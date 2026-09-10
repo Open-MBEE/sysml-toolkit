@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "cdc8337f-2887-5dfd-b43a-98940f5fab4c",
+    "@type": "DataType",
+    "declaredName": "Ratio",
+    "declaredShortName": null,
+    "elementId": "cdc8337f-2887-5dfd-b43a-98940f5fab4c",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "a662fb08-bb66-51eb-b83c-ec68ad6e40ed"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "92a29da7-f1d5-5997-be14-925701efc2b4"
+    }
+  }
+]

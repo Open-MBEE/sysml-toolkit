@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "a9ba2778-7aeb-5ae3-9319-0f5038faa469",
+    "@type": "InterfaceDefinition",
+    "declaredName": "FuelInterface",
+    "declaredShortName": null,
+    "elementId": "a9ba2778-7aeb-5ae3-9319-0f5038faa469",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "d3bb07b3-69bb-569c-92ff-1c1cb105155d"
+      },
+      {
+        "@id": "75aa2e13-6688-5c1e-880a-2d781712f7d8"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "ff7c474e-82f8-534d-b15b-a28c66f452df"
+    }
+  }
+]

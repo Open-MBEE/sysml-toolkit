@@ -1,0 +1,19 @@
+[
+  {
+    "@id": "6effee4e-b5e0-57fa-8159-719c436a0664",
+    "@type": "LibraryPackage",
+    "declaredName": "LocalLib",
+    "declaredShortName": null,
+    "elementId": "6effee4e-b5e0-57fa-8159-719c436a0664",
+    "isImpliedIncluded": false,
+    "isStandard": false,
+    "ownedRelationship": [
+      {
+        "@id": "0cc35d4f-56d8-58b0-94f3-a1eadef392f7"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "3c38c8c1-c7fc-54ed-8a41-4fc255a8bc07"
+    }
+  }
+]

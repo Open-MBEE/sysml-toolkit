@@ -1,0 +1,61 @@
+[
+  {
+    "@id": "a69a4790-4e05-5783-8eea-52ab6d2778db",
+    "@type": "ConnectionUsage",
+    "declaredName": "fuelLine",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "a69a4790-4e05-5783-8eea-52ab6d2778db",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "6488ef5a-064b-5db3-bf6b-5d421de989af"
+      },
+      {
+        "@id": "c728a621-adb9-5a65-9dbe-066368a5d204"
+      },
+      {
+        "@id": "745b43be-d76a-5e01-959c-f04173e39bcd"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e69950c4-1bbe-5fd8-af12-a7e91a475664"
+    }
+  },
+  {
+    "@id": "b4166a5e-8fb3-5a78-b6d0-09df17834615",
+    "@type": "ConnectionUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "b4166a5e-8fb3-5a78-b6d0-09df17834615",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "d0e30a99-e702-576a-9557-f869ea4ad067"
+      },
+      {
+        "@id": "5f4faee5-07c3-5d17-ae0a-7eccf92a2061"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "15e3e511-7f9b-5125-9537-35f8834ee09e"
+    }
+  }
+]

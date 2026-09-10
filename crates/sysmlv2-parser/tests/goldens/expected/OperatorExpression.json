@@ -1,0 +1,518 @@
+[
+  {
+    "@id": "be88b3e4-f92f-546e-a71c-3e39bcc9a0f0",
+    "@type": "OperatorExpression",
+    "elementId": "be88b3e4-f92f-546e-a71c-3e39bcc9a0f0",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "c294fd89-74f6-57c5-9f9e-dcbd442feeb0"
+      },
+      {
+        "@id": "ee68723f-8bd7-58d4-bdc3-41991fb7224e"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "75fd6df4-5958-5dcc-ae6c-a5fd6af01511"
+    }
+  },
+  {
+    "@id": "e8761831-c24e-5e90-b986-0278bfae466f",
+    "@type": "OperatorExpression",
+    "elementId": "e8761831-c24e-5e90-b986-0278bfae466f",
+    "isImpliedIncluded": false,
+    "operator": "*",
+    "ownedRelationship": [
+      {
+        "@id": "656ac702-2544-5f0b-a966-c80536576d00"
+      },
+      {
+        "@id": "68e0ffaa-9a62-559c-964d-207ff870381d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "83891bd9-6f65-5993-9731-52567abde0a5"
+    }
+  },
+  {
+    "@id": "e2087dff-65f4-52a9-996e-ba0ec7dca208",
+    "@type": "OperatorExpression",
+    "elementId": "e2087dff-65f4-52a9-996e-ba0ec7dca208",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "21615f7b-ef5c-5916-b90e-4f9a7df494cd"
+      },
+      {
+        "@id": "f2ad72b2-91a1-54cb-822d-68eb8965570d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "da90d812-d211-5f58-b248-94777db7f237"
+    }
+  },
+  {
+    "@id": "2c490daf-32cb-5dab-94e2-1321c70994ae",
+    "@type": "OperatorExpression",
+    "elementId": "2c490daf-32cb-5dab-94e2-1321c70994ae",
+    "isImpliedIncluded": false,
+    "operator": "<",
+    "ownedRelationship": [
+      {
+        "@id": "c8ce9d9b-675a-5137-9592-af0b384a268d"
+      },
+      {
+        "@id": "455b8524-3c1b-5b07-8780-35c51d6e778c"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "daa99778-7894-53b7-9dac-fc996033aee5"
+    }
+  },
+  {
+    "@id": "d7c1e95d-bb1b-55b8-950a-f594e40360fa",
+    "@type": "OperatorExpression",
+    "elementId": "d7c1e95d-bb1b-55b8-950a-f594e40360fa",
+    "isImpliedIncluded": false,
+    "operator": "..",
+    "ownedRelationship": [
+      {
+        "@id": "d86839a8-4cd8-5e00-820f-f415ce3336b4"
+      },
+      {
+        "@id": "1cdf2b47-ae7f-5dae-a661-79ea8fe4c87b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e01ca8c7-b2be-52cb-b297-64be800a2938"
+    }
+  },
+  {
+    "@id": "09f02ce6-ac29-5304-a8e1-d40a248f1fb3",
+    "@type": "OperatorExpression",
+    "elementId": "09f02ce6-ac29-5304-a8e1-d40a248f1fb3",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "98080ed4-4270-5937-a664-8126bc467feb"
+      },
+      {
+        "@id": "91d24174-5d19-5bd7-8aa8-601ed6274cfb"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "b331b499-cc6f-5343-8781-97231f285622"
+    }
+  },
+  {
+    "@id": "3b80d71d-9f8d-5442-9823-4701b266033e",
+    "@type": "OperatorExpression",
+    "elementId": "3b80d71d-9f8d-5442-9823-4701b266033e",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "970d474c-944f-5042-bca4-e39c8d9935d3"
+      },
+      {
+        "@id": "dbe40768-cf06-55d9-b2e9-60b50f1ea7f3"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "828494e4-74fe-55a1-99ae-7c8e8e252940"
+    }
+  },
+  {
+    "@id": "e0b4ba25-31bc-5737-93a4-ea30471b89bf",
+    "@type": "OperatorExpression",
+    "elementId": "e0b4ba25-31bc-5737-93a4-ea30471b89bf",
+    "isImpliedIncluded": false,
+    "operator": "!=",
+    "ownedRelationship": [
+      {
+        "@id": "715b5f5e-e2b4-5bce-9f14-93ea7fa4d082"
+      },
+      {
+        "@id": "f659addd-c709-5735-94b7-39ade4535d6a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "74591cc9-e9ec-5cb8-baaa-e893c25aa087"
+    }
+  },
+  {
+    "@id": "25acf65c-cf37-5185-b33d-526641c79941",
+    "@type": "OperatorExpression",
+    "elementId": "25acf65c-cf37-5185-b33d-526641c79941",
+    "isImpliedIncluded": false,
+    "operator": "/",
+    "ownedRelationship": [
+      {
+        "@id": "d454629a-7955-576b-be1b-1a31cc4cea7a"
+      },
+      {
+        "@id": "23c21857-24bc-5bc8-b58a-f4cac455e3eb"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "93fe950a-bd43-5070-a70c-cadedab446a7"
+    }
+  },
+  {
+    "@id": "884e6463-dafb-505b-8902-a4c501c16df3",
+    "@type": "OperatorExpression",
+    "elementId": "884e6463-dafb-505b-8902-a4c501c16df3",
+    "isImpliedIncluded": false,
+    "operator": "-",
+    "ownedRelationship": [
+      {
+        "@id": "ea12e5cd-f0fc-5f68-b1ea-8dcfe50dd406"
+      },
+      {
+        "@id": "8fbbcdf8-49d7-5e55-a27a-fa16d6c9f0cd"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "92b59c8e-5b6e-5d1c-9c58-6f1f3907efa6"
+    }
+  },
+  {
+    "@id": "1e706ad5-33a3-5c07-86af-3e85921c8c67",
+    "@type": "OperatorExpression",
+    "elementId": "1e706ad5-33a3-5c07-86af-3e85921c8c67",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "03728eb8-3ed8-56fc-a6d1-354421f068de"
+      },
+      {
+        "@id": "bfa403b9-a91e-5c9c-938a-b4e3a3d20e8b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4ed1f1d8-0b38-585d-b9e4-0b138646e8c7"
+    }
+  },
+  {
+    "@id": "2c2fd137-a8e8-5f7b-9f2c-59f6c1217bd9",
+    "@type": "OperatorExpression",
+    "elementId": "2c2fd137-a8e8-5f7b-9f2c-59f6c1217bd9",
+    "isImpliedIncluded": false,
+    "operator": "<",
+    "ownedRelationship": [
+      {
+        "@id": "457139b3-b619-5f79-9c14-6a1b507523e6"
+      },
+      {
+        "@id": "8aa0c060-06f4-5e4b-bb7a-9889fc720afd"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "833dd2ed-bc3d-5e6f-bcf9-ef4fc39cae3b"
+    }
+  },
+  {
+    "@id": "0a8323ee-1b7d-5fa0-b906-7fce1b66f040",
+    "@type": "OperatorExpression",
+    "elementId": "0a8323ee-1b7d-5fa0-b906-7fce1b66f040",
+    "isImpliedIncluded": false,
+    "operator": "<",
+    "ownedRelationship": [
+      {
+        "@id": "ad2dff5b-84ab-56bb-b81b-c6805fc84058"
+      },
+      {
+        "@id": "76e86b8e-6294-52e5-8f92-90afd0f37f44"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "bd30a435-9828-53dd-b540-87464fba7a78"
+    }
+  },
+  {
+    "@id": "3555eaf3-ca59-57cc-b637-c2514c4611b0",
+    "@type": "OperatorExpression",
+    "elementId": "3555eaf3-ca59-57cc-b637-c2514c4611b0",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "63b79919-3700-5521-a10a-fbb9b7c7eda7"
+      },
+      {
+        "@id": "9ee9ec4b-aa9e-5ffa-b005-826e4568daa4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "a6e414d5-01f5-535b-ab1c-2f069cec0b4a"
+    }
+  },
+  {
+    "@id": "171c1ebd-ff7d-5cd1-a52d-e8341e804834",
+    "@type": "OperatorExpression",
+    "elementId": "171c1ebd-ff7d-5cd1-a52d-e8341e804834",
+    "isImpliedIncluded": false,
+    "operator": "@",
+    "ownedRelationship": [
+      {
+        "@id": "05c49dd5-f4c8-5c60-a769-b3f36aa733a6"
+      },
+      {
+        "@id": "4b9ddbbb-4edb-5a92-99bd-78f1d3395d81"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "64d5b40b-e039-5c89-89a7-3bfe22186f70"
+    }
+  },
+  {
+    "@id": "eb44be68-dee8-582b-8e38-d25a655ee1d7",
+    "@type": "OperatorExpression",
+    "elementId": "eb44be68-dee8-582b-8e38-d25a655ee1d7",
+    "isImpliedIncluded": false,
+    "operator": ",",
+    "ownedRelationship": [
+      {
+        "@id": "03a89986-d9d2-54d8-8b83-4f78176fd4ce"
+      },
+      {
+        "@id": "85d53b02-8038-5e3c-ae26-74ca957be848"
+      },
+      {
+        "@id": "cd340ef8-ed6b-53ab-b3e8-7373ddc63ec5"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "42a8ffb3-a232-5a50-b6f0-e74790d8139a"
+    }
+  },
+  {
+    "@id": "5c5a9a64-7865-5586-9fac-cc1c213a3c82",
+    "@type": "OperatorExpression",
+    "elementId": "5c5a9a64-7865-5586-9fac-cc1c213a3c82",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "41970adf-7145-52ca-96e7-8c2a633ce65b"
+      },
+      {
+        "@id": "2d90f33c-e0d2-5c50-b9c9-3259e576f8e3"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6dacf931-384b-5dca-9633-5ca3503616d1"
+    }
+  },
+  {
+    "@id": "a4ec5215-d0cf-5b25-8d30-84b48e139ff9",
+    "@type": "OperatorExpression",
+    "elementId": "a4ec5215-d0cf-5b25-8d30-84b48e139ff9",
+    "isImpliedIncluded": false,
+    "operator": "if",
+    "ownedRelationship": [
+      {
+        "@id": "6335054d-8e5a-5d45-859f-64fe3fa8f40e"
+      },
+      {
+        "@id": "ee544492-4ce0-5d26-8d1f-5d2be12eebd4"
+      },
+      {
+        "@id": "d75a453b-8002-5dfd-984e-de16f5ff6ec2"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c192b2dd-3347-5b9f-947a-d13f8aa46502"
+    }
+  },
+  {
+    "@id": "5ab64283-b1f2-5f0c-9acd-40a901706085",
+    "@type": "OperatorExpression",
+    "elementId": "5ab64283-b1f2-5f0c-9acd-40a901706085",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "554aae19-ca8d-5915-90f4-1b8227418741"
+      },
+      {
+        "@id": "83b7f52d-2968-5703-a7fd-617bb0ebff23"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "9e1f2cbc-e423-542e-8bfb-892ad20bc6a4"
+    }
+  },
+  {
+    "@id": "7849c829-8620-519a-94be-f67d2ad9a1ac",
+    "@type": "OperatorExpression",
+    "elementId": "7849c829-8620-519a-94be-f67d2ad9a1ac",
+    "isImpliedIncluded": false,
+    "operator": "as",
+    "ownedRelationship": [
+      {
+        "@id": "b8e2f0a3-6e1f-5c9c-8ccd-dd5cbba32474"
+      },
+      {
+        "@id": "fe1bdc07-e399-5806-b7ee-95b98fa8a2f9"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "33679430-e83f-59f1-9293-991580940ae2"
+    }
+  },
+  {
+    "@id": "e33db449-6c7c-578d-b327-63cdc141893d",
+    "@type": "OperatorExpression",
+    "elementId": "e33db449-6c7c-578d-b327-63cdc141893d",
+    "isImpliedIncluded": false,
+    "operator": ",",
+    "ownedRelationship": [
+      {
+        "@id": "434be298-880a-513b-b2d1-9a175db96882"
+      },
+      {
+        "@id": "9479d6b1-e980-534d-8e6e-71b69675a470"
+      },
+      {
+        "@id": "fd3941af-cd40-5152-a813-c345bbf3fb1d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "0b1f907a-1124-5a33-90a4-c419f9893fd3"
+    }
+  },
+  {
+    "@id": "2b7fb26c-fdc0-586c-9850-e04a56c8a5fb",
+    "@type": "OperatorExpression",
+    "elementId": "2b7fb26c-fdc0-586c-9850-e04a56c8a5fb",
+    "isImpliedIncluded": false,
+    "operator": ",",
+    "ownedRelationship": [
+      {
+        "@id": "297b0ed7-37f0-5ca3-b40d-fe93907c80df"
+      },
+      {
+        "@id": "eb325e3c-2d37-5d24-9f10-5e64b6b5b2a2"
+      },
+      {
+        "@id": "00281372-c940-504e-863c-464697fa49be"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "683bc7ea-3590-5361-b844-5bf521b83065"
+    }
+  },
+  {
+    "@id": "db63ccae-109f-549d-9207-f119c7bca515",
+    "@type": "OperatorExpression",
+    "elementId": "db63ccae-109f-549d-9207-f119c7bca515",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "dac948c5-9254-5832-9af4-03ea3bcdd85f"
+      },
+      {
+        "@id": "9225e993-de47-5e35-a210-5ab6022bc2a5"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c238061e-fde2-5615-8715-a54d4d742bc5"
+    }
+  },
+  {
+    "@id": "27545d9a-e71f-5b11-83cb-1ece282804fc",
+    "@type": "OperatorExpression",
+    "elementId": "27545d9a-e71f-5b11-83cb-1ece282804fc",
+    "isImpliedIncluded": false,
+    "operator": "??",
+    "ownedRelationship": [
+      {
+        "@id": "151b7c1a-507c-5421-a82b-27fdb6408c55"
+      },
+      {
+        "@id": "ef6a97d8-66fa-5153-8519-d44d316bb527"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1ac1ef65-ef49-5fee-9534-b5fdf44da4bd"
+    }
+  },
+  {
+    "@id": "d0bcc0e9-18f7-5cd5-baff-72c0bc721695",
+    "@type": "OperatorExpression",
+    "elementId": "d0bcc0e9-18f7-5cd5-baff-72c0bc721695",
+    "isImpliedIncluded": false,
+    "operator": ">=",
+    "ownedRelationship": [
+      {
+        "@id": "8c167ad9-f0dd-5d9a-bf75-e2977ab3de87"
+      },
+      {
+        "@id": "1496ab1f-6eea-5f41-8bb5-8d337ad82711"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "88e4d0ea-af0c-53e1-838b-c935a8bac5ca"
+    }
+  },
+  {
+    "@id": "27ca2276-b665-5ba1-805d-547767617657",
+    "@type": "OperatorExpression",
+    "elementId": "27ca2276-b665-5ba1-805d-547767617657",
+    "isImpliedIncluded": false,
+    "operator": "*",
+    "ownedRelationship": [
+      {
+        "@id": "45e02294-6a8f-5c1c-ba7a-1a3b558cb035"
+      },
+      {
+        "@id": "9e297efc-3dc6-579f-be53-7bd35a022481"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6b2b253a-cf61-5c8e-9cfb-f6c063c66ed8"
+    }
+  },
+  {
+    "@id": "127b748d-dccf-528c-9758-aa5c9f49cbbf",
+    "@type": "OperatorExpression",
+    "elementId": "127b748d-dccf-528c-9758-aa5c9f49cbbf",
+    "isImpliedIncluded": false,
+    "operator": ">",
+    "ownedRelationship": [
+      {
+        "@id": "bd13dac1-812f-51da-8d76-ac030565894e"
+      },
+      {
+        "@id": "57031d6c-ad6a-5f1c-8ffc-8a1359fefd92"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e0b0c449-807b-59ef-a664-db05b1a4d99a"
+    }
+  },
+  {
+    "@id": "998542dd-b095-5180-acd3-324875ddd024",
+    "@type": "OperatorExpression",
+    "elementId": "998542dd-b095-5180-acd3-324875ddd024",
+    "isImpliedIncluded": false,
+    "operator": "+",
+    "ownedRelationship": [
+      {
+        "@id": "2dde8ab8-30f1-5bcf-9d0b-739a96824d8f"
+      },
+      {
+        "@id": "3f3b0901-49dc-5c25-88eb-a7cf762b61eb"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6a586784-a2da-573a-9786-a3be0d6fa27d"
+    }
+  }
+]

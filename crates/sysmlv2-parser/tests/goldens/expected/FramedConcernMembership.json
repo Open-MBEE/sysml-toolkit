@@ -1,0 +1,40 @@
+[
+  {
+    "@id": "557c1287-a7fe-5ce1-8c7e-df50d358524a",
+    "@type": "FramedConcernMembership",
+    "elementId": "557c1287-a7fe-5ce1-8c7e-df50d358524a",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "requirement",
+    "ownedRelatedElement": [
+      {
+        "@id": "60fd5b1a-233f-5e7d-b799-a9b7e97e2e26"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "cd72b8e5-2dde-548c-a8e2-e3c7ad1f24ee"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "2dcb59a3-47b8-55ca-ac50-1915922d443d",
+    "@type": "FramedConcernMembership",
+    "elementId": "2dcb59a3-47b8-55ca-ac50-1915922d443d",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "requirement",
+    "ownedRelatedElement": [
+      {
+        "@id": "7eac195c-b80c-550a-93ff-85650068925f"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "c513dc78-a162-52a0-8143-3e5b353486cc"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

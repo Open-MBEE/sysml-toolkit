@@ -1,0 +1,32 @@
+[
+  {
+    "@id": "40d7101a-4021-5bfa-8101-c4822bfe4c0f",
+    "@type": "OccurrenceUsage",
+    "declaredName": "mission1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "40d7101a-4021-5bfa-8101-c4822bfe4c0f",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isIndividual": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "8715742c-ea2a-55b3-8b46-f5f17123354c"
+      },
+      {
+        "@id": "635889b1-9830-5c53-8731-607705bbd7b5"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f3df5231-d8a3-5aaa-8561-4ccda64c6ca9"
+    },
+    "portionKind": null
+  }
+]

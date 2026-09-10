@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "f2fe562d-0858-5df0-b1c9-fd86f12f094c",
+    "@type": "NamespaceExpose",
+    "elementId": "f2fe562d-0858-5df0-b1c9-fd86f12f094c",
+    "importedNamespace": {
+      "@id": "8aed4546-91ef-58b7-948c-b52baee008a6"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "isImportAll": true,
+    "isRecursive": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "f84ef4c8-6b8e-5c2b-9322-44f7d587086b"
+    },
+    "owningRelationship": null,
+    "visibility": "protected"
+  }
+]

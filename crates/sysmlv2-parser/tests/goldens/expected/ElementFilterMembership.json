@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "64d5b40b-e039-5c89-89a7-3bfe22186f70",
+    "@type": "ElementFilterMembership",
+    "elementId": "64d5b40b-e039-5c89-89a7-3bfe22186f70",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "171c1ebd-ff7d-5cd1-a52d-e8341e804834"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "f84ef4c8-6b8e-5c2b-9322-44f7d587086b"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

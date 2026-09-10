@@ -1,0 +1,14 @@
+[package]
+name = "sysmlv2-syntax"
+description = "Syntax layer for OMG SysML v2 / KerML: lexer, parser, spans, AST, printer/formatter, body-context validation"
+readme = "../../README.md"
+keywords = ["sysml", "kerml", "mbse", "parser", "modeling"]
+categories = ["parser-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src/**", "Cargo.toml"]
+
+[dependencies]

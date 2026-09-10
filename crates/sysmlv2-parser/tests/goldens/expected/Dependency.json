@@ -1,0 +1,25 @@
+[
+  {
+    "@id": "b38aa8b2-11a9-5a82-b034-17548cdc2a7f",
+    "@type": "Dependency",
+    "client": [
+      {
+        "@id": "51d7ff5f-578f-5061-aefb-b0585fafb058"
+      }
+    ],
+    "declaredName": "Uses",
+    "declaredShortName": null,
+    "elementId": "b38aa8b2-11a9-5a82-b034-17548cdc2a7f",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "ca08b277-d306-558b-9b46-38e56551d695"
+    },
+    "supplier": [
+      {
+        "@id": "1a501d14-9e9c-5009-8eac-1fd058066eaf"
+      }
+    ]
+  }
+]

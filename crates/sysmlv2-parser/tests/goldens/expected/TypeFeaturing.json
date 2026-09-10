@@ -1,0 +1,17 @@
+[
+  {
+    "@id": "b9e9bb0b-98b5-594f-bda2-cd7a8334c7ef",
+    "@type": "TypeFeaturing",
+    "elementId": "b9e9bb0b-98b5-594f-bda2-cd7a8334c7ef",
+    "featuringType": {
+      "@id": "eace3bf2-30c6-5939-a601-ecefee39f96c"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "86af4d63-ac89-5513-82e5-6a8a24de1739"
+    },
+    "owningRelationship": null
+  }
+]

@@ -1,0 +1,612 @@
+{
+  "generator": {
+    "name": "@sysml/web",
+    "version": "0.5.5-rc.1"
+  },
+  "dataset": {
+    "svelte (declarations)": "5.57.0"
+  },
+  "kernel": "0.5.5-rc.1",
+  "library": "Template",
+  "elements": {
+    "Template::Template::Attribute": {
+      "spec": "svelte",
+      "interface": "Attribute",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::AttributeLike"
+      ]
+    },
+    "Template::Template::AttributeLike": {
+      "spec": "template-core",
+      "idlKind": "abstract",
+      "kind": "part",
+      "abstract": "abstract-kind",
+      "generalizations": [
+        "Web::DOM::Attr"
+      ]
+    },
+    "Template::Template::Block": {
+      "spec": "template-core",
+      "idlKind": "abstract",
+      "kind": "part",
+      "abstract": "abstract-kind",
+      "generalizations": [
+        "Template::Template::TemplateNode"
+      ]
+    },
+    "Template::Template::Comment": {
+      "spec": "svelte",
+      "interface": "Comment",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode",
+        "Web::DOM::Comment"
+      ]
+    },
+    "Template::Template::Component": {
+      "spec": "svelte",
+      "interface": "Component",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode"
+      ]
+    },
+    "Template::Template::Component::name": {
+      "spec": "svelte",
+      "interface": "Component",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::Component::props": {
+      "spec": "svelte",
+      "interface": "Component",
+      "member": "attributes",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Template::Template::AttributeLike",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ComponentDefinition": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "Template::Template::ComponentDefinition::contentHash": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::ComponentDefinition::dependencies": {
+      "kind": "part",
+      "type": "Template::Template::SourceDependency",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ComponentDefinition::export": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::ComponentDefinition::module": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::ComponentDefinition::props": {
+      "kind": "part",
+      "type": "Template::Template::PropDeclaration",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ComponentDefinition::restProps": {
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "Template::Template::ComponentDefinition::root": {
+      "kind": "reference",
+      "type": "Template::Template::Root",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ComponentDefinition::uri": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::EachBlock": {
+      "spec": "svelte",
+      "interface": "EachBlock",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::Block"
+      ]
+    },
+    "Template::Template::EachBlock::body": {
+      "spec": "svelte",
+      "interface": "EachBlock",
+      "member": "body",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Template::Template::Fragment",
+      "idlType": "Fragment"
+    },
+    "Template::Template::EachBlock::context": {
+      "spec": "svelte",
+      "interface": "EachBlock",
+      "member": "context",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "idlType": "Pattern | null",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::EachBlock::expression": {
+      "spec": "svelte",
+      "interface": "EachBlock",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "idlType": "Expression"
+    },
+    "Template::Template::EachBlock::fallback": {
+      "spec": "svelte",
+      "interface": "EachBlock",
+      "member": "fallback",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Template::Template::Fragment",
+      "idlType": "Fragment",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::EachBlock::index": {
+      "spec": "svelte",
+      "interface": "EachBlock",
+      "member": "index",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::EachBlock::kerml": {
+      "spec": "template-core",
+      "member": "kerml",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::EachBlock::kermlContext": {
+      "spec": "template-core",
+      "member": "kermlContext",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::EachBlock::kermlKey": {
+      "spec": "template-core",
+      "member": "kermlKey",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::EachBlock::key": {
+      "spec": "svelte",
+      "interface": "EachBlock",
+      "member": "key",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "idlType": "Expression",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::Element": {
+      "spec": "svelte",
+      "interface": "RegularElement",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode",
+        "Web::DOM::Element"
+      ]
+    },
+    "Template::Template::Element::attributes": {
+      "spec": "svelte",
+      "interface": "RegularElement",
+      "member": "attributes",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::AttributeLike",
+      "multiplicity": "[0..*]",
+      "ordered": true,
+      "redefines": true
+    },
+    "Template::Template::ExpressionEnvironment": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "Template::Template::ExpressionEnvironment::bindings": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ExpressionEnvironment::capabilities": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ExpressionEnvironment::dependencies": {
+      "kind": "part",
+      "type": "Template::Template::SourceDependency",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ExpressionEnvironment::implementation": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::ExpressionEnvironment::imports": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ExpressionEnvironment::inputs": {
+      "kind": "part",
+      "type": "Template::Template::InputBinding",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::ExpressionEnvironment::module": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ExpressionEnvironment::scope": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ExpressionEnvironment::version": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ExpressionTag": {
+      "spec": "svelte",
+      "interface": "ExpressionTag",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode"
+      ]
+    },
+    "Template::Template::ExpressionTag::embedded": {
+      "spec": "template-core",
+      "member": "embedded",
+      "kind": "part",
+      "type": "Template::Template::TemplateNode",
+      "multiplicity": "[0..*]"
+    },
+    "Template::Template::ExpressionTag::environment": {
+      "spec": "template-core",
+      "member": "environment",
+      "kind": "reference",
+      "type": "Template::Template::ExpressionEnvironment",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ExpressionTag::expression": {
+      "spec": "svelte",
+      "interface": "ExpressionTag",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "idlType": "Expression"
+    },
+    "Template::Template::ExpressionTag::kerml": {
+      "spec": "template-core",
+      "member": "kerml",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ExpressionTag::python": {
+      "spec": "template-core",
+      "member": "python",
+      "kind": "attribute",
+      "type": "Template::Template::Python",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ExpressionTag::sparql": {
+      "spec": "template-core",
+      "member": "sparql",
+      "kind": "attribute",
+      "type": "Template::Template::SPARQL",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::ExpressionTag::view": {
+      "spec": "template-core",
+      "member": "view",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::Fragment": {
+      "spec": "svelte",
+      "interface": "Fragment",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode",
+        "Web::DOM::DocumentFragment"
+      ]
+    },
+    "Template::Template::HtmlTag": {
+      "spec": "svelte",
+      "interface": "HtmlTag",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode"
+      ]
+    },
+    "Template::Template::HtmlTag::environment": {
+      "spec": "template-core",
+      "member": "environment",
+      "kind": "reference",
+      "type": "Template::Template::ExpressionEnvironment",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::HtmlTag::expression": {
+      "spec": "svelte",
+      "interface": "HtmlTag",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "idlType": "Expression"
+    },
+    "Template::Template::HtmlTag::kerml": {
+      "spec": "template-core",
+      "member": "kerml",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::HtmlTag::view": {
+      "spec": "template-core",
+      "member": "view",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::IfBlock": {
+      "spec": "svelte",
+      "interface": "IfBlock",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::Block"
+      ]
+    },
+    "Template::Template::IfBlock::alternate": {
+      "spec": "svelte",
+      "interface": "IfBlock",
+      "member": "alternate",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Template::Template::Fragment",
+      "idlType": "Fragment | null",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::IfBlock::consequent": {
+      "spec": "svelte",
+      "interface": "IfBlock",
+      "member": "consequent",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Template::Template::Fragment",
+      "idlType": "Fragment"
+    },
+    "Template::Template::IfBlock::kerml": {
+      "spec": "template-core",
+      "member": "kerml",
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::IfBlock::test": {
+      "spec": "svelte",
+      "interface": "IfBlock",
+      "member": "test",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "idlType": "Expression"
+    },
+    "Template::Template::InputBinding": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "Template::Template::InputBinding::name": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::InputBinding::selection": {
+      "kind": "attribute",
+      "type": "Template::Template::KerML",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::KerML": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "attribute",
+      "generalizations": [
+        "Template::Template::SourceExpression"
+      ]
+    },
+    "Template::Template::PropDeclaration": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "Template::Template::PropDeclaration::bindable": {
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "Template::Template::PropDeclaration::defaultValue": {
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::PropDeclaration::legacy": {
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "Template::Template::PropDeclaration::modelType": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::PropDeclaration::name": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::PropDeclaration::required": {
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "Template::Template::PropDeclaration::snippet": {
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "Template::Template::PropDeclaration::typeText": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::Python": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "attribute",
+      "generalizations": [
+        "Template::Template::SourceExpression"
+      ]
+    },
+    "Template::Template::Root": {
+      "spec": "svelte",
+      "interface": "Root",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode"
+      ]
+    },
+    "Template::Template::Root::environment": {
+      "spec": "template-core",
+      "member": "environment",
+      "kind": "part",
+      "type": "Template::Template::ExpressionEnvironment"
+    },
+    "Template::Template::Root::queryEnvironments": {
+      "spec": "template-core",
+      "member": "queryEnvironments",
+      "kind": "part",
+      "type": "Template::Template::ExpressionEnvironment",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Template::Template::SPARQL": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "attribute",
+      "generalizations": [
+        "Template::Template::SourceExpression"
+      ]
+    },
+    "Template::Template::SourceDependency": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "Template::Template::SourceDependency::contentHash": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::SourceDependency::resolvedUri": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Template::Template::SourceDependency::specifier": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "Template::Template::SourceExpression": {
+      "spec": "template-core",
+      "idlKind": "datatype",
+      "kind": "attribute",
+      "generalizations": [
+        "String"
+      ]
+    },
+    "Template::Template::SpreadAttribute": {
+      "spec": "svelte",
+      "interface": "SpreadAttribute",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::AttributeLike"
+      ]
+    },
+    "Template::Template::SpreadAttribute::expression": {
+      "spec": "svelte",
+      "interface": "SpreadAttribute",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Template::Template::SourceExpression",
+      "idlType": "Expression"
+    },
+    "Template::Template::TemplateNode": {
+      "spec": "template-core",
+      "idlKind": "abstract",
+      "kind": "part",
+      "abstract": "abstract-kind",
+      "generalizations": [
+        "Web::DOM::Node"
+      ]
+    },
+    "Template::Template::Text": {
+      "spec": "svelte",
+      "interface": "Text",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Template::Template::TemplateNode",
+        "Web::DOM::Text"
+      ]
+    }
+  },
+  "omitted": {}
+}

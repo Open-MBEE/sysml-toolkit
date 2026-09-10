@@ -1,0 +1,18 @@
+[package]
+name = "sysmlv2-model"
+description = "Semantic model layer for OMG SysML v2 / KerML: element graph, name resolution, JSON interchange (compact + full), referential checks, expression evaluation"
+readme = "../../README.md"
+keywords = ["sysml", "kerml", "mbse", "modeling", "json"]
+categories = ["parser-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src/**", "build.rs", "Cargo.toml"]
+
+[dependencies]
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.5.5-rc.1" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

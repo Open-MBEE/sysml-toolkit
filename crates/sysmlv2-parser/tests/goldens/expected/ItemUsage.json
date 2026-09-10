@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "b6e78b14-5020-5936-b4a0-7badb02a0aea",
+    "@type": "ItemUsage",
+    "declaredName": "fuel",
+    "declaredShortName": null,
+    "direction": "in",
+    "elementId": "b6e78b14-5020-5936-b4a0-7badb02a0aea",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "573e4f00-535a-549f-8879-0c519d683a6a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d2a7c1b0-26b2-5a78-84eb-ce530f0da1cb"
+    }
+  }
+]

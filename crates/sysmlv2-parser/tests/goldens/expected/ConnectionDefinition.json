@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "5f9ca8e2-e311-580b-8865-27f0831949cb",
+    "@type": "ConnectionDefinition",
+    "declaredName": "FuelLine",
+    "declaredShortName": null,
+    "elementId": "5f9ca8e2-e311-580b-8865-27f0831949cb",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "59b7fc3e-0336-5f06-acf6-a99bc2902444"
+      },
+      {
+        "@id": "a1be5408-84c7-5762-95d5-0861e7284dd4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8fcbacfc-242b-5719-8cdf-06f9544e3491"
+    }
+  }
+]

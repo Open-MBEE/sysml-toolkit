@@ -1,0 +1,102 @@
+[
+  {
+    "@id": "d2e80b7d-668b-5d26-83ad-56429f3d4487",
+    "@type": "ConstraintUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "d2e80b7d-668b-5d26-83ad-56429f3d4487",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "828494e4-74fe-55a1-99ae-7c8e8e252940"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "bfa74eb0-2101-5aec-b96a-4af06b39c743"
+    }
+  },
+  {
+    "@id": "6f7cb18c-a41b-52b4-aed3-fdb4aff9507c",
+    "@type": "ConstraintUsage",
+    "declaredName": "margin",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "6f7cb18c-a41b-52b4-aed3-fdb4aff9507c",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "833dd2ed-bc3d-5e6f-bcf9-ef4fc39cae3b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "ea20933a-5c6a-5e40-bc3f-3c997c7b5563"
+    }
+  },
+  {
+    "@id": "5c62c750-b8b8-5c00-97fb-3415ec62b6ee",
+    "@type": "ConstraintUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "5c62c750-b8b8-5c00-97fb-3415ec62b6ee",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "bd30a435-9828-53dd-b540-87464fba7a78"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "35177d51-08e6-5247-a3d0-229b188560aa"
+    }
+  },
+  {
+    "@id": "a19fdd8b-ff5f-5e42-9a4b-e076b2e75f8d",
+    "@type": "ConstraintUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "a19fdd8b-ff5f-5e42-9a4b-e076b2e75f8d",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "a6e414d5-01f5-535b-ab1c-2f069cec0b4a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1bdc9216-0736-57e0-b8e0-fa5c489e46a1"
+    }
+  }
+]

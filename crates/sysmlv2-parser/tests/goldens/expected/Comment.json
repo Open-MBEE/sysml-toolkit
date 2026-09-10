@@ -1,0 +1,38 @@
+[
+  {
+    "@id": "82ef5122-8d1e-5e3b-8705-ed53e3299e40",
+    "@type": "Comment",
+    "body": "kernel golden fixture ",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "82ef5122-8d1e-5e3b-8705-ed53e3299e40",
+    "isImpliedIncluded": false,
+    "locale": null,
+    "ownedRelationship": [
+      {
+        "@id": "a2d816a4-711f-5e54-b98c-f18ce4b53be3"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "ac1d1119-d224-58eb-a3e9-f2a106087fbb"
+    }
+  },
+  {
+    "@id": "3b51806e-cc8e-563c-bd6a-adf202773a28",
+    "@type": "Comment",
+    "body": "the primary vehicle configuration ",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "3b51806e-cc8e-563c-bd6a-adf202773a28",
+    "isImpliedIncluded": false,
+    "locale": null,
+    "ownedRelationship": [
+      {
+        "@id": "94be2d3c-e784-59ef-ab48-de4727ebbdcb"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1dd4441b-f5b5-5224-b0e8-4294e30e7f1e"
+    }
+  }
+]

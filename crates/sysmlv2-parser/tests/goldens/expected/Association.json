@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "a3068927-98a4-51c7-a327-425602a6edbe",
+    "@type": "Association",
+    "declaredName": "Link",
+    "declaredShortName": null,
+    "elementId": "a3068927-98a4-51c7-a327-425602a6edbe",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "11d2e87a-46da-5d50-a87a-9da79723ae40"
+      },
+      {
+        "@id": "4878f30e-9ae0-5a55-ae3a-a213430bd9f2"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5e8b0373-a937-5b96-8695-8dea29fc6c83"
+    }
+  }
+]

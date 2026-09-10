@@ -1,0 +1,43 @@
+[
+  {
+    "@id": "56666274-0f0f-5b07-a496-815d59da851f",
+    "@type": "StateDefinition",
+    "declaredName": "Modes",
+    "declaredShortName": null,
+    "elementId": "56666274-0f0f-5b07-a496-815d59da851f",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isParallel": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "2547db8e-541c-530d-ad16-cbf5e8448655"
+      },
+      {
+        "@id": "37481b95-7c68-5405-9ecf-6813e02467b6"
+      },
+      {
+        "@id": "27fea2fc-25a9-55b2-aaf8-80181de816bf"
+      },
+      {
+        "@id": "e88b646a-a6ce-5388-ba28-0af34083dad6"
+      },
+      {
+        "@id": "1e3c2cc9-7074-5fa1-883b-e661fda24a7b"
+      },
+      {
+        "@id": "f3a8c78e-83df-5669-a0ce-65b32a828548"
+      },
+      {
+        "@id": "8d45ba1a-9a21-527d-9f42-e85d4431886a"
+      },
+      {
+        "@id": "a7133a39-ff21-55fb-9a32-e8f5a0875dcb"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6b48945e-e293-5c2e-b344-ba0420a695e2"
+    }
+  }
+]

@@ -1,0 +1,344 @@
+[
+  {
+    "@id": "696b28ee-f510-5ab3-a589-bcd77e90e7a4",
+    "@type": "PartUsage",
+    "declaredName": "c1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "696b28ee-f510-5ab3-a589-bcd77e90e7a4",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "7b596294-63e9-5c1a-9a00-04372b524fae"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "89b6392b-7f94-51b9-b768-ee49fbb4fa55"
+    }
+  },
+  {
+    "@id": "fac4ef69-39e7-5130-b349-792092b0ef32",
+    "@type": "PartUsage",
+    "declaredName": "c2",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "fac4ef69-39e7-5130-b349-792092b0ef32",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "89bf4216-5a65-5b39-a83e-0d8299141d5d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e779733b-ee5b-5a89-a4cc-3213f2d4d498"
+    }
+  },
+  {
+    "@id": "8aed4546-91ef-58b7-948c-b52baee008a6",
+    "@type": "PartUsage",
+    "declaredName": "battery",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "8aed4546-91ef-58b7-948c-b52baee008a6",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "15cb0093-12e9-5178-a33f-a5b0c2d32442"
+      },
+      {
+        "@id": "f77b1552-a92a-5f7e-b7e3-a2721a75c6be"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "b1848462-04a0-57ea-b57c-b15a4d155ded"
+    }
+  },
+  {
+    "@id": "8d32e609-0269-52ca-9541-c4d10ed8d808",
+    "@type": "PartUsage",
+    "declaredName": "cell1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "8d32e609-0269-52ca-9541-c4d10ed8d808",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "7c16c3ae-e190-50c9-87ab-912e5ed4c144"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "15cb0093-12e9-5178-a33f-a5b0c2d32442"
+    }
+  },
+  {
+    "@id": "2a4b03a2-d317-50a8-a7a8-e08fe652eb2d",
+    "@type": "PartUsage",
+    "declaredName": "buyer",
+    "declaredShortName": null,
+    "direction": "in",
+    "elementId": "2a4b03a2-d317-50a8-a7a8-e08fe652eb2d",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "96f44f87-e9aa-5a76-90df-b52ec73aa648"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "0ff8f19b-d2d4-5e88-a31a-e2c625a3adc4"
+    }
+  },
+  {
+    "@id": "2ea75c38-86b1-50df-af81-42f44b37868e",
+    "@type": "PartUsage",
+    "declaredName": "operator",
+    "declaredShortName": null,
+    "direction": "in",
+    "elementId": "2ea75c38-86b1-50df-af81-42f44b37868e",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "fb02a578-5afa-5c7b-9236-6986c71b3172"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "51b67794-27ec-5ef8-ab19-06c71ebbfddb"
+    }
+  },
+  {
+    "@id": "0d447418-3ed4-5e89-bb37-c026b8b5bbf5",
+    "@type": "PartUsage",
+    "declaredName": "engine",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "0d447418-3ed4-5e89-bb37-c026b8b5bbf5",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "33846b34-4666-536e-987b-286167b40bb7"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4d99d0f6-749b-5fcc-8c3d-fa9b162c489b"
+    }
+  },
+  {
+    "@id": "edbeb5ad-1fdc-5020-bf8e-91df08fbc5da",
+    "@type": "PartUsage",
+    "declaredName": "wheels",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "edbeb5ad-1fdc-5020-bf8e-91df08fbc5da",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": true,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "26ebe939-1a7f-5f29-9152-6fc89d9e6408"
+      },
+      {
+        "@id": "9a0349d5-3513-541d-96f2-22ad6b74d068"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d25bc4f9-3447-59be-affd-9686190938b4"
+    }
+  },
+  {
+    "@id": "d058d243-8bc7-5f44-a26e-fa8a2afa3a63",
+    "@type": "PartUsage",
+    "declaredName": "driver",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "d058d243-8bc7-5f44-a26e-fa8a2afa3a63",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "c177cc07-0e28-5a67-9cf8-e8db7a17281c"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6ee2756f-4b77-5a55-a96a-83f00e7b20b9"
+    }
+  },
+  {
+    "@id": "51d7ff5f-578f-5061-aefb-b0585fafb058",
+    "@type": "PartUsage",
+    "declaredName": "vehicle1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "51d7ff5f-578f-5061-aefb-b0585fafb058",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "3295af7f-eb55-508a-b93e-9e8f66300bf2"
+      },
+      {
+        "@id": "9f609c3e-8bf3-509f-af97-75f0ea901cd2"
+      },
+      {
+        "@id": "5e152caa-0cd6-5d72-847a-5fe2cd7e5a92"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "cbd3d465-df6b-5993-809f-46e0880c9a75"
+    }
+  },
+  {
+    "@id": "1a501d14-9e9c-5009-8eac-1fd058066eaf",
+    "@type": "PartUsage",
+    "declaredName": "tank1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "1a501d14-9e9c-5009-8eac-1fd058066eaf",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "5adba6e6-e990-5484-a945-d651d8481d84"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c0d68fd8-3d4d-545d-8565-f0b0a1cb4e02"
+    }
+  },
+  {
+    "@id": "74628159-360d-5678-b470-4093535e5839",
+    "@type": "PartUsage",
+    "declaredName": "myCar",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "74628159-360d-5678-b470-4093535e5839",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isIndividual": true,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "f3a38009-ce6b-55ff-8a6e-38e441032453"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "55c4edf3-f9a3-5eed-b2fb-74a7b553cc41"
+    },
+    "portionKind": null
+  },
+  {
+    "@id": "25866a5c-f110-5de5-b64e-53e4fd1c3c2c",
+    "@type": "PartUsage",
+    "declaredName": "critical",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "25866a5c-f110-5de5-b64e-53e4fd1c3c2c",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "572c5c2b-e146-5e8b-85d4-b04869a07a03"
+      },
+      {
+        "@id": "29893e6e-cbf5-5c3d-907f-574fb712bebe"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f4268970-1116-5612-b30c-c48f970c8edb"
+    }
+  }
+]

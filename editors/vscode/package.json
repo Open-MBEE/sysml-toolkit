@@ -1,0 +1,81 @@
+{
+  "name": "sysmlv2",
+  "displayName": "SysML v2 / KerML (sysmlv2)",
+  "description": "SysML v2 and KerML language support via the sysmlv2 language server: exact dialect-aware highlighting, live diagnostics, outline, formatting.",
+  "version": "0.1.0",
+  "publisher": "sysml",
+  "license": "Apache-2.0",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Open-MBEE/sysml-toolkit.git",
+    "directory": "editors/vscode"
+  },
+  "homepage": "https://github.com/Open-MBEE/sysml-toolkit#readme",
+  "bugs": {
+    "url": "https://github.com/Open-MBEE/sysml-toolkit/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "sysml",
+        "aliases": ["SysML v2", "sysml"],
+        "extensions": [".sysml"],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "kerml",
+        "aliases": ["KerML", "kerml"],
+        "extensions": [".kerml"],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "sysml-signature",
+        "aliases": ["SysML v2 Signature"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "sysml",
+        "scopeName": "source.sysml",
+        "path": "./syntaxes/sysmlv2.tmLanguage.json"
+      },
+      {
+        "language": "kerml",
+        "scopeName": "source.sysml",
+        "path": "./syntaxes/sysmlv2.tmLanguage.json"
+      },
+      {
+        "language": "sysml-signature",
+        "scopeName": "source.sysml-signature",
+        "path": "./syntaxes/sysml-signature.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "sysmlv2",
+      "properties": {
+        "sysmlv2.serverPath": {
+          "type": "string",
+          "default": "sysmlv2",
+          "description": "Path to the sysmlv2 binary (the server runs as `sysmlv2 lsp`)."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "scripts": {
+    "package": "vsce package"
+  }
+}

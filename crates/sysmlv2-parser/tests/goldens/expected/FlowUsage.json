@@ -1,0 +1,33 @@
+[
+  {
+    "@id": "aca6e141-b9c1-55a1-86bd-c3e56d39af27",
+    "@type": "FlowUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "aca6e141-b9c1-55a1-86bd-c3e56d39af27",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "89a804a3-8471-50db-a7fe-d776288e8eba"
+      },
+      {
+        "@id": "8c1ad6d3-cb04-5f4c-aedf-d5ca51f432e2"
+      },
+      {
+        "@id": "c08f1a09-0c21-5b1c-a6be-43953b4a3bba"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "203962f7-ef20-5f03-8d3e-de6bebcedde1"
+    }
+  }
+]

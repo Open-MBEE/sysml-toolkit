@@ -1,0 +1,25 @@
+[
+  {
+    "@id": "5041ebfe-5fc1-5bd4-9e80-ebd9587ddcd7",
+    "@type": "CrossSubsetting",
+    "crossedFeature": {
+      "@id": "2a7cef10-b9f0-5d0a-a5d0-b5d827b22e78"
+    },
+    "elementId": "5041ebfe-5fc1-5bd4-9e80-ebd9587ddcd7",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "2a7cef10-b9f0-5d0a-a5d0-b5d827b22e78"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "082449e1-c699-5f47-94d2-acc48ce6a110"
+    },
+    "owningRelationship": null,
+    "subsettingFeature": {
+      "@id": "082449e1-c699-5f47-94d2-acc48ce6a110"
+    }
+  }
+]

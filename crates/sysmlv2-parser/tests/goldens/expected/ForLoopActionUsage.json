@@ -1,0 +1,33 @@
+[
+  {
+    "@id": "b6892e24-9c45-50ad-a093-ef63ad6baf87",
+    "@type": "ForLoopActionUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "b6892e24-9c45-50ad-a093-ef63ad6baf87",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "051e5e0d-e5ca-584e-857d-c678d920db63"
+      },
+      {
+        "@id": "5505efb7-9d8a-5f60-b201-d12ca9ce8100"
+      },
+      {
+        "@id": "4805c557-9083-5661-a2c5-4aa32dc3213b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d60ff657-c476-5f9d-8fbd-79929afcf725"
+    }
+  }
+]

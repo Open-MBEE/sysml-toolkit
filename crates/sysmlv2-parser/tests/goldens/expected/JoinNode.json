@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "d425450d-96c6-56b7-9b02-65e56800fa3b",
+    "@type": "JoinNode",
+    "declaredName": "j1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "d425450d-96c6-56b7-9b02-65e56800fa3b",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "100299a9-67be-54a0-866c-4b940ece3808"
+    }
+  }
+]

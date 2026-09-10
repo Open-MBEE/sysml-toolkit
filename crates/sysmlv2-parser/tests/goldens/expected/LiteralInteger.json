@@ -1,0 +1,277 @@
+[
+  {
+    "@id": "3909e795-cd8b-57e5-b37e-aa6e343db11b",
+    "@type": "LiteralInteger",
+    "elementId": "3909e795-cd8b-57e5-b37e-aa6e343db11b",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "49746651-19d6-5160-a7e3-deae48385b6f"
+    },
+    "value": 1
+  },
+  {
+    "@id": "29e076aa-33c2-5ace-ab1c-05afca88227f",
+    "@type": "LiteralInteger",
+    "elementId": "29e076aa-33c2-5ace-ab1c-05afca88227f",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "eda4afc9-115f-516e-8c65-8a0e8f56809f"
+    },
+    "value": 4
+  },
+  {
+    "@id": "495aa616-0614-566d-8305-0c5bab88638c",
+    "@type": "LiteralInteger",
+    "elementId": "495aa616-0614-566d-8305-0c5bab88638c",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "442f5240-5d27-58b2-aef0-a3545f12ca65"
+    },
+    "value": 1
+  },
+  {
+    "@id": "b250fc7f-b8b6-540f-bbec-3d54da6a4a33",
+    "@type": "LiteralInteger",
+    "elementId": "b250fc7f-b8b6-540f-bbec-3d54da6a4a33",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "fd360413-b4cf-5620-b741-8586624865d8"
+    },
+    "value": 0
+  },
+  {
+    "@id": "307c4a0e-e70e-57d1-8063-1e7971be3e8c",
+    "@type": "LiteralInteger",
+    "elementId": "307c4a0e-e70e-57d1-8063-1e7971be3e8c",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "b3850180-b309-5d2c-a113-c2ab8a002639"
+    },
+    "value": 1
+  },
+  {
+    "@id": "d8efdb55-b418-5485-ac51-7d56814ea9df",
+    "@type": "LiteralInteger",
+    "elementId": "d8efdb55-b418-5485-ac51-7d56814ea9df",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "06912f0e-670c-5438-a8bf-4eac1ba14808"
+    },
+    "value": 0
+  },
+  {
+    "@id": "e7b54ea3-93f6-5dbd-9052-bd02676df19f",
+    "@type": "LiteralInteger",
+    "elementId": "e7b54ea3-93f6-5dbd-9052-bd02676df19f",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "cd601c83-9590-5fc6-a249-a01b02475c88"
+    },
+    "value": 1
+  },
+  {
+    "@id": "95b49a1f-4787-5781-af8e-b1b70d245713",
+    "@type": "LiteralInteger",
+    "elementId": "95b49a1f-4787-5781-af8e-b1b70d245713",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "fae4fb36-b249-59f9-85c5-a8f8e590f096"
+    },
+    "value": 2
+  },
+  {
+    "@id": "e8fe8957-311a-5afa-9749-12f4c471cbf9",
+    "@type": "LiteralInteger",
+    "elementId": "e8fe8957-311a-5afa-9749-12f4c471cbf9",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "dda4a384-f6d7-5cae-80b6-be89d2292e57"
+    },
+    "value": 3
+  },
+  {
+    "@id": "21d0da96-b817-5969-935b-2cfd41f60bc9",
+    "@type": "LiteralInteger",
+    "elementId": "21d0da96-b817-5969-935b-2cfd41f60bc9",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "318d0def-3c3f-52c9-b397-1fae30943dd4"
+    },
+    "value": 1
+  },
+  {
+    "@id": "09f12bd8-4ae9-5696-b48d-98fbd8f67564",
+    "@type": "LiteralInteger",
+    "elementId": "09f12bd8-4ae9-5696-b48d-98fbd8f67564",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "0d974ca0-c018-5a7d-a5f4-1f4d98f800eb"
+    },
+    "value": 1
+  },
+  {
+    "@id": "fce34987-b264-5aa5-82bd-88a41872e4e4",
+    "@type": "LiteralInteger",
+    "elementId": "fce34987-b264-5aa5-82bd-88a41872e4e4",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "757b6f06-dfff-513f-958e-4b83cb29429d"
+    },
+    "value": 0
+  },
+  {
+    "@id": "7dcddd21-c970-5c90-8fcf-f57a0230ef90",
+    "@type": "LiteralInteger",
+    "elementId": "7dcddd21-c970-5c90-8fcf-f57a0230ef90",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "40a78cf9-c30f-53e0-82b5-3c52738e9040"
+    },
+    "value": 1
+  },
+  {
+    "@id": "450eca43-51fa-54ff-97b1-a0188163ca9a",
+    "@type": "LiteralInteger",
+    "elementId": "450eca43-51fa-54ff-97b1-a0188163ca9a",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "694c330e-e8cb-54a1-84df-04ac8fc44c30"
+    },
+    "value": 2
+  },
+  {
+    "@id": "99ecaa98-335d-506d-937e-ad8b6507e002",
+    "@type": "LiteralInteger",
+    "elementId": "99ecaa98-335d-506d-937e-ad8b6507e002",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "60e5192e-25f2-5f27-8dc5-08516a489b2b"
+    },
+    "value": 3
+  },
+  {
+    "@id": "b5a33f73-7cf5-5843-9026-1eb0c5de6be0",
+    "@type": "LiteralInteger",
+    "elementId": "b5a33f73-7cf5-5843-9026-1eb0c5de6be0",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "30592a0c-8206-5514-b75c-76c358ae5f59"
+    },
+    "value": 1
+  },
+  {
+    "@id": "48fa1f7c-1d95-52f1-b826-3caebdc09511",
+    "@type": "LiteralInteger",
+    "elementId": "48fa1f7c-1d95-52f1-b826-3caebdc09511",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "dff2b5aa-6a6b-5f80-889f-39a55de74829"
+    },
+    "value": 1
+  },
+  {
+    "@id": "81d1cdca-779a-5406-9975-15e22ffe9b74",
+    "@type": "LiteralInteger",
+    "elementId": "81d1cdca-779a-5406-9975-15e22ffe9b74",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "30b34168-8a88-5957-8147-e3a8679452d3"
+    },
+    "value": 2
+  },
+  {
+    "@id": "12966d50-f772-5789-9891-6b222f7a2dbd",
+    "@type": "LiteralInteger",
+    "elementId": "12966d50-f772-5789-9891-6b222f7a2dbd",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "84647514-e834-5257-bdbf-88a59a26eea6"
+    },
+    "value": 3
+  },
+  {
+    "@id": "feedca10-ee94-5aa0-bd9e-234540ff4c17",
+    "@type": "LiteralInteger",
+    "elementId": "feedca10-ee94-5aa0-bd9e-234540ff4c17",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "a3e39e3c-8a43-50b9-8956-ede08837e81b"
+    },
+    "value": 1
+  },
+  {
+    "@id": "2f7fc98e-3546-5cb3-a55d-a367d049cee0",
+    "@type": "LiteralInteger",
+    "elementId": "2f7fc98e-3546-5cb3-a55d-a367d049cee0",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "758dd948-710b-55cb-b688-8e8a522626e6"
+    },
+    "value": 5
+  },
+  {
+    "@id": "d04f37ef-2f74-5094-a3a9-be8319715277",
+    "@type": "LiteralInteger",
+    "elementId": "d04f37ef-2f74-5094-a3a9-be8319715277",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "918631c5-2431-535c-8cfa-61ce8bcd7b10"
+    },
+    "value": 0
+  },
+  {
+    "@id": "281adcfd-980d-5011-85b3-5c76b30b5b3a",
+    "@type": "LiteralInteger",
+    "elementId": "281adcfd-980d-5011-85b3-5c76b30b5b3a",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "e8646cec-0884-5277-a5ef-2434ad65410f"
+    },
+    "value": 2
+  },
+  {
+    "@id": "64f85043-7a59-51fa-b03f-d4eb11be8587",
+    "@type": "LiteralInteger",
+    "elementId": "64f85043-7a59-51fa-b03f-d4eb11be8587",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "9c04d171-dd61-5200-b2cb-dc91f55dcd55"
+    },
+    "value": 4
+  },
+  {
+    "@id": "f775c331-05af-5e07-99f6-0b9af7d26132",
+    "@type": "LiteralInteger",
+    "elementId": "f775c331-05af-5e07-99f6-0b9af7d26132",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "e3dc5a06-5031-5e7e-96ee-107ae6df608a"
+    },
+    "value": 3
+  }
+]

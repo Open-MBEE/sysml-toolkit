@@ -1,0 +1,32 @@
+[
+  {
+    "@id": "82af0c79-bfa3-5217-9860-d5522af29475",
+    "@type": "LiteralInfinity",
+    "elementId": "82af0c79-bfa3-5217-9860-d5522af29475",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "d787ee37-8a88-5c96-823e-a25c308d5745"
+    }
+  },
+  {
+    "@id": "b1fbb983-66e8-5876-8e30-784414040bef",
+    "@type": "LiteralInfinity",
+    "elementId": "b1fbb983-66e8-5876-8e30-784414040bef",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "e324f92b-3fdc-56a2-abbf-54f1173e1d78"
+    }
+  },
+  {
+    "@id": "410ad6d0-ce5c-5758-9564-7100e6a484d5",
+    "@type": "LiteralInfinity",
+    "elementId": "410ad6d0-ce5c-5758-9564-7100e6a484d5",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "14a31464-f719-59a5-ab8e-58fa8dd0ff43"
+    }
+  }
+]

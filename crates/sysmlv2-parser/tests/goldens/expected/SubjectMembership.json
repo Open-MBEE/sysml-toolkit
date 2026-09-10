@@ -1,0 +1,109 @@
+[
+  {
+    "@id": "88a2c682-1b99-55f3-9e56-ed7e0c0d6273",
+    "@type": "SubjectMembership",
+    "elementId": "88a2c682-1b99-55f3-9e56-ed7e0c0d6273",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "85343e5f-5f62-5818-ab87-97c8301003f0"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "43b5b4e1-7ce3-5cc1-8a6b-01fbe4aa1417"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "de8189af-32cc-5dac-896c-379e256a2094",
+    "@type": "SubjectMembership",
+    "elementId": "de8189af-32cc-5dac-896c-379e256a2094",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "d7b1c6de-6ee3-50b3-a0f1-032bfa9e1263"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "17537d63-89e2-5b76-8553-08fa64466e60"
+    },
+    "owningRelationship": null
+  },
+  {
+    "@id": "b2c764cb-9a1d-5640-85e0-79102bb98793",
+    "@type": "SubjectMembership",
+    "elementId": "b2c764cb-9a1d-5640-85e0-79102bb98793",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "cef94ea1-7186-552d-86e8-b3efd436d963"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "242f4bcf-c3a3-582d-8361-3d6275047903"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "c76e6541-d349-5e11-9ffe-24493d21ddd5",
+    "@type": "SubjectMembership",
+    "elementId": "c76e6541-d349-5e11-9ffe-24493d21ddd5",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "93778225-54c5-5f72-b69e-996450ff8a94"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "872ae867-3fe3-5424-b256-cc2ea9440a55"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "3ddb147a-30d1-52e7-9a5c-754654d98501",
+    "@type": "SubjectMembership",
+    "elementId": "3ddb147a-30d1-52e7-9a5c-754654d98501",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "e0f46d8f-4a77-554d-88d4-74dcd220a114"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "09958418-fd21-57b7-a778-a46a882eef69"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "fad22612-5960-5f9a-b3d0-44fcbedd71ea",
+    "@type": "SubjectMembership",
+    "elementId": "fad22612-5960-5f9a-b3d0-44fcbedd71ea",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "9b7f6f6b-2020-59b0-b72c-704b4143d373"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "3e7f9172-8af1-59a0-baac-f193e296d1a5"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

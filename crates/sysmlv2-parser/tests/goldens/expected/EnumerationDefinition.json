@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "b8c35147-8f80-5f60-b117-daf32c32481a",
+    "@type": "EnumerationDefinition",
+    "declaredName": "Color",
+    "declaredShortName": null,
+    "elementId": "b8c35147-8f80-5f60-b117-daf32c32481a",
+    "isAbstract": true,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": true,
+    "ownedRelationship": [
+      {
+        "@id": "28190bc5-3349-541a-989f-523111894a1a"
+      },
+      {
+        "@id": "c66e9510-19f0-5a84-9b60-f7d06dd021ac"
+      },
+      {
+        "@id": "19bf6764-dec1-5611-977b-5d2fb367ea1b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1e647fe3-2881-5a9b-886f-5c253ee312dc"
+    }
+  }
+]

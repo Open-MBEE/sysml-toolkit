@@ -1,0 +1,65 @@
+[
+  {
+    "@id": "0525074a-5073-5d35-91bf-039ac36fe0e0",
+    "@type": "EnumerationUsage",
+    "declaredName": "red",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "0525074a-5073-5d35-91bf-039ac36fe0e0",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "28190bc5-3349-541a-989f-523111894a1a"
+    }
+  },
+  {
+    "@id": "f5788957-6541-50c0-87d8-584da99858c3",
+    "@type": "EnumerationUsage",
+    "declaredName": "green",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "f5788957-6541-50c0-87d8-584da99858c3",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "c66e9510-19f0-5a84-9b60-f7d06dd021ac"
+    }
+  },
+  {
+    "@id": "f0265460-5573-5705-b821-f0abb7490e22",
+    "@type": "EnumerationUsage",
+    "declaredName": "blue",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "f0265460-5573-5705-b821-f0abb7490e22",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "19bf6764-dec1-5611-977b-5d2fb367ea1b"
+    }
+  }
+]

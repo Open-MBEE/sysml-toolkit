@@ -1,0 +1,25 @@
+[package]
+name = "sysmlv2-lsp"
+description = "sysmlv2 — Language Server Protocol server for SysML v2 / KerML"
+readme = "../../README.md"
+keywords = ["sysml", "kerml", "mbse", "lsp", "language-server"]
+categories = ["development-tools"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src/**", "Cargo.toml"]
+
+[dependencies]
+sysmlv2-parser.workspace = true
+sysmlv2-transform.workspace = true
+sysmlv2-lint.workspace = true
+sysmlv2-solve.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+sysmlv2-testkit.workspace = true

@@ -1,0 +1,46 @@
+[
+  {
+    "@id": "14b3d4f0-9cdf-5035-8d17-1a8470f0889e",
+    "@type": "PortDefinition",
+    "declaredName": "CmdPort",
+    "declaredShortName": null,
+    "elementId": "14b3d4f0-9cdf-5035-8d17-1a8470f0889e",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "259661c3-e985-5c12-acef-6b2810bea158"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "67550161-72b5-5857-b6e7-afeaabc29636"
+    }
+  },
+  {
+    "@id": "7e04cee7-7ef1-5f73-a8a1-00a6e1241dac",
+    "@type": "PortDefinition",
+    "declaredName": "FuelPort",
+    "declaredShortName": null,
+    "elementId": "7e04cee7-7ef1-5f73-a8a1-00a6e1241dac",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "d2a7c1b0-26b2-5a78-84eb-ce530f0da1cb"
+      },
+      {
+        "@id": "58e34945-7f50-5965-944a-7c988e14119a"
+      },
+      {
+        "@id": "f8977079-a1aa-538c-afbd-2cf421de7991"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "2c459733-0714-5c6f-b31f-2c258bbc0829"
+    }
+  }
+]

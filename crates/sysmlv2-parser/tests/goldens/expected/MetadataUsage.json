@@ -1,0 +1,94 @@
+[
+  {
+    "@id": "9bc4aa26-e873-551c-b1bc-18c828bf9e9c",
+    "@type": "MetadataUsage",
+    "elementId": "9bc4aa26-e873-551c-b1bc-18c828bf9e9c",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "068bb08a-01c4-5ac8-a0dc-46748ccf12de"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4f07a561-26dd-545a-a1d9-8682229587aa"
+    }
+  },
+  {
+    "@id": "9ab574c7-2476-538a-95b2-d3a6c0be2dc9",
+    "@type": "MetadataUsage",
+    "elementId": "9ab574c7-2476-538a-95b2-d3a6c0be2dc9",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "d80ddf67-10d8-5edb-988e-e9cd22bd648e"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "42df59d7-6a0f-5158-8c82-cd962997960d"
+    }
+  },
+  {
+    "@id": "6291462e-3efb-55a9-b0ca-7e41bee539f4",
+    "@type": "MetadataUsage",
+    "elementId": "6291462e-3efb-55a9-b0ca-7e41bee539f4",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "650a731e-0e33-531b-8d63-7c819edbe280"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "99e8805f-a04d-5fdc-a203-c329fd6b73e3"
+    }
+  },
+  {
+    "@id": "efc82897-fb7e-5d0a-8474-b8b3cbad9703",
+    "@type": "MetadataUsage",
+    "elementId": "efc82897-fb7e-5d0a-8474-b8b3cbad9703",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "79ac6004-4926-5421-a596-aed95664b468"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "435606f2-3cf9-5b46-89ae-59363de55c18"
+    }
+  },
+  {
+    "@id": "93271332-dfee-5e61-b6d3-141612e3861a",
+    "@type": "MetadataUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "93271332-dfee-5e61-b6d3-141612e3861a",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "64fba0b7-3604-5592-b15f-68347d75de91"
+      },
+      {
+        "@id": "71b5f7c7-b42e-528d-ba11-64f035dd05de"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "29893e6e-cbf5-5c3d-907f-574fb712bebe"
+    }
+  }
+]

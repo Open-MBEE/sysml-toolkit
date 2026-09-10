@@ -1,0 +1,47 @@
+[
+  {
+    "@id": "224333e9-6691-5b2d-9aaf-0539341e56b5",
+    "@type": "TriggerInvocationExpression",
+    "elementId": "224333e9-6691-5b2d-9aaf-0539341e56b5",
+    "isImpliedIncluded": false,
+    "kind": "after",
+    "ownedRelationship": [
+      {
+        "@id": "22e1ea4e-ee8b-56b1-8756-0c92289fd103"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "469825d0-d956-5cd8-b5c1-ab487864d341"
+    }
+  },
+  {
+    "@id": "56bebca0-14ce-5586-af88-7873a61c9eef",
+    "@type": "TriggerInvocationExpression",
+    "elementId": "56bebca0-14ce-5586-af88-7873a61c9eef",
+    "isImpliedIncluded": false,
+    "kind": "at",
+    "ownedRelationship": [
+      {
+        "@id": "ceb8ef2c-cc72-52af-9148-e5a6182f8c12"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e9f5edf2-ec4c-50bc-b885-3a42b7bad8df"
+    }
+  },
+  {
+    "@id": "86ef3089-8c44-5ea6-bf4e-743288e9a9b7",
+    "@type": "TriggerInvocationExpression",
+    "elementId": "86ef3089-8c44-5ea6-bf4e-743288e9a9b7",
+    "isImpliedIncluded": false,
+    "kind": "when",
+    "ownedRelationship": [
+      {
+        "@id": "b331b499-cc6f-5343-8781-97231f285622"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "410f31fa-a7be-50f4-bb53-a2ebb9109ea2"
+    }
+  }
+]

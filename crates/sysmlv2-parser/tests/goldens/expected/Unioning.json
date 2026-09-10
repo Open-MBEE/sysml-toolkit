@@ -1,0 +1,32 @@
+[
+  {
+    "@id": "d2941588-66a5-5dba-9019-8a7c6c2fd9db",
+    "@type": "Unioning",
+    "elementId": "d2941588-66a5-5dba-9019-8a7c6c2fd9db",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "eb32ce54-2e0e-53b4-abe3-94591aa95ad3"
+    },
+    "owningRelationship": null,
+    "unioningType": {
+      "@id": "18ec9748-da12-5d36-887a-b97e53614be5"
+    }
+  },
+  {
+    "@id": "b62de0cf-746c-5e9e-a7f3-b2dc6e6c500a",
+    "@type": "Unioning",
+    "elementId": "b62de0cf-746c-5e9e-a7f3-b2dc6e6c500a",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "eb32ce54-2e0e-53b4-abe3-94591aa95ad3"
+    },
+    "owningRelationship": null,
+    "unioningType": {
+      "@id": "029db469-0fe4-54df-9823-1878386a48ed"
+    }
+  }
+]

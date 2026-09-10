@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "87044970-967f-570c-bf53-ff4fded77bbe",
+    "@type": "ForkNode",
+    "declaredName": "f1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "87044970-967f-570c-bf53-ff4fded77bbe",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "998ffea7-4dbd-5198-a8c1-6daf843cf94a"
+    }
+  }
+]

@@ -1,0 +1,300 @@
+[
+  {
+    "@id": "8ad7b289-0074-5198-acdf-8f1671bf74d0",
+    "@type": "PartDefinition",
+    "declaredName": "Controller",
+    "declaredShortName": null,
+    "elementId": "8ad7b289-0074-5198-acdf-8f1671bf74d0",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "de003642-7b12-508a-a396-d2315c0cc450"
+      },
+      {
+        "@id": "5605b7bf-509a-5352-a70f-50d4b88f2440"
+      },
+      {
+        "@id": "8866312f-15e3-5028-9ba8-5e0b7905f2dc"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "29e23e9e-e74c-5747-932e-d5751539f371"
+    }
+  },
+  {
+    "@id": "7b47d5ad-8c8e-5466-8919-4a3d39df5d97",
+    "@type": "PartDefinition",
+    "declaredName": "Cell",
+    "declaredShortName": null,
+    "elementId": "7b47d5ad-8c8e-5466-8919-4a3d39df5d97",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "de621fec-336b-538e-8a22-47ad87945d1b"
+      },
+      {
+        "@id": "04b2e606-e6be-5a4e-9dd1-dcc135283068"
+      },
+      {
+        "@id": "ea20933a-5c6a-5e40-bc3f-3c997c7b5563"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "712b098b-9b17-537d-907f-ced64fb30a67"
+    }
+  },
+  {
+    "@id": "6f3968e0-7b41-56fb-a0ab-f1327107a983",
+    "@type": "PartDefinition",
+    "declaredName": "Party",
+    "declaredShortName": null,
+    "elementId": "6f3968e0-7b41-56fb-a0ab-f1327107a983",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "2f4e48fa-280f-5f6d-851f-7035a87c2f86"
+    }
+  },
+  {
+    "@id": "89f734ef-794c-5f35-9d4c-4cf8dd20d3e6",
+    "@type": "PartDefinition",
+    "declaredName": "Shared",
+    "declaredShortName": null,
+    "elementId": "89f734ef-794c-5f35-9d4c-4cf8dd20d3e6",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "0cc35d4f-56d8-58b0-94f3-a1eadef392f7"
+    }
+  },
+  {
+    "@id": "4422b952-c3da-5dd5-b59b-a3882ee4bcb6",
+    "@type": "PartDefinition",
+    "declaredName": "CellChoice",
+    "declaredShortName": null,
+    "elementId": "4422b952-c3da-5dd5-b59b-a3882ee4bcb6",
+    "isAbstract": true,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": true,
+    "ownedRelationship": [
+      {
+        "@id": "fdfd70fb-fe95-5494-9656-9e6ee96676ac"
+      },
+      {
+        "@id": "4eb479a3-2cf3-5c34-be05-51aa06082042"
+      },
+      {
+        "@id": "c31da287-1e56-5851-bd4f-17b4207ffd4f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f85b3930-8ead-52d3-93e5-1e8415a4f332"
+    }
+  },
+  {
+    "@id": "9212bfd6-9b5c-54aa-889a-bea86497e7e1",
+    "@type": "PartDefinition",
+    "declaredName": "LiIon",
+    "declaredShortName": null,
+    "elementId": "9212bfd6-9b5c-54aa-889a-bea86497e7e1",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "49b4befb-5744-5f12-871e-40f897594cd7"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4eb479a3-2cf3-5c34-be05-51aa06082042"
+    }
+  },
+  {
+    "@id": "75adffa5-3186-5da1-bcb7-4374fa2139ea",
+    "@type": "PartDefinition",
+    "declaredName": "NiMh",
+    "declaredShortName": null,
+    "elementId": "75adffa5-3186-5da1-bcb7-4374fa2139ea",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "607b6fec-c6aa-5b03-91ed-dea181a44c80"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c31da287-1e56-5851-bd4f-17b4207ffd4f"
+    }
+  },
+  {
+    "@id": "52a4de16-5a60-53f2-a0a4-cfb47cdb5431",
+    "@type": "PartDefinition",
+    "declaredName": "Vehicle",
+    "declaredShortName": null,
+    "elementId": "52a4de16-5a60-53f2-a0a4-cfb47cdb5431",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "94153ec3-64d8-5ac4-9565-020740b2c589"
+      },
+      {
+        "@id": "a47b0464-7dd9-54f1-9259-5a4f0a486087"
+      },
+      {
+        "@id": "4d99d0f6-749b-5fcc-8c3d-fa9b162c489b"
+      },
+      {
+        "@id": "d25bc4f9-3447-59be-affd-9686190938b4"
+      },
+      {
+        "@id": "cf669157-add6-51c6-a817-97b01ab3b8f4"
+      },
+      {
+        "@id": "6ee2756f-4b77-5a55-a96a-83f00e7b20b9"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f1ad132f-25f0-5d90-b4ee-3884339f82d6"
+    }
+  },
+  {
+    "@id": "b4d4bb20-73ae-57c5-95b5-61ab8dffc901",
+    "@type": "PartDefinition",
+    "declaredName": "Engine",
+    "declaredShortName": null,
+    "elementId": "b4d4bb20-73ae-57c5-95b5-61ab8dffc901",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "b3e0da3a-6af0-54c2-8e60-8d2a0b199863"
+    }
+  },
+  {
+    "@id": "29dcf76e-4409-5e52-8cde-09c29caa63bc",
+    "@type": "PartDefinition",
+    "declaredName": "Wheel",
+    "declaredShortName": null,
+    "elementId": "29dcf76e-4409-5e52-8cde-09c29caa63bc",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "0a06f5be-9f19-5cfb-bdc6-6803c388d908"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "951f8d89-3ee0-55a4-90ef-e88d99fcd061"
+    }
+  },
+  {
+    "@id": "0cb3b4e4-bdfa-5149-856f-b1dd9907b303",
+    "@type": "PartDefinition",
+    "declaredName": "Person",
+    "declaredShortName": null,
+    "elementId": "0cb3b4e4-bdfa-5149-856f-b1dd9907b303",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "79781906-5df7-5613-828b-96b3a643df4b"
+    }
+  },
+  {
+    "@id": "06f97471-f01c-5f29-be7c-c248be42749c",
+    "@type": "PartDefinition",
+    "declaredName": "Ground",
+    "declaredShortName": null,
+    "elementId": "06f97471-f01c-5f29-be7c-c248be42749c",
+    "isAbstract": true,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "c357a187-ed6d-53a7-897c-1105b8e406b9"
+    }
+  },
+  {
+    "@id": "67451027-1b8f-558f-b2de-d9628f4e4279",
+    "@type": "PartDefinition",
+    "declaredName": "Tank",
+    "declaredShortName": null,
+    "elementId": "67451027-1b8f-558f-b2de-d9628f4e4279",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "8f49ca61-6bbb-5a6e-a3f2-751d8f824fc5"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8aad2fef-f068-5f30-b73f-40b4a59edf8f"
+    }
+  },
+  {
+    "@id": "8fba673f-bee3-5999-b909-a97fdfd8dd96",
+    "@type": "PartDefinition",
+    "declaredName": "MyVehicle",
+    "declaredShortName": null,
+    "elementId": "8fba673f-bee3-5999-b909-a97fdfd8dd96",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "0919b829-f369-5b2a-9a5c-01ef55100308"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "9beb00a6-65b6-5738-9d8d-ff608ec1d73d"
+    }
+  },
+  {
+    "@id": "93fa7225-b409-5c7a-ab34-068ce5949b5d",
+    "@type": "PartDefinition",
+    "declaredName": "SafePart",
+    "declaredShortName": null,
+    "elementId": "93fa7225-b409-5c7a-ab34-068ce5949b5d",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "435606f2-3cf9-5b46-89ae-59363de55c18"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "eb338ec4-6fb3-54a8-ae8e-0cd2b093bede"
+    }
+  }
+]

@@ -1,0 +1,21 @@
+[
+  {
+    "@id": "c513dc78-a162-52a0-8143-3e5b353486cc",
+    "@type": "ViewpointDefinition",
+    "declaredName": "Clarity",
+    "declaredShortName": null,
+    "elementId": "c513dc78-a162-52a0-8143-3e5b353486cc",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "2dcb59a3-47b8-55ca-ac50-1915922d443d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "95fac6a8-d3e2-5b51-accd-9190505654bd"
+    }
+  }
+]

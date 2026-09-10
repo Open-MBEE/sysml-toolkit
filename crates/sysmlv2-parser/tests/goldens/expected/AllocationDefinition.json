@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "8ca0dd78-7c4d-51d9-9772-6207ed2fd292",
+    "@type": "AllocationDefinition",
+    "declaredName": "Realization",
+    "declaredShortName": null,
+    "elementId": "8ca0dd78-7c4d-51d9-9772-6207ed2fd292",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "1b3f021c-2eb4-590a-8f31-ee9c0a8ededc"
+      },
+      {
+        "@id": "779a93bb-f065-51a5-a639-df1377b411fe"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4bfd43a3-5751-5518-804c-a1a3830d3831"
+    }
+  }
+]

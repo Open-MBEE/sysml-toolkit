@@ -1,0 +1,17 @@
+[
+  {
+    "@id": "427ed29c-2252-55d1-adc3-573b7740de14",
+    "@type": "Disjoining",
+    "disjoiningType": {
+      "@id": "eace3bf2-30c6-5939-a601-ecefee39f96c"
+    },
+    "elementId": "427ed29c-2252-55d1-adc3-573b7740de14",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "26ec9c7c-c7ac-5e7f-92bf-8aef5d3c4c74"
+    },
+    "owningRelationship": null
+  }
+]

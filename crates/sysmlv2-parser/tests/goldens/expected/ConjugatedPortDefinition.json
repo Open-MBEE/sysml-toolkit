@@ -1,0 +1,34 @@
+[
+  {
+    "@id": "65f7472b-1f15-51cc-bdd2-4c5387d06cb3",
+    "@type": "ConjugatedPortDefinition",
+    "declaredName": "~CmdPort",
+    "elementId": "65f7472b-1f15-51cc-bdd2-4c5387d06cb3",
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "b68209e5-5e33-5867-8e7c-0b26adcf6e8f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "259661c3-e985-5c12-acef-6b2810bea158"
+    }
+  },
+  {
+    "@id": "c01b9cb6-d3b2-5622-bcc1-3f732a08ab82",
+    "@type": "ConjugatedPortDefinition",
+    "declaredName": "~FuelPort",
+    "elementId": "c01b9cb6-d3b2-5622-bcc1-3f732a08ab82",
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "f0500957-b89d-5afe-abfa-8713bc97b5bc"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f8977079-a1aa-538c-afbd-2cf421de7991"
+    }
+  }
+]

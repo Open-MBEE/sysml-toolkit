@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "6fe06e38-c59d-551b-b3a4-3008d3cf4cc4",
+    "@type": "Function",
+    "declaredName": "Calc",
+    "declaredShortName": null,
+    "elementId": "6fe06e38-c59d-551b-b3a4-3008d3cf4cc4",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "e475155d-d569-51b6-97c5-311b609472af"
+      },
+      {
+        "@id": "6b2b253a-cf61-5c8e-9cfb-f6c063c66ed8"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "2b27067b-07d5-5b24-a9f6-b71160375778"
+    }
+  }
+]

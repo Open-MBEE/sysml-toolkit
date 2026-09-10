@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "SysML v2 / KerML (fallback)",
+  "scopeName": "source.sysml",
+  "patterns": [
+    { "include": "#notes" },
+    { "include": "#doc-comment" },
+    { "include": "#strings" },
+    { "include": "#quoted-names" },
+    { "include": "#numbers" }
+  ],
+  "repository": {
+    "notes": {
+      "patterns": [
+        { "name": "comment.block.sysml", "begin": "//\\*", "end": "\\*/" },
+        { "name": "comment.line.double-slash.sysml", "match": "//[^*].*|//$" }
+      ]
+    },
+    "doc-comment": {
+      "name": "comment.block.documentation.sysml",
+      "begin": "/\\*",
+      "end": "\\*/"
+    },
+    "strings": {
+      "name": "string.quoted.double.sysml",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "name": "constant.character.escape.sysml", "match": "\\\\." }]
+    },
+    "quoted-names": {
+      "name": "variable.other.quoted.sysml",
+      "begin": "'",
+      "end": "'",
+      "patterns": [{ "name": "constant.character.escape.sysml", "match": "\\\\." }]
+    },
+    "numbers": {
+      "name": "constant.numeric.sysml",
+      "match": "\\b[0-9]+([eE][+-]?[0-9]+)?\\b"
+    }
+  }
+}

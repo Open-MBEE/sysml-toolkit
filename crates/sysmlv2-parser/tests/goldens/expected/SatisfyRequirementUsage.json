@@ -1,0 +1,34 @@
+[
+  {
+    "@id": "17537d63-89e2-5b76-8553-08fa64466e60",
+    "@type": "SatisfyRequirementUsage",
+    "declaredName": "svr",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "17537d63-89e2-5b76-8553-08fa64466e60",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isNegated": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "620e9ce7-6f9b-5ce9-807a-0eade68bb1ce"
+      },
+      {
+        "@id": "de8189af-32cc-5dac-896c-379e256a2094"
+      },
+      {
+        "@id": "6b245a21-650b-5123-a88f-f0cf2158db86"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f77b1552-a92a-5f7e-b7e3-a2721a75c6be"
+    }
+  }
+]

@@ -1,0 +1,35 @@
+[
+  {
+    "@id": "a3640bcc-f650-5e45-84ee-86bb0488063c",
+    "@type": "Flow",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "a3640bcc-f650-5e45-84ee-86bb0488063c",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isPortion": false,
+    "isSufficient": false,
+    "isUnique": true,
+    "isVariable": false,
+    "ownedRelationship": [
+      {
+        "@id": "ff32f210-a760-50dc-926a-98eb9c2b7161"
+      },
+      {
+        "@id": "a36c5f05-dc14-5a58-8168-fd7b2b5ae1e0"
+      },
+      {
+        "@id": "c28a4b1e-0e74-59f8-b0e4-ed1ae582f3d0"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "b85674f6-f44f-58c6-bc77-d8d33853e4d9"
+    }
+  }
+]

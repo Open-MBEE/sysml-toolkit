@@ -1,0 +1,13 @@
+[
+  {
+    "@id": "128fcfc0-c1e2-5468-8782-823859ae0466",
+    "@type": "LiteralBoolean",
+    "elementId": "128fcfc0-c1e2-5468-8782-823859ae0466",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "1ad7fdff-2c5b-5901-97e1-0fe14822a2b7"
+    },
+    "value": true
+  }
+]

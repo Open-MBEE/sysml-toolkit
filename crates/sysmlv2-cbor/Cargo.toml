@@ -1,0 +1,23 @@
+[package]
+name = "sysmlv2-cbor"
+description = "CBOR binary encoding of the OMG SysML v2 / KerML compact JSON interchange form: table-driven, deterministic, byte-for-byte reconstructable"
+readme = "README.md"
+keywords = ["sysml", "kerml", "mbse", "cbor", "serialization"]
+categories = ["development-tools", "encoding"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src/**", "Cargo.toml", "README.md"]
+
+[dependencies]
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.5.5-rc.1" }
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sysmlv2-parser.workspace = true
+sysmlv2-testkit.workspace = true
+miniz_oxide.workspace = true

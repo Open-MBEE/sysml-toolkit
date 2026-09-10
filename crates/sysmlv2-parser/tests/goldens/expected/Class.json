@@ -1,0 +1,26 @@
+[
+  {
+    "@id": "2f967252-e8e5-5d7d-b773-5f667f56b847",
+    "@type": "Class",
+    "declaredName": "Block",
+    "declaredShortName": null,
+    "elementId": "2f967252-e8e5-5d7d-b773-5f667f56b847",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "6b21b686-88c0-52b1-9732-2958944c0f83"
+      },
+      {
+        "@id": "61e6d41d-7428-505c-a5d4-1320a927a36c"
+      },
+      {
+        "@id": "3233ed68-fabd-579d-bfc4-1436ecafdca1"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "65e9de40-e1fc-5f3d-a028-42d1da6f1cb6"
+    }
+  }
+]

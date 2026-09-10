@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "0dcee25b-9689-5b5b-a54e-1b1ddba37870",
+    "@type": "ViewpointUsage",
+    "declaredName": "vp",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "0dcee25b-9689-5b5b-a54e-1b1ddba37870",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "3db3cce5-f7cc-51e2-a6d1-a7ca475fff7e"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "b8ebfab3-1746-5533-9e8c-4b3289b66720"
+    }
+  }
+]

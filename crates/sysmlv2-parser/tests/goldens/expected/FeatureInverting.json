@@ -1,0 +1,17 @@
+[
+  {
+    "@id": "dc3a8cde-1978-57de-a7d1-fca8c5a1bec3",
+    "@type": "FeatureInverting",
+    "elementId": "dc3a8cde-1978-57de-a7d1-fca8c5a1bec3",
+    "invertingFeature": {
+      "@id": "617d0af3-9851-542d-af8a-570fe993e48d"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "d835d2ed-0aca-592a-a949-1aeba5d920fc"
+    },
+    "owningRelationship": null
+  }
+]

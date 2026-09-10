@@ -1,0 +1,32 @@
+[
+  {
+    "@id": "a2d816a4-711f-5e54-b98c-f18ce4b53be3",
+    "@type": "Annotation",
+    "annotatedElement": {
+      "@id": "18ec9748-da12-5d36-887a-b97e53614be5"
+    },
+    "elementId": "a2d816a4-711f-5e54-b98c-f18ce4b53be3",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "82ef5122-8d1e-5e3b-8705-ed53e3299e40"
+    },
+    "owningRelationship": null
+  },
+  {
+    "@id": "94be2d3c-e784-59ef-ab48-de4727ebbdcb",
+    "@type": "Annotation",
+    "annotatedElement": {
+      "@id": "51d7ff5f-578f-5061-aefb-b0585fafb058"
+    },
+    "elementId": "94be2d3c-e784-59ef-ab48-de4727ebbdcb",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "3b51806e-cc8e-563c-bd6a-adf202773a28"
+    },
+    "owningRelationship": null
+  }
+]

@@ -1,0 +1,227 @@
+{
+  "generator": {
+    "name": "@sysml/web",
+    "version": "0.5.5-rc.1"
+  },
+  "dataset": {},
+  "kernel": "0.5.5-rc.1",
+  "library": "SvelteKit",
+  "elements": {
+    "SvelteKit::SvelteKit::BoundaryViolation": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "SvelteKit::SvelteKit::BoundaryViolation::imported": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::BoundaryViolation::module": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::BoundaryViolation::path": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::BoundaryViolation::reason": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::Hook": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "SvelteKit::SvelteKit::Hook::exports": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::Hook::file": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::Hook::locus": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::KitProject": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "SvelteKit::SvelteKit::KitProject::adapter": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::KitProject::hooks": {
+      "kind": "part",
+      "type": "SvelteKit::SvelteKit::Hook",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::KitProject::matchers": {
+      "kind": "part",
+      "type": "SvelteKit::SvelteKit::Matcher",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::KitProject::routes": {
+      "kind": "part",
+      "type": "SvelteKit::SvelteKit::RouteSegment"
+    },
+    "SvelteKit::SvelteKit::KitProject::routesDir": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::KitProject::violations": {
+      "kind": "part",
+      "type": "SvelteKit::SvelteKit::BoundaryViolation",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::Matcher": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "SvelteKit::SvelteKit::Matcher::file": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::Matcher::name": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::RenderPolicy": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "SvelteKit::SvelteKit::RenderPolicy::csr": {
+      "kind": "attribute",
+      "type": "Boolean",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::RenderPolicy::prerender": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::RenderPolicy::ssr": {
+      "kind": "attribute",
+      "type": "Boolean",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::RenderPolicy::trailingSlash": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::RouteFile": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "SvelteKit::SvelteKit::RouteFile::actions": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::RouteFile::component": {
+      "kind": "reference",
+      "type": "ComponentDefinition",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::RouteFile::exports": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::RouteFile::locus": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::RouteFile::methods": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::RouteFile::name": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::RouteFile::reset": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::RouteFile::role": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::RouteFile::uri": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::RouteSegment": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "SvelteKit::SvelteKit::RouteSegment::children": {
+      "kind": "part",
+      "type": "SvelteKit::SvelteKit::RouteSegment",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::RouteSegment::contentNegotiation": {
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "SvelteKit::SvelteKit::RouteSegment::files": {
+      "kind": "part",
+      "type": "SvelteKit::SvelteKit::RouteFile",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::RouteSegment::id": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::RouteSegment::kind": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "SvelteKit::SvelteKit::RouteSegment::matchers": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::RouteSegment::parameters": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "SvelteKit::SvelteKit::RouteSegment::policy": {
+      "kind": "part",
+      "type": "SvelteKit::SvelteKit::RenderPolicy",
+      "multiplicity": "[0..1]"
+    },
+    "SvelteKit::SvelteKit::RouteSegment::segment": {
+      "kind": "attribute",
+      "type": "String"
+    }
+  },
+  "omitted": {}
+}

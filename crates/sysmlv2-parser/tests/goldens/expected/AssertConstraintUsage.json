@@ -1,0 +1,31 @@
+[
+  {
+    "@id": "3171717a-2410-5b26-8002-ab68f90bde50",
+    "@type": "AssertConstraintUsage",
+    "declaredName": "volts",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "3171717a-2410-5b26-8002-ab68f90bde50",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isNegated": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "74881067-956d-5b23-894c-e62a95658224"
+      },
+      {
+        "@id": "0d8a2b21-c0c6-5f74-9329-8326c3257a36"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "04b2e606-e6be-5a4e-9dd1-dcc135283068"
+    }
+  }
+]

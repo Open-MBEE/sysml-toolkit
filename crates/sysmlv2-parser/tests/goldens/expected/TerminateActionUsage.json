@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "575bc578-fd5b-53aa-be91-a17f80743e42",
+    "@type": "TerminateActionUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "575bc578-fd5b-53aa-be91-a17f80743e42",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "eca8a369-21a4-5099-add4-c387b09f74d8"
+    }
+  }
+]

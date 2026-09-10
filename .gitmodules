@@ -1,0 +1,6 @@
+[submodule "spec-refs/apollo-11-sysml-v2"]
+	path = spec-refs/apollo-11-sysml-v2
+	url = https://github.com/airbus/apollo-11-sysml-v2
+[submodule "spec-refs/SysML-v2-Release"]
+	path = spec-refs/SysML-v2-Release
+	url = https://github.com/Systems-Modeling/SysML-v2-Release

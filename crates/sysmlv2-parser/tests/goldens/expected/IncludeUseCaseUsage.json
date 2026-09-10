@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "e99d791b-d5b9-50fd-bd36-3952457ca50e",
+    "@type": "IncludeUseCaseUsage",
+    "declaredName": "charge",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "e99d791b-d5b9-50fd-bd36-3952457ca50e",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "72215444-f0ed-585f-8b60-3118e83afcff"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d4469ec9-13f9-5387-b266-2cb368616cbf"
+    }
+  }
+]

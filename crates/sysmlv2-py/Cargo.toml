@@ -1,0 +1,26 @@
+# Python binding for the sysmlv2 stack. Built with
+# maturin (pyproject.toml alongside); not published to crates.io — the
+# deliverable is the `sysmlv2` wheel. Excluded from the workspace's
+# default members so plain `cargo test` never needs a Python toolchain.
+[package]
+name = "sysmlv2-py"
+description = "Python binding for the sysmlv2 SysML v2 / KerML toolkit: sessions, queries, and span-splice transformations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "sysmlv2"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.5.5-rc.1" }
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.5.5-rc.1" }
+sysmlv2-transform = { path = "../sysmlv2-transform", version = "0.5.5-rc.1" }
+sysmlv2-viz = { path = "../sysmlv2-viz", version = "0.5.5-rc.1" }
+sysmlv2-lsp = { path = "../sysmlv2-lsp", version = "0.5.5-rc.1" }
+serde_json.workspace = true
+pyo3 = { version = "0.23", features = ["abi3-py39"] }

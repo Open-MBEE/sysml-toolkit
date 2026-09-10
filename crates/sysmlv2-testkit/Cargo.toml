@@ -1,0 +1,11 @@
+[package]
+name = "sysmlv2-testkit"
+description = "Dev-only helpers for the sysmlv2 workspace: corpus paths and file collection"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

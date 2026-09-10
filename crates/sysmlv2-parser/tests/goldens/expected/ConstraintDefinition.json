@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "6be4ff34-73ac-53da-9c8b-b3513499f109",
+    "@type": "ConstraintDefinition",
+    "declaredName": "Positive_",
+    "declaredShortName": null,
+    "elementId": "6be4ff34-73ac-53da-9c8b-b3513499f109",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "c39c1a6b-784a-5777-a708-c0f222458e6f"
+      },
+      {
+        "@id": "4ed1f1d8-0b38-585d-b9e4-0b138646e8c7"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c1d10fe5-8622-57b7-b376-a097b35ab165"
+    }
+  }
+]

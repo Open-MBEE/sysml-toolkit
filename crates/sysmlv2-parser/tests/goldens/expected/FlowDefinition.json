@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "5725d973-00d6-5a85-808d-107a3ba0f851",
+    "@type": "FlowDefinition",
+    "declaredName": "FuelFlow",
+    "declaredShortName": null,
+    "elementId": "5725d973-00d6-5a85-808d-107a3ba0f851",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "98dd1d57-faa8-502f-b853-0a2c8f713ed8"
+      },
+      {
+        "@id": "77db66b0-2956-524c-97d9-f54c5b06a25f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1b007920-2fd0-5b36-8aa5-306a2afdd66d"
+    }
+  }
+]

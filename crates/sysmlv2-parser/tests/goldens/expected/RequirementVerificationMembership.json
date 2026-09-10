@@ -1,0 +1,21 @@
+[
+  {
+    "@id": "43f19e5e-f8bd-50af-a7e9-7e4842169c8d",
+    "@type": "RequirementVerificationMembership",
+    "elementId": "43f19e5e-f8bd-50af-a7e9-7e4842169c8d",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "requirement",
+    "ownedRelatedElement": [
+      {
+        "@id": "4c8fcf24-21fe-5c07-9c01-d915b5ab6f15"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "41948703-2a69-5500-8f8b-6cf5e662b580"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

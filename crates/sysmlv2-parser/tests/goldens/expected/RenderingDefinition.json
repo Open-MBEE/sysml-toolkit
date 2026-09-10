@@ -1,0 +1,17 @@
+[
+  {
+    "@id": "270286a8-c083-503d-bb6c-6850b6e834b1",
+    "@type": "RenderingDefinition",
+    "declaredName": "TreeRendering",
+    "declaredShortName": null,
+    "elementId": "270286a8-c083-503d-bb6c-6850b6e834b1",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "8aa8dc9c-5c04-5215-85de-bd7e8eeab9e0"
+    }
+  }
+]

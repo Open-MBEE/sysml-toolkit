@@ -1,0 +1,38 @@
+[
+  {
+    "@id": "d5c42bda-44b3-5da2-8fa0-4461df5cd36a",
+    "@type": "ConjugatedPortTyping",
+    "elementId": "d5c42bda-44b3-5da2-8fa0-4461df5cd36a",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "4728c399-0445-52ab-9370-2741dcb699c9"
+    },
+    "owningRelationship": null,
+    "type": {
+      "@id": "c01b9cb6-d3b2-5622-bcc1-3f732a08ab82"
+    },
+    "typedFeature": {
+      "@id": "4728c399-0445-52ab-9370-2741dcb699c9"
+    }
+  },
+  {
+    "@id": "5d5badce-7954-54c4-a1ba-505ec8050d15",
+    "@type": "ConjugatedPortTyping",
+    "elementId": "5d5badce-7954-54c4-a1ba-505ec8050d15",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "0aeb07f9-835c-519a-b4ba-2c42ac38c4e9"
+    },
+    "owningRelationship": null,
+    "type": {
+      "@id": "c01b9cb6-d3b2-5622-bcc1-3f732a08ab82"
+    },
+    "typedFeature": {
+      "@id": "0aeb07f9-835c-519a-b4ba-2c42ac38c4e9"
+    }
+  }
+]

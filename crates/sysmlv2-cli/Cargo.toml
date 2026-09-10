@@ -1,0 +1,47 @@
+[package]
+name = "sysmlv2-cli"
+description = "sysmlv2 — CLI for SysML v2 / KerML models: convert, format, and check"
+readme = "../../README.md"
+keywords = ["sysml", "kerml", "mbse", "cli", "modeling"]
+categories = ["command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src/**", "Cargo.toml"]
+
+[[bin]]
+name = "sysmlv2"
+path = "src/main.rs"
+
+[features]
+# Verbs beyond the core textual <-> JSON pipeline are feature-gated so a
+# slim binary (parse/fmt/convert/check/eval/query) can be built with
+# --no-default-features; CI builds both variants so release sizes stay
+# comparable. Dead code costs nothing at runtime — the split exists for
+# binary size and build time only. `lsp` is the Language Server verb.
+default = ["solve", "viz", "lsp"]
+solve = ["dep:sysmlv2-solve"]
+viz = ["dep:sysmlv2-viz"]
+lsp = ["dep:sysmlv2-lsp"]
+
+[dependencies]
+sysmlv2-parser.workspace = true
+sysmlv2-cbor.workspace = true
+sysmlv2-solve = { workspace = true, optional = true }
+sysmlv2-lint.workspace = true
+sysmlv2-transform.workspace = true
+sysmlv2-viz = { workspace = true, optional = true }
+sysmlv2-lsp = { workspace = true, optional = true }
+clap.workspace = true
+serde_json.workspace = true
+miniz_oxide.workspace = true
+uuid.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "wasi")))'.dependencies]
+xattr = "1"
+
+[dev-dependencies]
+sysmlv2-testkit.workspace = true
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.5.5-rc.1" }

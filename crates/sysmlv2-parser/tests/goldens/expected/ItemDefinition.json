@@ -1,0 +1,21 @@
+[
+  {
+    "@id": "6ed95443-83e0-5136-932e-e7bdd31748b1",
+    "@type": "ItemDefinition",
+    "declaredName": "Fuel",
+    "declaredShortName": null,
+    "elementId": "6ed95443-83e0-5136-932e-e7bdd31748b1",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "e4c0016e-eb1c-5a71-8026-1de3fac6733d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4fb794c3-9f02-56b8-989c-08785bab565a"
+    }
+  }
+]

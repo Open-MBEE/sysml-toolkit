@@ -1,0 +1,30 @@
+[
+  {
+    "@id": "d17b0d07-d6d2-5bf6-b3c5-a589fd4ff5a0",
+    "@type": "BindingConnectorAsUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "d17b0d07-d6d2-5bf6-b3c5-a589fd4ff5a0",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "72ae9af1-f7fb-5bb5-b93d-9c51515bc0a6"
+      },
+      {
+        "@id": "17b662fa-6e67-524a-82d6-e99bf20c5d24"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "533dcd75-8a1c-5415-b798-547df21d4cc5"
+    }
+  }
+]

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "SysML v2 Signature",
+  "scopeName": "source.sysml-signature",
+  "comment": "The hover card's function-signature notation — `name(param: Type, out param: Pkg::Type) → Type` — is NOT SysML source; this grammar exists so those fenced blocks colorize like a TypeScript signature popover without touching the real source.sysml grammar.",
+  "patterns": [
+    {
+      "name": "entity.name.function.sysml-signature",
+      "match": "(?:[A-Za-z_][A-Za-z0-9_]*|'[^']*')(?=\\s*\\()"
+    },
+    { "name": "storage.modifier.direction.sysml-signature", "match": "\\b(out|inout)\\b" },
+    {
+      "match": "(:|→)\\s*((?:[A-Za-z_][A-Za-z0-9_]*|'[^']*')(?:\\s*::\\s*(?:[A-Za-z_][A-Za-z0-9_]*|'[^']*'))*)",
+      "captures": {
+        "1": { "name": "keyword.operator.typing.sysml-signature" },
+        "2": {
+          "patterns": [
+            { "name": "punctuation.separator.scope.sysml-signature", "match": "::" },
+            { "name": "entity.name.namespace.qualifier.sysml-signature", "match": "(?:[A-Za-z_][A-Za-z0-9_]*|'[^']*')(?=\\s*::)" },
+            { "name": "entity.name.type.sysml-signature", "match": "[A-Za-z_][A-Za-z0-9_]*|'[^']*'" }
+          ]
+        }
+      }
+    },
+    { "name": "variable.parameter.sysml-signature", "match": "[A-Za-z_][A-Za-z0-9_]*|'[^']*'" },
+    { "name": "punctuation.section.parens.sysml-signature", "match": "[()]" },
+    { "name": "punctuation.separator.comma.sysml-signature", "match": "," }
+  ]
+}

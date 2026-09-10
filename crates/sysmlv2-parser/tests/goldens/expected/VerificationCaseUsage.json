@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "dd7ee43e-beeb-53d5-a16f-28d9de29b6c8",
+    "@type": "VerificationCaseUsage",
+    "declaredName": "test1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "dd7ee43e-beeb-53d5-a16f-28d9de29b6c8",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "99ec29d1-5dac-58d4-afaf-bfdff2f58178"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "49c3a6bf-9991-5d09-832b-4b2a7ec59490"
+    }
+  }
+]

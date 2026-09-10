@@ -1,0 +1,333 @@
+# CI + release.
+#
+# Gitflow: feature branches PR into develop;
+# releases PR develop into main; tags cut from main.
+#
+# The test job (full corpus gates + clippy) runs on PRs targeting main
+# or develop — plain pushes don't trigger it (main lands only via a
+# tested PR, so a redundant main-push run would just duplicate the tag
+# run on the same commit). Pushing a tag like `v0.1.0` runs the test job
+# plus the cross-target build matrix, packages the binaries (plus
+# SHA256SUMS), and attaches them to a GitHub release.
+#
+# Only the complete (default-features) binary ships. A slim variant
+# (--no-default-features — the core textual <-> JSON pipeline:
+# parse/fmt/convert/check/eval/query; see sysmlv2-cli/Cargo.toml
+# [features]) is additionally BUILT per target for measurement only:
+# the release carries a SIZES.md comparing the two, so the cost of the
+# optional verbs (and the future lsp feature) stays visible at every
+# release without doubling the artifact list. Flip slim archives on
+# only if a variant's delta ever grows past caring about. The test job
+# clippy-checks the slim variant so it cannot rot between releases.
+#
+# The wasm job gates the browser face: clippy for
+# wasm32-unknown-unknown, then the real pipeline — wasm-pack build, the
+# stdlib bundle + sealed-snapshot generation, and a node smoke test that
+# loads the built module and asserts snapshot replay is engaged. On tags
+# it uploads the npm package tarball (built wasm module + stdlib
+# artifacts inside) so every release carries the package, and it
+# publishes the tarball to the org's GitHub Packages npm registry
+# (@sysml/wasm — consumed by downstream deploy
+# pipelines). A workflow_dispatch run publishes too, so a package
+# version can ship without cutting a full release. The publish is
+# idempotent — an already-published version is skipped, since GitHub
+# Packages versions are immutable. Nothing is ever published to the
+# public npm registry.
+#
+# Notes for this repository:
+# - The full corpus gates run in the test job: the SysML-v2-Release
+#   corpus is fetched as a sparse, blob-filtered checkout of exactly the
+#   four gated directories (the upstream repo also carries doc/install
+#   trees we never read), pinned to the submodule gitlink SHA so the
+#   corpus and the code always move together. The Apollo submodule and
+#   z3 are installed too, so every self-skipping gate actually runs.
+# - The workspace has zero native dependencies (Z3 is a runtime
+#   subprocess, never linked), so cross-target builds need no extra
+#   system libraries beyond musl-tools for the static Linux build.
+
+name: ci
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    # opened/synchronize/reopened are GitHub's defaults, spelled out so
+    # it stays self-evident that every new commit pushed to an open PR
+    # (synchronize) re-runs the full test gates.
+    types: [opened, synchronize, reopened]
+    branches: [main, develop]
+  # Manual runs publish the wasm npm package from the chosen ref (wasm
+  # job) without cutting a release — e.g. the first 0.1.0 publish, or a
+  # develop-side kernel a consumer needs before the next release tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (full corpus gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch the SysML-v2-Release corpus (sparse, blob-filtered)
+        run: |
+          sha=$(git ls-tree HEAD spec-refs/SysML-v2-Release | awk '{print $3}')
+          echo "corpus pin: $sha"
+          git clone --filter=blob:none --no-checkout             https://github.com/Systems-Modeling/SysML-v2-Release             spec-refs/SysML-v2-Release
+          cd spec-refs/SysML-v2-Release
+          git sparse-checkout set sysml.library sysml/src/examples sysml/src/training sysml/src/validation
+          git fetch --filter=blob:none origin "$sha"
+          git checkout "$sha"
+      - name: Fetch the Apollo 11 validation corpus
+        run: git submodule update --init spec-refs/apollo-11-sysml-v2
+      - name: Install z3
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Formatting
+        run: |
+          rustup component add rustfmt
+          cargo fmt --check
+      - name: Run the full test suite
+        run: cargo test --release
+      - name: Clippy
+        run: |
+          rustup component add clippy
+          cargo clippy --release --all-targets -- -D warnings
+      - name: Clippy (slim CLI — no default features)
+        run: cargo clippy --release -p sysmlv2-cli --no-default-features -- -D warnings
+      - name: Generated libraries (strict check against the stdlib, canonical formatting)
+        # The committed files are checked as candidates: SYSMLV2_AMBIENT=off
+        # keeps the toolkit's built-in copies out so they cannot collide.
+        run: |
+          SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/Web.sysml local-packages/Template.sysml local-packages/Svelte.sysml local-packages/WebApp.sysml local-packages/SvelteKit.sysml
+          cargo run --release -p sysmlv2-cli -- fmt --check local-packages/Web.sysml local-packages/Template.sysml local-packages/Svelte.sysml local-packages/WebApp.sysml local-packages/SvelteKit.sysml
+      - name: Ambient libraries resolve without naming files
+        run: |
+          # Qualified element kinds: an `Elements::*` import would bring the
+          # `<template>` element kind into scope and shadow the `Template` package.
+          printf 'package V { part shell : Web::HTML::Elements::Div { :>> id = "app"; } part t : Template::Text; part k : Svelte::KeyBlock; part a : WebApp::Application; part r : SvelteKit::RouteSegment; }\n' > /tmp/ambient.sysml
+          cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library /tmp/ambient.sysml
+
+  wasm:
+    name: wasm (wasm32 gate + npm package + node smoke)
+    runs-on: ubuntu-latest
+    # Job-scoped: publishing to GitHub Packages needs packages: write,
+    # which no other job should hold.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch the standard library (sparse, blob-filtered)
+        run: |
+          sha=$(git ls-tree HEAD spec-refs/SysML-v2-Release | awk '{print $3}')
+          echo "corpus pin: $sha"
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/Systems-Modeling/SysML-v2-Release \
+            spec-refs/SysML-v2-Release
+          cd spec-refs/SysML-v2-Release
+          git sparse-checkout set sysml.library
+          git fetch --filter=blob:none origin "$sha"
+          git checkout "$sha"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # unknown-unknown for the bindgen module, wasip1 for the CLI
+          # artifact the package ships under cli/.
+          targets: wasm32-unknown-unknown,wasm32-wasip1
+      - name: Clippy (wasm32)
+        run: |
+          rustup component add clippy
+          cargo clippy --release -p sysmlv2-wasm --target wasm32-unknown-unknown -- -D warnings
+      - name: Install wasm-pack
+        # Pinned release binary. The rustwasm.github.io installer script
+        # is stale (the project moved to drager/wasm-pack) and serves
+        # 0.13.1 forever; old release URLs redirect to the new repo.
+        run: |
+          v=0.15.0
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${v}/wasm-pack-v${v}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+          mv "wasm-pack-v${v}-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/"
+          wasm-pack --version
+      - name: Build the npm package (wasm module + stdlib bundle/snapshot)
+        run: node crates/sysmlv2-wasm/npm/build.mjs
+      - name: Node smoke test (module load, stdlib check, snapshot replay)
+        run: node crates/sysmlv2-wasm/npm/smoke.mjs
+      - name: CLI wasi smoke (ambient context, provenance, size budget)
+        run: node crates/sysmlv2-wasm/npm/cli_smoke.mjs
+      - name: Upload the package tarball (release artifact)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: sysmlv2-wasm-npm
+          path: crates/sysmlv2-wasm/npm/dist/*.tgz
+          if-no-files-found: error
+      - name: Publish to GitHub Packages (tags + manual runs)
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        env:
+          NPM_TOKEN: ${{ github.token }}
+          # Fine-grained PAT, Contents: read+write on the consumer repo
+          # named by the KERNEL_CONSUMER_REPO variable — lets a fresh
+          # publish nudge that repo to bump its kernel pin
+          # (repository_dispatch). Optional: either unset skips the nudge.
+          DISPATCH_TOKEN: ${{ secrets.KERNEL_CONSUMER_DISPATCH_TOKEN }}
+          DISPATCH_REPO: ${{ vars.KERNEL_CONSUMER_REPO }}
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+          version=$(node -p "require('./crates/sysmlv2-wasm/npm/pkg/package.json').version")
+          # The package version comes from Cargo.toml ([workspace.package]),
+          # not from the tag — refuse to publish a release whose tag and
+          # source version disagree. Failing here also blocks the release
+          # job (needs: wasm), so mismatched binaries never ship either.
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} but package version ${version} — bump [workspace.package] version (and sibling dep pins) before tagging"
+            exit 1
+          fi
+          # A prerelease (a `-` in the version) publishes under the `next`
+          # dist-tag so `latest` keeps naming the newest stable version.
+          dist_tag=latest
+          case "$version" in *-*) dist_tag=next ;; esac
+          if npm view "@sysml/wasm@${version}" version \
+               --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "@sysml/wasm@${version} already published — skipping"
+          else
+            npm publish "crates/sysmlv2-wasm/npm/dist/sysml-wasm-${version}.tgz" \
+              --registry=https://npm.pkg.github.com --tag "$dist_tag"
+            # Tell the consumer repo a new kernel exists: its
+            # bump-kernel workflow rewrites the pin, commits, redeploys.
+            if [[ -n "$DISPATCH_TOKEN" && -n "$DISPATCH_REPO" ]]; then
+              curl -sSf -X POST \
+                -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${DISPATCH_REPO}/dispatches" \
+                -d "{\"event_type\":\"kernel-published\",\"client_payload\":{\"version\":\"${version}\"}}" \
+                && echo "dispatched kernel-published ${version} to ${DISPATCH_REPO}" \
+                || echo "::warning::kernel-published dispatch to ${DISPATCH_REPO} failed"
+            else
+              echo "dispatch token or repo not configured — skipping the bump nudge"
+            fi
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            packages: musl-tools
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            packages: musl-tools
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install system packages
+        if: matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+      - name: Build (slim — size measurement only, not shipped)
+        run: cargo build --release -p sysmlv2-cli --no-default-features --target ${{ matrix.target }}
+      - name: Stash the slim binary
+        shell: bash
+        run: |
+          bin=sysmlv2
+          [[ "${{ matrix.target }}" == *windows* ]] && bin=sysmlv2.exe
+          mkdir slim
+          cp "target/${{ matrix.target }}/release/$bin" slim/
+      - name: Build (complete)
+        run: cargo build --release -p sysmlv2-cli --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          bin=sysmlv2
+          [[ "$target" == *windows* ]] && bin=sysmlv2.exe
+          name="sysmlv2-${version}-${target}"
+          mkdir "$name"
+          cp "target/${target}/release/$bin" "$name/"
+          cp README.md LICENSE "$name/"
+          if [[ "$target" == *windows* ]]; then
+            7z a "${name}.zip" "$name"
+          else
+            tar czf "${name}.tar.gz" "$name"
+          fi
+          # One row of the release-wide size table (SIZES.md, release job).
+          complete=$(wc -c < "target/${target}/release/$bin")
+          slim=$(wc -c < "slim/$bin")
+          hsize() { awk -v b="$1" 'BEGIN { printf "%.1f MiB", b / 1048576 }'; }
+          printf '| %s | %s (%s) | %s (%s) | %s |\n' \
+            "$target" "$complete" "$(hsize "$complete")" \
+            "$slim" "$(hsize "$slim")" "$(hsize $((complete - slim)))" \
+            > "sizes-${target}.txt"
+          {
+            echo "| target | complete | slim | saved |"
+            echo "|---|---|---|---|"
+            cat "sizes-${target}.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sysmlv2-${{ matrix.target }}
+          path: |
+            sysmlv2-*.tar.gz
+            sysmlv2-*.zip
+            sizes-*.txt
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Binary size comparison (SIZES.md)
+        run: |
+          {
+            echo "# Binary sizes — sysmlv2 ${GITHUB_REF_NAME}"
+            echo
+            echo "| target | complete | slim | saved |"
+            echo "|---|---|---|---|"
+            sort dist/sizes-*.txt
+          } > dist/SIZES.md
+          rm dist/sizes-*.txt
+          cat dist/SIZES.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum sysmlv2-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A prerelease tag (a `-` in the name) is marked as such and
+          # never becomes the repository's latest release.
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "sysmlv2 $GITHUB_REF_NAME" \
+            --generate-notes $prerelease \
+            dist/*

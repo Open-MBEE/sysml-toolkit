@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "7d5dbf1d-d248-5d54-a03f-9ca66e099c66",
+    "@type": "AnalysisCaseUsage",
+    "declaredName": "trade1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "7d5dbf1d-d248-5d54-a03f-9ca66e099c66",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "13bbb985-15d9-5177-94e6-eca41fcf5ee0"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d5db4864-39a6-5d7d-ad46-0069cf6b3017"
+    }
+  }
+]

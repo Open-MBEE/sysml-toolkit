@@ -1,0 +1,35 @@
+[
+  {
+    "@id": "331c46a1-0133-56e5-8710-8b3f073767c7",
+    "@type": "Connector",
+    "declaredName": "link1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "331c46a1-0133-56e5-8710-8b3f073767c7",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isPortion": false,
+    "isSufficient": false,
+    "isUnique": true,
+    "isVariable": false,
+    "ownedRelationship": [
+      {
+        "@id": "37285d54-93f4-56fe-8c63-3e8d233509b6"
+      },
+      {
+        "@id": "ed390390-32a2-5416-ba16-78593301a376"
+      },
+      {
+        "@id": "ddd68030-e914-5415-bb97-e10c51bf83a3"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "29d93f4b-b706-5c9d-817d-49abcd0d1266"
+    }
+  }
+]

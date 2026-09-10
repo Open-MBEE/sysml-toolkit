@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "3b49a492-a921-51d6-9485-c28bfbaa8e6a",
+    "@type": "Structure",
+    "declaredName": "Assembly",
+    "declaredShortName": null,
+    "elementId": "3b49a492-a921-51d6-9485-c28bfbaa8e6a",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "4e6b36e8-941a-5717-8baf-295fbcb11bca"
+      },
+      {
+        "@id": "97e52f9a-07b4-5ea7-8361-24d3e4564d5f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c85dbe0c-3f39-5226-95dd-5dd0a52afdbc"
+    }
+  }
+]

@@ -1,0 +1,40 @@
+[
+  {
+    "@id": "35177d51-08e6-5247-a3d0-229b188560aa",
+    "@type": "RequirementConstraintMembership",
+    "elementId": "35177d51-08e6-5247-a3d0-229b188560aa",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "requirement",
+    "ownedRelatedElement": [
+      {
+        "@id": "5c62c750-b8b8-5c00-97fb-3415ec62b6ee"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "43b5b4e1-7ce3-5cc1-8a6b-01fbe4aa1417"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "1bdc9216-0736-57e0-b8e0-fa5c489e46a1",
+    "@type": "RequirementConstraintMembership",
+    "elementId": "1bdc9216-0736-57e0-b8e0-fa5c489e46a1",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "assumption",
+    "ownedRelatedElement": [
+      {
+        "@id": "a19fdd8b-ff5f-5e42-9a4b-e076b2e75f8d"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "43b5b4e1-7ce3-5cc1-8a6b-01fbe4aa1417"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

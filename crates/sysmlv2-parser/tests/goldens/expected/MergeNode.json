@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "04e647fc-7ceb-52c8-a58f-421214cc32a9",
+    "@type": "MergeNode",
+    "declaredName": "m1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "04e647fc-7ceb-52c8-a58f-421214cc32a9",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "feb2fabc-36db-595c-8479-c32d4782fb07"
+    }
+  }
+]

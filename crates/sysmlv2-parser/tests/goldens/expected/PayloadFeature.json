@@ -1,0 +1,34 @@
+[
+  {
+    "@id": "70469018-508c-5aae-92c0-9074b0c6cbfe",
+    "@type": "PayloadFeature",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "70469018-508c-5aae-92c0-9074b0c6cbfe",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "1880f5c0-5ee2-5331-93b6-36b6b35a6b7b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "89a804a3-8471-50db-a7fe-d776288e8eba"
+    }
+  },
+  {
+    "@id": "6d854585-97cd-5e95-8892-eb638626d7ef",
+    "@type": "PayloadFeature",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "6d854585-97cd-5e95-8892-eb638626d7ef",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "7559721f-662f-5e79-9764-e1c23c37ff28"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "ff32f210-a760-50dc-926a-98eb9c2b7161"
+    }
+  }
+]

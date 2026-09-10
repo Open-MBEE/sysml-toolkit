@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "ce0cc2b8-4f7c-5ad4-bb94-90c08eed4a20",
+    "@type": "UseCaseUsage",
+    "declaredName": "operate1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "ce0cc2b8-4f7c-5ad4-bb94-90c08eed4a20",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "b3a0226a-b0c6-5401-98b5-3ec4014e0a89"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4b876e70-314c-5911-ae67-a01cb807b252"
+    }
+  }
+]

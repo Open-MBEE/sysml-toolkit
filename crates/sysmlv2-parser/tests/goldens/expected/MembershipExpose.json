@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "e9bb5593-b0c3-5313-bc62-d30f43371cda",
+    "@type": "MembershipExpose",
+    "elementId": "e9bb5593-b0c3-5313-bc62-d30f43371cda",
+    "importedMembership": {
+      "@id": "15cb0093-12e9-5178-a33f-a5b0c2d32442"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "isImportAll": true,
+    "isRecursive": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "41f91634-612e-5953-aa66-1afc7433d14c"
+    },
+    "owningRelationship": null,
+    "visibility": "protected"
+  }
+]

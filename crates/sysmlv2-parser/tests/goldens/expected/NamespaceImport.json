@@ -1,0 +1,74 @@
+[
+  {
+    "@id": "1d01cae5-4f0c-5532-95ab-ff1a2fc175a3",
+    "@type": "NamespaceImport",
+    "elementId": "1d01cae5-4f0c-5532-95ab-ff1a2fc175a3",
+    "importedNamespace": {
+      "@ref": "ScalarValues"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "isImportAll": false,
+    "isRecursive": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "f26c6a02-fe86-54aa-8fd0-8f8802f0f916"
+    },
+    "owningRelationship": null,
+    "visibility": "private"
+  },
+  {
+    "@id": "d209d781-4d76-55a3-8fe6-c29335daa270",
+    "@type": "NamespaceImport",
+    "elementId": "d209d781-4d76-55a3-8fe6-c29335daa270",
+    "importedNamespace": {
+      "@ref": "ScalarValues"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "isImportAll": false,
+    "isRecursive": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "d6d6dbf5-e30f-5791-8f81-e317f7e20c1c"
+    },
+    "owningRelationship": null,
+    "visibility": "private"
+  },
+  {
+    "@id": "72c5db57-4c95-57ef-83c0-941cffbb8dee",
+    "@type": "NamespaceImport",
+    "elementId": "72c5db57-4c95-57ef-83c0-941cffbb8dee",
+    "importedNamespace": {
+      "@ref": "ScalarValues"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "isImportAll": false,
+    "isRecursive": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "a4e70c80-d79e-5bc5-b6e9-527ebcaab7ad"
+    },
+    "owningRelationship": null,
+    "visibility": "private"
+  },
+  {
+    "@id": "1385b52c-6adf-5b97-8f5b-1cded070625a",
+    "@type": "NamespaceImport",
+    "elementId": "1385b52c-6adf-5b97-8f5b-1cded070625a",
+    "importedNamespace": {
+      "@ref": "ScalarValues"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "isImportAll": false,
+    "isRecursive": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "da7feaa1-f5fe-57cb-b4db-9a5f7970978e"
+    },
+    "owningRelationship": null,
+    "visibility": "private"
+  }
+]

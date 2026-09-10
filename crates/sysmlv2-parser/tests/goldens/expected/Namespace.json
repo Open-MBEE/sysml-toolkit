@@ -1,0 +1,50 @@
+[
+  {
+    "@id": "7b698c67-bb87-5e2f-80c1-70d9196b9c0f",
+    "@type": "Namespace",
+    "elementId": "7b698c67-bb87-5e2f-80c1-70d9196b9c0f",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "a9490c81-6194-59ad-96c0-3f108800b137"
+      }
+    ],
+    "owningRelationship": null
+  },
+  {
+    "@id": "587df319-fc7b-56b2-a04e-4a98019ea3d3",
+    "@type": "Namespace",
+    "elementId": "587df319-fc7b-56b2-a04e-4a98019ea3d3",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "b55a2a1c-6bc2-568c-98e4-28a817d8b390"
+      }
+    ],
+    "owningRelationship": null
+  },
+  {
+    "@id": "1144a22e-81da-5f8c-8919-4506938ef202",
+    "@type": "Namespace",
+    "elementId": "1144a22e-81da-5f8c-8919-4506938ef202",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "10f79071-4ada-5837-a637-77a922af1aa5"
+      }
+    ],
+    "owningRelationship": null
+  },
+  {
+    "@id": "d0c35472-2d83-5dab-9903-ebee5d93e0f7",
+    "@type": "Namespace",
+    "elementId": "d0c35472-2d83-5dab-9903-ebee5d93e0f7",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "a42d2ced-4f8d-55db-bcf5-9a6c9f069b89"
+      }
+    ],
+    "owningRelationship": null
+  }
+]

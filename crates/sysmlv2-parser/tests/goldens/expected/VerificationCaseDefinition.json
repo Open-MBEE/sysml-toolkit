@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "3e7f9172-8af1-59a0-baac-f193e296d1a5",
+    "@type": "VerificationCaseDefinition",
+    "declaredName": "VoltageTest",
+    "declaredShortName": null,
+    "elementId": "3e7f9172-8af1-59a0-baac-f193e296d1a5",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "fad22612-5960-5f9a-b3d0-44fcbedd71ea"
+      },
+      {
+        "@id": "16e95725-efff-5edb-9cad-21b0e8bb05e9"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d43139ac-1cfe-5eef-81c3-d110aa80e740"
+    }
+  }
+]

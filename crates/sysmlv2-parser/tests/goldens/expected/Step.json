@@ -1,0 +1,29 @@
+[
+  {
+    "@id": "825b2cb9-f744-51d8-b8f6-f04cc7780dbf",
+    "@type": "Step",
+    "declaredName": "s1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "825b2cb9-f744-51d8-b8f6-f04cc7780dbf",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isPortion": false,
+    "isSufficient": false,
+    "isUnique": true,
+    "isVariable": false,
+    "ownedRelationship": [
+      {
+        "@id": "15749ad3-2715-576a-8650-e6e0953bec1f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "a3f94ace-cbbb-5aa7-83e7-4af97264cbb4"
+    }
+  }
+]

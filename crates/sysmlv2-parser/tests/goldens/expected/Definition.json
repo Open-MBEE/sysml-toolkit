@@ -1,0 +1,21 @@
+[
+  {
+    "@id": "d5d2a18a-6a31-560c-87a7-7082651569bc",
+    "@type": "Definition",
+    "declaredName": "CustomDef",
+    "declaredShortName": null,
+    "elementId": "d5d2a18a-6a31-560c-87a7-7082651569bc",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "4f07a561-26dd-545a-a1d9-8682229587aa"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5cae18e3-c759-5d75-b588-f40eb53292b7"
+    }
+  }
+]

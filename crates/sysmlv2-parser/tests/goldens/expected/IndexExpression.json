@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "033a148b-ee88-5438-8a9b-5d55903f0af6",
+    "@type": "IndexExpression",
+    "elementId": "033a148b-ee88-5438-8a9b-5d55903f0af6",
+    "isImpliedIncluded": false,
+    "operator": "#",
+    "ownedRelationship": [
+      {
+        "@id": "71c6de51-c175-5203-9281-0bc27d991869"
+      },
+      {
+        "@id": "9c117919-ab31-5b3f-be9c-e6c127a1b17e"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "b888164a-01a7-5920-ac67-bd668b06e264"
+    }
+  }
+]

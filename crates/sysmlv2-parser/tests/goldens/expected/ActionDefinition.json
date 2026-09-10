@@ -1,0 +1,136 @@
+[
+  {
+    "@id": "8bc04852-112b-59da-809a-4e4891913afa",
+    "@type": "ActionDefinition",
+    "declaredName": "Cycle",
+    "declaredShortName": null,
+    "elementId": "8bc04852-112b-59da-809a-4e4891913afa",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "3738d171-f952-5cca-bb19-1ed4e16f2c91"
+      },
+      {
+        "@id": "e548020a-d33a-5198-a27c-b98f2b0a841f"
+      },
+      {
+        "@id": "1e2d05c2-7166-5149-bff6-c6b2a3efbbff"
+      },
+      {
+        "@id": "ccbcb59d-f72d-539f-832f-ef7f5dc126ec"
+      },
+      {
+        "@id": "47d3dd65-7338-5015-a630-3657686d8028"
+      },
+      {
+        "@id": "cbe97ef7-ad04-59a9-aad3-301e8fbd234b"
+      },
+      {
+        "@id": "e17f304f-e12d-5043-b0e9-87c5f5a5b5d4"
+      },
+      {
+        "@id": "fed6bc6c-b160-51d7-a28e-a5710839a5e1"
+      },
+      {
+        "@id": "746361f6-225c-5866-9403-2a8bb342580e"
+      },
+      {
+        "@id": "0cb5e857-25eb-56d9-8731-9f05247ca609"
+      },
+      {
+        "@id": "3d7d70ac-31df-5d05-9395-69d1677f4f58"
+      },
+      {
+        "@id": "4a210927-40e0-5997-a25d-a4ed2b885c9f"
+      },
+      {
+        "@id": "998ffea7-4dbd-5198-a8c1-6daf843cf94a"
+      },
+      {
+        "@id": "7f5901ee-19df-521d-8a02-4403a0cf84dd"
+      },
+      {
+        "@id": "d974865d-d70a-58a3-bced-7b56146c5553"
+      },
+      {
+        "@id": "7c037abe-f989-50e4-b1d0-ddf9d7cdbeae"
+      },
+      {
+        "@id": "cdece18b-4443-50b1-a328-fea5639e80ad"
+      },
+      {
+        "@id": "e3631353-3d6f-56bc-8151-8e302edbec0f"
+      },
+      {
+        "@id": "100299a9-67be-54a0-866c-4b940ece3808"
+      },
+      {
+        "@id": "61802bb2-d6cd-5fae-8de7-df2e8c1cb3a0"
+      },
+      {
+        "@id": "feb2fabc-36db-595c-8479-c32d4782fb07"
+      },
+      {
+        "@id": "70b3c134-e5b2-5683-95c9-898206664e60"
+      },
+      {
+        "@id": "4c1eddaf-be37-5aa6-a530-328718a35aa7"
+      },
+      {
+        "@id": "afebc9e9-4127-5eee-bb9f-ec20aa044891"
+      },
+      {
+        "@id": "54de289a-ef80-5157-ab4d-1919a753aba4"
+      },
+      {
+        "@id": "d60ff657-c476-5f9d-8fbd-79929afcf725"
+      },
+      {
+        "@id": "1d051508-4f8a-5898-b3c9-4a93ddaee4be"
+      },
+      {
+        "@id": "23fe1d6e-76c5-559d-a44f-a5faf8df92ff"
+      },
+      {
+        "@id": "a61c6760-82b3-5bf4-afc1-60ba82882636"
+      },
+      {
+        "@id": "b5bbff79-637e-563c-920d-6b3586d72d39"
+      },
+      {
+        "@id": "3296afc3-29e5-55d2-a642-b80c8c3a0bc2"
+      },
+      {
+        "@id": "eca8a369-21a4-5099-add4-c387b09f74d8"
+      },
+      {
+        "@id": "5edc5912-bfd6-55ba-ace5-362bd22bc206"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6e5bd38f-1370-5bc7-aab0-83d6d200718b"
+    }
+  },
+  {
+    "@id": "e9df9d3b-ace8-5f8f-93ba-0826b93bf07a",
+    "@type": "ActionDefinition",
+    "declaredName": "Compute",
+    "declaredShortName": null,
+    "elementId": "e9df9d3b-ace8-5f8f-93ba-0826b93bf07a",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "aec96c3e-5196-5626-8e88-45ad5a8df6c2"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "66afc10e-95de-5110-9824-dfc14680475d"
+    }
+  }
+]

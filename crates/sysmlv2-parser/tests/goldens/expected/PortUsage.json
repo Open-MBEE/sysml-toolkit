@@ -1,0 +1,161 @@
+[
+  {
+    "@id": "dcd71825-9ab8-529d-8065-fd3cb2ed21fc",
+    "@type": "PortUsage",
+    "declaredName": "receiverPort",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "dcd71825-9ab8-529d-8065-fd3cb2ed21fc",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "39abd74a-9ab9-591c-9983-c223428a9e75"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "de003642-7b12-508a-a396-d2315c0cc450"
+    }
+  },
+  {
+    "@id": "6764906b-966f-5e96-ac74-573085868bd0",
+    "@type": "PortUsage",
+    "declaredName": "fuelPort",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "6764906b-966f-5e96-ac74-573085868bd0",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "1962b24e-ee5b-5731-9692-0aecbc23967e"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "cf669157-add6-51c6-a817-97b01ab3b8f4"
+    }
+  },
+  {
+    "@id": "4728c399-0445-52ab-9370-2741dcb699c9",
+    "@type": "PortUsage",
+    "declaredName": "outlet",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "4728c399-0445-52ab-9370-2741dcb699c9",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "d5c42bda-44b3-5da2-8fa0-4461df5cd36a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8f49ca61-6bbb-5a6e-a3f2-751d8f824fc5"
+    }
+  },
+  {
+    "@id": "0aeb07f9-835c-519a-b4ba-2c42ac38c4e9",
+    "@type": "PortUsage",
+    "declaredName": "supplierPort",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "0aeb07f9-835c-519a-b4ba-2c42ac38c4e9",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": true,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "5d5badce-7954-54c4-a1ba-505ec8050d15"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d3bb07b3-69bb-569c-92ff-1c1cb105155d"
+    }
+  },
+  {
+    "@id": "5767841c-d25a-5037-94a1-ce2ce0424849",
+    "@type": "PortUsage",
+    "declaredName": "consumerPort",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "5767841c-d25a-5037-94a1-ce2ce0424849",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": true,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "b20bf2b2-db91-5ee4-be6f-f625ea1f8dda"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "75aa2e13-6688-5c1e-880a-2d781712f7d8"
+    }
+  },
+  {
+    "@id": "bb98b1dd-f13b-5fea-b807-c5889d3281bd",
+    "@type": "PortUsage",
+    "elementId": "bb98b1dd-f13b-5fea-b807-c5889d3281bd",
+    "isComposite": false,
+    "isEnd": true,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "6920ec9c-05b1-57bd-9c7d-8d252b7e8ed0"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "fb472a83-c823-5a30-b61b-bd1f167150ee"
+    }
+  },
+  {
+    "@id": "da4d17f8-b750-53e2-ad99-ccda7502ec65",
+    "@type": "PortUsage",
+    "elementId": "da4d17f8-b750-53e2-ad99-ccda7502ec65",
+    "isComposite": false,
+    "isEnd": true,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "7008e632-776c-5d84-bf74-af3edd303591"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8a016c74-0544-5d50-a774-68b7504232ad"
+    }
+  }
+]

@@ -1,0 +1,131 @@
+{
+  "generator": {
+    "name": "@sysml/web",
+    "version": "0.5.5-rc.1"
+  },
+  "dataset": {},
+  "kernel": "0.5.5-rc.1",
+  "library": "WebApp",
+  "elements": {
+    "WebApp::WebApp::Application": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "WebApp::WebApp::Application::assets": {
+      "kind": "part",
+      "type": "WebApp::WebApp::Asset",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "WebApp::WebApp::Application::dependencies": {
+      "kind": "part",
+      "type": "SourceDependency",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "WebApp::WebApp::Application::entryModule": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "WebApp::WebApp::Application::mountTarget": {
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Application::navigation": {
+      "kind": "part",
+      "type": "WebApp::WebApp::NavigationGraph",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Application::rootComponent": {
+      "kind": "reference",
+      "type": "ComponentDefinition",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Application::rootComponentExpression": {
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Application::router": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Application::startupMode": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "WebApp::WebApp::Asset": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "WebApp::WebApp::Asset::contentHash": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Asset::kind": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Asset::path": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "WebApp::WebApp::NavigationGraph": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "WebApp::WebApp::NavigationGraph::adapter": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::NavigationGraph::router": {
+      "kind": "attribute",
+      "type": "String"
+    },
+    "WebApp::WebApp::NavigationGraph::routes": {
+      "kind": "part",
+      "type": "WebApp::WebApp::Route",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "WebApp::WebApp::Route": {
+      "spec": "application-schema",
+      "idlKind": "datatype",
+      "kind": "part"
+    },
+    "WebApp::WebApp::Route::children": {
+      "kind": "part",
+      "type": "WebApp::WebApp::Route",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "WebApp::WebApp::Route::component": {
+      "kind": "reference",
+      "type": "ComponentDefinition",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Route::componentExpression": {
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Route::name": {
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "WebApp::WebApp::Route::path": {
+      "kind": "attribute",
+      "type": "String"
+    }
+  },
+  "omitted": {}
+}

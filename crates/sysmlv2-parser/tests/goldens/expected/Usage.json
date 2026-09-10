@@ -1,0 +1,30 @@
+[
+  {
+    "@id": "5e56eec6-bd88-516e-a8b1-e12bd69fe941",
+    "@type": "Usage",
+    "declaredName": "customThing",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "5e56eec6-bd88-516e-a8b1-e12bd69fe941",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "42df59d7-6a0f-5158-8c82-cd962997960d"
+      },
+      {
+        "@id": "b4ca5c8b-44d3-540f-8484-2227471288b9"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e4fe9877-d042-5b49-9d26-bc15a878f9c3"
+    }
+  }
+]

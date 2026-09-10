@@ -1,0 +1,26 @@
+[
+  {
+    "@id": "b2431f4a-77af-564a-b148-afaf46f7e9e9",
+    "@type": "Behavior",
+    "declaredName": "Act",
+    "declaredShortName": null,
+    "elementId": "b2431f4a-77af-564a-b148-afaf46f7e9e9",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "3ec52739-c7ae-5328-832f-b75e7aef74c6"
+      },
+      {
+        "@id": "a3f94ace-cbbb-5aa7-83e7-4af97264cbb4"
+      },
+      {
+        "@id": "7addb326-bf34-5e56-96cb-c427a4224aa6"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4a10b223-5c4e-57af-a99a-8744c0eb99b8"
+    }
+  }
+]

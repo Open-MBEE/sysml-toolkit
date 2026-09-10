@@ -1,0 +1,74 @@
+[
+  {
+    "@id": "75fd6df4-5958-5dcc-ae6c-a5fd6af01511",
+    "@type": "TransitionFeatureMembership",
+    "elementId": "75fd6df4-5958-5dcc-ae6c-a5fd6af01511",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "guard",
+    "ownedRelatedElement": [
+      {
+        "@id": "be88b3e4-f92f-546e-a71c-3e39bcc9a0f0"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "0aa53bb2-cff2-5762-9c49-04c22ab86b6e"
+    },
+    "owningRelationship": null
+  },
+  {
+    "@id": "24e6b8da-7771-56ad-a590-2a9c79f4966b",
+    "@type": "TransitionFeatureMembership",
+    "elementId": "24e6b8da-7771-56ad-a590-2a9c79f4966b",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "trigger",
+    "ownedRelatedElement": [
+      {
+        "@id": "c8c79f89-2433-52f2-9be2-463a01bdd066"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "c86eee60-3f88-5d5a-a9fb-ac04d9780968"
+    },
+    "owningRelationship": null
+  },
+  {
+    "@id": "74591cc9-e9ec-5cb8-baaa-e893c25aa087",
+    "@type": "TransitionFeatureMembership",
+    "elementId": "74591cc9-e9ec-5cb8-baaa-e893c25aa087",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "guard",
+    "ownedRelatedElement": [
+      {
+        "@id": "e0b4ba25-31bc-5737-93a4-ea30471b89bf"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "c86eee60-3f88-5d5a-a9fb-ac04d9780968"
+    },
+    "owningRelationship": null
+  },
+  {
+    "@id": "70cb5ee1-1fda-5fd6-a5c6-3d9b2fc9bd7f",
+    "@type": "TransitionFeatureMembership",
+    "elementId": "70cb5ee1-1fda-5fd6-a5c6-3d9b2fc9bd7f",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "effect",
+    "ownedRelatedElement": [
+      {
+        "@id": "c6032cc8-5721-585e-b382-9a5bdb9a02c8"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "c86eee60-3f88-5d5a-a9fb-ac04d9780968"
+    },
+    "owningRelationship": null
+  }
+]

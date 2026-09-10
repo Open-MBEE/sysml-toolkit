@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "64abeb80-eadb-5d6a-9590-ced7ea05474e",
+    "@type": "Metaclass",
+    "declaredName": "Note",
+    "declaredShortName": null,
+    "elementId": "64abeb80-eadb-5d6a-9590-ced7ea05474e",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "3c390bda-2af3-57aa-a32e-f5a82589e03b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "bcf7c953-0b0f-5eb8-8569-c79f72a6fd52"
+    }
+  }
+]

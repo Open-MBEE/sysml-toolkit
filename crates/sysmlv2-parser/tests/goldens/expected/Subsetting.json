@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "9ac9a748-d209-548d-9eb8-9f0364bb2710",
+    "@type": "Subsetting",
+    "elementId": "9ac9a748-d209-548d-9eb8-9f0364bb2710",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "293382af-106c-5f3d-885f-3eed22e44227"
+    },
+    "owningRelationship": null,
+    "subsettedFeature": {
+      "@id": "eace3bf2-30c6-5939-a601-ecefee39f96c"
+    },
+    "subsettingFeature": {
+      "@id": "293382af-106c-5f3d-885f-3eed22e44227"
+    }
+  }
+]

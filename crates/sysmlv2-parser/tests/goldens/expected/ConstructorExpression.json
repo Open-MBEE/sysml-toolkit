@@ -1,0 +1,22 @@
+[
+  {
+    "@id": "ac72b6a9-29e1-5f59-80ac-da9a686042cc",
+    "@type": "ConstructorExpression",
+    "elementId": "ac72b6a9-29e1-5f59-80ac-da9a686042cc",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "30742f94-a581-56af-aad7-f42a3b4ce2df"
+      },
+      {
+        "@id": "cc4b96e5-277e-5692-958c-7ce041cc4da2"
+      },
+      {
+        "@id": "23584c7d-e0c7-5514-a034-f6f01ae31cdc"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5766bc0a-7576-5eda-a22d-4e6956340649"
+    }
+  }
+]

@@ -1,0 +1,86 @@
+# Workspace for the sysmlv2 stack.
+# sysmlv2-syntax: lexer/parser/AST/printer + body-context validation.
+# sysmlv2-model: element graph, resolution, JSON interchange, referential
+#   checks, expression evaluation. sysmlv2-solve: SMT (Z3) constraint
+#   solving. sysmlv2-parser: compatibility facade re-exporting syntax +
+#   model. sysmlv2-cli: the `sysmlv2` binary. sysmlv2-testkit: dev-only corpus
+#   helpers. sysmlv2-lsp: the Language Server.
+#   Future members: sysmlv2-export, sysmlv2-api.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/sysmlv2-syntax",
+    "crates/sysmlv2-model",
+    "crates/sysmlv2-solve",
+    "crates/sysmlv2-lint",
+    "crates/sysmlv2-parser",
+    "crates/sysmlv2-cbor",
+    "crates/sysmlv2-cli",
+    "crates/sysmlv2-transform",
+    "crates/sysmlv2-viz",
+    "crates/sysmlv2-lsp",
+    "crates/sysmlv2-py",
+    "crates/sysmlv2-wasm",
+    "crates/sysmlv2-testkit",
+]
+
+# sysmlv2-py needs a Python toolchain to link; keep it out of the
+# default build/test set (build it explicitly: cargo build -p sysmlv2-py,
+# or with maturin from crates/sysmlv2-py).
+default-members = [
+    "crates/sysmlv2-syntax",
+    "crates/sysmlv2-model",
+    "crates/sysmlv2-solve",
+    "crates/sysmlv2-lint",
+    "crates/sysmlv2-parser",
+    "crates/sysmlv2-cbor",
+    "crates/sysmlv2-cli",
+    "crates/sysmlv2-transform",
+    "crates/sysmlv2-viz",
+    "crates/sysmlv2-lsp",
+    "crates/sysmlv2-wasm",
+    "crates/sysmlv2-testkit",
+]
+
+[workspace.package]
+version = "0.5.5-rc.1"
+edition = "2021"
+rust-version = "1.86"
+license = "Apache-2.0"
+repository = "https://github.com/Open-MBEE/sysml-toolkit"
+
+[workspace.dependencies]
+sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.5.5-rc.1" }
+sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.5.5-rc.1" }
+sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.5.5-rc.1" }
+sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.5.5-rc.1" }
+sysmlv2-testkit = { path = "crates/sysmlv2-testkit" }
+sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.5.5-rc.1" }
+sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.5.5-rc.1" }
+sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.5.5-rc.1" }
+lsp-server = "0.7"
+lsp-types = "0.97"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: parse floats exactly (correctly rounded), so
+# parse(print(x)) == x and a payload's state digest is one digest
+# whether it traveled as JSON text or binary. The default fast path
+# can land 1 ULP off (e.g. "1e-28"), silently splitting digests.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+uuid = { version = "1", features = ["v4", "v5", "js"] }
+clap = { version = "4", features = ["derive", "wrap_help", "env"] }
+jsonschema = "0.26"
+miniz_oxide = "0.8"
+regex-lite = "0.1"
+
+# The wasi CLI artifact is size-sensitive: it ships in
+# the npm package and browsers fetch it lazily. Opt-in profile — native
+# builds keep the stock release profile.
+[profile.wasi-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

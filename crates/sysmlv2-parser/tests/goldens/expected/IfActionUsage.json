@@ -1,0 +1,33 @@
+[
+  {
+    "@id": "0ea37bb0-c4c9-50a2-9721-2aa691cd0af4",
+    "@type": "IfActionUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "0ea37bb0-c4c9-50a2-9721-2aa691cd0af4",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "6e4e2583-7894-50b8-a27b-4ed742a8eef1"
+      },
+      {
+        "@id": "4ac8490f-d4d2-5fd4-9e75-4442d9dc53cb"
+      },
+      {
+        "@id": "fbcbb70e-5c79-50bc-a947-6c126e685e19"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "afebc9e9-4127-5eee-bb9f-ec20aa044891"
+    }
+  }
+]

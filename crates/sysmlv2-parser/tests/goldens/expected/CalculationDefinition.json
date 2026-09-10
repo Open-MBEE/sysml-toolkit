@@ -1,0 +1,27 @@
+[
+  {
+    "@id": "c39de4d2-c6aa-5de3-bab7-07146d180963",
+    "@type": "CalculationDefinition",
+    "declaredName": "Efficiency",
+    "declaredShortName": null,
+    "elementId": "c39de4d2-c6aa-5de3-bab7-07146d180963",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "cd819134-d7ee-566f-8927-f9cdf72a4e71"
+      },
+      {
+        "@id": "433f91e9-c088-576f-90c2-a9f30d29fc50"
+      },
+      {
+        "@id": "4733d185-3e4e-5232-a077-8b00b7ce64a7"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "82bc8991-52c1-5c4b-af05-f1a31668c275"
+    }
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "@id": "5b3ce367-63d6-5063-a75a-57d851e8215c",
+    "@type": "Succession",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "5b3ce367-63d6-5063-a75a-57d851e8215c",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isPortion": false,
+    "isSufficient": false,
+    "isUnique": true,
+    "isVariable": false,
+    "ownedRelationship": [
+      {
+        "@id": "6a016554-d117-5a0e-8cd9-abd52080ed14"
+      },
+      {
+        "@id": "55f68010-ff4a-5a68-bd84-553e9d2fbbb8"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "7addb326-bf34-5e56-96cb-c427a4224aa6"
+    }
+  }
+]

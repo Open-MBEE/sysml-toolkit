@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "51b67794-27ec-5ef8-ab19-06c71ebbfddb",
+    "@type": "ActorMembership",
+    "elementId": "51b67794-27ec-5ef8-ab19-06c71ebbfddb",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "2ea75c38-86b1-50df-af81-42f44b37868e"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "242f4bcf-c3a3-582d-8361-3d6275047903"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

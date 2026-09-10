@@ -1,0 +1,629 @@
+[
+  {
+    "@id": "b9f8bb66-ce2d-5f0f-bb35-d69b580674b3",
+    "@type": "AttributeUsage",
+    "declaredName": "total",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "b9f8bb66-ce2d-5f0f-bb35-d69b580674b3",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "bc87207e-7507-5b78-8b42-b8fb95a98092"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e5c5ed2d-fd3b-5248-b6af-caa8c19e2e81"
+    }
+  },
+  {
+    "@id": "f516e654-4fdc-52ef-943d-22c4aa3879da",
+    "@type": "AttributeUsage",
+    "declaredName": "voltage",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "f516e654-4fdc-52ef-943d-22c4aa3879da",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "7c4172cc-2b87-5df7-9619-8dc6f257e6dc"
+      },
+      {
+        "@id": "f46063ff-2f36-5e90-8d16-51e986e4823b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "de621fec-336b-538e-8a22-47ad87945d1b"
+    }
+  },
+  {
+    "@id": "a43dcadd-a2a5-54fb-8d6b-10bef1497500",
+    "@type": "AttributeUsage",
+    "declaredName": "ceiling",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "a43dcadd-a2a5-54fb-8d6b-10bef1497500",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "4c50edad-a8c1-5706-837d-6c083dc9438f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "fb218302-1d0e-5290-b39d-aa0f14769a3d"
+    }
+  },
+  {
+    "@id": "d5d749bb-2ebd-531f-b7ff-67c2ab66640f",
+    "@type": "AttributeUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "d5d749bb-2ebd-531f-b7ff-67c2ab66640f",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "8584169f-b306-5758-a5fd-c7266bf1b15f"
+      },
+      {
+        "@id": "2bcb3847-0824-5fc3-8cb6-0bed5d7b75a4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6b245a21-650b-5123-a88f-f0cf2158db86"
+    }
+  },
+  {
+    "@id": "5c1361fd-ada1-5c36-a629-cb3254e1c782",
+    "@type": "AttributeUsage",
+    "declaredName": "flag",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "5c1361fd-ada1-5c36-a629-cb3254e1c782",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "20ec55c0-7e6d-5926-bea2-78496917d3d5"
+      },
+      {
+        "@id": "1ad7fdff-2c5b-5901-97e1-0fe14822a2b7"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5131410c-0b5e-5808-a511-31f259dbdfa5"
+    }
+  },
+  {
+    "@id": "c56498ef-eec0-54ed-b74c-69dfc3312ad5",
+    "@type": "AttributeUsage",
+    "declaredName": "picked",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "c56498ef-eec0-54ed-b74c-69dfc3312ad5",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "8f1735b3-22ff-5548-a2ec-ec920b0937b5"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "bef6ca67-ecc2-5660-b27e-99e94ba6c4e4"
+    }
+  },
+  {
+    "@id": "b7512d17-a569-5abc-91f7-549cdc607535",
+    "@type": "AttributeUsage",
+    "declaredName": "exprZoo",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "b7512d17-a569-5abc-91f7-549cdc607535",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "1f5165df-54d3-50f5-adc9-1e5d9ed5122b"
+      },
+      {
+        "@id": "c192b2dd-3347-5b9f-947a-d13f8aa46502"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "04ee6f7c-637b-591e-9fdf-14ef57d6c5ff"
+    }
+  },
+  {
+    "@id": "21e69cd5-4c16-571f-b59a-e2f399c0ac81",
+    "@type": "AttributeUsage",
+    "declaredName": "seq",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "21e69cd5-4c16-571f-b59a-e2f399c0ac81",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "b888164a-01a7-5920-ac67-bd668b06e264"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "a5a09f26-18de-565a-b865-ed1d9e911ce1"
+    }
+  },
+  {
+    "@id": "39a57205-32bf-5b59-90b1-ef8bae5f859f",
+    "@type": "AttributeUsage",
+    "declaredName": "sel",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "39a57205-32bf-5b59-90b1-ef8bae5f859f",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "81dc307c-0fdb-5546-8302-e573d9453b36"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8be10917-2b1a-50ab-9f12-33809f869bd8"
+    }
+  },
+  {
+    "@id": "a2fd0085-e9a9-501a-9901-8b97651bfaec",
+    "@type": "AttributeUsage",
+    "declaredName": "nullish",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "a2fd0085-e9a9-501a-9901-8b97651bfaec",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "1ac1ef65-ef49-5fee-9534-b5fdf44da4bd"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "59862999-0a54-5e6c-8488-40cccdd924a7"
+    }
+  },
+  {
+    "@id": "e6f83e4b-9e57-5510-aaa1-fd3251615eff",
+    "@type": "AttributeUsage",
+    "declaredName": "text",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "e6f83e4b-9e57-5510-aaa1-fd3251615eff",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "361802f0-1648-5c41-beae-06bb95968ec8"
+      },
+      {
+        "@id": "11972e1f-1510-5559-9334-8e55d4e1eb08"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "009f514d-b3d4-5a5f-a6e5-e390fc1731dd"
+    }
+  },
+  {
+    "@id": "b8ea4b4d-eade-5772-85d0-050255f3c1a6",
+    "@type": "AttributeUsage",
+    "declaredName": "inf",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "b8ea4b4d-eade-5772-85d0-050255f3c1a6",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "d787ee37-8a88-5c96-823e-a25c308d5745"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6ae87358-666d-533c-80e8-592da46d0e95"
+    }
+  },
+  {
+    "@id": "930b8584-c046-511f-a5cc-c8fdde137dac",
+    "@type": "AttributeUsage",
+    "declaredName": "meta1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "930b8584-c046-511f-a5cc-c8fdde137dac",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "738cab10-3feb-5a35-b596-bbd3f16aba71"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1772a058-f65d-53bc-a1a2-b9af6a3ccdee"
+    }
+  },
+  {
+    "@id": "a8f91d30-2562-5361-beb7-471aa17d492a",
+    "@type": "AttributeUsage",
+    "declaredName": "cons",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "a8f91d30-2562-5361-beb7-471aa17d492a",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "5766bc0a-7576-5eda-a22d-4e6956340649"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5f45c968-fcd2-59db-8774-b2ae7dd79ccd"
+    }
+  },
+  {
+    "@id": "4b9f8f3a-1796-5a48-837e-19bb1fd0e7db",
+    "@type": "AttributeUsage",
+    "declaredName": "re",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "4b9f8f3a-1796-5a48-837e-19bb1fd0e7db",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "bf356408-1f60-538d-9ab0-e4992e32d84d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "fc9815d1-4ace-5bfd-b870-0432e2a3c655"
+    }
+  },
+  {
+    "@id": "5d5f8789-547e-5fd3-a378-12f85a2319a9",
+    "@type": "AttributeUsage",
+    "declaredName": "im",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "5d5f8789-547e-5fd3-a378-12f85a2319a9",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "deacd2d6-c958-5a8a-aa0a-1efd73ad0ec4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "758a9b46-c361-5933-94c4-05f9758182f8"
+    }
+  },
+  {
+    "@id": "2f8c9dc1-c4e3-5cfe-b18c-029d68addad9",
+    "@type": "AttributeUsage",
+    "declaredName": "mass",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "2f8c9dc1-c4e3-5cfe-b18c-029d68addad9",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "824f414d-c597-51a8-8ce8-fbac6b6c593e"
+      },
+      {
+        "@id": "985dc734-11ca-544d-8e9b-e7fe6f4eab9f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "94153ec3-64d8-5ac4-9565-020740b2c589"
+    }
+  },
+  {
+    "@id": "13dc3cfd-7a42-5934-acd6-14bcab569117",
+    "@type": "AttributeUsage",
+    "declaredName": "vin",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "13dc3cfd-7a42-5934-acd6-14bcab569117",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "89f53a5b-5000-5dd0-a26a-f2793aafb45c"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "a47b0464-7dd9-54f1-9259-5a4f0a486087"
+    }
+  },
+  {
+    "@id": "2d27c521-c531-5135-94bd-9224c3c96174",
+    "@type": "AttributeUsage",
+    "declaredName": "diameter",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "2d27c521-c531-5135-94bd-9224c3c96174",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "12123fcd-6a09-5639-a467-3d1fee57db36"
+      },
+      {
+        "@id": "99ffdff8-e71b-5583-8005-ff0c431b30c9"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "0a06f5be-9f19-5cfb-bdc6-6803c388d908"
+    }
+  },
+  {
+    "@id": "25d1f2bc-cab6-54ef-8651-5ab105fcb731",
+    "@type": "AttributeUsage",
+    "declaredName": "octane",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "25d1f2bc-cab6-54ef-8651-5ab105fcb731",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "f2c4fdb3-666d-5301-8426-0765b343dfbe"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e4c0016e-eb1c-5a71-8026-1de3fac6733d"
+    }
+  },
+  {
+    "@id": "56fa4313-0d9d-5b23-987e-cbef12f7d447",
+    "@type": "AttributeUsage",
+    "declaredName": "maxFlow",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "56fa4313-0d9d-5b23-987e-cbef12f7d447",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "ec2914e0-b52d-579f-b196-5c6a23f93736"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "58e34945-7f50-5965-944a-7c988e14119a"
+    }
+  },
+  {
+    "@id": "e7e696c5-a834-5a9d-a0af-cd7e5598c22a",
+    "@type": "AttributeUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "e7e696c5-a834-5a9d-a0af-cd7e5598c22a",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "1289b24f-3bfe-549e-b8d3-f0a3f7c40c94"
+      },
+      {
+        "@id": "249baa4c-6d31-5dbd-ac55-bdaf85b82855"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "9f609c3e-8bf3-509f-af97-75f0ea901cd2"
+    }
+  },
+  {
+    "@id": "c6edf181-849a-5f16-bc45-cc9b32ecf7d2",
+    "@type": "AttributeUsage",
+    "declaredName": "paint",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "c6edf181-849a-5f16-bc45-cc9b32ecf7d2",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "e08b3a0c-f6bd-5272-b4c5-e1b5390dda70"
+      },
+      {
+        "@id": "146bd9d4-95e5-5e7b-b480-75a661556fc4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5e152caa-0cd6-5d72-847a-5fe2cd7e5a92"
+    }
+  },
+  {
+    "@id": "38cd9cb3-b075-5398-ae22-bb738b42625f",
+    "@type": "AttributeUsage",
+    "declaredName": "level",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "38cd9cb3-b075-5398-ae22-bb738b42625f",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "84825064-89e4-549a-b0e5-9493fc64bea4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8d5cef94-9f18-5990-b557-d05998d37e21"
+    }
+  }
+]

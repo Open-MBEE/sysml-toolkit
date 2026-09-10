@@ -1,0 +1,33 @@
+[
+  {
+    "@id": "538d79c6-b261-5380-96be-795b2f9d45bc",
+    "@type": "CalculationUsage",
+    "declaredName": "eff1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "538d79c6-b261-5380-96be-795b2f9d45bc",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "873e7dcb-bd72-5fd3-9a44-0ba02d783564"
+      },
+      {
+        "@id": "cb46e92e-8277-573e-96de-ec11de990ab9"
+      },
+      {
+        "@id": "30fd1ded-91e2-592e-856f-09c21247d417"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "bf6e56ee-a3d2-56d3-9fca-1cfcfe000423"
+    }
+  }
+]

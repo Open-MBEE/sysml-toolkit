@@ -1,0 +1,18 @@
+[
+  {
+    "@id": "5b98b0fd-8032-5b03-af37-7718c686633c",
+    "@type": "OccurrenceDefinition",
+    "declaredName": "Mission",
+    "declaredShortName": null,
+    "elementId": "5b98b0fd-8032-5b03-af37-7718c686633c",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isIndividual": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "017d3651-a0b7-5257-bbf3-bbf1c7cfb79b"
+    }
+  }
+]

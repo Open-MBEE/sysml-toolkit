@@ -1,0 +1,44 @@
+[
+  {
+    "@id": "b68209e5-5e33-5867-8e7c-0b26adcf6e8f",
+    "@type": "PortConjugation",
+    "conjugatedType": {
+      "@id": "65f7472b-1f15-51cc-bdd2-4c5387d06cb3"
+    },
+    "elementId": "b68209e5-5e33-5867-8e7c-0b26adcf6e8f",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "originalPortDefinition": {
+      "@id": "14b3d4f0-9cdf-5035-8d17-1a8470f0889e"
+    },
+    "originalType": {
+      "@id": "14b3d4f0-9cdf-5035-8d17-1a8470f0889e"
+    },
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "65f7472b-1f15-51cc-bdd2-4c5387d06cb3"
+    },
+    "owningRelationship": null
+  },
+  {
+    "@id": "f0500957-b89d-5afe-abfa-8713bc97b5bc",
+    "@type": "PortConjugation",
+    "conjugatedType": {
+      "@id": "c01b9cb6-d3b2-5622-bcc1-3f732a08ab82"
+    },
+    "elementId": "f0500957-b89d-5afe-abfa-8713bc97b5bc",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "originalPortDefinition": {
+      "@id": "7e04cee7-7ef1-5f73-a8a1-00a6e1241dac"
+    },
+    "originalType": {
+      "@id": "7e04cee7-7ef1-5f73-a8a1-00a6e1241dac"
+    },
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "c01b9cb6-d3b2-5622-bcc1-3f732a08ab82"
+    },
+    "owningRelationship": null
+  }
+]

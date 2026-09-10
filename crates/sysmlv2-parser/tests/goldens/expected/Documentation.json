@@ -1,0 +1,72 @@
+[
+  {
+    "@id": "8aab8787-0af1-5ab5-8ea8-4f21ca0bc956",
+    "@type": "Documentation",
+    "body": "Cells shall stay under the voltage ceiling. ",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "8aab8787-0af1-5ab5-8ea8-4f21ca0bc956",
+    "isImpliedIncluded": false,
+    "locale": null,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "276e0494-7cca-5717-b8fd-1b7b8df5274d"
+    }
+  },
+  {
+    "@id": "383c51ca-3c8d-5ab3-bae1-8df22dfc2c06",
+    "@type": "Documentation",
+    "body": "unit cost stays in budget ",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "383c51ca-3c8d-5ab3-bae1-8df22dfc2c06",
+    "isImpliedIncluded": false,
+    "locale": null,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "8d0ac3d7-5159-5e45-8ac4-ffd78c4b2cb8"
+    }
+  },
+  {
+    "@id": "e7bcb966-d08b-5e4a-8728-8ab98b12509f",
+    "@type": "Documentation",
+    "body": "keep the system within limits ",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "e7bcb966-d08b-5e4a-8728-8ab98b12509f",
+    "isImpliedIncluded": false,
+    "locale": null,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "1aaa4495-c5d2-54bc-85bc-2b4affd93c44"
+    }
+  },
+  {
+    "@id": "8a433f1d-9131-52f4-a525-a431228627a7",
+    "@type": "Documentation",
+    "body": "pick the best cell ",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "8a433f1d-9131-52f4-a525-a431228627a7",
+    "isImpliedIncluded": false,
+    "locale": null,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "50a5e5a8-1811-57ee-a76f-6abed1d0dc33"
+    }
+  },
+  {
+    "@id": "574e742b-738d-5189-9cb1-6bf7ae539565",
+    "@type": "Documentation",
+    "body": "Structural fixture for the per-metaclass golden gate. ",
+    "declaredName": null,
+    "declaredShortName": null,
+    "elementId": "574e742b-738d-5189-9cb1-6bf7ae539565",
+    "isImpliedIncluded": false,
+    "locale": null,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "d5b5a131-48eb-54fd-a6e3-322388b52282"
+    }
+  }
+]

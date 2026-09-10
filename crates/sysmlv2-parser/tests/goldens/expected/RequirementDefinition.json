@@ -1,0 +1,33 @@
+[
+  {
+    "@id": "43b5b4e1-7ce3-5cc1-8a6b-01fbe4aa1417",
+    "@type": "RequirementDefinition",
+    "declaredName": "SafeVoltage",
+    "declaredShortName": "R-1",
+    "elementId": "43b5b4e1-7ce3-5cc1-8a6b-01fbe4aa1417",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "276e0494-7cca-5717-b8fd-1b7b8df5274d"
+      },
+      {
+        "@id": "88a2c682-1b99-55f3-9e56-ed7e0c0d6273"
+      },
+      {
+        "@id": "fb218302-1d0e-5290-b39d-aa0f14769a3d"
+      },
+      {
+        "@id": "35177d51-08e6-5247-a3d0-229b188560aa"
+      },
+      {
+        "@id": "1bdc9216-0736-57e0-b8e0-fa5c489e46a1"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "b748b236-10a3-5739-bd14-b4d1e40ee361"
+    }
+  }
+]

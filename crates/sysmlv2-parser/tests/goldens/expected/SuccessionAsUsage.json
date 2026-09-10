@@ -1,0 +1,285 @@
+[
+  {
+    "@id": "0f1f1cd8-ff85-501c-94eb-d61ecec925b1",
+    "@type": "SuccessionAsUsage",
+    "elementId": "0f1f1cd8-ff85-501c-94eb-d61ecec925b1",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "ecd35053-3440-55ed-b182-6b0e74a244bf"
+      },
+      {
+        "@id": "b3d13d2f-a59c-5b99-b542-6b44301fd23c"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "ccbcb59d-f72d-539f-832f-ef7f5dc126ec"
+    }
+  },
+  {
+    "@id": "ef4fb6fa-8dfc-5932-be79-55cad465a1b3",
+    "@type": "SuccessionAsUsage",
+    "elementId": "ef4fb6fa-8dfc-5932-be79-55cad465a1b3",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "44175119-fe83-5ddf-aee9-e0602b799f31"
+      },
+      {
+        "@id": "0d83c085-2db0-55ed-bb6e-c209b9cb96b6"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "cbe97ef7-ad04-59a9-aad3-301e8fbd234b"
+    }
+  },
+  {
+    "@id": "27f524b0-c2b2-5f84-95c8-3887b898a052",
+    "@type": "SuccessionAsUsage",
+    "elementId": "27f524b0-c2b2-5f84-95c8-3887b898a052",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "2e61776c-f38a-51fc-84d8-6c5e510d86b3"
+      },
+      {
+        "@id": "2198bd85-2b0e-5333-b772-9614020d2375"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "af89b209-ac56-5bae-8225-1bfdcd5bc3e0"
+    }
+  },
+  {
+    "@id": "478c6f74-acdc-5e66-875d-913253c81f0a",
+    "@type": "SuccessionAsUsage",
+    "elementId": "478c6f74-acdc-5e66-875d-913253c81f0a",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "8ec0ff3e-6f3e-5155-a001-e065c0e3c3d9"
+      },
+      {
+        "@id": "f9941ed2-a560-5ed3-85ed-15f01ac0b45d"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "bebc7490-3575-5791-9bd4-38368922f812"
+    }
+  },
+  {
+    "@id": "3556ff43-ebeb-53d3-be56-71a09ad02400",
+    "@type": "SuccessionAsUsage",
+    "elementId": "3556ff43-ebeb-53d3-be56-71a09ad02400",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "53b96348-d2a3-5bbb-a33c-7cd78400c0fa"
+      },
+      {
+        "@id": "8dcb0612-ded4-5d15-8625-2dabb6bea476"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4a210927-40e0-5997-a25d-a4ed2b885c9f"
+    }
+  },
+  {
+    "@id": "79f557bf-f190-5364-8f1f-0957e054b4bc",
+    "@type": "SuccessionAsUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "79f557bf-f190-5364-8f1f-0957e054b4bc",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "488f5985-ab8e-5916-b7ac-910fa9ad4a5d"
+      },
+      {
+        "@id": "297b8b93-b8a9-514f-9306-3e834b726ae0"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "7f5901ee-19df-521d-8a02-4403a0cf84dd"
+    }
+  },
+  {
+    "@id": "d27e54bb-233e-5999-8988-71a7b97e2f6c",
+    "@type": "SuccessionAsUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "d27e54bb-233e-5999-8988-71a7b97e2f6c",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "9061c06b-d122-5234-9c45-1868c5c5d7cf"
+      },
+      {
+        "@id": "13a5fdd0-6340-52c0-be2e-d92d8831c77c"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d974865d-d70a-58a3-bced-7b56146c5553"
+    }
+  },
+  {
+    "@id": "f23da104-9ee7-5065-bcb4-ad66b1b2cf8b",
+    "@type": "SuccessionAsUsage",
+    "elementId": "f23da104-9ee7-5065-bcb4-ad66b1b2cf8b",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "f0af17ab-1139-5ef2-8306-021f545f5cd3"
+      },
+      {
+        "@id": "8db37813-f846-5a8b-93db-402a4b2e38cd"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e3631353-3d6f-56bc-8151-8e302edbec0f"
+    }
+  },
+  {
+    "@id": "a6bfcb0d-829b-50bd-8c26-052d288fd342",
+    "@type": "SuccessionAsUsage",
+    "elementId": "a6bfcb0d-829b-50bd-8c26-052d288fd342",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "a8ec01a1-b95a-5d60-9777-11a43795f714"
+      },
+      {
+        "@id": "8a6b9de8-476a-56fe-b6eb-9f6f3c32cd93"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "61802bb2-d6cd-5fae-8de7-df2e8c1cb3a0"
+    }
+  },
+  {
+    "@id": "0247109e-114d-5b71-9d9b-79cba8858363",
+    "@type": "SuccessionAsUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "0247109e-114d-5b71-9d9b-79cba8858363",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "961acf79-0547-5a9d-8ee6-2997dec2e6c0"
+      },
+      {
+        "@id": "ab207c5d-0377-51d7-a399-60db63a46cdb"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5edc5912-bfd6-55ba-ace5-362bd22bc206"
+    }
+  },
+  {
+    "@id": "03ec9c3f-ac40-54cb-a78c-9d5ee8146263",
+    "@type": "SuccessionAsUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "03ec9c3f-ac40-54cb-a78c-9d5ee8146263",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "b9183aa8-6941-5ee2-abd0-f286838b06e1"
+      },
+      {
+        "@id": "8dccaf7e-b3d1-5e3c-8ae3-5fdf76dda5e6"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1e3c2cc9-7074-5fa1-883b-e661fda24a7b"
+    }
+  },
+  {
+    "@id": "856f3cfe-5699-5f61-ba1d-77b93463846b",
+    "@type": "SuccessionAsUsage",
+    "elementId": "856f3cfe-5699-5f61-ba1d-77b93463846b",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "a7bbac67-c7c4-5189-8724-1318e7119f8b"
+      },
+      {
+        "@id": "257a3448-adce-5d47-b748-d37867a8f3e4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "83dc5e45-bd09-59c9-95a3-7717fb19ab11"
+    }
+  },
+  {
+    "@id": "247f4b2f-6aa8-5377-937b-13b0259486ec",
+    "@type": "SuccessionAsUsage",
+    "elementId": "247f4b2f-6aa8-5377-937b-13b0259486ec",
+    "isComposite": false,
+    "isImpliedIncluded": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "48f3e8b6-8c74-5716-92db-b4fe5ceea469"
+      },
+      {
+        "@id": "b1cc5afb-9f7f-5ba3-ab67-cdb1789cce1f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c2f7e9ec-d585-5c86-b7ae-4a19cecf99cf"
+    }
+  }
+]

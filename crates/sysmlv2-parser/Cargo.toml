@@ -1,0 +1,33 @@
+[package]
+name = "sysmlv2-parser"
+description = "Parser library for the OMG SysML v2 / KerML textual notation, producing a spec-aligned AST and JSON interchange output"
+readme = "../../README.md"
+keywords = ["sysml", "kerml", "mbse", "parser", "modeling"]
+categories = ["parser-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# The vendored spec grammars and OMG corpus (EPL-2.0 / LGPL) at the
+# workspace root are reference material for development and testing only —
+# the published crate ships the library sources alone.
+include = [
+    "src/**",
+    "Cargo.toml",
+]
+
+[features]
+default = ["json"]
+json = ["dep:sysmlv2-model", "dep:serde_json"]
+
+[dependencies]
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.5.5-rc.1" }
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.5.5-rc.1", optional = true }
+# for tests/examples that build serde_json values directly
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+jsonschema.workspace = true
+sysmlv2-testkit.workspace = true
+uuid.workspace = true

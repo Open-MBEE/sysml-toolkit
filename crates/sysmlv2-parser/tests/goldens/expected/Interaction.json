@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "37534416-6474-5354-a890-e7c46f3f7a85",
+    "@type": "Interaction",
+    "declaredName": "Exchange",
+    "declaredShortName": null,
+    "elementId": "37534416-6474-5354-a890-e7c46f3f7a85",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "ba80255b-1c4e-56ee-bcfe-af93ef896672"
+      },
+      {
+        "@id": "0b815cb2-62d3-508a-96f6-519f9124d413"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "35e05c85-dfe5-53e8-837d-c0303917ee92"
+    }
+  }
+]

@@ -1,0 +1,33 @@
+[
+  {
+    "@id": "10f78eb8-4dba-5028-9986-8128f2d0de1e",
+    "@type": "AllocationUsage",
+    "declaredName": "realization",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "10f78eb8-4dba-5028-9986-8128f2d0de1e",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "312db8c9-2949-5cfb-83dd-decf1ea71551"
+      },
+      {
+        "@id": "dd0c6ed5-c71b-57fb-9b42-a8876974f429"
+      },
+      {
+        "@id": "f7edc1b4-da1c-53ba-9386-1095f2ea2cb6"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "75325c5c-9dda-5b14-b797-161b56a12272"
+    }
+  }
+]

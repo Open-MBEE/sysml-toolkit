@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "0ff8f19b-d2d4-5e88-a31a-e2c625a3adc4",
+    "@type": "StakeholderMembership",
+    "elementId": "0ff8f19b-d2d4-5e88-a31a-e2c625a3adc4",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "2a4b03a2-d317-50a8-a7a8-e08fe652eb2d"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "d35b10d6-4b1f-5664-9c81-28644d4be900"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

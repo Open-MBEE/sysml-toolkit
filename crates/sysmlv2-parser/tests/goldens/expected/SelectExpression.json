@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "8e1d1bf9-43b3-59ca-87c9-41f9463945d0",
+    "@type": "SelectExpression",
+    "elementId": "8e1d1bf9-43b3-59ca-87c9-41f9463945d0",
+    "isImpliedIncluded": false,
+    "operator": "select",
+    "ownedRelationship": [
+      {
+        "@id": "944b162d-95c7-5927-ac00-887ef4f008f9"
+      },
+      {
+        "@id": "458037a4-2c09-54bd-bfd4-fc5fe57c38b4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8f1735b3-22ff-5548-a2ec-ec920b0937b5"
+    }
+  }
+]

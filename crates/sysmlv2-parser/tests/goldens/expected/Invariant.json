@@ -1,0 +1,30 @@
+[
+  {
+    "@id": "608d3499-df17-5d5f-8cec-f7b6eb0ea815",
+    "@type": "Invariant",
+    "declaredName": "positiveCount",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "608d3499-df17-5d5f-8cec-f7b6eb0ea815",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isNegated": false,
+    "isOrdered": false,
+    "isPortion": false,
+    "isSufficient": false,
+    "isUnique": true,
+    "isVariable": false,
+    "ownedRelationship": [
+      {
+        "@id": "88e4d0ea-af0c-53e1-838b-c935a8bac5ca"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "97e52f9a-07b4-5ea7-8361-24d3e4564d5f"
+    }
+  }
+]

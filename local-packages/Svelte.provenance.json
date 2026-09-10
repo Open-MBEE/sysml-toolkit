@@ -1,0 +1,802 @@
+{
+  "generator": {
+    "name": "@sysml/web",
+    "version": "0.5.5-rc.1"
+  },
+  "dataset": {
+    "svelte (declarations)": "5.57.0"
+  },
+  "kernel": "0.5.5-rc.1",
+  "library": "Svelte",
+  "elements": {
+    "Svelte::Svelte::AnimateDirective": {
+      "spec": "svelte",
+      "interface": "AnimateDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::AnimateDirective::expression": {
+      "spec": "svelte",
+      "interface": "AnimateDirective",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "null | Expression",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::AttachTag": {
+      "spec": "svelte",
+      "interface": "AttachTag",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "TemplateNode"
+      ]
+    },
+    "Svelte::Svelte::AttachTag::expression": {
+      "spec": "svelte",
+      "interface": "AttachTag",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Expression"
+    },
+    "Svelte::Svelte::AwaitBlock": {
+      "spec": "svelte",
+      "interface": "AwaitBlock",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Block"
+      ]
+    },
+    "Svelte::Svelte::AwaitBlock::catch": {
+      "spec": "svelte",
+      "interface": "AwaitBlock",
+      "member": "catch",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Fragment",
+      "idlType": "Fragment | null",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::AwaitBlock::error": {
+      "spec": "svelte",
+      "interface": "AwaitBlock",
+      "member": "error",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Pattern | null",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::AwaitBlock::expression": {
+      "spec": "svelte",
+      "interface": "AwaitBlock",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Expression"
+    },
+    "Svelte::Svelte::AwaitBlock::pending": {
+      "spec": "svelte",
+      "interface": "AwaitBlock",
+      "member": "pending",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Fragment",
+      "idlType": "Fragment | null",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::AwaitBlock::then": {
+      "spec": "svelte",
+      "interface": "AwaitBlock",
+      "member": "then",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Fragment",
+      "idlType": "Fragment | null",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::AwaitBlock::value": {
+      "spec": "svelte",
+      "interface": "AwaitBlock",
+      "member": "value",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Pattern | null",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::BindDirective": {
+      "spec": "svelte",
+      "interface": "BindDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::BindDirective::expression": {
+      "spec": "svelte",
+      "interface": "BindDirective",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Identifier | MemberExpression | SequenceExpression"
+    },
+    "Svelte::Svelte::ClassDirective": {
+      "spec": "svelte",
+      "interface": "ClassDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::ClassDirective::expression": {
+      "spec": "svelte",
+      "interface": "ClassDirective",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Expression"
+    },
+    "Svelte::Svelte::ClassDirective::localName": {
+      "spec": "svelte",
+      "interface": "ClassDirective",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"class\"",
+      "redefines": true,
+      "value": "class"
+    },
+    "Svelte::Svelte::ConstTag": {
+      "spec": "svelte",
+      "interface": "ConstTag",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "TemplateNode"
+      ]
+    },
+    "Svelte::Svelte::ConstTag::declaration": {
+      "spec": "svelte",
+      "interface": "ConstTag",
+      "member": "declaration",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "VariableDeclaration"
+    },
+    "Svelte::Svelte::DebugTag": {
+      "spec": "svelte",
+      "interface": "DebugTag",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "TemplateNode"
+      ]
+    },
+    "Svelte::Svelte::DebugTag::identifiers": {
+      "spec": "svelte",
+      "interface": "DebugTag",
+      "member": "identifiers",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Identifier[]",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Svelte::Svelte::DeclarationTag": {
+      "spec": "svelte",
+      "interface": "DeclarationTag",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "TemplateNode"
+      ]
+    },
+    "Svelte::Svelte::DeclarationTag::declaration": {
+      "spec": "svelte",
+      "interface": "DeclarationTag",
+      "member": "declaration",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "VariableDeclaration"
+    },
+    "Svelte::Svelte::Directive": {
+      "spec": "svelte",
+      "interface": "Directive",
+      "version": "5.57.0",
+      "idlKind": "union",
+      "kind": "part",
+      "abstract": "abstract-kind",
+      "generalizations": [
+        "AttributeLike"
+      ]
+    },
+    "Svelte::Svelte::Environment": {
+      "spec": "svelte",
+      "idlKind": "datatype",
+      "kind": "part",
+      "generalizations": [
+        "ExpressionEnvironment"
+      ]
+    },
+    "Svelte::Svelte::JavaScript": {
+      "spec": "svelte",
+      "idlKind": "datatype",
+      "kind": "attribute",
+      "generalizations": [
+        "SourceExpression"
+      ]
+    },
+    "Svelte::Svelte::KeyBlock": {
+      "spec": "svelte",
+      "interface": "KeyBlock",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Block"
+      ]
+    },
+    "Svelte::Svelte::KeyBlock::body": {
+      "spec": "svelte",
+      "interface": "KeyBlock",
+      "member": "fragment",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Fragment",
+      "idlType": "Fragment"
+    },
+    "Svelte::Svelte::KeyBlock::expression": {
+      "spec": "svelte",
+      "interface": "KeyBlock",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Expression"
+    },
+    "Svelte::Svelte::LetDirective": {
+      "spec": "svelte",
+      "interface": "LetDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::LetDirective::expression": {
+      "spec": "svelte",
+      "interface": "LetDirective",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "null | Identifier | ArrayExpression | ObjectExpression",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::OnDirective": {
+      "spec": "svelte",
+      "interface": "OnDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::OnDirective::expression": {
+      "spec": "svelte",
+      "interface": "OnDirective",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "null | Expression",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::OnDirective::modifiers": {
+      "spec": "svelte",
+      "interface": "OnDirective",
+      "member": "modifiers",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "Array<\n\t\t\t\t| 'capture'\n\t\t\t\t| 'nonpassive'\n\t\t\t\t| 'once'\n\t\t\t\t| 'passive'\n\t\t\t\t| 'preventDefault'\n\t\t\t\t| 'self'\n\t\t\t\t| 'stopImmediatePropagation'\n\t\t\t\t| 'stopPropagation'\n\t\t\t\t| 'trusted'\n\t\t\t>",
+      "multiplicity": "[0..*]",
+      "ordered": true,
+      "flags": [
+        "enumerated:\"capture\"|\"nonpassive\"|\"once\"|\"passive\"|\"preventDefault\"|\"self\"|\"stopImmediatePropagation\"|\"stopPropagation\"|\"trusted\""
+      ]
+    },
+    "Svelte::Svelte::RegularElement": {
+      "spec": "svelte",
+      "interface": "RegularElement",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::RenderTag": {
+      "spec": "svelte",
+      "interface": "RenderTag",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "TemplateNode"
+      ]
+    },
+    "Svelte::Svelte::RenderTag::expression": {
+      "spec": "svelte",
+      "interface": "RenderTag",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "SimpleCallExpression | (ChainExpression & { expression: SimpleCallExpression })"
+    },
+    "Svelte::Svelte::SlotElement": {
+      "spec": "svelte",
+      "interface": "SlotElement",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SlotElement::localName": {
+      "spec": "svelte",
+      "interface": "SlotElement",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"slot\"",
+      "redefines": true,
+      "value": "slot"
+    },
+    "Svelte::Svelte::SnippetBlock": {
+      "spec": "svelte",
+      "interface": "SnippetBlock",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Block"
+      ]
+    },
+    "Svelte::Svelte::SnippetBlock::body": {
+      "spec": "svelte",
+      "interface": "SnippetBlock",
+      "member": "body",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "Fragment",
+      "idlType": "Fragment"
+    },
+    "Svelte::Svelte::SnippetBlock::expression": {
+      "spec": "svelte",
+      "interface": "SnippetBlock",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Identifier"
+    },
+    "Svelte::Svelte::SnippetBlock::parameters": {
+      "spec": "svelte",
+      "interface": "SnippetBlock",
+      "member": "parameters",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Pattern[]",
+      "multiplicity": "[0..*]",
+      "ordered": true
+    },
+    "Svelte::Svelte::SnippetBlock::typeParams": {
+      "spec": "svelte",
+      "interface": "SnippetBlock",
+      "member": "typeParams",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::StyleDirective": {
+      "spec": "svelte",
+      "interface": "StyleDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::StyleDirective::modifiers": {
+      "spec": "svelte",
+      "interface": "StyleDirective",
+      "member": "modifiers",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "Array<'important'>",
+      "multiplicity": "[0..*]",
+      "ordered": true,
+      "flags": [
+        "literal:\"important\""
+      ]
+    },
+    "Svelte::Svelte::StyleDirective::value": {
+      "spec": "svelte",
+      "interface": "StyleDirective",
+      "member": "value",
+      "version": "5.57.0",
+      "kind": "part",
+      "type": "TemplateNode",
+      "idlType": "true | ExpressionTag | Array<ExpressionTag | Text>",
+      "multiplicity": "[0..*]",
+      "ordered": true,
+      "flags": [
+        "presence:true"
+      ]
+    },
+    "Svelte::Svelte::SvelteBody": {
+      "spec": "svelte",
+      "interface": "SvelteBody",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteBody::localName": {
+      "spec": "svelte",
+      "interface": "SvelteBody",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:body\"",
+      "redefines": true,
+      "value": "svelte:body"
+    },
+    "Svelte::Svelte::SvelteBoundary": {
+      "spec": "svelte",
+      "interface": "SvelteBoundary",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteBoundary::localName": {
+      "spec": "svelte",
+      "interface": "SvelteBoundary",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:boundary\"",
+      "redefines": true,
+      "value": "svelte:boundary"
+    },
+    "Svelte::Svelte::SvelteComponent": {
+      "spec": "svelte",
+      "interface": "SvelteComponent",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteComponent::expression": {
+      "spec": "svelte",
+      "interface": "SvelteComponent",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Expression"
+    },
+    "Svelte::Svelte::SvelteComponent::localName": {
+      "spec": "svelte",
+      "interface": "SvelteComponent",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:component\"",
+      "redefines": true,
+      "value": "svelte:component"
+    },
+    "Svelte::Svelte::SvelteDocument": {
+      "spec": "svelte",
+      "interface": "SvelteDocument",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteDocument::localName": {
+      "spec": "svelte",
+      "interface": "SvelteDocument",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:document\"",
+      "redefines": true,
+      "value": "svelte:document"
+    },
+    "Svelte::Svelte::SvelteElement": {
+      "spec": "svelte",
+      "interface": "SvelteElement",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteElement::localName": {
+      "spec": "svelte",
+      "interface": "SvelteElement",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:element\"",
+      "redefines": true,
+      "value": "svelte:element"
+    },
+    "Svelte::Svelte::SvelteElement::tag": {
+      "spec": "svelte",
+      "interface": "SvelteElement",
+      "member": "tag",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "Expression"
+    },
+    "Svelte::Svelte::SvelteFragment": {
+      "spec": "svelte",
+      "interface": "SvelteFragment",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteFragment::localName": {
+      "spec": "svelte",
+      "interface": "SvelteFragment",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:fragment\"",
+      "redefines": true,
+      "value": "svelte:fragment"
+    },
+    "Svelte::Svelte::SvelteHead": {
+      "spec": "svelte",
+      "interface": "SvelteHead",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteHead::localName": {
+      "spec": "svelte",
+      "interface": "SvelteHead",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:head\"",
+      "redefines": true,
+      "value": "svelte:head"
+    },
+    "Svelte::Svelte::SvelteOptions": {
+      "spec": "svelte",
+      "interface": "SvelteOptionsRaw",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteOptions::localName": {
+      "spec": "svelte",
+      "interface": "SvelteOptionsRaw",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:options\"",
+      "redefines": true,
+      "value": "svelte:options"
+    },
+    "Svelte::Svelte::SvelteSelf": {
+      "spec": "svelte",
+      "interface": "SvelteSelf",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteSelf::localName": {
+      "spec": "svelte",
+      "interface": "SvelteSelf",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:self\"",
+      "redefines": true,
+      "value": "svelte:self"
+    },
+    "Svelte::Svelte::SvelteWindow": {
+      "spec": "svelte",
+      "interface": "SvelteWindow",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::SvelteWindow::localName": {
+      "spec": "svelte",
+      "interface": "SvelteWindow",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"svelte:window\"",
+      "redefines": true,
+      "value": "svelte:window"
+    },
+    "Svelte::Svelte::TitleElement": {
+      "spec": "svelte",
+      "interface": "TitleElement",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Element"
+      ]
+    },
+    "Svelte::Svelte::TitleElement::localName": {
+      "spec": "svelte",
+      "interface": "TitleElement",
+      "member": "name",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "\"title\"",
+      "redefines": true,
+      "value": "title"
+    },
+    "Svelte::Svelte::TransitionDirective": {
+      "spec": "svelte",
+      "interface": "TransitionDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::TransitionDirective::expression": {
+      "spec": "svelte",
+      "interface": "TransitionDirective",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "null | Expression",
+      "multiplicity": "[0..1]"
+    },
+    "Svelte::Svelte::TransitionDirective::intro": {
+      "spec": "svelte",
+      "interface": "TransitionDirective",
+      "member": "intro",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "Svelte::Svelte::TransitionDirective::modifiers": {
+      "spec": "svelte",
+      "interface": "TransitionDirective",
+      "member": "modifiers",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "String",
+      "idlType": "Array<'local' | 'global'>",
+      "multiplicity": "[0..*]",
+      "ordered": true,
+      "flags": [
+        "enumerated:\"local\"|\"global\""
+      ]
+    },
+    "Svelte::Svelte::TransitionDirective::outro": {
+      "spec": "svelte",
+      "interface": "TransitionDirective",
+      "member": "outro",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "Boolean"
+    },
+    "Svelte::Svelte::TypeScript": {
+      "spec": "svelte",
+      "idlKind": "datatype",
+      "kind": "attribute",
+      "generalizations": [
+        "Svelte::Svelte::JavaScript"
+      ]
+    },
+    "Svelte::Svelte::UseDirective": {
+      "spec": "svelte",
+      "interface": "UseDirective",
+      "version": "5.57.0",
+      "idlKind": "node",
+      "kind": "part",
+      "generalizations": [
+        "Svelte::Svelte::Directive"
+      ]
+    },
+    "Svelte::Svelte::UseDirective::expression": {
+      "spec": "svelte",
+      "interface": "UseDirective",
+      "member": "expression",
+      "version": "5.57.0",
+      "kind": "attribute",
+      "type": "SourceExpression",
+      "idlType": "null | Expression",
+      "multiplicity": "[0..1]"
+    }
+  },
+  "omitted": {}
+}

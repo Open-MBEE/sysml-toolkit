@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "65e329d9-45cf-543a-b5d7-e1ac2dad350c",
+    "@type": "Predicate",
+    "declaredName": "IsHot",
+    "declaredShortName": null,
+    "elementId": "65e329d9-45cf-543a-b5d7-e1ac2dad350c",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "ownedRelationship": [
+      {
+        "@id": "cd2cee2d-ef46-5e20-8a53-a764b83504c5"
+      },
+      {
+        "@id": "e0b0c449-807b-59ef-a664-db05b1a4d99a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "2817ede5-9533-5ab8-b99e-12bc87e7b566"
+    }
+  }
+]

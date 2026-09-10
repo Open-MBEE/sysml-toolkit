@@ -1,0 +1,25 @@
+# PlantUML emission for SysML v2 / KerML models: seven
+# views over the resolved model — structure ("tree"), interconnection,
+# state machines, action flows, sequence, use case, and mixed — plus
+# comment notes, metadata stereotypes, inherited members, library /
+# import display, line styles, a color palette, and node hyperlink
+# templates. Consumers: the CLI's `viz` verb, the Python binding's
+# `Session.to_plantuml`, and services replacing the Pilot visualizer's
+# model→PlantUML stage.
+[package]
+name = "sysmlv2-viz"
+description = "PlantUML emission for SysML v2 / KerML models"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.5.5-rc.1" }
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.5.5-rc.1" }
+serde_json.workspace = true
+
+[dev-dependencies]
+sysmlv2-testkit.workspace = true

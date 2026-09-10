@@ -1,0 +1,59 @@
+[
+  {
+    "@id": "2547db8e-541c-530d-ad16-cbf5e8448655",
+    "@type": "StateSubactionMembership",
+    "elementId": "2547db8e-541c-530d-ad16-cbf5e8448655",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "entry",
+    "ownedRelatedElement": [
+      {
+        "@id": "92688a33-caba-5099-ac40-b13ff47048d3"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "56666274-0f0f-5b07-a496-815d59da851f"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "37481b95-7c68-5405-9ecf-6813e02467b6",
+    "@type": "StateSubactionMembership",
+    "elementId": "37481b95-7c68-5405-9ecf-6813e02467b6",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "do",
+    "ownedRelatedElement": [
+      {
+        "@id": "bd0ff153-f340-53bb-8284-65bd420e73c1"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "56666274-0f0f-5b07-a496-815d59da851f"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  },
+  {
+    "@id": "27fea2fc-25a9-55b2-aaf8-80181de816bf",
+    "@type": "StateSubactionMembership",
+    "elementId": "27fea2fc-25a9-55b2-aaf8-80181de816bf",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "kind": "exit",
+    "ownedRelatedElement": [
+      {
+        "@id": "c44d93a5-0988-5b14-aa1f-35675171ef65"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "56666274-0f0f-5b07-a496-815d59da851f"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

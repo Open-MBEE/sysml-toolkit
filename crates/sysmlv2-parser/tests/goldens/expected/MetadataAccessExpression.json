@@ -1,0 +1,16 @@
+[
+  {
+    "@id": "7cfdee05-d14e-5197-98eb-ad6250e4cb2b",
+    "@type": "MetadataAccessExpression",
+    "elementId": "7cfdee05-d14e-5197-98eb-ad6250e4cb2b",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "42a0c03c-0b87-5e74-aa44-c13cca1b4272"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "738cab10-3feb-5a35-b596-bbd3f16aba71"
+    }
+  }
+]

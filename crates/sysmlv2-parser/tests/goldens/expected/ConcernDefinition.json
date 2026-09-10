@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "d35b10d6-4b1f-5664-9c81-28644d4be900",
+    "@type": "ConcernDefinition",
+    "declaredName": "Affordability",
+    "declaredShortName": null,
+    "elementId": "d35b10d6-4b1f-5664-9c81-28644d4be900",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "8d0ac3d7-5159-5e45-8ac4-ffd78c4b2cb8"
+      },
+      {
+        "@id": "0ff8f19b-d2d4-5e88-a31a-e2c625a3adc4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "4279f06e-8fad-5e1a-998c-8f36815e1802"
+    }
+  }
+]

@@ -1,0 +1,24 @@
+[
+  {
+    "@id": "4ef6c6db-f727-51e6-ab7d-9d6d56fd5101",
+    "@type": "ViewDefinition",
+    "declaredName": "Overview",
+    "declaredShortName": null,
+    "elementId": "4ef6c6db-f727-51e6-ab7d-9d6d56fd5101",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "b8ebfab3-1746-5533-9e8c-4b3289b66720"
+      },
+      {
+        "@id": "6bdabc9a-25bd-586f-b456-458abb7b6f05"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "ba256ad4-a43d-54ec-933b-0dee63d918dd"
+    }
+  }
+]

@@ -1,0 +1,31 @@
+[package]
+name = "sysmlv2-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WASM/JS binding for the sysmlv2 stack: sessions, checking, interchange JSON, PlantUML emission"
+publish = false
+
+# rlib so the binding logic is testable natively (`cargo test -p
+# sysmlv2-wasm`); cdylib is the wasm-pack deliverable.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sysmlv2-syntax = { path = "../sysmlv2-syntax" }
+sysmlv2-model = { path = "../sysmlv2-model" }
+# Solverless tier only (interval propagation); the Z3 subprocess
+# path compiles for wasm32 but is never called from the binding.
+sysmlv2-solve.workspace = true
+sysmlv2-transform.workspace = true
+sysmlv2-cbor.workspace = true
+sysmlv2-viz.workspace = true
+sysmlv2-lsp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysmlv2-lint.workspace = true
+wasm-bindgen = "0.2"
+# gen-stdlib-bundle only (native tool; gzip emission).
+miniz_oxide.workspace = true

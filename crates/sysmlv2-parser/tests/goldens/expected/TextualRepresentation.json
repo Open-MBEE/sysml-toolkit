@@ -1,0 +1,16 @@
+[
+  {
+    "@id": "c85c3bc9-44ae-5e1f-ac8f-9edf05dc46a1",
+    "@type": "TextualRepresentation",
+    "body": " self.mass > 0 ",
+    "declaredName": "inOcl",
+    "declaredShortName": null,
+    "elementId": "c85c3bc9-44ae-5e1f-ac8f-9edf05dc46a1",
+    "isImpliedIncluded": false,
+    "language": "ocl",
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "4ba251c1-a134-5965-8610-534fe5a8ebc6"
+    }
+  }
+]

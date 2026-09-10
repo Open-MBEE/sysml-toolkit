@@ -1,0 +1,408 @@
+[
+  {
+    "@id": "22d6b2b3-247d-563b-90f2-dccd2f21583b",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "22d6b2b3-247d-563b-90f2-dccd2f21583b",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "6115469c-57a5-50af-ab59-e3d776783691"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1d18f95b-2254-5c79-a78d-e2c45affc50b"
+    }
+  },
+  {
+    "@id": "89ff3f46-8f04-5794-b48a-0d6e11cacb80",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "89ff3f46-8f04-5794-b48a-0d6e11cacb80",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "b1be76b0-11bc-51bb-9498-873a483c1a8a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "ac95c348-7bdd-5f0a-940b-50b826207a18"
+    }
+  },
+  {
+    "@id": "c8ded0dc-ecba-50a7-a373-e1db84aad139",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "c8ded0dc-ecba-50a7-a373-e1db84aad139",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "16e5c263-7851-58a3-8ef1-74a4a1e2f8f1"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e2987384-c556-56f6-ada5-74d243c8388b"
+    }
+  },
+  {
+    "@id": "e915eddc-8b19-525c-813e-21591b68e8b9",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "e915eddc-8b19-525c-813e-21591b68e8b9",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "2fc32fbc-170e-525c-b5ed-866e6609a7a3"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "afc0b750-7ff0-5cc2-bcbb-1487785115f7"
+    }
+  },
+  {
+    "@id": "e199bb4b-9852-52e5-a099-95b0515226fb",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "e199bb4b-9852-52e5-a099-95b0515226fb",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "d40aec82-b826-5375-8e3b-9f92b519e16e"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "3cc98b18-a2fa-5bf3-96ba-54e9ec79bf83"
+    }
+  },
+  {
+    "@id": "014b2cc3-579e-5d62-8352-58b2ab190c47",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "014b2cc3-579e-5d62-8352-58b2ab190c47",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "2e89841f-0bae-59e3-b133-b51c51f1337b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "27969e56-7f5c-562b-a9a6-73c2a584e550"
+    }
+  },
+  {
+    "@id": "5b225d04-95af-5672-bd56-ad49a1402353",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "5b225d04-95af-5672-bd56-ad49a1402353",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "adec2ef9-69e6-5632-8af1-8f51357a4684"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "71dfc64b-22c0-5f24-99ab-43f0ada2a74f"
+    }
+  },
+  {
+    "@id": "9e5029a8-3b87-5973-85b1-f3792d44c147",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "9e5029a8-3b87-5973-85b1-f3792d44c147",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "28e5efb6-6757-504a-b772-cb7ba59f10e9"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "7416e236-9da6-5c68-b833-1c64c02d11ce"
+    }
+  },
+  {
+    "@id": "1bad2188-3614-5a1f-81c7-a6cfee97acc3",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "1bad2188-3614-5a1f-81c7-a6cfee97acc3",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "0ae19563-0194-5d12-b593-8868ee40cc8b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "433e9f1d-0b84-5f84-8cde-a0d019edf089"
+    }
+  },
+  {
+    "@id": "f2781de8-e2c8-58aa-9e70-396c33788bcc",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "f2781de8-e2c8-58aa-9e70-396c33788bcc",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "0d317f10-1149-564e-8925-17bbc38ee255"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "6a29982d-7b0f-5beb-a16e-7f1c2cf5d956"
+    }
+  },
+  {
+    "@id": "40eb4d82-fdc2-5f1e-a495-2817382b0c51",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "40eb4d82-fdc2-5f1e-a495-2817382b0c51",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "ce22196a-bd4c-54ee-a997-3223070dffbd"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "9759ce03-a67b-5ca2-9de1-60fa4d58ad84"
+    }
+  },
+  {
+    "@id": "950ddbcf-2873-5af4-bd1a-2aada77826d9",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "950ddbcf-2873-5af4-bd1a-2aada77826d9",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "b4236308-d355-5979-95ab-afbee6e95484"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "c2a3622c-7167-5fb2-ae61-35b147d56129"
+    }
+  },
+  {
+    "@id": "a2735726-3b2b-5468-8c77-0be7b2a2551d",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "a2735726-3b2b-5468-8c77-0be7b2a2551d",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "372b79d3-949a-55c9-acf0-c88c0245150b"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "a038c210-1ad1-5ff5-a471-7d01fc66b174"
+    }
+  },
+  {
+    "@id": "0a91fde6-28e6-5c8c-8975-acfb8f4f59a0",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "0a91fde6-28e6-5c8c-8975-acfb8f4f59a0",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "65122036-0969-5b09-9862-01c9e1911d95"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "42533f40-debc-551d-af41-b0a2ad56b38c"
+    }
+  },
+  {
+    "@id": "67bbc0be-fb74-5f73-94de-72e1045b9952",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "67bbc0be-fb74-5f73-94de-72e1045b9952",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "2002e4e3-cf81-57d5-87c1-b7a23f0169ae"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "2183d02c-0d64-5a6b-9358-2d3bf8cadb02"
+    }
+  },
+  {
+    "@id": "fc25d236-9220-5059-846c-e94c08d12123",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "fc25d236-9220-5059-846c-e94c08d12123",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "2b28e23a-15a0-5bc0-89a3-9ad7709e6c2f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "7ef7e057-035d-5f08-bb5c-09c48113cbf9"
+    }
+  },
+  {
+    "@id": "82a2729d-77db-593c-b4e4-99cc0581f858",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "82a2729d-77db-593c-b4e4-99cc0581f858",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "d5a80104-4649-5045-a7d3-d7fd41f02d9a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "fe4e1695-6b78-51f7-bfe8-514c2c09ced2"
+    }
+  },
+  {
+    "@id": "2ce0263f-ce52-59e3-ba0a-fb838af4246f",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "2ce0263f-ce52-59e3-ba0a-fb838af4246f",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "d43bc7f3-a3a8-5e29-93e5-3a4fb5846598"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f288126a-639d-5695-b0e1-f7cdc2468dfd"
+    }
+  },
+  {
+    "@id": "0b8aa017-e490-5a23-b603-286f795d9f85",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "0b8aa017-e490-5a23-b603-286f795d9f85",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "ddd5a848-b0e2-57cc-92bc-28352ee355c4"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8b0b3d50-23fc-58c2-8cd8-d7eee405b67b"
+    }
+  },
+  {
+    "@id": "eab009b7-c488-5d3a-9d9a-3c7aaba15c93",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "eab009b7-c488-5d3a-9d9a-3c7aaba15c93",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "f42e1363-e323-5f16-aa34-9b44983d984a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "02cbf87d-55a2-53bb-9194-077b7b60a682"
+    }
+  },
+  {
+    "@id": "1cb2ab67-6e08-5f3a-9fc8-6fa58bd86c5b",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "1cb2ab67-6e08-5f3a-9fc8-6fa58bd86c5b",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "e185a767-a75b-5b55-804a-e7aa69562f34"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "f43a7860-0ba0-5d00-b28f-aa417bfb5035"
+    }
+  },
+  {
+    "@id": "15a5bb4d-4114-5167-ae29-a86c09272f65",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "15a5bb4d-4114-5167-ae29-a86c09272f65",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "d6599b95-e212-549d-8e21-d426c5a8a1fd"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "3ddc83c6-071a-54d8-9276-103d3c1c5f63"
+    }
+  },
+  {
+    "@id": "fbfcd052-497d-5c99-9a70-21f25fe6534a",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "fbfcd052-497d-5c99-9a70-21f25fe6534a",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "e764f693-a8cd-51e4-bae1-4c3625912b2a"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "2ae7cf2f-bd9c-5c6b-8769-63464552fdb9"
+    }
+  },
+  {
+    "@id": "ed3ef80f-8e23-5568-9c94-c9afc4711278",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "ed3ef80f-8e23-5568-9c94-c9afc4711278",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "24e1f314-8875-5e0a-a6bb-540012891e84"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "54e2bda5-0a71-50f8-bd79-9895dc4c5374"
+    }
+  },
+  {
+    "@id": "ecd4ad19-74f9-55ce-bd83-560ddb1fd451",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "ecd4ad19-74f9-55ce-bd83-560ddb1fd451",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "c9959df2-dcc3-5740-8b39-dddce5ad1fd3"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "d95e6255-c4c0-587b-a2db-43610aa99427"
+    }
+  },
+  {
+    "@id": "9c262790-612c-5552-ad5c-6868c5efdc77",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "9c262790-612c-5552-ad5c-6868c5efdc77",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "5392acf3-0b3c-5765-85a3-42976c6a8440"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "b4f25e58-9e04-510e-acb2-c610071d138a"
+    }
+  },
+  {
+    "@id": "4d1ae7cd-1cfc-592e-9c64-ac7739b8edfe",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "4d1ae7cd-1cfc-592e-9c64-ac7739b8edfe",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "2e65ebfe-8b48-5eb4-b46b-f0e9c75cbc4f"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5cd78d4b-5bf9-5830-962a-6618591ad31e"
+    }
+  },
+  {
+    "@id": "284e7483-2c60-58e0-a55a-5dc6568c2155",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "284e7483-2c60-58e0-a55a-5dc6568c2155",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "b5d2b5f8-69d8-5e09-9f7c-4f6f04066c32"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "bef83ef2-17c3-5873-a5c9-eed55eb5fc70"
+    }
+  },
+  {
+    "@id": "d54cc8f2-124a-57b5-a74c-8a44b653e955",
+    "@type": "FeatureReferenceExpression",
+    "elementId": "d54cc8f2-124a-57b5-a74c-8a44b653e955",
+    "isImpliedIncluded": false,
+    "ownedRelationship": [
+      {
+        "@id": "444ab977-dd8d-57ba-98e7-0595d2b6d020"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "146bd9d4-95e5-5e7b-b480-75a661556fc4"
+    }
+  }
+]

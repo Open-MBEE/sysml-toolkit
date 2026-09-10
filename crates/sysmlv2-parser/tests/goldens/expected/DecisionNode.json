@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "1d0ff7df-1b43-5213-8d93-290f97bb7575",
+    "@type": "DecisionNode",
+    "declaredName": "d1",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "1d0ff7df-1b43-5213-8d93-290f97bb7575",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "e17f304f-e12d-5043-b0e9-87c5f5a5b5d4"
+    }
+  }
+]

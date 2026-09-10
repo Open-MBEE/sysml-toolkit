@@ -1,0 +1,32 @@
+[
+  {
+    "@id": "c6c072cb-af1e-5b87-aabe-5c8ca4bc0d75",
+    "@type": "Intersecting",
+    "elementId": "c6c072cb-af1e-5b87-aabe-5c8ca4bc0d75",
+    "intersectingType": {
+      "@id": "18ec9748-da12-5d36-887a-b97e53614be5"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "bfa3d55d-db8f-54c3-9658-c3d06a6ab739"
+    },
+    "owningRelationship": null
+  },
+  {
+    "@id": "c06ae9a1-1af2-5910-bcda-4415205f701d",
+    "@type": "Intersecting",
+    "elementId": "c06ae9a1-1af2-5910-bcda-4415205f701d",
+    "intersectingType": {
+      "@id": "029db469-0fe4-54df-9823-1878386a48ed"
+    },
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "bfa3d55d-db8f-54c3-9658-c3d06a6ab739"
+    },
+    "owningRelationship": null
+  }
+]

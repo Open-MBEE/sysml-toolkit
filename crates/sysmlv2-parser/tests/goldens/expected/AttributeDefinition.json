@@ -1,0 +1,73 @@
+[
+  {
+    "@id": "8b08d4bb-a8c2-5e8f-8c93-e6e5b15fc79d",
+    "@type": "AttributeDefinition",
+    "declaredName": "Command",
+    "declaredShortName": null,
+    "elementId": "8b08d4bb-a8c2-5e8f-8c93-e6e5b15fc79d",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "2c6916e4-4cbd-594b-bfe5-bdca5c95be74"
+    }
+  },
+  {
+    "@id": "57e792be-f65e-5503-94d8-85cf2667f46b",
+    "@type": "AttributeDefinition",
+    "declaredName": "Ack",
+    "declaredShortName": null,
+    "elementId": "57e792be-f65e-5503-94d8-85cf2667f46b",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "9ff31f6d-5f8f-532f-b389-9187c75b406e"
+    }
+  },
+  {
+    "@id": "46b21cd4-0e03-530f-bbcf-9790babdd10b",
+    "@type": "AttributeDefinition",
+    "declaredName": "Complex_",
+    "declaredShortName": null,
+    "elementId": "46b21cd4-0e03-530f-bbcf-9790babdd10b",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "fc9815d1-4ace-5bfd-b870-0432e2a3c655"
+      },
+      {
+        "@id": "758a9b46-c361-5933-94c4-05f9758182f8"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5a2fe4bc-9127-5c91-8b0f-60ef70bb9c72"
+    }
+  },
+  {
+    "@id": "d0c05a8c-f501-5aba-9ec0-e409ca3d8556",
+    "@type": "AttributeDefinition",
+    "declaredName": "Pressure",
+    "declaredShortName": null,
+    "elementId": "d0c05a8c-f501-5aba-9ec0-e409ca3d8556",
+    "isAbstract": false,
+    "isImpliedIncluded": false,
+    "isSufficient": false,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "c6d6862d-8394-59b8-9bf9-deec7299e2c5"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "e556b0c7-6a83-52a7-8f3a-f351f360ebc9"
+    }
+  }
+]

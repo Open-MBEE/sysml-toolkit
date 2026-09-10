@@ -1,0 +1,164 @@
+[
+  {
+    "@id": "2eb391dc-5bb9-50a7-a481-2de834b0dac1",
+    "@type": "Redefinition",
+    "elementId": "2eb391dc-5bb9-50a7-a481-2de834b0dac1",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "44720207-db18-5b54-aa2c-cef00644f886"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "dcd71825-9ab8-529d-8065-fd3cb2ed21fc"
+    },
+    "redefiningFeature": {
+      "@id": "44720207-db18-5b54-aa2c-cef00644f886"
+    }
+  },
+  {
+    "@id": "a7f97a95-a662-5013-9e12-336a27d47dab",
+    "@type": "Redefinition",
+    "elementId": "a7f97a95-a662-5013-9e12-336a27d47dab",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "9bd03bf9-8320-5589-afb8-d3797f1ccb44"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "dcd71825-9ab8-529d-8065-fd3cb2ed21fc"
+    },
+    "redefiningFeature": {
+      "@id": "9bd03bf9-8320-5589-afb8-d3797f1ccb44"
+    }
+  },
+  {
+    "@id": "3702a262-eba7-5bbf-81c3-e3cf06c597a6",
+    "@type": "Redefinition",
+    "elementId": "3702a262-eba7-5bbf-81c3-e3cf06c597a6",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "785ca8d3-db25-5d0e-b160-70fe2c57bb7f"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "dcd71825-9ab8-529d-8065-fd3cb2ed21fc"
+    },
+    "redefiningFeature": {
+      "@id": "785ca8d3-db25-5d0e-b160-70fe2c57bb7f"
+    }
+  },
+  {
+    "@id": "efd59a01-e8c8-572b-b14c-c2ecf2783519",
+    "@type": "Redefinition",
+    "elementId": "efd59a01-e8c8-572b-b14c-c2ecf2783519",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "410aa43e-62b2-5ebc-af9f-564ac98c3f5f"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "dcd71825-9ab8-529d-8065-fd3cb2ed21fc"
+    },
+    "redefiningFeature": {
+      "@id": "410aa43e-62b2-5ebc-af9f-564ac98c3f5f"
+    }
+  },
+  {
+    "@id": "8584169f-b306-5758-a5fd-c7266bf1b15f",
+    "@type": "Redefinition",
+    "elementId": "8584169f-b306-5758-a5fd-c7266bf1b15f",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "d5d749bb-2ebd-531f-b7ff-67c2ab66640f"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "a43dcadd-a2a5-54fb-8d6b-10bef1497500"
+    },
+    "redefiningFeature": {
+      "@id": "d5d749bb-2ebd-531f-b7ff-67c2ab66640f"
+    }
+  },
+  {
+    "@id": "2f09da6f-6591-5406-8106-3e82c1c414c0",
+    "@type": "Redefinition",
+    "elementId": "2f09da6f-6591-5406-8106-3e82c1c414c0",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "8baee662-5f02-512b-b671-c812c4a7bf95"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "73cf213a-035d-5adb-bf23-21081b7bf3af"
+    },
+    "redefiningFeature": {
+      "@id": "8baee662-5f02-512b-b671-c812c4a7bf95"
+    }
+  },
+  {
+    "@id": "30124b8f-3a95-504d-b21c-57021ef16099",
+    "@type": "Redefinition",
+    "elementId": "30124b8f-3a95-504d-b21c-57021ef16099",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "7a8d2694-47b2-57bf-8420-77269b0644fb"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "8baee662-5f02-512b-b671-c812c4a7bf95"
+    },
+    "redefiningFeature": {
+      "@id": "7a8d2694-47b2-57bf-8420-77269b0644fb"
+    }
+  },
+  {
+    "@id": "e946c03d-cb7f-5f94-9052-a8ada1d89251",
+    "@type": "Redefinition",
+    "elementId": "e946c03d-cb7f-5f94-9052-a8ada1d89251",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "e90b81ab-7447-5eb3-8815-5ac9fddd93d5"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "a59ecc5b-f1e1-580c-a299-41becdf312c5"
+    },
+    "redefiningFeature": {
+      "@id": "e90b81ab-7447-5eb3-8815-5ac9fddd93d5"
+    }
+  },
+  {
+    "@id": "1289b24f-3bfe-549e-b8d3-f0a3f7c40c94",
+    "@type": "Redefinition",
+    "elementId": "1289b24f-3bfe-549e-b8d3-f0a3f7c40c94",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "e7e696c5-a834-5a9d-a0af-cd7e5598c22a"
+    },
+    "owningRelationship": null,
+    "redefinedFeature": {
+      "@id": "2f8c9dc1-c4e3-5cfe-b18c-029d68addad9"
+    },
+    "redefiningFeature": {
+      "@id": "e7e696c5-a834-5a9d-a0af-cd7e5598c22a"
+    }
+  }
+]

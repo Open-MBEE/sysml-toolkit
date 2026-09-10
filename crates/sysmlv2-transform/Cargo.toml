@@ -1,0 +1,23 @@
+[package]
+name = "sysmlv2-transform"
+description = "Span-splice transformation engine for OMG SysML v2 / KerML textual models: semantic navigation, minimal text edits, and a commit pipeline that verifies resolution outcomes are preserved"
+readme = "../../README.md"
+keywords = ["sysml", "kerml", "mbse", "refactoring", "transformation"]
+categories = ["development-tools"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src/**", "Cargo.toml"]
+
+[dependencies]
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.5.5-rc.1" }
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.5.5-rc.1" }
+sysmlv2-cbor = { path = "../sysmlv2-cbor", version = "0.5.5-rc.1" }
+uuid.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+sysmlv2-solve.workspace = true
+sysmlv2-testkit.workspace = true

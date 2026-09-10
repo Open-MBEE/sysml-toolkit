@@ -1,0 +1,33 @@
+[
+  {
+    "@id": "88706eed-466c-52f5-a3ff-bb595d936317",
+    "@type": "InterfaceUsage",
+    "declaredName": "fuelInterface",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "88706eed-466c-52f5-a3ff-bb595d936317",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "0fa4a5cb-df18-5393-9506-29b60c34dbce"
+      },
+      {
+        "@id": "fb472a83-c823-5a30-b61b-bd1f167150ee"
+      },
+      {
+        "@id": "8a016c74-0544-5d50-a774-68b7504232ad"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "67e7bc2e-d46a-5e67-9b82-b73e0c932bca"
+    }
+  }
+]

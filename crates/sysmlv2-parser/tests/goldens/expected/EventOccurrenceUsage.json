@@ -1,0 +1,23 @@
+[
+  {
+    "@id": "5594cc9d-0eca-5da9-97a6-2dba118ae912",
+    "@type": "EventOccurrenceUsage",
+    "declaredName": "launch",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "5594cc9d-0eca-5da9-97a6-2dba118ae912",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "635889b1-9830-5c53-8731-607705bbd7b5"
+    }
+  }
+]

@@ -1,0 +1,28 @@
+[
+  {
+    "@id": "10d4a088-ae5f-56d4-814c-6df50e74c79a",
+    "@type": "ExhibitStateUsage",
+    "declaredName": "modes",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "10d4a088-ae5f-56d4-814c-6df50e74c79a",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isParallel": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "979f0021-548e-54d2-b2d6-4f1c92fcff5e"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "8866312f-15e3-5028-9ba8-5e0b7905f2dc"
+    }
+  }
+]

@@ -1,0 +1,90 @@
+[
+  {
+    "@id": "762daf44-2cea-5055-bd8b-59d2622191cc",
+    "@type": "PerformActionUsage",
+    "declaredName": "run",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "762daf44-2cea-5055-bd8b-59d2622191cc",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "9821ee4e-8b8b-5412-a89f-b892d00228a6"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "5605b7bf-509a-5352-a70f-50d4b88f2440"
+    }
+  },
+  {
+    "@id": "92688a33-caba-5099-ac40-b13ff47048d3",
+    "@type": "PerformActionUsage",
+    "declaredName": "init",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "92688a33-caba-5099-ac40-b13ff47048d3",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "2547db8e-541c-530d-ad16-cbf5e8448655"
+    }
+  },
+  {
+    "@id": "bd0ff153-f340-53bb-8284-65bd420e73c1",
+    "@type": "PerformActionUsage",
+    "declaredName": "monitor",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "bd0ff153-f340-53bb-8284-65bd420e73c1",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "37481b95-7c68-5405-9ecf-6813e02467b6"
+    }
+  },
+  {
+    "@id": "c44d93a5-0988-5b14-aa1f-35675171ef65",
+    "@type": "PerformActionUsage",
+    "declaredName": "shutdown",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "c44d93a5-0988-5b14-aa1f-35675171ef65",
+    "isAbstract": false,
+    "isComposite": false,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [],
+    "owningRelationship": {
+      "@id": "27fea2fc-25a9-55b2-aaf8-80181de816bf"
+    }
+  }
+]

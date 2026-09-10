@@ -1,0 +1,52 @@
+[
+  {
+    "@id": "60fd5b1a-233f-5e7d-b799-a9b7e97e2e26",
+    "@type": "ConcernUsage",
+    "declaredName": "afford",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "60fd5b1a-233f-5e7d-b799-a9b7e97e2e26",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "e167514c-9bf1-590f-8446-86b62041dad2"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "557c1287-a7fe-5ce1-8c7e-df50d358524a"
+    }
+  },
+  {
+    "@id": "7eac195c-b80c-550a-93ff-85650068925f",
+    "@type": "ConcernUsage",
+    "declaredName": "afford2",
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "7eac195c-b80c-550a-93ff-85650068925f",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "89c7d14f-ff6d-5d2f-b91f-e2e9778cea57"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "2dcb59a3-47b8-55ca-ac50-1915922d443d"
+    }
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "@id": "6bdabc9a-25bd-586f-b456-458abb7b6f05",
+    "@type": "ViewRenderingMembership",
+    "elementId": "6bdabc9a-25bd-586f-b456-458abb7b6f05",
+    "isImplied": false,
+    "isImpliedIncluded": false,
+    "ownedRelatedElement": [
+      {
+        "@id": "880c83ad-5c1b-5bef-9ce8-c6adf3e19cc8"
+      }
+    ],
+    "ownedRelationship": [],
+    "owningRelatedElement": {
+      "@id": "4ef6c6db-f727-51e6-ab7d-9d6d56fd5101"
+    },
+    "owningRelationship": null,
+    "visibility": "public"
+  }
+]

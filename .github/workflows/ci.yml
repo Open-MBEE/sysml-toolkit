@@ -25,14 +25,12 @@
 # stdlib bundle + sealed-snapshot generation, and a node smoke test that
 # loads the built module and asserts snapshot replay is engaged. On tags
 # it uploads the npm package tarball (built wasm module + stdlib
-# artifacts inside) so every release carries the package, and it
-# publishes the tarball to the org's GitHub Packages npm registry
-# (@sysml/wasm — consumed by downstream deploy
-# pipelines). A workflow_dispatch run publishes too, so a package
-# version can ship without cutting a full release. The publish is
-# idempotent — an already-published version is skipped, since GitHub
-# Packages versions are immutable. Nothing is ever published to the
-# public npm registry.
+# artifacts inside) so every release carries the package. When an
+# NPM_TOKEN secret is configured it also publishes the tarball to the
+# npm registry as @sysml/wasm (tags and manual runs); without the secret
+# the publish is skipped and the release still ships the tarball as an
+# asset. The publish is idempotent — an already-published version is
+# skipped.
 #
 # Notes for this repository:
 # - The full corpus gates run in the test job: the SysML-v2-Release
@@ -56,9 +54,8 @@ on:
     # (synchronize) re-runs the full test gates.
     types: [opened, synchronize, reopened]
     branches: [main, develop]
-  # Manual runs publish the wasm npm package from the chosen ref (wasm
-  # job) without cutting a release — e.g. the first 0.1.0 publish, or a
-  # develop-side kernel a consumer needs before the next release tag.
+  # Manual runs build (and, with NPM_TOKEN, publish) the wasm npm
+  # package from the chosen ref without cutting a release.
   workflow_dispatch:
 
 permissions:
@@ -115,11 +112,8 @@ jobs:
   wasm:
     name: wasm (wasm32 gate + npm package + node smoke)
     runs-on: ubuntu-latest
-    # Job-scoped: publishing to GitHub Packages needs packages: write,
-    # which no other job should hold.
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v7
       - name: Fetch the standard library (sparse, blob-filtered)
@@ -164,50 +158,38 @@ jobs:
           name: sysmlv2-wasm-npm
           path: crates/sysmlv2-wasm/npm/dist/*.tgz
           if-no-files-found: error
-      - name: Publish to GitHub Packages (tags + manual runs)
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-        env:
-          NPM_TOKEN: ${{ github.token }}
-          # Fine-grained PAT, Contents: read+write on the consumer repo
-          # named by the KERNEL_CONSUMER_REPO variable — lets a fresh
-          # publish nudge that repo to bump its kernel pin
-          # (repository_dispatch). Optional: either unset skips the nudge.
-          DISPATCH_TOKEN: ${{ secrets.KERNEL_CONSUMER_DISPATCH_TOKEN }}
-          DISPATCH_REPO: ${{ vars.KERNEL_CONSUMER_REPO }}
+      - name: Check the tag against the package version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          echo "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
           version=$(node -p "require('./crates/sysmlv2-wasm/npm/pkg/package.json').version")
           # The package version comes from Cargo.toml ([workspace.package]),
-          # not from the tag — refuse to publish a release whose tag and
-          # source version disagree. Failing here also blocks the release
-          # job (needs: wasm), so mismatched binaries never ship either.
-          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+          # not from the tag — refuse a release whose tag and source
+          # version disagree. Failing here also blocks the release job
+          # (needs: wasm), so mismatched binaries never ship either.
+          if [[ "${GITHUB_REF_NAME#v}" != "$version" ]]; then
             echo "::error::tag ${GITHUB_REF_NAME} but package version ${version} — bump [workspace.package] version (and sibling dep pins) before tagging"
             exit 1
           fi
+      - name: Publish to npm (tags + manual runs, when NPM_TOKEN is configured)
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -z "$NPM_TOKEN" ]]; then
+            echo "NPM_TOKEN not configured — skipping the npm publish (the tarball ships as a release asset)"
+            exit 0
+          fi
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+          version=$(node -p "require('./crates/sysmlv2-wasm/npm/pkg/package.json').version")
           # A prerelease (a `-` in the version) publishes under the `next`
           # dist-tag so `latest` keeps naming the newest stable version.
           dist_tag=latest
           case "$version" in *-*) dist_tag=next ;; esac
-          if npm view "@sysml/wasm@${version}" version \
-               --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+          if npm view "@sysml/wasm@${version}" version >/dev/null 2>&1; then
             echo "@sysml/wasm@${version} already published — skipping"
           else
             npm publish "crates/sysmlv2-wasm/npm/dist/sysml-wasm-${version}.tgz" \
-              --registry=https://npm.pkg.github.com --tag "$dist_tag"
-            # Tell the consumer repo a new kernel exists: its
-            # bump-kernel workflow rewrites the pin, commits, redeploys.
-            if [[ -n "$DISPATCH_TOKEN" && -n "$DISPATCH_REPO" ]]; then
-              curl -sSf -X POST \
-                -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${DISPATCH_REPO}/dispatches" \
-                -d "{\"event_type\":\"kernel-published\",\"client_payload\":{\"version\":\"${version}\"}}" \
-                && echo "dispatched kernel-published ${version} to ${DISPATCH_REPO}" \
-                || echo "::warning::kernel-published dispatch to ${DISPATCH_REPO} failed"
-            else
-              echo "dispatch token or repo not configured — skipping the bump nudge"
-            fi
+              --access public --tag "$dist_tag"
           fi
 
   build:

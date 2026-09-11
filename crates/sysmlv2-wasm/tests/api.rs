@@ -1644,7 +1644,8 @@ fn render_view_accepts_plain_dom_parts_without_a_template_root() {
     ]);
     let mut s = Session::from_sources(&src).unwrap();
     assert_eq!(
-        s.render_view("BrowserViews::summary", Some("html".into())).unwrap(),
+        s.render_view("BrowserViews::summary", Some("html".into()))
+            .unwrap(),
         "<article><h2>Overview</h2><p class=\"lead\">A rendered view.</p></article>"
     );
 }

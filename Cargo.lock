@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-cbor"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "miniz_oxide",
  "serde_json",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-cli"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "clap",
  "miniz_oxide",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-lint"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "regex-lite",
  "serde_json",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-lsp"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "crossbeam-channel",
  "lsp-server",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-model"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-parser"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "jsonschema",
  "serde_json",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-py"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "pyo3",
  "serde_json",
@@ -1290,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-solve"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "sysmlv2-model",
  "sysmlv2-syntax",
@@ -1299,15 +1299,15 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-syntax"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 
 [[package]]
 name = "sysmlv2-testkit"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 
 [[package]]
 name = "sysmlv2-transform"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "serde_json",
  "sysmlv2-cbor",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-viz"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "serde_json",
  "sysmlv2-model",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-wasm"
-version = "0.5.5-rc.1"
+version = "0.6.0"
 dependencies = [
  "miniz_oxide",
  "serde",

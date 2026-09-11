@@ -17,8 +17,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-sysmlv2-model = { path = "../sysmlv2-model", version = "0.5.5-rc.1" }
-sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.5.5-rc.1" }
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.6.0" }
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.6.0" }
 serde_json.workspace = true
 
 [dev-dependencies]

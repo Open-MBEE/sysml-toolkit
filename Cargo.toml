@@ -44,21 +44,21 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.5.5-rc.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
 repository = "https://github.com/Open-MBEE/sysml-toolkit"
 
 [workspace.dependencies]
-sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.5.5-rc.1" }
-sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.5.5-rc.1" }
-sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.5.5-rc.1" }
-sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.5.5-rc.1" }
+sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.6.0" }
+sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.6.0" }
+sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.6.0" }
+sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.6.0" }
 sysmlv2-testkit = { path = "crates/sysmlv2-testkit" }
-sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.5.5-rc.1" }
-sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.5.5-rc.1" }
-sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.5.5-rc.1" }
+sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.6.0" }
+sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.6.0" }
+sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.6.0" }
 lsp-server = "0.7"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"

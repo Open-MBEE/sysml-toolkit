@@ -20,6 +20,7 @@
 
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use sysmlv2_parser::json::model_to_compact_json;
@@ -110,16 +111,16 @@ fn golden_snapshots_per_metaclass() {
     for (ty, text) in &snap {
         let path = expected_dir.join(format!("{ty}.json"));
         match fs::read_to_string(&path) {
-            Err(_) => report.push_str(&format!("  new metaclass without a golden: {ty}\n")),
+            Err(_) => writeln!(report, "  new metaclass without a golden: {ty}").unwrap(),
             Ok(want) if want != *text => {
-                report.push_str(&format!("  golden differs: {ty}\n"));
+                writeln!(report, "  golden differs: {ty}").unwrap();
             }
             Ok(_) => {}
         }
     }
     for ty in &on_disk {
         if !snap.contains_key(ty) {
-            report.push_str(&format!("  golden no longer produced: {ty}\n"));
+            writeln!(report, "  golden no longer produced: {ty}").unwrap();
         }
     }
     assert!(

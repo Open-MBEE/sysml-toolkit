@@ -4,7 +4,7 @@
 //! exists so the codec carries no external dependency and stays
 //! wasm-clean by construction.
 
-use crate::Error;
+use crate::{Error, ErrorKind};
 
 const MAJOR_UINT: u8 = 0;
 const MAJOR_NINT: u8 = 1;
@@ -24,9 +24,15 @@ impl Writer {
     /// A writer opened with the RFC 9277 payload magic already
     /// emitted: tag 55799 wrapping application tag `0x24533243`
     /// ("$S2C"); the body written next is the tags' content, so the
-    /// whole payload stays one valid CBOR item.
-    pub fn with_magic() -> Self {
-        let mut w = Self::default();
+    /// whole payload stays one valid CBOR item. Room for roughly
+    /// `elements` element records is reserved up front — an id-table
+    /// entry is 17 bytes and a record's frame about as much again — so
+    /// a whole model never starts from nothing and walks the doubling
+    /// sequence.
+    pub fn with_magic_for(elements: usize) -> Self {
+        let mut w = Self {
+            buf: Vec::with_capacity(crate::MAGIC.len() + elements.saturating_mul(48)),
+        };
         w.buf.extend_from_slice(crate::MAGIC);
         w
     }
@@ -41,6 +47,9 @@ impl Writer {
         self.buf.extend_from_slice(bytes);
     }
 
+    // Each arm narrows `arg` to the width its own range bound already
+    // proves exact — that is what picking the shortest head means.
+    #[allow(clippy::cast_possible_truncation)]
     fn head(&mut self, major: u8, arg: u64) {
         let m = major << 5;
         match arg {
@@ -150,7 +159,7 @@ impl<'a> Reader<'a> {
         let b = *self
             .buf
             .get(self.pos)
-            .ok_or_else(|| Error::new("truncated payload"))?;
+            .ok_or_else(|| Error::of(ErrorKind::Truncated, "truncated payload"))?;
         self.pos += 1;
         Ok(b)
     }
@@ -160,7 +169,7 @@ impl<'a> Reader<'a> {
             .pos
             .checked_add(n)
             .filter(|&e| e <= self.buf.len())
-            .ok_or_else(|| Error::new("truncated payload"))?;
+            .ok_or_else(|| Error::of(ErrorKind::Truncated, "truncated payload"))?;
         let s = &self.buf[self.pos..end];
         self.pos = end;
         Ok(s)
@@ -179,6 +188,20 @@ impl<'a> Reader<'a> {
 
     fn len(arg: u64) -> Result<usize, Error> {
         usize::try_from(arg).map_err(|_| Error::new("length overflow"))
+    }
+
+    /// Narrow an already-read wire integer to an in-memory index or
+    /// position. Wire integers are 64-bit and `usize` is 32 bits on
+    /// the wasm targets, so a value that cannot address memory here is
+    /// a malformed payload rather than a silently wrapped index.
+    pub fn index_of(arg: u64) -> Result<usize, Error> {
+        usize::try_from(arg).map_err(|_| Error::new(format!("wire index {arg} out of range")))
+    }
+
+    /// Read an unsigned wire integer as an index or position
+    /// ([`Self::index_of`]).
+    pub fn index(&mut self) -> Result<usize, Error> {
+        Self::index_of(self.uint()?)
     }
 
     pub fn head(&mut self) -> Result<Head, Error> {
@@ -234,6 +257,39 @@ impl<'a> Reader<'a> {
     /// [`crate::describe`]. Iterative (a pending counter, not
     /// recursion), and every step consumes at least one byte, so
     /// adversarial nesting terminates at the truncation error.
+    /// Read a map keyed by strictly ascending in-memory indices — the
+    /// shape every exception, owner and units section shares. The
+    /// header is gated against the payload before anything is
+    /// allocated (`per_entry` is the fewest bytes one entry can
+    /// occupy), each key is narrowed and checked against its
+    /// predecessor, and `value` reads the value with the reader
+    /// positioned on it. `what` names the section in the three errors
+    /// this can raise.
+    pub fn ascending_map<T>(
+        &mut self,
+        what: &str,
+        per_entry: usize,
+        mut value: impl FnMut(&mut Self) -> Result<T, Error>,
+    ) -> Result<Vec<(usize, T)>, Error> {
+        let n = match self.head()? {
+            Head::Map(n) if n <= self.remaining() / per_entry => n,
+            Head::Map(_) => return Err(Error::new(format!("{what} longer than payload"))),
+            _ => return Err(Error::new(format!("{what} expected"))),
+        };
+        let mut out = Vec::with_capacity(n);
+        let mut prev: Option<usize> = None;
+        for _ in 0..n {
+            let key = self.index()?;
+            if prev.is_some_and(|p| key <= p) {
+                return Err(Error::new(format!("{what} indices not ascending")));
+            }
+            prev = Some(key);
+            let v = value(self)?;
+            out.push((key, v));
+        }
+        Ok(out)
+    }
+
     pub fn skip_items(&mut self, count: u64) -> Result<(), Error> {
         let mut pending = count;
         while pending > 0 {

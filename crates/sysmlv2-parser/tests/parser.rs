@@ -807,6 +807,29 @@ fn constructor_and_metadata_access() {
         value_expr("x.metadata").kind,
         ExprKind::MetadataAccess { .. }
     ));
+    let ExprKind::MetadataAccess { target } = value_expr("P::Q::x.metadata").kind else {
+        panic!()
+    };
+    assert_eq!(target.to_display_string(), "P::Q::x");
+    // A left operand that is not an element reference is diagnosed, and the
+    // operand itself survives in the tree.
+    let Parse { unit, diagnostics } = parse_source("package P { attribute a = (1 + 2).metadata; }");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("element reference")),
+        "{diagnostics:#?}"
+    );
+    let MemberKind::Package(pkg) = &unit.members[0].kind else {
+        panic!()
+    };
+    let MemberKind::Usage(u) = &pkg.body.as_ref().unwrap()[0].kind else {
+        panic!()
+    };
+    assert!(matches!(
+        u.value.as_ref().unwrap().expr.kind,
+        ExprKind::Binary { .. }
+    ));
 }
 
 #[test]
@@ -1051,8 +1074,22 @@ fn member_prefixed_target_succession_source_multiplicity() {
         panic!()
     };
     assert!(source.multiplicity.is_some());
-    assert!(matches!(&source.target, TargetRef::Chain(links) if links.is_empty()));
+    assert!(source.target.is_unspelled());
     assert!(matches!(&target.target, TargetRef::Name(qn) if qn.to_display_string() == "next"));
+}
+
+/// The reference of an end the text does not spell has a name of its own,
+/// is recognised by it, and carries no span because it covers no text.
+#[test]
+fn an_unspelled_reference_is_named_and_spanless() {
+    let unspelled = TargetRef::unspelled();
+    assert!(unspelled.is_unspelled());
+    assert_eq!(unspelled.span(), sysmlv2_parser::Span::default());
+    let spelled = first_usage("package P { connect a to b; }");
+    let UsageDetail::Connector { ends } = &spelled.detail else {
+        panic!()
+    };
+    assert!(ends.iter().all(|e| !e.target.is_unspelled()));
 }
 
 #[test]
@@ -1781,4 +1818,404 @@ fn spans_are_meaningful() {
     let Parse { unit, .. } = parse_source(src);
     let m = &unit.members[0];
     assert_eq!(m.span.slice(src), src.trim_end());
+}
+
+// ---------------------------------------------------------------------------
+// Member-start lookahead
+// ---------------------------------------------------------------------------
+
+fn state_body(src: &str) -> Vec<Member> {
+    let body = package_body(src);
+    let MemberKind::Definition(d) = &body[0].kind else {
+        panic!("expected a state definition, got {:?}", body[0].kind)
+    };
+    let MemberKind::Usage(s) = &d.body.as_ref().unwrap()[0].kind else {
+        panic!("expected a state usage")
+    };
+    s.body.clone().expect("state body")
+}
+
+/// The lookahead that tells an accept *node* from the accept-transition
+/// shorthand balances braces, so a trigger carrying a body-expression
+/// argument keeps its `then` target, and it scans the whole member, so a
+/// trigger of any length does too.
+#[test]
+fn accept_transition_shorthand_keeps_its_target() {
+    let items = state_body(
+        "package P {
+            state def S {
+                state s1 {
+                    accept sig when xs->exists { in x; x > 0 } then s2;
+                }
+                state s2;
+            }
+        }",
+    );
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let MemberKind::Usage(t) = &items[0].kind else {
+        panic!("{:?}", items[0].kind)
+    };
+    assert_eq!(t.kind, UsageKind::Transition);
+    let UsageDetail::Transition {
+        trigger, target, ..
+    } = &t.detail
+    else {
+        panic!()
+    };
+    assert!(trigger.is_some() && target.is_some());
+
+    // A trigger far longer than any fixed scan window.
+    let guard = (0..250)
+        .map(|i| format!("a{i} > 0"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let items = state_body(&format!(
+        "package P {{
+            state def S {{
+                state s1 {{
+                    accept sig when {guard} then s2;
+                }}
+                state s2;
+            }}
+        }}"
+    ));
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let MemberKind::Usage(t) = &items[0].kind else {
+        panic!("{:?}", items[0].kind)
+    };
+    assert_eq!(t.kind, UsageKind::Transition);
+
+    // An accept node with a body is still a node, not a transition.
+    let items = state_body(
+        "package P {
+            state def S {
+                state s1 {
+                    accept sig : Signal { assign x := 1; }
+                }
+            }
+        }",
+    );
+    let MemberKind::Usage(a) = &items[0].kind else {
+        panic!("{:?}", items[0].kind)
+    };
+    assert_eq!(a.kind, UsageKind::Accept);
+    assert!(a.body.is_some());
+}
+
+/// A `{` that follows a complete trigger or payload expression opens the
+/// accept node's own body and ends the lookahead, so a following member
+/// starting with `then`, `if` or `do` is neither consumed nor able to turn
+/// the node into a transition shorthand.
+#[test]
+fn accept_node_body_ends_the_lookahead() {
+    fn action_body(src: &str) -> Vec<Member> {
+        let body = package_body(src);
+        let MemberKind::Usage(a) = &body[0].kind else {
+            panic!("expected an action usage, got {:?}", body[0].kind)
+        };
+        a.body.clone().expect("action body")
+    }
+
+    for trigger in ["via p", "at t1", "when c", ": Signal"] {
+        for tail in ["then b;", "if g then b;", "do b;"] {
+            let src = format!(
+                "package P {{ action a {{ accept sig {trigger} {{ }} {tail} action b; }} }}"
+            );
+            let items = action_body(&src);
+            let MemberKind::Usage(node) = &items[0].kind else {
+                panic!("{src}: {:?}", items[0].kind)
+            };
+            assert_eq!(node.kind, UsageKind::Accept, "{src}");
+            assert!(node.body.is_some(), "{src}");
+            // The tail and the following declaration both survive as their
+            // own members.
+            assert_eq!(items.len(), 3, "{src}: {items:#?}");
+        }
+    }
+}
+
+/// A trigger, a `via` clause and a payload's value are parsed as full
+/// expressions, and a conditional is one of them: its `if` stands where an
+/// operand is expected, so it opens the conditional rather than the guard
+/// of the transition shorthand. The parenthesized and bare spellings
+/// classify alike, and the guard that really is one still reads as a
+/// guard.
+#[test]
+fn a_conditional_in_a_trigger_is_not_the_shorthands_guard() {
+    fn only_member(src: &str) -> Usage {
+        let items = state_body(src);
+        assert_eq!(items.len(), 1, "{src}: {items:#?}");
+        let MemberKind::Usage(u) = &items[0].kind else {
+            panic!("{src}: {:?}", items[0].kind)
+        };
+        u.clone()
+    }
+
+    for trigger in [
+        "when (if a ? b else c)",
+        "when if a ? b else c",
+        "when if a ? b else if c ? d else e",
+        "via if a ? p else q",
+        "when if g ? b else c",
+    ] {
+        let src = format!(
+            "package P {{
+                state def S {{
+                    state s1 {{
+                        accept sig : Sig {trigger};
+                    }}
+                    state s2;
+                }}
+            }}"
+        );
+        assert_eq!(only_member(&src).kind, UsageKind::Accept, "{src}");
+    }
+
+    // The shorthand's guard is still a guard — after a payload, after a
+    // trigger expression, and after one that ends in a conditional.
+    for head in [
+        "accept sig : Sig if g",
+        "accept sig when c if g",
+        "accept sig when if a ? b else c if g",
+    ] {
+        let src = format!(
+            "package P {{
+                state def S {{
+                    state s1 {{
+                        {head} then s2;
+                    }}
+                    state s2;
+                }}
+            }}"
+        );
+        let member = only_member(&src);
+        assert_eq!(member.kind, UsageKind::Transition, "{src}");
+        let UsageDetail::Transition { guard, target, .. } = &member.detail else {
+            panic!("{src}: {:?}", member.detail)
+        };
+        assert!(guard.is_some() && target.is_some(), "{src}");
+    }
+}
+
+/// The word-spelled operators take an operand the way their symbolic
+/// spellings do, and an expression may spell an operand as a body. A
+/// brace after one therefore opens that operand, not the accept node's
+/// own body — so the scan reads on to the `then` beyond it and classifies
+/// the member as the transition it is.
+#[test]
+fn a_brace_after_a_word_operator_is_an_operand() {
+    fn only_member(src: &str) -> Usage {
+        let items = state_body(src);
+        assert_eq!(items.len(), 1, "{src}: {items:#?}");
+        let MemberKind::Usage(u) = &items[0].kind else {
+            panic!("{src}: {:?}", items[0].kind)
+        };
+        u.clone()
+    }
+
+    fn state(member: &str) -> String {
+        format!(
+            "package P {{
+                state def S {{
+                    state s1 {{
+                        {member}
+                    }}
+                    state s2;
+                }}
+            }}"
+        )
+    }
+
+    for expr in [
+        "a and { b }",
+        "a or { b }",
+        "a xor { b }",
+        "a implies { b }",
+        "not { b }",
+    ] {
+        let src = state(&format!("accept sig : Sig when {expr} then s2;"));
+        let member = only_member(&src);
+        assert_eq!(member.kind, UsageKind::Transition, "{src}");
+        let UsageDetail::Transition {
+            trigger, target, ..
+        } = &member.detail
+        else {
+            panic!("{src}: {:?}", member.detail)
+        };
+        assert!(trigger.is_some() && target.is_some(), "{src}");
+
+        // Without the tail the same head is the node itself, and its
+        // own body still reads as a body.
+        let src = state(&format!("accept sig : Sig when {expr};"));
+        assert_eq!(only_member(&src).kind, UsageKind::Accept, "{src}");
+        let src = state(&format!("accept sig : Sig when {expr} {{ action q; }}"));
+        let member = only_member(&src);
+        assert_eq!(member.kind, UsageKind::Accept, "{src}");
+        assert!(member.body.is_some(), "{src}");
+    }
+}
+
+/// The lookahead stops at the member it is classifying, so a body holding
+/// many accept members costs time linear in its size rather than
+/// quadratic — including when those members are malformed, which is when
+/// a scan looking for a balanced terminator would run away.
+///
+/// Measured in tokens read rather than in wall-clock time: the count is
+/// exactly the work the scan does, and does not depend on the machine.
+///
+/// A member that never closes its brace nests a body per member, so the
+/// probe runs on a thread with room for the nesting bound itself — the
+/// count it reads is kept per thread, so the parsing has to happen there
+/// too.
+#[test]
+fn accept_lookahead_is_linear_in_the_body_size() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(accept_lookahead_probe)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn accept_lookahead_probe() {
+    fn lookahead_tokens(member: &str, count: usize) -> u64 {
+        let members = (0..count)
+            .map(|i| member.replace('#', &i.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let src = format!("package P {{ action a {{ {members} }} }}");
+        sysmlv2_parser::parser::take_accept_lookahead_tokens();
+        let _ = parse_source(&src);
+        sysmlv2_parser::parser::take_accept_lookahead_tokens()
+    }
+
+    for member in [
+        // Well formed, and each shape of unbalanced opener: a member that
+        // never closes its bracket, its parenthesis, or its brace.
+        "accept sig# via p { }",
+        "accept sig# when (x;",
+        "accept sig# when x[1;",
+        "accept sig# when { x;",
+    ] {
+        let small = lookahead_tokens(member, 1_000);
+        let large = lookahead_tokens(member, 4_000);
+        assert!(
+            large <= small * 5,
+            "{member:?}: 4000 members read {large} lookahead tokens \
+             against {small} for 1000"
+        );
+    }
+
+    // A well-formed member's classification reads its own tokens and no
+    // more; a malformed one stops at its terminator all the same.
+    for (member, ceiling) in [
+        ("accept sig# via p { }", 8),
+        ("accept sig# when (x;", 8),
+        ("accept sig# when x[1;", 8),
+    ] {
+        let per_member = lookahead_tokens(member, 1_000) / 1_000;
+        assert!(
+            per_member <= ceiling,
+            "{member:?} read {per_member} lookahead tokens per member"
+        );
+    }
+}
+
+/// Nested `else action { … }` levels are each parsed once: the branch is
+/// decided by lookahead instead of by parsing a whole subtree and rolling
+/// back, which cost one full re-parse of everything below per level.
+#[test]
+fn nested_else_action_bodies_parse_in_linear_time() {
+    const DEPTH: usize = 8;
+    const INNER_MEMBERS: usize = 3000;
+    let innermost = (0..INNER_MEMBERS)
+        .map(|i| format!("part p{i};"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut nested = format!("if c {{ }} else action {{ {innermost} }}");
+    for _ in 0..DEPTH {
+        nested = format!("if c {{ }} else action {{ {nested} }}");
+    }
+    let src = format!("package P {{ action a {{ {nested} }} }}");
+    let start = std::time::Instant::now();
+    let body = package_body(&src);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "{DEPTH} nested else-action levels took {:?}",
+        start.elapsed()
+    );
+
+    // The nesting is still what it says: each level is an if-node whose
+    // else branch is an anonymous action body holding the next one.
+    let MemberKind::Usage(action) = &body[0].kind else {
+        panic!("{:?}", body[0].kind)
+    };
+    let mut members = action.body.clone().expect("action body");
+    let mut level = 0;
+    loop {
+        let MemberKind::Usage(node) = &members[0].kind else {
+            panic!("{:?}", members[0].kind)
+        };
+        assert_eq!(node.kind, UsageKind::IfNode);
+        let UsageDetail::IfNode { else_body, .. } = &node.detail else {
+            panic!()
+        };
+        let else_body = else_body.as_ref().expect("else branch");
+        assert_eq!(else_body.kind, UsageKind::Action);
+        members = else_body.body.clone().expect("else action body");
+        level += 1;
+        if members.len() == INNER_MEMBERS {
+            break;
+        }
+    }
+    assert_eq!(level, DEPTH + 1);
+}
+
+/// A declared nested if-node after `else` is still recognised through its
+/// action head.
+#[test]
+fn else_action_declaration_before_if_is_a_nested_node() {
+    let body = package_body("package P { action a { if c { } else action alt if d { } } }");
+    let MemberKind::Usage(action) = &body[0].kind else {
+        panic!()
+    };
+    let members = action.body.as_ref().unwrap();
+    let MemberKind::Usage(node) = &members[0].kind else {
+        panic!()
+    };
+    let UsageDetail::IfNode { else_body, .. } = &node.detail else {
+        panic!()
+    };
+    let alt = else_body.as_ref().expect("else branch");
+    assert_eq!(alt.kind, UsageKind::IfNode);
+    assert_eq!(alt.declaration.id.name.as_ref().unwrap().value, "alt");
+}
+
+/// Syntax-tree nodes stay small. Every member of a body, every usage and
+/// every expression is stored by value in a `Vec` and moved through the
+/// parser's call chain, so one oversized payload — a multiplicity's two
+/// expressions, an accept node's payload part — is paid for by every node
+/// of that kind in the file and by every stack frame that carries one.
+/// Ceilings are for a 64-bit target and leave a little room; a real
+/// increase should be a deliberate one.
+#[test]
+fn syntax_tree_nodes_stay_small() {
+    use std::mem::size_of;
+    for (name, size, ceiling) in [
+        ("Member", size_of::<Member>(), 576),
+        ("MemberKind", size_of::<MemberKind>(), 552),
+        ("Usage", size_of::<Usage>(), 544),
+        ("UsageDetail", size_of::<UsageDetail>(), 96),
+        ("Definition", size_of::<Definition>(), 288),
+        ("Expr", size_of::<Expr>(), 80),
+        ("Multiplicity", size_of::<Multiplicity>(), 144),
+        ("FeatureDeclaration", size_of::<FeatureDeclaration>(), 352),
+        ("ConnectorEnd", size_of::<ConnectorEnd>(), 88),
+        ("PayloadPart", size_of::<PayloadPart>(), 120),
+    ] {
+        assert!(
+            size <= ceiling,
+            "{name} is {size} bytes, over its {ceiling}-byte ceiling"
+        );
+    }
 }

@@ -287,6 +287,24 @@ fn kerml_units_are_out_of_scope() {
 }
 
 #[test]
+fn a_unit_named_in_upper_case_is_the_same_dialect() {
+    // Unit names come from file systems that do not distinguish case,
+    // so the dialect a name spells is read without it: this text parses
+    // (it is KerML, which SysML would reject) and the gate refuses it
+    // for the same dialect the parse chose.
+    let mut s = Session::from_sources(vec![(
+        "m.KerML".into(),
+        "package K { feature f { feature g; } }".into(),
+    )])
+    .expect("parses");
+    let f = elem(&mut s, "K::f");
+    assert_eq!(
+        s.extract_definition_eligibility(f).unwrap_err(),
+        ExtractRefusal::UnsupportedDialect
+    );
+}
+
+#[test]
 fn a_definition_is_not_an_extractable_usage() {
     let src = "package P { part def A { attribute a; } }";
     let mut s = session(src);

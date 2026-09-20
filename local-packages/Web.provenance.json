@@ -1,13 +1,13 @@
 {
   "generator": {
     "name": "@sysml/web",
-    "version": "0.5.5-rc.1"
+    "version": "0.8.0"
   },
   "dataset": {
     "@webref/idl": "3.83.0",
     "@webref/elements": "2.8.0"
   },
-  "kernel": "0.5.5-rc.1",
+  "kernel": "0.8.0",
   "library": "Web",
   "elements": {
     "Web::DOM::AbstractRange": {
@@ -14483,22 +14483,6 @@
         "wrapper:HTMLOptionsCollection"
       ]
     },
-    "Web::HTML::HTMLSelectElement::remove": {
-      "spec": "html",
-      "interface": "HTMLSelectElement",
-      "member": "remove",
-      "url": "https://html.spec.whatwg.org/multipage/#dom-htmlselectelement-remove",
-      "kind": "operation",
-      "params": [
-        {
-          "name": "index",
-          "type": "Integer",
-          "multiplicity": "[0..1]",
-          "optional": true
-        }
-      ],
-      "overloads": 2
-    },
     "Web::HTML::HTMLSelectElement::reportValidity": {
       "spec": "html",
       "interface": "HTMLSelectElement",
@@ -18226,6 +18210,9 @@
     "Web::HTML::HTMLOrSVGOrMathMLElement::dataset": {
       "reason": "record",
       "idlType": "DOMStringMap"
+    },
+    "Web::HTML::HTMLSelectElement::remove": {
+      "reason": "inherited-member:ChildNode"
     },
     "Web::HTML::OffscreenCanvas::convertToBlob": {
       "reason": "external-type:Blob"

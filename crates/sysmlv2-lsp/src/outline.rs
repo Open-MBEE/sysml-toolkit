@@ -28,9 +28,42 @@ use sysmlv2_parser::ast::{
 use sysmlv2_parser::span::Span;
 
 /// Build the outline for one parsed unit over its source text.
+///
+/// Names are the declared names verbatim (anonymous members get a
+/// `«keyword»` label): the completion tier derives referenceable
+/// spellings from this tree, so the empty unrestricted name `''` stays
+/// `""` here. Responses that leave the server go through
+/// [`spell_symbols`] / [`spell_name`], which give that name a visible
+/// spelling — clients reject a symbol whose name is empty and drop the
+/// whole outline of the file on one.
+#[must_use]
 pub fn document_symbols(unit: &SourceUnit, src: &str, mapper: &Mapper<'_>) -> Vec<DocumentSymbol> {
     let ctx = Ctx { src, mapper };
     walk(&unit.members, &ctx, false)
+}
+
+/// A symbol or completion label that is never empty: the empty
+/// unrestricted name is spelled as in source, `''`. Only for labels —
+/// insert text must keep escaping the raw name.
+#[must_use]
+pub fn spell_name(raw: &str) -> String {
+    if raw.is_empty() {
+        "''".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Apply [`spell_name`] to every symbol of an outline before it is sent.
+pub fn spell_symbols(symbols: &mut [DocumentSymbol]) {
+    for s in symbols {
+        if s.name.is_empty() {
+            s.name = spell_name("");
+        }
+        if let Some(children) = &mut s.children {
+            spell_symbols(children);
+        }
+    }
 }
 
 /// First `doc` body per declaration, keyed by the declared name's
@@ -415,6 +448,8 @@ fn usage_detail(u: &Usage, ctx: &Ctx<'_>) -> Option<String> {
 
 /// Declared name: regular name preferred, short name as fallback,
 /// `«keyword»` for anonymous members (positional structure stays visible).
+/// The empty unrestricted name `''` is legal and distinct from anonymity
+/// and stays `""` here (see [`document_symbols`]).
 fn name_of(id: &Identification, keyword: &str) -> String {
     id.name
         .as_ref()
@@ -430,7 +465,7 @@ fn sel(id: &Identification, member: Span) -> Span {
         .as_ref()
         .or(id.short_name.as_ref())
         .map(|n| n.span)
-        .unwrap_or(Span::new(member.start, member.start))
+        .unwrap_or_else(|| Span::new(member.start, member.start))
 }
 
 #[allow(deprecated)] // DocumentSymbol's `deprecated` field must be filled

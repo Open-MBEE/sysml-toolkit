@@ -800,9 +800,48 @@ fn check_sources_reports_parse_errors_with_positions() {
     assert!(!findings.is_empty(), "expected parse findings");
     let f = &findings[0];
     assert_eq!(f.severity, sysmlv2_transform::Severity::Error);
+    assert_eq!(f.stage, sysmlv2_transform::CheckStage::Parse);
     assert_eq!(f.unit, "bad.sysml");
     assert_eq!(f.line, 2, "position should point at the broken typing");
     assert!(f.col > 0);
+}
+
+#[test]
+fn check_sources_stages_context_referential_and_semantic_findings() {
+    let lib = sysmlv2_testkit::library_dir();
+    let findings = sysmlv2_transform::check_sources(
+        &[(
+            "staged.sysml".into(),
+            "package Staged {\n  import ScalarValues::*;\n  part p : Missing;\n  attribute def V;\n  individual def I :> V;\n}\n".into(),
+        )],
+        Some(&lib),
+    )
+    .expect("check runs");
+    let stage_of = |needle: &str| {
+        findings
+            .iter()
+            .find(|f| f.message.contains(needle))
+            .unwrap_or_else(|| panic!("no finding containing {needle:?}: {findings:?}"))
+            .stage
+    };
+    assert_eq!(
+        stage_of("explicit visibility"),
+        sysmlv2_transform::CheckStage::Context
+    );
+    assert_eq!(
+        stage_of("unresolved reference"),
+        sysmlv2_transform::CheckStage::Referential
+    );
+    assert_eq!(
+        stage_of("cannot specialize a data type"),
+        sysmlv2_transform::CheckStage::Semantic
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.stage != sysmlv2_transform::CheckStage::Parse),
+        "nothing failed to parse: {findings:?}"
+    );
 }
 
 #[test]
@@ -1296,4 +1335,907 @@ fn replace_batch_tolerates_sibling_consumed_references() {
     assert!(t.contains("part def Beta;"), "{t}");
     assert!(t.contains("about Beta"), "{t}");
     assert!(t.contains("body = \"new\""), "{t}");
+}
+
+#[test]
+fn removing_inline_succession_preserves_its_action_and_references() {
+    for prefix in [
+        "then",
+        "then [1]",
+        "private then",
+        "then private",
+        "then // retained\n",
+    ] {
+        let src =
+            format!("part p {{ perform action a; {prefix} perform action b; first b then a; }}");
+        let mut s = session(&src);
+        let owner = s.resolved().resolve_qualified("p").unwrap();
+        let edge = s
+            .resolved()
+            .owned_members(owner)
+            .into_iter()
+            .find(|&m| s.resolved().element_type(m) == "SuccessionAsUsage")
+            .unwrap();
+        let mut edit = s.edit();
+        edit.remove(edge);
+        edit.commit()
+            .expect("only the implicit relationship is removed");
+        let out = text(&s);
+        assert!(
+            out.contains("perform action a;")
+                && out.contains("perform action b;")
+                && out.contains("first b then a;"),
+            "{out}"
+        );
+        assert_eq!(out.matches("then").count(), 1, "{out}");
+        assert!(!out.contains("[1]"), "{out}");
+        if prefix.contains("private") {
+            assert!(out.contains("private"), "{out}");
+        }
+        if prefix.contains("retained") {
+            assert!(out.contains("// retained"), "{out}");
+        }
+        let owner = s.resolved().resolve_qualified("p").unwrap();
+        assert_eq!(
+            s.resolved()
+                .owned_members(owner)
+                .into_iter()
+                .filter(|&m| s.resolved().element_type(m) == "SuccessionAsUsage")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn check_sources_names_the_private_member_behind_an_unresolved_reference() {
+    let lib = sysmlv2_testkit::library_dir();
+    let findings = sysmlv2_transform::check_sources(
+        &[(
+            "blocked.sysml".into(),
+            "package P {\n  constraint def MaxTime { private port maxTime; }\n  part def Req { constraint c : MaxTime; attribute limit; bind c.maxTime = limit; }\n}\n".into(),
+        )],
+        Some(&lib),
+    )
+    .expect("check runs");
+    let f = findings
+        .iter()
+        .find(|f| f.message.starts_with("unresolved reference"))
+        .unwrap_or_else(|| panic!("{findings:?}"));
+    assert_eq!(
+        f.message,
+        "unresolved reference `maxTime` — `P::MaxTime::maxTime` exists but is private"
+    );
+    assert_eq!(f.stage, sysmlv2_transform::CheckStage::Referential);
+}
+
+// ---------------------------------------------------------------------------
+// split: one file per nested package, references preserved
+// ---------------------------------------------------------------------------
+
+const SPLIT_SRC: &str = "package Lib { part def Thing; }
+package R {
+    private import Lib::*;
+    package A {
+        part def X;
+        part t : Thing;
+        part b : B::Y;
+    }
+    package B {
+        part def Y :> A::X;
+    }
+    part r : A::X;
+}
+package Q {
+    part q : R::A::X;
+    private import R::B::*;
+    part y : Y;
+}
+";
+
+fn split_session(src: &str) -> sysmlv2_transform::Session {
+    sysmlv2_transform::Session::from_sources(vec![("models/r.sysml".into(), src.into())]).unwrap()
+}
+
+#[test]
+fn split_plan_names_one_unit_per_nested_package() {
+    let mut s = split_session(SPLIT_SRC);
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    assert_eq!(plan.root_unit, "models/r.sysml");
+    assert_eq!(plan.directory, "models/r");
+    let units: Vec<(&str, &str, Option<&str>)> = plan
+        .entries
+        .iter()
+        .map(|e| (e.qualified.as_str(), e.unit.as_str(), e.new_name.as_deref()))
+        .collect();
+    assert_eq!(
+        units,
+        [
+            ("R::A", "models/r/A.sysml", None),
+            ("R::B", "models/r/B.sysml", None)
+        ]
+    );
+    assert!(plan.entries.iter().all(|e| e.bytes > 0));
+    // Not a package, or a package with nothing nested: refused with a reason.
+    let lib = s.resolved().resolve_qualified("Lib").unwrap();
+    let err = s
+        .split_plan(lib, &sysmlv2_transform::SplitOptions::default())
+        .unwrap_err();
+    assert!(err.to_string().contains("owns no nested package"), "{err}");
+}
+
+#[test]
+fn split_hoists_packages_and_keeps_every_reference_resolving() {
+    let mut s = split_session(SPLIT_SRC);
+    let before = s.resolved().unresolved_count();
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    let mut edit = s.edit();
+    edit.split(&plan);
+    let report = edit.commit().unwrap_or_else(|e| panic!("{e}"));
+    // The root's `private import Lib::*` fed only the moved text: noted.
+    assert!(
+        report.findings.iter().all(|f| f.contains("import")),
+        "{:?}",
+        report.findings
+    );
+    let unit = |name: &str| {
+        s.units()
+            .find(|(_, n, _)| *n == name)
+            .map(|(_, _, t)| t.to_string())
+            .unwrap_or_else(|| panic!("no unit {name}"))
+    };
+    let r = unit("models/r.sysml");
+    // The root keeps its own members and re-exports the moved packages.
+    assert!(!r.contains("package A"), "{r}");
+    assert!(r.contains("    part r : A::X;\n"), "{r}");
+    assert!(r.contains("    public import A;\n"), "{r}");
+    assert!(r.contains("    public import B;\n"), "{r}");
+    // Moved text is dedented and outward references are spelled in full;
+    // references inside the moved package stay as written.
+    let a = unit("models/r/A.sysml");
+    assert_eq!(
+        a,
+        "package A {\n    part def X;\n    part t : Lib::Thing;\n    part b : R::B::Y;\n}\n"
+    );
+    let b = unit("models/r/B.sysml");
+    assert_eq!(b, "package B {\n    part def Y :> R::A::X;\n}\n");
+    assert_eq!(s.resolved().unresolved_count(), before);
+    // Qualified references through the root, from inside and outside,
+    // still denote the same elements.
+    let q = s.resolved().resolve_qualified("Q::q").unwrap();
+    let x = s.resolved().resolve_qualified("A::X").unwrap();
+    assert_eq!(s.resolved().typings(q), vec![x]);
+    assert_eq!(s.resolved().resolve_qualified("R::A::X"), Some(x));
+    assert_eq!(
+        s.resolved().resolve_qualified("R::B::Y"),
+        s.resolved().resolve_qualified("B::Y")
+    );
+}
+
+#[test]
+fn split_renames_a_colliding_package_and_aliases_it() {
+    // `Lib` already exists at the root: the nested one is renamed and
+    // the root keeps an alias, so `R::Lib::K` still resolves.
+    let src = "package Lib { part def Thing; }
+package R {
+    package Lib { part def K; }
+    part k : Lib::K;
+}
+package Q { part k : R::Lib::K; }
+";
+    let mut s = split_session(src);
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(
+            root,
+            &sysmlv2_transform::SplitOptions {
+                naming: sysmlv2_transform::SplitNaming::Slug,
+                directory: Some("out".into()),
+                uri_units: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(plan.entries.len(), 1);
+    assert_eq!(plan.entries[0].new_name.as_deref(), Some("R Lib"));
+    assert_eq!(plan.entries[0].unit, "out/R-Lib.sysml");
+    let mut edit = s.edit();
+    edit.split(&plan);
+    edit.commit().unwrap_or_else(|e| panic!("{e}"));
+    let r = s
+        .units()
+        .find(|(_, n, _)| *n == "models/r.sysml")
+        .map(|(_, _, t)| t.to_string())
+        .unwrap();
+    assert!(r.contains("    public alias Lib for 'R Lib';\n"), "{r}");
+    let moved = s
+        .units()
+        .find(|(_, n, _)| *n == "out/R-Lib.sysml")
+        .map(|(_, _, t)| t.to_string())
+        .unwrap();
+    assert_eq!(moved, "package 'R Lib' { part def K; }\n");
+    assert_eq!(s.resolved().unresolved_count(), 0);
+    let k = s.resolved().resolve_qualified("'R Lib'::K").unwrap();
+    assert_eq!(s.resolved().resolve_qualified("R::Lib::K"), Some(k));
+}
+
+#[test]
+fn split_respells_a_renamed_package_naming_itself_and_keeps_its_own_imports() {
+    // `Lib::K` written inside the nested `Lib` names the package itself:
+    // under the new name it must follow. `Thing` resolves through the
+    // package's own import, which moves with it: left as written.
+    let src = "package Lib { part def Thing; }
+package R {
+    package Lib {
+        private import $::Lib::*;
+        part def K;
+        part k : Lib::K;
+        part k2 : R::Lib::K;
+        part k3 : $::R::Lib::K;
+        part t : Thing;
+    }
+}
+";
+    let mut s = split_session(src);
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    let mut edit = s.edit();
+    edit.split(&plan);
+    edit.commit().unwrap_or_else(|e| panic!("{e}"));
+    let moved = s
+        .units()
+        .find(|(_, n, _)| *n == "models/r/R Lib.sysml")
+        .map(|(_, _, t)| t.to_string())
+        .unwrap();
+    assert_eq!(
+        moved,
+        "package 'R Lib' {\n    private import $::Lib::*;\n    part def K;\n    part k : 'R Lib'::K;\n    part k2 : R::Lib::K;\n    part k3 : $::R::Lib::K;\n    part t : Thing;\n}\n"
+    );
+    assert_eq!(s.resolved().unresolved_count(), 0);
+}
+
+#[test]
+fn split_prefixes_a_respelled_reference_the_moved_text_would_shadow() {
+    // `A::X` and `Thing` respell to `R::A::X` and `Lib::Thing`, whose
+    // first segments the moved package's own members `R` and `Lib` would
+    // capture: both spellings start from the global root instead.
+    let src = "package Lib { part def Thing; }
+package R {
+    private import Lib::*;
+    package A { part def X; }
+    package B {
+        part def R;
+        part def Lib;
+        part def Y :> A::X;
+        part t : Thing;
+    }
+}
+";
+    let mut s = split_session(src);
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    let mut edit = s.edit();
+    edit.split(&plan);
+    edit.commit().unwrap_or_else(|e| panic!("{e}"));
+    let moved = s
+        .units()
+        .find(|(_, n, _)| *n == "models/r/B.sysml")
+        .map(|(_, _, t)| t.to_string())
+        .unwrap();
+    assert_eq!(
+        moved,
+        "package B {\n    part def R;\n    part def Lib;\n    part def Y :> $::R::A::X;\n    part t : $::Lib::Thing;\n}\n"
+    );
+    assert_eq!(s.resolved().unresolved_count(), 0);
+}
+
+#[test]
+fn split_plan_reads_the_extension_from_the_file_segment_only() {
+    let src = "package R { package A { part def X; } }\n";
+    let mut s =
+        sysmlv2_transform::Session::from_sources(vec![("models.v2/r".into(), src.into())]).unwrap();
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    assert_eq!(plan.directory, "models.v2/r");
+    assert_eq!(plan.entries[0].unit, "models.v2/r/A.sysml");
+    let mut s = sysmlv2_transform::Session::from_sources(vec![(
+        "k.kerml".into(),
+        "package R { package 'A/B' { classifier X; } }\n".into(),
+    )])
+    .unwrap();
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    // A path separator in a name never nests the file; the dialect's
+    // extension carries over.
+    assert_eq!(plan.entries[0].unit, "k/A-B.kerml");
+}
+
+#[test]
+fn split_keeps_global_rooted_references_global() {
+    // Inside B a member named `R` shadows the root package, so the
+    // reference into A is written from the global root; the hoist must
+    // not strip that prefix, which would make it denote the local `R`.
+    let src = "package R {
+    package A { part def X; }
+    package B {
+        part def R { part def X; }
+        part x : $::R::A::X;
+        part y : R::X;
+    }
+}
+";
+    let mut s = split_session(src);
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    let mut edit = s.edit();
+    edit.split(&plan);
+    edit.commit().unwrap_or_else(|e| panic!("{e}"));
+    let b = s
+        .units()
+        .find(|(_, n, _)| *n == "models/r/B.sysml")
+        .map(|(_, _, t)| t.to_string())
+        .unwrap();
+    assert!(b.contains("    part x : $::R::A::X;\n"), "{b}");
+    assert!(b.contains("    part y : R::X;\n"), "{b}");
+    let x = s.resolved().resolve_qualified("B::x").unwrap();
+    let ax = s.resolved().resolve_qualified("A::X").unwrap();
+    assert_eq!(s.resolved().typings(x), vec![ax]);
+}
+
+#[test]
+fn split_dry_run_reports_the_new_units_as_splices_and_leaves_the_session() {
+    let mut s = split_session(SPLIT_SRC);
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(root, &sysmlv2_transform::SplitOptions::default())
+        .unwrap();
+    let mut edit = s.edit();
+    edit.split(&plan);
+    let report = edit.check().unwrap_or_else(|e| panic!("{e}"));
+    let new_a: String = report
+        .splices
+        .iter()
+        .filter(|sp| sp.unit == "models/r/A.sysml")
+        .map(|sp| sp.text.as_str())
+        .collect();
+    assert!(new_a.starts_with("package A {"), "{new_a}");
+    assert_eq!(s.units().count(), 1, "a dry run adds no unit");
+}
+
+// ---------------------------------------------------------------------------
+// lenient sources: drop the members that do not parse, keep the rest
+// ---------------------------------------------------------------------------
+
+fn lenient(src: &str) -> sysmlv2_transform::LenientSources {
+    sysmlv2_transform::lenient_sources(&[("p.sysml".into(), src.into())])
+}
+
+/// Every record slices the original text it names; the repaired text
+/// builds a session.
+fn assert_lenient_records(src: &str, r: &sysmlv2_transform::LenientSources) {
+    for d in &r.dropped {
+        assert_eq!(&src[d.start as usize..d.end as usize], d.text, "{d:?}");
+    }
+    assert!(r.unrepaired.is_empty(), "{:?}", r.unrepaired);
+    // The records account for every line break the repair took or added.
+    let removed: usize = r.dropped.iter().map(|d| d.lines_removed as usize).sum();
+    let added: usize = r
+        .dropped
+        .iter()
+        .map(|d| d.inserted.matches('\n').count())
+        .sum();
+    let repaired = &r.sources[0].1;
+    assert_eq!(
+        src.matches('\n').count() - removed + added,
+        repaired.matches('\n').count(),
+        "{:?}",
+        r.dropped
+    );
+    sysmlv2_transform::Session::from_sources(r.sources.clone()).expect("repaired text parses");
+}
+
+#[test]
+fn lenient_sources_drop_only_the_members_that_carry_parse_errors() {
+    let src = "package P {\n    part def A;\n    part def B {\n        part x : ;\n        part ok : A;\n    }\n    part a : A;\n}\n";
+    let r = lenient(src);
+    assert_eq!(r.sources.len(), 1);
+    assert_eq!(
+        r.sources[0].1,
+        "package P {\n    part def A;\n    part def B {\n        part ok : A;\n    }\n    part a : A;\n}\n"
+    );
+    assert_eq!(r.dropped.len(), 1, "{:?}", r.dropped);
+    let d = &r.dropped[0];
+    assert_eq!(
+        (d.unit.as_str(), d.line, d.col, d.end_line, d.end_col),
+        ("p.sysml", 4, 9, 4, 19)
+    );
+    assert_eq!(d.text, "part x : ;");
+    assert!(d.inserted.is_empty());
+    // The whole line went, one line break with it.
+    assert_eq!((d.lines_removed, d.whole_lines), (1, true));
+    assert!(d.message.contains("expected"), "{}", d.message);
+    assert_lenient_records(src, &r);
+    // Clean sources come back untouched with nothing dropped.
+    let clean = "package Q { part def C; }\n";
+    let r2 = lenient(clean);
+    assert_eq!(r2.sources[0].1, clean);
+    assert!(r2.dropped.is_empty() && r2.unrepaired.is_empty());
+}
+
+#[test]
+fn lenient_sources_drop_stray_closers_outside_any_member() {
+    let src = "package P { part def A; }\n}}}\npackage Q { part def B; }\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P { part def A; }\npackage Q { part def B; }\n"
+    );
+    // Three closers on one line: the parser reports two per round, so
+    // the first two go together and the last goes with the line break.
+    let texts: Vec<&str> = r.dropped.iter().map(|d| d.text.as_str()).collect();
+    assert_eq!(texts, ["}}", "}"]);
+    assert_eq!((r.dropped[0].line, r.dropped[0].col), (2, 1));
+    assert_eq!(
+        (r.dropped[0].lines_removed, r.dropped[0].whole_lines),
+        (0, false)
+    );
+    assert_eq!(
+        (r.dropped[1].lines_removed, r.dropped[1].whole_lines),
+        (1, true)
+    );
+}
+
+#[test]
+fn lenient_sources_recover_a_failed_member_the_parser_skipped() {
+    // A stray statement at package level has no member node: its text is
+    // recovered from the tokens, and the package keeps its other members.
+    let src = "package P {\n    part def A;\n    foo bar;\n    part def C;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P {\n    part def A;\n    part def C;\n}\n"
+    );
+    let texts: Vec<&str> = r.dropped.iter().map(|d| d.text.as_str()).collect();
+    assert_eq!(texts, ["foo bar;"]);
+    // Inside a state's sub-action body as well.
+    let src = "state def S { do action a { part q : ; part r; } }\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "state def S { do action a {  part r; } }\n");
+    assert_eq!(r.dropped[0].text, "part q : ;");
+}
+
+#[test]
+fn lenient_sources_keep_records_exact_when_cuts_enclose_earlier_ones() {
+    // `x` fails inside `B`, and `B` itself then fails on `foo bar`: the
+    // whole of `B` goes in a later round, and every record still slices
+    // the original text.
+    let src = "package P {\n    part def B {\n        part x : ;\n        foo bar\n    }\n    part y : ;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert!(
+        r.dropped.iter().any(|d| d.text == "part y : ;"),
+        "{:?}",
+        r.dropped
+    );
+    assert!(
+        r.sources[0].1.starts_with("package P {\n"),
+        "{}",
+        r.sources[0].1
+    );
+    assert!(!r.sources[0].1.contains("foo bar"), "{}", r.sources[0].1);
+}
+
+#[test]
+fn lenient_sources_cut_only_the_member_when_it_shares_a_line() {
+    let src = "package P { part def A; part x : ; part def C; }\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "package P { part def A;  part def C; }\n");
+    assert_eq!((r.dropped[0].line, r.dropped[0].col), (1, 25));
+    assert_eq!(
+        (r.dropped[0].lines_removed, r.dropped[0].whole_lines),
+        (0, false)
+    );
+    // A member missing its `;` is the one that goes: the parser kept it
+    // and reported a zero-width error at its end, so its neighbour stays.
+    let src = "package P {\n    part x : Foo\n    part y;\n    part def C;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P {\n    part y;\n    part def C;\n}\n"
+    );
+    assert_eq!(r.dropped[0].text, "part x : Foo");
+    assert_eq!(
+        (r.dropped[0].lines_removed, r.dropped[0].whole_lines),
+        (1, true)
+    );
+    // Two broken members on one line leave no blank line behind.
+    let src = "package P {\n    part x : ; part y : ;\n    part def C;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "package P {\n    part def C;\n}\n");
+}
+
+#[test]
+fn lenient_sources_close_bodies_left_open_at_the_end() {
+    let src = "package P {\n    part def A;\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "package P {\n    part def A;\n}\n");
+    assert_eq!(r.dropped.len(), 1);
+    let d = &r.dropped[0];
+    assert_eq!(
+        (d.start, d.end, d.text.as_str(), d.inserted.as_str()),
+        (src.len() as u32, src.len() as u32, "", "}\n")
+    );
+    assert_eq!((d.line, d.col), (3, 1));
+    assert!(d.message.contains("end of input"), "{}", d.message);
+    // Without a trailing line break the closer starts a new line, and a
+    // nested body left open gets both closers.
+    let src = "package P {\n    part def A {\n        part x;";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P {\n    part def A {\n        part x;\n}\n}\n"
+    );
+}
+
+#[test]
+fn lenient_sources_handle_kerml_crlf_and_many_errors() {
+    let src = "package P {\n    class A;\n    feature x : ;\n    class C;\n}\n";
+    let r = sysmlv2_transform::lenient_sources(&[("p.kerml".into(), src.into())]);
+    assert!(r.unrepaired.is_empty(), "{:?}", r.unrepaired);
+    assert_eq!(
+        r.sources[0].1,
+        "package P {\n    class A;\n    class C;\n}\n"
+    );
+    assert_eq!(r.dropped[0].text, "feature x : ;");
+    assert_eq!((r.dropped[0].line, r.dropped[0].col), (3, 5));
+    let src = "package P {\r\n    part def A;\r\n    part x : ;\r\n}\r\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "package P {\r\n    part def A;\r\n}\r\n");
+    // Many broken members repair in a handful of rounds, all recorded.
+    let mut src = String::from("package P {\n");
+    for i in 0..100 {
+        src.push_str("    part x");
+        src.push_str(&i.to_string());
+        src.push_str(" : ;\n");
+    }
+    src.push_str("    part def Z;\n}\n");
+    let r = lenient(&src);
+    assert_lenient_records(&src, &r);
+    assert_eq!(r.dropped.len(), 100);
+    assert_eq!(r.sources[0].1, "package P {\n    part def Z;\n}\n");
+}
+
+#[test]
+fn lenient_sources_keep_unit_order_and_name_units_that_stay_broken() {
+    let r = sysmlv2_transform::lenient_sources(&[
+        ("a.sysml".into(), "package A { part x : ; }\n".into()),
+        ("b.sysml".into(), "package B { part def Y; }\n".into()),
+        ("c.sysml".into(), "package C {\n    part x : ;\n".into()),
+    ]);
+    let names: Vec<&str> = r.sources.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["a.sysml", "b.sysml", "c.sysml"]);
+    assert_eq!(r.sources[1].1, "package B { part def Y; }\n");
+    assert_eq!(r.sources[2].1, "package C {\n}\n");
+    assert!(
+        r.dropped
+            .iter()
+            .all(|d| d.unit == "a.sysml" || d.unit == "c.sysml")
+    );
+    assert!(r.unrepaired.is_empty(), "{:?}", r.unrepaired);
+    // A unit that is nothing but a broken statement repairs to nothing.
+    let r = sysmlv2_transform::lenient_sources(&[("d.sysml".into(), "package".into())]);
+    assert_eq!(r.sources[0].1, "");
+    assert_eq!(r.dropped[0].text, "package");
+    assert!(r.unrepaired.is_empty(), "{r:?}");
+}
+
+#[test]
+fn lenient_sources_drop_a_stray_opener_alone() {
+    // A diagnostic sitting on a brace names that brace: it goes alone,
+    // and the package after it stays.
+    let src = "package P { part def A; }\n{\npackage Q { part def B; }\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P { part def A; }\npackage Q { part def B; }\n"
+    );
+    let texts: Vec<&str> = r.dropped.iter().map(|d| d.text.as_str()).collect();
+    assert_eq!(texts, ["{"]);
+}
+
+#[test]
+fn lenient_sources_keep_healthy_siblings_of_a_member_missing_its_terminator() {
+    // The parser keeps a member that lacks its `;` and reports a
+    // zero-width error at its end; the repair must charge that member,
+    // never the sibling after it, or the cut cascades through the unit.
+    let src = "package P {\n    action def Act {\n        while c {\n            action a;\n        } until ;\n        action b;\n    }\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert!(r.sources[0].1.contains("action b;"), "{}", r.sources[0].1);
+    assert!(
+        r.sources[0].1.contains("action def Act {"),
+        "{}",
+        r.sources[0].1
+    );
+    assert!(r.dropped.len() <= 2, "{:?}", r.dropped);
+    let src =
+        "package P {\n    attribute f = {in a; a + 1} foo;\n    part def C;\n    part def D;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P {\n    part def C;\n    part def D;\n}\n"
+    );
+    let src = "package P { part def A; } part x : A   \n\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert!(
+        r.sources[0].1.starts_with("package P { part def A; }"),
+        "{}",
+        r.sources[0].1
+    );
+    assert_eq!(r.dropped[0].text, "part x : A");
+    // A failed member whose header holds an expression body goes as one
+    // record, from its first token through the body it opens.
+    let src =
+        "package P {\n    part x : A = {1} foo {\n        part a;\n    }\n    part def C;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "package P {\n    part def C;\n}\n");
+    assert_eq!(r.dropped.len(), 1, "{:?}", r.dropped);
+}
+
+#[test]
+fn lenient_sources_repair_a_unit_left_open_by_an_unterminated_literal() {
+    // The literal swallows the rest of the unit; the failed member goes
+    // from its start to the end, and the package gets its closer back.
+    let src =
+        "package P {\n    part def A;\n    attribute b = \"unterminated;\n    part def C;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "package P {\n    part def A;\n}\n");
+    assert!(
+        r.dropped[0]
+            .text
+            .starts_with("attribute b = \"unterminated;"),
+        "{:?}",
+        r.dropped
+    );
+    assert_eq!(r.dropped[1].inserted, "}\n");
+    let src = "package P {\n    part def A;\n    /* open\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(r.sources[0].1, "package P {\n    part def A;\n}\n");
+    // Stray closers cut one round at a time still converge.
+    let src = "package P { part def A; }\n}}\npackage Q { part def B; }\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P { part def A; }\npackage Q { part def B; }\n"
+    );
+}
+
+#[test]
+fn lenient_sources_drop_a_stray_opener_inside_a_body() {
+    // The stray `{` is closed by the package's own `}`, which leaves the
+    // package open at the end: the brace goes alone, the members stay,
+    // and the closer the first round would have appended is not needed.
+    let src = "package P {\n    part def A;\n    {\n    part def C;\n}\n";
+    let r = lenient(src);
+    assert_lenient_records(src, &r);
+    assert_eq!(
+        r.sources[0].1,
+        "package P {\n    part def A;\n    part def C;\n}\n"
+    );
+    let texts: Vec<&str> = r
+        .dropped
+        .iter()
+        .filter(|d| !d.text.is_empty())
+        .map(|d| d.text.as_str())
+        .collect();
+    assert_eq!(texts, ["{"]);
+}
+
+/// A fully qualified reference spelled through a renamed ancestor
+/// (`'A B'::X`) is respelled at the ancestor segment and verified
+/// through the batch's correspondence map, with an unrelated rename in
+/// flight alongside.
+#[test]
+fn batch_respells_ancestor_qualified_references() {
+    let src = "package 'A B' {
+    part def X;
+}
+package Q {
+    part def other_def;
+    part x : 'A B'::X;
+    part o : other_def;
+}
+";
+    let mut s = session(src);
+    let ab = s.resolved().resolve_qualified("'A B'").unwrap();
+    let other = s.resolved().resolve_qualified("Q::other_def").unwrap();
+    let mut edit = s.edit();
+    edit.rename(ab, "AB");
+    edit.rename(other, "OtherDef");
+    let report = edit.commit().expect("legal batch must commit");
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    let out = text(&s);
+    assert!(out.contains("package AB {"), "{out}");
+    assert!(out.contains("part x : AB::X;"), "{out}");
+    assert!(out.contains("part o : OtherDef;"), "{out}");
+    assert_eq!(s.resolved().unresolved_count(), 0);
+    assert!(s.resolved().resolve_qualified("AB::X").is_some());
+}
+
+/// A rename whose new name a sibling already carries would make every
+/// qualified reference to either ambiguous. By default the batch
+/// refuses up front, naming the clash; under the skip policy the
+/// colliding rename is dropped and reported while the rest commits.
+#[test]
+fn colliding_rename_refuses_or_is_skipped_with_a_finding() {
+    let src = "package P {
+    part def Foo;
+    part def foo;
+    part def bar;
+    part a : P::Foo;
+    part b : P::foo;
+}
+";
+    let mut s = session(src);
+    let foo = s.resolved().resolve_qualified("P::foo").unwrap();
+    let bar = s.resolved().resolve_qualified("P::bar").unwrap();
+
+    let mut edit = s.edit();
+    edit.rename(foo, "Foo");
+    edit.rename(bar, "Bar");
+    let err = edit.commit().expect_err("sibling clash refuses");
+    match err {
+        TransformError::NameTaken { name, existing } => {
+            assert_eq!(name, "Foo");
+            assert_eq!(existing, "P::Foo");
+        }
+        other => panic!("{other}"),
+    }
+    assert_eq!(text(&s), src);
+
+    let mut edit = s.edit();
+    edit.skip_colliding_renames();
+    edit.rename(foo, "Foo");
+    edit.rename(bar, "Bar");
+    let report = edit.commit().expect("the rest of the batch commits");
+    assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    assert!(
+        report.findings[0].contains("rename of `P::foo` to `Foo` skipped")
+            && report.findings[0].contains("`P::Foo` is already named `Foo`"),
+        "{}",
+        report.findings[0]
+    );
+    let out = text(&s);
+    assert!(out.contains("part def foo;"), "{out}");
+    assert!(out.contains("part def Bar;"), "{out}");
+    assert!(out.contains("part b : P::foo;"), "{out}");
+    assert_eq!(s.resolved().unresolved_count(), 0);
+}
+
+/// Two renames in one batch claiming the same name in one owner clash
+/// with each other: the second is the one dropped. A batch that is
+/// nothing but dropped renames leaves the session untouched.
+#[test]
+fn renames_claiming_one_name_clash_within_the_batch() {
+    let src = "package P {
+    part def foo_a;
+    part def foo_b;
+}
+";
+    let mut s = session(src);
+    let a = s.resolved().resolve_qualified("P::foo_a").unwrap();
+    let b = s.resolved().resolve_qualified("P::foo_b").unwrap();
+    let mut edit = s.edit();
+    edit.skip_colliding_renames();
+    edit.rename(a, "Foo");
+    edit.rename(b, "Foo");
+    let report = edit.commit().expect("commits");
+    assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    assert!(
+        report.findings[0].contains("rename of `P::foo_b` to `Foo` skipped")
+            && report.findings[0].contains("already renames its sibling `P::foo_a` to `Foo`"),
+        "{}",
+        report.findings[0]
+    );
+    let out = text(&s);
+    assert!(
+        out.contains("part def Foo;") && out.contains("part def foo_b;"),
+        "{out}"
+    );
+
+    // Swapping two sibling names is not a clash: both old names leave.
+    let foo = s.resolved().resolve_qualified("P::Foo").unwrap();
+    let b = s.resolved().resolve_qualified("P::foo_b").unwrap();
+    let mut edit = s.edit();
+    edit.rename(foo, "foo_b");
+    edit.rename(b, "Foo");
+    edit.commit().expect("a swap commits");
+
+    // Only a dropped rename: nothing planned, nothing changed.
+    let before = text(&s);
+    let b = s.resolved().resolve_qualified("P::Foo").unwrap();
+    let mut edit = s.edit();
+    edit.skip_colliding_renames();
+    edit.rename(b, "foo_b");
+    let report = edit.commit().expect("an all-dropped batch reports");
+    assert_eq!(report.findings.len(), 1);
+    assert!(report.splices.is_empty());
+    assert_eq!(text(&s), before);
+}
+
+#[test]
+fn split_plan_spells_uri_units_as_the_editor_does() {
+    // Uri-named units: kept names percent-encode everything outside the
+    // unreserved set (after the path-separator repair), slugs stay
+    // plain; the directory comes from the uri stem.
+    let src = "package R {\n    package 'a/b%c é~' { part def K; }\n    package Plain { part def P; }\n}\n";
+    let mut s = sysmlv2_transform::Session::from_sources(vec![(
+        "file:///w/models/r.sysml".into(),
+        src.into(),
+    )])
+    .unwrap();
+    let root = s.resolved().resolve_qualified("R").unwrap();
+    let plan = s
+        .split_plan(
+            root,
+            &sysmlv2_transform::SplitOptions {
+                uri_units: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(plan.directory, "file:///w/models/r");
+    let units: Vec<&str> = plan.entries.iter().map(|e| e.unit.as_str()).collect();
+    assert_eq!(
+        units,
+        [
+            "file:///w/models/r/a-b%25c%20%C3%A9~.sysml",
+            "file:///w/models/r/Plain.sysml"
+        ]
+    );
+    let plan = s
+        .split_plan(
+            root,
+            &sysmlv2_transform::SplitOptions {
+                naming: sysmlv2_transform::SplitNaming::Slug,
+                uri_units: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        plan.entries[0].unit,
+        "file:///w/models/r/a-b-c-%C3%A9.sysml"
+    );
 }

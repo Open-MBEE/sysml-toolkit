@@ -3,7 +3,8 @@
 Language support for the OMG SysML v2 and KerML textual notations, powered by the `sysmlv2` language server (`sysmlv2 lsp`).
 
 - **Exact, dialect-aware highlighting** via semantic tokens. Keywords in this language are contextual — `part` is a keyword in SysML and a legal name in KerML — so no TextMate grammar can classify them; the parser does, and this extension renders its verdict. The bundled TextMate grammar is a deliberately coarse fallback (notes, doc comments, strings, numbers) shown only until the server answers.
-- **Live diagnostics** on every keystroke: parse errors with recovery (the file keeps working while broken) plus body-context validation.
+- **Live diagnostics**: parse errors with recovery and body-context validation; a configured standard library enables semantic diagnostics.
+- **Navigation and editing**: go to definition, references, completion, hover, rename, inlay hints, code lenses, and refactoring actions from the language server. Semantic features require library context.
 - **Outline / breadcrumbs / sticky scroll** from the document symbol tree, including anonymous members (`«part»`) and `: Type [mult]` details.
 - **Formatting** via the toolkit's idempotent, note-preserving formatter.
 
@@ -18,6 +19,8 @@ Language support for the OMG SysML v2 and KerML textual notations, powered by th
    npx vsce package        # produces sysmlv2-<version>.vsix
    code --install-extension sysmlv2-*.vsix
    ```
+
+To enable semantic features, start VS Code from an environment with `SYSMLV2_LIB_DIR` set to an initialized `sysml.library` directory. The extension launches `sysmlv2 lsp` and inherits that environment; `sysmlv2.serverPath` controls only the executable. Other clients can pass `--lib /path/to/sysml.library` directly.
 
 ## Other editors
 

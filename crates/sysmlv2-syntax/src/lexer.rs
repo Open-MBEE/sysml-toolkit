@@ -24,15 +24,27 @@ use crate::diag::Diagnostic;
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
 
+/// The most token slots reserved before tokenizing, whatever the input
+/// size (see the estimate below).
+const MAX_TOKEN_HINT: usize = 64 * 1024;
+
 /// Tokenize `src`, returning every token including trivia, terminated by an
 /// [`TokenKind::Eof`] token. Malformed input yields `Error` tokens plus
 /// diagnostics; the token stream always covers the entire input.
+#[must_use]
 pub fn tokenize(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut lexer = Lexer {
         src: src.as_bytes(),
         text: src,
         pos: 0,
-        tokens: Vec::new(),
+        // Measured across the corpora, source text runs about two bytes
+        // to the token once trivia is counted. The estimate is capped
+        // because the ratio is a property of written notation, not of
+        // text: a file that is mostly one long comment is a couple of
+        // tokens, and a slot per two bytes of it would reserve orders of
+        // magnitude more than the lexer will fill. Past the cap the
+        // vector grows the usual way.
+        tokens: Vec::with_capacity((src.len() / 2 + 1).min(MAX_TOKEN_HINT)),
         diags: Vec::new(),
     };
     lexer.run();
@@ -55,13 +67,16 @@ impl<'s> Lexer<'s> {
             debug_assert!(self.pos > start, "lexer must always make progress");
             self.tokens.push(Token::new(kind, self.span_from(start)));
         }
-        let end = self.src.len() as u32;
+        let end = crate::span::clamp_offset(self.src.len());
         self.tokens
             .push(Token::new(TokenKind::Eof, Span::new(end, end)));
     }
 
     fn span_from(&self, start: usize) -> Span {
-        Span::new(start as u32, self.pos as u32)
+        Span::new(
+            crate::span::clamp_offset(start),
+            crate::span::clamp_offset(self.pos),
+        )
     }
 
     fn peek(&self, ahead: usize) -> Option<u8> {
@@ -343,8 +358,14 @@ impl<'s> Lexer<'s> {
 /// Decode the value of an `UNRESTRICTED_NAME` or `STRING_VALUE` token: strip
 /// the quotes and resolve escape sequences. Invalid escapes (already reported
 /// by the lexer) are kept verbatim without the backslash.
+///
+/// Total over any input: a leading quote and a trailing quote are removed
+/// when present, so text that is not a complete token — empty, unterminated,
+/// or never quoted at all — decodes to what it holds rather than failing.
+#[must_use]
 pub fn unescape(raw: &str) -> String {
-    let inner = &raw[1..raw.len().saturating_sub(1).max(1)];
+    let inner = raw.strip_prefix(['\'', '"']).unwrap_or(raw);
+    let inner = inner.strip_suffix(['\'', '"']).unwrap_or(inner);
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {

@@ -13,6 +13,7 @@ use crate::span::Span;
 /// SysML share one lexical structure and expression grammar but differ in
 /// structural keywords and reserved words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Dialect {
     #[default]
     Sysml,
@@ -21,6 +22,7 @@ pub enum Dialect {
 
 /// A parsed source unit (one `.sysml` / `.kerml` file): the root namespace.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SourceUnit {
     pub dialect: Dialect,
     pub members: Vec<Member>,
@@ -28,6 +30,7 @@ pub struct SourceUnit {
 
 /// One member of a namespace or body, with its optional visibility prefix.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Member {
     pub visibility: Option<Visibility>,
     /// A bare `then` immediately before this (occurrence) member — an
@@ -41,6 +44,7 @@ pub struct Member {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Visibility {
     Public,
     Private,
@@ -48,6 +52,7 @@ pub enum Visibility {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MemberKind {
     Package(Package),
     Import(Import),
@@ -104,6 +109,7 @@ pub enum MemberKind {
 
 /// KerML standalone relationship declarations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RelationshipDeclKind {
     /// `subtype A specializes B` (Specialization)
     Specialization,
@@ -126,6 +132,7 @@ pub enum RelationshipDeclKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RelationshipDecl {
     pub kind: RelationshipDeclKind,
     pub id: Identification,
@@ -134,6 +141,7 @@ pub struct RelationshipDecl {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MultiplicityDecl {
     pub id: Identification,
     /// `subsets N` form.
@@ -144,12 +152,14 @@ pub struct MultiplicityDecl {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RequirementConstraintKind {
     Assumption,
     Requirement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StateSubactionKind {
     Entry,
     Do,
@@ -158,6 +168,7 @@ pub enum StateSubactionKind {
 
 /// `dependency <id>? from? clients to suppliers`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Dependency {
     pub metadata: Vec<QualifiedName>,
     pub id: Identification,
@@ -167,12 +178,14 @@ pub struct Dependency {
 
 /// `<shortName>` and/or name from an element declaration.
 #[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Identification {
     pub short_name: Option<Name>,
     pub name: Option<Name>,
 }
 
 impl Identification {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.short_name.is_none() && self.name.is_none()
     }
@@ -180,6 +193,7 @@ impl Identification {
 
 /// A single name: an `ID` or an `'unrestricted name'` (already unescaped).
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Name {
     pub value: String,
     pub span: Span,
@@ -189,7 +203,16 @@ pub struct Name {
 /// basic name (`[a-zA-Z_]\w*`), otherwise single-quoted with
 /// `\b \t \n \f \r " ' \` escaped. Used by the printer and by the normative
 /// library-ID computation.
+#[must_use]
 pub fn escape_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    write_escaped_name(name, &mut out);
+    out
+}
+
+/// [`escape_name`] appended to an existing buffer, for callers that
+/// render many names through one allocation.
+pub fn write_escaped_name(name: &str, out: &mut String) {
     let basic = !name.is_empty()
         && name
             .chars()
@@ -198,9 +221,9 @@ pub fn escape_name(name: &str) -> String {
             .unwrap_or(false)
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if basic {
-        return name.to_string();
+        out.push_str(name);
+        return;
     }
-    let mut out = String::with_capacity(name.len() + 2);
     out.push('\'');
     for c in name.chars() {
         match c {
@@ -216,11 +239,11 @@ pub fn escape_name(name: &str) -> String {
         }
     }
     out.push('\'');
-    out
 }
 
 /// `($::)? (Name ::)* Name`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QualifiedName {
     /// Prefixed with `$::` (resolve from the global root namespace).
     pub is_global: bool,
@@ -230,6 +253,7 @@ pub struct QualifiedName {
 
 impl QualifiedName {
     /// Dot/colons-free display form, e.g. `Vehicle::engine`.
+    #[must_use]
     pub fn to_display_string(&self) -> String {
         let mut s = String::new();
         if self.is_global {
@@ -246,37 +270,80 @@ impl QualifiedName {
 
     /// Textual-notation form with restricted names quoted (`A::'..'`) —
     /// the `{"@ref"}` encoding, parsed back by the JSON reader.
+    #[must_use]
     pub fn to_ref_string(&self) -> String {
         let mut s = String::new();
+        self.write_ref_string(&mut s);
+        s
+    }
+
+    /// [`Self::to_ref_string`] appended to an existing buffer, for
+    /// callers that render many names through one allocation.
+    pub fn write_ref_string(&self, out: &mut String) {
         if self.is_global {
-            s.push_str("$::");
+            out.push_str("$::");
         }
         for (i, seg) in self.segments.iter().enumerate() {
             if i > 0 {
-                s.push_str("::");
+                out.push_str("::");
             }
-            s.push_str(&escape_name(&seg.value));
+            write_escaped_name(&seg.value, out);
         }
-        s
     }
 }
 
 /// A reference target: a plain qualified name or a feature chain `a.b.c`
 /// (each chain link itself a qualified name).
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TargetRef {
     Name(QualifiedName),
     Chain(Vec<QualifiedName>),
 }
 
 impl TargetRef {
+    /// The reference of a connector end the text does not spell.
+    ///
+    /// The target-succession shorthand (`then next;`) and the bare-end
+    /// connector forms leave one end's reference out entirely: the end
+    /// exists, but what it refers to comes from the surrounding member
+    /// rather than from any name in the text. That is this value, and
+    /// [`TargetRef::is_unspelled`] recognises it.
+    #[must_use]
+    pub fn unspelled() -> Self {
+        TargetRef::Chain(Vec::new())
+    }
+
+    /// Whether this is the unspelled reference of [`TargetRef::unspelled`].
+    #[must_use]
+    pub fn is_unspelled(&self) -> bool {
+        matches!(self, TargetRef::Chain(links) if links.is_empty())
+    }
+
+    /// The single qualified name this reference spells, if it spells one
+    /// rather than a feature chain.
+    ///
+    /// A reference reached through a pointer cannot be matched down to its
+    /// name in a nested pattern, so callers that only want the name ask
+    /// for it here instead of guarding a match arm and re-testing inside.
+    #[must_use]
+    pub fn as_name(&self) -> Option<&QualifiedName> {
+        match self {
+            TargetRef::Name(qn) => Some(qn),
+            TargetRef::Chain(_) => None,
+        }
+    }
+
+    /// The source text this reference covers; empty for an unspelled one,
+    /// which has no text of its own.
+    #[must_use]
     pub fn span(&self) -> Span {
         match self {
             TargetRef::Name(qn) => qn.span,
-            TargetRef::Chain(links) => links
-                .first()
-                .map(|f| f.span.join(links.last().unwrap().span))
-                .unwrap_or_default(),
+            TargetRef::Chain(links) => match (links.first(), links.last()) {
+                (Some(first), Some(last)) => first.span.join(last.span),
+                _ => Span::default(),
+            },
         }
     }
 }
@@ -288,6 +355,7 @@ impl TargetRef {
 /// `('standard'? 'library')? '#Meta'* 'package' Identification? Body`
 /// (also KerML `namespace` declarations, flagged `is_namespace`).
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Package {
     pub is_library: bool,
     pub is_standard: bool,
@@ -302,6 +370,7 @@ pub struct Package {
 
 /// `import all? <target> (::*)? (::**)? [filters] ;`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Import {
     pub is_import_all: bool,
     pub target: QualifiedName,
@@ -315,6 +384,7 @@ pub struct Import {
 
 /// `alias <short> name for <target> ;`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Alias {
     pub id: Identification,
     pub target: QualifiedName,
@@ -326,6 +396,7 @@ pub struct Alias {
 
 /// `comment <id>? (about e1, e2)? (locale "...")? /* body */`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Comment {
     pub id: Identification,
     pub about: Vec<QualifiedName>,
@@ -336,6 +407,7 @@ pub struct Comment {
 
 /// `doc <id>? (locale "...")? /* body */`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Doc {
     pub id: Identification,
     pub locale: Option<String>,
@@ -344,6 +416,7 @@ pub struct Doc {
 
 /// `rep <id>? language "lang" /* body */`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TextualRep {
     pub id: Identification,
     pub language: String,
@@ -356,6 +429,7 @@ pub struct TextualRep {
 
 /// The kind keyword(s) of a SysML definition (`<kind> def`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DefKind {
     Attribute,
     Enum,
@@ -403,6 +477,7 @@ pub enum DefKind {
 
 /// The kind keyword of a SysML usage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UsageKind {
     Attribute,
     Enum,
@@ -481,6 +556,7 @@ pub enum UsageKind {
 
 /// `abstract` / `variation` / `individual` / `#Meta` prefixes on a definition.
 #[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DefPrefix {
     pub is_abstract: bool,
     pub is_variation: bool,
@@ -491,6 +567,7 @@ pub struct DefPrefix {
 
 /// `<prefix> <kind> def Identification? (:> supers)? Body`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Definition {
     pub prefix: DefPrefix,
     pub kind: DefKind,
@@ -502,7 +579,7 @@ pub struct Definition {
     /// KerML `all` sufficiency marker (`classifier all C …`).
     pub is_sufficient: bool,
     /// KerML type multiplicity (`class C [2] …`).
-    pub multiplicity: Option<Multiplicity>,
+    pub multiplicity: Option<Box<Multiplicity>>,
     /// KerML `~` / `conjugates` target.
     pub conjugates: Vec<TargetRef>,
     /// KerML `disjoint from A, B`.
@@ -517,6 +594,7 @@ pub struct Definition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FeatureDirection {
     In,
     Out,
@@ -525,6 +603,7 @@ pub enum FeatureDirection {
 
 /// Occurrence portion kind (`snapshot` / `timeslice` prefix).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PortionKind {
     Snapshot,
     Timeslice,
@@ -532,6 +611,7 @@ pub enum PortionKind {
 
 /// Prefix modifiers on a usage.
 #[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UsagePrefix {
     pub direction: Option<FeatureDirection>,
     pub is_derived: bool,
@@ -562,6 +642,7 @@ pub struct UsagePrefix {
 /// carrying its own basic prefix, distinct from the end feature's own
 /// prefix (`end in x : T feature y;`, `end derived c : Cart[1] item x;`).
 #[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CrossFeature {
     pub direction: Option<FeatureDirection>,
     pub is_derived: bool,
@@ -584,8 +665,9 @@ pub struct CrossFeature {
 /// One end of a connector (`connect`, `bind`, `first…then`, interface parts):
 /// `([mult])? (name ::>)? target`
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnectorEnd {
-    pub multiplicity: Option<Multiplicity>,
+    pub multiplicity: Option<Box<Multiplicity>>,
     pub name: Option<Name>,
     pub target: TargetRef,
 }
@@ -593,29 +675,33 @@ pub struct ConnectorEnd {
 /// A flow/message end: a feature chain whose last step is the flow feature
 /// (e.g. `tank.fuelOut`).
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FlowEnd {
     pub target: TargetRef,
 }
 
 /// Payload of a flow/message (`of` clause) or an accept action.
 #[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PayloadPart {
     pub id: Identification,
     pub specializations: Vec<FeatureSpecialization>,
-    pub multiplicity: Option<Multiplicity>,
+    pub multiplicity: Option<Box<Multiplicity>>,
     pub is_ordered: bool,
     pub is_nonunique: bool,
-    pub value: Option<FeatureValue>,
+    pub value: Option<Box<FeatureValue>>,
 }
 
 /// Trigger of an accept action: `at`/`after`/`when` expression.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Trigger {
     pub kind: TriggerKind,
     pub expr: Expr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TriggerKind {
     At,
     After,
@@ -623,7 +709,13 @@ pub enum TriggerKind {
 }
 
 /// Kind-specific parts of a usage beyond the uniform declaration shape.
+///
+/// Each variant's payload sits behind a pointer. A usage carries exactly
+/// one detail, so an inline payload would size every usage in the tree by
+/// the largest form; the field names and the shape of every pattern stay
+/// as they are.
 #[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UsageDetail {
     #[default]
     None,
@@ -634,12 +726,12 @@ pub enum UsageDetail {
     Binding { ends: Vec<ConnectorEnd> },
     /// `first a then b` (also `then b` target shorthand with no source).
     Succession {
-        source: Option<ConnectorEnd>,
-        target: ConnectorEnd,
+        source: Option<Box<ConnectorEnd>>,
+        target: Box<ConnectorEnd>,
     },
     /// Flow/message: `of` payload, `from a to b` (or bare `a to b`).
     Flow {
-        payload: Option<PayloadPart>,
+        payload: Option<Box<PayloadPart>>,
         source: Option<FlowEnd>,
         target: Option<FlowEnd>,
     },
@@ -655,47 +747,47 @@ pub enum UsageDetail {
     Assert { negated: bool },
     /// `accept <payload> (via <expr>)?` (+ trigger inside payload).
     Accept {
-        payload: PayloadPart,
-        trigger: Option<Trigger>,
-        via: Option<Expr>,
+        payload: Box<PayloadPart>,
+        trigger: Option<Box<Trigger>>,
+        via: Option<Box<Expr>>,
     },
     /// `send <expr>? (via <expr>)? (to <expr>)?`
     Send {
-        payload: Option<Expr>,
-        via: Option<Expr>,
-        to: Option<Expr>,
+        payload: Option<Box<Expr>>,
+        via: Option<Box<Expr>>,
+        to: Option<Box<Expr>>,
     },
     /// `assign <target> := <expr>`
-    Assign { target: Expr, value: Expr },
+    Assign { target: Box<Expr>, value: Box<Expr> },
     /// `terminate <expr>?`
-    Terminate { target: Option<Expr> },
+    Terminate { target: Option<Box<Expr>> },
     /// `if <cond> { … } (else …)?` — bodies are anonymous action usages.
     IfNode {
-        cond: Expr,
+        cond: Box<Expr>,
         then_body: Box<Usage>,
         /// Either an action body or a nested if-node usage.
         else_body: Option<Box<Usage>>,
     },
     /// `while <cond> { … } (until <expr> ;)?` — `cond` is `None` for `loop`.
     WhileLoop {
-        cond: Option<Expr>,
+        cond: Option<Box<Expr>>,
         body: Box<Usage>,
-        until: Option<Expr>,
+        until: Option<Box<Expr>>,
     },
     /// `for <var> in <seq> { … }`
     ForLoop {
-        var: FeatureDeclaration,
-        seq: Expr,
+        var: Box<FeatureDeclaration>,
+        seq: Box<Expr>,
         body: Box<Usage>,
     },
     /// `transition (first)? <source>? trigger? guard? effect? then <target>`
     Transition {
         source: Option<TargetRef>,
         trigger: Option<Box<UsageDetail>>,
-        guard: Option<Expr>,
+        guard: Option<Box<Expr>>,
         /// Effect action (`do …`): a performed-action usage.
         effect: Option<Box<Usage>>,
-        target: Option<ConnectorEnd>,
+        target: Option<Box<ConnectorEnd>>,
         /// `else target ;` default transition.
         is_default: bool,
     },
@@ -703,6 +795,7 @@ pub enum UsageDetail {
 
 /// One specialization clause in a feature declaration.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FeatureSpecialization {
     /// `: T1, T2` or `defined by T1, T2`. `conjugated` per entry (`~Port`).
     TypedBy(Vec<TypeRef>),
@@ -717,6 +810,7 @@ pub enum FeatureSpecialization {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeRef {
     /// `~T` — conjugated (port) type.
     pub is_conjugated: bool,
@@ -725,6 +819,7 @@ pub struct TypeRef {
 
 /// `[expr]` or `[expr .. expr]`, with optional `ordered` / `nonunique`.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Multiplicity {
     /// Lower bound when the `l..u` form is used.
     pub lower: Option<Expr>,
@@ -735,10 +830,11 @@ pub struct Multiplicity {
 /// The declaration part of a usage: identification plus any specializations,
 /// multiplicity, and ordering markers, in source order.
 #[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FeatureDeclaration {
     pub id: Identification,
     pub specializations: Vec<FeatureSpecialization>,
-    pub multiplicity: Option<Multiplicity>,
+    pub multiplicity: Option<Box<Multiplicity>>,
     pub is_ordered: bool,
     pub is_nonunique: bool,
     /// KerML `all` sufficiency marker.
@@ -760,6 +856,7 @@ pub struct FeatureDeclaration {
 
 impl FeatureDeclaration {
     /// True when nothing at all was declared.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.id.is_empty()
             && self.specializations.is_empty()
@@ -779,6 +876,7 @@ impl FeatureDeclaration {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ValueKind {
     /// `= expr`
     Bound,
@@ -791,6 +889,7 @@ pub enum ValueKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FeatureValue {
     pub kind: ValueKind,
     pub expr: Expr,
@@ -802,12 +901,13 @@ pub struct FeatureValue {
 /// their target as a leading [`FeatureSpecialization::References`] in the
 /// declaration, mirroring the grammar's `OwnedReferenceSubsetting`.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Usage {
     pub prefix: UsagePrefix,
     pub kind: UsageKind,
     pub declaration: FeatureDeclaration,
     pub detail: UsageDetail,
-    pub value: Option<FeatureValue>,
+    pub value: Option<Box<FeatureValue>>,
     /// `state … parallel { … }`
     pub is_parallel: bool,
     pub body: Option<Vec<Member>>,
@@ -820,6 +920,7 @@ pub struct Usage {
 /// Binary / n-ary operators, named as in the abstract syntax `operator`
 /// strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BinaryOp {
     NullCoalescing, // ??
     Implies,        // implies
@@ -847,6 +948,7 @@ pub enum BinaryOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UnaryOp {
     Plus,
     Minus,
@@ -856,6 +958,7 @@ pub enum UnaryOp {
 
 /// `istype` / `hastype` / `@` / `as` / `meta` / `@@` operators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ClassificationOp {
     IsType,
     HasType,
@@ -866,12 +969,18 @@ pub enum ClassificationOp {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+///
+/// Every `ty` reference sits behind a pointer: a named type is a
+/// qualified name of its own, and leaving one inline would size every
+/// expression node in the tree by it.
 pub enum ExprKind {
     Literal(Literal),
     /// `null` or `()`
@@ -898,11 +1007,11 @@ pub enum ExprKind {
         op: ClassificationOp,
         /// `None` = implicit self operand.
         operand: Option<Box<Expr>>,
-        ty: TargetRef,
+        ty: Box<TargetRef>,
     },
     /// `all T` — extent of a type.
     Extent {
-        ty: TargetRef,
+        ty: Box<TargetRef>,
     },
     /// `target.member` — feature-chain step.
     ChainStep {
@@ -922,7 +1031,7 @@ pub enum ExprKind {
     /// `target->Fn(args)` / `target->Fn {body}` / `target->Fn ref`.
     Arrow {
         target: Box<Expr>,
-        ty: TargetRef,
+        ty: Box<TargetRef>,
         args: ArrowArgs,
     },
     /// `target.{ body }` — collect.
@@ -937,12 +1046,12 @@ pub enum ExprKind {
     },
     /// `Type(args)` — invocation.
     Invocation {
-        ty: TargetRef,
+        ty: Box<TargetRef>,
         args: Vec<Arg>,
     },
     /// `new Type(args)` — constructor.
     Constructor {
-        ty: TargetRef,
+        ty: Box<TargetRef>,
         args: Vec<Arg>,
     },
     /// `{ in p1 : T1; … ; result-expr }` — expression body (lambda). SysML
@@ -964,6 +1073,7 @@ pub enum ExprKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ArrowArgs {
     /// `->Fn { body }`
     Body(Box<Expr>),
@@ -975,6 +1085,7 @@ pub enum ArrowArgs {
 
 /// A positional or named (`param = value`) argument.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Arg {
     /// Redefined parameter name for named arguments.
     pub name: Option<QualifiedName>,
@@ -982,6 +1093,7 @@ pub struct Arg {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Literal {
     Bool(bool),
     /// Raw text preserved; decoded value.
@@ -992,4 +1104,56 @@ pub enum Literal {
     Real(String),
     /// `*` — positive infinity (unbounded multiplicity).
     Infinity,
+}
+
+#[cfg(test)]
+mod spelling_tests {
+    use super::{Name, QualifiedName, escape_name, write_escaped_name};
+    use crate::Span;
+
+    fn qn(is_global: bool, segments: &[&str]) -> QualifiedName {
+        QualifiedName {
+            is_global,
+            segments: segments
+                .iter()
+                .map(|s| Name {
+                    value: (*s).to_string(),
+                    span: Span::default(),
+                })
+                .collect(),
+            span: Span::default(),
+        }
+    }
+
+    /// The buffered spellings render exactly what the allocating ones do,
+    /// appending rather than replacing.
+    #[test]
+    fn buffered_spelling_matches_the_allocating_one() {
+        for name in [
+            "Vehicle",
+            "_x9",
+            "",
+            "with space",
+            "9lead",
+            "it's",
+            "back\\slash",
+            "tab\there",
+            "line\nbreak",
+            "quote\"mark",
+        ] {
+            let mut buf = String::from("<");
+            write_escaped_name(name, &mut buf);
+            assert_eq!(buf, format!("<{}", escape_name(name)), "{name:?}");
+        }
+        for name in [
+            qn(false, &["Vehicle"]),
+            qn(false, &["Vehicle", "engine"]),
+            qn(true, &["Vehicle", "engine", "with space"]),
+            qn(true, &[]),
+        ] {
+            let mut buf = String::from("<");
+            name.write_ref_string(&mut buf);
+            assert_eq!(buf, format!("<{}", name.to_ref_string()));
+        }
+    }
 }

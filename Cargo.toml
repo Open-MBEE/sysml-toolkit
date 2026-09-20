@@ -44,22 +44,22 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.9.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/Open-MBEE/sysml-toolkit"
 
 [workspace.dependencies]
-sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.6.0" }
-sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.6.0" }
-sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.6.0" }
-sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.6.0" }
+sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.9.0" }
+sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.9.0" }
+sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.9.0" }
+sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.9.0" }
 sysmlv2-testkit = { path = "crates/sysmlv2-testkit" }
-sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.6.0" }
-sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.6.0" }
-sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.6.0" }
-lsp-server = "0.7"
+sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.9.0" }
+sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.9.0" }
+sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.9.0" }
+lsp-server = "0.10"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
@@ -70,9 +70,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4", "v5", "js"] }
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
-jsonschema = "0.26"
-miniz_oxide = "0.8"
+jsonschema = "0.56"
+miniz_oxide = "0.9"
 regex-lite = "0.1"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-rational = "0.4"
+num-traits = "0.2"
 
 # The wasi CLI artifact is size-sensitive: it ships in
 # the npm package and browsers fetch it lazily. Opt-in profile — native
@@ -84,3 +88,12 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Shipped native binaries (the release build matrix) — whole-program
+# optimisation is worth the build time there and nowhere else: the
+# test job keeps the stock release profile so its many test binaries
+# link quickly.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

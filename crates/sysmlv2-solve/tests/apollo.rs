@@ -42,6 +42,9 @@ fn apollo_solve_ratchet() {
                 );
             }
             Some(SolveOutcome::Unknown(_)) => unknown += 1,
+            // A conclusion this count does not know would silently skew
+            // the ratchet.
+            Some(other) => panic!("unhandled solve conclusion: {other:?}"),
         }
     }
     assert_eq!(

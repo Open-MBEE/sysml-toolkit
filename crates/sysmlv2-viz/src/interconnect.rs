@@ -125,6 +125,7 @@ pub(crate) fn emit(
         connectors: Vec::new(),
         behavior_edges: Vec::new(),
         rendered: Vec::new(),
+        content: HashMap::new(),
     };
     for &e in tops {
         em.render(e, 0);
@@ -167,10 +168,12 @@ struct Emitter<'a> {
     behavior_edges: Vec<ElementRef>,
     /// Every node drawn (mixed reference-edge pass).
     rendered: Vec<ElementRef>,
+    /// Memo of [`Self::has_content`] per element.
+    content: HashMap<ElementRef, bool>,
 }
 
 impl Emitter<'_> {
-    fn next_alias(&mut self) -> String {
+    fn next_alias(&self) -> String {
         format!("n{}", self.alias.len() + self.typed_port_alias.len() + 1)
     }
 
@@ -223,12 +226,19 @@ impl Emitter<'_> {
     }
 
     /// Does `e`'s subtree contribute interconnection content (a part,
-    /// port, or connector)?
+    /// port, or connector)? Memoized: the gate runs from `classify` for
+    /// every definition and again from `render_package`, so without the
+    /// memo each subtree would be re-walked once per ancestor level.
     fn has_content(&mut self, e: ElementRef) -> bool {
+        if let Some(&known) = self.content.get(&e) {
+            return known;
+        }
+        let mut found = false;
         for m in self.r.owned_members(e) {
             let ty = self.r.element_type(m);
             if ty == "PortUsage" || CONNECTORS.contains(&ty) || BLOCK_USAGES.contains(&ty) {
-                return true;
+                found = true;
+                break;
             }
             if (ty == "Package"
                 || ty == "LibraryPackage"
@@ -236,10 +246,12 @@ impl Emitter<'_> {
                 || KERML_BLOCKS.contains(&ty))
                 && self.has_content(m)
             {
-                return true;
+                found = true;
+                break;
             }
         }
-        false
+        self.content.insert(e, found);
+        found
     }
 
     fn indent(&mut self, depth: usize) {
@@ -286,7 +298,7 @@ impl Emitter<'_> {
 
     /// The node keyword for a block: `rectangle` everywhere; actor
     /// members read better as PlantUML actors (mixed).
-    fn block_keyword(&mut self, e: ElementRef) -> &'static str {
+    fn block_keyword(&self, e: ElementRef) -> &'static str {
         if self.mixed && self.r.owning_membership_type(e) == Some("ActorMembership") {
             "actor"
         } else {
@@ -405,33 +417,22 @@ impl Emitter<'_> {
         }
     }
 
-    /// Ports owned by `e`'s definitions (direct typings, user or
-    /// library), in declaration order, not shadowed by an owned port of
-    /// the same name.
+    /// Ports `e` inherits through its *written* heritage (typings and
+    /// specializations, transitively), shadowing applied — the resolver's
+    /// own walk ([`ResolvedModel::inherited_features`]). Two kinds stay
+    /// out: implied bases (every part inherits the standard library's
+    /// generic `ownedPorts` through its implied base), and the library's
+    /// *abstract* port usages when a written `:> Parts::Part` reaches
+    /// them — neither is structure the model declares. Concrete ports
+    /// declared by a definition that happens to live in a loaded library
+    /// still arrive, because the typing that reaches them is written.
     fn inherited_ports(&mut self, e: ElementRef) -> Vec<ElementRef> {
-        let own_names: Vec<String> = self
-            .r
-            .owned_members(e)
+        self.r
+            .inherited_features(e, false)
             .into_iter()
             .filter(|&m| self.r.element_type(m) == "PortUsage")
-            .filter_map(|m| self.r.element_name(m).map(str::to_string))
-            .collect();
-        let mut out = Vec::new();
-        for t in self.r.typings(e) {
-            for m in self.r.owned_members(t) {
-                if self.r.element_type(m) != "PortUsage" {
-                    continue;
-                }
-                let shadowed = self
-                    .r
-                    .element_name(m)
-                    .is_some_and(|n| own_names.iter().any(|o| o == n));
-                if !shadowed && !out.contains(&m) {
-                    out.push(m);
-                }
-            }
-        }
-        out
+            .filter(|&m| !(self.r.is_library_element(m) && self.r.is_abstract(m)))
+            .collect()
     }
 
     /// One port node. `on` is the usage box a definition port renders
@@ -487,39 +488,27 @@ impl Emitter<'_> {
         self.rendered.push(e);
     }
 
-    /// The alias of the deepest rendered link of one end's feature
-    /// chain, tracking the usage context so definition ports resolve to
-    /// their per-usage node (`tank.fuelOut` → the `fuelOut` port on the
-    /// `tank` box).
     fn end_alias(&mut self, chain: &[ElementRef]) -> Option<String> {
-        let mut best = None;
-        let mut context = None;
-        for &link in chain {
-            // A definition port reached through a usage names *that
-            // usage's* port node, not the definition's own — the
-            // per-usage alias wins over the link's global one.
-            if let Some(ctx) = context {
-                if let Some(a) = self.typed_port_alias.get(&(ctx, link)) {
-                    best = Some(a.clone());
-                    context = None;
-                    continue;
-                }
-            }
-            if let Some(a) = self.alias.get(&link) {
-                best = Some(a.clone());
-                context = Some(link);
-            }
-        }
-        best
+        project_end(self.r, chain, &self.alias, &self.typed_port_alias).map(|(id, _)| id)
     }
 
     fn emit_connector_edges(&mut self) {
-        for c in self.connectors.clone() {
+        // Collection is over, so the pass takes the list rather than
+        // copying it to keep the emitter free to mutate.
+        for c in std::mem::take(&mut self.connectors) {
             let ends = self.r.connector_end_targets(c);
-            let aliases: Vec<String> = ends
+            let Some(aliases): Option<Vec<_>> = ends
                 .iter()
-                .filter_map(|end| self.end_alias(&end.chain))
-                .collect();
+                .map(|end| {
+                    if end.spelling.is_some() {
+                        return None;
+                    }
+                    project_end(self.r, &end.chain, &self.alias, &self.typed_port_alias)
+                })
+                .collect()
+            else {
+                continue;
+            };
             if aliases.len() < 2 {
                 continue;
             }
@@ -553,8 +542,24 @@ impl Emitter<'_> {
             } else {
                 format!(" : {}", inline_label(&label))
             };
-            for w in aliases.windows(2) {
-                let _ = writeln!(self.edges, "{} {arrow} {}{suffix}", w[0], w[1]);
+            for (at, w) in aliases.windows(2).enumerate() {
+                let end_label = |at: usize, projected: &(String, usize)| {
+                    if projected.1 < ends[at].chain.len() {
+                        format!(
+                            " \"{}\"",
+                            escape(&crate::chain_label(self.r, &ends[at].chain))
+                        )
+                    } else {
+                        String::new()
+                    }
+                };
+                let source_label = end_label(at, &w[0]);
+                let target_label = end_label(at + 1, &w[1]);
+                let _ = writeln!(
+                    self.edges,
+                    "{}{source_label} {arrow}{target_label} {}{suffix}",
+                    w[0].0, w[1].0
+                );
             }
         }
     }
@@ -562,7 +567,7 @@ impl Emitter<'_> {
     /// Succession and transition edges (mixed). The component dialect
     /// has no `[*]` pseudostate, so unspelled ends drop their edge.
     fn emit_behavior_edges(&mut self) {
-        for e in self.behavior_edges.clone() {
+        for e in std::mem::take(&mut self.behavior_edges) {
             if self.r.element_type(e) == "TransitionUsage" {
                 let parts = self.r.transition_parts(e);
                 let (Some(src), Some(tgt)) = (
@@ -603,7 +608,7 @@ impl Emitter<'_> {
     /// Typing / specialization / stereotyped reference / import edges
     /// between rendered nodes (mixed).
     fn emit_reference_edges(&mut self) {
-        for e in self.rendered.clone() {
+        for e in std::mem::take(&mut self.rendered) {
             let alias = self.alias[&e].clone();
             let ty = self.r.element_type(e);
             let is_usage = !ty.ends_with("Definition") && !KERML_BLOCKS.contains(&ty);
@@ -667,4 +672,33 @@ impl Emitter<'_> {
         );
         Some(alias)
     }
+}
+
+/// Project a chain onto its deepest rendered occurrence. Crossing into a
+/// type's member must not jump to that member's separate declaration box.
+/// The returned prefix length lets callers retain the unrendered feature path.
+pub(crate) fn project_end(
+    r: &mut ResolvedModel,
+    chain: &[ElementRef],
+    drawn: &HashMap<ElementRef, String>,
+    typed_ports: &HashMap<(ElementRef, ElementRef), String>,
+) -> Option<(String, usize)> {
+    let mut best = None;
+    let mut context = None;
+    for (i, &link) in chain.iter().enumerate() {
+        if let Some(ctx) = context {
+            if let Some(id) = typed_ports.get(&(ctx, link)) {
+                // Per-usage port chips have no rendered descendants.
+                return Some((id.clone(), i + 1));
+            }
+            if r.owner(link) != Some(ctx) {
+                break;
+            }
+        }
+        if let Some(id) = drawn.get(&link) {
+            best = Some((id.clone(), i + 1));
+        }
+        context = Some(link);
+    }
+    best
 }

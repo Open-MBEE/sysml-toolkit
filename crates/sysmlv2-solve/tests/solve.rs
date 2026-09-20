@@ -102,9 +102,12 @@ fn real_witness_by_default_sort() {
         panic!("expected a witness, got {out:?}");
     };
     assert_eq!(w.len(), 1);
-    match w[0].1 {
-        WitnessValue::Real(f) => assert!(f > 3.0 && f < 4.0, "witness {f} out of range"),
-        ref v => panic!("expected a real witness, got {v:?}"),
+    match &w[0].1 {
+        WitnessValue::Real(r) => {
+            let f = r.to_f64();
+            assert!(f > 3.0 && f < 4.0, "witness {r} out of range");
+        }
+        v => panic!("expected a real witness, got {v:?}"),
     }
 }
 
@@ -408,7 +411,12 @@ fn variable_converts_across_same_dimension_units() {
     let x = w.iter().find(|(n, _)| n == "x").expect("x in witness");
     assert_eq!(
         x.1,
-        WitnessValue::WithUnit(Box::new(WitnessValue::Real(20.0)), "beat".to_string()),
+        WitnessValue::WithUnit(
+            Box::new(WitnessValue::Real(
+                sysmlv2_model::rational::Rational::from_integer(20),
+            )),
+            "beat".to_string(),
+        ),
         "{w:?}"
     );
 }
@@ -450,11 +458,11 @@ fn scalar_scaling_keeps_the_unit() {
     match &w[0].1 {
         sysmlv2_solve::WitnessValue::WithUnit(v, u) => {
             assert_eq!(u, "mm");
-            match **v {
-                sysmlv2_solve::WitnessValue::Real(f) => {
-                    assert!((4.0..=5.0).contains(&f), "{f}")
+            match &**v {
+                sysmlv2_solve::WitnessValue::Real(r) => {
+                    assert!((4.0..=5.0).contains(&r.to_f64()), "{r}")
                 }
-                ref other => panic!("unexpected witness {other:?}"),
+                other => panic!("unexpected witness {other:?}"),
             }
         }
         other => panic!("expected a unit-tagged witness, got {other:?}"),
@@ -478,19 +486,58 @@ fn unsupported_construct_is_unknown() {
     assert!(m.contains("not in the solvable fragment"), "{m}");
 }
 
-#[test]
-fn missing_z3_binary_reports_unavailable() {
+/// Try to solve an empty model with `z3` taken from `path`, and return
+/// the availability failure that must follow.
+fn unavailable(path: &std::path::Path) -> sysmlv2_solve::SolveError {
     let cfg = SolverConfig {
-        z3_path: Some("/nonexistent/z3-binary".into()),
+        z3_path: Some(path.to_path_buf()),
         ..Default::default()
     };
     let mut model = Model::new();
     model.add_source("test.sysml", "package P { }");
-    let err = solve_constraints(&model, &cfg);
-    assert!(matches!(
-        err,
-        Err(sysmlv2_solve::SolveError::SolverUnavailable(_))
-    ));
+    match solve_constraints(&model, &cfg) {
+        Err(e) => e,
+        Ok(_) => panic!("solving cannot succeed through `{}`", path.display()),
+    }
+}
+
+#[test]
+fn missing_z3_binary_reports_unavailable() {
+    use std::error::Error as _;
+    let err = unavailable(std::path::Path::new("/nonexistent/z3-binary"));
+    match &err {
+        sysmlv2_solve::SolveError::SolverUnavailable { path, source } => {
+            assert_eq!(path, std::path::Path::new("/nonexistent/z3-binary"));
+            assert_eq!(
+                source.as_ref().map(std::io::Error::kind),
+                Some(std::io::ErrorKind::NotFound)
+            );
+        }
+        other => panic!("unexpected failure: {other}"),
+    }
+    assert!(err.source().is_some(), "the cause is reachable as a source");
+    assert!(err.to_string().contains("/nonexistent/z3-binary"), "{err}");
+}
+
+#[test]
+#[cfg(unix)]
+fn an_unreadable_z3_binary_is_told_apart_from_a_missing_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sysmlv2-solve-perm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("z3");
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = unavailable(&path);
+    std::fs::remove_dir_all(&dir).unwrap();
+    match &err {
+        sysmlv2_solve::SolveError::SolverUnavailable { source, .. } => assert_eq!(
+            source.as_ref().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "a binary that exists but cannot be executed must not read as missing: {err}"
+        ),
+        other => panic!("unexpected failure: {other}"),
+    }
 }
 
 #[test]
@@ -752,6 +799,12 @@ fn max_min_fold_to_ite_chains() {
     );
     assert!(
         w.contains(&("lo".to_string(), WitnessValue::Int(2))),
+        "{w:?}"
+    );
+    // The fold's step auxiliaries never surface in the witness.
+    let declared = ["hi", "lo", "a", "b"];
+    assert!(
+        w.iter().all(|(n, _)| declared.contains(&n.as_str())),
         "{w:?}"
     );
 }

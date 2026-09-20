@@ -118,3 +118,44 @@ fn corpus_ratchet() {
         "the doc-carrier family disappeared: {named:#?}"
     );
 }
+
+/// Checking a session leaves its unused-import answer a fresh build's:
+/// the validation passes look names up speculatively (alias targets,
+/// constraint references), and those lookups are not source references.
+#[test]
+fn check_findings_do_not_count_import_use() {
+    use sysmlv2_transform::Library;
+    let lib = Library::Sources {
+        units: std::sync::Arc::new(vec![(
+            "MiniLib.kerml".to_string(),
+            "standard library package MiniLib { class Thing; }".to_string(),
+        )]),
+        snapshot: None,
+    };
+    // (body, unused imports a fresh build reports)
+    let cases = [
+        ("package A { private import MiniLib::*; }", 1),
+        (
+            "package A { private import MiniLib::*; alias T for Thing; }",
+            0,
+        ),
+        (
+            "package A { private import MiniLib::*; part p : Thing; }",
+            0,
+        ),
+        // An alias that fails to resolve walks the import without using it.
+        (
+            "package A { private import MiniLib::*; alias T for Nope; }",
+            1,
+        ),
+    ];
+    for (body, expected) in cases {
+        let src = vec![("a.sysml".to_string(), body.to_string())];
+        let mut fresh = Session::from_sources_with_library(src.clone(), Some(lib.clone())).unwrap();
+        let unused_fresh = fresh.unused_private_imports();
+        assert_eq!(unused_fresh.len(), expected, "{body}");
+        let mut checked = Session::from_sources_with_library(src, Some(lib.clone())).unwrap();
+        let _ = checked.check_findings();
+        assert_eq!(checked.unused_private_imports(), unused_fresh, "{body}");
+    }
+}

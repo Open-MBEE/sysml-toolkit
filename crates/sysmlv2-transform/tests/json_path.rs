@@ -100,21 +100,18 @@ fn edit_a_payload_and_reemit() {
 }
 
 #[test]
-fn anonymous_root_gets_numbered_unit_and_ids_map() {
+fn anonymous_root_gets_numbered_unit_and_keeps_its_ids() {
     // No Flexo naming: the lifted unit is document-1.sysml, so the
-    // ownership paths (and ids) differ from the original m.sysml
-    // emission — id_map_from names every element's move.
+    // ownership paths derive different ids from the original m.sysml
+    // emission — and the session keeps the document's ids as explicit
+    // ids, so nothing moves and id_map_from has nothing to report.
     let input = demo_json_unstamped();
     let mut s = Session::from_interchange_json(&input).expect("lifts");
     assert_eq!(s.units().next().unwrap().1, "document-1.sysml");
+    assert!(s.has_explicit_ids());
     let out = s.to_compact_json();
-    assert_ne!(ids(&input), ids(&out));
-    let map = s.id_map_from(&input);
-    // Every *named* element maps old -> new.
-    assert!(!map.is_empty());
-    for (old, _) in &map {
-        assert!(ids(&input).contains(&old.to_string()));
-    }
+    assert_eq!(ids(&input), ids(&out));
+    assert!(s.id_map_from(&input).is_empty());
 }
 
 fn demo_json_unstamped() -> Value {

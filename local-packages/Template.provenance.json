@@ -1,12 +1,12 @@
 {
   "generator": {
     "name": "@sysml/web",
-    "version": "0.5.5-rc.1"
+    "version": "0.8.0"
   },
   "dataset": {
     "svelte (declarations)": "5.57.0"
   },
-  "kernel": "0.5.5-rc.1",
+  "kernel": "0.8.0",
   "library": "Template",
   "elements": {
     "Template::Template::Attribute": {

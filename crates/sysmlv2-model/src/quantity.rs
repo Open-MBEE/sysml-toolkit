@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use sysmlv2_syntax::Span;
-use sysmlv2_syntax::ast::{Expr, ExprKind, Name, QualifiedName, TargetRef, escape_name};
+use sysmlv2_syntax::ast::{Dialect, Expr, ExprKind, Name, QualifiedName, TargetRef};
 
 use crate::eval::{Unit, Value};
 use crate::json::{ElementRef, ResolvedModel, ScopeRef};
@@ -33,30 +33,58 @@ use crate::json::{ElementRef, ResolvedModel, ScopeRef};
 /// base-quantity element, exponents as reduced rationals (`den > 0`,
 /// gcd 1, zero factors dropped). Two dimensions are equal iff the
 /// factor lists are — the commensurability test.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct QuantityDims {
     /// `(base-quantity element, exponent numerator, denominator)`.
     factors: Vec<(usize, i32, i32)>,
 }
 
 impl QuantityDims {
+    pub(crate) fn valid(&self, n: usize) -> bool {
+        self.factors
+            .iter()
+            .all(|&(e, num, den)| e < n && num != 0 && den > 0)
+    }
+    pub(crate) fn dimensionless() -> Self {
+        Self {
+            factors: Vec::new(),
+        }
+    }
+
+    pub(crate) fn product(&self, other: &Self, divide: bool) -> Option<Self> {
+        let sign = if divide { -1 } else { 1 };
+        normalize(
+            self.factors
+                .iter()
+                .map(|&(q, n, d)| (q, i64::from(n), i64::from(d)))
+                .chain(
+                    other
+                        .factors
+                        .iter()
+                        .map(|&(q, n, d)| (q, i64::from(n) * sign, i64::from(d))),
+                )
+                .collect(),
+        )
+    }
+
+    pub(crate) fn pow(&self, exponent: i32) -> Option<Self> {
+        normalize(
+            self.factors
+                .iter()
+                .map(|&(q, n, d)| (q, i64::from(n) * i64::from(exponent), i64::from(d)))
+                .collect(),
+        )
+    }
+
     /// Dimension one — no base-quantity factors.
+    #[must_use]
     pub fn is_dimensionless(&self) -> bool {
         self.factors.is_empty()
     }
 
-    /// Canonical identity key (index/map currency).
-    fn key(&self) -> String {
-        use std::fmt::Write;
-        let mut out = String::new();
-        for &(q, n, d) in &self.factors {
-            let _ = write!(out, "q{q}^{n}/{d};");
-        }
-        out
-    }
-
     /// Render for diagnostics with the base quantities' declared names:
     /// `L*T^-2`, `M`, `1` (dimensionless).
+    #[must_use]
     pub fn render(&self, model: &ResolvedModel) -> String {
         if self.factors.is_empty() {
             return "1".to_string();
@@ -136,10 +164,37 @@ fn simple_qn(name: &str) -> QualifiedName {
 impl ResolvedModel {
     /// The dimension a quantity value type declares: its `mRef`
     /// measurement reference's unit definition, read through
-    /// [`Self::unit_def_dims`]. `None` when the type does not carry a
+    /// its own `unit_def_dims`. `None` when the type does not carry a
     /// determinable dimension (not a quantity type, no standard
     /// library, an abstract measurement reference).
     pub fn quantity_dims_of_type(&mut self, ty: ElementRef) -> Option<QuantityDims> {
+        if !self.b.semantic_ready {
+            return self.quantity_dims_of_type_uncached(ty);
+        }
+        if let Some(hit) = self
+            .b
+            .semantic_memo
+            .types
+            .get(&(ty.0, crate::eval::unit_spelling_expansion()))
+            .cloned()
+        {
+            self.b.used_imports.extend(hit.imports);
+            return hit.value;
+        }
+        let imports = std::mem::take(&mut self.b.used_imports);
+        let value = self.quantity_dims_of_type_uncached(ty);
+        let proof = crate::semantic_memo::Proven {
+            value: value.clone(),
+            imports: self.b.used_imports.iter().copied().collect(),
+        };
+        self.b.used_imports.extend(imports);
+        self.b
+            .semantic_memo
+            .types
+            .insert((ty.0, crate::eval::unit_spelling_expansion()), proof);
+        value
+    }
+    fn quantity_dims_of_type_uncached(&mut self, ty: ElementRef) -> Option<QuantityDims> {
         let (mref, _) = self.member_of(ty, &simple_qn("mRef"))?;
         self.typings(mref)
             .into_iter()
@@ -178,6 +233,33 @@ impl ResolvedModel {
     /// unitPowerFactors = ()`); a definition stating neither reads
     /// through its explicit supertypes.
     fn unit_def_dims(&mut self, def: ElementRef) -> Option<QuantityDims> {
+        if !self.b.semantic_ready {
+            return self.unit_def_dims_uncached(def);
+        }
+        if let Some(hit) = self
+            .b
+            .semantic_memo
+            .definitions
+            .get(&(def.0, crate::eval::unit_spelling_expansion()))
+            .cloned()
+        {
+            self.b.used_imports.extend(hit.imports);
+            return hit.value;
+        }
+        let imports = std::mem::take(&mut self.b.used_imports);
+        let value = self.unit_def_dims_uncached(def);
+        let proof = crate::semantic_memo::Proven {
+            value: value.clone(),
+            imports: self.b.used_imports.iter().copied().collect(),
+        };
+        self.b.used_imports.extend(imports);
+        self.b
+            .semantic_memo
+            .definitions
+            .insert((def.0, crate::eval::unit_spelling_expansion()), proof);
+        value
+    }
+    fn unit_def_dims_uncached(&mut self, def: ElementRef) -> Option<QuantityDims> {
         let qpf = self.resolve_qualified("Quantities::QuantityPowerFactor")?;
         let mut seen: HashSet<ElementRef> = HashSet::new();
         let mut queue = VecDeque::from([def]);
@@ -220,7 +302,9 @@ impl ResolvedModel {
         let (escope, eexpr) = self.value_expr(em)?;
         let exp = match self.evaluate_in(escope, &eexpr).ok()? {
             Value::Integer(i) => i64::try_from(i).ok()?,
-            Value::Rational(r) if r.fract() == 0.0 && r.abs() < i64::MAX as f64 => r as i64,
+            // A literal `2.0` canonicalizes to the integer arm; the double
+            // arm covers a computed approximate integer.
+            Value::Real(r) if r.fract() == 0.0 && r.abs() < i64::MAX as f64 => r as i64,
             _ => return None,
         };
         Some((quantity.0, exp))
@@ -230,7 +314,9 @@ impl ResolvedModel {
     /// settles on an element, else a structural read of a plain
     /// reference / member-chain spelling (`isq.L`).
     fn expr_element(&mut self, scope: ScopeRef, expr: &Expr) -> Option<ElementRef> {
-        if let Ok(Value::Element(e) | Value::Unbound(e)) = self.evaluate_in(scope, expr) {
+        if let Ok(Value::Element(e) | Value::Unbound(e) | Value::UnboundMember(e)) =
+            self.evaluate_in(scope, expr)
+        {
             return Some(e);
         }
         fn flatten(e: &Expr, out: &mut Vec<Name>) -> bool {
@@ -307,7 +393,7 @@ impl ResolvedModel {
         self.ensure_quantity_index();
         self.quantity_index
             .as_ref()
-            .and_then(|ix| ix.by_dims.get(&dims.key()))
+            .and_then(|ix| ix.by_dims.get(dims))
             .map(|v| v.iter().map(|&e| ElementRef(e)).collect())
             .unwrap_or_default()
     }
@@ -334,7 +420,7 @@ impl ResolvedModel {
     }
 
     fn build_quantity_index(&mut self) -> crate::json::QuantityIndex {
-        let mut by_dims: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_dims: HashMap<QuantityDims, Vec<usize>> = HashMap::new();
         let mut by_unit_def: HashMap<usize, Vec<usize>> = HashMap::new();
         let Some(sqv) = self.resolve_qualified("Quantities::ScalarQuantityValue") else {
             return crate::json::QuantityIndex {
@@ -352,7 +438,7 @@ impl ResolvedModel {
             let Some(d) = self.quantity_dims_of_type(e) else {
                 continue;
             };
-            by_dims.entry(d.key()).or_default().push(e.0);
+            by_dims.entry(d).or_default().push(e.0);
             if let Some((mref, _)) = self.member_of(e, &simple_qn("mRef")) {
                 for def in self.typings(mref) {
                     let bucket = by_unit_def.entry(def.0).or_default();
@@ -375,15 +461,11 @@ impl ResolvedModel {
             named.sort_by(|a, b| (a.1.len(), &a.1).cmp(&(b.1.len(), &b.1)));
             named.into_iter().map(|(e, _)| e).collect()
         };
-        for k in by_dims.keys().cloned().collect::<Vec<_>>() {
-            let bucket = by_dims.remove(&k).unwrap_or_default();
-            let sorted = order(bucket, self);
-            by_dims.insert(k, sorted);
+        for bucket in by_dims.values_mut() {
+            *bucket = order(std::mem::take(bucket), self);
         }
-        for k in by_unit_def.keys().copied().collect::<Vec<_>>() {
-            let bucket = by_unit_def.remove(&k).unwrap_or_default();
-            let sorted = order(bucket, self);
-            by_unit_def.insert(k, sorted);
+        for bucket in by_unit_def.values_mut() {
+            *bucket = order(std::mem::take(bucket), self);
         }
         crate::json::QuantityIndex {
             by_dims,
@@ -398,7 +480,7 @@ impl ResolvedModel {
         let name = match v {
             Value::Boolean(_) => "Boolean",
             Value::Integer(_) => "Integer",
-            Value::Rational(_) => "Real",
+            Value::Rational(_) | Value::Real(_) => "Real",
             Value::String(_) => "String",
             _ => return None,
         };
@@ -411,8 +493,13 @@ impl ResolvedModel {
     /// import), the standard `ISQ` wrapper package's re-export, and
     /// every qualified suffix up to the full owner chain. `None` when
     /// nothing resolves to the target from there.
-    pub fn type_spelling_at(&mut self, scope: ScopeRef, target: ElementRef) -> Option<String> {
-        self.reference_spelling_at(scope, None, target)
+    pub fn type_spelling_at(
+        &mut self,
+        dialect: Option<Dialect>,
+        scope: ScopeRef,
+        target: ElementRef,
+    ) -> Option<String> {
+        self.reference_spelling_at(dialect, scope, None, target)
     }
 
     /// [`Self::type_spelling_at`] for an arbitrary reference site: the
@@ -422,6 +509,7 @@ impl ResolvedModel {
     /// itself — `RefSite::exclude`).
     pub fn reference_spelling_at(
         &mut self,
+        dialect: Option<Dialect>,
         scope: ScopeRef,
         exclude: Option<ElementRef>,
         target: ElementRef,
@@ -435,7 +523,7 @@ impl ResolvedModel {
         }
         let mut spelled: Vec<(String, Vec<String>)> = candidates
             .into_iter()
-            .map(|segs| (spell_segments(&segs), segs))
+            .map(|segs| (spell_segments(dialect, &segs), segs))
             .collect();
         spelled.sort_by(|a, b| (a.0.len(), &a.0).cmp(&(b.0.len(), &b.0)));
         spelled.dedup_by(|a, b| a.0 == b.0);
@@ -448,10 +536,14 @@ impl ResolvedModel {
     }
 
     /// The fully qualified spelling of `target` — its named owner chain
-    /// from the document root, each segment source-escaped. `None` for
-    /// anonymous elements.
-    pub fn full_spelling(&mut self, target: ElementRef) -> Option<String> {
-        Some(spell_segments(&self.owner_name_chain(target)?))
+    /// from the document root, each segment spelled for `dialect` (see
+    /// `spell_segments`). `None` for anonymous elements.
+    pub fn full_spelling(
+        &mut self,
+        dialect: Option<Dialect>,
+        target: ElementRef,
+    ) -> Option<String> {
+        Some(spell_segments(dialect, &self.owner_name_chain(target)?))
     }
 
     /// Whether `segments` (raw name values, unescaped) resolve to
@@ -486,14 +578,13 @@ impl ResolvedModel {
     }
 }
 
-/// Spell raw segment names as a source reference (`::`-joined,
-/// non-identifier segments quoted).
-fn spell_segments(segments: &[String]) -> String {
-    segments
-        .iter()
-        .map(|n| escape_name(n))
-        .collect::<Vec<_>>()
-        .join("::")
+/// Spell raw segment names as a source reference (`::`-joined). Reserved
+/// words of `dialect` — the unit the text is spliced into — and
+/// non-identifier segments are quoted, so the result re-parses there
+/// and the formatter leaves it alone; `None` quotes the words of either
+/// dialect for text without a known destination.
+fn spell_segments(dialect: Option<Dialect>, segments: &[String]) -> String {
+    sysmlv2_syntax::name::spell_path(dialect, segments)
 }
 
 fn segments_qn(segments: Vec<String>) -> QualifiedName {
@@ -507,5 +598,69 @@ fn segments_qn(segments: Vec<String>) -> QualifiedName {
             })
             .collect(),
         span: Span::default(),
+    }
+}
+
+impl ResolvedModel {
+    pub(crate) fn prepare_quantity_memo(&mut self) {
+        let imports = self.b.used_imports.clone();
+        let unit_type = self.resolve_qualified("Quantities::MeasurementUnit");
+        if let Some(unit_type) = unit_type {
+            for e in 0..self.b.elements.len() {
+                if crate::metaclass::conforms(self.b.elements[e].ty, "DataType") {
+                    self.quantity_dims_of_type(ElementRef(e));
+                    if self.conforms(ElementRef(e), unit_type) {
+                        self.unit_def_dims(ElementRef(e));
+                    }
+                } else if crate::metaclass::conforms(self.b.elements[e].ty, "Feature")
+                    && self
+                        .typings(ElementRef(e))
+                        .into_iter()
+                        .any(|t| self.conforms(t, unit_type))
+                {
+                    crate::eval::prepare_unit(&mut self.b, e);
+                }
+            }
+        }
+        self.b.used_imports = imports;
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    #[test]
+    fn dimensions_match_uncached_queries_and_replay_complete_import_evidence() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec-refs/SysML-v2-Release/sysml.library");
+        if !path.exists() {
+            return;
+        }
+        let mut model = crate::model::Model::new();
+        model.load_library_dir(&path).unwrap();
+        let mut r = ResolvedModel::build(&model);
+        for name in [
+            "ISQ::AccelerationValue",
+            "ISQ::LengthValue",
+            "ISQ::MassValue",
+            "ScalarValues::Real",
+        ] {
+            let ty = r.resolve_qualified(name).unwrap();
+            r.b.semantic_ready = false;
+            r.b.used_imports.clear();
+            let expected = r.quantity_dims_of_type(ty);
+            let imports = r.b.used_imports.clone();
+            r.b.semantic_ready = true;
+            assert_eq!(r.quantity_dims_of_type(ty), expected);
+            assert!(
+                r.b.semantic_memo
+                    .types
+                    .get(&(ty.0, crate::eval::unit_spelling_expansion()))
+                    .is_some()
+            );
+            r.b.used_imports.clear();
+            assert_eq!(r.quantity_dims_of_type(ty), expected);
+            assert_eq!(r.b.used_imports, imports, "{name}");
+        }
     }
 }

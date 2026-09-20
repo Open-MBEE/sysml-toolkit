@@ -3,8 +3,9 @@
 //! solve to exactly the recorded outcome counts — `valid` and
 //! `unsatisfiable` must stay 0 on a conforming corpus (a nonzero
 //! `unsatisfiable` would mean we prove a published model self-
-//! contradictory); `satisfiable` should only grow as the translator learns
-//! more of the fragment. Skips when no `z3` is on PATH.
+//! contradictory). Changes in satisfiable/unknown counts require an
+//! explained translation improvement or soundness correction. Skips when
+//! no `z3` is on PATH.
 
 use sysmlv2_model::model::Model;
 use sysmlv2_solve::{SolveOutcome, SolverConfig, solve_constraints, z3_version};
@@ -49,6 +50,9 @@ fn corpus_solve_ratchet() {
                 );
             }
             Some(SolveOutcome::Unknown(_)) => unknown += 1,
+            // A conclusion this count does not know would silently skew
+            // the ratchet.
+            Some(other) => panic!("unhandled solve conclusion: {other:?}"),
         }
     }
     // The 1 valid is genuine and verified by hand: `Turbojet Stage
@@ -59,7 +63,7 @@ fn corpus_solve_ratchet() {
     // benign strengthening on a conforming corpus; UNSAT (⇒ violated)
     // is the alarming direction and must stay 0.
     // 56/23 → 59/30 when asserted constraints with *inherited* bodies
-    // entered the undecided pool (2026-07-17): the solver produces
+    // entered the undecided pool: the solver produces
     // witnesses for three of the ten, the rest stay unknown.
     // 59/30 → 64/25 with the sequence intrinsics (sum over bound
     // sequence arguments — the Mass-Roll-up family); the ten remaining
@@ -72,16 +76,21 @@ fn corpus_solve_ratchet() {
     // approx-Unknown bucket (its `outerDiameter` leaf is a
     // bracket-over-quantity value, outside the fragment).
     // 65/24 → 65/27 when unbound-feature cardinality stopped
-    // fabricating (2026-07-23): three `(1..size(xs)-1)->forAll` bodies
+    // fabricating: three `(1..size(xs)-1)->forAll` bodies
     // over unbound `[0..*]` collections used to evaluate vacuously true
     // (fabricated size 1 emptied the range) and never reached the
     // solver; they now enter the undecided pool, where the quantified
     // size-dependent bodies are outside the decidable fragment.
+    // 65/27 → 63/29 when nested unknown receiver paths stopped sharing
+    // declaration-level variables: `device.battery.power` in User Keyword
+    // Example and `generator.generateTorque.torque` in 12b-Allocation-1
+    // now stay unknown. Supporting them again requires preserving each
+    // receiver path in the solver's variable identity.
     assert_eq!(
         (valid, sat, unsat, unknown),
-        (1, 65, 0, 27),
+        (1, 63, 0, 29),
         "solve ratchet moved — unsatisfiable must stay 0 on the \
-         conforming corpus; satisfiable should only grow via translator \
-         improvements"
+         conforming corpus; satisfiable/unknown changes require an \
+         explained translation improvement or soundness correction"
     );
 }

@@ -348,7 +348,7 @@ fn owner_chain_reaches(r: &mut ResolvedModel, from: ElementRef, to: ElementRef) 
 
 #[test]
 fn provenance_records_owner_and_chain_root() {
-    // The M29a0 classification scenario: references to `Engine::mass`
+    // The classification scenario: references to `Engine::mass`
     // divide into (a) a site internal to the definition body (`margin`'s
     // value), (b) a site reached through the usage (`engine.mass` — chain
     // root = the usage), and (c) an outside reference through the
@@ -425,4 +425,42 @@ fn provenance_records_owner_and_chain_root() {
     assert_eq!(usage_sites.len(), 1, "{usage_sites:?}");
     assert_eq!(usage_sites[0].chain_root, None);
     assert!(owner_chain_reaches(&mut r, usage_sites[0].owner, total));
+}
+
+#[test]
+fn inherited_member_sites_do_not_take_the_base_resolution_walks() {
+    // Resolving `other` inside `Sub` fills Sub's base cache first, which
+    // resolves `Thing` through P's import. That walk belongs to the
+    // `:> Thing` site alone: the redefinition site is reached through
+    // inheritance, not through the import, and a base cache filled by a
+    // later lookup (a prepared library rebuilds its caches under the
+    // user's lookups) must not change what a site records.
+    let src = "package Lib { part def Thing { part other : Other; } part def Other; }
+package P { private import Lib::*; part def Sub :> Thing { part :>> other; } }";
+    let mut r = resolved(src);
+    let import = r
+        .reference_sites()
+        .iter()
+        .find(|s| s.kind == "importedNamespace")
+        .expect("import site")
+        .owner;
+    let thing = r.resolve_qualified("Lib::Thing").expect("resolves");
+    let other = r.resolve_qualified("Lib::Thing::other").expect("resolves");
+
+    let spec = r.references_to(thing);
+    assert_eq!(spec.len(), 1, "{spec:?}");
+    assert_eq!(
+        spec[0].via_imports,
+        [(import, sysmlv2_parser::json::AccessMode::Any)],
+        "the specialization resolved through the import, lexically"
+    );
+
+    let redefinition = r.references_to(other);
+    assert_eq!(redefinition.len(), 1, "{redefinition:?}");
+    assert_eq!(redefinition[0].kind, "redefinedFeature");
+    assert!(
+        redefinition[0].via_imports.is_empty(),
+        "{:?}",
+        redefinition[0].via_imports
+    );
 }

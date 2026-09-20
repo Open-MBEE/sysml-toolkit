@@ -10,14 +10,14 @@
 //! (`use case def X { use case y; }`) render flat under a composition
 //! edge (`usecase` cannot nest in PlantUML).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
 
 use crate::{
-    VizOptions, escape, frame, inline_label, link_suffix, stereo_text, stereotype, style_header,
-    usage_label,
+    VizOptions, escape, frame, inline_label, link_suffix, note_text, stereo_text, stereotype,
+    style_header, usage_label,
 };
 
 /// Case-family node metaclasses.
@@ -38,6 +38,7 @@ pub(crate) fn emit(r: &mut ResolvedModel, tops: &[ElementRef], opts: &VizOptions
         r,
         opts,
         alias: HashMap::new(),
+        drawn: HashSet::new(),
         body: String::new(),
         edges: String::new(),
         notes: 0,
@@ -61,6 +62,8 @@ struct Emitter<'a> {
     r: &'a mut ResolvedModel,
     opts: &'a VizOptions,
     alias: HashMap<ElementRef, String>,
+    /// Every element whose node line is already in `body`.
+    drawn: HashSet<ElementRef>,
     body: String,
     edges: String,
     /// Objective-note counter (`o1…` — disjoint from node aliases and
@@ -102,10 +105,8 @@ impl Emitter<'_> {
                     let target_alias = self.alias_for(target);
                     let _ = writeln!(self.edges, "{owner_alias} ..> {target_alias} : «include»");
                     // The target renders on its own when reached; a
-                    // forward reference draws the node lazily below.
-                    if !self.body.contains(&format!(" as {target_alias} ")) {
-                        self.ensure_case_node(target);
-                    }
+                    // forward reference draws the node lazily here.
+                    self.ensure_case_node(target);
                 }
                 return;
             }
@@ -133,8 +134,13 @@ impl Emitter<'_> {
         }
     }
 
-    /// The `usecase` node line for a case element.
+    /// The `usecase` node line for a case element, once — an element
+    /// reached both through an `«include»` reference and through the
+    /// containment walk keeps the single declaration it already has.
     fn emit_case_node(&mut self, e: ElementRef, alias: &str) {
+        if !self.drawn.insert(e) {
+            return;
+        }
         let ty = self.r.element_type(e);
         let stereo = stereotype(ty);
         let label = if ty.ends_with("Definition") {
@@ -159,14 +165,11 @@ impl Emitter<'_> {
     /// A case referenced before (or without) its own traversal still
     /// gets a node.
     fn ensure_case_node(&mut self, e: ElementRef) {
-        let alias = self.alias_for(e);
-        let marker = format!(" as {alias} ");
-        if self.body.contains(&marker) {
+        if self.drawn.contains(&e) || !CASES.contains(&self.r.element_type(e)) {
             return;
         }
-        if CASES.contains(&self.r.element_type(e)) {
-            self.emit_case_node(e, &alias);
-        }
+        let alias = self.alias_for(e);
+        self.emit_case_node(e, &alias);
     }
 
     fn render_actor(&mut self, m: ElementRef, case_alias: &str) {
@@ -212,19 +215,17 @@ impl Emitter<'_> {
             .collect();
         self.notes += 1;
         let k = self.notes;
-        let _ = writeln!(self.edges, "note as o{k}");
         let header = if label.trim().is_empty() {
             "«objective»".to_string()
         } else {
             format!("«objective» {}", inline_label(&label))
         };
-        let _ = writeln!(self.edges, "{header}");
+        let mut text = escape(&header);
         for b in bodies {
-            for line in b.lines() {
-                let _ = writeln!(self.edges, "{line}");
-            }
+            text.push_str("\\n");
+            text.push_str(&note_text(&b));
         }
-        let _ = writeln!(self.edges, "end note");
+        let _ = writeln!(self.edges, "note \"{text}\" as o{k}");
         let _ = writeln!(self.edges, "o{k} .. {case_alias}");
     }
 }

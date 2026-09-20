@@ -150,6 +150,19 @@ fn minimize_is_idempotent_and_ids_stable() {
 /// spellings the lift prints are (ratcheted) eliminated.
 #[test]
 fn corpus_lift_minimize_gate() {
+    // Unoptimized lifter frames run to 128 KB per nesting level, and the
+    // deepest corpus model sits within bytes of the default test-thread
+    // stack. Give the gate its own generous stack so unrelated struct
+    // growth cannot trip it.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(corpus_lift_minimize_gate_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn corpus_lift_minimize_gate_body() {
     let files = sysmlv2_testkit::user_files();
     assert!(files.len() > 100, "expected the corpus checkout");
     let (mut minimized, mut respelled, mut reverted) = (0usize, 0usize, 0usize);

@@ -14,7 +14,7 @@
 //! the grammars, and the corpus sweep asserts every `Ident` in every
 //! clean-parsing file classifies (a vocabulary gap cannot hide).
 
-use crate::position::Mapper;
+use crate::position::{Mapper, offset32};
 use lsp_types::{SemanticToken, SemanticTokenModifier, SemanticTokenType};
 use std::collections::HashMap;
 use sysmlv2_parser::ast::{
@@ -205,6 +205,7 @@ pub const VOCABULARY: &[&str] = &[
 ];
 
 /// Legend indices — the order is the wire protocol; append only.
+#[must_use]
 pub fn legend_types() -> Vec<SemanticTokenType> {
     vec![
         SemanticTokenType::NAMESPACE,   // 0
@@ -219,6 +220,7 @@ pub fn legend_types() -> Vec<SemanticTokenType> {
     ]
 }
 
+#[must_use]
 pub fn legend_modifiers() -> Vec<SemanticTokenModifier> {
     vec![SemanticTokenModifier::DECLARATION] // bit 0
 }
@@ -244,6 +246,7 @@ pub struct Classified {
 
 /// Classify one parsed unit's tokens. `tokens` must be the unfiltered
 /// lexer output for `src` (trivia included — notes classify as comments).
+#[must_use]
 pub fn classify(unit: &SourceUnit, src: &str, tokens: &[Token]) -> Vec<Classified> {
     let names = collect_name_roles(unit);
     let mut out = Vec::new();
@@ -449,6 +452,7 @@ fn record_qn(map: &mut HashMap<(u32, u32), (u32, u32)>, qn: &QualifiedName, ty: 
 /// Encode classified tokens as the LSP wire format: sorted, multi-line
 /// comments split per line (multiline tokens need a client capability we
 /// don't assume), lengths in the negotiated encoding's units.
+#[must_use]
 pub fn encode(mut toks: Vec<Classified>, src: &str, mapper: &Mapper<'_>) -> Vec<SemanticToken> {
     toks.sort_by_key(|t| t.span.start);
     let mut out = Vec::with_capacity(toks.len());
@@ -477,7 +481,7 @@ pub fn encode(mut toks: Vec<Classified>, src: &str, mapper: &Mapper<'_>) -> Vec<
         if text.contains('\n') {
             let mut line_start = t.span.start;
             for line in text.split('\n') {
-                let line_end = line_start + line.len() as u32;
+                let line_end = line_start + offset32(line.len());
                 if line_start < line_end {
                     push(Span::new(line_start, line_end), t.token_type, t.modifiers);
                 }
@@ -492,6 +496,7 @@ pub fn encode(mut toks: Vec<Classified>, src: &str, mapper: &Mapper<'_>) -> Vec<
 
 /// Convenience: how many `Ident` tokens failed to classify (the corpus
 /// completeness gate — 0 on clean-parsing files).
+#[must_use]
 pub fn unclassified_idents(unit: &SourceUnit, src: &str, tokens: &[Token]) -> Vec<Span> {
     let names = collect_name_roles(unit);
     tokens
@@ -506,6 +511,7 @@ pub fn unclassified_idents(unit: &SourceUnit, src: &str, tokens: &[Token]) -> Ve
 }
 
 /// The unfiltered token stream for one text (lexer output, trivia kept).
+#[must_use]
 pub fn lex(src: &str) -> Vec<Token> {
     sysmlv2_parser::lexer::tokenize(src).0
 }

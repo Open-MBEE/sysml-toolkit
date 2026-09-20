@@ -23,6 +23,55 @@ use std::collections::{HashMap, HashSet};
 use sysmlv2_syntax::ast::escape_name;
 use uuid::Uuid;
 
+/// Why a derivation could not run over a payload. A caller distinguishes
+/// a malformed payload (every variant but the last) from a payload that
+/// is well formed but does not carry enough identity to complete an
+/// assignment ([`IdError::NoIdentity`], reachable only from
+/// [`assign_ids`]).
+///
+/// Non-exhaustive: the derivation may come to distinguish further
+/// malformed shapes, and naming one is not a breaking change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdError {
+    /// The payload is not a flat array of elements.
+    NotAnElementArray,
+    /// The element at this index is not a JSON object.
+    NotAnObject(usize),
+    /// The element at this index carries no string `@id`.
+    MissingId(usize),
+    /// The element at this index carries no string `@type`.
+    MissingType(usize),
+    /// An `@id` that is not a UUID, so nothing can chain from it.
+    InvalidId(String),
+    /// The element at this index has neither a derivable id nor an
+    /// exception entry naming it.
+    NoIdentity(usize),
+}
+
+impl std::fmt::Display for IdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdError::NotAnElementArray => f.write_str("compact payload is a flat element array"),
+            IdError::NotAnObject(i) => write!(f, "element {i} is an object"),
+            IdError::MissingId(i) => write!(f, "element {i} has a string @id"),
+            IdError::MissingType(i) => write!(f, "element {i} has a string @type"),
+            IdError::InvalidId(id) => write!(f, "invalid @id `{id}`"),
+            IdError::NoIdentity(i) => {
+                write!(f, "element {i}: no derivable id and no exception entry")
+            }
+        }
+    }
+}
+
+impl std::error::Error for IdError {}
+
+impl From<IdError> for String {
+    fn from(error: IdError) -> String {
+        error.to_string()
+    }
+}
+
 /// Per element of `compact` (payload order): the graph-derived id, or
 /// `None` where the scheme assigns rather than derives (document
 /// roots) or the element is unreachable from any root. `external_name`
@@ -32,8 +81,8 @@ use uuid::Uuid;
 pub fn derive_ids(
     compact: &Value,
     external_name: &dyn Fn(&str) -> Option<String>,
-) -> Result<Vec<Option<Uuid>>, String> {
-    Ok(walk(compact, external_name, None)?.0)
+) -> Result<Vec<Option<Uuid>>, IdError> {
+    Ok(walk(compact, external_name, None, Paths::Discard)?.0)
 }
 
 /// Per element of `compact` (payload order): the ownership path that
@@ -46,8 +95,8 @@ pub fn derive_ids(
 pub fn segment_paths(
     compact: &Value,
     external_name: &dyn Fn(&str) -> Option<String>,
-) -> Result<Vec<Option<(usize, String)>>, String> {
-    Ok(walk(compact, external_name, None)?.1)
+) -> Result<Vec<Option<(usize, String)>>, IdError> {
+    Ok(walk(compact, external_name, None, Paths::Keep)?.1)
 }
 
 /// Compute the **final** id of every element of a payload whose `@id`
@@ -60,8 +109,8 @@ pub fn assign_ids(
     compact: &Value,
     exceptions: &HashMap<usize, Uuid>,
     external_name: &dyn Fn(&str) -> Option<String>,
-) -> Result<Vec<Uuid>, String> {
-    let derived = walk(compact, external_name, Some(exceptions))?.0;
+) -> Result<Vec<Uuid>, IdError> {
+    let derived = walk(compact, external_name, Some(exceptions), Paths::Discard)?.0;
     derived
         .into_iter()
         .enumerate()
@@ -70,35 +119,80 @@ pub fn assign_ids(
                 .get(&i)
                 .copied()
                 .or(d)
-                .ok_or_else(|| format!("element {i}: no derivable id and no exception entry"))
+                .ok_or(IdError::NoIdentity(i))
         })
         .collect()
 }
 
-type Paths = Vec<Option<(usize, String)>>;
+type SegmentPaths = Vec<Option<(usize, String)>>;
+
+/// Whether the walk materializes segment paths. Only [`segment_paths`]
+/// reads them, and building one costs a string per element plus a copy
+/// of the parent's whole path per step — an id derivation, which every
+/// encoded payload runs, pays none of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Paths {
+    Keep,
+    Discard,
+}
+
+/// The ownership paths built during a walk, when they are wanted.
+struct Trail(Option<SegmentPaths>);
+
+impl Trail {
+    fn new(n: usize, mode: Paths) -> Trail {
+        Trail((mode == Paths::Keep).then(|| vec![None; n]))
+    }
+
+    /// A root's path: itself, and no segments.
+    fn seed(&mut self, root: usize) {
+        if let Some(paths) = self.0.as_mut() {
+            paths[root] = Some((root, String::new()));
+        }
+    }
+
+    /// `child`'s path is `parent`'s extended by `seg`. A parent with no
+    /// path (unreachable from any root) gives its children none either.
+    fn extend(&mut self, child: usize, parent: usize, seg: &str) {
+        let Some(paths) = self.0.as_mut() else { return };
+        let Some((root, parent_path)) = &paths[parent] else {
+            return;
+        };
+        let (root, path) = (
+            *root,
+            if parent_path.is_empty() {
+                seg.to_owned()
+            } else {
+                format!("{parent_path}/{seg}")
+            },
+        );
+        paths[child] = Some((root, path));
+    }
+
+    fn finish(self, n: usize) -> SegmentPaths {
+        self.0.unwrap_or_else(|| vec![None; n])
+    }
+}
 
 fn walk(
     compact: &Value,
     external_name: &dyn Fn(&str) -> Option<String>,
     finals: Option<&HashMap<usize, Uuid>>,
-) -> Result<(Vec<Option<Uuid>>, Paths), String> {
-    let elems = compact
-        .as_array()
-        .ok_or_else(|| "compact payload is a flat element array".to_string())?;
+    keep_paths: Paths,
+) -> Result<(Vec<Option<Uuid>>, SegmentPaths), IdError> {
+    let elems = compact.as_array().ok_or(IdError::NotAnElementArray)?;
     let n = elems.len();
     let obj = |i: usize| elems[i].as_object().expect("checked below");
     let mut index: HashMap<&str, usize> = HashMap::with_capacity(n);
     for (i, e) in elems.iter().enumerate() {
-        let o = e
-            .as_object()
-            .ok_or_else(|| format!("element {i} is an object"))?;
+        let o = e.as_object().ok_or(IdError::NotAnObject(i))?;
         let id = o
             .get("@id")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("element {i} has a string @id"))?;
+            .ok_or(IdError::MissingId(i))?;
         o.get("@type")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("element {i} has a string @type"))?;
+            .ok_or(IdError::MissingType(i))?;
         index.insert(id, i);
     }
     let ty = |i: usize| obj(i).get("@type").and_then(Value::as_str).unwrap_or("");
@@ -114,8 +208,16 @@ fn walk(
             _ => Vec::new(),
         }
     };
+    // Both ownership lists, resolved once: the name fixpoint below reads
+    // the relationship list of every element on every pass, and the walk
+    // reads both again.
+    let owned_rels: Vec<Vec<usize>> = (0..n).map(|i| targets(i, "ownedRelationship")).collect();
+    let owned_elems: Vec<Vec<usize>> = (0..n).map(|i| targets(i, "ownedRelatedElement")).collect();
 
-    // Names: declared, else the graph-effective fixpoint.
+    // Names: declared, else the graph-effective fixpoint. This is the
+    // id-segment reading of the one naming rule — see
+    // `full::effective_name_of` for the rule and its other
+    // implementations; a change to one belongs in all of them.
     let declared = |i: usize| -> Option<String> {
         let o = obj(i);
         o.get("declaredName")
@@ -125,7 +227,7 @@ fn walk(
     };
     let mut names: Vec<Option<String>> = (0..n).map(declared).collect();
     let effective = |i: usize, names: &[Option<String>]| -> Option<String> {
-        for r in targets(i, "ownedRelationship") {
+        for &r in &owned_rels[i] {
             let key = match ty(r) {
                 "Redefinition" => "redefinedFeature",
                 "ReferenceSubsetting" => "referencedFeature",
@@ -162,10 +264,10 @@ fn walk(
     // Roots: elements owned by nothing in the payload.
     let mut owned: vec::BitSet = vec::BitSet::new(n);
     for i in 0..n {
-        for r in targets(i, "ownedRelationship") {
+        for &r in &owned_rels[i] {
             owned.set(r);
         }
-        for k in targets(i, "ownedRelatedElement") {
+        for &k in &owned_elems[i] {
             owned.set(k);
         }
     }
@@ -175,29 +277,24 @@ fn walk(
     // (`derive_ids` — divergence must not cascade), the parent's
     // computed/exception id when assigning (`assign_ids` — the payload
     // carries placeholders).
-    let final_of = |k: usize, derived: &Vec<Option<Uuid>>| -> Result<Uuid, String> {
+    let final_of = |k: usize, derived: &Vec<Option<Uuid>>| -> Result<Uuid, IdError> {
         match finals {
             Some(exceptions) => exceptions
                 .get(&k)
                 .copied()
                 .or(derived[k])
-                .ok_or_else(|| format!("element {k}: no derivable id and no exception entry")),
-            None => Uuid::parse_str(id_str(k)).map_err(|_| format!("invalid @id `{}`", id_str(k))),
+                .ok_or(IdError::NoIdentity(k)),
+            None => {
+                Uuid::parse_str(id_str(k)).map_err(|_| IdError::InvalidId(id_str(k).to_string()))
+            }
         }
     };
-    let mut paths: Paths = vec![None; n];
+    let mut paths = Trail::new(n, keep_paths);
     let mut stack: Vec<usize> = (0..n).filter(|&i| !owned.get(i)).collect();
     for &root in &stack {
-        paths[root] = Some((root, String::new()));
+        paths.seed(root);
     }
     let mut visited = vec::BitSet::new(n);
-    let join = |p: &str, seg: &str| {
-        if p.is_empty() {
-            seg.to_owned()
-        } else {
-            format!("{p}/{seg}")
-        }
-    };
     while let Some(owner) = stack.pop() {
         if visited.get(owner) {
             continue;
@@ -205,8 +302,8 @@ fn walk(
         visited.set(owner);
         let owner_ns = final_of(owner, &derived)?;
         let mut used: HashSet<String> = HashSet::new();
-        for (i, rel) in targets(owner, "ownedRelationship").into_iter().enumerate() {
-            let kids = targets(rel, "ownedRelatedElement");
+        for (i, &rel) in owned_rels[owner].iter().enumerate() {
+            let kids = &owned_elems[rel];
             let membership = ty(rel).ends_with("Membership");
             // A single-member membership whose member has an id-name
             // chains **past the membership**: the member
@@ -221,15 +318,11 @@ fn walk(
                     if used.insert(named.clone()) {
                         let kid = kids[0];
                         derived[kid] = Some(Uuid::new_v5(&owner_ns, named.as_bytes()));
-                        if let Some((root, p)) = paths[owner].clone() {
-                            paths[kid] = Some((root, join(&p, &named)));
-                        }
+                        paths.extend(kid, owner, &named);
                         stack.push(kid);
                         let kid_ns = final_of(kid, &derived)?;
                         derived[rel] = Some(Uuid::new_v5(&kid_ns, b"m"));
-                        if let Some((root, p)) = paths[kid].clone() {
-                            paths[rel] = Some((root, join(&p, "m")));
-                        }
+                        paths.extend(rel, kid, "m");
                         stack.push(rel);
                         continue;
                     }
@@ -250,15 +343,13 @@ fn walk(
                 }
             }
             derived[rel] = Some(Uuid::new_v5(&owner_ns, seg.as_bytes()));
-            if let Some((root, p)) = paths[owner].clone() {
-                paths[rel] = Some((root, join(&p, &seg)));
-            }
+            paths.extend(rel, owner, &seg);
             // A relationship can own relationships of its own
             // (annotations, filters) — it is an owner in its own right.
             stack.push(rel);
             let rel_ns = final_of(rel, &derived)?;
             let mut kid_used: HashSet<String> = HashSet::new();
-            for (j, kid) in kids.into_iter().enumerate() {
+            for (j, &kid) in kids.iter().enumerate() {
                 let mut kseg = format!("e{j}");
                 if membership {
                     if let Some(name) = &names[kid] {
@@ -269,14 +360,12 @@ fn walk(
                     }
                 }
                 derived[kid] = Some(Uuid::new_v5(&rel_ns, kseg.as_bytes()));
-                if let Some((root, p)) = &paths[rel] {
-                    paths[kid] = Some((*root, format!("{p}/{kseg}")));
-                }
+                paths.extend(kid, rel, &kseg);
                 stack.push(kid);
             }
         }
     }
-    Ok((derived, paths))
+    Ok((derived, paths.finish(n)))
 }
 
 /// Tiny fixed-size bit set (no dependency).

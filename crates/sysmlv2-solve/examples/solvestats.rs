@@ -35,7 +35,7 @@ fn main() {
                 valid += 1;
                 println!(
                     "VALID: {} — {:?} ({})",
-                    model.units()[s.unit].name,
+                    model.unit(s.unit).name,
                     s.name,
                     s.element_type
                 );
@@ -44,7 +44,7 @@ fn main() {
                 unsat += 1;
                 println!(
                     "UNSAT: {} — {:?} ({})",
-                    model.units()[s.unit].name,
+                    model.unit(s.unit).name,
                     s.name,
                     s.element_type
                 );
@@ -54,7 +54,7 @@ fn main() {
                 let vals: Vec<String> = w.iter().map(|(n, v)| format!("{n} = {v}")).collect();
                 println!(
                     "sat: {} — {:?} e.g. {}",
-                    model.units()[s.unit].name,
+                    model.unit(s.unit).name,
                     s.name,
                     vals.join(", ")
                 );
@@ -63,6 +63,8 @@ fn main() {
                 unknown += 1;
                 *reasons.entry(m.clone()).or_default() += 1;
             }
+            // A conclusion this tally does not know would go uncounted.
+            Some(other) => panic!("unhandled solve conclusion: {other:?}"),
         }
     }
     println!(

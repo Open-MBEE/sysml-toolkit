@@ -15,5 +15,5 @@ pub mod span;
 pub mod token;
 pub mod visit;
 
-pub use diag::Diagnostic;
+pub use diag::{Diagnostic, Diagnostics};
 pub use span::Span;

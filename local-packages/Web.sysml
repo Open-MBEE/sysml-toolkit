@@ -7,7 +7,9 @@ library package Web {
        readonly -> constant; tree-node references (Node/Attr and their collections) are derived navigation the
        toolkit constructs from ownership; mixins are abstract definitions with multiple specialization;
        operations are nested action definitions (in parameters, out result; Promise<T> -> T, recorded async;
-       overloads merged); callbacks are action definitions; record<K, V> is an entry attribute definition.
+       overloads merged; an operation repeating the name of an inherited one is left to the inherited
+       declaration and recorded in the sidecar); callbacks are action definitions; record<K, V> is an
+       entry attribute definition.
        Element kinds fix localName once and specialize the element's interface. Provenance: the sidecar.
        */
 
@@ -430,7 +432,7 @@ library package Web {
             constant attribute slotAssignment : SlotAssignmentMode;
             constant attribute clonable : Boolean;
             derived ref part host : Element;
-            attribute innerHTML : Base::Anything;
+            attribute innerHTML : Base::DataValue;
             action def setHTML {
                 in html : String;
                 in options : HTML::SetHTMLOptions[0..1];
@@ -481,8 +483,8 @@ library package Web {
             derived ref part shadowRoot : ShadowRoot[0..1];
             constant ref part customElementRegistry : HTML::CustomElementRegistry[0..1];
             attribute 'part' : String[0..*] ordered;
-            attribute innerHTML : Base::Anything;
-            attribute outerHTML : Base::Anything;
+            attribute innerHTML : Base::DataValue;
+            attribute outerHTML : Base::DataValue;
             action def hasAttributes {
                 out result : Boolean;
             }
@@ -1021,7 +1023,7 @@ library package Web {
             attribute lang : String;
             attribute translate : Boolean;
             attribute dir : String;
-            attribute hidden : Base::Anything[0..1];
+            attribute hidden : Base::DataValue[0..1];
             attribute inert : Boolean;
             attribute accessKey : String;
             constant attribute accessKeyLabel : String;
@@ -1217,7 +1219,7 @@ library package Web {
 
         part def HTMLIFrameElement :> HTMLElement {
             attribute src : String;
-            attribute srcdoc : Base::Anything;
+            attribute srcdoc : Base::DataValue;
             attribute name : String;
             attribute sandbox : String[0..*] ordered;
             attribute allow : String;
@@ -1329,7 +1331,7 @@ library package Web {
         abstract part def HTMLMediaElement :> HTMLElement {
             constant ref part error : MediaError[0..1];
             attribute src : String;
-            attribute srcObject : Base::Anything[0..1];
+            attribute srcObject : Base::DataValue[0..1];
             constant attribute currentSrc : String;
             attribute crossOrigin : String[0..1];
             constant attribute NETWORK_EMPTY : Natural = 0;
@@ -1570,9 +1572,6 @@ library package Web {
             action def add {
                 in element : HTMLElement;
                 in before : Base::Anything[0..1];
-            }
-            action def remove {
-                in index : Integer[0..1];
             }
             action def checkValidity {
                 out result : Boolean;
@@ -1992,7 +1991,7 @@ library package Web {
             attribute type : String;
             attribute defaultValue : String;
             attribute value : String;
-            attribute valueAsDate : Base::Anything[0..1];
+            attribute valueAsDate : Base::DataValue[0..1];
             attribute valueAsNumber : Real;
             attribute width : Natural;
             constant attribute willValidate : Boolean;
@@ -2042,11 +2041,11 @@ library package Web {
         }
 
         attribute def SetHTMLOptions {
-            attribute sanitizer : Base::Anything[0..1] default = "default";
+            attribute sanitizer : Base::DataValue[0..1] default = "default";
         }
 
         attribute def SetHTMLUnsafeOptions {
-            attribute sanitizer : Base::Anything[0..1];
+            attribute sanitizer : Base::DataValue[0..1];
             attribute runScripts : Boolean[0..1] default = false;
         }
 

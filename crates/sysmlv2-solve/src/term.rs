@@ -5,6 +5,8 @@
 //! finalization and inserts `to_real` coercions wherever `Int`- and
 //! `Real`-sorted operands mix (SMT-LIB has no implicit numeric widening).
 
+use sysmlv2_model::rational::Rational;
+
 /// SMT sort of a term. `Enum` carries an index into the translation's enum
 /// sort table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -45,8 +47,8 @@ pub(crate) enum Op {
 pub(crate) enum Term {
     BoolLit(bool),
     IntLit(i128),
-    /// Pre-rendered SMT real literal (`3.14`, `(/ 1.0 2.0)`, `(- 0.5)`).
-    RealLit(String),
+    /// Exact real literal; rendered as `3.0` or `(/ 3.0 10.0)`.
+    RealLit(Rational),
     /// String literal (unescaped; rendering doubles interior quotes).
     StrLit(String),
     /// Free variable — index into the translation's variable table.
@@ -110,7 +112,7 @@ impl RenderCtx<'_> {
         match t {
             Term::BoolLit(b) => Ok((b.to_string(), Sort::Bool)),
             Term::IntLit(i) => Ok((render_int(*i), Sort::Int)),
-            Term::RealLit(s) => Ok((s.clone(), Sort::Real)),
+            Term::RealLit(r) => Ok((render_real(r), Sort::Real)),
             Term::StrLit(s) => Ok((format!("\"{}\"", s.replace('"', "\"\"")), Sort::Str)),
             Term::Var(i) => Ok((self.var_syms[*i].clone(), self.var_sorts[*i])),
             Term::EnumLit(s, c) => Ok((self.enums[*s].ctors[*c].clone(), Sort::Enum(*s))),
@@ -261,31 +263,18 @@ pub(crate) fn render_int(i: i128) -> String {
     }
 }
 
-/// Exact SMT real literal for a finite `f64` (every finite double is a
-/// dyadic rational). `None` when the exact fraction would overflow the
-/// integer rendering (astronomically large or tiny magnitudes).
-pub(crate) fn real_from_f64(f: f64) -> Option<String> {
-    if !f.is_finite() {
-        return None;
-    }
-    let neg = f.is_sign_negative() && f != 0.0;
-    let mut x = f.abs();
-    let mut den: i128 = 1;
-    while x.fract() != 0.0 {
-        if den > i128::MAX / 2 || x > 1e37 {
-            return None;
-        }
-        x *= 2.0;
-        den *= 2;
-    }
-    if x > 1e37 {
-        return None;
-    }
-    let num = x as i128;
-    let body = if den == 1 {
-        format!("{num}.0")
+/// Render an exact rational as an SMT-LIB real literal: `3.0`,
+/// `(/ 3.0 10.0)`, or either inside `(- …)` when negative.
+pub(crate) fn render_real(r: &Rational) -> String {
+    let (n, d) = r.abs().to_string_parts();
+    let body = if d == "1" {
+        format!("{n}.0")
     } else {
-        format!("(/ {num}.0 {den}.0)")
+        format!("(/ {n}.0 {d}.0)")
     };
-    Some(if neg { format!("(- {body})") } else { body })
+    if r.is_negative() {
+        format!("(- {body})")
+    } else {
+        body
+    }
 }

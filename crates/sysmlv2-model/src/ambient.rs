@@ -49,11 +49,13 @@ pub const LIBRARIES: &[(&str, &str)] = &[
 /// out — to validate a regenerated file as a candidate without its
 /// built-in copy colliding, or to run against a bare standard library.
 /// Always on where there is no environment (the browser target).
+#[must_use]
 pub fn enabled() -> bool {
     !std::env::var_os("SYSMLV2_AMBIENT").is_some_and(|v| v == "off")
 }
 
 /// The ambient units in load order, honoring [`enabled`].
+#[must_use]
 pub fn units() -> Vec<(String, String)> {
     if !enabled() {
         return Vec::new();
@@ -79,6 +81,7 @@ pub fn add_to(model: &mut Model) {
 /// A content hash over the ambient sources (and whether they are
 /// enabled), mixed into library cache keys so a regenerated library
 /// never replays a stale recording.
+#[must_use]
 pub fn content_hash() -> u64 {
     if !enabled() {
         return 0x6f66_6600; // "off"
@@ -101,6 +104,7 @@ pub fn content_hash() -> u64 {
 }
 
 /// Mix an ambient content hash into a library-directory cache key.
+#[must_use]
 pub fn mix_key(dir_key: u64) -> u64 {
     dir_key.rotate_left(17).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ content_hash()
 }

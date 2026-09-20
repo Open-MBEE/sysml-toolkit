@@ -79,14 +79,18 @@ Where the bytes go, relative to compact JSON:
 - **tables (u16)** — the generated metamodel tables (type codes, field ordinals, kinds, defaults; currently from the 20250201 normative release). Refused on any decode, since every element record reads through them — but independently of layout, so a tables-only regeneration is diagnosable as exactly that.
 - **scheme (u8)** — the id-derivation scheme (`IDS.md`; wire scheme 1 is that document's graph-derived derivation). Consulted **only** where derivation is in play (id-elided payloads, snapshot or delta): explicit-id payloads decode regardless of it. Digest failures on matched-scheme payloads therefore come pre-diagnosed: not a scheme skew, so library skew or corruption.
 
+**Flags.** `elideIds` (1), `fullForm` (2), `delta` (4), `deltaPortable` (8), `unitPaths` (16), `impliedOwners` (32), and `explicitIds` (64): a compact snapshot whose ids are not all the graph derivation of `IDS.md` — a session that loaded a document from another producer, or under other unit names, keeps the ids it was given and marks the payload so a receiver never re-derives them; such a session refuses id elision. Informational for decoders, which always read the id table; `describe` reports it as `explicitIds`.
+
 Unknown flag bits are refused, so a decoder never misreads a payload kind it does not know. **Determinism:** byte output is a pure function of the input Value (canonical type/field/table ordering); an exact byte fixture in `crates/sysmlv2-cbor/tests/determinism.rs` pins the wire format.
 
 ## Using it
 
 - **CLI** — `sysmlv2 convert model.sysml --to compact-cbor -o m.s2c`; a `.s2c` input decodes up front and flows like `.json` (`sysmlv2 convert m.s2c --to text`). Binary stdout when `-o` is omitted. `--flexo` is JSON-only (the change-record envelope wraps JSON; CBOR carries the bare element array).
 - **Rust** — `sysmlv2_cbor::{to_compact_cbor, from_compact_cbor}` (`Value ↔ bytes`), or `Session::{to_compact_cbor, from_compact_cbor[_with_library]}` in `sysmlv2-transform`.
-- **wasm** — `session.toCompactCbor(): Uint8Array`, `Session.fromCompactCbor(bytes, libSources?, libSnapshot?)`.
+- **wasm** — `session.toCompactCbor(): Uint8Array`, `Session.fromCompactCbor(bytes, libSources?, libSnapshot?, indent?)`.
 - **Python** — `session.to_compact_cbor() -> bytes`, `Session.from_compact_cbor(data, lib=None)`.
+
+Every Rust entry point fails with one `sysmlv2_cbor::Error`, whose `Display` explains the refusal and whose `kind()` classifies it for callers that act on the classes differently: `MissingMagic` (not an s2c payload), `UnsupportedVersion` (a wire-layout, table, id-scheme, base-index or resolver-artifact generation this build does not implement), `NeedsResolver` (an id-elided payload at an entry point that carries no name resolver), `WrongForm` (a well-formed payload of another kind — the message names the entry point to use), `BaseDigestMismatch` (the held base is not the one the delta names), `Truncated`, and `Malformed` for everything else. The enum is `#[non_exhaustive]`: later wire generations will distinguish more, so match with a wildcard arm.
 
 ## Compact-form canonicalization
 
@@ -96,44 +100,45 @@ The presence-faithful round-trip means the codec never bridges the *default elis
 
 ## Measured comparison (real corpora)
 
-Two corpora, measured with `cargo run --release -p sysmlv2-cbor --example corpus_bench` (medians of 5 runs, Apple Silicon; deflate level 8 via the workspace's existing compressor — CBOR needs no compressor to beat compressed JSON, and general-purpose compression composes on top):
+Two pinned corpora, measured with toolkit implementation `15a9de5` on Apple Silicon/macOS arm64. Reproduce with `cargo run --release -p sysmlv2-cbor --example corpus_bench` (medians of five runs; deflate level 8). This harness measures each serialization stage; it does not exercise the CLI’s prepared-library cache. Times are descriptive single-machine results, not performance guarantees.
 
-**`library`** — every textual unit of the vendored standard library loaded as user sources (94 units, **91,319 elements**):
+The official library pin is `de1070ae8e79c21532b8004fc663d47b35d0e9fa`; Apollo is `6e9c93fe7d80c5ca3534bb14b10ab374a643ef2d`.
 
-| form | bytes | +deflate |
-|---|---:|---:|
-| pretty JSON | 45,392,718 | 4,570,527 |
-| minified JSON | 35,401,680 | 4,346,312 |
-| compact CBOR | 3,991,107 | 2,314,235 |
-| **min-JSON / CBOR** | **8.9×** | **1.9×** |
-
-**`model`** — the vendored end-to-end validation model (`spec-refs/apollo-11-sysml-v2`, 28 units, **23,276 elements**), resolved against the standard library:
+**Library** — 94 textual units loaded as user sources, 91,405 compact elements.
 
 | form | bytes | +deflate |
 |---|---:|---:|
-| pretty JSON | 11,915,294 | 1,177,595 |
-| minified JSON | 9,273,607 | 1,125,183 |
-| compact CBOR | 977,151 | 606,183 |
-| **min-JSON / CBOR** | **9.5×** | **1.9×** |
+| pretty JSON | 45432828 | 4575775 |
+| minified JSON | 35432925 | 4351340 |
+| compact CBOR | 3579835 | 2077326 |
+| compact CBOR --elide-ids | 2029539 | 558533 |
+| ratio min-JSON / CBOR | 9.90x | 2.09x |
 
-Pipeline timing, textual notation → serialized form and back (`library` / `model`):
+**Apollo 11** — 28 textual units resolved against the standard library, 23,276 compact elements.
 
-| stage | library ms | model ms |
+| form | bytes | +deflate |
 |---|---:|---:|
-| text → model (parse) | 12.0 | 16.3 |
-| model → element array (lower + resolve + Value) | 245.9 | 214.5 |
-| Value → minified JSON | 39.0 | 10.9 |
-| Value → CBOR | 104.8 | 26.4 |
-| minified JSON → Value | 84.8 | 22.5 |
-| CBOR → Value | 80.7 | 22.0 |
-| Value → CBOR --elide-ids (derive + verify) | 219.2 | 45.3 |
-| CBOR --elide-ids → Value (derive + digest) | 235.1 | 49.0 |
-| Value → textual notation (lift + print) | 115.3 | 27.7 |
+| pretty JSON | 11917868 | 1177849 |
+| minified JSON | 9275587 | 1125537 |
+| compact CBOR | 886602 | 547650 |
+| compact CBOR --elide-ids | 491485 | 160052 |
+| ratio min-JSON / CBOR | 10.46x | 2.06x |
 
-Reading the numbers:
+| stage | library ms | Apollo ms |
+|---|---:|---:|
+| text → model (parse) | 10.5 | 17.2 |
+| model → element array (lower+resolve+Value) | 252.6 | 234.8 |
+| Value → minified JSON | 28.1 | 7.5 |
+| Value → CBOR | 127.9 | 30.5 |
+| minified JSON → Value | 88.4 | 23.7 |
+| CBOR → Value | 116.1 | 30.9 |
+| Value → CBOR --elide-ids (derive+verify) | 251.2 | 55.6 |
+| CBOR --elide-ids → Value (derive+digest) | 262.2 | 62.3 |
+| Value → textual notation (lift+print) | 112.1 | 29.0 |
 
-- **Size.** Real models do better than the golden corpus (~5.8×): ~9× under minified JSON raw, at ~43 B/element. **Raw CBOR is already smaller than deflated minified JSON** — the wire wins without spending CPU on compression — and after both sides deflate, CBOR still halves the payload (the id table's random UUID bytes are the dominant incompressible remainder; eliding them is what id elision, below, does).
-- **Time.** Encoding costs ~2.5× JSON serialization (table lookups per field) but is a small slice of the text→bytes pipeline — lowering + resolution dominates at ~200+ ms. Decoding is consistently *faster* than JSON parsing (no string keys to hash, no text numbers to parse), so the read path — the hot one for a web client or a Flexo retrieval — is both ~9× smaller and slightly cheaper to parse. The lift back to textual notation is identical for both forms (they produce the same `Value`).
+Compact CBOR is 9.9–10.5× smaller than minified JSON, or about 2.1× after deflate. In this run, encoding takes about 4.1–4.6× JSON serialization time and decoding takes about 1.3× JSON parsing time. Smaller payloads can reduce transfer/storage costs, but this measurement does not establish a faster decoder. Id elision adds graph derivation and digest work. Lowering and resolution remain a substantial part of the complete pipeline.
+
+Full-form CBOR is 10.9–11.6× smaller than minified full JSON (1.78× after deflate). Appending the harness’s small package yields strict deltas of 338 bytes for the library and 316 bytes for Apollo; portable deltas are 345 bytes for both.
 
 ## Delta payloads
 
@@ -186,7 +191,7 @@ The id table was the dominant *incompressible* remainder of the un-elided format
 
 | corpus | CBOR | elided | CBOR+deflate | elided+deflate |
 |---|---:|---:|---:|---:|
-| library | 3,991,107 | 2,442,273 | 2,314,235 | **797,325** |
-| model | 977,151 | 582,034 | 606,183 | **218,243** |
+| library | 3,579,835 | 2,029,539 | 2,077,326 | 558,533 |
+| Apollo | 886,602 | 491,485 | 547,650 | 160,052 |
 
-Against minified JSON that is **14.5–15.9× raw** and **~5.3× after both sides deflate** (versus 1.9× without elision). Cost: derivation roughly doubles encode (219 ms / 45 ms on the two corpora) and decode (235 ms / 49 ms incl. the digest check) — still the same order as JSON parsing, and far under lowering/resolution.
+Against minified JSON, elision gives **17.5–18.9× raw** and **7.0–7.8× after both sides deflate** in the benchmark above. Derivation and digest verification roughly double ordinary CBOR encode/decode time; see the stage table for the measured costs.

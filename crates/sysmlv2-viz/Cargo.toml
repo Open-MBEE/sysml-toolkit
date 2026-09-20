@@ -10,6 +10,8 @@
 name = "sysmlv2-viz"
 description = "PlantUML emission for SysML v2 / KerML models"
 readme = "README.md"
+keywords = ["sysml", "kerml", "mbse", "plantuml", "diagram"]
+categories = ["visualization"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,8 +19,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-sysmlv2-model = { path = "../sysmlv2-model", version = "0.6.0" }
-sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.6.0" }
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.9.0" }
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.9.0" }
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

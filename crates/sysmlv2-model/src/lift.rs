@@ -15,7 +15,7 @@
 //! `emit(parse(print(lift(j)))) == j` for compact `j` emitted by this crate.
 
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use sysmlv2_syntax::ast::*;
 use sysmlv2_syntax::span::Span;
 
@@ -28,26 +28,60 @@ pub struct Lifted {
     pub errors: Vec<String>,
 }
 
+/// Why a payload could not be lifted at all. A problem inside an
+/// otherwise well-formed payload may be reported in [`Lifted::errors`],
+/// but a cycle or exhausted depth budget refuses the document: returning
+/// a partial expression could change its value while still printing as
+/// valid source.
+///
+/// Non-exhaustive: a payload shape the lift cannot start on may be
+/// recognised later, and naming one is not a breaking change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LiftError {
+    /// The payload is not the flat array of elements KerML 10.4.6
+    /// describes.
+    NotAnElementArray,
+    /// An entry of the array is not a JSON object.
+    NotAnElement,
+    /// An element carries no `@id`, so nothing can point at it.
+    ElementWithoutId,
+    /// Following the ownership graph would lose a subtree or operand.
+    Incomplete { errors: Vec<String> },
+}
+
+impl std::fmt::Display for LiftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiftError::NotAnElementArray => {
+                f.write_str("expected a flat JSON array of elements (KerML 10.4.6)")
+            }
+            LiftError::NotAnElement => f.write_str("expected every element to be a JSON object"),
+            LiftError::ElementWithoutId => f.write_str("element without @id"),
+            LiftError::Incomplete { errors } => {
+                write!(
+                    f,
+                    "cannot lift the document without data loss: {}",
+                    errors.join("; ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LiftError {}
+
+impl From<LiftError> for String {
+    fn from(error: LiftError) -> String {
+        error.to_string()
+    }
+}
+
 /// Lift a compact-JSON element array into a syntax AST.
-pub fn from_compact_json(value: &Value) -> Result<Lifted, String> {
+pub fn from_compact_json(value: &Value) -> Result<Lifted, LiftError> {
     from_compact_json_with_names(value, &HashMap::new())
 }
 
-/// Like [`from_compact_json`], with an extra `id → qualified-name segments`
-/// table for references that point outside the document (e.g. the standard
-/// library when the JSON was emitted with library resolution).
-/// Split a multi-document element list into per-root-namespace chunks.
-///
-/// Interchange JSON holds one root `Namespace` element per document (an
-/// element of `@type` `Namespace` with no `owningRelationship`); every
-/// other element is reachable from exactly one root through the ownership
-/// closure (`ownedRelationship` on elements, `ownedRelatedElement` on
-/// relationships). Returns one `(root_name, elements)` pair per root in
-/// input order — `root_name` is the root's `qualifiedName`/`declaredName`
-/// when present (the Flexo convention stores the source file name there).
-/// `None` when the input has no root namespaces or when any element is
-/// unreachable from every root (callers then treat the input as one
-/// document).
 /// Qualified-name map over a whole element list: element `@id` → name
 /// segments, built by walking the ownership closure from each root
 /// namespace and collecting `declaredName`s. Feed it to
@@ -89,6 +123,11 @@ pub fn document_name_map(value: &Value) -> std::collections::HashMap<String, Vec
         next_featuring: true,
         body_featuring: false,
         errors: Vec::new(),
+        reported: HashSet::new(),
+        depth_reported: HashSet::new(),
+        in_progress: HashSet::new(),
+        depth: 0,
+        incomplete: false,
     };
     let is_root = |e: &Value| {
         e.get("@type").and_then(|v| v.as_str()) == Some("Namespace")
@@ -200,6 +239,24 @@ pub fn document_reference_name_map(
     out
 }
 
+/// Split a multi-document element list into per-root-namespace chunks.
+///
+/// Interchange JSON holds one root `Namespace` element per document (an
+/// element of `@type` `Namespace` with no `owningRelationship`); every
+/// other element is reachable from exactly one root through the ownership
+/// closure (`ownedRelationship` on elements, `ownedRelatedElement` on
+/// relationships). Returns one `(root_name, elements)` pair per root in
+/// input order — `root_name` is the root's `qualifiedName`/`declaredName`
+/// when present (the interchange convention stores the source file name
+/// there). `None` when the input has no root namespaces or when any
+/// element is unreachable from every root (callers then treat the input
+/// as one document).
+///
+/// # Panics
+///
+/// Never: every element is assigned to a document before the split
+/// begins, and a payload with an unassignable element returns `None`
+/// rather than reaching the split.
 pub fn split_documents(value: &Value) -> Option<Vec<(Option<String>, Value)>> {
     let elements = value.as_array()?;
     let id_of = |e: &Value| e.get("@id").and_then(|v| v.as_str()).map(str::to_owned);
@@ -273,21 +330,76 @@ pub fn split_documents(value: &Value) -> Option<Vec<(Option<String>, Value)>> {
     )
 }
 
+/// Like [`from_compact_json`], with an extra `id → qualified-name segments`
+/// table for references that point outside the document (e.g. the standard
+/// library when the JSON was emitted with library resolution).
 pub fn from_compact_json_with_names(
     value: &Value,
     extra_names: &HashMap<String, Vec<String>>,
-) -> Result<Lifted, String> {
+) -> Result<Lifted, LiftError> {
+    // The lift recurses once per membership and owned definition or
+    // usage (expressions use a work stack), so its stack need is set by
+    // [`MAX_LIFT_DEPTH`] rather than by whichever thread called it (a
+    // language-server worker, a test thread), and it gets a thread of its
+    // own to carry that need.
+    //
+    // Only a payload that nests deeply enough to want one takes it:
+    // spawning costs several times what lifting a small document does,
+    // and anything lifting many documents would pay that per document.
+    // Depth decides it rather than size, because it is depth the stack
+    // answers for — and a payload that does nest deeply is never the
+    // small one the spawn would dominate.
+    //
+    // A target without threads, or a host that refuses one, lifts in
+    // place; the depth guard applies either way.
+    #[cfg(not(target_family = "wasm"))]
+    if value
+        .as_array()
+        .is_some_and(|items| nests_deeper_than(items, IN_PLACE_DEPTH))
+    {
+        let spawned = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("sysmlv2-lift".into())
+                .stack_size(LIFT_STACK_BYTES)
+                .spawn_scoped(scope, || lift_document(value, extra_names))
+                .map(std::thread::ScopedJoinHandle::join)
+        });
+        match spawned {
+            Ok(Ok(lifted)) => return lifted,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => {}
+        }
+    }
+    lift_document(value, extra_names)
+}
+
+/// [`from_compact_json_with_names`] without moving the lift onto a stack
+/// of its own: what a target without threads does, and what a caller
+/// already holding a stack sized for [`MAX_LIFT_DEPTH`] steps can ask
+/// for. The depth guard applies here too — this is the same lift, on the
+/// calling thread.
+pub fn from_compact_json_on_this_stack(
+    value: &Value,
+    extra_names: &HashMap<String, Vec<String>>,
+) -> Result<Lifted, LiftError> {
+    lift_document(value, extra_names)
+}
+
+fn lift_document(
+    value: &Value,
+    extra_names: &HashMap<String, Vec<String>>,
+) -> Result<Lifted, LiftError> {
     let Value::Array(items) = value else {
-        return Err("expected a flat JSON array of elements (KerML 10.4.6)".into());
+        return Err(LiftError::NotAnElementArray);
     };
     let mut by_id: HashMap<&str, El> = HashMap::new();
     let mut order: Vec<&str> = Vec::new();
     for item in items {
         let Value::Object(el) = item else {
-            return Err("expected every element to be a JSON object".into());
+            return Err(LiftError::NotAnElement);
         };
         let Some(id) = el.get("@id").and_then(|v| v.as_str()) else {
-            return Err("element without @id".into());
+            return Err(LiftError::ElementWithoutId);
         };
         by_id.insert(id, el);
         order.push(id);
@@ -317,6 +429,11 @@ pub fn from_compact_json_with_names(
         next_featuring: true,
         body_featuring: false,
         errors: Vec::new(),
+        reported: HashSet::new(),
+        depth_reported: HashSet::new(),
+        in_progress: HashSet::new(),
+        depth: 0,
+        incomplete: false,
     };
     lifter.dialect = lifter.detect_dialect();
     lifter.compute_qnames(&order);
@@ -358,6 +475,11 @@ pub fn from_compact_json_with_names(
                 members.push(m);
             }
         }
+    }
+    if lifter.incomplete {
+        return Err(LiftError::Incomplete {
+            errors: lifter.errors,
+        });
     }
     Ok(Lifted {
         unit: SourceUnit {
@@ -532,6 +654,110 @@ const KERML_MARKERS: &[&str] = &[
     "MetadataFeature",
 ];
 
+/// The most lift steps one ownership path may take: a step is a
+/// membership or the package, definition or usage it owns. Expressions
+/// use an iterative walk with a separate bound. Ownership pointers come from the payload, so a
+/// chain that loops back on itself or nests without bound must end in an
+/// error rather than exhaust the stack. A nesting level of written
+/// notation costs two steps (its membership and the member). The parser
+/// can accept a leaf member inside its deepest body, hence the extra pair.
+pub const MAX_LIFT_DEPTH: usize = 2 * (sysmlv2_syntax::parser::MAX_NESTING as usize + 1);
+
+/// Expressions are walked without recursive stack frames, but their AST
+/// consumers still need a bound. Match the parser's operator budget plus
+/// its leaf operand; expression bodies retain the structural budget.
+pub const MAX_LIFT_EXPR_DEPTH: usize = sysmlv2_syntax::parser::MAX_EXPR_OPERATORS as usize + 1;
+
+/// Stack reserved for the lift thread: enough for [`MAX_LIFT_DEPTH`]
+/// steps in an unoptimized build, where one step costs up to about
+/// 190 KiB (an optimized build needs a twentieth of that). Reserved
+/// address space only — pages are committed as the recursion touches
+/// them.
+#[cfg(not(target_family = "wasm"))]
+const LIFT_STACK_BYTES: usize = 128 << 20;
+
+/// The deepest payload lifted on the caller's own stack.
+///
+/// Measured against the two megabytes a thread gets when it asks for
+/// none, in an unoptimized build, where a step is at its most
+/// expensive. That is the smallest stack a caller can be on: one that
+/// parses has already reserved a larger one for the parser's own bound
+/// (`sysmlv2_syntax::parser::MAX_NESTING_STACK_BYTES`), and a caller
+/// that only lifts need not have. Past this the payload could nest
+/// toward [`MAX_LIFT_DEPTH`], which needs a stack sized for it; a
+/// nesting level of written notation costs two steps, so this is eight
+/// levels of braces.
+#[cfg(not(target_family = "wasm"))]
+const IN_PLACE_DEPTH: usize = 16;
+
+/// Whether the payload's ownership pointers reach more than `limit` steps
+/// below a root — the question [`from_compact_json_with_names`] decides
+/// by, answered in one pass without recursing and without lifting
+/// anything.
+///
+/// A payload whose ownership is not a forest — an element owned twice, a
+/// cycle, an element with no `@id` — counts as deep: the lift's own
+/// guards handle those, and a stack sized for the bound is what they need
+/// to reach.
+#[cfg(not(target_family = "wasm"))]
+fn nests_deeper_than(items: &[Value], limit: usize) -> bool {
+    // A step enters an element no step on the path has entered, so a
+    // payload of at most `limit` elements cannot nest past `limit`. This
+    // is the common case and it costs nothing to answer.
+    if items.len() <= limit {
+        return false;
+    }
+    fn owned_ids(el: &Value) -> impl Iterator<Item = &str> {
+        ["ownedRelationship", "ownedRelatedElement"]
+            .into_iter()
+            .filter_map(|key| el.get(key))
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(|child| child.get("@id").and_then(Value::as_str))
+    }
+    let mut by_id: HashMap<&str, &Value> = HashMap::with_capacity(items.len());
+    for item in items {
+        let Some(id) = item.get("@id").and_then(Value::as_str) else {
+            return true;
+        };
+        if by_id.insert(id, item).is_some() {
+            return true;
+        }
+    }
+    let mut owned: HashSet<&str> = HashSet::new();
+    for item in items {
+        for child in owned_ids(item) {
+            if by_id.contains_key(child) && !owned.insert(child) {
+                return true;
+            }
+        }
+    }
+    let mut level: Vec<&str> = by_id
+        .keys()
+        .copied()
+        .filter(|id| !owned.contains(id))
+        .collect();
+    let mut seen: HashSet<&str> = level.iter().copied().collect();
+    let mut depth = 0usize;
+    while !level.is_empty() {
+        depth += 1;
+        if depth > limit {
+            return true;
+        }
+        let mut next = Vec::new();
+        for id in level {
+            for child in owned_ids(by_id[id]) {
+                if by_id.contains_key(child) && seen.insert(child) {
+                    next.push(child);
+                }
+            }
+        }
+        level = next;
+    }
+    // Whatever no root reaches sits in a cycle.
+    seen.len() != by_id.len()
+}
+
 struct Lifter<'a> {
     by_id: HashMap<&'a str, El<'a>>,
     /// Dangling id → source spelling, from unresolved-reference recovery
@@ -550,9 +776,74 @@ struct Lifter<'a> {
     /// a variant member inherits its variation's featuring.
     body_featuring: bool,
     errors: Vec<String>,
+    /// The messages already in `errors`, so one condition met again and
+    /// again over a payload is recorded once. The list is read by a
+    /// person; its length should follow the payload's problems, not its
+    /// size.
+    reported: HashSet<String>,
+    /// Roots of the subtrees already reported as truncated. Reaching the
+    /// bound truncates the subtree under the element the step was about to
+    /// enter; a later walk reaching the bound below one of these roots
+    /// truncates the same subtree again and is not reported twice, so the
+    /// list follows the number of subtrees the payload loses rather than
+    /// the number of elements in them — while a payload losing two
+    /// subtrees with nothing in common still says so twice.
+    depth_reported: HashSet<&'a str>,
+    /// Ids of the memberships, usages, definitions and expression
+    /// elements on the current lift path — re-entering one means the
+    /// payload's ownership pointers form a cycle.
+    in_progress: HashSet<&'a str>,
+    /// Lift steps on the current path (see [`MAX_LIFT_DEPTH`]).
+    depth: usize,
+    /// A structural failure must not escape as a successful partial AST.
+    incomplete: bool,
 }
 
 impl<'a> Lifter<'a> {
+    /// Record `message`, unless the same message is recorded already.
+    fn record(&mut self, message: String) {
+        if self.reported.insert(message.clone()) {
+            self.errors.push(message);
+        }
+    }
+
+    /// Take one lift step into `id`. `None` — with an error recorded —
+    /// when the payload's ownership pointers loop back to an element
+    /// already being lifted or nest past [`MAX_LIFT_DEPTH`]; the caller
+    /// skips that subtree, diagnoses siblings, then refuses the document.
+    fn enter(&mut self, id: &'a str) -> Option<()> {
+        if self.depth >= MAX_LIFT_DEPTH {
+            self.incomplete = true;
+            // A walk that starts lower down the same chain reaches the
+            // bound again a little further along it and truncates inside a
+            // subtree already reported, which says nothing new; a payload
+            // that loses two subtrees with nothing in common says so
+            // twice.
+            let inside_reported = self
+                .depth_reported
+                .iter()
+                .any(|root| self.in_progress.contains(root));
+            if !inside_reported && self.depth_reported.insert(id) {
+                self.record(format!(
+                    "ownership nesting deeper than {MAX_LIFT_DEPTH} at {id}"
+                ));
+            }
+            return None;
+        }
+        if !self.in_progress.insert(id) {
+            self.incomplete = true;
+            self.record(format!("ownership cycle through {id}"));
+            return None;
+        }
+        self.depth += 1;
+        Some(())
+    }
+
+    fn leave(&mut self, id: &'a str) {
+        self.in_progress.remove(id);
+        self.depth -= 1;
+    }
+
     fn detect_dialect(&self) -> Dialect {
         for el in self.by_id.values() {
             if KERML_MARKERS.contains(&ty(el)) {
@@ -594,6 +885,19 @@ impl<'a> Lifter<'a> {
     /// for unnamed features — the effective name taken from the first
     /// referenced or redefined feature (KerML 8.2.3.5 / SysML reference
     /// forms), mirroring the emitter's scope registration.
+    ///
+    /// One naming rule, four representations — an element is named by
+    /// its declaration, else by its *naming feature*: the first feature
+    /// it redefines, else the one it references, else the last link of
+    /// its chain, each followed transitively. The implementations are
+    /// this one (over payload JSON), `json::Builder::graph_effective_name`
+    /// (over the lowered element graph, where `Builder::effective_name`
+    /// is the declaration-only half), `full::effective_name_of` (over the
+    /// full form's element maps, which also derives the positional
+    /// implied names), and the fixpoint inside `ids::walk` (over a
+    /// compact payload, for id segments). They agree by construction and
+    /// by the differential test in the round-trip gate; a change to one
+    /// belongs in all of them.
     fn effective_name(&self, el: El<'a>, depth: usize) -> Option<String> {
         // A binary connector-family end is findable only as `source`/
         // `target` (its implied redefinition of the BinaryConnection ends —
@@ -707,29 +1011,43 @@ impl<'a> Lifter<'a> {
         if let Some(cached) = self.qnames.get(id) {
             return cached.clone();
         }
-        // Placeholder guards cycles.
-        self.qnames.insert(id, None);
-        // An id outside the document (library reference, dangling patched
-        // @ref) has no in-document qualified name — callers fall through
-        // to `extra_names` / recovery spellings.
-        let &el = self.by_id.get(id)?;
-        let result = (|| {
-            let own = self.effective_name(el, 0)?;
-            match self.owner_of(el) {
-                None => Some(vec![own]),
-                Some(owner) if ty(owner) == "Namespace" && self.owner_of(owner).is_none() => {
-                    Some(vec![own])
-                }
-                Some(owner) => {
-                    let owner_id: &'a str = id_of(owner);
-                    let mut path = self.qname_of(owner_id)?;
-                    path.push(own);
-                    Some(path)
-                }
+        // Walk the owner chain up to the nearest named ancestor, a root,
+        // or a cycle, then name downward — iteratively, so a deep chain
+        // costs no stack. A placeholder entry guards cycles; an id outside
+        // the document (library reference, dangling patched @ref) has no
+        // in-document qualified name — callers fall through to
+        // `extra_names` / recovery spellings.
+        let mut chain: Vec<(&'a str, El<'a>)> = Vec::new();
+        let mut cur = id;
+        let base: Option<Vec<String>> = loop {
+            if let Some(cached) = self.qnames.get(cur) {
+                break cached.clone();
             }
-        })();
-        self.qnames.insert(id, result.clone());
-        result
+            self.qnames.insert(cur, None);
+            let Some(&el) = self.by_id.get(cur) else {
+                break None;
+            };
+            chain.push((cur, el));
+            match self.owner_of(el) {
+                None => break Some(Vec::new()),
+                Some(owner) if ty(owner) == "Namespace" && self.owner_of(owner).is_none() => {
+                    break Some(Vec::new());
+                }
+                Some(owner) => cur = id_of(owner),
+            }
+        };
+        let mut path = base;
+        for (cid, el) in chain.into_iter().rev() {
+            path = match (path, self.effective_name(el, 0)) {
+                (Some(mut p), Some(own)) => {
+                    p.push(own);
+                    Some(p)
+                }
+                _ => None,
+            };
+            self.qnames.insert(cid, path.clone());
+        }
+        path
     }
 
     /// Whether `el` carries materialized derived properties (a full-form
@@ -867,7 +1185,7 @@ impl<'a> Lifter<'a> {
         if let Some(name) = self.unresolved_names.get(id) {
             return Some(target_from_ref_string(name));
         }
-        self.errors.push(format!(
+        self.record(format!(
             "cannot name reference target {id} (element outside document?)"
         ));
         // Even unnameable, the reference must not silently vanish from
@@ -966,8 +1284,7 @@ impl<'a> Lifter<'a> {
                             leading_then = true;
                             leading_then_multiplicity = self
                                 .lift_connector_end(rels[0])
-                                .and_then(|e| e.multiplicity)
-                                .map(Box::new);
+                                .and_then(|e| e.multiplicity);
                             continue;
                         }
                     }
@@ -1075,7 +1392,57 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// An Annotation owned by the annotated element that owns its
+    /// annotating element lifts that element as a member; an annotating
+    /// element with `about` targets of its own keeps the owner among them.
+    #[inline(never)]
+    fn lift_prefix_annotation(&mut self, rel: El<'a>, vis: Option<Visibility>) -> Option<Member> {
+        let Some(el) = self
+            .first_related(rel)
+            .filter(|el| crate::metaclass::conforms(ty(el), "AnnotatingElement"))
+        else {
+            self.errors
+                .push("unsupported member relationship @type Annotation".to_string());
+            return None;
+        };
+        let in_type = self.owner_is_type(rel);
+        let mut member = self.lift_owning_member_element(el, vis, in_type)?;
+        // An annotating element with `about` targets of its own
+        // annotates only those; the owner it also annotated in this
+        // shape joins the targets so nothing is lost.
+        let owner = match self.target(rel, "owningRelatedElement") {
+            Some(TargetRef::Name(qn)) => Some(qn),
+            _ => None,
+        };
+        match &mut member.kind {
+            MemberKind::Comment(c) if !c.about.is_empty() => {
+                if let Some(owner) = owner {
+                    c.about.insert(0, owner);
+                }
+            }
+            MemberKind::Usage(u) => {
+                if let UsageDetail::Metadata { about } = &mut u.detail {
+                    if !about.is_empty() {
+                        if let Some(owner) = owner {
+                            about.insert(0, owner);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Some(member)
+    }
+
     fn lift_member(&mut self, rel: El<'a>) -> Option<Member> {
+        let id = id_of(rel);
+        self.enter(id)?;
+        let member = self.lift_member_inner(rel);
+        self.leave(id);
+        member
+    }
+
+    fn lift_member_inner(&mut self, rel: El<'a>) -> Option<Member> {
         let vis = Self::visibility(rel);
         // The visibility indicator is mandatory on imports (`ImportPrefix`),
         // so a public import must print explicitly — unlike other members,
@@ -1148,6 +1515,15 @@ impl<'a> Lifter<'a> {
                 let in_type = self.owner_is_type(rel);
                 self.lift_owning_member_element(el, vis, in_type)
             }
+            // The prefix-annotation shape (KerML `ownedAnnotatingElement`):
+            // the annotated element owns the Annotation, which owns the
+            // annotating element — a body comment, documentation or
+            // metadata of the owner, exactly what the owning-membership
+            // shape spells.
+            // The prefix-annotation shape (KerML `ownedAnnotatingElement`):
+            // out of line, because this function recurses through every
+            // member and its frame must stay small.
+            "Annotation" => self.lift_prefix_annotation(rel, vis),
             "FeatureMembership" | "EndFeatureMembership" => {
                 let el = self.first_related(rel)?;
                 let usage = self.lift_usage(el, false)?;
@@ -1266,8 +1642,7 @@ impl<'a> Lifter<'a> {
                 ))
             }
             other => {
-                self.errors
-                    .push(format!("unsupported member relationship @type {other}"));
+                self.record(format!("unsupported member relationship @type {other}"));
                 None
             }
         }
@@ -1297,9 +1672,14 @@ impl<'a> Lifter<'a> {
         let t = ty(el);
         // Packages / namespaces.
         if matches!(t, "Package" | "LibraryPackage" | "Namespace") {
+            // The only owned element whose body is lifted here rather
+            // than through `lift_definition` / `lift_usage`, so this is
+            // where its own step is counted.
+            self.enter(id_of(el))?;
             let rels = self.owned_rels(el);
             let (metadata, rest) = self.take_prefix_metadata(&rels);
             let members = self.lift_members(&rest);
+            self.leave(id_of(el));
             return Some(Self::member(
                 vis,
                 MemberKind::Package(Package {
@@ -1465,7 +1845,7 @@ impl<'a> Lifter<'a> {
                         }
                     }
                 }
-                let range = self.bounds_to_multiplicity(bounds);
+                let range = self.bounds_to_multiplicity(bounds).map(|m| *m);
                 return Some(Self::member(
                     vis,
                     MemberKind::MultiplicityDecl(MultiplicityDecl {
@@ -1497,8 +1877,7 @@ impl<'a> Lifter<'a> {
             usage.prefix.is_type_member = owner_is_type && self.dialect == Dialect::Kerml;
             return Some(Self::member(vis, MemberKind::Usage(usage)));
         }
-        self.errors
-            .push(format!("unsupported owned element @type {t}"));
+        self.record(format!("unsupported owned element @type {t}"));
         None
     }
 
@@ -1530,21 +1909,21 @@ impl<'a> Lifter<'a> {
         (metadata, rest)
     }
 
-    fn bounds_to_multiplicity(&mut self, mut bounds: Vec<Expr>) -> Option<Multiplicity> {
+    fn bounds_to_multiplicity(&self, mut bounds: Vec<Expr>) -> Option<Box<Multiplicity>> {
         match bounds.len() {
-            1 => Some(Multiplicity {
+            1 => Some(Box::new(Multiplicity {
                 lower: None,
                 upper: bounds.pop().unwrap(),
                 span: Span::default(),
-            }),
+            })),
             2 => {
                 let upper = bounds.pop().unwrap();
                 let lower = bounds.pop().unwrap();
-                Some(Multiplicity {
+                Some(Box::new(Multiplicity {
                     lower: Some(lower),
                     upper,
                     span: Span::default(),
-                })
+                }))
             }
             _ => None,
         }
@@ -1553,6 +1932,14 @@ impl<'a> Lifter<'a> {
     // ---- definitions ----
 
     fn lift_definition(&mut self, el: El<'a>, kind: DefKind) -> Option<Definition> {
+        let id = id_of(el);
+        self.enter(id)?;
+        let definition = self.lift_definition_inner(el, kind);
+        self.leave(id);
+        definition
+    }
+
+    fn lift_definition_inner(&mut self, el: El<'a>, kind: DefKind) -> Option<Definition> {
         let rels = self.owned_rels(el);
         let (metadata, rels) = self.take_prefix_metadata(&rels);
         let mut specializes = Vec::new();
@@ -1676,8 +2063,16 @@ impl<'a> Lifter<'a> {
 
     // ---- usages ----
 
-    #[allow(clippy::too_many_lines)]
     fn lift_usage(&mut self, el: El<'a>, is_variant: bool) -> Option<Usage> {
+        let id = id_of(el);
+        self.enter(id)?;
+        let usage = self.lift_usage_inner(el, is_variant);
+        self.leave(id);
+        usage
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn lift_usage_inner(&mut self, el: El<'a>, is_variant: bool) -> Option<Usage> {
         let t = ty(el);
         let featuring = std::mem::replace(&mut self.next_featuring, true);
         let kind = usage_kind_of(t, self.dialect).unwrap_or(UsageKind::Default);
@@ -1984,6 +2379,23 @@ impl<'a> Lifter<'a> {
                 "OwningMembership" => {
                     let inner = self.first_related(rel);
                     match inner.map(ty) {
+                        // A chain source (`first a.b`): the membership owns
+                        // the synthesized chain feature and names it as its
+                        // member.
+                        Some("Feature")
+                            if kind == UsageKind::Transition
+                                && transition_source.is_none()
+                                && self
+                                    .owned_rels(inner.unwrap())
+                                    .iter()
+                                    .any(|r| ty(r) == "FeatureChaining") =>
+                        {
+                            // `memberElement` is derived on an
+                            // OwningMembership; a producer may omit it.
+                            transition_source = self
+                                .target(rel, "memberElement")
+                                .or_else(|| self.lift_feature_chain(inner.unwrap()));
+                        }
                         Some("MultiplicityRange")
                             if declaration.multiplicity.is_none()
                                 && Self::declared_name(inner.unwrap()).is_none() =>
@@ -2106,6 +2518,8 @@ impl<'a> Lifter<'a> {
                     }
                     body_rels.push(rel);
                 }
+                // A plain-name source (`first s1`) rides a Membership; a
+                // chain source is handled with the OwningMemberships above.
                 "Membership" if matches!(t, "TransitionUsage") && transition_source.is_none() => {
                     transition_source = self.target(rel, "memberElement");
                 }
@@ -2210,7 +2624,7 @@ impl<'a> Lifter<'a> {
             kind,
             declaration,
             detail,
-            value,
+            value: value.map(Box::new),
             is_parallel: bval(el, "isParallel"),
             body: if members.is_empty() {
                 None
@@ -2247,7 +2661,22 @@ impl<'a> Lifter<'a> {
             {
                 UsageDetail::Connector { ends }
             }
-            UsageKind::Binding if !ends.is_empty() => UsageDetail::Binding { ends },
+            UsageKind::Binding if ends.len() == 2 => UsageDetail::Binding { ends },
+            UsageKind::Binding => {
+                // A binding connector binds exactly two ends; any other
+                // arity is a partial document — including none at all,
+                // which is what a minimally populated payload builds.
+                // Keep whatever ends are there visible as a plain
+                // connector detail so the text shows what is there, and
+                // report the arity either way: the printer's fallback
+                // spelling relies on that report having been made.
+                self.record(format!(
+                    "binding connector {} has {} end(s), expected two",
+                    id_of(el),
+                    ends.len()
+                ));
+                UsageDetail::Connector { ends }
+            }
             UsageKind::Succession if !ends.is_empty() => {
                 let mut ends = ends;
                 if ends.len() >= 2 {
@@ -2258,17 +2687,20 @@ impl<'a> Lifter<'a> {
                     // its `then [1] x;` variant, kept in `source`).
                     let source = if source.name.is_none()
                         && source.multiplicity.is_none()
-                        && matches!(&source.target, TargetRef::Chain(links) if links.is_empty())
+                        && source.target.is_unspelled()
                     {
                         None
                     } else {
                         Some(source)
                     };
-                    UsageDetail::Succession { source, target }
+                    UsageDetail::Succession {
+                        source: source.map(Box::new),
+                        target: Box::new(target),
+                    }
                 } else {
                     UsageDetail::Succession {
                         source: None,
-                        target: ends.remove(0),
+                        target: Box::new(ends.remove(0)),
                     }
                 }
             }
@@ -2284,7 +2716,7 @@ impl<'a> Lifter<'a> {
                     (None, None)
                 };
                 UsageDetail::Flow {
-                    payload: flow_payload,
+                    payload: flow_payload.map(Box::new),
                     source: s,
                     target: tt,
                 }
@@ -2301,9 +2733,9 @@ impl<'a> Lifter<'a> {
             UsageKind::Transition => UsageDetail::Transition {
                 source,
                 trigger,
-                guard,
+                guard: guard.map(Box::new),
                 effect,
-                target,
+                target: target.map(Box::new),
                 is_default: false,
             },
             UsageKind::Accept => {
@@ -2338,9 +2770,9 @@ impl<'a> Lifter<'a> {
                     }
                 }
                 UsageDetail::Accept {
-                    payload: payload_part.unwrap_or_default(),
-                    trigger: trigger_part,
-                    via,
+                    payload: Box::new(payload_part.unwrap_or_default()),
+                    trigger: trigger_part.map(Box::new),
+                    via: via.map(Box::new),
                 }
             }
             UsageKind::Send => {
@@ -2357,7 +2789,11 @@ impl<'a> Lifter<'a> {
                 let to = slots.pop().unwrap();
                 let via = slots.pop().unwrap();
                 let payload = slots.pop().unwrap();
-                UsageDetail::Send { payload, via, to }
+                UsageDetail::Send {
+                    payload: payload.map(Box::new),
+                    via: via.map(Box::new),
+                    to: to.map(Box::new),
+                }
             }
             UsageKind::Assign => {
                 let mut exprs = Vec::new();
@@ -2371,7 +2807,10 @@ impl<'a> Lifter<'a> {
                 if exprs.len() == 2 {
                     let value = exprs.pop().unwrap();
                     let target = exprs.pop().unwrap();
-                    UsageDetail::Assign { target, value }
+                    UsageDetail::Assign {
+                        target: Box::new(target),
+                        value: Box::new(value),
+                    }
                 } else {
                     UsageDetail::None
                 }
@@ -2385,7 +2824,9 @@ impl<'a> Lifter<'a> {
                         }
                     }
                 }
-                UsageDetail::Terminate { target }
+                UsageDetail::Terminate {
+                    target: target.map(Box::new),
+                }
             }
             UsageKind::IfNode => {
                 let mut cond = None;
@@ -2407,10 +2848,10 @@ impl<'a> Lifter<'a> {
                     Box::new(bodies.remove(0))
                 };
                 UsageDetail::IfNode {
-                    cond: cond.unwrap_or(Expr {
+                    cond: Box::new(cond.unwrap_or_else(|| Expr {
                         kind: ExprKind::Null,
                         span: Span::default(),
-                    }),
+                    })),
                     then_body,
                     else_body: if bodies.is_empty() {
                         None
@@ -2439,7 +2880,11 @@ impl<'a> Lifter<'a> {
                     }
                 }
                 match body {
-                    Some(body) => UsageDetail::WhileLoop { cond, body, until },
+                    Some(body) => UsageDetail::WhileLoop {
+                        cond: cond.map(Box::new),
+                        body,
+                        until: until.map(Box::new),
+                    },
                     None => UsageDetail::None,
                 }
             }
@@ -2458,7 +2903,11 @@ impl<'a> Lifter<'a> {
                     }
                 }
                 match (seq, body) {
-                    (Some(seq), Some(body)) => UsageDetail::ForLoop { var, seq, body },
+                    (Some(seq), Some(body)) => UsageDetail::ForLoop {
+                        var: Box::new(var),
+                        seq: Box::new(seq),
+                        body,
+                    },
                     _ => UsageDetail::None,
                 }
             }
@@ -2551,7 +3000,7 @@ impl<'a> Lifter<'a> {
         Some(ConnectorEnd {
             multiplicity,
             name: sval(el, "declaredName").map(name),
-            target: target.unwrap_or(TargetRef::Chain(Vec::new())),
+            target: target.unwrap_or_else(TargetRef::unspelled),
         })
     }
 
@@ -2623,10 +3072,10 @@ impl<'a> Lifter<'a> {
                 "FeatureValue" => {
                     if let Some(ex) = self.first_related(rel) {
                         if let Some(expr) = self.lift_expr(ex) {
-                            payload.value = Some(FeatureValue {
+                            payload.value = Some(Box::new(FeatureValue {
                                 kind: ValueKind::Bound,
                                 expr,
-                            });
+                            }));
                         }
                     }
                 }
@@ -2639,6 +3088,119 @@ impl<'a> Lifter<'a> {
     // ---- expressions ----
 
     fn lift_expr(&mut self, el: El<'a>) -> Option<Expr> {
+        // Postorder on an explicit work stack: even a left-associated
+        // operator chain consumes no recursive lift frames. Each occurrence
+        // is evaluated separately, so shared payload operands keep their
+        // position without cloning an ever-growing expression subtree.
+        enum Work<'a> {
+            Enter(El<'a>, usize),
+            Finish(El<'a>, usize),
+        }
+        let mut work = vec![Work::Enter(el, 0)];
+        let mut values = Vec::new();
+        while let Some(step) = work.pop() {
+            match step {
+                Work::Enter(el, depth) => {
+                    let id = id_of(el);
+                    if depth >= MAX_LIFT_EXPR_DEPTH {
+                        self.incomplete = true;
+                        self.record(format!(
+                            "expression nesting deeper than {MAX_LIFT_EXPR_DEPTH} at {id}"
+                        ));
+                        values.push(None);
+                        continue;
+                    }
+                    if !self.in_progress.insert(id) {
+                        self.incomplete = true;
+                        self.record(format!("ownership cycle through {id}"));
+                        values.push(None);
+                        continue;
+                    }
+                    let children = self.expression_children(el);
+                    work.push(Work::Finish(el, children.len()));
+                    work.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|child| Work::Enter(child, depth + 1)),
+                    );
+                }
+                Work::Finish(el, count) => {
+                    let children = values.split_off(values.len() - count);
+                    let missing = children.iter().any(Option::is_none);
+                    let implicit_subject = ty(el) == "OperatorExpression"
+                        && matches!(
+                            sval(el, "operator"),
+                            Some("istype" | "hastype" | "@" | "@@" | "as" | "meta")
+                        );
+                    let expr = if missing && !implicit_subject {
+                        None
+                    } else {
+                        self.lift_expr_inner(el, &mut children.into_iter())
+                    };
+                    // An implicit subject is the one intentional empty
+                    // expression: classification operators read it as self.
+                    let self_reference = ty(el) == "FeatureReferenceExpression"
+                        && self
+                            .owned_rels(el)
+                            .iter()
+                            .any(|r| ty(r) == "ReturnParameterMembership");
+                    if expr.is_none() && !self_reference && !self.incomplete {
+                        self.incomplete = true;
+                        self.record(format!(
+                            "cannot lift expression {} at {}",
+                            ty(el),
+                            id_of(el)
+                        ));
+                    }
+                    self.in_progress.remove(id_of(el));
+                    values.push(expr);
+                }
+            }
+        }
+        values.pop().flatten()
+    }
+
+    /// Children in precisely the order the expression assembler consumes
+    /// them. Parameter wrappers and type-reference parameters add no AST
+    /// depth. An expression body goes through the bounded member lifter.
+    fn expression_children(&mut self, el: El<'a>) -> Vec<El<'a>> {
+        match ty(el) {
+            "FeatureReferenceExpression" => {
+                for rel in self.owned_rels(el) {
+                    if ty(rel) == "ReturnParameterMembership" {
+                        continue;
+                    }
+                    if self.target(rel, "memberElement").is_some() {
+                        break;
+                    }
+                    if let Some(inner) = self.first_related(rel) {
+                        return vec![inner];
+                    }
+                }
+                Vec::new()
+            }
+            "FeatureChainExpression"
+            | "IndexExpression"
+            | "CollectExpression"
+            | "SelectExpression"
+            | "InvocationExpression"
+            | "ConstructorExpression"
+            | "OperatorExpression" => self
+                .owned_rels(el)
+                .into_iter()
+                .filter(|rel| ty(rel) == "ParameterMembership")
+                .filter_map(|rel| self.param_expr_el(rel))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn lift_expr_inner(
+        &mut self,
+        el: El<'a>,
+        children: &mut std::vec::IntoIter<Option<Expr>>,
+    ) -> Option<Expr> {
         let mk = |kind: ExprKind| {
             Some(Expr {
                 kind,
@@ -2659,17 +3221,30 @@ impl<'a> Lifter<'a> {
                 mk(ExprKind::Literal(Literal::Integer(raw)))
             }
             "LiteralRational" => {
-                let raw = match el.get("value") {
-                    Some(Value::Number(n)) => {
-                        let s = n.to_string();
-                        // A real literal must contain a fraction or exponent.
-                        if s.contains('.') || s.contains('e') || s.contains('E') {
-                            s
-                        } else {
-                            format!("{s}.0")
-                        }
+                // A real literal must contain a fraction or exponent.
+                // The value is a JSON number when a double denotes it
+                // exactly and the written text otherwise (a decimal with
+                // more digits than a double holds, an exponent past its
+                // range); both spellings read back the same way.
+                // The fraction is appended only to a written whole
+                // number. A value the payload spells some other way — a
+                // rational's `1/3`, say — is kept verbatim: appending to
+                // it changes what it denotes, and `1/3.0` reads back as a
+                // division by a different number.
+                let whole = |s: &str| {
+                    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                };
+                let real = |s: &str| {
+                    if whole(s) {
+                        format!("{s}.0")
+                    } else {
+                        s.to_string()
                     }
-                    Some(Value::String(s)) => s.clone(),
+                };
+                let raw = match el.get("value") {
+                    Some(Value::Number(n)) => real(&n.to_string()),
+                    Some(Value::String(s)) => real(s),
                     _ => "0.0".to_string(),
                 };
                 mk(ExprKind::Literal(Literal::Real(raw)))
@@ -2687,8 +3262,8 @@ impl<'a> Lifter<'a> {
                         return Some(target_to_expr(target));
                     }
                     // Nested expression member (lazy operand wrapper).
-                    if let Some(inner) = self.first_related(rel) {
-                        return self.lift_expr(inner);
+                    if self.first_related(rel).is_some() {
+                        return children.next().flatten();
                     }
                 }
                 None
@@ -2707,8 +3282,8 @@ impl<'a> Lifter<'a> {
                 for rel in self.owned_rels(el) {
                     match ty(rel) {
                         "ParameterMembership" => {
-                            if let Some(inner) = self.param_expr_el(rel) {
-                                target_expr = self.lift_expr(inner);
+                            if self.param_expr_el(rel).is_some() {
+                                target_expr = children.next().flatten();
                             }
                         }
                         "Membership" | "OwningMembership" => {
@@ -2723,7 +3298,7 @@ impl<'a> Lifter<'a> {
                 })
             }
             "IndexExpression" => {
-                let ops = self.operands(el);
+                let ops = children.by_ref().flatten().collect::<Vec<_>>();
                 let mut it = ops.into_iter();
                 mk(ExprKind::Index {
                     target: Box::new(it.next()?),
@@ -2732,7 +3307,7 @@ impl<'a> Lifter<'a> {
             }
             "CollectExpression" | "SelectExpression" => {
                 let is_select = ty(el) == "SelectExpression";
-                let ops = self.operands(el);
+                let ops = children.by_ref().flatten().collect::<Vec<_>>();
                 let mut it = ops.into_iter();
                 let target = Box::new(it.next()?);
                 let body = Box::new(it.next()?);
@@ -2748,7 +3323,11 @@ impl<'a> Lifter<'a> {
                 let mut args = Vec::new();
                 for rel in self.owned_rels(el) {
                     match ty(rel) {
-                        "Membership" => fn_ty = self.target(rel, "memberElement"),
+                        // A chained callee (`a.b(x)`) rides an
+                        // OwningMembership owning the chain feature.
+                        "Membership" | "OwningMembership" => {
+                            fn_ty = self.target(rel, "memberElement")
+                        }
                         "FeatureMembership" => {
                             fnref = self.target(rel, "memberElement").and_then(|t| match t {
                                 TargetRef::Name(qn) => Some(qn),
@@ -2788,8 +3367,8 @@ impl<'a> Lifter<'a> {
                                     }
                                 }
                             }
-                            if let Some(inner) = self.param_expr_el(rel) {
-                                if let Some(value) = self.lift_expr(inner) {
+                            if self.param_expr_el(rel).is_some() {
+                                if let Some(value) = children.next().flatten() {
                                     args.push(Arg {
                                         name: arg_name,
                                         value,
@@ -2804,7 +3383,7 @@ impl<'a> Lifter<'a> {
                 let ty_target = fn_ty?;
                 if ty(el) == "ConstructorExpression" {
                     return mk(ExprKind::Constructor {
-                        ty: ty_target,
+                        ty: Box::new(ty_target),
                         args,
                     });
                 }
@@ -2814,44 +3393,33 @@ impl<'a> Lifter<'a> {
                     let target = it.next()?.value;
                     return mk(ExprKind::Arrow {
                         target: Box::new(target),
-                        ty: ty_target,
+                        ty: Box::new(ty_target),
                         args: ArrowArgs::FunctionRef(f),
                     });
                 }
                 mk(ExprKind::Invocation {
-                    ty: ty_target,
+                    ty: Box::new(ty_target),
                     args,
                 })
             }
-            "OperatorExpression" => self.lift_operator_expr(el),
+            "OperatorExpression" => self.lift_operator_expr(el, children),
             "Expression" => {
                 let rels = self.owned_rels(el);
                 let members = self.lift_members(&rels);
                 mk(ExprKind::Body { members })
             }
             other => {
-                self.errors
-                    .push(format!("unsupported expression @type {other}"));
+                self.record(format!("unsupported expression @type {other}"));
                 None
             }
         }
     }
 
-    fn operands(&mut self, el: El<'a>) -> Vec<Expr> {
-        let mut ops = Vec::new();
-        for rel in self.owned_rels(el) {
-            if ty(rel) == "ParameterMembership" {
-                if let Some(inner) = self.param_expr_el(rel) {
-                    if let Some(e) = self.lift_expr(inner) {
-                        ops.push(e);
-                    }
-                }
-            }
-        }
-        ops
-    }
-
-    fn lift_operator_expr(&mut self, el: El<'a>) -> Option<Expr> {
+    fn lift_operator_expr(
+        &mut self,
+        el: El<'a>,
+        children: &mut std::vec::IntoIter<Option<Expr>>,
+    ) -> Option<Expr> {
         let op = sval(el, "operator").unwrap_or("");
         let mk = |kind: ExprKind| {
             Some(Expr {
@@ -2884,7 +3452,7 @@ impl<'a> Lifter<'a> {
                 ty_target = self.target(rel, "memberElement");
             }
         }
-        let ops = self.operands(el);
+        let ops = children.by_ref().flatten().collect::<Vec<_>>();
 
         if op == "if" {
             let mut it = ops.into_iter();
@@ -2898,7 +3466,9 @@ impl<'a> Lifter<'a> {
             return mk(ExprKind::Sequence(ops));
         }
         if op == "all" {
-            return mk(ExprKind::Extent { ty: ty_target? });
+            return mk(ExprKind::Extent {
+                ty: Box::new(ty_target?),
+            });
         }
         if op == "[" {
             let mut it = ops.into_iter();
@@ -2933,7 +3503,7 @@ impl<'a> Lifter<'a> {
             return mk(ExprKind::Classification {
                 op: cop,
                 operand,
-                ty: ty_target?,
+                ty: Box::new(ty_target?),
             });
         }
         if ops.len() == 1 {
@@ -2976,7 +3546,7 @@ impl<'a> Lifter<'a> {
             "**" => BinaryOp::Pow,
             "^" => BinaryOp::Caret,
             other => {
-                self.errors.push(format!("unknown operator {other:?}"));
+                self.record(format!("unknown operator {other:?}"));
                 return None;
             }
         };
@@ -3118,4 +3688,196 @@ pub(crate) fn usage_kind_of(t: &str, dialect: Dialect) -> Option<UsageKind> {
         "Expression" if dialect == Dialect::Kerml => UsageKind::Expr,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chain of `depth` parts, each owned by the one above through a
+    /// membership: the shape whose ownership pointers the lift follows.
+    fn chain(depth: usize) -> Vec<Value> {
+        chain_named("", depth)
+    }
+
+    /// The same chain with every id under `prefix`, so two of them are
+    /// independent subtrees of one payload.
+    ///
+    /// Ownership is spelled both ways round, as a payload spells it: the
+    /// chain then has the one root it reads as, rather than as many roots
+    /// as it has elements.
+    fn chain_named(prefix: &str, depth: usize) -> Vec<Value> {
+        let mut items = Vec::new();
+        for i in 0..depth {
+            let mut membership = serde_json::json!({
+                "@id": format!("{prefix}m{i}"),
+                "@type": "OwningMembership",
+                "ownedRelatedElement": [{ "@id": format!("{prefix}p{i}") }],
+            });
+            if i > 0 {
+                membership["owningRelatedElement"] =
+                    serde_json::json!({ "@id": format!("{prefix}p{}", i - 1) });
+            }
+            items.push(membership);
+            let owned = if i + 1 < depth {
+                serde_json::json!([{ "@id": format!("{prefix}m{}", i + 1) }])
+            } else {
+                serde_json::json!([])
+            };
+            items.push(serde_json::json!({
+                "@id": format!("{prefix}p{i}"),
+                "@type": "PartUsage",
+                "declaredName": format!("{prefix}p{i}"),
+                "owningRelationship": { "@id": format!("{prefix}m{i}") },
+                "ownedRelationship": owned,
+            }));
+        }
+        items
+    }
+
+    /// The decision that keeps a small document off a thread of its own
+    /// reads the payload's depth, not its size: a wide document stays in
+    /// place however many elements it holds, and a deep one does not.
+    #[test]
+    fn the_in_place_decision_follows_the_payload_depth() {
+        // Two steps per level, so the chain crosses the bound at half of
+        // it.
+        assert!(!nests_deeper_than(&chain(4), IN_PLACE_DEPTH));
+        assert!(nests_deeper_than(&chain(IN_PLACE_DEPTH), IN_PLACE_DEPTH));
+
+        // Many siblings under one owner is one level, whatever the count.
+        let mut wide = vec![serde_json::json!({
+            "@id": "root",
+            "@type": "Namespace",
+            "ownedRelationship": (0..500)
+                .map(|i| serde_json::json!({ "@id": format!("m{i}") }))
+                .collect::<Vec<_>>(),
+        })];
+        for i in 0..500 {
+            wide.push(serde_json::json!({
+                "@id": format!("m{i}"),
+                "@type": "OwningMembership",
+                "ownedRelatedElement": [],
+            }));
+        }
+        assert!(!nests_deeper_than(&wide, IN_PLACE_DEPTH));
+
+        // A payload whose ownership is not a forest takes the stack the
+        // lift's own guards need to report it.
+        let cycle = vec![
+            serde_json::json!({
+                "@id": "a", "@type": "OwningMembership",
+                "ownedRelatedElement": [{ "@id": "b" }],
+            }),
+            serde_json::json!({
+                "@id": "b", "@type": "PartUsage",
+                "ownedRelationship": [{ "@id": "a" }],
+            }),
+        ];
+        assert!(nests_deeper_than(&cycle, 1));
+    }
+
+    /// The deepest payload the lift takes in place fits the smallest
+    /// stack an ordinary caller runs on: a worker thread given one
+    /// megabyte. Overflowing here would end the process rather than
+    /// report anything, so the bound is measured by lifting that payload
+    /// on such a thread — in an unoptimized build, where a step costs the
+    /// most.
+    #[test]
+    fn the_deepest_in_place_payload_fits_a_small_stack() {
+        // Two steps per level of nesting, so the deepest chain taken in
+        // place is half the step bound.
+        let items = chain(IN_PLACE_DEPTH / 2);
+        assert!(!nests_deeper_than(&items, IN_PLACE_DEPTH));
+        let lifted = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || from_compact_json(&Value::Array(items)))
+            .unwrap()
+            .join()
+            .unwrap()
+            .expect("a well-formed payload lifts");
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+    }
+
+    /// A payload nesting past the bound is reported rather than followed,
+    /// and reported once however far past it goes.
+    #[test]
+    fn nesting_past_the_bound_is_reported_once() {
+        let Err(LiftError::Incomplete { errors }) =
+            from_compact_json(&Value::Array(chain(MAX_LIFT_DEPTH * 2)))
+        else {
+            panic!("an over-budget document must not return a partial AST")
+        };
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| e.contains("ownership nesting deeper than"))
+                .count(),
+            1,
+            "{:?}",
+            errors
+        );
+    }
+
+    /// Each truncated subtree is reported: two independent chains past the
+    /// bound lose their elements at two different places, and a reader
+    /// given one entry would take the other loss for elements the payload
+    /// never held.
+    #[test]
+    fn every_truncated_subtree_is_reported() {
+        let mut items = chain_named("a", MAX_LIFT_DEPTH * 2);
+        items.extend(chain_named("b", MAX_LIFT_DEPTH * 2));
+        let Err(LiftError::Incomplete { errors }) = from_compact_json(&Value::Array(items)) else {
+            panic!("an over-budget document must not return a partial AST")
+        };
+        let reports: Vec<&String> = errors
+            .iter()
+            .filter(|e| e.contains("ownership nesting deeper than"))
+            .collect();
+        assert_eq!(reports.len(), 2, "{:?}", errors);
+        assert!(
+            reports.iter().any(|e| e.contains(" at am"))
+                && reports.iter().any(|e| e.contains(" at bm")),
+            "{reports:?}"
+        );
+    }
+
+    /// A binding connector with no ends at all is as much a partial
+    /// document as one with three, and it is what a minimally populated
+    /// payload builds. Its arity is reported, and the usage keeps the
+    /// plain connector detail the notation can still spell — a bare
+    /// binding has no spelling of its own.
+    #[test]
+    fn a_binding_with_no_ends_is_reported() {
+        let items = vec![
+            serde_json::json!({
+                "@id": "m0",
+                "@type": "OwningMembership",
+                "ownedRelatedElement": [{ "@id": "b0" }],
+            }),
+            serde_json::json!({
+                "@id": "b0",
+                "@type": "BindingConnectorAsUsage",
+                "owningRelationship": { "@id": "m0" },
+                "ownedRelationship": [],
+            }),
+        ];
+        let lifted = from_compact_json(&Value::Array(items)).expect("a well-formed payload lifts");
+        assert!(
+            lifted
+                .errors
+                .iter()
+                .any(|e| e.contains("binding connector b0 has 0 end(s), expected two")),
+            "{:?}",
+            lifted.errors
+        );
+        let sysmlv2_syntax::ast::MemberKind::Usage(u) = &lifted.unit.members[0].kind else {
+            panic!("expected a usage: {:#?}", lifted.unit.members[0].kind)
+        };
+        assert!(
+            matches!(&u.detail, UsageDetail::Connector { ends } if ends.is_empty()),
+            "{:?}",
+            u.detail
+        );
+    }
 }

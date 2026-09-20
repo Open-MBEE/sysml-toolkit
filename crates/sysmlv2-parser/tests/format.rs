@@ -311,3 +311,423 @@ fn at_type_spacing_follows_the_spelling() {
         "idempotent"
     );
 }
+
+#[test]
+fn anonymous_comment_members_keep_their_indentation() {
+    // A bare `/* … */` member has no keyword before its body; the body
+    // printer must not trim the indentation it just received.
+    let src = "package P {\n    part def A {\n        /* a member comment */\n        attribute x;\n        comment /* keyworded */\n    }\n    /* top-level member */\n}\n";
+    let formatted = format_source(src, Dialect::Sysml).unwrap();
+    assert_eq!(
+        formatted,
+        "package P {\n    part def A {\n        /* a member comment */\n        attribute x;\n        /* keyworded */\n    }\n    /* top-level member */\n}\n"
+    );
+    let again = format_source(&formatted, Dialect::Sysml).unwrap();
+    assert_eq!(again, formatted, "not idempotent");
+    // A multi-line anonymous body: the opening line keeps the member's
+    // indentation, so the gutter lines up under it.
+    let src = "package P {\n    part def A {\n        /* first\n         * second\n         */\n    }\n}\n";
+    let formatted = format_source(src, Dialect::Sysml).unwrap();
+    assert_eq!(formatted, src);
+    assert_eq!(
+        format_source(&formatted, Dialect::Sysml).unwrap(),
+        formatted
+    );
+    // A comment with an identification keeps its body on the keyword line.
+    let src = "package P {\n    comment c /* named */\n    comment about P /* about */\n}\n";
+    let formatted = format_source(src, Dialect::Sysml).unwrap();
+    assert_eq!(
+        formatted,
+        "package P {\n    comment c /* named */\n    comment about P /* about */\n}\n"
+    );
+}
+
+/// Names that are reserved words print quoted in the dialect that
+/// reserves them — and only there — and re-parse: declarations and
+/// qualified references alike.
+#[test]
+fn reserved_word_names_round_trip_in_each_dialect() {
+    let sysml = "package 'part' {\n    part def 'action';\n    part 'view' : 'action';\n    \
+                 view 'state' {\n        expose 'part'::'view';\n    }\n}\n";
+    let kerml = "package 'class' {\n    classifier 'if';\n    feature part : 'if';\n    \
+                 feature 'feature' : 'if';\n}\n";
+    for (src, dialect) in [(sysml, Dialect::Sysml), (kerml, Dialect::Kerml)] {
+        let parsed = parse(src, dialect);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let printed = print_source(&parsed.unit);
+        let reparsed = parse(&printed, dialect);
+        assert!(
+            reparsed.diagnostics.is_empty(),
+            "printed output does not parse: {}\n---\n{printed}",
+            reparsed.diagnostics[0].message
+        );
+        assert_eq!(normalized(&parsed.unit), normalized(&reparsed.unit));
+        let formatted = format_source(src, dialect).unwrap();
+        assert_eq!(
+            format_source(&formatted, dialect).unwrap(),
+            formatted,
+            "idempotent"
+        );
+    }
+    let formatted = format_source(sysml, Dialect::Sysml).unwrap();
+    assert!(
+        formatted.contains("part 'view' : 'action';")
+            && formatted.contains("expose 'part'::'view';"),
+        "{formatted}"
+    );
+    // `part` is not a KerML word: the KerML printer leaves it bare.
+    let formatted = format_source(kerml, Dialect::Kerml).unwrap();
+    assert!(
+        formatted.contains("feature part : 'if';")
+            && formatted.contains("feature 'feature' : 'if';"),
+        "{formatted}"
+    );
+}
+
+/// A binding whose detail carries other than the pair of ends the notation
+/// spells — a shape the parser never builds, but one an assembled tree can
+/// reach — prints a member that parses and stays that one member. The
+/// binding form spells only the pair, so another count is never printed
+/// behind it: one end would read as a missing right side, three as a chain
+/// of two whose third end is quietly lost.
+///
+/// SysML requires the `bind` clause after that keyword, and KerML, which
+/// takes the keyword alone, draws a finding for a binding connector that
+/// does not bind two features. So in both the member survives as its
+/// declaration alone — behind `feature` in KerML, as `ref` where SysML
+/// has nothing to declare — and every end with it, spelled as an
+/// `end ::> …;` body member.
+///
+/// Every case keeps a member *after* the binding: a member that prints as
+/// nothing but its terminator parses only in last position, where the
+/// repair of a body's result expression swallows it.
+#[test]
+fn binding_with_other_than_two_ends_still_round_trips() {
+    use sysmlv2_parser::ast::{Member, MemberKind, UsageDetail, UsageKind};
+
+    fn set_end_count(unit: &mut SourceUnit, count: usize) {
+        let MemberKind::Package(p) = &mut unit.members[0].kind else {
+            panic!("expected a package")
+        };
+        for m in p.body.as_mut().expect("package body") {
+            if let MemberKind::Usage(u) = &mut m.kind {
+                if let UsageDetail::Binding { ends } = &mut u.detail {
+                    assert_eq!(ends.len(), 2);
+                    let spare = ends[0].clone();
+                    ends.resize(count, spare);
+                }
+            }
+        }
+    }
+
+    fn package_body<'a>(unit: &'a SourceUnit, printed: &str) -> &'a [Member] {
+        let MemberKind::Package(p) = &unit.members[0].kind else {
+            panic!("{printed:?}: expected a package")
+        };
+        p.body.as_deref().expect("package body")
+    }
+
+    for (dialect, src) in [
+        (Dialect::Sysml, "package P { bind a = b; part z; }"),
+        (
+            Dialect::Sysml,
+            "package P { binding b1 : B bind a = b; part z; }",
+        ),
+        (
+            Dialect::Sysml,
+            "package P { bind a = b { part q; } part z; }",
+        ),
+        (
+            Dialect::Sysml,
+            "package P { binding b1 : B bind a = b { part q; } part z; }",
+        ),
+        (Dialect::Kerml, "package P { binding of a = b; feature z; }"),
+        (
+            Dialect::Kerml,
+            "package P { binding b1 : B of a = b; feature z; }",
+        ),
+        (
+            Dialect::Kerml,
+            "package P { binding of a = b { feature q; } feature z; }",
+        ),
+        (
+            Dialect::Kerml,
+            "package P { binding b1 : B of a = b { feature q; } feature z; }",
+        ),
+    ] {
+        for count in [0, 1, 3, 4] {
+            let mut unit = parse(src, dialect).unit;
+            set_end_count(&mut unit, count);
+            let printed = print_source(&unit);
+            let back = parse(&printed, dialect);
+            assert!(
+                back.diagnostics.is_empty(),
+                "{src} with {count} end(s) printed {printed:?}: {:#?}",
+                back.diagnostics
+            );
+            // Printing what came back changes nothing further.
+            assert_eq!(
+                print_source(&back.unit),
+                printed,
+                "{src} with {count} end(s): a second round trip moved"
+            );
+            let body = package_body(&back.unit, &printed);
+            // The connector and the member after it, both still there.
+            assert_eq!(body.len(), 2, "{printed:?}: a member disappeared");
+            let MemberKind::Usage(u) = &body[0].kind else {
+                panic!("{printed:?}: expected a usage")
+            };
+            assert!(
+                !printed.contains('='),
+                "{printed:?}: ends spelled as a pair without one"
+            );
+            // Nothing spells the binding, so the member keeps its
+            // declaration alone — behind `feature` in KerML, which names
+            // a metaclass on every member, and as `ref` where SysML has
+            // nothing to declare — and every end moves into the body as
+            // an `end` member.
+            assert!(
+                !printed.contains("bind") && !printed.contains("connect"),
+                "{printed:?}: a connector form without its clause"
+            );
+            let declared = src.contains("binding b1");
+            assert_eq!(
+                u.kind,
+                match (dialect, declared) {
+                    (Dialect::Kerml, _) => UsageKind::Feature,
+                    (_, true) => UsageKind::Default,
+                    (_, false) => UsageKind::Ref,
+                },
+                "{printed:?}"
+            );
+            let kept = u
+                .body
+                .iter()
+                .flatten()
+                .filter(|m| matches!(&m.kind, MemberKind::Usage(e) if e.prefix.is_end))
+                .count();
+            assert_eq!(kept, count, "{printed:?}: ends kept");
+        }
+    }
+
+    // The pair the notation does spell still prints as the binding it is.
+    let unit = parse_source("package P { bind a = b; }").unit;
+    assert_eq!(print_source(&unit), "package P {\n    bind a = b;\n}\n");
+    let unit = parse_kerml_source("package P { binding of a = b; }").unit;
+    assert_eq!(print_source(&unit), "package P {\n    binding a = b;\n}\n");
+}
+
+/// The chain threshold counts operands, not their low eight bits: a chain
+/// whose operand count crosses a byte boundary still breaks per condition.
+#[test]
+fn long_logical_chain_breaks_past_a_byte_of_operands() {
+    for n in [255usize, 256, 257, 300] {
+        let chain = (0..n)
+            .map(|i| format!("a{i} > 0.0"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let src = format!("package P {{\n    constraint c {{\n        {chain}\n    }}\n}}\n");
+        let out = format_source(&src, Dialect::Sysml).unwrap();
+        let broken = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("and "))
+            .count();
+        assert_eq!(broken, n - 1, "{n} operands did not break per condition");
+        assert_eq!(
+            format_source(&out, Dialect::Sysml).unwrap(),
+            out,
+            "idempotent"
+        );
+    }
+}
+
+/// A failed format reports one error value: it lists what went wrong, keeps
+/// the individual diagnostics reachable as a slice, and propagates with `?`.
+#[test]
+fn a_failed_format_is_one_error_value() {
+    const BROKEN: &str = "package P { part a = ; part b = ; }";
+
+    fn format(src: &str) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(format_source(src, Dialect::Sysml)?)
+    }
+
+    let listed = format(BROKEN).unwrap_err().to_string();
+    let diagnostics = format_source(BROKEN, Dialect::Sysml).unwrap_err();
+    assert!(!diagnostics.is_empty());
+    assert_eq!(listed.lines().count(), diagnostics.len());
+    assert!(listed.starts_with("error: "), "{listed}");
+    // The slice is still there behind the wrapper.
+    assert_eq!(Some(&diagnostics[0]), diagnostics.first());
+    assert_eq!(diagnostics.iter().count(), diagnostics.len());
+    assert_eq!(diagnostics.clone().into_vec(), diagnostics.to_vec());
+}
+
+/// The notation's end clause reads two ends or more — `from a to b`,
+/// `(a, b, c)` — so a connector an assembled tree gave fewer has no
+/// clause to put them in: `(a)` is not a list the parser reads back, and
+/// printing one would emit text that fails where it used to succeed.
+/// The ends go into the body instead, as the `end ::> …;` members the
+/// notation already gives an end written out rather than listed, which
+/// is what a one-ended connector lifted from interchange already spells.
+#[test]
+fn a_connector_below_the_clause_keeps_its_ends_as_members() {
+    use sysmlv2_parser::ast::{MemberKind, UsageDetail};
+
+    fn set_end_count(unit: &mut SourceUnit, count: usize) {
+        let MemberKind::Package(p) = &mut unit.members[0].kind else {
+            panic!("expected a package")
+        };
+        for m in p.body.as_mut().expect("package body") {
+            if let MemberKind::Usage(u) = &mut m.kind {
+                if let UsageDetail::Connector { ends } = &mut u.detail {
+                    assert_eq!(ends.len(), 2);
+                    let spare = ends[0].clone();
+                    ends.resize(count, spare);
+                }
+            }
+        }
+    }
+
+    for (dialect, src) in [
+        (
+            Dialect::Sysml,
+            "package P { connection c1 connect a to b; part z; }",
+        ),
+        (Dialect::Sysml, "package P { connect a to b; part z; }"),
+        (
+            Dialect::Sysml,
+            "package P { allocation c1 allocate a to b; part z; }",
+        ),
+        (
+            Dialect::Sysml,
+            "package P { interface i1 connect a to b; part z; }",
+        ),
+        (
+            Dialect::Kerml,
+            "package P { connector c1 from a to b; feature z; }",
+        ),
+        (
+            Dialect::Kerml,
+            "package P { connector c1 from a to b { feature q; } feature z; }",
+        ),
+    ] {
+        for count in [0, 1] {
+            let mut unit = parse(src, dialect).unit;
+            set_end_count(&mut unit, count);
+            let printed = print_source(&unit);
+            let back = parse(&printed, dialect);
+            assert!(
+                back.diagnostics.is_empty(),
+                "{src} with {count} end(s) printed {printed:?}: {:#?}",
+                back.diagnostics
+            );
+            assert!(
+                !printed.contains('('),
+                "{printed:?}: a list the clause does not read"
+            );
+            // Printing what came back changes nothing further.
+            assert_eq!(
+                print_source(&back.unit),
+                printed,
+                "{src} with {count} end(s): a second round trip moved"
+            );
+            let MemberKind::Package(p) = &back.unit.members[0].kind else {
+                panic!("{printed:?}: expected a package")
+            };
+            let body = p.body.as_deref().expect("package body");
+            assert_eq!(body.len(), 2, "{printed:?}: a member disappeared");
+            let MemberKind::Usage(u) = &body[0].kind else {
+                panic!("{printed:?}: expected a usage")
+            };
+            let kept = u
+                .body
+                .iter()
+                .flatten()
+                .filter(|m| matches!(&m.kind, MemberKind::Usage(e) if e.prefix.is_end))
+                .count();
+            assert_eq!(kept, count, "{printed:?}: ends kept");
+        }
+    }
+}
+
+/// An end with no name, no multiplicity and an unspelled target has
+/// nothing to print after its prefix. SysML reads a member that is only
+/// its prefix; KerML wants an element after one, and stops on the
+/// terminator — so the bare end is spelled `end feature;`, naming the
+/// metaclass the end has anyway, which both dialects read and print back
+/// unchanged. `end;` would leave the other dialect text it cannot parse.
+#[test]
+fn a_bare_end_member_names_an_element_both_dialects_read() {
+    use sysmlv2_parser::ast::{MemberKind, TargetRef, UsageDetail};
+
+    /// Leave the connector one end with nothing spelled on it at all.
+    fn strip_the_end(unit: &mut SourceUnit) {
+        let MemberKind::Package(p) = &mut unit.members[0].kind else {
+            panic!("expected a package")
+        };
+        for m in p.body.as_mut().expect("package body") {
+            if let MemberKind::Usage(u) = &mut m.kind {
+                if let UsageDetail::Connector { ends } = &mut u.detail {
+                    ends.truncate(1);
+                    ends[0].name = None;
+                    ends[0].multiplicity = None;
+                    ends[0].target = TargetRef::unspelled();
+                }
+            }
+        }
+    }
+
+    for (dialect, src) in [
+        (
+            Dialect::Sysml,
+            "package P { connection c1 connect a to b; part z; }",
+        ),
+        (
+            Dialect::Kerml,
+            "package P { connector c1 from a to b; feature z; }",
+        ),
+    ] {
+        let mut unit = parse(src, dialect).unit;
+        strip_the_end(&mut unit);
+        let printed = print_source(&unit);
+        assert!(printed.contains("end feature;"), "{printed:?}");
+        let back = parse(&printed, dialect);
+        assert!(
+            back.diagnostics.is_empty(),
+            "{printed:?}: {:#?}",
+            back.diagnostics
+        );
+        assert_eq!(
+            print_source(&back.unit),
+            printed,
+            "{src}: a second round trip moved"
+        );
+    }
+
+    // The spelling itself, in each dialect's own container: what the
+    // printer writes now is read by both, and what it wrote before was
+    // read by one.
+    for (dialect, container) in [
+        (Dialect::Sysml, "package P { connection c1 { @ } part z; }"),
+        (
+            Dialect::Kerml,
+            "package P { connector c1 { @ } feature z; }",
+        ),
+    ] {
+        assert!(
+            parse(&container.replace('@', "end feature;"), dialect)
+                .diagnostics
+                .is_empty(),
+            "{dialect:?} does not read `end feature;`"
+        );
+    }
+    assert!(
+        !parse(
+            "package P { connector c1 { end; } feature z; }",
+            Dialect::Kerml
+        )
+        .diagnostics
+        .is_empty(),
+        "`end;` reads in both dialects after all"
+    );
+}

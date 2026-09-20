@@ -1,0 +1,2316 @@
+{
+  "repository": "https://github.com/Open-MBEE/OpenSysML",
+  "revision": "d7d432ff410e60f9146c38bfe51b4db749a924b1",
+  "files": [
+    {
+      "file": "probes/validateActionUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateActionUsageType.sysml",
+      "sha256": "c5144381f81dbb2aa2c4506245a56457510e90fe98cde2fc2e869ccde6c37180"
+    },
+    {
+      "file": "probes/validateActorMembershipOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateActorMembershipOwningType.sysml",
+      "sha256": "3c1bf3ffc3dea9911c7024edc38f2432a58c0f20f1e67f0718644f08be4c45ce"
+    },
+    {
+      "file": "probes/validateAllocationUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateAllocationUsageType.sysml",
+      "sha256": "7a6a2958a2ee681d0d3a935b6f821a86e7278ed17e5152b977ff4df4ee4ab9e7"
+    },
+    {
+      "file": "probes/validateAnalysisCaseUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateAnalysisCaseUsageType.sysml",
+      "sha256": "47560a0f14e196fccdc6f40611375d20a95acb114fc9c17d2132d20ac926b27d"
+    },
+    {
+      "file": "probes/validateAnnotationAnnotatedElementOwnership.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateAnnotationAnnotatedElementOwnership.kerml",
+      "sha256": "1c58bd2a80e9cbbb41eec68c15221df96f3333d27a3c03c2358e24a7f9014063"
+    },
+    {
+      "file": "probes/validateAssertConstraintUsageReference.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateAssertConstraintUsageReference.sysml",
+      "sha256": "7f2ddd00307b3bb51edc65d053f4a091066ac579d80e62e70901a52308d2e3c3"
+    },
+    {
+      "file": "probes/validateAssignmentActionUsageReferent.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateAssignmentActionUsageReferent.sysml",
+      "sha256": "4fbb097f45f56fb37d00be250946e11a1e9ba0a37282e8413acd19469ded219e"
+    },
+    {
+      "file": "probes/validateAssignmentActionUsageReferentIsTimeVarying.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateAssignmentActionUsageReferentIsTimeVarying.sysml",
+      "sha256": "18471668c09340bde6428b1dd664b81614ef36b9195e39e6bc7eecd17f04eda3"
+    },
+    {
+      "file": "probes/validateAssociationBinarySpecialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateAssociationBinarySpecialization.kerml",
+      "sha256": "e175112d8e5826c0e38189b014cfa2ebe77cb17a5f6390a48c64901ca4028c34"
+    },
+    {
+      "file": "probes/validateAssociationEndTypes.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateAssociationEndTypes.kerml",
+      "sha256": "287e1d71ddd5f2f2f2887e5addfae825503649b99af9558fb2da8311a8aca1a4"
+    },
+    {
+      "file": "probes/validateAssociationRelatedTypes.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateAssociationRelatedTypes.kerml",
+      "sha256": "b2aaf19cf8755921d562e001c167fd1e74815a15b2d4f6d469da14b91a44c6b2"
+    },
+    {
+      "file": "probes/validateAttributeUsageEnumerationType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateAttributeUsageEnumerationType.sysml",
+      "sha256": "95e36d99bae36feb7e0dceb5c0c1d89b8abd10ae8d117aff379813c200f8e2a5"
+    },
+    {
+      "file": "probes/validateAttributeUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateAttributeUsageType.sysml",
+      "sha256": "723fbbe3a772f35f93e64291c4bedd766d703e07dd04aea3361a1530af13e37f"
+    },
+    {
+      "file": "probes/validateBehaviorSpecialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateBehaviorSpecialization.kerml",
+      "sha256": "c04aedc6f54ef51b74733a64311805d97ddb8cd0b34c3d4bfbc420a75bcc03ae"
+    },
+    {
+      "file": "probes/validateBindingConnectorIsBinary.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateBindingConnectorIsBinary.kerml",
+      "sha256": "2a423e3b7efa2a2ada1943db67f6d427d05008198d34cc2ee4b64bf05f4c682c"
+    },
+    {
+      "file": "probes/validateBindingConnectorTypeConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateBindingConnectorTypeConformance.kerml",
+      "sha256": "cc0414e28af6906a6160eb620f86ad91123eb68a2700a71e0c568b47dbecf121"
+    },
+    {
+      "file": "probes/validateBindingConnectorTypeConformance.result.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateBindingConnectorTypeConformance.result.kerml",
+      "sha256": "499a3cfc9dd4a268d1e0ae8c47c4f4d1897aab19f9f545c85f50d04b3db90664"
+    },
+    {
+      "file": "probes/validateBindingConnectorTypeConformance.satisfy.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateBindingConnectorTypeConformance.satisfy.sysml",
+      "sha256": "cefe261e6c0e7dfd823b99f56a0efc9466cf2e4d8025e5ee431ea4fb3c03ca22"
+    },
+    {
+      "file": "probes/validateBindingConnectorTypeConformance.subject.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateBindingConnectorTypeConformance.subject.sysml",
+      "sha256": "97b04c1712720861557f57c75f03d0650e81919722d8df976122b2bc298aaedb"
+    },
+    {
+      "file": "probes/validateCalculationUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCalculationUsageType.sysml",
+      "sha256": "2b85880bee51305d3743464f4d28713b7b10bd55745a8ca29369b0fc9dc53973"
+    },
+    {
+      "file": "probes/validateCaseDefinitionOnlyOneObjective.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCaseDefinitionOnlyOneObjective.sysml",
+      "sha256": "72f27d72bca72e3e12952ecab7ed5a00225b8d54b20d5eed55d66b41f855614f"
+    },
+    {
+      "file": "probes/validateCaseDefinitionOnlyOneSubject.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCaseDefinitionOnlyOneSubject.sysml",
+      "sha256": "7f35837969d823949f974bd2df5e60ad323a959016d6eb69c2b0e5d0f605c548"
+    },
+    {
+      "file": "probes/validateCaseDefinitionSubjectParameterPosition.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCaseDefinitionSubjectParameterPosition.sysml",
+      "sha256": "51ca4d140be70e0062f584ddb4bd471174762e8ec4370e858cfecb9d419361ba"
+    },
+    {
+      "file": "probes/validateCaseUsageOnlyOneObjective.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCaseUsageOnlyOneObjective.sysml",
+      "sha256": "117f21b3a063eb9f9e7673d3af3fd790a5c386ffacd127f70a84496a41b29ae4"
+    },
+    {
+      "file": "probes/validateCaseUsageOnlyOneSubject.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCaseUsageOnlyOneSubject.sysml",
+      "sha256": "4d7ae36349e1a239489ba43ad23935f7cb39917dfdc72962068b21563d011b4d"
+    },
+    {
+      "file": "probes/validateCaseUsageSubjectParameterPosition.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCaseUsageSubjectParameterPosition.sysml",
+      "sha256": "3f95d8a6f4eaf0be86a67bae73092f42a7dd6967dfaa2b8f13383a05d7ffb272"
+    },
+    {
+      "file": "probes/validateCaseUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateCaseUsageType.sysml",
+      "sha256": "aa4a2965a5fa8c06a0432a1fd5733da4fe6d4ad17ac4914ef4f1b170bda67a3e"
+    },
+    {
+      "file": "probes/validateClassSpecialization.connection.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateClassSpecialization.connection.sysml",
+      "sha256": "a3d596ea3422dad989271f1d860c1a53f11a6fc97f4da000675b782389dc9462"
+    },
+    {
+      "file": "probes/validateClassSpecialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateClassSpecialization.kerml",
+      "sha256": "c19d6bde3b7c94c65d69452fe879e10a80309ccb2b576124419939ccd5c0509e"
+    },
+    {
+      "file": "probes/validateClassSpecialization.subsets.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateClassSpecialization.subsets.kerml",
+      "sha256": "3e496c3af6ecd1245de47685feb2ed6e0827cc11c62a37e60b14fdf04e59e97d"
+    },
+    {
+      "file": "probes/validateClassSpecialization.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateClassSpecialization.sysml",
+      "sha256": "49fcb126ee83e2ab192d8cd9a85e6a19e5112b06a233b7c7af5e4dc41d4ecd0a"
+    },
+    {
+      "file": "probes/validateClassifierDefaultSupertype.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateClassifierDefaultSupertype.kerml",
+      "sha256": "fd9b54496c840eeffaa9e60057ff1cf838dc78a3c11efc1d110bf551fa29b7ef"
+    },
+    {
+      "file": "probes/validateConnectionUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateConnectionUsageType.sysml",
+      "sha256": "4f22f676ed0cffa436a6022bdc282932805eab153905b964fc92aa82405407be"
+    },
+    {
+      "file": "probes/validateConnectorBinarySpecialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateConnectorBinarySpecialization.kerml",
+      "sha256": "7de855409959a61a7c7746d13a5e6502ad0a602f90a1054b18fc708b6f4b6e09"
+    },
+    {
+      "file": "probes/validateConnectorRelatedFeatures.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateConnectorRelatedFeatures.sysml",
+      "sha256": "42588e832e78550584f2d1ea3bc07ae445be25000fe08a0943b4803a0956a0a2"
+    },
+    {
+      "file": "probes/validateConnectorTypeFeaturing.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateConnectorTypeFeaturing.kerml",
+      "sha256": "4515e42d7710ba592ddd19f426eba0319af68dc697b3dee6a661985e830fa6fe"
+    },
+    {
+      "file": "probes/validateConstructorExpressionNoDuplicateFeatureRedefinition.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateConstructorExpressionNoDuplicateFeatureRedefinition.kerml",
+      "sha256": "77aac50b6193ad9105823807b8ba87e08a91ebfbb5699097c98a70bd976cbaa9"
+    },
+    {
+      "file": "probes/validateControlNodeIncomingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateControlNodeIncomingSuccessions.sysml",
+      "sha256": "fe13fe4886ff9f0f1fe201c86d04bb66923a8b7f1a1c17d1fdd5406da3fa63d5"
+    },
+    {
+      "file": "probes/validateControlNodeOutgoingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateControlNodeOutgoingSuccessions.sysml",
+      "sha256": "3e5e4b3abe5a9afc2eb725d608da4a11277cd4083dae1970bcb390c127d1afa0"
+    },
+    {
+      "file": "probes/validateControlNodeOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateControlNodeOwningType.sysml",
+      "sha256": "831b476c7617a29ab656f5078936db30ecb51eed44caa6a75c9348de424ab0b4"
+    },
+    {
+      "file": "probes/validateCrossSubsettingCrossedFeature.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateCrossSubsettingCrossedFeature.kerml",
+      "sha256": "a082f967336025c1c389e46af5c660d639fdb1f93d47d6bcf8fef54c4a2fa7a4"
+    },
+    {
+      "file": "probes/validateCrossSubsettingCrossingFeature.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateCrossSubsettingCrossingFeature.kerml",
+      "sha256": "ca5a8a648692e8fd4c7064c6a86482292f2d22a3a5cac9e588bc7797236a80a0"
+    },
+    {
+      "file": "probes/validateDataTypeSpecialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateDataTypeSpecialization.kerml",
+      "sha256": "4818829546399aaa977e12607905ad76f61c6d4db868408f4e5b383188414c98"
+    },
+    {
+      "file": "probes/validateDataTypeSpecialization.subsets.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateDataTypeSpecialization.subsets.kerml",
+      "sha256": "107dc0090e2ac3a576f92cd8e482f0002b78a617a2a7ab41715113baa70b4a49"
+    },
+    {
+      "file": "probes/validateDataTypeSpecialization.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateDataTypeSpecialization.sysml",
+      "sha256": "9bf46fc9db3efe741ac50af6bb07732219ed267bc9eb4e1544df30f9f95eb544"
+    },
+    {
+      "file": "probes/validateDecisionNodeIncomingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateDecisionNodeIncomingSuccessions.sysml",
+      "sha256": "66b09f076bd62ecc48e528179550fe381fca0bf3f8df687580631429d3a29e86"
+    },
+    {
+      "file": "probes/validateDecisionNodeOutgoingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateDecisionNodeOutgoingSuccessions.sysml",
+      "sha256": "aa7f90625cb866fec1886a415480eac5b90b155060dfdedacae45739b78df945"
+    },
+    {
+      "file": "probes/validateDefinitionVariationMembership.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateDefinitionVariationMembership.sysml",
+      "sha256": "7a0596b3f72f90c7008c3462f71e91a3350310bb4278cbd71a681d8e2808ef25"
+    },
+    {
+      "file": "probes/validateDefinitionVariationSpecialization.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateDefinitionVariationSpecialization.sysml",
+      "sha256": "526f9f46bf9c2781e1c081cb0e55fc5487ab323e0f1334209570b87154ef96eb"
+    },
+    {
+      "file": "probes/validateElementFilterMembershipIsBoolean.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateElementFilterMembershipIsBoolean.kerml",
+      "sha256": "d3ebeaa8a1898b283bae2c5f3f671ccb7fcd64a85b800e76d36a350cb7ad809c"
+    },
+    {
+      "file": "probes/validateElementFilterMembershipIsModelLevelEvaluable.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateElementFilterMembershipIsModelLevelEvaluable.sysml",
+      "sha256": "06a3bb1c800e4a04f91233916ec0e6925bc8280713c1d08863c3713f09d2f3bb"
+    },
+    {
+      "file": "probes/validateEnumerationUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateEnumerationUsageType.sysml",
+      "sha256": "1655ea5cdbee74465679f7022393ce6c67da366f7cd6340ad3c70cef656121b2"
+    },
+    {
+      "file": "probes/validateEventOccurrenceUsageReferent.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateEventOccurrenceUsageReferent.sysml",
+      "sha256": "a0aabbb39fa5c5686eab8d375ed5bc6feb5605b23ee59b3127274390b5b78c2d"
+    },
+    {
+      "file": "probes/validateExhibitStateUsageReference.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateExhibitStateUsageReference.sysml",
+      "sha256": "5a687df5c996bbb4284e2dd181cc283874e69a9d7a614dd8b81cd0a39fd27cfa"
+    },
+    {
+      "file": "probes/validateExposeOwningNamespace.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateExposeOwningNamespace.sysml",
+      "sha256": "60886b071cc4ff5b608c320dd219822ec0b33638a61760d0d880fac6b3554c80"
+    },
+    {
+      "file": "probes/validateExpressionResultExpressionMembership.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateExpressionResultExpressionMembership.kerml",
+      "sha256": "14d2d06e9b7648cef86d281ecbb37240209f7f63da2ecccf39bb2945f7ba2dd2"
+    },
+    {
+      "file": "probes/validateExpressionResultExpressionMembership.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateExpressionResultExpressionMembership.sysml",
+      "sha256": "ab76f87ce4bfb9d9614b0c1ba709e61944c241f4db99ebc499a7dd2ecc33d364"
+    },
+    {
+      "file": "probes/validateExpressionResultExpressionMembership.typed.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateExpressionResultExpressionMembership.typed.kerml",
+      "sha256": "152830408edcc5c5873296320ad3c6b4418400af52207984d28f5f568599f62b"
+    },
+    {
+      "file": "probes/validateExpressionResultParameterMembership.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateExpressionResultParameterMembership.kerml",
+      "sha256": "99c7488c9a0980c2b5d353b4dc71794a9a08b790f6af91e3ecdfc0c0b89e3f68"
+    },
+    {
+      "file": "probes/validateFeatureChainExpressionFeatureConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureChainExpressionFeatureConformance.kerml",
+      "sha256": "6defa056f0a926e6283304abf219a2476fbbda4617ddd34fd06d6b3cfa0cde9d"
+    },
+    {
+      "file": "probes/validateFeatureChainingFeatureConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureChainingFeatureConformance.kerml",
+      "sha256": "dd17ab1378f427f4e70920a12d1c53ea8a08762887c53f2d489f727f60093efe"
+    },
+    {
+      "file": "probes/validateFeatureChainingFeatureNotOne.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureChainingFeatureNotOne.kerml",
+      "sha256": "9af9ec21c0cae4714fbf4aa7f07cb3e19ea2b6d6844cf338d23ff66a7d4aca0a"
+    },
+    {
+      "file": "probes/validateFeatureChainingFeaturesNotSelf.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureChainingFeaturesNotSelf.kerml",
+      "sha256": "1c2fe811403005b8e1803555cb8e68dd8562d7ae83725f273f0a14756c311129"
+    },
+    {
+      "file": "probes/validateFeatureConstantIsVariable.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureConstantIsVariable.sysml",
+      "sha256": "c8801ee28c22bb1b36e5e62879544d239e1d0fd2e2d73fb1dbf5c5e16778d6e5"
+    },
+    {
+      "file": "probes/validateFeatureCrossFeatureSpecialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureCrossFeatureSpecialization.kerml",
+      "sha256": "b9921a730ad8b4757cf6a2b08de5e2de3fcbe9f2f95721ebcc8d02b9ecf3f9bf"
+    },
+    {
+      "file": "probes/validateFeatureCrossFeatureType.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureCrossFeatureType.kerml",
+      "sha256": "c5f7c0a0859ab32cd2cb5cce8be4a2c85e65024146fbf7e60f9d98fac281118b"
+    },
+    {
+      "file": "probes/validateFeatureEndFeatureMultiplicity.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureEndFeatureMultiplicity.kerml",
+      "sha256": "c2c87866147c7322771d9e81bfc4eac2ba5eac080970959893030e23d9fbf9f8"
+    },
+    {
+      "file": "probes/validateFeatureEndNoDirection.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureEndNoDirection.sysml",
+      "sha256": "cc7aeff1ba9b1bf8773dd7ec9644a416deb862c8dfb411dcbf4ec4a9d731ef67"
+    },
+    {
+      "file": "probes/validateFeatureEndNotDerivedAbstractCompositeOrPortion.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureEndNotDerivedAbstractCompositeOrPortion.sysml",
+      "sha256": "1c2e4736fedee61f061c0aeb0c71aa751dbab017edd8a9d9c59cc68897e8be63"
+    },
+    {
+      "file": "probes/validateFeatureHasType.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureHasType.kerml",
+      "sha256": "2923608f93d0ebeaf31c0b5e13584814f795943d270c855055cbc132cc465991"
+    },
+    {
+      "file": "probes/validateFeatureIsVariable.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureIsVariable.kerml",
+      "sha256": "7746dceee24421c41c7e8abbff7fc000c11ee7f5732ff83eabc8a2775177b1a8"
+    },
+    {
+      "file": "probes/validateFeatureOwnedCrossSubsetting.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureOwnedCrossSubsetting.kerml",
+      "sha256": "59f5f9efaab072db156a72f67b61e43536e4a98a0ddeb285d945e0f56e6c30ca"
+    },
+    {
+      "file": "probes/validateFeatureOwnedReferenceSubsetting.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureOwnedReferenceSubsetting.kerml",
+      "sha256": "ad0bb0e8ccbdf27467f76cf23427037469c8ae5153116cc6429c0637ce2a0d1c"
+    },
+    {
+      "file": "probes/validateFeaturePortionNotVariable.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeaturePortionNotVariable.kerml",
+      "sha256": "049c09930d020f077760225fafb572540b53cc3cdf19526630d652d1906014ae"
+    },
+    {
+      "file": "probes/validateFeatureReferenceExpressionReferentIsFeature.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureReferenceExpressionReferentIsFeature.kerml",
+      "sha256": "2778519f39ef0bd9e40dbe1a98dbd0bf40086e357b064a00fc120964885f549a"
+    },
+    {
+      "file": "probes/validateFeatureValueIsInitial.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureValueIsInitial.kerml",
+      "sha256": "f6875ba84cdf1cc1463a428d5442367a18e10a5d0e938ebc6ffcedf8aa2d5a46"
+    },
+    {
+      "file": "probes/validateFeatureValueOverriding.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureValueOverriding.kerml",
+      "sha256": "72d5a77626a1692e25ef6aca9e21f21f2f52ec7ced982979a7090d0493263b5c"
+    },
+    {
+      "file": "probes/validateFeatureValueOverriding.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFeatureValueOverriding.sysml",
+      "sha256": "f0ade12fc328eec2e6f5825dae7a3ae259647dfb5e9b5eae07e5fa85f1570315"
+    },
+    {
+      "file": "probes/validateFlowDefinitionConnectionEnds.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFlowDefinitionConnectionEnds.sysml",
+      "sha256": "8e8d46c70f3408e2f003339f33e4ec2d83e855c2e715860f25c974237b49d77d"
+    },
+    {
+      "file": "probes/validateFlowEndImplicitSubsetting.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFlowEndImplicitSubsetting.kerml",
+      "sha256": "0e66a44f13806fdad6ea1fe4f204bea87e75480bf32b0d6cbe87e7c174a8bf50"
+    },
+    {
+      "file": "probes/validateFlowEndImplicitSubsetting.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFlowEndImplicitSubsetting.sysml",
+      "sha256": "bd082fb5806c439215a06e5b6291bf20b7243eeefe6b995443947cfc4c2ac6c9"
+    },
+    {
+      "file": "probes/validateFlowEndSubsetting.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFlowEndSubsetting.kerml",
+      "sha256": "0c00eedca39dbeebb4e0eb5c92ed9b30f9f6c12a529986231a19ff2a7250de1a"
+    },
+    {
+      "file": "probes/validateFlowUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFlowUsageType.sysml",
+      "sha256": "b6f6bf259b3fa0c9d948b70b468a5fadac27c5973e4c86fe02ee7e1a95bc187d"
+    },
+    {
+      "file": "probes/validateForkNodeIncomingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateForkNodeIncomingSuccessions.sysml",
+      "sha256": "43ae8e99ead862b7e5075d5e82ef114a836b5c018ef78e9351bae1aff6eaf6a5"
+    },
+    {
+      "file": "probes/validateFunctionResultExpressionMembership.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFunctionResultExpressionMembership.kerml",
+      "sha256": "80e97209ffe97e690beae488a2cd713b2707f17b236c224c6179cc570fcd5969"
+    },
+    {
+      "file": "probes/validateFunctionResultExpressionMembership.specialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFunctionResultExpressionMembership.specialization.kerml",
+      "sha256": "79ad6bdcf88c090ad95baab1c571d8897e6c2ac05f985a603416f9b1d8d5ec82"
+    },
+    {
+      "file": "probes/validateFunctionResultExpressionMembership.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateFunctionResultExpressionMembership.sysml",
+      "sha256": "52724d7f3d60d70207fc6e7f2e666aabdc522506e837c6c21c82fbfef288195a"
+    },
+    {
+      "file": "probes/validateFunctionResultParameterMembership.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateFunctionResultParameterMembership.kerml",
+      "sha256": "cf2c478f2e3cbdeee86ede3ed517a425f0e1a2d081e5377806425d4c8b7af522"
+    },
+    {
+      "file": "probes/validateImportTopLevelVisibility.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateImportTopLevelVisibility.kerml",
+      "sha256": "146fbb7574e7eae56417683800d70de9b24238dd290330f21e4ff2d5a0cb0223"
+    },
+    {
+      "file": "probes/validateIncludeUseCaseUsageReference.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateIncludeUseCaseUsageReference.sysml",
+      "sha256": "7bd55601f895f10df0dae595ce1061ffcadb8a00f54fa37b6875c1bf03e67513"
+    },
+    {
+      "file": "probes/validateInstantiationExpressionInstantiatedType.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateInstantiationExpressionInstantiatedType.kerml",
+      "sha256": "cec4ee784e423dc8c04fa66af4a349e2e65478343889a00dac3a402f42ee218d"
+    },
+    {
+      "file": "probes/validateInterfaceDefinitionEnd.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateInterfaceDefinitionEnd.sysml",
+      "sha256": "2b8c31a04c6498f4c5bbd2ae2a7b1c95fb860f63b0f13326e2af2c29a90924c4"
+    },
+    {
+      "file": "probes/validateInterfaceUsageEnd.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateInterfaceUsageEnd.sysml",
+      "sha256": "ce009bc0069ac1c861eb6638a214ef45795030b154361db5a1271c65ba7928bb"
+    },
+    {
+      "file": "probes/validateInterfaceUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateInterfaceUsageType.sysml",
+      "sha256": "b119d7d929f10b8686782d66839ed3912da8b109b9e14d9619830bad0866d507"
+    },
+    {
+      "file": "probes/validateInvocationExpressionInstantiatedType.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateInvocationExpressionInstantiatedType.kerml",
+      "sha256": "11ffb85e44afb0fdca19ad21b6bbaac156647ca87ec14f1873967ea5b00b59d5"
+    },
+    {
+      "file": "probes/validateInvocationExpressionNoDuplicateParameterRedefinition.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateInvocationExpressionNoDuplicateParameterRedefinition.kerml",
+      "sha256": "a2d93dd6e30de080d4da3f86ce242dbe1feadba54b26bd28c44f08ad5e36d3e2"
+    },
+    {
+      "file": "probes/validateInvocationExpressionParameterRedefinition.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateInvocationExpressionParameterRedefinition.kerml",
+      "sha256": "6ee5d2ec562ef76bb68594e59b7f014fdc10dede96517a12608b280c2a78beb4"
+    },
+    {
+      "file": "probes/validateJoinNodeOutgoingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateJoinNodeOutgoingSuccessions.sysml",
+      "sha256": "2ab6ebe7519892157dbd69068f005ed12771eaf9ee445794991fa54a5f59e7bb"
+    },
+    {
+      "file": "probes/validateLibraryPackageNotStandard.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateLibraryPackageNotStandard.kerml",
+      "sha256": "0937fa7683a19b7c8cc80f36c769c3256cfd8fc827bf06b415274d91b877c5bc"
+    },
+    {
+      "file": "probes/validateMergeNodeIncomingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateMergeNodeIncomingSuccessions.sysml",
+      "sha256": "203872be3ba250f4952d28d387141579b4cf394b82fe3c1dcc8779fb3695e153"
+    },
+    {
+      "file": "probes/validateMergeNodeOutgoingSuccessions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateMergeNodeOutgoingSuccessions.sysml",
+      "sha256": "2162957070ce889c4d7f5622d06c7b91ec0aab7205a6de253512fef67ecc5007"
+    },
+    {
+      "file": "probes/validateMetadataFeatureAnnotatedElement.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateMetadataFeatureAnnotatedElement.kerml",
+      "sha256": "c3bda00fdc8c42e51369b6c5bb1384bdeb3af69293354300e03ec5ff39ef6fe5"
+    },
+    {
+      "file": "probes/validateMetadataFeatureBody.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateMetadataFeatureBody.kerml",
+      "sha256": "897470bf9a6e9f7f36824fe573c9e6c814e75d5e2e7dea741843903db7bd2eab"
+    },
+    {
+      "file": "probes/validateMetadataFeatureMetadata.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateMetadataFeatureMetadata.kerml",
+      "sha256": "94e7450209e727b13688fa7bd0d429ece1c9997abf164aafc2deb1d168b76ca4"
+    },
+    {
+      "file": "probes/validateMetadataFeatureMetadataNotAbstract.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateMetadataFeatureMetadataNotAbstract.kerml",
+      "sha256": "a08d7d0e76ff1013911615afbfcf74f99a1833933d6ea7368958594407d09418"
+    },
+    {
+      "file": "probes/validateMetadataUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateMetadataUsageType.sysml",
+      "sha256": "554d83c2cd978fe4e7158c7c130530e5c16be619692d99574aad55ac6ffc7a57"
+    },
+    {
+      "file": "probes/validateMultiplicityRangeResultTypes.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateMultiplicityRangeResultTypes.kerml",
+      "sha256": "1af3a3fe44e228bef91bea58259998ada3bbd90c332dd23b63d80c85cdc7b1ff"
+    },
+    {
+      "file": "probes/validateNamespaceDistinguishablity.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateNamespaceDistinguishablity.kerml",
+      "sha256": "c5046b88f962dc1c4127e4c2c56f4fd6e3dd2d5410e372e68cbee8e360a6ae7f"
+    },
+    {
+      "file": "probes/validateObjectiveMembershipOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateObjectiveMembershipOwningType.sysml",
+      "sha256": "0f4c676d77707a05eea12b7c93dffde71f65ec5df1852772e2589b9537473e9b"
+    },
+    {
+      "file": "probes/validateOccurrenceUsageIndividualDefinition.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateOccurrenceUsageIndividualDefinition.sysml",
+      "sha256": "b0a844055ea3ab13820b5f02aecd9d1f09ce5029d323e12397d95920f09b9189"
+    },
+    {
+      "file": "probes/validateOccurrenceUsageIndividualUsage.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateOccurrenceUsageIndividualUsage.sysml",
+      "sha256": "8e7ca8491bc4f150ef8fa00eb3cd67a0917269e327fe0f83fb88a7facb040ca2"
+    },
+    {
+      "file": "probes/validateOccurrenceUsageIsPortion.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateOccurrenceUsageIsPortion.sysml",
+      "sha256": "600c3cfcc30f0a13f5d3d08be109398231aa003399ea0fe0ff2c3882c7ef05a7"
+    },
+    {
+      "file": "probes/validateOccurrenceUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateOccurrenceUsageType.sysml",
+      "sha256": "5628a55e2dea4e61cd520dab9c5246990fbf54393a105f57260320a50c75cd57"
+    },
+    {
+      "file": "probes/validateOperatorExpressionBracketOperator.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateOperatorExpressionBracketOperator.kerml",
+      "sha256": "a2f09eaef1cf5931fbfc2d7858cb4d89512ef2f46eda61d094b62b6bb0157687"
+    },
+    {
+      "file": "probes/validateOperatorExpressionCastConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateOperatorExpressionCastConformance.kerml",
+      "sha256": "365175d9400a8cd731e282c77faa52a0630f546670e47bba6fb3488b41a369c9"
+    },
+    {
+      "file": "probes/validateOperatorExpressionQuantity.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateOperatorExpressionQuantity.sysml",
+      "sha256": "5b9945428003848bb64fe270806a6d6314970f10136556b90f0d94ff4b62ffd3"
+    },
+    {
+      "file": "probes/validateOwnedDifferencingNotOne.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateOwnedDifferencingNotOne.kerml",
+      "sha256": "12a4172ece60492a43fc2a55ce7d067d7932cef439e155a4f676812f7d52ad5a"
+    },
+    {
+      "file": "probes/validateOwnedIntersectingNotOne.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateOwnedIntersectingNotOne.kerml",
+      "sha256": "bbf9fe7ee59d7c9bf601ea088fe7596765a4d42910972e09afd477ee7c2f260e"
+    },
+    {
+      "file": "probes/validateOwnedUnioningNotOne.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateOwnedUnioningNotOne.kerml",
+      "sha256": "6af898ebfe772cf80f9ee3e3f47169fbdff573132048ba79831eef727f986fd4"
+    },
+    {
+      "file": "probes/validatePerformActionUsageReference.sysml",
+      "source": "cmd/validation-census/testdata/probes/validatePerformActionUsageReference.sysml",
+      "sha256": "67656c8054900033faa15f9db34603e484f92febd4bd1cefbc2f86f4455a3ba6"
+    },
+    {
+      "file": "probes/validatePortDefinitionOwnedUsagesNotComposite.sysml",
+      "source": "cmd/validation-census/testdata/probes/validatePortDefinitionOwnedUsagesNotComposite.sysml",
+      "sha256": "722d70f5a0a1b8822e60148a20ade0d10155802d2d68976815290a8a7c18d906"
+    },
+    {
+      "file": "probes/validatePortUsageIsReference.sysml",
+      "source": "cmd/validation-census/testdata/probes/validatePortUsageIsReference.sysml",
+      "sha256": "abee375893983e92c208447bb9c6bcda5c6343b10505f0fca869a21c87c37ad1"
+    },
+    {
+      "file": "probes/validatePortUsageNestedUsagesNotComposite.sysml",
+      "source": "cmd/validation-census/testdata/probes/validatePortUsageNestedUsagesNotComposite.sysml",
+      "sha256": "5f5f9a7d33a86903bcdd2f587888054bd13ff90a0fefc49d29d903dfedcfe828"
+    },
+    {
+      "file": "probes/validatePortUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validatePortUsageType.sysml",
+      "sha256": "973f15ada1f48538d770bfb3b290a4a563a6259360995528a07dd29304cf0831"
+    },
+    {
+      "file": "probes/validateRedefinitionDirectionConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateRedefinitionDirectionConformance.kerml",
+      "sha256": "2d86964740412e5e888daedf73506d5035d9670f6c6b0645a248c2fe14030215"
+    },
+    {
+      "file": "probes/validateRedefinitionEndConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateRedefinitionEndConformance.kerml",
+      "sha256": "4e294bdff639a02dc0eaf235f4f48f2b60a02d8d9b2094c37c0df9b55bb46437"
+    },
+    {
+      "file": "probes/validateRedefinitionFeaturingTypes.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateRedefinitionFeaturingTypes.kerml",
+      "sha256": "8f496ebd1c47d381a3b9e27c48c9981d565b48c9f260c440f6175f33d314a9a4"
+    },
+    {
+      "file": "probes/validateRedefinitionMultiplicityConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateRedefinitionMultiplicityConformance.kerml",
+      "sha256": "895d5ee55c6a7cb45658c29d31009d459a99cbe8f060ceb0107e83a191881d15"
+    },
+    {
+      "file": "probes/validateRenderingUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRenderingUsageType.sysml",
+      "sha256": "cd84fd85726b3f295e9c6223da4314cb49ab858884dd43c781a2f35c1abac41e"
+    },
+    {
+      "file": "probes/validateRequirementConstraintMembershipOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRequirementConstraintMembershipOwningType.sysml",
+      "sha256": "58fd45f1529e66ffbc50b1a365864ee8f9a286bcff4a3140e545f65312f8c5f2"
+    },
+    {
+      "file": "probes/validateRequirementDefinitionOnlyOneSubject.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRequirementDefinitionOnlyOneSubject.sysml",
+      "sha256": "b86ec782b0b42f70589950e4606659561a1dd7b1a717a146cf9bb451d3b5c81d"
+    },
+    {
+      "file": "probes/validateRequirementDefinitionSubjectParameterPosition.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRequirementDefinitionSubjectParameterPosition.sysml",
+      "sha256": "1e3fdf540a77d8bb9f9955d477a694e0362b25ce96697e42319d890d4e9db466"
+    },
+    {
+      "file": "probes/validateRequirementUsageOnlyOneSubject.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRequirementUsageOnlyOneSubject.sysml",
+      "sha256": "c546b453dcdb8dd7f6ddbee14f3af7e7e641d7770e9189611504bd3c888ceb2b"
+    },
+    {
+      "file": "probes/validateRequirementUsageSubjectParameterPosition.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRequirementUsageSubjectParameterPosition.sysml",
+      "sha256": "33567afdb58abe09e107e1dfda750b79cd646f9283962f2c7256d89df37c0c57"
+    },
+    {
+      "file": "probes/validateRequirementUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRequirementUsageType.sysml",
+      "sha256": "44f358caef373754f7ff9c287157e68e9d6fca39f78dec31dac8cb324d8694e6"
+    },
+    {
+      "file": "probes/validateRequirementVerificationMembershipOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateRequirementVerificationMembershipOwningType.sysml",
+      "sha256": "cc410b6d1902422709c23343db88820c2d861fc546949979729036fd1528b7bd"
+    },
+    {
+      "file": "probes/validateReturnParameterMembershipOwningType.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateReturnParameterMembershipOwningType.kerml",
+      "sha256": "e414d44a901ba8cf345fae9ded7f18effe5e55c8976b80f2291c6ee839e3425c"
+    },
+    {
+      "file": "probes/validateSatisfyRequirementUsageReference.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateSatisfyRequirementUsageReference.sysml",
+      "sha256": "52687c8ba582bba2eab2431773f22c980a7534f3718f2d5a8ccae6ce001f1dde"
+    },
+    {
+      "file": "probes/validateSendActionUsagePayloadArgument.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateSendActionUsagePayloadArgument.sysml",
+      "sha256": "baa3dffd158e378f094ce8c1fc19c35c0ae6a17047e1bebe7e26d86099f6f1cc"
+    },
+    {
+      "file": "probes/validateSendActionUsageReceiver.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateSendActionUsageReceiver.sysml",
+      "sha256": "0972eb8b6d6ace7826b82926d66a0e8f0f01353344a8968139bd87b915e4c5fb"
+    },
+    {
+      "file": "probes/validateSpecializationSpecificNotConjugated.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateSpecializationSpecificNotConjugated.kerml",
+      "sha256": "d6f8eac60f9165df8dc0a95558d26407147c4efe86797d37ae832ce5ab05c866"
+    },
+    {
+      "file": "probes/validateSpecializationSpecificNotConjugated.subset.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateSpecializationSpecificNotConjugated.subset.kerml",
+      "sha256": "0748697edaf8064a2c65512759fdb86774dc8c0f83eb811cea7c5844d85389e4"
+    },
+    {
+      "file": "probes/validateStakeholderMembershipOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateStakeholderMembershipOwningType.sysml",
+      "sha256": "62c404b7d5be56a667f511c0eaaba4be780c34b5f8ac22fb848f84e048291fae"
+    },
+    {
+      "file": "probes/validateStateDefinitionParallelSubactions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateStateDefinitionParallelSubactions.sysml",
+      "sha256": "81ee3a495d01b22250aca1ccddb994c214dfd3375bb707297b108b6d1889b72f"
+    },
+    {
+      "file": "probes/validateStateDefinitionSubactionKind.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateStateDefinitionSubactionKind.sysml",
+      "sha256": "2739286ed5bbf3eead651d3f9fd52ba198f5e190edc24b88983755967e99aa00"
+    },
+    {
+      "file": "probes/validateStateSubactionMembershioOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateStateSubactionMembershioOwningType.sysml",
+      "sha256": "37631cb4594507e02c948440505cb382aae84b1d3dd886160af490e7ff138be1"
+    },
+    {
+      "file": "probes/validateStateUsageParallelSubactions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateStateUsageParallelSubactions.sysml",
+      "sha256": "581f3251380febbcd7d1634af8e6c3bbabc252b695e23d8d11e06d214be49f0f"
+    },
+    {
+      "file": "probes/validateStateUsageSubactionKind.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateStateUsageSubactionKind.sysml",
+      "sha256": "1f12d812e156330fe462d013e37c53624e63ff4a5d6ff960212dc8ad99e863c6"
+    },
+    {
+      "file": "probes/validateStateUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateStateUsageType.sysml",
+      "sha256": "d662bc3f00cb585d3288b5da5b7fb712cd9c1ca5b6a0ea2e1d181aa6df8c5687"
+    },
+    {
+      "file": "probes/validateStructureSpecialization.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateStructureSpecialization.kerml",
+      "sha256": "d43386ae380bf2b22adc1a5c398d435e129ba61f162fa49f530bc2d523333fba"
+    },
+    {
+      "file": "probes/validateSubjectMembershipOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateSubjectMembershipOwningType.sysml",
+      "sha256": "7e75b74f38b38a1a9af45971c4ca5726743eedf7066c824d4d0e0a422cd54340"
+    },
+    {
+      "file": "probes/validateSubsettingConstantConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateSubsettingConstantConformance.kerml",
+      "sha256": "9f6a302d78458f79e0e304ae612e279eb4ffe2383fe0d7a6ca5c67a8c217cb97"
+    },
+    {
+      "file": "probes/validateSubsettingFeaturingTypes.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateSubsettingFeaturingTypes.kerml",
+      "sha256": "5411309d79c16eb3cd53f88524159b3ecf44a4d52b7271c9ec961b2afba22fb8"
+    },
+    {
+      "file": "probes/validateSubsettingMultiplicityConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateSubsettingMultiplicityConformance.kerml",
+      "sha256": "ea9abe0cfb7da633ec8b4afa4bda593c4d7aff59ed579c2c77a66b441f139c1c"
+    },
+    {
+      "file": "probes/validateSubsettingUniquenessConformance.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateSubsettingUniquenessConformance.kerml",
+      "sha256": "b9dd0faefdd9426eb243fc66bf3ce542b6cde9dc2310073c67c73f8f0f7a6e1a"
+    },
+    {
+      "file": "probes/validateTransitionFeatureMembershipGuardExpression.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateTransitionFeatureMembershipGuardExpression.sysml",
+      "sha256": "870b3420d8a351bf2e6b993893d1c7a8bff72bb5411026b8b83784d23ff71ab1"
+    },
+    {
+      "file": "probes/validateTransitionUsageSuccession.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateTransitionUsageSuccession.sysml",
+      "sha256": "da5fd2b3de787fe1d7eb9b0fc1ed9e2c4f69b0a94fb02af5cd4e67eca8c15d9c"
+    },
+    {
+      "file": "probes/validateTransitionUsageTriggerActions.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateTransitionUsageTriggerActions.sysml",
+      "sha256": "db81b4c8573885822c6a8a5ddfc20a745b3a8298b03f2620edab2774f821f95b"
+    },
+    {
+      "file": "probes/validateTriggerInvocationActionAfterArgument.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateTriggerInvocationActionAfterArgument.sysml",
+      "sha256": "b7e84977c6ec72bc3db924e50aeb93879d17cea33e7423a2756295aba004554b"
+    },
+    {
+      "file": "probes/validateTriggerInvocationActionAtArgument.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateTriggerInvocationActionAtArgument.sysml",
+      "sha256": "634bdbb68310e46d9ba7e1785336086c4dcf8086b84726917452cae871ee63d3"
+    },
+    {
+      "file": "probes/validateTriggerInvocationActionWhenArgument.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateTriggerInvocationActionWhenArgument.sysml",
+      "sha256": "36e5e4c341188c09c0b39b1a701b6603cdfa048c150cb750bce61bb8726c0a5b"
+    },
+    {
+      "file": "probes/validateTypeAtMostOneConjugator.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateTypeAtMostOneConjugator.kerml",
+      "sha256": "6477e6e99b1bd52aea5ea84f21afdd33be889b861e630927903e049074ba7e5f"
+    },
+    {
+      "file": "probes/validateTypeDifferencingTypesNotSelf.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateTypeDifferencingTypesNotSelf.kerml",
+      "sha256": "d3882b1ca32cdf6e2c7c6b6d64f697aa6c43710180f2d56fa67adec4d9e35049"
+    },
+    {
+      "file": "probes/validateTypeIntersectingTypesNotSelf.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateTypeIntersectingTypesNotSelf.kerml",
+      "sha256": "8ccd6d3fe3ae9bc3a7fbabced0d721f33fa866437bd45c77e2e4c1f63a94fa9b"
+    },
+    {
+      "file": "probes/validateTypeOwnedMultiplicity.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateTypeOwnedMultiplicity.kerml",
+      "sha256": "c02eeda3e1e98cc9bd3fb6d1246682161e132c027364476216ca09d6212cfc60"
+    },
+    {
+      "file": "probes/validateTypeUnioningTypesNotSelf.kerml",
+      "source": "cmd/validation-census/testdata/probes/validateTypeUnioningTypesNotSelf.kerml",
+      "sha256": "3566435d089e1b84b4945a78c4dadcf96fc0fa9a968d6637e09d8aa60483a746"
+    },
+    {
+      "file": "probes/validateUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateUsageType.sysml",
+      "sha256": "7e9c886f7f8afb1c136d39711ca0b434f5901a5b7f45eacf986d5758a0266642"
+    },
+    {
+      "file": "probes/validateUsageVariationMembership.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateUsageVariationMembership.sysml",
+      "sha256": "1eb5637966fe3aec0ab07172a4b13f6c69d0e05d5283b619984e8c2f069d892d"
+    },
+    {
+      "file": "probes/validateUsageVariationSpecialization.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateUsageVariationSpecialization.sysml",
+      "sha256": "90b720a8bfdc1a9870e24ef77ee9482fb19e466e32dc120b9d1f62f8a6084c83"
+    },
+    {
+      "file": "probes/validateUseCaseUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateUseCaseUsageType.sysml",
+      "sha256": "877e5ad9b819ce6bc10723cdf020855e79ef8baffef27f1843333f6dab877ca5"
+    },
+    {
+      "file": "probes/validateVariationMembershipOwningNamespace.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateVariationMembershipOwningNamespace.sysml",
+      "sha256": "1a3b889691464152d760018635738a58d552271072e228df953f8f10f1922eb0"
+    },
+    {
+      "file": "probes/validateVerificationCaseUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateVerificationCaseUsageType.sysml",
+      "sha256": "a77c84a98e38705e1c87759ea58ccc4ffe588d535e9a5c826065ccc8f2dd3cc3"
+    },
+    {
+      "file": "probes/validateViewDefinitionOnlyOnvViewRendering.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateViewDefinitionOnlyOnvViewRendering.sysml",
+      "sha256": "77fa40ace821bb4d04ecd9e4396f8cf1abbab30f9cee7a24a6c7b8c22a4003d9"
+    },
+    {
+      "file": "probes/validateViewRenderingMembershipOwningType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateViewRenderingMembershipOwningType.sysml",
+      "sha256": "11db4d502cd7889202619ec9fead0b6c0df153d5798feb175d0ae108ec2c3f49"
+    },
+    {
+      "file": "probes/validateViewUsageOnlyOneRendering.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateViewUsageOnlyOneRendering.sysml",
+      "sha256": "1ab8920c49acc25a190d6ca61f4d3f40df6a9b02bbd4b3abbbedd006b407d4b6"
+    },
+    {
+      "file": "probes/validateViewUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateViewUsageType.sysml",
+      "sha256": "d129f904b04d4d16005c99bbdf454dd9788b77ea48949ca5d751b592a8708fa0"
+    },
+    {
+      "file": "probes/validateViewpointUsageType.sysml",
+      "source": "cmd/validation-census/testdata/probes/validateViewpointUsageType.sysml",
+      "sha256": "1bdeeafcc4e15e351ce1df41f00ed1a88adde9a308d3534bf93d3f6b7d2b580a"
+    },
+    {
+      "file": "negative/extensions/x01-initial-state-marker.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x01-initial-state-marker.sysml",
+      "sha256": "9fdcda5181cd7d60d625583b1a330b07e35235da32bb135ce7931f7971492b36"
+    },
+    {
+      "file": "negative/extensions/x02-choice-pseudostate.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x02-choice-pseudostate.sysml",
+      "sha256": "99ed9604dcde4cb9de6e170bfaa353b649aea3341bb92d07c50cbe47e2c991a4"
+    },
+    {
+      "file": "negative/extensions/x03-junction-pseudostate.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x03-junction-pseudostate.sysml",
+      "sha256": "5787354b30ce9c3a5e46ea28c5aacc24a80f81a1ee202775511da7c0e20c7aae"
+    },
+    {
+      "file": "negative/extensions/x04-orthogonal-region.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x04-orthogonal-region.sysml",
+      "sha256": "5241496b97b24675a8d241ed92cb206110a18a77b3f5cfdddf190f0c2b14aee5"
+    },
+    {
+      "file": "negative/extensions/x05-defer-member.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x05-defer-member.sysml",
+      "sha256": "e7474e4f3452a940de6bd0fc281b0b8547499df6d2d2cd2698f558f03f4c96b0"
+    },
+    {
+      "file": "negative/extensions/x06-history-member.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x06-history-member.sysml",
+      "sha256": "2b862b37235827c6ac118748d17f08f06fdf25fe40f8f19e6f692cae35551e08"
+    },
+    {
+      "file": "negative/extensions/x07-transition-to.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x07-transition-to.sysml",
+      "sha256": "ee2e8119809006b35d1c9f8867d1f0f9eb27e2476ac454bb8e04d41b683eede5"
+    },
+    {
+      "file": "negative/extensions/x08-require-outside-requirement-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/extensions/x08-require-outside-requirement-body.sysml",
+      "sha256": "b06b6da37acb3d8ef1bfda92b018373ca3eae40482d6f4ea84c85fc13bf8720d"
+    },
+    {
+      "file": "negative/grammar/g01-unclosed-package-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g01-unclosed-package-body.sysml",
+      "sha256": "29e610fb4b7a1d8fcb920fece50ad0240179ae6feb83f49ad8dc11d486925780"
+    },
+    {
+      "file": "negative/grammar/g02-import-without-visibility.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g02-import-without-visibility.sysml",
+      "sha256": "99f280ad2a5400e712c15f23ad2cb39e7b80f621c23067263f3b531e83f7e3fe"
+    },
+    {
+      "file": "negative/grammar/g03-alias-without-for.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g03-alias-without-for.sysml",
+      "sha256": "0ae5de6d154d4649170fc7ee1b0418bbb4b2e2ef376834cecaf532c71bf9939f"
+    },
+    {
+      "file": "negative/grammar/g04-specialization-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g04-specialization-without-target.sysml",
+      "sha256": "00849ca582e1002450bd149a6152ee4646d157399456ec36d006110e8731d5de"
+    },
+    {
+      "file": "negative/grammar/g05-typing-without-type.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g05-typing-without-type.sysml",
+      "sha256": "41f0edb51693626644dd6bb50e8b77368720cdffe98351af5941c659797e103b"
+    },
+    {
+      "file": "negative/grammar/g06-definition-with-multiplicity.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g06-definition-with-multiplicity.sysml",
+      "sha256": "ad6ded34c13d1057509c1bfa6929789672488b067517dc63279e7742fbc29615"
+    },
+    {
+      "file": "negative/grammar/g07-entry-outside-state-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g07-entry-outside-state-body.sysml",
+      "sha256": "aca89701f7d0bf8b1c4e1393c0718e745905ffefcf943f37072be50c57544981"
+    },
+    {
+      "file": "negative/grammar/g08-do-outside-state-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g08-do-outside-state-body.sysml",
+      "sha256": "196c55ad9b9215f43f06419cd09ae61d0b7196a5c72d5f85df0ef42ab3791f12"
+    },
+    {
+      "file": "negative/grammar/g09-value-without-expression.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g09-value-without-expression.sysml",
+      "sha256": "22d04a7b64c52612e692e36d0e53ab434b36640af885170fa6d2896d956d7f99"
+    },
+    {
+      "file": "negative/grammar/g10-operator-without-operand.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g10-operator-without-operand.sysml",
+      "sha256": "a35935f1754b4a7288cff01b449f036a3a3a8637f54ff3956d855ffb4f32e684"
+    },
+    {
+      "file": "negative/grammar/g11-assignment-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g11-assignment-without-target.sysml",
+      "sha256": "9863ae635c0f6ce302c37218eb701c606f9700a28a4e89a134a237727f3632cd"
+    },
+    {
+      "file": "negative/grammar/g12-unterminated-block-comment.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g12-unterminated-block-comment.sysml",
+      "sha256": "3d4a6082253432ae25a69eaf805931cab9c433d1753aee41e9a9b2b22c68b3db"
+    },
+    {
+      "file": "negative/grammar/g13-entry-then-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g13-entry-then-without-target.sysml",
+      "sha256": "eff848678317dec67c61ba4ece1a5a5a0865b9b6e7f36a5055210d02d94b19c1"
+    },
+    {
+      "file": "negative/grammar/g14-connect-without-to.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g14-connect-without-to.sysml",
+      "sha256": "8b2b3f4b3d795fca4a44c38f8f7f505e01fbedd4fe79c0dd3dc2c8a89b092f18"
+    },
+    {
+      "file": "negative/grammar/g15-keyword-as-name.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g15-keyword-as-name.sysml",
+      "sha256": "48e39677639799c68e11df4ed10e7dda738fc56643c28ef23316a1f0a21f2c88"
+    },
+    {
+      "file": "negative/grammar/g16-expose-without-name.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g16-expose-without-name.sysml",
+      "sha256": "1a7a747807d55b8ffb0d4a6306efcf596481a6803b1dcde09516d9bbb1d68c23"
+    },
+    {
+      "file": "negative/grammar/g17-render-without-usage.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g17-render-without-usage.sysml",
+      "sha256": "4687e0593e74b5ea92f5affed0492fa0b1da3ac09430b2d8d3eadf944003ac82"
+    },
+    {
+      "file": "negative/grammar/g18-require-without-constraint.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g18-require-without-constraint.sysml",
+      "sha256": "5a7e9c76165c27e67c1af21d0eb0d48807855ad467e2b1e9bfe2655f7d7d595b"
+    },
+    {
+      "file": "negative/grammar/g19-frame-without-concern.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g19-frame-without-concern.sysml",
+      "sha256": "ea856658f5a71081a9e95a78903be10c6126d28d2a4b69e3207c090952250fdb"
+    },
+    {
+      "file": "negative/grammar/g20-include-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g20-include-without-target.sysml",
+      "sha256": "c19fb8428db5d27be018232915ea22a877a3bdb9dcde4cfc1fa1f56becd27bd5"
+    },
+    {
+      "file": "negative/grammar/g21-filter-without-expression.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g21-filter-without-expression.sysml",
+      "sha256": "047292df090f92cd6920c391e2bcb693cb30b2a60dfbf3fc9d64d372738d1728"
+    },
+    {
+      "file": "negative/grammar/g22-dependency-without-to.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g22-dependency-without-to.sysml",
+      "sha256": "9d7ee1ac5be5c5ecda657d7101e7e9c14d2e10fcf02c1d8f36f35c99fe678292"
+    },
+    {
+      "file": "negative/grammar/g23-rep-without-language.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g23-rep-without-language.sysml",
+      "sha256": "5a9dc61e4f571ee18157af99cc2442fb73a1640c36a3035aa043991f7460256f"
+    },
+    {
+      "file": "negative/grammar/g24-alias-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g24-alias-without-target.sysml",
+      "sha256": "759481c235d24df2d00636a4f8d11c7538c243692b21308e50b00478cbe23a82"
+    },
+    {
+      "file": "negative/grammar/g25-library-without-package.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g25-library-without-package.sysml",
+      "sha256": "14b426dc72c7c38dc93af5b4f0c8b0d33283ed1d6b94a38174f65baceb52b3e0"
+    },
+    {
+      "file": "negative/grammar/g26-multiplicity-open-range.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g26-multiplicity-open-range.sysml",
+      "sha256": "e1ef71b5ad9862314e4f333df011ca39a904270cd70b355e573dbc10fd55ca17"
+    },
+    {
+      "file": "negative/grammar/g27-bind-without-right-end.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g27-bind-without-right-end.sysml",
+      "sha256": "15cb5485642ae67dff1f93c8ee686d8de9f92fd753d3c5e4f0056f8d8c9175c0"
+    },
+    {
+      "file": "negative/grammar/g28-succession-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g28-succession-without-target.sysml",
+      "sha256": "e8d65a2e559495365ec46ce52da3eb2cca5e681c841c5bb502e887ac850aff7a"
+    },
+    {
+      "file": "negative/grammar/g29-flow-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g29-flow-without-target.sysml",
+      "sha256": "c053631bb62cf4c3c4c80e42b100f6e2cd1207d45f2bbdcb128ec31f061697e0"
+    },
+    {
+      "file": "negative/grammar/g30-message-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g30-message-without-target.sysml",
+      "sha256": "e7bf3a910e1a3626fc9439b6adb25265f547c7b470f818a82a63205a10a4fe2a"
+    },
+    {
+      "file": "negative/grammar/g31-allocate-without-to.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g31-allocate-without-to.sysml",
+      "sha256": "2a3034bb47732b851ec0202e15bb7e9f352dc7719d720de884461bae0159e198"
+    },
+    {
+      "file": "negative/grammar/g32-if-without-condition.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g32-if-without-condition.sysml",
+      "sha256": "fa4ea9252b78f460b6e5918a475e2758fd745e5c8f74441f2f232aa96b3ed235"
+    },
+    {
+      "file": "negative/grammar/g33-while-without-condition.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g33-while-without-condition.sysml",
+      "sha256": "b433ae2f214ab7cf078765039c33ef7aab91c632ae800304735390f18bfde73b"
+    },
+    {
+      "file": "negative/grammar/g34-for-without-in.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g34-for-without-in.sysml",
+      "sha256": "49e3698e4622d1fdae6a2442c23ba2a29288e560ec9b928a47ea5bd81e3284e8"
+    },
+    {
+      "file": "negative/grammar/g35-accept-without-payload.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g35-accept-without-payload.sysml",
+      "sha256": "65a965c31a199d9f5e511e01222be9d006e2406f3edf88afd494bbe77aace964"
+    },
+    {
+      "file": "negative/grammar/g36-direction-without-feature.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g36-direction-without-feature.sysml",
+      "sha256": "7b2fd3ada5bb84ac4091aeff5f2f73c03afbd83946295f28e65603af6be6d807"
+    },
+    {
+      "file": "negative/grammar/g37-redefines-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g37-redefines-without-target.sysml",
+      "sha256": "88199ac2d6d14affc1c4be88d95ceb5a0e732ace93370c912b169d5ffc01d72a"
+    },
+    {
+      "file": "negative/grammar/g38-references-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g38-references-without-target.sysml",
+      "sha256": "f5e960ef106b38ff6481ca0ca9ded7e4fc4ced2f2f1429b173c16cf70f30bd00"
+    },
+    {
+      "file": "negative/grammar/g39-redefinition-symbol-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g39-redefinition-symbol-without-target.sysml",
+      "sha256": "26f2f253e2bab9fb37757e9fbc7a3db1e7fc7495844838c25af429277a3d665d"
+    },
+    {
+      "file": "negative/grammar/g40-modulo-without-operand.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g40-modulo-without-operand.sysml",
+      "sha256": "80c7343310d6d50d9dc6afd7c5a29becd864a0feeedb7954951b8edd3c338659"
+    },
+    {
+      "file": "negative/grammar/g41-exponent-without-operand.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g41-exponent-without-operand.sysml",
+      "sha256": "8167129cb4dc5fd36b59f9ef656c21b575fb4762f0a627a959836feba5f81eba"
+    },
+    {
+      "file": "negative/grammar/g42-implies-without-operand.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g42-implies-without-operand.sysml",
+      "sha256": "06213e580288dae4dab80ab41f88626476aef2f0f4f69c87b3665d2563b96b8c"
+    },
+    {
+      "file": "negative/grammar/g43-null-coalescing-without-operand.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g43-null-coalescing-without-operand.sysml",
+      "sha256": "60b86ced0c16eeaf2b092e7da2b518b68bcc64b9ffb57e3f0bbc86ac892bf58e"
+    },
+    {
+      "file": "negative/grammar/g44-conditional-without-else.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g44-conditional-without-else.sysml",
+      "sha256": "68a59545fb75a6cec40983041f7ba88ed11fd55bd003d48f46a9936a1b2da991"
+    },
+    {
+      "file": "negative/grammar/g45-classification-test-without-type.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g45-classification-test-without-type.sysml",
+      "sha256": "8291ebe1c06953f9800e3d35c0738e748470099db0835c4c198271c84e73c231"
+    },
+    {
+      "file": "negative/grammar/g46-cast-without-type.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g46-cast-without-type.sysml",
+      "sha256": "36d6a4a70364f392ecdfa1efe148a15110773b1bb3c8e2ac78dce3894f34bb7b"
+    },
+    {
+      "file": "negative/grammar/g47-prefix-metadata-without-name.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g47-prefix-metadata-without-name.sysml",
+      "sha256": "cd34d5b4c86eb2710fd27b0b4e0e8c81ffc43495d261f1f0f08770ead53cf6c8"
+    },
+    {
+      "file": "negative/grammar/g48-decision-without-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g48-decision-without-body.sysml",
+      "sha256": "5d06c79240ffdd903389050649505ff9d58f304ad0e2ba3c8c789e88b7ba9956"
+    },
+    {
+      "file": "negative/grammar/g49-assign-without-value.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g49-assign-without-value.sysml",
+      "sha256": "07ea44d4a4ac516f4a76a3c4986dfb8a4763b44b90b3881527d94b1bf2e96454"
+    },
+    {
+      "file": "negative/grammar/g50-conjugated-port-typing-without-name.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g50-conjugated-port-typing-without-name.sysml",
+      "sha256": "d765abe4a5f997681afcc3e9999b2c63df8db304e871ce8da425b568d2323202"
+    },
+    {
+      "file": "negative/grammar/g51-real-without-fraction.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g51-real-without-fraction.sysml",
+      "sha256": "b324e5c8a7f2baca9537606fba24dc8aedf502f800efaf454d7a63f32ab85e20"
+    },
+    {
+      "file": "negative/grammar/g52-unterminated-string.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g52-unterminated-string.sysml",
+      "sha256": "0926be620124fac18f532662abca2512189daa723b7d19304fd801b06d3a4a02"
+    },
+    {
+      "file": "negative/grammar/g53-range-without-upper-bound.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g53-range-without-upper-bound.sysml",
+      "sha256": "1f6775a623a6f8026e68403b7b59e29920e20dce465ca7b1dfeb9bf358c0fbad"
+    },
+    {
+      "file": "negative/grammar/g54-argument-list-trailing-comma.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g54-argument-list-trailing-comma.sysml",
+      "sha256": "8f923c83328c775e8ea83adde39a8af5368c9634a94b0ad8112a3a291950b52a"
+    },
+    {
+      "file": "negative/grammar/g55-feature-chain-trailing-dot.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g55-feature-chain-trailing-dot.sysml",
+      "sha256": "c40fa6f83e5101b94adf36979cd5830cf11d2320260c85c148c0689da369888c"
+    },
+    {
+      "file": "negative/grammar/g56-qualified-name-trailing-separator.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g56-qualified-name-trailing-separator.sysml",
+      "sha256": "0509791486e519d63c78e09862fa091350caa0abb6d8d9a984bc0b13483c4710"
+    },
+    {
+      "file": "negative/grammar/g57-unterminated-unrestricted-name.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g57-unterminated-unrestricted-name.sysml",
+      "sha256": "64dfb8213b791ddd8ed119d3c75d73175aff6b7bf6f49b5ea9f5de497605bd50"
+    },
+    {
+      "file": "negative/grammar/g58-satisfy-without-reference.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g58-satisfy-without-reference.sysml",
+      "sha256": "c7268c0c71ad1598b72783f6c9c6f6f8dbf9fea59df0e2b4b45ea3287038f43f"
+    },
+    {
+      "file": "negative/grammar/g59-crosses-without-target.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g59-crosses-without-target.sysml",
+      "sha256": "361e43ba484f9a98d454adbb07957d3c17fa6c1ac50fb7919089627c3b55b850"
+    },
+    {
+      "file": "negative/grammar/g60-alias-keyword-as-name.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g60-alias-keyword-as-name.sysml",
+      "sha256": "8db240618e52a2cc16d0fe41a916bff60b9d220d684d700731aa5091243b3263"
+    },
+    {
+      "file": "negative/grammar/g61-actor-outside-requirement-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g61-actor-outside-requirement-body.sysml",
+      "sha256": "1c42449cd7b05e698067eca7910f3b4bdb9e589a9710dfa764bbb4892a2fecc0"
+    },
+    {
+      "file": "negative/grammar/g62-subject-outside-requirement-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g62-subject-outside-requirement-body.sysml",
+      "sha256": "35f24e44c29ea1143fd51f8c9394e9b56ac001527d15cb8afdac8248cfc5c3c9"
+    },
+    {
+      "file": "negative/grammar/g63-objective-outside-case-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g63-objective-outside-case-body.sysml",
+      "sha256": "a196a3fc2ab8e588f671b7f0dc448e5bc76ceed481a192ff072ce68783a61013"
+    },
+    {
+      "file": "negative/grammar/g64-stakeholder-outside-requirement-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g64-stakeholder-outside-requirement-body.sysml",
+      "sha256": "4775c69e0ea3c9bdbd8f82097374a6cab51d14e2af48d5a04d2b0efed35ed89c"
+    },
+    {
+      "file": "negative/grammar/g65-entry-action-outside-state-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g65-entry-action-outside-state-body.sysml",
+      "sha256": "d1c9f25edf4efbe6ecc2ce0848991be50fbae87e8897c21f8728f77caf5cad95"
+    },
+    {
+      "file": "negative/grammar/g66-render-outside-view-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g66-render-outside-view-body.sysml",
+      "sha256": "dc5386e5fe6b0a4118598b52a5765f94b57494316d5be01e318e61ec7f2f2f22"
+    },
+    {
+      "file": "negative/grammar/g67-expose-outside-view-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g67-expose-outside-view-body.sysml",
+      "sha256": "4eb409449b79b59fab52470c295ee456f24851c90030a35182ea47d50e63e8eb"
+    },
+    {
+      "file": "negative/grammar/g68-definition-in-enumeration-body.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g68-definition-in-enumeration-body.sysml",
+      "sha256": "afd9f10288bf23dfb707112a807e2e9d64934f597440ebea5299795487c2b9a0"
+    },
+    {
+      "file": "negative/grammar/g69-calc-body-second-result-expression.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g69-calc-body-second-result-expression.sysml",
+      "sha256": "aca3b18747cb40da97116dc64eef61061315768e6e73853dc84fb012eeeb9d51"
+    },
+    {
+      "file": "negative/grammar/g70-name-before-usage-keyword.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/g70-name-before-usage-keyword.sysml",
+      "sha256": "a15cc4d1114b09848b825ea571107eec291cf8e62ded847c123a93fa22619d42"
+    },
+    {
+      "file": "negative/grammar/k01-specializes-without-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k01-specializes-without-target.kerml",
+      "sha256": "ed903802776cb5c4c6ec5e1a7d9549ce0db2b76cf50007c7c2418198cc31322c"
+    },
+    {
+      "file": "negative/grammar/k02-sysml-keyword-in-kerml.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k02-sysml-keyword-in-kerml.kerml",
+      "sha256": "6e3e07394e7072566bdcb4a2690e811233448510804b9400acc23c6206e7167e"
+    },
+    {
+      "file": "negative/grammar/k03-feature-typing-without-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k03-feature-typing-without-type.kerml",
+      "sha256": "4c28a45160657593a73702996c6a1752af99b697d3b50d6b738b1770799ff3b3"
+    },
+    {
+      "file": "negative/grammar/k04-dangling-visibility.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k04-dangling-visibility.kerml",
+      "sha256": "925be73673580e29c14d08faa84eba78fdb2976bf59a8e84dd9f502f1d933680"
+    },
+    {
+      "file": "negative/grammar/k05-unclosed-body.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k05-unclosed-body.kerml",
+      "sha256": "cb88ba94fa11a8efa56db011779fc596e4a13d49d06cdb5d39897f4f3d0aa3d6"
+    },
+    {
+      "file": "negative/grammar/k06-disjoining-without-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k06-disjoining-without-target.kerml",
+      "sha256": "d7931451a77a2ad642f0d9e7abfcb31e8546dcb3b23ed210229ac540aeb1fee7"
+    },
+    {
+      "file": "negative/grammar/k07-conjugation-without-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k07-conjugation-without-target.kerml",
+      "sha256": "5dcf32bf3413b07f7c897b74caf845e97e6de7421b5375d01e93c8408a0ab2b5"
+    },
+    {
+      "file": "negative/grammar/k08-return-without-feature.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k08-return-without-feature.kerml",
+      "sha256": "cd95e6c72bb95f9a1d111ba6b6423f083f6e2aa7aed30c97e629f8241e2846f8"
+    },
+    {
+      "file": "negative/grammar/k09-inverting-without-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k09-inverting-without-target.kerml",
+      "sha256": "f1a9a8b60de379be054b7c23acee4c27023e346e072e8c64a9778488eca21456"
+    },
+    {
+      "file": "negative/grammar/k10-featuring-without-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k10-featuring-without-type.kerml",
+      "sha256": "95c665b40ae04f10e78493ea15ec1566ae49e731a45768f76cada3ec0b69f00d"
+    },
+    {
+      "file": "negative/grammar/k11-namespace-prefix-metadata-without-name.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k11-namespace-prefix-metadata-without-name.kerml",
+      "sha256": "3285458fe9bff9ee04b7f9122938387900e023478d8a283dd8ca092ef113c487"
+    },
+    {
+      "file": "negative/grammar/k12-multiplicity-subset-without-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k12-multiplicity-subset-without-target.kerml",
+      "sha256": "2126506441b42eb776515141057daa241b307a5cb4701560121cda1ac4c7b2af"
+    },
+    {
+      "file": "negative/grammar/k13-step-without-declaration.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k13-step-without-declaration.kerml",
+      "sha256": "90a88278141dc7d7400f2e3bd0a90b17a5f4cca79f7129fbb70901fd277fd86a"
+    },
+    {
+      "file": "negative/grammar/k14-flow-without-payload-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k14-flow-without-payload-target.kerml",
+      "sha256": "13b9abb311113369bf865552052e7c3d2f2155a79e140fd589dd482c4c1c2233"
+    },
+    {
+      "file": "negative/grammar/k15-conjugation-without-original.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k15-conjugation-without-original.kerml",
+      "sha256": "7ab2bae5ef43801c53220ce58b57e09873304048bbe3c7bd4734b5a539820291"
+    },
+    {
+      "file": "negative/grammar/k16-redefinition-without-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k16-redefinition-without-target.kerml",
+      "sha256": "e311e90db2cc363fa83f3c4ee0b8548fd34e88d57612aa1831206d5b619ccae0"
+    },
+    {
+      "file": "negative/grammar/k17-unions-without-target.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k17-unions-without-target.kerml",
+      "sha256": "9565530613351eb7feeee9b841f403c98078adca227409a33f55118e355cf037"
+    },
+    {
+      "file": "negative/grammar/k18-connector-end-without-reference.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k18-connector-end-without-reference.kerml",
+      "sha256": "aa28d786a86ec9d09a37cf595bc035df2050e87fe4fd5d32ef582c6b078e4398"
+    },
+    {
+      "file": "negative/grammar/k19-metadata-typing-without-name.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k19-metadata-typing-without-name.kerml",
+      "sha256": "560d8584e831b3914b05c911488e25fb2c7598261119e1b761f43fe9f4dc335f"
+    },
+    {
+      "file": "negative/grammar/k20-function-body-second-result-expression.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k20-function-body-second-result-expression.kerml",
+      "sha256": "e651aba59455a0eb3430903faabf29ed412547c9a8e76d1b8ee40210340cd0e8"
+    },
+    {
+      "file": "negative/grammar/k21-name-before-feature-keyword.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/grammar/k21-name-before-feature-keyword.kerml",
+      "sha256": "abc05115810a2f21efd47d53a62828cc47366d8eaec9f0c543cd9e28c7944728"
+    },
+    {
+      "file": "negative/semantic/cn01-fork-two-incoming.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn01-fork-two-incoming.sysml",
+      "sha256": "76e16924a6936d1c80337427b08c99c7d99b60a05b721c6c00434b985d6d49c9"
+    },
+    {
+      "file": "negative/semantic/cn02-join-two-outgoing.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn02-join-two-outgoing.sysml",
+      "sha256": "43a66e5421da4d77230ed4a1f6e502b0d43348dc1bc0ddff5e656b9af56212ca"
+    },
+    {
+      "file": "negative/semantic/cn03-merge-two-outgoing.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn03-merge-two-outgoing.sysml",
+      "sha256": "3069888ca47ec4b79ec292f63c6313118964963592eb60bbaf9e4580f54f2883"
+    },
+    {
+      "file": "negative/semantic/cn04-decide-two-incoming.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn04-decide-two-incoming.sysml",
+      "sha256": "b499ace0fc465240c743228e27bc3005a6a6fcc521cad99f1fafe52decc290e5"
+    },
+    {
+      "file": "negative/semantic/cn05-control-node-outside-action.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn05-control-node-outside-action.sysml",
+      "sha256": "f77ae21b177dea2353f90cfcb4642f8fdc71182ae44e1f7b90ca9d410e3ac825"
+    },
+    {
+      "file": "negative/semantic/cn06-fork-incoming-target-multiplicity.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn06-fork-incoming-target-multiplicity.sysml",
+      "sha256": "5ef2a4724da7a15f3658257565a055c8ab9d10bf0a4c5f6171e2612801969ac9"
+    },
+    {
+      "file": "negative/semantic/cn07-join-outgoing-source-multiplicity.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn07-join-outgoing-source-multiplicity.sysml",
+      "sha256": "6aeba7b1afaa07b8bac701a094d5639bfa802800aea2a51ca5ab1abc56f9819e"
+    },
+    {
+      "file": "negative/semantic/cn08-merge-incoming-source-multiplicity.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn08-merge-incoming-source-multiplicity.sysml",
+      "sha256": "ed788f8727db7984a985d0c064995a57caf44def7e1027b06650b615e45267d0"
+    },
+    {
+      "file": "negative/semantic/cn09-decide-outgoing-target-multiplicity.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/cn09-decide-outgoing-target-multiplicity.sysml",
+      "sha256": "8f83715c9834b416384a13adaaa5652f0cb29b9443512e6ff1b62333b82e84bf"
+    },
+    {
+      "file": "negative/semantic/k01-two-owned-multiplicities.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k01-two-owned-multiplicities.kerml",
+      "sha256": "a1caa8e03eeb77976b4ea6288b40140c4e568fd2dbc565e8820cce913ce282d1"
+    },
+    {
+      "file": "negative/semantic/k02-differences-one-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k02-differences-one-type.kerml",
+      "sha256": "7dabcdc58d53e7763218b1d7e1874790270635a990bfc16dc61f3eef112e953c"
+    },
+    {
+      "file": "negative/semantic/k03-intersects-one-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k03-intersects-one-type.kerml",
+      "sha256": "0fd49239c2e0388c4f0808c95582dc0dc417b192e003d2ae50b51f4031ba6387"
+    },
+    {
+      "file": "negative/semantic/k04-unions-one-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k04-unions-one-type.kerml",
+      "sha256": "212c46b41592f359537f13baa47272e4b4d85dcecc3fa27be61e9798b29e51f7"
+    },
+    {
+      "file": "negative/semantic/k05-differences-self.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k05-differences-self.kerml",
+      "sha256": "19805e65d041f7fa88dffe01f20625c981e740f0f59d6442e6bb9df674f8b35b"
+    },
+    {
+      "file": "negative/semantic/k06-intersects-self.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k06-intersects-self.kerml",
+      "sha256": "b1576e75edffc043c09e8c5bbdddddf03ba1ed4e4cbda7b610ae684de5f56cd7"
+    },
+    {
+      "file": "negative/semantic/k07-unions-self.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k07-unions-self.kerml",
+      "sha256": "01a1ce0e92b6f72ecfa5efa7829868f017cfc20ac903c2e1f59ae110c5ffd22d"
+    },
+    {
+      "file": "negative/semantic/k08-conjugated-type-specialized.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k08-conjugated-type-specialized.kerml",
+      "sha256": "fa73d468253bfac5d63dd51e8572ba6a53f25262fe819e53c478c8744db6b2fb"
+    },
+    {
+      "file": "negative/semantic/k09-two-reference-subsettings.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k09-two-reference-subsettings.kerml",
+      "sha256": "9615791ae3c075a08aabde44df456b2fdbd646d3a975c6e8a976647a747929c2"
+    },
+    {
+      "file": "negative/semantic/k10-portion-var-feature.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k10-portion-var-feature.kerml",
+      "sha256": "6406d5bc818bd8e57cbb3955982c400a9585972ea238a2dfffe2756e0089aa89"
+    },
+    {
+      "file": "negative/semantic/k11-initial-value-nonvariable.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k11-initial-value-nonvariable.kerml",
+      "sha256": "399afe2787ad957dc68652cc363ab49638e27c5aa2b527c49b2c131869014e0c"
+    },
+    {
+      "file": "negative/semantic/k12-chain-through-self.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k12-chain-through-self.kerml",
+      "sha256": "3147f066f5014f66ddd2f6544d93e60e72264247ae5e2ee110bb3e91b4e9ae34"
+    },
+    {
+      "file": "negative/semantic/k13-subsets-inaccessible-feature.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k13-subsets-inaccessible-feature.kerml",
+      "sha256": "dee344fe3ccfd0854da1e6b5c56fb64f0f5743a90943b61fb1f11aad6ff62285"
+    },
+    {
+      "file": "negative/semantic/k14-variable-subsets-constant.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k14-variable-subsets-constant.kerml",
+      "sha256": "311b0f61fc215a905da83a81904f8a01caac35e646eefdf299c5c656b3e4ec82"
+    },
+    {
+      "file": "negative/semantic/k15-nonend-redefines-end.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k15-nonend-redefines-end.kerml",
+      "sha256": "5908d88ededabbd39e210756a41c31382fb5e0310b2b8814c2eaecf73ca017ff"
+    },
+    {
+      "file": "negative/semantic/k16-crosses-from-nonend.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k16-crosses-from-nonend.kerml",
+      "sha256": "8eea7c786cdfdb88fe0e0919f188adde625026c4d0d64d7df08fa8d85852b45b"
+    },
+    {
+      "file": "negative/semantic/k17-crosses-not-through-opposite-end.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k17-crosses-not-through-opposite-end.kerml",
+      "sha256": "e452d8f9a1e9f9c670f15aa7374e924b86bcd962e8ee3d5c3298a5bc62d6b4df"
+    },
+    {
+      "file": "negative/semantic/k18-cross-feature-type-differs.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k18-cross-feature-type-differs.kerml",
+      "sha256": "80a1cecadd92177a461e10b6c09226f6f6d4c62f6d71f0f264342381d44bf195"
+    },
+    {
+      "file": "negative/semantic/k19-cross-feature-not-specializing.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k19-cross-feature-not-specializing.kerml",
+      "sha256": "7d403f9e8a599fb4ce896fd89891578763e78920b9742fe02145685cd61ebba0"
+    },
+    {
+      "file": "negative/semantic/k20-datatype-specializes-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k20-datatype-specializes-class.kerml",
+      "sha256": "5a5502e43ec98ca6bbeed34259bf418bafde1b6d7b396a815feba6c495139070"
+    },
+    {
+      "file": "negative/semantic/k21-class-specializes-datatype.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k21-class-specializes-datatype.kerml",
+      "sha256": "a1f0574d04a203bc019a56b466d106038fae786ad356faeb24ecd25f1172c96f"
+    },
+    {
+      "file": "negative/semantic/k22-struct-specializes-behavior.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k22-struct-specializes-behavior.kerml",
+      "sha256": "b6300b859bd6f3a338c3b31d227ff3aa501391913cec7eca101c713baee6bf28"
+    },
+    {
+      "file": "negative/semantic/k23-behavior-specializes-struct.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k23-behavior-specializes-struct.kerml",
+      "sha256": "ceff30950aaacbd79240a90d5913043335fcc16886f433f57b10c498fab4bf1d"
+    },
+    {
+      "file": "negative/semantic/k24-binary-assoc-three-ends.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k24-binary-assoc-three-ends.kerml",
+      "sha256": "ab3f838f4abbde1fd3c9e5ec72148096da872571a226f4e01cb42f077e61e856"
+    },
+    {
+      "file": "negative/semantic/k25-assoc-one-end.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k25-assoc-one-end.kerml",
+      "sha256": "58bf540494e59c661beed5e164720c026ddc199f00fa77554ebceea242b8fd29"
+    },
+    {
+      "file": "negative/semantic/k26-binary-connector-three-ends.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k26-binary-connector-three-ends.kerml",
+      "sha256": "7a87d21071e6843a2f70c0d3d7ebacba8aedc2ad0c0bf006c3ca1d437dbd454a"
+    },
+    {
+      "file": "negative/semantic/k27-connector-feature-outside-featuring-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k27-connector-feature-outside-featuring-type.kerml",
+      "sha256": "581607ad4927b403a5690c39582a0df42a2c6b28f97b4d01a169d0395e72ee11"
+    },
+    {
+      "file": "negative/semantic/k28-expr-two-return-parameters.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k28-expr-two-return-parameters.kerml",
+      "sha256": "c01e82b4d205dc616ed751e81f8d009700f7ca0e3717240551decb18bbb09215"
+    },
+    {
+      "file": "negative/semantic/k29-function-inherits-second-result-expression.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k29-function-inherits-second-result-expression.kerml",
+      "sha256": "e6bee7a213186f2ab8b68fc4c305ddfad9a44282271a08156ea790c859134e84"
+    },
+    {
+      "file": "negative/semantic/k30-expr-inherits-second-result-expression.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k30-expr-inherits-second-result-expression.kerml",
+      "sha256": "9acfeb4171aaec01de9c7265889cd10f779c104d901382dd8531def89841c5ab"
+    },
+    {
+      "file": "negative/semantic/k31-invoke-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k31-invoke-class.kerml",
+      "sha256": "4e5b8cec2f5fb1323fbd9d282a6e64405353b83798e71fc7f19ae201384fbeb6"
+    },
+    {
+      "file": "negative/semantic/k32-too-many-arguments.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k32-too-many-arguments.kerml",
+      "sha256": "2c6b4c23c5e1af8e1e7599e74df5c5c7e31ccb24fe219fa46f13327f28ba3dd7"
+    },
+    {
+      "file": "negative/semantic/k33-parameter-bound-twice.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k33-parameter-bound-twice.kerml",
+      "sha256": "42730a2aa7176058b863ed0ff447be4625764a8800b29cb3c9aac0d18e232f92"
+    },
+    {
+      "file": "negative/semantic/k34-constructor-feature-bound-twice.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k34-constructor-feature-bound-twice.kerml",
+      "sha256": "61093cf88f78fc5f7759e4ce61a34e9edb804601ca7920dae5a27c6f438834d8"
+    },
+    {
+      "file": "negative/semantic/k35-metadata-annotates-wrong-kind.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k35-metadata-annotates-wrong-kind.kerml",
+      "sha256": "39dd6961615fffa4b638218bb77cdd730fa3ab11da2a6b5f415262adc0070180"
+    },
+    {
+      "file": "negative/semantic/k36-metadata-body-redefines-outside.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k36-metadata-body-redefines-outside.kerml",
+      "sha256": "f58244e170b7bc3ea5edcde7919111b952c8c7a2368443399ea96a4dfe9b4161"
+    },
+    {
+      "file": "negative/semantic/k37-multiplicity-bound-not-natural.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k37-multiplicity-bound-not-natural.kerml",
+      "sha256": "bf1c0bf6fc7bc9f7366a795a3b8a670f835adc6b7032fa35ae0d001bc2427a23"
+    },
+    {
+      "file": "negative/semantic/k38-flow-end-without-dot-notation.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k38-flow-end-without-dot-notation.kerml",
+      "sha256": "d92bf6a79b8ad4d17582c2026e30b761e56b50c84177746802bea7524fc67b1a"
+    },
+    {
+      "file": "negative/semantic/k39-feature-reference-to-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k39-feature-reference-to-class.kerml",
+      "sha256": "317ee153fe71f3d4476d1eb18c3ab6cebf75fbaa6a06f1d0715164a7ae462555"
+    },
+    {
+      "file": "negative/semantic/k40-metadata-typed-by-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k40-metadata-typed-by-class.kerml",
+      "sha256": "5fbcb5688a6f297e611ea4ae0cc2f6e47a7a9a871e9fe84f6c00bd8d223efe43"
+    },
+    {
+      "file": "negative/semantic/k41-chain-expression-to-nested-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k41-chain-expression-to-nested-class.kerml",
+      "sha256": "e8c3fb0ac62d5e4ec934277f2692af321ea872dc2c26b595500b338e0f2b17f8"
+    },
+    {
+      "file": "negative/semantic/k42-two-cross-subsettings.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k42-two-cross-subsettings.kerml",
+      "sha256": "c8acd2127ed405b024b8d05e9c0b2f344994766ee6fd514f77816f4b4ad0a4b5"
+    },
+    {
+      "file": "negative/semantic/k43-expr-typed-by-function-states-second-result-expression.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k43-expr-typed-by-function-states-second-result-expression.kerml",
+      "sha256": "71fc6f788b1936f4acca0b5f53b0c1c1ffe33322e539c293e939e708a10ea7a9"
+    },
+    {
+      "file": "negative/semantic/k44-expr-referencing-expr-states-second-result-expression.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k44-expr-referencing-expr-states-second-result-expression.kerml",
+      "sha256": "1ccd21a11d7222c1b6fe5f367e575b58d4c7b97bda61b9374cbbc844687cdee7"
+    },
+    {
+      "file": "negative/semantic/k45-conjugated-feature-without-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k45-conjugated-feature-without-type.kerml",
+      "sha256": "f807ded885321c0188fcdb47467620064c81983bbe0e4f32099006988b225e41"
+    },
+    {
+      "file": "negative/semantic/k46-conjugated-structure-not-an-object.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k46-conjugated-structure-not-an-object.kerml",
+      "sha256": "01346b0f68b18b253d6eb767d7ec3d69ddb2341f823eb7dddc6553de32711891"
+    },
+    {
+      "file": "negative/semantic/k47-feature-chain-through-alias-to-another-type.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k47-feature-chain-through-alias-to-another-type.kerml",
+      "sha256": "6fd0ab91759909800da497c63f11ec46d16c2f067c1a756b29805f487fc7ca12"
+    },
+    {
+      "file": "negative/semantic/k48-annotating-element-annotates-itself.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k48-annotating-element-annotates-itself.kerml",
+      "sha256": "9bbf8ef9ff1c4499b6de203b973003337034f65185b61cac8c1ac58bc6c28f02"
+    },
+    {
+      "file": "negative/semantic/k49-binding-connector-with-three-ends.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k49-binding-connector-with-three-ends.kerml",
+      "sha256": "5e2906b4ca04fdfe262a275a364e74e8fced31875c74e8398973c97d880dc741"
+    },
+    {
+      "file": "negative/semantic/k50-inline-cross-feature-also-crosses.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k50-inline-cross-feature-also-crosses.kerml",
+      "sha256": "98cdbca111b6fe0e4027c58fee89502ad816b5692a9fc77aa61513681e8c54f7"
+    },
+    {
+      "file": "negative/semantic/k51-return-parameter-in-classifier.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k51-return-parameter-in-classifier.kerml",
+      "sha256": "2f422648ff9423a27a2ef0e0f0829cf09c48994dbcd98a29064a0f6a3b690522"
+    },
+    {
+      "file": "negative/semantic/k52-two-conjugators.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k52-two-conjugators.kerml",
+      "sha256": "1142c4bfea9648208d1635cd71e17703dba7b47581d03e7b25e903942fdeaa79"
+    },
+    {
+      "file": "negative/semantic/k53-boolean-expression-subsets-datatype.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k53-boolean-expression-subsets-datatype.kerml",
+      "sha256": "ef7112b82ec9cc250081a5be5467514017d344953fca32b0c955f54de1bbad47"
+    },
+    {
+      "file": "negative/semantic/k54-cross-feature-typed-narrower-than-end.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k54-cross-feature-typed-narrower-than-end.kerml",
+      "sha256": "3cafd0d1ca601cd97ea1c0d8a7d53ed7755aed2033415fdac4326188f0325a58"
+    },
+    {
+      "file": "negative/semantic/k55-subtype-specific-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k55-subtype-specific-is-package.kerml",
+      "sha256": "9b3d7932e396d5e6dad3f2ebdd804481304faab9c0ea6dcf47a91e9507369ebb"
+    },
+    {
+      "file": "negative/semantic/k56-subtype-general-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k56-subtype-general-is-package.kerml",
+      "sha256": "40af7eb1af35dd862e46947a9cadc6874d77f7955737d441fa6e5e131f95c386"
+    },
+    {
+      "file": "negative/semantic/k57-subclassifier-subclassifier-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k57-subclassifier-subclassifier-is-package.kerml",
+      "sha256": "edcfcd39125108a44b1e7b35dd55632f439e4be7c6cefb15caf604e035d3ea89"
+    },
+    {
+      "file": "negative/semantic/k58-subclassifier-superclassifier-is-feature.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k58-subclassifier-superclassifier-is-feature.kerml",
+      "sha256": "55f41510200792d0f9489ffecca7fbd1ae4cad61f20d4c341d92aff59f2f8ca5"
+    },
+    {
+      "file": "negative/semantic/k59-typing-typed-feature-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k59-typing-typed-feature-is-package.kerml",
+      "sha256": "fda1934888d567e97de8ac37b38b93995b0cbf89ed5f782f7d33e77327ffa663"
+    },
+    {
+      "file": "negative/semantic/k60-typing-typed-feature-is-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k60-typing-typed-feature-is-class.kerml",
+      "sha256": "72fd0552f7e294a427f1aaf0c7d81480040a296f1ed29fa2a6c4f5f3a07f0174"
+    },
+    {
+      "file": "negative/semantic/k61-typing-type-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k61-typing-type-is-package.kerml",
+      "sha256": "8386ad1f0fec01e6709a12ee4892c57be8f95e1b950c21487abaeae4268ca94c"
+    },
+    {
+      "file": "negative/semantic/k62-subset-subsetting-feature-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k62-subset-subsetting-feature-is-package.kerml",
+      "sha256": "cf3730ce937ed53def8a7cf57e48c014ddcea57517c3838f3c5a47e39958630b"
+    },
+    {
+      "file": "negative/semantic/k63-subset-subsetted-feature-is-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k63-subset-subsetted-feature-is-class.kerml",
+      "sha256": "84c283a537afc40c78ae9d7cf3ca4f0e4b2c267da3c21ee52ff50f5771805737"
+    },
+    {
+      "file": "negative/semantic/k64-redefinition-redefining-feature-is-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k64-redefinition-redefining-feature-is-class.kerml",
+      "sha256": "34dd3ee403171d60ca141097c61c3dce5bc1f87c242add44d5f2431e010679c6"
+    },
+    {
+      "file": "negative/semantic/k65-redefinition-redefined-feature-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k65-redefinition-redefined-feature-is-package.kerml",
+      "sha256": "779016a81879bce51020de2a9b8d703524024b6b0068b4392c2cc9bcb7e2823f"
+    },
+    {
+      "file": "negative/semantic/k66-conjugate-conjugated-type-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k66-conjugate-conjugated-type-is-package.kerml",
+      "sha256": "4180bacb74837f87536a26169b67a321d6601a1642c0216ceeb6bff94d669dcc"
+    },
+    {
+      "file": "negative/semantic/k67-conjugate-original-type-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k67-conjugate-original-type-is-package.kerml",
+      "sha256": "093c664af5a89009df0baa60f5839ea91d34ecd01b51979fc42e9bb3379a35d5"
+    },
+    {
+      "file": "negative/semantic/k68-inverse-feature-inverted-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k68-inverse-feature-inverted-is-package.kerml",
+      "sha256": "7ad0ca23461e715dfbfcfa20850b43b0bdda24d29ee6ad9e29d7d91de682e66c"
+    },
+    {
+      "file": "negative/semantic/k69-inverse-inverting-feature-is-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k69-inverse-inverting-feature-is-class.kerml",
+      "sha256": "2755eff4bb6b8e358c1d0a95ddadd53bf31c02b8226d8aa58517ca2988e3f98a"
+    },
+    {
+      "file": "negative/semantic/k70-disjoint-type-disjoined-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k70-disjoint-type-disjoined-is-package.kerml",
+      "sha256": "a8c8c2fe3fd07e333c6acc95def6d38853454a0dfd469989871479af8793c9ae"
+    },
+    {
+      "file": "negative/semantic/k71-disjoint-disjoining-type-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k71-disjoint-disjoining-type-is-package.kerml",
+      "sha256": "f6e6e0340a5ee8478bc7b6067473f6aa983f9e1882f4de666ae685f3649d786a"
+    },
+    {
+      "file": "negative/semantic/k72-featuring-feature-of-type-is-class.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k72-featuring-feature-of-type-is-class.kerml",
+      "sha256": "c0038b64d49a3cfc71a13bf34814962f02838606179c3fe290c4e432244f727a"
+    },
+    {
+      "file": "negative/semantic/k73-featuring-featuring-type-is-package.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/k73-featuring-featuring-type-is-package.kerml",
+      "sha256": "89c0108977c672863769a618924d3fb3b8225e5096c927abb7efc59fcd3da47f"
+    },
+    {
+      "file": "negative/semantic/s01-action-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s01-action-typed-by-part-def.sysml",
+      "sha256": "f07d453d407c8f056b0824aac4ba7fc19f3f9cf493d2283425c9fc20d1907c9d"
+    },
+    {
+      "file": "negative/semantic/s02-allocation-typed-by-connection-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s02-allocation-typed-by-connection-def.sysml",
+      "sha256": "9930b963df8d27c5a8617f94a73be850c4e9e0454650b81f7648042dd640064c"
+    },
+    {
+      "file": "negative/semantic/s03-analysis-typed-by-case-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s03-analysis-typed-by-case-def.sysml",
+      "sha256": "93310066a44507ce13305f1b7630a92d98a10b8d96ab4698420df12aa68315a9"
+    },
+    {
+      "file": "negative/semantic/s04-assert-references-non-constraint.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s04-assert-references-non-constraint.sysml",
+      "sha256": "6ad0e902f189dd9b6182c9978507d0b5cce2db0eb5215bc00db120d3ad3fe0e9"
+    },
+    {
+      "file": "negative/semantic/s05-assign-to-package-level-attribute.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s05-assign-to-package-level-attribute.sysml",
+      "sha256": "4c99a2d12942aefa9cf4215a4a2105760a488af84fd0781a8f30f8cdd6001f82"
+    },
+    {
+      "file": "negative/semantic/s06-enum-attribute-two-types.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s06-enum-attribute-two-types.sysml",
+      "sha256": "400be2e8a49f8b62cb1a9d9f925f34f04266dd6e46dccc02a28e3bb4a7e67e17"
+    },
+    {
+      "file": "negative/semantic/s07-calc-typed-by-action-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s07-calc-typed-by-action-def.sysml",
+      "sha256": "aaebd8ee2072e365d2b349f73c0a67869067c3807a297b0ab4ed38c406263b64"
+    },
+    {
+      "file": "negative/semantic/s08-case-def-two-objectives.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s08-case-def-two-objectives.sysml",
+      "sha256": "868ab73c809504a7b472ccfb6c752af485c18b3f35cebfa88e1b8053773de626"
+    },
+    {
+      "file": "negative/semantic/s09-case-def-two-subjects.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s09-case-def-two-subjects.sysml",
+      "sha256": "5d91f3520498c2a027a0bd6feca8ef15ec36496450a65b1093f665f611c05642"
+    },
+    {
+      "file": "negative/semantic/s10-case-def-subject-not-first.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s10-case-def-subject-not-first.sysml",
+      "sha256": "e23a4debcd827d486918fee0b6cce50c0892cb88e95e6826b3e037b398da94d7"
+    },
+    {
+      "file": "negative/semantic/s11-case-two-objectives.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s11-case-two-objectives.sysml",
+      "sha256": "090f918cc9dea813be39ce777d8759b5d459ec3054500348676ca2a7c9fe9bd6"
+    },
+    {
+      "file": "negative/semantic/s12-case-two-subjects.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s12-case-two-subjects.sysml",
+      "sha256": "688a77923c0fb9dc1d9e5a9e6f21db20fa93e9977316ddabd7ecb2fe75e31063"
+    },
+    {
+      "file": "negative/semantic/s13-case-subject-not-first.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s13-case-subject-not-first.sysml",
+      "sha256": "cbd74ef1c309e63236d144ed5c8fb0bf74fd3b977f29b57f4bb49a723ce5cb2b"
+    },
+    {
+      "file": "negative/semantic/s14-case-typed-by-action-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s14-case-typed-by-action-def.sysml",
+      "sha256": "5c7a6eacff5a3b49c0e7c622233705e3e57b9f196ba9ecf30f55e06fc3f64909"
+    },
+    {
+      "file": "negative/semantic/s15-connection-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s15-connection-typed-by-part-def.sysml",
+      "sha256": "ede3d38184d8ff5b875f5f19dec139ad1a23b663582084d5fccf17b6d367f173"
+    },
+    {
+      "file": "negative/semantic/s16-event-references-non-occurrence.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s16-event-references-non-occurrence.sysml",
+      "sha256": "d6560eb37ad03311b958897a780f2f6efc762326e6432c98795902844d6435d3"
+    },
+    {
+      "file": "negative/semantic/s17-exhibit-references-non-state.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s17-exhibit-references-non-state.sysml",
+      "sha256": "bcc817c05a96fe35eff2f44d701cb7a1e19b4824fda26b69ebbaac374826b73e"
+    },
+    {
+      "file": "negative/semantic/s18-flow-def-three-ends.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s18-flow-def-three-ends.sysml",
+      "sha256": "cd3c290dba956644acc8dd77aee2701c679b6f741f0d25e456cde1787cbcc263"
+    },
+    {
+      "file": "negative/semantic/s19-flow-typed-by-connection-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s19-flow-typed-by-connection-def.sysml",
+      "sha256": "01052f49bb00b246ec1b28b980792a242c92e608fe8513d035656048b26216aa"
+    },
+    {
+      "file": "negative/semantic/s20-include-references-non-use-case.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s20-include-references-non-use-case.sysml",
+      "sha256": "c3f4122422e81d15474c7cb52680ce789082ed56aef2d5f2f364c091deab8ab2"
+    },
+    {
+      "file": "negative/semantic/s21-interface-def-end-not-port.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s21-interface-def-end-not-port.sysml",
+      "sha256": "9dbf82406df16b0e1f1717f583879acaa86f6ecd637c1a441576e2a64c2e5315"
+    },
+    {
+      "file": "negative/semantic/s22-interface-typed-by-connection-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s22-interface-typed-by-connection-def.sysml",
+      "sha256": "6e6b5266612c435b7c795748e80d51aca0befda37d9d5d77cf8a60e6f29c3427"
+    },
+    {
+      "file": "negative/semantic/s23-metadata-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s23-metadata-typed-by-part-def.sysml",
+      "sha256": "04e1624ca67b3a6c524030653f45dca70c9e61aa2e5da2636bbd6785e6a884c6"
+    },
+    {
+      "file": "negative/semantic/s24-perform-references-non-action.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s24-perform-references-non-action.sysml",
+      "sha256": "340d6308219eb41e4b204c3461c32e8f3c5da981b902f288fb6f59022ff731e1"
+    },
+    {
+      "file": "negative/semantic/s25-port-nested-composite-part.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s25-port-nested-composite-part.sysml",
+      "sha256": "44e2bf67ecc5d1f3da55a14318043fd14aac1091bb4b3c22d78066e323d7e854"
+    },
+    {
+      "file": "negative/semantic/s26-port-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s26-port-typed-by-part-def.sysml",
+      "sha256": "f5846020fa95ec36610dd9a607a5cd42ac1248e493fa7f693a8dce838579afaa"
+    },
+    {
+      "file": "negative/semantic/s27-rendering-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s27-rendering-typed-by-part-def.sysml",
+      "sha256": "e4bfe950289284e5eab84f5617ff3f611a8a0b18de00d2b1f366088b9a108c15"
+    },
+    {
+      "file": "negative/semantic/s28-requirement-def-subject-not-first.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s28-requirement-def-subject-not-first.sysml",
+      "sha256": "ad86ec3e329b4dfba626f6814d510a046cbd02cd95df49223580a94a4c3436a9"
+    },
+    {
+      "file": "negative/semantic/s29-requirement-two-subjects.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s29-requirement-two-subjects.sysml",
+      "sha256": "cf79e6c8ffbd5fa9712aa8bcd1608faf1a938850b6092846e49671652cc1edca"
+    },
+    {
+      "file": "negative/semantic/s30-requirement-subject-not-first.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s30-requirement-subject-not-first.sysml",
+      "sha256": "359913a01297998958fd5d761a24f63f899335841c2db383fcaba8d7bc549dda"
+    },
+    {
+      "file": "negative/semantic/s31-requirement-typed-by-constraint-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s31-requirement-typed-by-constraint-def.sysml",
+      "sha256": "9769f8a306da979e1076312dd6ff87b04348fb1f4ebf9d68a05883ae6db16aa6"
+    },
+    {
+      "file": "negative/semantic/s32-satisfy-references-non-requirement.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s32-satisfy-references-non-requirement.sysml",
+      "sha256": "3834f784258dce54a934092553d94ef2064db4a52aa0f468bc033d84a06eec64"
+    },
+    {
+      "file": "negative/semantic/s33-parallel-state-usage-with-succession.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s33-parallel-state-usage-with-succession.sysml",
+      "sha256": "b93b9f8c0e968ed56531ea1860a7a718139624d2af34c01acd64d210e8478fa7"
+    },
+    {
+      "file": "negative/semantic/s34-state-usage-two-entry-actions.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s34-state-usage-two-entry-actions.sysml",
+      "sha256": "0d8984409a2bb1cd4871c1fd7182f56e4bcffcb5e6fd7f8a64cd3a2d4b8ee437"
+    },
+    {
+      "file": "negative/semantic/s35-state-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s35-state-typed-by-part-def.sysml",
+      "sha256": "224161a3c310f664e0cffe266682257e2a5be3404d99caac72143265e56c0d84"
+    },
+    {
+      "file": "negative/semantic/s36-usage-typed-by-feature.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s36-usage-typed-by-feature.sysml",
+      "sha256": "6ac0c2a4a17203d4255f3a9586d4e5393a39f47ec9b94a5a1687328a3a8940b0"
+    },
+    {
+      "file": "negative/semantic/s37-variation-usage-member-not-variant.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s37-variation-usage-member-not-variant.sysml",
+      "sha256": "b7b2bb09a32906edaf4feb81457666d28b28e053cc0e7c0f470530762b018bf9"
+    },
+    {
+      "file": "negative/semantic/s38-use-case-typed-by-case-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s38-use-case-typed-by-case-def.sysml",
+      "sha256": "b62368fa45ec074e649d688392990792585cdd79cd8741f65d2c9c3cebd0cb3c"
+    },
+    {
+      "file": "negative/semantic/s39-verification-typed-by-case-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s39-verification-typed-by-case-def.sysml",
+      "sha256": "dbeb62a8129384fa837001382b412d95b1e78bed9f45de564f9f0e8de9b3d843"
+    },
+    {
+      "file": "negative/semantic/s40-view-def-two-renderings.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s40-view-def-two-renderings.sysml",
+      "sha256": "c31f781e99fe7d0047e775e186ef5ba9fd4b1ca594cc7b6fce347e63e05db182"
+    },
+    {
+      "file": "negative/semantic/s41-view-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s41-view-typed-by-part-def.sysml",
+      "sha256": "d90466aebdfe75162687b8e5fde322e58950a965eb548294ae021ccc9f243daa"
+    },
+    {
+      "file": "negative/semantic/s42-viewpoint-typed-by-requirement-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s42-viewpoint-typed-by-requirement-def.sysml",
+      "sha256": "1ac6cfaf3b4731123361aa2abb8ac2aac6283dea8fd19c03d96d44398c7f0b2a"
+    },
+    {
+      "file": "negative/semantic/s43-assign-to-non-feature.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s43-assign-to-non-feature.sysml",
+      "sha256": "bdd82633e3a751c32d22b17e53bb79e91376e156d541da44c8cbbce1f623879c"
+    },
+    {
+      "file": "negative/semantic/s44-transition-target-not-action.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s44-transition-target-not-action.sysml",
+      "sha256": "044078720d1ddd88e6c2054bfb048cdc94c8e93941e66dd4b1220bba85ba5857"
+    },
+    {
+      "file": "negative/semantic/s45-snapshot-outside-occurrence.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s45-snapshot-outside-occurrence.sysml",
+      "sha256": "e981ac66134f8cf560d7c2daecd6ba33f6fddb361ee6bca7ecaba4cbc952c3a0"
+    },
+    {
+      "file": "negative/semantic/s46-feature-value-overriding.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s46-feature-value-overriding.sysml",
+      "sha256": "1cb0deab890c61aa7f7167730a7c5793ab26276a6f972eda6d052af6b1811f1c"
+    },
+    {
+      "file": "negative/semantic/s47-enumeration-specializes-enumeration.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s47-enumeration-specializes-enumeration.sysml",
+      "sha256": "14e10194546fa43d072fd21b289cbf3a4280c998f926fb4a3c76a456fdf6f0fd"
+    },
+    {
+      "file": "negative/semantic/s48-after-trigger-not-duration.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s48-after-trigger-not-duration.sysml",
+      "sha256": "c09f3d8ee901f5f22ba725bf39959c1f3d47b354f9ee4fbc7e420373cb1821ae"
+    },
+    {
+      "file": "negative/semantic/s49-at-trigger-not-time-instant.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s49-at-trigger-not-time-instant.sysml",
+      "sha256": "07b3309c030d43cba7b9c2fce1617ab870a13e516f4f004e2e8759afa3f58653"
+    },
+    {
+      "file": "negative/semantic/s50-when-trigger-not-boolean.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s50-when-trigger-not-boolean.sysml",
+      "sha256": "7cc1fac59acb2dcb888e2a9ff81f0173f5409c5ae5b0863807d617ae58b5f243"
+    },
+    {
+      "file": "negative/semantic/s51-enum-value-body-typed-outside-enumeration.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s51-enum-value-body-typed-outside-enumeration.sysml",
+      "sha256": "a4ee6b69e747f90cee65315b20f22b95f5aa030df5872c871c18e186b0918297"
+    },
+    {
+      "file": "negative/semantic/s52-variant-port-composite.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s52-variant-port-composite.sysml",
+      "sha256": "e056d2d1566209e4e78fa4b70957b2d3f65d420c63e5959a68acbd015325bfdf"
+    },
+    {
+      "file": "negative/semantic/s80-constant-attribute-not-variable.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s80-constant-attribute-not-variable.sysml",
+      "sha256": "745101f9d88dfbc45496fab45a3f1ccba81ebf7e94e82d1a22707382c124afab"
+    },
+    {
+      "file": "negative/semantic/s81-guarded-succession-guard-not-boolean.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s81-guarded-succession-guard-not-boolean.sysml",
+      "sha256": "cc3e263fd5cd5b089f48cbe50a6960fdbe6ef2ce14caeca7b2226e78dfe05d5d"
+    },
+    {
+      "file": "negative/semantic/s82-constraint-specialization-states-second-result-expression.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s82-constraint-specialization-states-second-result-expression.sysml",
+      "sha256": "c56daa9a9af44e8b1ce0c263aa767487aa97f0f764e758b6a754145afedd3189"
+    },
+    {
+      "file": "negative/semantic/s83-redefined-constraint-usage-states-second-result-expression.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s83-redefined-constraint-usage-states-second-result-expression.sysml",
+      "sha256": "8db6baf16264824e8ee76508b7af17c4db5a51ff8181fe323e413bdc7d1513e0"
+    },
+    {
+      "file": "negative/semantic/s84-referencing-constraint-usage-states-second-result-expression.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s84-referencing-constraint-usage-states-second-result-expression.sysml",
+      "sha256": "6e6acfb04c749eb40b03fd0cf76514a9ad319681ff1d39f3b6d4a7f5ca375e5b"
+    },
+    {
+      "file": "negative/semantic/s85-viewpoint-inherits-second-result-expression.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s85-viewpoint-inherits-second-result-expression.sysml",
+      "sha256": "ec12ae25513485f2b0c2a7e33372a8562e6768d266118c2ca5e161df7bf6f79c"
+    },
+    {
+      "file": "negative/semantic/s86-end-with-direction.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s86-end-with-direction.sysml",
+      "sha256": "54c10bb6684f21abc3ea7eae371beb426c3da9ac8632778488d12e24c6d0add9"
+    },
+    {
+      "file": "negative/semantic/s87-end-derived-or-abstract.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s87-end-derived-or-abstract.sysml",
+      "sha256": "714404264649ed229c72c2f181fb2c9683483a953f21b24b9765fafdb958340f"
+    },
+    {
+      "file": "negative/semantic/s88-cross-feature-typed-narrower-than-end.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s88-cross-feature-typed-narrower-than-end.sysml",
+      "sha256": "c51f578b7ba2e0d99631edc7f49e6c3239dfb5b3525d872246fcfce5f731f807"
+    },
+    {
+      "file": "negative/semantic/s89-case-def-inherits-two-objectives.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s89-case-def-inherits-two-objectives.sysml",
+      "sha256": "45a6eb7d6162aed4b83d6053770c4cc3611ced623e4a08d4207d214fcdb96c21"
+    },
+    {
+      "file": "negative/semantic/s90-requirement-def-inherits-two-subjects.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s90-requirement-def-inherits-two-subjects.sysml",
+      "sha256": "31510eac5816337c9c049444ba34dc8261584b7cd331e208acb397c5188ab9f8"
+    },
+    {
+      "file": "negative/semantic/s91-case-references-second-objective.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s91-case-references-second-objective.sysml",
+      "sha256": "e67f61e5318c85f2f64e7ca4dec0c7df47af92df0503c24754b8210c99aa08bb"
+    },
+    {
+      "file": "negative/semantic/s92-requirement-references-second-subject.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s92-requirement-references-second-subject.sysml",
+      "sha256": "2619a97843e072eb185b18aae6f3043844306ca626d5d01902dd5c7cb77d3266"
+    },
+    {
+      "file": "negative/semantic/s93-assert-through-owner-of-unnamed-assertion.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/s93-assert-through-owner-of-unnamed-assertion.sysml",
+      "sha256": "930a8abbe9b7a040c4465396d29c64c47ff5f759309d783e0a1893a9866eebdc"
+    },
+    {
+      "file": "negative/semantic/send-constructor-non-type.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/send-constructor-non-type.sysml",
+      "sha256": "c1462621695f2b06877c99b8b7b61975f86cf8cbe1c906cfe0483a12c460ed4c"
+    },
+    {
+      "file": "negative/semantic/send-payload-non-behavior.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/send-payload-non-behavior.sysml",
+      "sha256": "dd1f4457a1a2cd4da3781f038bca91ff171d980eead917f956ba5c662c356cb8"
+    },
+    {
+      "file": "negative/semantic/send-subaction-no-payload.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/semantic/send-subaction-no-payload.sysml",
+      "sha256": "fd1dbafefab70819777cd9db46369bcae629b081c7647e50821865303a66ecf6"
+    },
+    {
+      "file": "negative/xpect/p01-public-root-import.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p01-public-root-import.kerml",
+      "sha256": "d23dc8a8294a870cf8ac7a046db46fe7f409e91dc069d9484172918898f3aa3e"
+    },
+    {
+      "file": "negative/xpect/p02-association-end-two-types.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p02-association-end-two-types.kerml",
+      "sha256": "70d46c0e55be859d35f5037f8aee3b63dae218e27df02e028ec8146ce7d158f3"
+    },
+    {
+      "file": "negative/xpect/p03-variable-in-datatype.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p03-variable-in-datatype.kerml",
+      "sha256": "924a8f0b490e47867ac400c562d14ae508040e72e030b4a7a3f2b131a087e577"
+    },
+    {
+      "file": "negative/xpect/p04-nonunique-subsets-unique.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p04-nonunique-subsets-unique.kerml",
+      "sha256": "fceeb9e75bb0cd31588eb99941f8d81236141b61599e08d1f3000d057c329e12"
+    },
+    {
+      "file": "negative/xpect/p05-single-chaining-feature.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p05-single-chaining-feature.kerml",
+      "sha256": "0b77b5e24c9e3d1cf1e9268c8b456f878b7ff8ed58620ceb4e8f8f7995f78e0a"
+    },
+    {
+      "file": "negative/xpect/p06-private-member-reference.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p06-private-member-reference.kerml",
+      "sha256": "fde7364e24cd794641d90f8b27e53c70394cea25cb0340483fe41102eca1eda3"
+    },
+    {
+      "file": "negative/xpect/p07-extraneous-closing-brace.kerml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p07-extraneous-closing-brace.kerml",
+      "sha256": "2bc1a4460d46884cbba8cff73280a9c4f27dc4ed2afe097db79dd9b1a8e0a43c"
+    },
+    {
+      "file": "negative/xpect/p08-variant-outside-variation.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p08-variant-outside-variation.sysml",
+      "sha256": "047514c6a3d29df31fa3a43fbf8ad75e986bdc001273beaff545e289efc7f5ab"
+    },
+    {
+      "file": "negative/xpect/p09-variation-member-not-variant.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p09-variation-member-not-variant.sysml",
+      "sha256": "68e9fc3a4fc01030f13b7b608085d74b60c423d8b6d920f19d0f94ac2ac390d5"
+    },
+    {
+      "file": "negative/xpect/p10-variation-specializes-variation.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p10-variation-specializes-variation.sysml",
+      "sha256": "21f60962b93e20cc6a940e60033dc9ecb4fc9b497680c286fcbb9ca462660def"
+    },
+    {
+      "file": "negative/xpect/p11-metadata-body-not-evaluable.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p11-metadata-body-not-evaluable.sysml",
+      "sha256": "bffc4ac6385e812529a8342e06ecdfca8990b4039820d9b6cf86f8206a91dde7"
+    },
+    {
+      "file": "negative/xpect/p12-filter-integer-condition.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p12-filter-integer-condition.sysml",
+      "sha256": "79e936d6b975b5341b5124d19469affefd0764f471ea97644260d48581722456"
+    },
+    {
+      "file": "negative/xpect/p13-state-two-entry-actions.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p13-state-two-entry-actions.sysml",
+      "sha256": "e81a74143d4da2b6e593669b0ff02f15731725d4af7af2f04f4b5e181c5a6a66"
+    },
+    {
+      "file": "negative/xpect/p14-requirement-two-subjects.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p14-requirement-two-subjects.sysml",
+      "sha256": "800682eac8fe41bb22ad6932dead0aa6778a8499f48f970f9f4cd964aa891b1b"
+    },
+    {
+      "file": "negative/xpect/p15-attribute-typed-by-part-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p15-attribute-typed-by-part-def.sysml",
+      "sha256": "b9d47ab8c6f9f76e6525606ef7772e5ed2de8285d26f88b3cd78abaed8a4391b"
+    },
+    {
+      "file": "negative/xpect/p16-part-typed-by-attribute-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p16-part-typed-by-attribute-def.sysml",
+      "sha256": "ecd1841740b347558d209f092a07a4eded23bad2b3f70f4fbd3f2ed7dbf979e1"
+    },
+    {
+      "file": "negative/xpect/p17-calc-two-return-parameters.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p17-calc-two-return-parameters.sysml",
+      "sha256": "3c3be56ed943dcbde1da783518188893c644a0accba6ccb3ed91991b803bfbd4"
+    },
+    {
+      "file": "negative/xpect/p18-enum-two-types.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p18-enum-two-types.sysml",
+      "sha256": "0e7080c2a21dea3f71ca7fc124c7d1391ab85cd80cdb8b5843dbea9ea34590c5"
+    },
+    {
+      "file": "negative/xpect/p18-enum-value-typed-outside-enumeration.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p18-enum-value-typed-outside-enumeration.sysml",
+      "sha256": "35fe24f63079e825750b236ca3c1ff45a23e5902b3944fb7df92b37c4d018c86"
+    },
+    {
+      "file": "negative/xpect/p19-parallel-state-with-transition.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p19-parallel-state-with-transition.sysml",
+      "sha256": "f1cabc5b0442450e2d630cbc7dc26d1d80c5aa4db3f6c71f75c03be7a4bf2081"
+    },
+    {
+      "file": "negative/xpect/p20-connection-with-one-end.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p20-connection-with-one-end.sysml",
+      "sha256": "00cfeaffc36471bb7af646c58c188dda5ca4536da8118dd720135558ea0fb3bf"
+    },
+    {
+      "file": "negative/xpect/p21-filter-constructor-condition.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p21-filter-constructor-condition.sysml",
+      "sha256": "594cef262e56f0b5568bcf4c69ee890bdd06807bd21c655e42dfbecff4876605"
+    },
+    {
+      "file": "negative/xpect/p22-filter-not-model-level-evaluable.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p22-filter-not-model-level-evaluable.sysml",
+      "sha256": "3d5dc1a4f00995a44359a17b60e79f1b10b9a56f5e44634530189d49b7e68d74"
+    },
+    {
+      "file": "negative/xpect/p23-metadata-body-feature-not-redefining.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p23-metadata-body-feature-not-redefining.sysml",
+      "sha256": "69071eed0a3951bc82f05d39c3bdb877ff62fc167e4a08fcdc0609e43bb8d5f0"
+    },
+    {
+      "file": "negative/xpect/p24-metadata-abstract-type.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p24-metadata-abstract-type.sysml",
+      "sha256": "4aff9c8f8b222cfff7f1c6ee4f3794c869ede431600ccd12dcbc1ff0ab81066f"
+    },
+    {
+      "file": "negative/xpect/p25-two-individual-definitions.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p25-two-individual-definitions.sysml",
+      "sha256": "2e67ca5a7db2ef3e6320ce86404263a38629fe04ade5d6797d878046be1227bd"
+    },
+    {
+      "file": "negative/xpect/p26-port-def-nonreferential-usage.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p26-port-def-nonreferential-usage.sysml",
+      "sha256": "83c64ab3944d582c223ac8bad83da84fb9a4ac86277327d111c3deb2eb139a20"
+    },
+    {
+      "file": "negative/xpect/p27-interface-end-not-port.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p27-interface-end-not-port.sysml",
+      "sha256": "dade43491b5e34a835ba2f00246e41b01ad482bffe48969d720c1d05959fed7e"
+    },
+    {
+      "file": "negative/xpect/p28-package-level-feature-redefined.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p28-package-level-feature-redefined.sysml",
+      "sha256": "b9c0fa8bdd241caa981f01124bfce7fa12786c8d2e841e33bdfd0dcda5b17ca0"
+    },
+    {
+      "file": "negative/xpect/p29-verify-outside-objective.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p29-verify-outside-objective.sysml",
+      "sha256": "e8c2eb93970abdae6f8deda3c745dd50c67406f982006b07cf3847b55f188b0f"
+    },
+    {
+      "file": "negative/xpect/p30-two-view-renderings.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p30-two-view-renderings.sysml",
+      "sha256": "aad124dee496e551273e3529cd8e7b1cc968f11f728acfb2e7016f7300b49057"
+    },
+    {
+      "file": "negative/xpect/p31-redefinition-incompatible-direction.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p31-redefinition-incompatible-direction.sysml",
+      "sha256": "a37cb3f6cb8ef4b97016b1b1fc751150dc6d4b86c006d67baa859a1d77f03263"
+    },
+    {
+      "file": "negative/xpect/p32-redefinition-same-featuring-type.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p32-redefinition-same-featuring-type.sysml",
+      "sha256": "40f09e0417db77d9f7824bfe3e6bd08bfac9111b1c33d2bed4344479d543e814"
+    },
+    {
+      "file": "negative/xpect/p33-individual-typed-by-plain-def.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p33-individual-typed-by-plain-def.sysml",
+      "sha256": "376a0dcceb828108144c7b121eb0c8f31e00228e28a77af9e099b3b1561f3e88"
+    },
+    {
+      "file": "negative/xpect/p34-accepter-source-not-state.sysml",
+      "source": "cmd/pilot-reject/testdata/negative/xpect/p34-accepter-source-not-state.sysml",
+      "sha256": "40ca490f1df6ff7b558241c10ab9d617e9b3234b5fc4d11fdae700eccf6524fc"
+    }
+  ]
+}

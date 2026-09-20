@@ -5,6 +5,7 @@
 //! documented report; the empty base is a recognizable constant.
 
 use serde_json::Value;
+use std::fmt::Write as _;
 use sysmlv2_cbor::{
     DeltaOptions, apply_delta_cbor, apply_delta_cbor_lenient, delta_canonical, delta_compact_cbor,
     empty_base_digest, rebase_ids, state_digest,
@@ -35,10 +36,7 @@ const TARGET_UNIT: &str = "package P {
 }";
 
 fn opts(portable: bool) -> DeltaOptions {
-    DeltaOptions {
-        portable,
-        ..Default::default()
-    }
+    DeltaOptions::new().with_portable(portable)
 }
 
 #[test]
@@ -89,6 +87,82 @@ fn canonicalization_is_emission_order_independent() {
         apply_delta_cbor(&bytes, &compact).unwrap(),
         delta_canonical(&compact).unwrap()
     );
+}
+
+/// The canonical order is computed once, as a permutation, and then
+/// either borrowed (digests, diffs) or moved through (apply). All three
+/// must land on the identical array — including for a payload with
+/// several roots, unreachable elements, and a shuffled emission order,
+/// where the walk falls back to appending what it never visited.
+#[test]
+fn borrowed_and_applied_canonicalization_agree_on_a_ragged_payload() {
+    let id = |n: u8| format!("00000000-0000-4000-8000-0000000000{n:02x}");
+    let pkg = |n: u8, owned: &[u8]| {
+        serde_json::json!({
+            "@type": "Package", "@id": id(n),
+            "ownedRelationship": owned.iter().map(|&t| serde_json::json!({ "@id": id(t) }))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let membership = |n: u8, member: u8| {
+        serde_json::json!({
+            "@type": "OwningMembership", "@id": id(n),
+            "ownedRelatedElement": [{ "@id": id(member) }],
+            "memberElement": { "@id": id(member) },
+        })
+    };
+    // Two owning roots plus two elements nothing owns at all.
+    let model = Value::Array(vec![
+        pkg(1, &[3]),
+        pkg(2, &[5]),
+        membership(3, 4),
+        pkg(4, &[]),
+        membership(5, 6),
+        pkg(6, &[]),
+        pkg(7, &[]),
+        pkg(8, &[]),
+    ]);
+    // The same payload with the owned elements emitted elsewhere; the
+    // roots keep their relative order, which is the one thing the
+    // canonical walk takes from emission order.
+    let shuffled = Value::Array(vec![
+        pkg(1, &[3]),
+        membership(5, 6),
+        pkg(2, &[5]),
+        pkg(6, &[]),
+        membership(3, 4),
+        pkg(4, &[]),
+        pkg(7, &[]),
+        pkg(8, &[]),
+    ]);
+    let ids_of = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["@id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let want = delta_canonical(&model).unwrap();
+    assert_eq!(
+        ids_of(&want),
+        [1, 3, 4, 2, 5, 6, 7, 8].map(id).to_vec(),
+        "ownership preorder from each root, then what nothing owns"
+    );
+    assert_eq!(delta_canonical(&shuffled).unwrap(), want);
+    assert_eq!(
+        state_digest(&model).unwrap(),
+        state_digest(&shuffled).unwrap()
+    );
+    // The applied state canonicalizes through the owned path.
+    let empty = Value::Array(Vec::new());
+    for portable in [false, true] {
+        let bytes = delta_compact_cbor(&empty, &model, &opts(portable)).unwrap();
+        assert_eq!(
+            apply_delta_cbor(&bytes, &empty).unwrap(),
+            want,
+            "portable={portable}"
+        );
+    }
 }
 
 #[test]
@@ -463,7 +537,7 @@ fn patched_updates_make_big_owner_inserts_constant_size() {
     let body = |n: usize, extra: bool| {
         let mut s = String::from("package P {\n");
         for k in 0..n {
-            s.push_str(&format!("    part def D{k};\n"));
+            writeln!(s, "    part def D{k};").unwrap();
         }
         if extra {
             s.push_str("    attribute q;\n");
@@ -607,10 +681,7 @@ fn units_ride_the_delta_and_apply_returns_them() {
     let bytes = delta_compact_cbor(
         &base,
         &target,
-        &DeltaOptions {
-            units: target_units.clone(),
-            ..Default::default()
-        },
+        &DeltaOptions::new().with_units(target_units.clone()),
     )
     .unwrap();
     let (got, report) = sysmlv2_cbor::apply_delta_cbor_report(&bytes, &base).unwrap();
@@ -652,10 +723,7 @@ fn rename_only_change_is_a_legal_delta() {
     let bytes = delta_compact_cbor(
         &base,
         &target,
-        &DeltaOptions {
-            units: target_units,
-            ..Default::default()
-        },
+        &DeltaOptions::new().with_units(target_units),
     )
     .unwrap();
     let d = sysmlv2_cbor::describe(&bytes).unwrap();
@@ -683,11 +751,7 @@ fn units_refuse_portable() {
     let err = delta_compact_cbor(
         &base,
         &target,
-        &DeltaOptions {
-            portable: true,
-            units,
-            ..Default::default()
-        },
+        &DeltaOptions::new().with_portable(true).with_units(units),
     )
     .unwrap_err();
     assert!(err.to_string().contains("strict deltas only"), "{err}");
@@ -708,10 +772,7 @@ fn units_compose_with_elision() {
     let bytes = sysmlv2_cbor::delta_compact_cbor_elided(
         &base,
         &target,
-        &DeltaOptions {
-            units: target_units.clone(),
-            ..Default::default()
-        },
+        &DeltaOptions::new().with_units(target_units),
         &|_| None,
     )
     .unwrap();
@@ -922,7 +983,7 @@ mod implied_owner_deltas {
     const M: &str = "00000000-0000-4000-8000-00000000000e";
     const KID: &str = "00000000-0000-4000-8000-00000000000f";
 
-    fn pkg(id: &str, name: &str, owned: &[&str], owner: Value) -> Value {
+    fn pkg(id: &str, name: &str, owned: &[&str], owner: &Value) -> Value {
         json!({
             "@type": "Package", "@id": id, "elementId": id,
             "declaredName": name, "isImpliedIncluded": false,
@@ -946,10 +1007,10 @@ mod implied_owner_deltas {
 
     fn state(owner: &str) -> Value {
         Value::Array(vec![
-            pkg(A, "A", if owner == A { &[M] } else { &[] }, Value::Null),
-            pkg(B, "B", if owner == B { &[M] } else { &[] }, Value::Null),
+            pkg(A, "A", if owner == A { &[M] } else { &[] }, &Value::Null),
+            pkg(B, "B", if owner == B { &[M] } else { &[] }, &Value::Null),
             membership(owner),
-            pkg(KID, "Kid", &[], json!({"@id": M})),
+            pkg(KID, "Kid", &[], &json!({"@id": M})),
         ])
     }
 
@@ -994,7 +1055,7 @@ mod implied_owner_deltas {
         // A is owned by M per the forward list but carries no
         // backpointer keys at all (absent-key exceptions), and M is
         // owned by nothing while claiming B.
-        let target = Value::Array(vec![bare(A, &[]), inconsistent.clone()]);
+        let target = Value::Array(vec![bare(A, &[]), inconsistent]);
         let base = Value::Array(Vec::new());
         let bytes = delta_compact_cbor(&base, &target, &opts(false)).unwrap();
         let got = apply_delta_cbor(&bytes, &base).unwrap();

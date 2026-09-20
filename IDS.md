@@ -4,7 +4,7 @@ How this toolkit assigns `@id`s to **user-model** elements. The scheme makes eve
 
 On the wire, this derivation is stamped as **id-scheme 1** in the payload header of the binary interchange form (`CBOR.md`): id-elided payloads (snapshot or delta) refuse a scheme they don't carry, while explicit-id payloads ignore the stamp entirely.
 
-Standard-library elements are unaffected: named library elements keep their normative KerML 9.1 name-based UUIDs, positional library elements keep their sealed-snapshot ids.
+Standard-library elements are unaffected: named library elements keep their normative KerML 9.1 name-based UUIDs, unnamed library elements keep their deterministic toolkit-local path ids.
 
 ## The derivation
 

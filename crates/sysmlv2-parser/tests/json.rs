@@ -146,6 +146,40 @@ fn feature_value_and_literals() {
     assert_eq!(real["value"], 3.5);
 }
 
+/// A real literal a double cannot denote exactly travels as its written
+/// text, and lifts back to that same text — the JSON-path model and the
+/// text-path model agree on the value either way.
+#[test]
+fn real_literals_beyond_double_precision_travel_as_text() {
+    use sysmlv2_parser::lift::from_compact_json;
+    use sysmlv2_parser::print::print_source;
+    for (written, wire) in [
+        // Exactly representable: a number, as before.
+        ("3.5", Value::from(3.5)),
+        ("0.1", Value::from(0.1)),
+        // More significant digits than a double holds.
+        (
+            "1.234567890123456789012345678901",
+            Value::from("1.234567890123456789012345678901"),
+        ),
+        // An exponent past the double range, which would otherwise
+        // become an infinity — and JSON has no spelling for that.
+        ("1e400", Value::from("1e400")),
+    ] {
+        let elements = emit(&format!("package P {{ attribute a = {written}; }}"));
+        let real = find(&elements, "LiteralRational");
+        assert_eq!(real["value"], wire, "wire value of {written}");
+
+        let lifted = from_compact_json(&Value::Array(elements)).expect("lift");
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        let text = print_source(&lifted.unit);
+        assert!(
+            text.contains(written),
+            "{written} survives the lift: {text}"
+        );
+    }
+}
+
 #[test]
 fn initial_and_default_value_flags() {
     let elements = emit("package P { attribute a : X := 1; }");

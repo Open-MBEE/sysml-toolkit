@@ -1,4 +1,4 @@
-// KerML has the same requirement after the 2026-05 grammar correction.
+// KerML has the same requirement in the pinned grammar.
 package P {
     flow of; //~ ERROR a payload requires a type, specialization, or value
     flow of [1]; //~ ERROR expected a name

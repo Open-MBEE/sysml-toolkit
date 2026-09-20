@@ -42,6 +42,7 @@ pub const IMPLEMENTED_NORMATIVE_VALIDATION_RULES: &[&str] = &[
 ];
 
 /// Validate one parsed source unit; returns all body-context diagnostics.
+#[must_use]
 pub fn validate(unit: &SourceUnit) -> Vec<Diagnostic> {
     let mut v = Validator {
         dialect: unit.dialect,

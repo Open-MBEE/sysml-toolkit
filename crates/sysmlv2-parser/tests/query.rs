@@ -227,6 +227,41 @@ fn element_qualified_names() {
     assert_eq!(r.element_qualified_name(root_pkg).as_deref(), Some("Demo"));
 }
 
+#[test]
+fn qualified_names_include_effective_names_of_redefined_ancestors() {
+    let mut r = resolved(
+        "package P {
+        part def Tank { attribute mass = 1; }
+        part base { part tank : Tank; part <spare> : Tank; part 'fuel tank' : Tank; }
+        part actual :> base {
+            part :>> tank { attribute :>> mass = 2; }
+            part :>> spare;
+            part :>> 'fuel tank';
+        }
+        ref part :> actual;
+        part { part child; }
+    }",
+    );
+    for name in [
+        "P::actual::tank",
+        "P::actual::tank::mass",
+        "P::actual::spare",
+        "P::actual::'fuel tank'",
+    ] {
+        let element = r.resolve_qualified(name).expect(name);
+        let id = r.element_id(element);
+        assert_eq!(r.element_qualified_name(element).as_deref(), Some(name));
+        let again = r.resolve_qualified(name).unwrap();
+        assert_eq!(r.element_id(again), id);
+    }
+    let child = r
+        .elements_of_metaclass("PartUsage")
+        .into_iter()
+        .find(|e| r.element_name(*e) == Some("child"))
+        .unwrap();
+    assert_eq!(r.element_qualified_name(child), None);
+}
+
 /// Classification follows semantic-metadata implied specializations: an
 /// element annotated with a `SemanticMetadata` subtype conforms to the
 /// metadata's `baseType` value — for annotated *definitions* as well as

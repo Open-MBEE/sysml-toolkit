@@ -18,7 +18,7 @@
 //   dist/      sysml-wasm-<version>.tgz
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, existsSync } from "node:fs";
+import { copyFileSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { dirname, join, resolve, delimiter } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -34,13 +34,17 @@ const npmDir = join(crateDir, "npm");
 const localWasmPack = join(npmDir, "node_modules", ".bin", "wasm-pack");
 const wasmPack = process.env.WASM_PACK ?? (existsSync(localWasmPack) ? localWasmPack : "wasm-pack");
 const rustupToolchains = join(homedir(), ".rustup", "toolchains");
-const stableBin = existsSync(rustupToolchains)
+const pinnedChannel = readFileSync(join(repoRoot, "rust-toolchain.toml"), "utf8")
+  .match(/^channel\s*=\s*"([^"]+)"/m)?.[1];
+if (!pinnedChannel) throw new Error("rust-toolchain.toml does not declare a channel");
+const channel = process.env.RUSTUP_TOOLCHAIN ?? pinnedChannel;
+const toolchainBin = existsSync(rustupToolchains)
   ? readdirSync(rustupToolchains)
-      .filter((d) => d.startsWith("stable-"))
+      .filter((d) => d === channel || d.startsWith(`${channel}-`))
       .map((d) => join(rustupToolchains, d, "bin"))
       .find((b) => existsSync(join(b, "cargo")))
   : undefined;
-const env = stableBin ? { ...process.env, PATH: `${stableBin}${delimiter}${process.env.PATH}` } : process.env;
+const env = toolchainBin ? { ...process.env, PATH: `${toolchainBin}${delimiter}${process.env.PATH}` } : process.env;
 const libraryDir =
   process.env.SYSMLV2_LIBRARY ??
   join(repoRoot, "spec-refs", "SysML-v2-Release", "sysml.library");
@@ -52,9 +56,44 @@ const run = (cmd, args, opts = {}) => {
 
 // 1. The package module (web target: explicit init(url) — works in
 // browsers, workers, and bundlers without wasm-aware config) and the
-// smoke-test module (nodejs target).
-run(wasmPack, ["build", crateDir, "--release", "--target", "web", "--out-dir", "npm/pkg", "--out-name", "sysmlv2"]);
-run(wasmPack, ["build", crateDir, "--release", "--target", "nodejs", "--out-dir", "npm/pkg-node", "--out-name", "sysmlv2"]);
+// smoke-test module (nodejs target). The linear memory is capped below
+// the wasm32 maximum: a runaway allocation then fails inside the module
+// (an error the host reports and a worker restart clears) instead of
+// growing until the browser kills the whole tab. The cap leaves ample
+// room above what the largest models and library snapshots use.
+const MAX_MEMORY_BYTES = 2 * 1024 * 1024 * 1024;
+// The module's stack is reserved explicitly rather than left at the
+// linker's default megabyte, which is below the depths the toolkit's
+// recursive passes bound themselves to — on this target running out of
+// stack traps instead of unwinding, so a bound the stack cannot hold is
+// a crash where the host expects a finding. The size is declared in the
+// crate, next to the reasoning, and read from there so the two cannot
+// drift; tests/stack.rs holds them together.
+const stackSizeBytes = (() => {
+  const src = readFileSync(join(crateDir, "src", "lib.rs"), "utf8");
+  const found = src.match(/pub const WASM_STACK_BYTES: usize = (\d+);/);
+  if (!found) throw new Error("WASM_STACK_BYTES not found in crates/sysmlv2-wasm/src/lib.rs");
+  return Number(found[1]);
+})();
+// The link flag goes in the wasm32-only rustflags variable, never the
+// global RUSTFLAGS: the packager inherits this environment when it installs
+// its helper binary for the host (a plain `cargo install`, no --target),
+// and the host linker rejects a wasm-only argument. Cargo reads exactly
+// one rustflags source, and a set (encoded) RUSTFLAGS wins over the
+// target variable, so any flags the caller exported are folded into the
+// target variable and removed from the environment wasm-pack sees.
+const encodedRustflags = process.env.CARGO_ENCODED_RUSTFLAGS?.split("\x1f") ?? [];
+const targetRustflags = [
+  ...encodedRustflags,
+  process.env.RUSTFLAGS,
+  process.env.CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS,
+  `-C link-arg=--max-memory=${MAX_MEMORY_BYTES}`,
+  `-C link-arg=-zstack-size=${stackSizeBytes}`,
+].filter(Boolean).join(" ");
+const { RUSTFLAGS: _rustflags, CARGO_ENCODED_RUSTFLAGS: _encoded, ...hostEnv } = env;
+const wasmEnv = { ...hostEnv, CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: targetRustflags };
+run(wasmPack, ["build", crateDir, "--release", "--target", "web", "--out-dir", "npm/pkg", "--out-name", "sysmlv2"], { env: wasmEnv });
+run(wasmPack, ["build", crateDir, "--release", "--target", "nodejs", "--out-dir", "npm/pkg-node", "--out-name", "sysmlv2"], { env: wasmEnv });
 
 // 2. Standard-library artifacts into the package. The shipped bundle
 // carries the ambient libraries (Web, Template, engine overlays,
@@ -72,10 +111,21 @@ run("cargo", ["run", "--release", "-p", "sysmlv2-wasm", "--bin", "gen_stdlib_bun
 // toolchain-path care as any wasm build on machines where another
 // cargo shadows rustup (CARGO / CARGO_TARGET_DIR are honored).
 const cargo = process.env.CARGO ?? "cargo";
+// The same stack reservation as the module above: the recursion bounds
+// and the trap-on-overflow behaviour are the target's, not the binding's.
+const wasiEnv = {
+  ...hostEnv,
+  CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS: [
+    ...encodedRustflags,
+    process.env.RUSTFLAGS,
+    process.env.CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS,
+    `-C link-arg=-zstack-size=${stackSizeBytes}`,
+  ].filter(Boolean).join(" "),
+};
 run(
   cargo,
   ["build", "-p", "sysmlv2-cli", "--no-default-features", "--features", "solve,viz", "--target", "wasm32-wasip1", "--profile", "wasi-release"],
-  { cwd: repoRoot }
+  { cwd: repoRoot, env: wasiEnv }
 );
 const targetDir = process.env.CARGO_TARGET_DIR
   ? resolve(repoRoot, process.env.CARGO_TARGET_DIR)
@@ -123,7 +173,8 @@ writeFileSync(pkgJsonPath, JSON.stringify(pkg, null, 2) + "\n");
 const distDir = join(crateDir, "npm", "dist");
 mkdirSync(distDir, { recursive: true });
 run("npm", ["pack", "--pack-destination", distDir], { cwd: join(crateDir, "npm", "pkg") });
-const packed = readdirSync(distDir).find((f) => f.endsWith(".tgz") && f.startsWith("sysml-wasm-"));
+// npm derives this filename from the scoped package identity. Never pick a
+// tarball by directory order: dist may also contain older package versions.
 const final = `sysml-wasm-${pkg.version}.tgz`;
-if (packed && packed !== final) renameSync(join(distDir, packed), join(distDir, final));
+if (!existsSync(join(distDir, final))) throw new Error(`npm pack did not produce ${final}`);
 console.log(`packaged: npm/dist/${final}`);

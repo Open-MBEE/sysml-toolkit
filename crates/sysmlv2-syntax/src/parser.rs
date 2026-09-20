@@ -30,17 +30,20 @@ pub struct Parse {
 }
 
 impl Parse {
+    #[must_use]
     pub fn has_errors(&self) -> bool {
         !self.diagnostics.is_empty()
     }
 }
 
 /// Parse a `.sysml` source text (root namespace, SysML dialect).
+#[must_use]
 pub fn parse_source(src: &str) -> Parse {
     parse_dialect(src, Dialect::Sysml)
 }
 
 /// Parse a `.kerml` source text (root namespace, KerML dialect).
+#[must_use]
 pub fn parse_kerml_source(src: &str) -> Parse {
     parse_dialect(src, Dialect::Kerml)
 }
@@ -60,12 +63,10 @@ pub struct ExprParse {
 /// an error. Expressions are shared between the dialects; the SysML
 /// reserved-word set applies, so reserved names need quoting (`'part'`
 /// stays a plain name in KerML but must be quoted here).
+#[must_use]
 pub fn parse_expression(src: &str) -> ExprParse {
-    let (all_tokens, mut diags) = tokenize(src);
-    let tokens: Vec<Token> = all_tokens
-        .into_iter()
-        .filter(|t| !t.kind.is_trivia())
-        .collect();
+    let (mut tokens, mut diags) = tokenize(src);
+    tokens.retain(|t| !t.kind.is_trivia());
     let mut p = Parser {
         src,
         tokens,
@@ -75,6 +76,9 @@ pub fn parse_expression(src: &str) -> ExprParse {
         meta_body: false,
         enum_body: false,
         semi_repair: SemiRepair::Off,
+        depth: 0,
+        expr_frames: 0,
+        expr_chain: 0,
     };
     let expr = p.parse_expr();
     if expr.is_some() && !p.at_eof() {
@@ -94,11 +98,34 @@ pub fn parse_expression(src: &str) -> ExprParse {
 }
 
 fn parse_dialect(src: &str, dialect: Dialect) -> Parse {
-    let (all_tokens, mut diags) = tokenize(src);
-    let tokens: Vec<Token> = all_tokens
-        .into_iter()
-        .filter(|t| !t.kind.is_trivia())
-        .collect();
+    parse_keeping_notes(src, dialect, None)
+}
+
+/// Parse and hand back the note tokens in source order, from the one
+/// tokenization the parse already does. The formatter needs the notes the
+/// parser drops as trivia, and re-lexing the file to recover them doubles
+/// the lexical work.
+pub(crate) fn parse_with_notes(src: &str, dialect: Dialect) -> (Parse, Vec<(Span, String)>) {
+    let mut notes = Vec::new();
+    let parse = parse_keeping_notes(src, dialect, Some(&mut notes));
+    (parse, notes)
+}
+
+fn parse_keeping_notes(
+    src: &str,
+    dialect: Dialect,
+    notes: Option<&mut Vec<(Span, String)>>,
+) -> Parse {
+    let (mut tokens, mut diags) = tokenize(src);
+    if let Some(notes) = notes {
+        notes.extend(
+            tokens
+                .iter()
+                .filter(|t| matches!(t.kind, TokenKind::LineNote | TokenKind::BlockNote))
+                .map(|t| (t.span, t.text(src).trim_end().to_string())),
+        );
+    }
+    tokens.retain(|t| !t.kind.is_trivia());
     let mut p = Parser {
         src,
         tokens,
@@ -108,6 +135,9 @@ fn parse_dialect(src: &str, dialect: Dialect) -> Parse {
         meta_body: false,
         enum_body: false,
         semi_repair: SemiRepair::Off,
+        depth: 0,
+        expr_frames: 0,
+        expr_chain: 0,
     };
     let unit = p.parse_root();
     diags.append(&mut p.diags);
@@ -115,6 +145,138 @@ fn parse_dialect(src: &str, dialect: Dialect) -> Parse {
         unit,
         diagnostics: diags,
     }
+}
+
+/// How deeply bodies and expressions may nest before the parser reports
+/// that the input is too deeply nested and stops descending.
+///
+/// Nesting is bounded because descending is recursive and running out of
+/// stack ends the process outright instead of producing a diagnostic. The
+/// number is above every depth the toolkit supports downstream — a name is
+/// resolved through at most sixty-four owners, and the published example
+/// and library models nest ten levels of braces — so it turns unbounded
+/// input into a diagnostic without standing in the way of a real model.
+///
+/// The bound assumes a stack it fits inside: [`MAX_NESTING_STACK_BYTES`].
+pub const MAX_NESTING: u32 = 128;
+
+/// The stack a thread needs to parse input nested to [`MAX_NESTING`].
+///
+/// A bound on the descent only turns unbounded input into a diagnostic
+/// where the stack reaches the bound. On a smaller one the process ends
+/// at some shallower depth the parser accepts — a stack overflow, which
+/// is an abort, not a diagnostic and not even an unwind — so a thread
+/// that parses has to hold the whole of what the parser admits.
+///
+/// Measured over the deepest input the bound admits: bodies nested to
+/// the bound cost the most, and which body is dearest shows only
+/// unoptimized — a flow's costs about ten and a half megabytes there,
+/// against about nine and three quarters for the part bodies the probes
+/// nest, while optimized both come in just under four. Nesting that
+/// carries a full operator chain at its deepest level costs a little
+/// less again. This is sized above the largest unoptimized figure, so
+/// it holds in either build.
+///
+/// A thread that does not ask for a stack gets two megabytes, which
+/// holds about seventy of the levels an optimized build admits and
+/// about two dozen unoptimized; [`on_parsing_stack`] is how a thread
+/// asks for this instead. Reserved address space only — pages are
+/// committed as the recursion touches them.
+pub const MAX_NESTING_STACK_BYTES: usize = 16 << 20;
+
+/// Run `work` on a thread holding [`MAX_NESTING_STACK_BYTES`], named
+/// `name`.
+///
+/// The nesting bound only turns unbounded input into a diagnostic on a
+/// stack that reaches the bound, and a thread that asks for no stack
+/// does not have one. Every entry point of this workspace that parses
+/// runs its work through here — the command line and the language
+/// server's loop — and the server's workspace worker reserves the same
+/// size on the thread it spawns.
+///
+/// An embedder's thread is not one of those: a library call parses on
+/// whichever thread makes it. One that may be handed deeply nested
+/// input can call this, or reserve the same size on a thread of its
+/// own.
+///
+/// Where no thread can be had — a target without them, a host that
+/// refuses one — `work` runs on the calling thread, which then reaches
+/// only as deep as that stack allows: input the bound admits can run the
+/// descent out of stack, and that ends the process outright, with no
+/// diagnostic and no unwind. A host that refused the thread is told so
+/// through `refused`, which is handed what the system said and reports it
+/// the way the caller's channel allows, before `work` runs. A target
+/// without threads is not a refusal and does not reach it.
+pub fn on_parsing_stack<T, F>(name: &str, refused: impl FnOnce(&std::io::Error), work: F) -> T
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    // The work is handed to the thread, so it cannot simply be called
+    // again where the thread never starts: the thread takes it from
+    // here, and it is still here when nothing took it.
+    let mut work = Some(work);
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let spawned = std::thread::scope(|scope| {
+            let slot = &mut work;
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .stack_size(MAX_NESTING_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    (slot.take().expect("the work is taken once"))()
+                })
+                .map(std::thread::ScopedJoinHandle::join)
+        });
+        match spawned {
+            Ok(Ok(value)) => return value,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            // No thread to be had: nothing took the work, so it runs
+            // here — on a stack that was not reserved, which is what the
+            // caller is told before the work starts.
+            Err(err) => refused(&err),
+        }
+    }
+    #[cfg(target_family = "wasm")]
+    let _ = (name, refused);
+    work.take().expect("no thread took the work")()
+}
+
+/// The most operators one leaning chain of an expression may spell.
+///
+/// Operators at one precedence level, feature-chain steps, indexes and
+/// `->` applications are all built iteratively, so no descent is charged
+/// for them — but the tree each builds leans one node deep per operator,
+/// and *walking* that tree recurses: dropping it, printing it, checking
+/// it, emitting it. An unbounded chain therefore exhausts the stack
+/// outside the parser, where there is no diagnostic to report.
+///
+/// The budget measures the longest chain of operators leaning on one
+/// another, not the number of nodes in the expression: a branch hanging
+/// off the chain — an operand on the right, one item of a sequence, one
+/// argument of an invocation, one member of a body — spells a chain of
+/// its own, and what an operator leans on is the longer of the two. So a
+/// thousand short operands cost what one of them costs, while a thousand
+/// operators stacked on one another are refused however they are spelled.
+/// The bound is far above the chain any written expression spells and far
+/// below the depth those walks can hold on the smallest stack the toolkit
+/// ships against.
+pub const MAX_EXPR_OPERATORS: u32 = 1024;
+
+thread_local! {
+    static ACCEPT_LOOKAHEAD_TOKENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Tokens the accept-member lookahead has read on this thread since this
+/// was last called, and reset the count to zero.
+///
+/// Classifying a member that begins with `accept` needs a look ahead for
+/// the transition shorthand's `then`. The scan is meant to stop within
+/// the member it classifies, whether or not that member is well formed;
+/// this reports what it actually read, so the cost can be pinned without
+/// timing the machine it runs on.
+pub fn take_accept_lookahead_tokens() -> u64 {
+    ACCEPT_LOOKAHEAD_TOKENS.with(|n| n.replace(0))
 }
 
 /// Words reserved by the SysML dialect (SysML.xtext ∪ KerMLExpressions.xtext).
@@ -390,9 +552,20 @@ struct Parser<'s> {
     /// an entirely empty usage followed by its terminating semicolon.
     enum_body: bool,
     semi_repair: SemiRepair,
+    /// How many bodies and expressions are open above the current one.
+    /// Both recurse, so both count against the same budget.
+    depth: u32,
+    /// How many expression frames are open above the current one. Zero at
+    /// the start of a member's outermost expression, which is where the
+    /// chain budget below is refilled.
+    expr_frames: u32,
+    /// How deep the expression completed at this position leans — the
+    /// longest chain of operators in it (see [`MAX_EXPR_OPERATORS`]).
+    expr_chain: u32,
 }
 
 /// Is `word` reserved in `dialect` (and thus unusable as a bare name)?
+#[must_use]
 pub fn is_reserved(dialect: Dialect, word: &str) -> bool {
     let table = match dialect {
         Dialect::Sysml => RESERVED,
@@ -723,8 +896,48 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_body_members(&mut self) -> Vec<Member> {
+        if self.depth >= MAX_NESTING {
+            self.error_here(format!(
+                "nesting is too deep (more than {MAX_NESTING} levels of bodies and expressions)"
+            ));
+            self.skip_to_body_close();
+            return Vec::new();
+        }
+        self.depth += 1;
+        let members = self.parse_body_members_inner();
+        self.depth -= 1;
+        members
+    }
+
+    /// Consume the rest of the current body, leaving its closing brace for
+    /// the caller. Used when the parser refuses to descend any further, so
+    /// that one diagnostic is reported instead of a cascade.
+    fn skip_to_body_close(&mut self) {
+        let mut depth = 0i32;
+        while !self.at_eof() {
+            match self.cur().kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    fn parse_body_members_inner(&mut self) -> Vec<Member> {
         let mut members = Vec::new();
+        // Members of a body are siblings: each spells a chain of its own
+        // rather than continuing the one its predecessor spelled, and the
+        // body leans as deep as its deepest member (see [`Self::branch`]).
+        let mut deepest = self.expr_chain;
         while !self.at(TokenKind::RBrace) && !self.at_eof() {
+            deepest = deepest.max(self.expr_chain);
+            self.expr_chain = 0;
             let before = self.pos;
             let diags_before = self.diags.len();
             match self.parse_member() {
@@ -806,6 +1019,7 @@ impl<'s> Parser<'s> {
                 }
             }
         }
+        self.expr_chain = deepest.max(self.expr_chain);
         members
     }
 
@@ -830,7 +1044,7 @@ impl<'s> Parser<'s> {
             let checkpoint = self.pos;
             self.bump();
             if self.at(TokenKind::LBracket) {
-                leading_then_multiplicity = self.parse_multiplicity().map(Box::new);
+                leading_then_multiplicity = self.parse_multiplicity();
             }
             let starts_full_member = self.at(TokenKind::Hash)
                 || self.at_kw("public")
@@ -873,7 +1087,10 @@ impl<'s> Parser<'s> {
                     prefix: UsagePrefix::default(),
                     kind: UsageKind::Succession,
                     declaration: FeatureDeclaration::default(),
-                    detail: UsageDetail::Succession { source, target },
+                    detail: UsageDetail::Succession {
+                        source: source.map(Box::new),
+                        target: Box::new(target),
+                    },
                     value: None,
                     is_parallel: false,
                     body,
@@ -1074,7 +1291,10 @@ impl<'s> Parser<'s> {
                 prefix: UsagePrefix::default(),
                 kind: UsageKind::Succession,
                 declaration: FeatureDeclaration::default(),
-                detail: UsageDetail::Succession { source, target },
+                detail: UsageDetail::Succession {
+                    source: source.map(Box::new),
+                    target: Box::new(target),
+                },
                 value: None,
                 is_parallel: false,
                 body,
@@ -1094,7 +1314,7 @@ impl<'s> Parser<'s> {
                     trigger: None,
                     guard: None,
                     effect: None,
-                    target: Some(target),
+                    target: Some(Box::new(target)),
                     is_default: true,
                 },
                 value: None,
@@ -1331,8 +1551,8 @@ impl<'s> Parser<'s> {
                 kind: UsageKind::Succession,
                 declaration: FeatureDeclaration::default(),
                 detail: UsageDetail::Succession {
-                    source: Some(source),
-                    target,
+                    source: Some(Box::new(source)),
+                    target: Box::new(target),
                 },
                 value: None,
                 is_parallel: false,
@@ -1351,9 +1571,9 @@ impl<'s> Parser<'s> {
                 detail: UsageDetail::Transition {
                     source: Some(source.target),
                     trigger: None,
-                    guard: Some(guard),
+                    guard: Some(Box::new(guard)),
                     effect: None,
-                    target: Some(target),
+                    target: Some(Box::new(target)),
                     is_default: false,
                 },
                 value: None,
@@ -1415,9 +1635,9 @@ impl<'s> Parser<'s> {
                 detail: UsageDetail::Transition {
                     source: None,
                     trigger: None,
-                    guard: Some(cond),
+                    guard: Some(Box::new(cond)),
                     effect,
-                    target: Some(target),
+                    target: Some(Box::new(target)),
                     is_default: false,
                 },
                 value: None,
@@ -1434,28 +1654,151 @@ impl<'s> Parser<'s> {
     /// `;`/`{` after the payload) rather than a transition shorthand
     /// (`accept … then …`)? Scan ahead for `then`/`if`/`do` before the
     /// terminator.
+    ///
+    /// A brace only nests where an expression may spell one: the
+    /// body-expression argument of an operator applied through `->`
+    /// (`xs->exists { in x; x > 0 }`), or an operand position inside a
+    /// trigger or value expression. A brace anywhere a complete expression
+    /// has just ended — after a name, a literal or a closing bracket —
+    /// opens the node's own body and ends the scan.
+    ///
+    /// Only a brace can hold a `;`, so an unclosed `(` or `[` never
+    /// carries the scan past the member's own terminator, and a run of
+    /// members that each leave a bracket open costs time linear in the
+    /// body rather than quadratic. Unclosed braces are bounded instead by
+    /// the nesting the parser will descend at all: past that the input is
+    /// refused whichever way this classifies it. Within those bounds the
+    /// scan is not truncated by a token count — an arbitrarily long
+    /// trigger is still classified from its own tokens.
     fn accept_is_node(&self) -> bool {
-        let mut i = 1;
-        let mut depth = 0i32;
+        let mut scanned = 1;
+        let is_node = self.accept_node_scan(&mut scanned);
+        ACCEPT_LOOKAHEAD_TOKENS.with(|n| n.set(n.get().saturating_add(scanned as u64)));
+        is_node
+    }
+
+    /// The scan itself, leaving the token it stopped at in `i` so its cost
+    /// can be observed (see [`take_accept_lookahead_tokens`]).
+    fn accept_node_scan(&self, i: &mut usize) -> bool {
+        #[derive(PartialEq, Eq, Clone, Copy)]
+        enum ArrowRef {
+            /// Not in the target reference of `->`.
+            No,
+            /// A name is expected next: just after `->`, `::`, `.` or the
+            /// global-scope root `$`.
+            Expect,
+            /// The last token was one of the reference's names.
+            InName,
+        }
+
+        // Expression braces the scan has entered, and parentheses and
+        // brackets within them. They are counted apart because a `;` ends
+        // the member wherever a brace is not holding it.
+        let mut braces = 0i32;
+        let mut groups = 0i32;
+        // Whether a `{` at this point would open an expression rather than
+        // the node's own body.
+        let mut expr_brace = false;
+        // Where in the target reference of `->` the scan stands. The
+        // reference names the operator whose argument may be a body
+        // expression, and its own words are not member keywords.
+        let mut arrow = ArrowRef::No;
         loop {
-            let t = self.nth(i);
+            let t = self.nth(*i);
             match t.kind {
                 TokenKind::Eof => return true,
-                TokenKind::Semi | TokenKind::LBrace if depth == 0 => return true,
-                TokenKind::LParen | TokenKind::LBracket => depth += 1,
-                TokenKind::RParen | TokenKind::RBracket => depth -= 1,
-                TokenKind::Ident if depth == 0 => {
+                TokenKind::Semi if braces == 0 => return true,
+                TokenKind::LBrace if braces == 0 && groups == 0 && !expr_brace => return true,
+                TokenKind::RBrace if braces == 0 => return true,
+                TokenKind::LBrace => {
+                    braces += 1;
+                    if braces > MAX_NESTING as i32 {
+                        return true;
+                    }
+                }
+                TokenKind::RBrace => braces -= 1,
+                TokenKind::LParen | TokenKind::LBracket => groups += 1,
+                TokenKind::RParen | TokenKind::RBracket if groups > 0 => groups -= 1,
+                TokenKind::Ident if braces == 0 && groups == 0 && arrow != ArrowRef::Expect => {
                     let text = t.text(self.src);
-                    if text == "then" || text == "if" || text == "do" {
+                    // `if` is the shorthand's guard only where a complete
+                    // expression has just ended. Where an operand is
+                    // expected instead it opens a conditional expression
+                    // — the trigger, the `via` expression and a payload's
+                    // value are all parsed as full expressions, and each
+                    // admits one — so the same state that says whether a
+                    // brace would open an expression says whether this
+                    // `if` does.
+                    if text == "then" || text == "do" || (text == "if" && !expr_brace) {
                         return false;
                     }
                 }
                 _ => {}
             }
-            i += 1;
-            if i > 200 {
-                return true;
+            // What a `{` would mean *after* this token.
+            match t.kind {
+                TokenKind::Arrow => {
+                    arrow = ArrowRef::Expect;
+                    expr_brace = false;
+                }
+                // A target reference continues through a qualification, a
+                // feature-chain step, and the global-scope root it may
+                // start from: `->f.g { … }`, `->$::Q::exists { … }`.
+                TokenKind::ColonColon | TokenKind::Dot if arrow == ArrowRef::InName => {
+                    arrow = ArrowRef::Expect;
+                    expr_brace = false;
+                }
+                TokenKind::Dollar if arrow == ArrowRef::Expect => {
+                    arrow = ArrowRef::InName;
+                    expr_brace = true;
+                }
+                TokenKind::Ident | TokenKind::UnrestrictedName => {
+                    expr_brace = if arrow == ArrowRef::Expect {
+                        arrow = ArrowRef::InName;
+                        true
+                    } else {
+                        arrow = ArrowRef::No;
+                        // Words an operand follows: the trigger and `via`
+                        // clauses introduce one, `else` continues a
+                        // conditional expression with one, and the
+                        // word-spelled operators take one the way their
+                        // symbolic spellings do. The classification words
+                        // (`as`, `istype`, `hastype`, `meta`) and `all`
+                        // take a type name instead, where a brace cannot
+                        // stand, so they are not here.
+                        matches!(
+                            t.text(self.src),
+                            "at" | "after"
+                                | "when"
+                                | "via"
+                                | "else"
+                                | "and"
+                                | "or"
+                                | "xor"
+                                | "implies"
+                                | "not"
+                        )
+                    };
+                }
+                TokenKind::String
+                | TokenKind::Decimal
+                | TokenKind::Exp
+                | TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::RBrace
+                | TokenKind::LBrace => {
+                    arrow = ArrowRef::No;
+                    expr_brace = false;
+                }
+                // Operators, separators and openers all leave an operand
+                // expected, and an expression may spell that operand as a
+                // body.
+                _ => {
+                    arrow = ArrowRef::No;
+                    expr_brace = true;
+                }
             }
+            *i += 1;
         }
     }
 
@@ -1520,9 +1863,9 @@ impl<'s> Parser<'s> {
             detail: UsageDetail::Transition {
                 source,
                 trigger,
-                guard,
+                guard: guard.map(Box::new),
                 effect,
-                target: Some(target),
+                target: Some(Box::new(target)),
                 is_default: false,
             },
             value: None,
@@ -1580,9 +1923,9 @@ impl<'s> Parser<'s> {
             detail: UsageDetail::Transition {
                 source,
                 trigger,
-                guard,
+                guard: guard.map(Box::new),
                 effect,
-                target: Some(target),
+                target: Some(Box::new(target)),
                 is_default: false,
             },
             value: None,
@@ -1619,7 +1962,11 @@ impl<'s> Parser<'s> {
                 prefix: UsagePrefix::default(),
                 kind: UsageKind::Send,
                 declaration: FeatureDeclaration::default(),
-                detail: UsageDetail::Send { payload, via, to },
+                detail: UsageDetail::Send {
+                    payload: payload.map(Box::new),
+                    via: via.map(Box::new),
+                    to: to.map(Box::new),
+                },
                 value: None,
                 is_parallel: false,
                 body,
@@ -1657,7 +2004,10 @@ impl<'s> Parser<'s> {
                 prefix: UsagePrefix::default(),
                 kind: UsageKind::Assign,
                 declaration: FeatureDeclaration::default(),
-                detail: UsageDetail::Assign { target, value },
+                detail: UsageDetail::Assign {
+                    target: Box::new(target),
+                    value: Box::new(value),
+                },
                 value: None,
                 is_parallel: false,
                 body,
@@ -1677,7 +2027,11 @@ impl<'s> Parser<'s> {
                     prefix: UsagePrefix::default(),
                     kind: UsageKind::Send,
                     declaration,
-                    detail: UsageDetail::Send { payload, via, to },
+                    detail: UsageDetail::Send {
+                        payload: payload.map(Box::new),
+                        via: via.map(Box::new),
+                        to: to.map(Box::new),
+                    },
                     value: None,
                     is_parallel: false,
                     body,
@@ -1714,8 +2068,8 @@ impl<'s> Parser<'s> {
                     kind: UsageKind::Assign,
                     declaration,
                     detail: UsageDetail::Assign {
-                        target,
-                        value: assigned,
+                        target: Box::new(target),
+                        value: Box::new(assigned),
                     },
                     value: None,
                     is_parallel: false,
@@ -1760,7 +2114,7 @@ impl<'s> Parser<'s> {
             Some(ConnectorEnd {
                 multiplicity,
                 name: None,
-                target: TargetRef::Chain(Vec::new()),
+                target: TargetRef::unspelled(),
             })
         } else {
             None
@@ -1995,7 +2349,7 @@ impl<'s> Parser<'s> {
         self.expect_kw("multiplicity");
         let id = self.parse_identification();
         let (subsets, range) = if self.at(TokenKind::LBracket) {
-            (None, self.parse_multiplicity())
+            (None, self.parse_multiplicity().map(|m| *m))
         } else {
             if !self.eat(TokenKind::ColonGt) {
                 self.expect_kw("subsets");
@@ -2414,8 +2768,8 @@ impl<'s> Parser<'s> {
             self.expect_kw("then");
             let target = self.parse_connector_end()?;
             UsageDetail::Succession {
-                source: Some(source),
-                target,
+                source: Some(Box::new(source)),
+                target: Box::new(target),
             }
         } else {
             UsageDetail::None
@@ -3147,7 +3501,9 @@ impl<'s> Parser<'s> {
                     usage_prefix,
                     UsageKind::Terminate,
                     FeatureDeclaration::default(),
-                    UsageDetail::Terminate { target },
+                    UsageDetail::Terminate {
+                        target: target.map(Box::new),
+                    },
                 )
                 .map(MemberKind::Usage);
         }
@@ -3356,7 +3712,8 @@ impl<'s> Parser<'s> {
         })
     }
 
-    /// Like [`parse_body`] but distinguishes `None` (`;`) from parse failure.
+    /// Like [`Parser::parse_brace_body`] but distinguishes `None` (a `;`
+    /// body) from a parse failure.
     fn parse_body_or_semi(&mut self) -> Option<Option<Vec<Member>>> {
         self.parse_body_or_semi_ctx(false, false)
     }
@@ -3471,7 +3828,9 @@ impl<'s> Parser<'s> {
                     prefix,
                     UsageKind::Terminate,
                     declaration,
-                    UsageDetail::Terminate { target },
+                    UsageDetail::Terminate {
+                        target: target.map(Box::new),
+                    },
                 );
             }
         }
@@ -3566,9 +3925,9 @@ impl<'s> Parser<'s> {
                 detail: UsageDetail::Transition {
                     source: Some(source.target),
                     trigger: None,
-                    guard: Some(guard),
+                    guard: Some(Box::new(guard)),
                     effect: None,
-                    target: Some(target),
+                    target: Some(Box::new(target)),
                     is_default: false,
                 },
                 value: None,
@@ -3584,8 +3943,8 @@ impl<'s> Parser<'s> {
             kind: UsageKind::Succession,
             declaration,
             detail: UsageDetail::Succession {
-                source: Some(source),
-                target,
+                source: Some(Box::new(source)),
+                target: Box::new(target),
             },
             value: None,
             is_parallel: false,
@@ -3646,7 +4005,7 @@ impl<'s> Parser<'s> {
         };
         let detail = if payload.is_some() || source.is_some() {
             UsageDetail::Flow {
-                payload,
+                payload: payload.map(Box::new),
                 source,
                 target,
             }
@@ -3965,9 +4324,9 @@ impl<'s> Parser<'s> {
             None
         };
         Some(UsageDetail::Accept {
-            payload,
-            trigger,
-            via,
+            payload: Box::new(payload),
+            trigger: trigger.map(Box::new),
+            via: via.map(Box::new),
         })
     }
 
@@ -4006,7 +4365,11 @@ impl<'s> Parser<'s> {
             prefix,
             kind: UsageKind::Send,
             declaration,
-            detail: UsageDetail::Send { payload, via, to },
+            detail: UsageDetail::Send {
+                payload: payload.map(Box::new),
+                via: via.map(Box::new),
+                to: to.map(Box::new),
+            },
             value: None,
             is_parallel: false,
             body,
@@ -4026,7 +4389,10 @@ impl<'s> Parser<'s> {
             prefix,
             kind: UsageKind::Assign,
             declaration,
-            detail: UsageDetail::Assign { target, value },
+            detail: UsageDetail::Assign {
+                target: Box::new(target),
+                value: Box::new(value),
+            },
             value: None,
             is_parallel: false,
             body,
@@ -4052,6 +4418,31 @@ impl<'s> Parser<'s> {
         })
     }
 
+    /// Just after `else`: does a nested if-node follow rather than an
+    /// anonymous action body? An if-node reaches its `if` keyword before any
+    /// body brace, however it is prefixed (`else if`, `else action a if`,
+    /// `else #Meta if`); an action-body parameter reaches the brace first.
+    /// Type arguments are balanced so an `if` inside a declaration's
+    /// parenthesised or bracketed parts does not count.
+    fn else_starts_if_node(&self) -> bool {
+        let mut i = 0;
+        let mut depth = 0i32;
+        loop {
+            let t = self.nth(i);
+            match t.kind {
+                TokenKind::Eof => return false,
+                TokenKind::LBrace | TokenKind::RBrace | TokenKind::Semi if depth == 0 => {
+                    return false;
+                }
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket if depth > 0 => depth -= 1,
+                TokenKind::Ident if depth == 0 && t.is_kw(self.src, "if") => return true,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
     /// After `if <cond>` where an action body follows.
     fn parse_if_node_rest(
         &mut self,
@@ -4062,20 +4453,36 @@ impl<'s> Parser<'s> {
         let then_body = Box::new(self.parse_action_body_parameter()?);
         let else_body = if self.eat_kw("else") {
             // Both alternatives may start with `action`: an action-body
-            // parameter, or a nested IfNode carrying its full
-            // ActionNodePrefix. Try the complete node first, then roll back
-            // cleanly to the anonymous-action-body alternative.
-            let checkpoint = self.pos;
-            let diags = self.diags.len();
-            let nested_if = match self.parse_definition_or_usage() {
-                Some(MemberKind::Usage(u)) if u.kind == UsageKind::IfNode => Some(u),
-                _ => None,
-            };
-            if let Some(nested_if) = nested_if {
-                Some(Box::new(nested_if))
+            // parameter, or a nested if-node carrying its full action node
+            // prefix. The `if` keyword that a nested node must reach before
+            // its body brace decides between them, so the alternative is
+            // chosen before parsing — parsing the branch speculatively and
+            // rolling back would re-parse every nested `else action { … }`
+            // level once per level.
+            if self.else_starts_if_node() {
+                let checkpoint = self.pos;
+                let diags = self.diags.len();
+                // An else-if nests an action without an enclosing body.
+                // Charge this edge too, before entering its parser frames.
+                if self.depth >= MAX_NESTING {
+                    self.refuse_deeper(format!(
+                        "nesting is too deep (more than {MAX_NESTING} levels of bodies and expressions)"
+                    ));
+                    return None;
+                }
+                self.depth += 1;
+                let nested = self.parse_definition_or_usage();
+                self.depth -= 1;
+                match nested {
+                    None => return None,
+                    Some(MemberKind::Usage(u)) if u.kind == UsageKind::IfNode => Some(Box::new(u)),
+                    _ => {
+                        self.pos = checkpoint;
+                        self.diags.truncate(diags);
+                        Some(Box::new(self.parse_action_body_parameter()?))
+                    }
+                }
             } else {
-                self.pos = checkpoint;
-                self.diags.truncate(diags);
                 Some(Box::new(self.parse_action_body_parameter()?))
             }
         } else {
@@ -4089,7 +4496,7 @@ impl<'s> Parser<'s> {
             kind: UsageKind::IfNode,
             declaration,
             detail: UsageDetail::IfNode {
-                cond,
+                cond: Box::new(cond),
                 then_body,
                 else_body,
             },
@@ -4118,7 +4525,11 @@ impl<'s> Parser<'s> {
             prefix,
             kind: UsageKind::WhileLoop,
             declaration,
-            detail: UsageDetail::WhileLoop { cond, body, until },
+            detail: UsageDetail::WhileLoop {
+                cond: cond.map(Box::new),
+                body,
+                until: until.map(Box::new),
+            },
             value: None,
             is_parallel: false,
             body: None,
@@ -4139,7 +4550,11 @@ impl<'s> Parser<'s> {
             prefix,
             kind: UsageKind::ForLoop,
             declaration,
-            detail: UsageDetail::ForLoop { var, seq, body },
+            detail: UsageDetail::ForLoop {
+                var: Box::new(var),
+                seq: Box::new(seq),
+                body,
+            },
             value: None,
             is_parallel: false,
             body: None,
@@ -4277,7 +4692,9 @@ impl<'s> Parser<'s> {
         }
     }
 
-    fn parse_multiplicity(&mut self) -> Option<Multiplicity> {
+    /// Boxed: a multiplicity holds two expressions inline, and every
+    /// declaration that can carry one would otherwise pay for them.
+    fn parse_multiplicity(&mut self) -> Option<Box<Multiplicity>> {
         let start = self.cur().span;
         self.expect(TokenKind::LBracket, "`[`")?;
         let Some(first) = self.parse_mult_bound() else {
@@ -4295,11 +4712,11 @@ impl<'s> Parser<'s> {
         };
         let end = self.cur().span;
         self.expect(TokenKind::RBracket, "`]` closing multiplicity");
-        Some(Multiplicity {
+        Some(Box::new(Multiplicity {
             lower,
             upper,
             span: start.join(end),
-        })
+        }))
     }
 
     /// After a malformed multiplicity bound, skip to (and past) the `]`
@@ -4381,7 +4798,9 @@ impl<'s> Parser<'s> {
         None
     }
 
-    fn parse_value_part(&mut self) -> Option<FeatureValue> {
+    /// Boxed: a feature value holds an expression inline, and every
+    /// usage carries the slot whether or not it has a value.
+    fn parse_value_part(&mut self) -> Option<Box<FeatureValue>> {
         let kind = if self.eat(TokenKind::Eq) {
             ValueKind::Bound
         } else if self.eat(TokenKind::ColonEq) {
@@ -4397,24 +4816,80 @@ impl<'s> Parser<'s> {
             return None;
         };
         let expr = self.parse_expr()?;
-        Some(FeatureValue { kind, expr })
+        Some(Box::new(FeatureValue { kind, expr }))
     }
 
     // ---- expressions (KerML Expressions grammar, precedence climbing) ----
 
     pub(crate) fn parse_expr(&mut self) -> Option<Expr> {
-        self.parse_conditional()
+        self.descend(Self::parse_conditional)
+    }
+
+    /// Take one expression-nesting step, running `parse` one level down.
+    ///
+    /// Every recursive expression path goes through here, so the bound is
+    /// charged wherever the parser descends — including the
+    /// right-associative exponentiation recursion, which does not return
+    /// through [`Self::parse_expr`].
+    fn descend(&mut self, parse: fn(&mut Self) -> Option<Expr>) -> Option<Expr> {
+        if self.depth >= MAX_NESTING {
+            self.refuse_deeper(format!(
+                "nesting is too deep (more than {MAX_NESTING} levels of bodies and expressions)"
+            ));
+            return None;
+        }
+        if self.expr_frames == 0 {
+            self.expr_chain = 0;
+        }
+        self.depth += 1;
+        self.expr_frames += 1;
+        let expr = parse(self);
+        self.expr_frames -= 1;
+        self.depth -= 1;
+        expr
+    }
+
+    /// Report that the parser will not take this expression any further,
+    /// and abandon the rest of it.
+    ///
+    /// One diagnostic per truncated subtree, as on the body path: the text
+    /// that will not be parsed is consumed here, so it does not reach the
+    /// member loop as a run of stray tokens each reported again.
+    fn refuse_deeper(&mut self, message: String) {
+        self.error_here(message);
+        self.skip_to_member_end();
+    }
+
+    /// Consume the rest of the current member, leaving its `;` — or the
+    /// closing brace of the enclosing body — for the caller. Brackets and
+    /// parentheses opened before this point were consumed by the frames
+    /// being abandoned, so a closer with no opener here belongs to the
+    /// abandoned text.
+    fn skip_to_member_end(&mut self) {
+        let mut depth = 0i32;
+        while !self.at_eof() {
+            match self.cur().kind {
+                TokenKind::Semi if depth == 0 => return,
+                TokenKind::RBrace if depth == 0 => return,
+                TokenKind::LBrace | TokenKind::LBracket | TokenKind::LParen => depth += 1,
+                TokenKind::RBrace | TokenKind::RBracket | TokenKind::RParen => {
+                    depth = (depth - 1).max(0);
+                }
+                _ => {}
+            }
+            self.bump();
+        }
     }
 
     fn parse_conditional(&mut self) -> Option<Expr> {
         if self.at_kw("if") {
             let start = self.cur().span;
             self.bump();
-            let cond = self.parse_null_coalescing()?;
+            let cond = self.branch(Self::parse_null_coalescing)?;
             self.expect(TokenKind::Question, "`?` in conditional expression");
-            let then_branch = self.parse_expr()?;
+            let then_branch = self.branch(Self::parse_expr)?;
             self.expect_kw("else");
-            let else_branch = self.parse_expr()?;
+            let else_branch = self.branch(Self::parse_expr)?;
             let span = start.join(else_branch.span);
             return Some(Expr {
                 kind: ExprKind::Conditional {
@@ -4428,23 +4903,57 @@ impl<'s> Parser<'s> {
         self.parse_null_coalescing()
     }
 
-    fn mk_binary(&self, op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+    /// Charge `links` more operators to the chain that leads here, and
+    /// refuse to build it any longer once it passes
+    /// [`MAX_EXPR_OPERATORS`].
+    fn charge_chain(&mut self, links: u32) -> Option<()> {
+        self.expr_chain = self.expr_chain.saturating_add(links);
+        if self.expr_chain > MAX_EXPR_OPERATORS {
+            self.refuse_deeper(format!(
+                "expression has a chain of more than {MAX_EXPR_OPERATORS} operators"
+            ));
+            return None;
+        }
+        Some(())
+    }
+
+    /// Run `parse` as a branch hanging off the current chain rather than
+    /// as a continuation of it: an operand on the right, one item of a
+    /// sequence, one argument, one member of a body.
+    ///
+    /// The branch spells a chain of its own, so it starts from an empty
+    /// budget — siblings do not charge each other. What it reaches is
+    /// then folded back with a maximum, because the node that owns both
+    /// leans on whichever side is longer: a branch deeper than the chain
+    /// it hangs from keeps the whole expression's operators charged to
+    /// everything built above it.
+    fn branch<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> T {
+        let chain = std::mem::take(&mut self.expr_chain);
+        let parsed = parse(self);
+        self.expr_chain = chain.max(self.expr_chain);
+        parsed
+    }
+
+    /// Build one binary node, charging it against the chain budget (see
+    /// [`MAX_EXPR_OPERATORS`]).
+    fn mk_binary(&mut self, op: BinaryOp, lhs: Expr, rhs: Expr) -> Option<Expr> {
+        self.charge_chain(1)?;
         let span = lhs.span.join(rhs.span);
-        Expr {
+        Some(Expr {
             kind: ExprKind::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             },
             span,
-        }
+        })
     }
 
     fn parse_null_coalescing(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_implies()?;
         while self.eat(TokenKind::QuestionQuestion) {
-            let rhs = self.parse_implies()?;
-            lhs = self.mk_binary(BinaryOp::NullCoalescing, lhs, rhs);
+            let rhs = self.branch(Self::parse_implies)?;
+            lhs = self.mk_binary(BinaryOp::NullCoalescing, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4452,8 +4961,8 @@ impl<'s> Parser<'s> {
     fn parse_implies(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_or()?;
         while self.eat_kw("implies") {
-            let rhs = self.parse_or()?;
-            lhs = self.mk_binary(BinaryOp::Implies, lhs, rhs);
+            let rhs = self.branch(Self::parse_or)?;
+            lhs = self.mk_binary(BinaryOp::Implies, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4468,8 +4977,8 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             };
-            let rhs = self.parse_xor()?;
-            lhs = self.mk_binary(op, lhs, rhs);
+            let rhs = self.branch(Self::parse_xor)?;
+            lhs = self.mk_binary(op, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4477,8 +4986,8 @@ impl<'s> Parser<'s> {
     fn parse_xor(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_and()?;
         while self.eat_kw("xor") {
-            let rhs = self.parse_and()?;
-            lhs = self.mk_binary(BinaryOp::Xor, lhs, rhs);
+            let rhs = self.branch(Self::parse_and)?;
+            lhs = self.mk_binary(BinaryOp::Xor, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4493,8 +5002,8 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             };
-            let rhs = self.parse_equality()?;
-            lhs = self.mk_binary(op, lhs, rhs);
+            let rhs = self.branch(Self::parse_equality)?;
+            lhs = self.mk_binary(op, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4513,8 +5022,8 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             };
-            let rhs = self.parse_classification()?;
-            lhs = self.mk_binary(op, lhs, rhs);
+            let rhs = self.branch(Self::parse_classification)?;
+            lhs = self.mk_binary(op, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4552,7 +5061,7 @@ impl<'s> Parser<'s> {
                 kind: ExprKind::Classification {
                     op,
                     operand: None,
-                    ty,
+                    ty: Box::new(ty),
                 },
                 span,
             }
@@ -4571,12 +5080,13 @@ impl<'s> Parser<'s> {
         {
             let op = self.classification_op()?;
             let ty = self.parse_target_ref()?;
+            self.charge_chain(1)?;
             let span = lhs.span.join(ty.span());
             lhs = Expr {
                 kind: ExprKind::Classification {
                     op,
                     operand: Some(Box::new(lhs)),
-                    ty,
+                    ty: Box::new(ty),
                 },
                 span,
             };
@@ -4598,8 +5108,8 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             };
-            let rhs = self.parse_range()?;
-            lhs = self.mk_binary(op, lhs, rhs);
+            let rhs = self.branch(Self::parse_range)?;
+            lhs = self.mk_binary(op, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4607,8 +5117,8 @@ impl<'s> Parser<'s> {
     fn parse_range(&mut self) -> Option<Expr> {
         let lhs = self.parse_additive()?;
         if self.eat(TokenKind::DotDot) {
-            let rhs = self.parse_additive()?;
-            return Some(self.mk_binary(BinaryOp::Range, lhs, rhs));
+            let rhs = self.branch(Self::parse_additive)?;
+            return self.mk_binary(BinaryOp::Range, lhs, rhs);
         }
         Some(lhs)
     }
@@ -4623,8 +5133,8 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             };
-            let rhs = self.parse_multiplicative()?;
-            lhs = self.mk_binary(op, lhs, rhs);
+            let rhs = self.branch(Self::parse_multiplicative)?;
+            lhs = self.mk_binary(op, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4642,8 +5152,8 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             };
-            let rhs = self.parse_exponentiation()?;
-            lhs = self.mk_binary(op, lhs, rhs);
+            let rhs = self.branch(Self::parse_exponentiation)?;
+            lhs = self.mk_binary(op, lhs, rhs)?;
         }
         Some(lhs)
     }
@@ -4666,9 +5176,10 @@ impl<'s> Parser<'s> {
         } else {
             return Some(lhs);
         };
-        // Right-associative.
-        let rhs = self.parse_exponentiation()?;
-        Some(self.mk_binary(op, lhs, rhs))
+        // Right-associative: the recursion is this operator's right
+        // operand, one level further down, and is charged as such.
+        let rhs = self.branch(|p| p.descend(Self::parse_exponentiation))?;
+        self.mk_binary(op, lhs, rhs)
     }
 
     fn parse_unary(&mut self) -> Option<Expr> {
@@ -4706,7 +5217,7 @@ impl<'s> Parser<'s> {
             let ty = self.parse_target_ref()?;
             let span = start.join(ty.span());
             return Some(Expr {
-                kind: ExprKind::Extent { ty },
+                kind: ExprKind::Extent { ty: Box::new(ty) },
                 span,
             });
         }
@@ -4719,10 +5230,11 @@ impl<'s> Parser<'s> {
             if self.at(TokenKind::Dot) {
                 // `.{ body }` = collect; `.metadata` = metadata access;
                 // otherwise a feature-chain step.
+                self.charge_chain(1)?;
                 match self.nth(1).kind {
                     TokenKind::LBrace | TokenKind::Semi => {
                         self.bump();
-                        let body = self.parse_body_expr()?;
+                        let body = self.branch(Self::parse_body_expr)?;
                         let span = expr.span.join(body.span);
                         expr = Expr {
                             kind: ExprKind::Collect {
@@ -4733,19 +5245,28 @@ impl<'s> Parser<'s> {
                         };
                     }
                     _ if self.nth_kw(1, "metadata") => {
-                        if let ExprKind::Ref(qn) = expr.kind.clone() {
-                            self.bump();
-                            let end = self.bump().span;
-                            expr = Expr {
-                                kind: ExprKind::MetadataAccess { target: qn },
-                                span: expr.span.join(end),
-                            };
-                        } else {
-                            self.error_here(
-                                "`.metadata` requires an element reference on the left".to_string(),
-                            );
-                            self.bump();
-                            self.bump();
+                        // Move the left operand out rather than copying it:
+                        // a chain of suffixes would clone everything parsed
+                        // so far at each `.metadata`.
+                        let span = expr.span;
+                        match expr.kind {
+                            ExprKind::Ref(qn) => {
+                                self.bump();
+                                let end = self.bump().span;
+                                expr = Expr {
+                                    kind: ExprKind::MetadataAccess { target: qn },
+                                    span: span.join(end),
+                                };
+                            }
+                            kind => {
+                                self.error_here(
+                                    "`.metadata` requires an element reference on the left"
+                                        .to_string(),
+                                );
+                                self.bump();
+                                self.bump();
+                                expr = Expr { kind, span };
+                            }
                         }
                     }
                     _ => {
@@ -4762,8 +5283,9 @@ impl<'s> Parser<'s> {
                     }
                 }
             } else if self.at(TokenKind::DotQuestion) {
+                self.charge_chain(1)?;
                 self.bump();
-                let body = self.parse_body_expr()?;
+                let body = self.branch(Self::parse_body_expr)?;
                 let span = expr.span.join(body.span);
                 expr = Expr {
                     kind: ExprKind::Select {
@@ -4773,9 +5295,10 @@ impl<'s> Parser<'s> {
                     span,
                 };
             } else if self.at(TokenKind::Hash) && self.nth(1).kind == TokenKind::LParen {
+                self.charge_chain(1)?;
                 self.bump();
                 self.bump();
-                let index = self.parse_sequence_expr()?;
+                let index = self.branch(Self::parse_sequence_expr)?;
                 let end = self.cur().span;
                 self.expect(TokenKind::RParen, "`)` closing index");
                 expr = Expr {
@@ -4786,8 +5309,9 @@ impl<'s> Parser<'s> {
                     },
                 };
             } else if self.at(TokenKind::LBracket) {
+                self.charge_chain(1)?;
                 self.bump();
-                let arg = self.parse_sequence_expr()?;
+                let arg = self.branch(Self::parse_sequence_expr)?;
                 let end = self.cur().span;
                 self.expect(TokenKind::RBracket, "`]`");
                 expr = Expr {
@@ -4798,14 +5322,15 @@ impl<'s> Parser<'s> {
                     },
                 };
             } else if self.at(TokenKind::Arrow) {
+                self.charge_chain(1)?;
                 self.bump();
                 let ty = self.parse_target_ref()?;
                 let args = if self.at(TokenKind::LBrace)
                     || (self.dialect == Dialect::Sysml && self.at(TokenKind::Semi))
                 {
-                    ArrowArgs::Body(Box::new(self.parse_body_expr()?))
+                    ArrowArgs::Body(Box::new(self.branch(Self::parse_body_expr)?))
                 } else if self.at(TokenKind::LParen) {
-                    ArrowArgs::List(self.parse_argument_list()?)
+                    ArrowArgs::List(self.branch(Self::parse_argument_list)?)
                 } else {
                     ArrowArgs::FunctionRef(self.parse_qualified_name()?)
                 };
@@ -4813,7 +5338,7 @@ impl<'s> Parser<'s> {
                 expr = Expr {
                     kind: ExprKind::Arrow {
                         target: Box::new(expr),
-                        ty,
+                        ty: Box::new(ty),
                         args,
                     },
                     span,
@@ -4866,10 +5391,13 @@ impl<'s> Parser<'s> {
         if self.at_kw("new") {
             self.bump();
             let ty = self.parse_target_ref()?;
-            let args = self.parse_argument_list()?;
+            let args = self.branch(Self::parse_argument_list)?;
             let span = start.join(self.prev_end_span());
             return Some(Expr {
-                kind: ExprKind::Constructor { ty, args },
+                kind: ExprKind::Constructor {
+                    ty: Box::new(ty),
+                    args,
+                },
                 span,
             });
         }
@@ -4906,25 +5434,27 @@ impl<'s> Parser<'s> {
         if self.at_name() || self.at(TokenKind::Dollar) {
             let target = self.parse_target_ref()?;
             if self.at(TokenKind::LParen) {
-                let args = self.parse_argument_list()?;
+                let args = self.branch(Self::parse_argument_list)?;
                 let span = start.join(self.prev_end_span());
                 return Some(Expr {
-                    kind: ExprKind::Invocation { ty: target, args },
+                    kind: ExprKind::Invocation {
+                        ty: Box::new(target),
+                        args,
+                    },
                     span,
                 });
             }
-            return Some(match target {
-                TargetRef::Name(qn) => Expr {
+            return match target {
+                TargetRef::Name(qn) => Some(Expr {
                     span: qn.span,
                     kind: ExprKind::Ref(qn),
-                },
-                chain @ TargetRef::Chain(_) => {
+                }),
+                TargetRef::Chain(links) => {
                     // A chain in expression position: fold into chain steps
-                    // from a leading reference.
-                    let span = chain.span();
-                    let TargetRef::Chain(links) = chain else {
-                        unreachable!()
-                    };
+                    // from a leading reference. The fold leans one node per
+                    // link, so the links are charged like any other chain.
+                    let span = links.first().unwrap().span.join(links.last().unwrap().span);
+                    self.charge_chain(links.len() as u32 - 1)?;
                     let mut iter = links.into_iter();
                     let first = iter.next().unwrap();
                     let mut expr = Expr {
@@ -4941,9 +5471,9 @@ impl<'s> Parser<'s> {
                             span: s,
                         };
                     }
-                    Expr { span, ..expr }
+                    Some(Expr { span, ..expr })
                 }
-            });
+            };
         }
 
         self.error_here(format!(
@@ -5029,7 +5559,7 @@ impl<'s> Parser<'s> {
             if self.at(TokenKind::RParen) || self.at(TokenKind::RBracket) {
                 break;
             }
-            items.push(self.parse_expr()?);
+            items.push(self.branch(Self::parse_expr)?);
         }
         let span = items.first().unwrap().span.join(items.last().unwrap().span);
         Some(Expr {
@@ -5046,7 +5576,7 @@ impl<'s> Parser<'s> {
             return Some(args);
         }
         loop {
-            let value = self.parse_expr()?;
+            let value = self.branch(Self::parse_expr)?;
             if self.eat(TokenKind::Eq) {
                 // Named argument: the "value" we parsed is the parameter name.
                 let name = match value.kind {
@@ -5059,7 +5589,7 @@ impl<'s> Parser<'s> {
                         None
                     }
                 };
-                let actual = self.parse_expr()?;
+                let actual = self.branch(Self::parse_expr)?;
                 args.push(Arg {
                     name,
                     value: actual,

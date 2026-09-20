@@ -39,7 +39,9 @@ use uuid::Uuid;
 // qualified-name IDs — cached `lib_ids` from earlier versions are stale.
 // From v5 on, [`TOOLKIT_BUILD`] invalidates automatically across source
 // changes; bump the MAGIC digit only for serialized-layout changes.
-const MAGIC: &[u8; 8] = b"SYSML5LC";
+// v6: outcomes may carry the root names their resolution missed, so a
+// replay can re-resolve exactly the entries a model's root additions reach.
+const MAGIC: &[u8; 8] = b"SYSML6LC";
 
 /// Toolkit build identity stamped into every serialized cache: the crate
 /// version plus a fingerprint of the semantics-bearing crate sources
@@ -54,12 +56,22 @@ pub const TOOLKIT_BUILD: &str = concat!(
     env!("SYSMLV2_SEMANTICS_FINGERPRINT")
 );
 
+/// The serialized header carries the build identity's length in one byte.
+const _: () = assert!(
+    TOOLKIT_BUILD.len() <= 255,
+    "the cache header stores the build identity's length in one byte"
+);
+
 /// Recorded resolution outcomes for a library's pending references, in
 /// queue order. `None` = the reference did not resolve (also cached — the
 /// unresolved long tail is re-reported identically without re-searching).
 #[derive(Clone)]
 pub struct LibraryCache {
     pub(crate) outcomes: Vec<Option<Uuid>>,
+    /// Per outcome, the root-namespace names its resolution looked up and
+    /// missed. A model that introduces one of them resolves that entry
+    /// afresh instead of replaying it.
+    pub(crate) outcome_misses: Vec<Vec<String>>,
     /// Element ids of the library prefix, in creation order — replayed at
     /// element creation so the warm build skips ownership-path
     /// construction, per-element UUIDv5 hashing, and the whole normative
@@ -80,16 +92,46 @@ pub struct LibraryCache {
     pub(crate) fingerprint: u64,
 }
 
+/// Largest cache file either loader reads. A file beyond it is a foreign
+/// or damaged one, not an allocation request: the loaders check the size
+/// before reading and bound the read itself, so a miss costs a `stat`.
+pub(crate) const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Write `bytes` to `path` so that readers see either the previous file
+/// or the whole new one, never a partial write. The temporary file
+/// carries a fresh identifier: two processes recording the same cache
+/// would otherwise interleave their writes into one sibling file, and a
+/// crash would strand a partial file exactly where the next writer looks.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        std::fs::File::create(&temporary)?.write_all(bytes)?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Read a cache file whole, refusing one past [`MAX_BYTES`].
+pub(crate) fn read_capped(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_BYTES {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX_BYTES).then_some(buf)
+}
+
 impl LibraryCache {
-    /// Serialize to `path` (atomically via a sibling temp file).
+    /// Serialize to `path`, atomically.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let buf = self.to_bytes();
-        let tmp = path.with_extension("tmp");
-        std::fs::File::create(&tmp)?.write_all(&buf)?;
-        std::fs::rename(&tmp, path)
+        write_atomically(path, &self.to_bytes())
     }
 
     /// The serialized form `save` writes — for hosts that carry the
@@ -104,13 +146,24 @@ impl LibraryCache {
         buf.extend_from_slice(TOOLKIT_BUILD.as_bytes());
         buf.extend_from_slice(&self.fingerprint.to_le_bytes());
         buf.extend_from_slice(&(self.outcomes.len() as u64).to_le_bytes());
-        for o in &self.outcomes {
-            match o {
-                Some(id) => {
-                    buf.push(1);
-                    buf.extend_from_slice(id.as_bytes());
+        for (i, o) in self.outcomes.iter().enumerate() {
+            let misses = self.outcome_misses.get(i).map_or(&[][..], Vec::as_slice);
+            let tag = match (o, misses.is_empty()) {
+                (None, true) => 0,
+                (Some(_), true) => 1,
+                (None, false) => 2,
+                (Some(_), false) => 3,
+            };
+            buf.push(tag);
+            if let Some(id) = o {
+                buf.extend_from_slice(id.as_bytes());
+            }
+            if !misses.is_empty() {
+                buf.extend_from_slice(&(misses.len() as u32).to_le_bytes());
+                for name in misses {
+                    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(name.as_bytes());
                 }
-                None => buf.push(0),
             }
         }
         buf.extend_from_slice(&(self.lib_ids.len() as u64).to_le_bytes());
@@ -137,13 +190,11 @@ impl LibraryCache {
         buf
     }
 
-    /// Deserialize from `path`; `None` on any mismatch (missing file, other
-    /// toolkit build, truncation) — the caller then falls back to a cold
-    /// build and re-records.
+    /// Deserialize from `path`; `None` on any mismatch (missing file,
+    /// other toolkit build, truncation, a file past the cache size limit)
+    /// — the caller then falls back to a cold build and re-records.
     pub fn load(path: &Path) -> Option<LibraryCache> {
-        let mut buf = Vec::new();
-        std::fs::File::open(path).ok()?.read_to_end(&mut buf).ok()?;
-        Self::from_bytes(&buf)
+        Self::from_bytes(&read_capped(path)?)
     }
 
     /// Deserialize [`Self::to_bytes`] output; `None` on any mismatch
@@ -179,22 +230,47 @@ impl LibraryCache {
             return None;
         }
         let mut outcomes = Vec::with_capacity(count);
+        let mut outcome_misses = Vec::with_capacity(count);
         for _ in 0..count {
-            let (tag, r) = rest.split_first()?;
-            match tag {
-                0 => {
-                    outcomes.push(None);
-                    rest = r;
+            let (tag, mut r) = rest.split_first()?;
+            if !matches!(tag, 0..=3) {
+                return None;
+            }
+            if tag & 1 == 1 {
+                if r.len() < 16 {
+                    return None;
                 }
-                1 => {
-                    if r.len() < 16 {
+                outcomes.push(Some(Uuid::from_bytes(r[..16].try_into().ok()?)));
+                r = &r[16..];
+            } else {
+                outcomes.push(None);
+            }
+            let mut misses = Vec::new();
+            if tag & 2 == 2 {
+                if r.len() < 4 {
+                    return None;
+                }
+                let n = u32::from_le_bytes(r[..4].try_into().ok()?) as usize;
+                r = &r[4..];
+                // Each name costs at least its length prefix.
+                if n > r.len() / 4 {
+                    return None;
+                }
+                for _ in 0..n {
+                    if r.len() < 4 {
                         return None;
                     }
-                    outcomes.push(Some(Uuid::from_bytes(r[..16].try_into().ok()?)));
-                    rest = &r[16..];
+                    let len = u32::from_le_bytes(r[..4].try_into().ok()?) as usize;
+                    r = &r[4..];
+                    if r.len() < len {
+                        return None;
+                    }
+                    misses.push(String::from_utf8(r[..len].to_vec()).ok()?);
+                    r = &r[len..];
                 }
-                _ => return None,
             }
+            outcome_misses.push(misses);
+            rest = r;
         }
         fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
             if rest.len() < n {
@@ -248,6 +324,7 @@ impl LibraryCache {
         }
         Some(LibraryCache {
             outcomes,
+            outcome_misses,
             fingerprint,
             lib_ids,
             lib_qnames,

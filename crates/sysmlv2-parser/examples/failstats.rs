@@ -22,7 +22,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 fn main() {
     let root = std::env::args()
         .nth(1)
-        .unwrap_or("spec-refs/SysML-v2-Release".into());
+        .unwrap_or_else(|| "spec-refs/SysML-v2-Release".into());
     let mut files = Vec::new();
     collect(Path::new(&root), &mut files);
     files.sort();

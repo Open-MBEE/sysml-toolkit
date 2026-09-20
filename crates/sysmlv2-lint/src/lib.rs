@@ -34,8 +34,11 @@
 //! (the declared name re-spelled in the required style) — the hooks a
 //! host's quick fixes key on.
 
+pub mod json;
+
 use regex_lite::Regex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::LazyLock;
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
 use sysmlv2_syntax::Span;
 
@@ -64,6 +67,7 @@ impl Severity {
     }
 
     /// The config spelling ("off" | "hint" | "info" | "warn" | "error").
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Severity::Off => "off",
@@ -89,6 +93,7 @@ pub const STYLES: &[(&str, &str)] = &[
 ];
 
 /// Style-preset names, for inventories and validation messages.
+#[must_use]
 pub fn style_names() -> Vec<&'static str> {
     STYLES.iter().map(|(n, _)| *n).collect()
 }
@@ -107,13 +112,14 @@ pub struct ScopeInfo {
     pub default_style: Option<&'static str>,
 }
 
-/// One rule's identity and configuration surface: stable kebab-case
-/// id, one-line description (doubles as UI copy), default severity,
-/// the scopes its inventory advertises, the style presets its scopes
-/// accept (empty = severity-only scopes), and family-level style
-/// options (`(key, label, default style)`).
+/// One rule's identity and configuration surface: its [`RuleId`]
+/// (whose spelling is the stable kebab-case id), one-line description
+/// (doubles as UI copy), default severity, the scopes its inventory
+/// advertises, the style presets its scopes accept (empty =
+/// severity-only scopes), and family-level style options (`(key,
+/// label, default style)`).
 pub struct Rule {
-    pub id: &'static str,
+    pub id: RuleId,
     pub description: &'static str,
     pub default: Severity,
     pub scopes: &'static [ScopeInfo],
@@ -148,6 +154,137 @@ pub enum OptionKind {
         values: &'static [&'static str],
     },
 }
+
+/// Declares [`RuleId`] with the wire spelling of every variant, so the
+/// enum, [`RuleId::id`] and its `FromStr` cannot drift apart.
+macro_rules! rule_ids {
+    ($($(#[$attr:meta])* $variant:ident = $id:literal,)+) => {
+        /// The identity of a rule as findings and configuration carry
+        /// it. Every rule of [`RULES`] has a variant; `LintConfig` is
+        /// the pseudo-rule configuration findings report under — never
+        /// configurable, so [`RuleId::rule`] answers `None` for it.
+        /// [`RuleId::id`] (and `Display`) is the stable kebab-case
+        /// spelling reports and config use; `FromStr` reads it back.
+        /// Findings sort by that spelling, not by variant order.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum RuleId {
+            $($(#[$attr])* $variant,)+
+        }
+
+        impl RuleId {
+            /// Every id the crate knows, in declaration order.
+            pub const ALL: &'static [RuleId] = &[$(RuleId::$variant,)+];
+
+            /// The stable kebab-case id — the rule's name on the wire
+            /// (reports, `sysmlint.json`, diagnostic codes).
+            #[must_use]
+            pub const fn id(self) -> &'static str {
+                match self {
+                    $(RuleId::$variant => $id,)+
+                }
+            }
+        }
+
+        impl std::str::FromStr for RuleId {
+            type Err = LintError;
+
+            fn from_str(s: &str) -> Result<RuleId, LintError> {
+                match s {
+                    $($id => Ok(RuleId::$variant),)+
+                    _ => Err(LintError::UnknownRule(s.to_string())),
+                }
+            }
+        }
+    };
+}
+
+rule_ids! {
+    NamingConvention = "naming-convention",
+    UndocumentedElement = "undocumented-element",
+    UntypedUsage = "untyped-usage",
+    UnusedDefinition = "unused-definition",
+    UnusedParameter = "unused-parameter",
+    ImportVisibility = "import-visibility",
+    VisibilityBlockedReference = "visibility-blocked-reference",
+    UsageKindMismatch = "usage-kind-mismatch",
+    PortMemberReferential = "port-member-referential",
+    InheritedNameShadow = "inherited-name-shadow",
+    UnqualifiedEnumLiteral = "unqualified-enum-literal",
+    UnitSpelling = "unit-spelling",
+    DimensionalConsistency = "dimensional-consistency",
+    QualifiedNames = "qualified-names",
+    MultilineConditions = "multiline-conditions",
+    Indentation = "indentation",
+    GeneratedProvenanceInvalid = "generated-provenance-invalid",
+    GeneratedProvenanceBaselineOutdated = "generated-provenance-baseline-outdated",
+    GeneratedElementModified = "generated-element-modified",
+    /// A complaint about the configuration itself, not the model.
+    LintConfig = "lint-config",
+}
+
+impl RuleId {
+    /// The rule's inventory entry; `None` for `lint-config`, which is
+    /// not a configurable rule.
+    #[must_use]
+    pub fn rule(self) -> Option<&'static Rule> {
+        RULES.iter().find(|r| r.id == self)
+    }
+
+    /// Whether the rule reports model text nothing uses (a dead
+    /// definition or parameter) — findings editors render faded, like
+    /// unused imports.
+    #[must_use]
+    pub const fn is_dead_model(self) -> bool {
+        matches!(self, RuleId::UnusedDefinition | RuleId::UnusedParameter)
+    }
+}
+
+impl std::fmt::Display for RuleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+/// Compare against a wire spelling a host handed in — a diagnostic
+/// code, a `--rule` argument — without spelling `.id()` at every site.
+impl PartialEq<&str> for RuleId {
+    fn eq(&self, other: &&str) -> bool {
+        self.id() == *other
+    }
+}
+
+/// The failures the crate reports outside a lint pass (a pass itself
+/// speaks only in findings) — what a caller may branch on. A
+/// configuration whose *content* is wrong is never one of these: an
+/// unknown id, option or value inside readable JSON becomes a
+/// `lint-config` finding, so a host sees it beside the model's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LintError {
+    /// No rule carries the id ([`RuleId`]'s [`FromStr`](std::str::FromStr),
+    /// `Config::set`).
+    UnknownRule(String),
+    /// The configuration text is not JSON at all, so no rule setting
+    /// in it was read ([`Config::from_json`]).
+    ConfigNotJson(String),
+    /// A member's text does not parse on its own, so it has no
+    /// canonical form ([`canonical_member_text`]).
+    UnparseableMember(String),
+}
+
+impl std::fmt::Display for LintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LintError::UnknownRule(id) => write!(f, "unknown lint rule `{id}`"),
+            LintError::ConfigNotJson(detail) => write!(f, "config is not JSON: {detail}"),
+            LintError::UnparseableMember(detail) => {
+                write!(f, "member does not parse: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LintError {}
 
 const STYLE_NAMES: &[&str] = &[
     "camelCase",
@@ -228,7 +365,7 @@ const DEF_SCOPES: &[ScopeInfo] = &[
 /// Every rule the engine knows, in documentation order.
 pub const RULES: &[Rule] = &[
     Rule {
-        id: "naming-convention",
+        id: RuleId::NamingConvention,
         description: "a declared name off the project's casing conventions — definitions \
                       PascalCase, usages and features camelCase by default; families and \
                       per-stereotype scopes take a style preset or a regex (info by \
@@ -247,7 +384,7 @@ pub const RULES: &[Rule] = &[
         options: NAMING_OPTIONS,
     },
     Rule {
-        id: "undocumented-element",
+        id: RuleId::UndocumentedElement,
         description: "a definition without a documentation body — its own `doc` or a \
                       comment written `about` it; `depth` extends below the top-level \
                       default, scopes tune severity and depth per stereotype",
@@ -258,7 +395,7 @@ pub const RULES: &[Rule] = &[
         options: UNDOCUMENTED_OPTIONS,
     },
     Rule {
-        id: "untyped-usage",
+        id: RuleId::UntypedUsage,
         description: "a named usage declaring no typing, subsetting, or redefinition \
                       clause; enumeration literals and transitions are off by default \
                       (scopes re-enable or silence per stereotype)",
@@ -269,7 +406,7 @@ pub const RULES: &[Rule] = &[
         options: &[],
     },
     Rule {
-        id: "unused-definition",
+        id: RuleId::UnusedDefinition,
         description: "a user definition nothing in the user model references (closed \
                       world: off by default — models are interchange artifacts and \
                       outside consumers are invisible here)",
@@ -280,7 +417,7 @@ pub const RULES: &[Rule] = &[
         options: &[],
     },
     Rule {
-        id: "unused-parameter",
+        id: RuleId::UnusedParameter,
         description: "an input parameter of a calc/constraint/action definition never \
                       used in its body (fix: delete the parameter); scopes toggle each \
                       definition context; off by default",
@@ -291,7 +428,83 @@ pub const RULES: &[Rule] = &[
         options: &[],
     },
     Rule {
-        id: "unit-spelling",
+        id: RuleId::ImportVisibility,
+        description: "an import declared without a visibility keyword (the grammar \
+                      requires one); the fix declares the visibility its dependents \
+                      need — `private` when nothing outside the importing namespace \
+                      resolves through it, `public` (or `protected` inside a type) \
+                      otherwise; the other keywords are offered as rewrites. Info by \
+                      default: the syntax check already reports the missing keyword \
+                      as an error, this finding carries the fix",
+        default: Severity::Info,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::VisibilityBlockedReference,
+        description: "an unresolved reference that names a member the resolver \
+                      can reach only by ignoring visibility (a chain step or \
+                      qualified name into a private member); the fix widens the \
+                      member's visibility to `public` — a rewrite, applied only on \
+                      request",
+        default: Severity::Warn,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::UsageKindMismatch,
+        description: "a usage typed by a definition of another kind (an `attribute` typed \
+                      by a port definition); the fix rewrites the usage keyword to the \
+                      definition's kind — a rewrite, applied only on request. Info by \
+                      default: the semantic check already reports the typing as an error, \
+                      this finding carries the fix",
+        default: Severity::Info,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::PortMemberReferential,
+        description: "a composite non-port usage inside a port body (ports own only \
+                      referential members); the fix inserts `ref`. Info by default: the \
+                      semantic check already reports the member as an error, this finding \
+                      carries the fix",
+        default: Severity::Info,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::InheritedNameShadow,
+        description: "a member reusing an inherited member's name without redefining it, \
+                      or a type inheriting one name from two places; the fix spells the \
+                      redefinition (`:>>`) when the member's types and multiplicity allow \
+                      one. Info by default: the semantic check already reports the \
+                      collision as a warning, this finding carries the fix",
+        default: Severity::Info,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::UnqualifiedEnumLiteral,
+        description: "an unresolved simple name that matches exactly one enumeration \
+                      literal in the model; the fix qualifies it",
+        default: Severity::Warn,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::UnitSpelling,
         description: "quantity-bracket unit spellings — the same unit spelled two ways \
                       across the model (`'m⋅s⁻¹'` here, `m/s` there), and, with the \
                       `style` option (`quoted-product` | `expression`), any multi-factor \
@@ -303,7 +516,7 @@ pub const RULES: &[Rule] = &[
         options: UNIT_OPTIONS,
     },
     Rule {
-        id: "dimensional-consistency",
+        id: RuleId::DimensionalConsistency,
         description: "a quantity attribute whose declared type and value unit disagree \
                       dimensionally (`: MassValue = 9.8 [m/s^2]` — fix: re-type to the \
                       unit's quantity type); the `untyped` scope (warn by default) \
@@ -317,7 +530,7 @@ pub const RULES: &[Rule] = &[
         options: &[],
     },
     Rule {
-        id: "qualified-names",
+        id: RuleId::QualifiedNames,
         description: "one element, one reference spelling — the same target written \
                       `MassValue` here and `ISQ::MassValue` there flags the minority \
                       sites (fix: re-spell to the majority form); the `style` option \
@@ -333,7 +546,7 @@ pub const RULES: &[Rule] = &[
         options: QUALIFIED_OPTIONS,
     },
     Rule {
-        id: "multiline-conditions",
+        id: RuleId::MultilineConditions,
         description: "a long condition chain written on one source line — chains of \
                       `min` or more operands (default 3) read best one condition per \
                       line, the connective leading each continuation, which is what \
@@ -346,7 +559,7 @@ pub const RULES: &[Rule] = &[
         options: CHAIN_OPTIONS,
     },
     Rule {
-        id: "indentation",
+        id: RuleId::Indentation,
         description: "leading whitespace off the project's indentation style — tabs by \
                       default, or a fixed number of spaces (`style` picks the character, \
                       `size` the columns one level takes); lines inside a verbatim \
@@ -359,7 +572,7 @@ pub const RULES: &[Rule] = &[
         options: INDENT_OPTIONS,
     },
     Rule {
-        id: "generated-provenance-invalid",
+        id: RuleId::GeneratedProvenanceInvalid,
         description: "corrupted transformer ownership — a Generated marker without a \
                       provenance record, a record whose `about` target is missing, \
                       multiple, unmarked, or carries the wrong key, duplicate \
@@ -375,7 +588,7 @@ pub const RULES: &[Rule] = &[
         options: &[],
     },
     Rule {
-        id: "generated-provenance-baseline-outdated",
+        id: RuleId::GeneratedProvenanceBaselineOutdated,
         description: "a provenance record predating the structure/policy baseline \
                       fields — valid legacy provenance, not tamper; the next \
                       successful sync backfills the record without changing the \
@@ -387,7 +600,7 @@ pub const RULES: &[Rule] = &[
         options: &[],
     },
     Rule {
-        id: "generated-element-modified",
+        id: RuleId::GeneratedElementModified,
         description: "a generated member drifting from its provenance baseline, \
                       classified without consulting the data source: a changed \
                       canonicalization policy/schema is baseline drift the next sync \
@@ -499,10 +712,6 @@ const CHAIN_SCOPES: &[ScopeInfo] = &[
     scope!("Invariant", "invariant"),
 ];
 
-fn rule(id: &str) -> Option<&'static Rule> {
-    RULES.iter().find(|r| r.id == id)
-}
-
 /// A compiled naming pattern with the words used to describe it in
 /// findings and, for presets, the style name suggestions convert to.
 #[derive(Clone)]
@@ -600,7 +809,9 @@ impl RuleConfig {
 /// config and any host overrides. Unknown ids, options, and malformed
 /// values collect as configuration findings.
 pub struct Config {
-    rules: BTreeMap<&'static str, RuleConfig>,
+    /// One entry per rule of [`RULES`] — membership is what makes an
+    /// id configurable.
+    rules: BTreeMap<RuleId, RuleConfig>,
     naming_definitions: Pattern,
     naming_usages: Pattern,
     undocumented_depth: u32,
@@ -703,11 +914,12 @@ impl Config {
         }
     }
 
-    /// Parse the JSON config form. Errors are unreadable JSON only —
-    /// unknown ids/levels/options become findings, not errors.
-    pub fn from_json(text: &str) -> Result<Config, String> {
+    /// Parse the JSON config form. The only error is text that is not
+    /// JSON at all ([`LintError::ConfigNotJson`]) — unknown
+    /// ids/levels/options become findings, not errors.
+    pub fn from_json(text: &str) -> Result<Config, LintError> {
         let v: serde_json::Value =
-            serde_json::from_str(text).map_err(|e| format!("config is not JSON: {e}"))?;
+            serde_json::from_str(text).map_err(|e| LintError::ConfigNotJson(e.to_string()))?;
         let mut cfg = Config::default();
         let Some(rules) = v.get("rules") else {
             return Ok(cfg);
@@ -718,9 +930,16 @@ impl Config {
             return Ok(cfg);
         };
         for (id, val) in rules {
+            let rule = match cfg.configurable(id) {
+                Ok(rule) => rule,
+                Err(e) => {
+                    cfg.complaints.push(e.to_string());
+                    continue;
+                }
+            };
             match val {
                 serde_json::Value::String(s) => match Severity::parse(s) {
-                    Some(level) => cfg.set(id, level),
+                    Some(level) => cfg.set_level(rule, level),
                     None => cfg.complaints.push(format!(
                         "rule `{id}`: level must be one of {}",
                         SEVERITIES.join(", ")
@@ -729,7 +948,7 @@ impl Config {
                 serde_json::Value::Object(o) => {
                     if let Some(s) = o.get("severity") {
                         match s.as_str().and_then(Severity::parse) {
-                            Some(level) => cfg.set(id, level),
+                            Some(level) => cfg.set_level(rule, level),
                             None => cfg.complaints.push(format!(
                                 "rule `{id}`: severity must be one of {}",
                                 SEVERITIES.join(", ")
@@ -737,7 +956,7 @@ impl Config {
                         }
                     }
                     for (key, val) in o.iter().filter(|(k, _)| *k != "severity") {
-                        cfg.set_option(id, key, val);
+                        cfg.set_option(rule, key, val);
                     }
                 }
                 _ => cfg.complaints.push(format!(
@@ -749,21 +968,37 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The configurable rule an id spells. `lint-config` is unknown
+    /// here like any other id no rule entry backs: it reports on the
+    /// configuration, it is not configured.
+    fn configurable(&self, id: &str) -> Result<RuleId, LintError> {
+        id.parse::<RuleId>()
+            .ok()
+            .filter(|rule| self.rules.contains_key(rule))
+            .ok_or_else(|| LintError::UnknownRule(id.to_string()))
+    }
+
     /// Override one rule's base severity (the CLI's `--rule id=level`).
     /// Unknown ids become configuration findings.
     pub fn set(&mut self, id: &str, level: Severity) {
-        match rule(id) {
-            Some(r) => self.rules.get_mut(r.id).expect("seeded").base = level,
-            None => self.complaints.push(format!("unknown lint rule `{id}`")),
+        match self.configurable(id) {
+            Ok(rule) => self.set_level(rule, level),
+            Err(e) => self.complaints.push(e.to_string()),
+        }
+    }
+
+    fn set_level(&mut self, rule: RuleId, level: Severity) {
+        if let Some(cfg) = self.rules.get_mut(&rule) {
+            cfg.base = level;
         }
     }
 
     /// Apply one rule option from config. Unknown keys and malformed
     /// values become configuration findings; the rule keeps its
     /// defaults for anything that fails to parse.
-    fn set_option(&mut self, id: &str, key: &str, val: &serde_json::Value) {
+    fn set_option(&mut self, id: RuleId, key: &str, val: &serde_json::Value) {
         let complaint = match (id, key) {
-            ("naming-convention", "definitions" | "usages") => match parse_style_spec(val) {
+            (RuleId::NamingConvention, "definitions" | "usages") => match parse_style_spec(val) {
                 Ok(pat) => {
                     match key {
                         "definitions" => self.naming_definitions = pat,
@@ -773,7 +1008,7 @@ impl Config {
                 }
                 Err(e) => format!("rule `{id}`: option `{key}` {e}"),
             },
-            ("unit-spelling", "style") => match val.as_str() {
+            (RuleId::UnitSpelling, "style") => match val.as_str() {
                 Some("quoted-product") => {
                     self.unit_style = Some(UnitStyle::QuotedProduct);
                     return;
@@ -786,7 +1021,7 @@ impl Config {
                     format!("rule `{id}`: option `{key}` must be `quoted-product` or `expression`")
                 }
             },
-            ("qualified-names", "style") => match val.as_str() {
+            (RuleId::QualifiedNames, "style") => match val.as_str() {
                 Some("qualified") => {
                     self.qualified_style = Some(QualifiedStyle::Qualified);
                     return;
@@ -805,20 +1040,20 @@ impl Config {
                     )
                 }
             },
-            ("undocumented-element", "depth") => match val.as_u64() {
+            (RuleId::UndocumentedElement, "depth") => match val.as_u64() {
                 Some(d) if d >= 1 => {
-                    self.undocumented_depth = d.min(u32::MAX as u64) as u32;
+                    self.undocumented_depth = u32::try_from(d).unwrap_or(u32::MAX);
                     return;
                 }
                 _ => format!("rule `{id}`: option `{key}` must be a positive integer"),
             },
-            ("multiline-conditions", "min") => match val.as_u64() {
+            (RuleId::MultilineConditions, "min") => match val.as_u64() {
                 Some(0) => {
                     self.chain_min = 0;
                     return;
                 }
                 Some(n) if n >= 2 => {
-                    self.chain_min = n.min(u8::MAX as u64) as u8;
+                    self.chain_min = u8::try_from(n).unwrap_or(u8::MAX);
                     return;
                 }
                 _ => format!(
@@ -826,7 +1061,7 @@ impl Config {
                      integer ≥ 2"
                 ),
             },
-            ("indentation", "style") => match val.as_str() {
+            (RuleId::Indentation, "style") => match val.as_str() {
                 Some("tabs") => {
                     self.indent_style = IndentStyle::Tabs;
                     return;
@@ -837,14 +1072,14 @@ impl Config {
                 }
                 _ => format!("rule `{id}`: option `{key}` must be `tabs` or `spaces`"),
             },
-            ("indentation", "size") => match val.as_u64() {
+            (RuleId::Indentation, "size") => match val.as_u64() {
                 Some(n) if n >= 1 => {
-                    self.indent_size = n.min(u8::MAX as u64) as u8;
+                    self.indent_size = u8::try_from(n).unwrap_or(u8::MAX);
                     return;
                 }
                 _ => format!("rule `{id}`: option `{key}` must be a positive integer"),
             },
-            (_, "scopes") if rule(id).is_some() => {
+            (_, "scopes") => {
                 let Some(map) = val.as_object() else {
                     self.complaints.push(format!(
                         "rule `{id}`: `scopes` must be an object of metaclass → setting"
@@ -864,19 +1099,21 @@ impl Config {
     /// One `scopes` entry: key validated against the rule's context
     /// shape, value = severity string, style name (styled rules), or
     /// an object of per-scope settings.
-    fn set_scope(&mut self, id: &str, key: &str, val: &serde_json::Value) {
-        let Some(r) = rule(id) else { return };
+    fn set_scope(&mut self, id: RuleId, key: &str, val: &serde_json::Value) {
+        let Some(r) = id.rule() else { return };
         let valid_key = r.scopes.iter().any(|s| s.key == key)
             || match id {
-                "unused-parameter" => false, // strict: the three contexts only
+                RuleId::UnusedParameter => false, // strict: the three contexts only
                 // Textual rule: a line has no metaclass to scope by.
-                "indentation" => false,
+                RuleId::Indentation => false,
                 // Aspect scopes, not metaclasses: the two inventory keys only.
-                "dimensional-consistency" => false,
+                RuleId::DimensionalConsistency => false,
                 // Reference sites have no metaclass to scope by.
-                "qualified-names" => false,
-                "untyped-usage" => key.ends_with("Usage"),
-                "undocumented-element" | "unused-definition" => key.ends_with("Definition"),
+                RuleId::QualifiedNames => false,
+                RuleId::UntypedUsage => key.ends_with("Usage"),
+                RuleId::UndocumentedElement | RuleId::UnusedDefinition => {
+                    key.ends_with("Definition")
+                }
                 _ => key.ends_with("Definition") || key.ends_with("Usage") || key == "Feature",
             };
         if !valid_key {
@@ -929,9 +1166,9 @@ impl Config {
                                 "rule `{id}`: scope `{key}`: regex must be a string"
                             )),
                         },
-                        ("depth", v) if id == "undocumented-element" => match v.as_u64() {
+                        ("depth", v) if id == RuleId::UndocumentedElement => match v.as_u64() {
                             Some(d) if d >= 1 => {
-                                setting.depth = Some(d.min(u32::MAX as u64) as u32)
+                                setting.depth = Some(u32::try_from(d).unwrap_or(u32::MAX))
                             }
                             _ => self.complaints.push(format!(
                                 "rule `{id}`: scope `{key}`: depth must be a positive integer"
@@ -953,13 +1190,10 @@ impl Config {
         }
         // Overlay onto any seeded entry (a config severity flip keeps
         // the seeded style, and vice versa).
-        let entry = self
-            .rules
-            .get_mut(r.id)
-            .expect("seeded")
-            .scopes
-            .entry(key.to_string())
-            .or_default();
+        let Some(cfg) = self.rules.get_mut(&id) else {
+            return;
+        };
+        let entry = cfg.scopes.entry(key.to_string()).or_default();
         if setting.severity.is_some() {
             entry.severity = setting.severity;
             entry.seeded = false;
@@ -972,8 +1206,13 @@ impl Config {
         }
     }
 
-    fn cfg(&self, id: &str) -> &RuleConfig {
-        self.rules.get(id).expect("every rule is seeded")
+    /// A configurable rule's effective configuration. Every rule of
+    /// [`RULES`] is seeded; only `lint-config`, which no pass asks
+    /// for, has none.
+    fn cfg(&self, id: RuleId) -> &RuleConfig {
+        self.rules
+            .get(&id)
+            .expect("every configurable rule is seeded")
     }
 }
 
@@ -1000,6 +1239,7 @@ fn parse_style_spec(val: &serde_json::Value) -> Result<Pattern, String> {
 /// Re-spell `name` in a preset style: split into words on `_`, `-`,
 /// spaces, and lower→upper case boundaries, then recompose. `None`
 /// when the name yields no words.
+#[must_use]
 pub fn convert_to_style(name: &str, style: &str) -> Option<String> {
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -1065,6 +1305,10 @@ pub struct Edit {
 pub struct Fix {
     pub label: String,
     pub deletes: bool,
+    /// The fix changes what a declaration means (a keyword, a member's
+    /// visibility) rather than how it is spelled; hosts apply such fixes
+    /// only on explicit request, never in a fix-all sweep.
+    pub semantic: bool,
     pub edits: Vec<Edit>,
 }
 
@@ -1079,7 +1323,7 @@ pub struct Fix {
 /// applied automatically.
 #[derive(Clone, Debug)]
 pub struct Finding {
-    pub rule: &'static str,
+    pub rule: RuleId,
     pub severity: Severity,
     pub message: String,
     pub unit: Option<usize>,
@@ -1090,7 +1334,7 @@ pub struct Finding {
     pub alternatives: Vec<Fix>,
 }
 
-fn finding(rule: &'static str, severity: Severity, message: String) -> Finding {
+fn finding(rule: RuleId, severity: Severity, message: String) -> Finding {
     Finding {
         rule,
         severity,
@@ -1150,33 +1394,51 @@ pub fn lint_units(
     let sources = sources.as_slice();
     let mut out = Vec::new();
     for c in &config.complaints {
-        out.push(finding("lint-config", Severity::Warn, c.clone()));
+        out.push(finding(RuleId::LintConfig, Severity::Warn, c.clone()));
     }
-    if config.cfg("naming-convention").enabled() {
+    if config.cfg(RuleId::NamingConvention).enabled() {
         naming_convention(resolved, config, &mut out);
     }
-    if config.cfg("undocumented-element").enabled() {
+    if config.cfg(RuleId::UndocumentedElement).enabled() {
         undocumented_element(resolved, config, &mut out);
     }
-    if config.cfg("untyped-usage").enabled() {
+    if config.cfg(RuleId::UntypedUsage).enabled() {
         untyped_usage(resolved, config, &mut out);
     }
-    if config.cfg("unused-parameter").enabled() {
+    if config.cfg(RuleId::UnusedParameter).enabled() {
         unused_parameter(resolved, config, &mut out);
     }
-    if config.cfg("unused-definition").enabled() {
+    if config.cfg(RuleId::UnusedDefinition).enabled() {
         unused_definition(resolved, config, &mut out);
     }
-    if config.cfg("unit-spelling").enabled() {
+    if config.cfg(RuleId::ImportVisibility).enabled() {
+        import_visibility(resolved, config, &mut out);
+    }
+    if config.cfg(RuleId::VisibilityBlockedReference).enabled() {
+        visibility_blocked_reference(resolved, config, sources, &mut out);
+    }
+    if config.cfg(RuleId::UsageKindMismatch).enabled() {
+        usage_kind_mismatch(resolved, config, sources, &mut out);
+    }
+    if config.cfg(RuleId::PortMemberReferential).enabled() {
+        port_member_referential(resolved, config, sources, &mut out);
+    }
+    if config.cfg(RuleId::InheritedNameShadow).enabled() {
+        inherited_name_shadow(resolved, config, sources, &mut out);
+    }
+    if config.cfg(RuleId::UnqualifiedEnumLiteral).enabled() {
+        unqualified_enum_literal(resolved, config, &mut out);
+    }
+    if config.cfg(RuleId::UnitSpelling).enabled() {
         unit_spelling(resolved, config, &mut out);
     }
-    if config.cfg("dimensional-consistency").enabled() {
+    if config.cfg(RuleId::DimensionalConsistency).enabled() {
         dimensional_consistency(resolved, config, &mut out);
     }
-    if config.cfg("qualified-names").enabled() {
+    if config.cfg(RuleId::QualifiedNames).enabled() {
         if sources.is_empty() {
             out.push(finding(
-                "lint-config",
+                RuleId::LintConfig,
                 Severity::Warn,
                 "rule `qualified-names` reads source text, which this host did not \
                  provide — no references were checked"
@@ -1186,13 +1448,13 @@ pub fn lint_units(
             qualified_names(resolved, config, sources, &mut out);
         }
     }
-    if config.cfg("multiline-conditions").enabled() {
+    if config.cfg(RuleId::MultilineConditions).enabled() {
         multiline_conditions(resolved, config, &mut out);
     }
-    if config.cfg("indentation").enabled() {
+    if config.cfg(RuleId::Indentation).enabled() {
         if sources.is_empty() {
             out.push(finding(
-                "lint-config",
+                RuleId::LintConfig,
                 Severity::Warn,
                 "rule `indentation` reads source text, which this host did not provide — \
                  no lines were checked"
@@ -1203,15 +1465,15 @@ pub fn lint_units(
         }
     }
     let generated_rules = [
-        "generated-provenance-invalid",
-        "generated-provenance-baseline-outdated",
-        "generated-element-modified",
+        RuleId::GeneratedProvenanceInvalid,
+        RuleId::GeneratedProvenanceBaselineOutdated,
+        RuleId::GeneratedElementModified,
     ];
-    if generated_rules.iter().any(|id| config.cfg(id).enabled()) {
+    if generated_rules.iter().any(|&id| config.cfg(id).enabled()) {
         if units.iter().any(|(_, name, _)| !name.is_empty()) {
             generated_guard(resolved, config, units, &mut out, None, false);
-        } else if generated_rules.iter().any(|id| {
-            let default = RULES.iter().find(|r| r.id == *id).map(|r| r.default);
+        } else if generated_rules.iter().any(|&id| {
+            let default = id.rule().map(|r| r.default);
             default.is_some_and(|d| config.cfg(id).base != d)
         }) {
             // Only an explicitly configured rule complains — the rules
@@ -1219,7 +1481,7 @@ pub fn lint_units(
             // lint_with_sources) skipping defaults silently beats a
             // warning on every model without provenance.
             out.push(finding(
-                "lint-config",
+                RuleId::LintConfig,
                 Severity::Warn,
                 "the generated-provenance rules read unit names (the sidecar contract is \
                  spelled in them), which this host did not provide — no generated \
@@ -1229,10 +1491,10 @@ pub fn lint_units(
         }
     }
     out.sort_by(|a, b| {
-        (a.unit, a.span.map(|s| s.start), a.rule, &a.message).cmp(&(
+        (a.unit, a.span.map(|s| s.start), a.rule.id(), &a.message).cmp(&(
             b.unit,
             b.span.map(|s| s.start),
-            b.rule,
+            b.rule.id(),
             &b.message,
         ))
     });
@@ -1245,7 +1507,8 @@ pub fn lint_units(
 /// other). Only written names are checked (synthesized elements have
 /// no declaration site). Preset-style findings carry a `suggest`.
 fn naming_convention(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
-    let cfg = config.cfg("naming-convention");
+    let cfg = config.cfg(RuleId::NamingConvention);
+    let mut siblings = SiblingNames::default();
     let elems: Vec<ElementRef> = resolved.user_elements().collect();
     for e in elems {
         let ty = resolved.element_type(e);
@@ -1274,12 +1537,17 @@ fn naming_convention(resolved: &mut ResolvedModel, config: &Config, out: &mut Ve
         if pat.regex.is_match(&name) {
             continue;
         }
+        // No suggestion a sibling already carries: applying it would
+        // make every qualified reference to either element ambiguous
+        // (the edit engine drops such a rename), so the finding stays
+        // and the fix is left to the author.
         let suggest = pat
             .style
             .and_then(|style| convert_to_style(&name, style))
-            .filter(|c| c != &name && pat.regex.is_match(c));
+            .filter(|c| c != &name && pat.regex.is_match(c))
+            .filter(|c| !siblings.carried_by_sibling(resolved, e, c));
         let mut f = finding(
-            "naming-convention",
+            RuleId::NamingConvention,
             severity,
             format!("{family} name `{name}` should be {}", pat.describe),
         );
@@ -1291,13 +1559,57 @@ fn naming_convention(resolved: &mut ResolvedModel, config: &Config, out: &mut Ve
     }
 }
 
+/// The names the owned members of each owner carry (effective and
+/// short), indexed once per owner on first use — the clash check a
+/// naming suggestion runs against its siblings, without re-reading
+/// every sibling's names for every finding in one namespace.
+#[derive(Default)]
+struct SiblingNames {
+    by_owner: HashMap<ElementRef, HashMap<String, Vec<ElementRef>>>,
+}
+
+impl SiblingNames {
+    /// Whether a member of `e`'s owner other than `e` carries `name` as
+    /// its effective or short name — the clash a rename of `e` to `name`
+    /// would create.
+    fn carried_by_sibling(
+        &mut self,
+        resolved: &mut ResolvedModel,
+        e: ElementRef,
+        name: &str,
+    ) -> bool {
+        let Some(owner) = resolved.owner(e) else {
+            return false;
+        };
+        let names = self.by_owner.entry(owner).or_insert_with(|| {
+            let mut names: HashMap<String, Vec<ElementRef>> = HashMap::new();
+            for sib in resolved.owned_members(owner) {
+                // The names lookup finds a sibling by (declared, else the
+                // written naming reference), not the specification's
+                // effective name: a rename clashes with what resolves.
+                let lookup = resolved.element_lookup_name(sib);
+                let short = resolved
+                    .element_declared_short_name(sib)
+                    .map(str::to_string);
+                for carried in [lookup, short].into_iter().flatten() {
+                    names.entry(carried).or_default().push(sib);
+                }
+            }
+            names
+        });
+        names
+            .get(name)
+            .is_some_and(|holders| holders.iter().any(|&holder| holder != e))
+    }
+}
+
 /// `undocumented-element`: definitions in scope without a
 /// documentation body — their own `doc` member or a comment written
 /// `about` them. Coverage defaults to top-level definitions; `depth`
 /// (rule-level or per-scope) extends into nested types, and scope
 /// severities tune each stereotype.
 fn undocumented_element(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
-    let cfg = config.cfg("undocumented-element");
+    let cfg = config.cfg(RuleId::UndocumentedElement);
     let documented: BTreeSet<ElementRef> = resolved
         .annotation_notes()
         .into_iter()
@@ -1340,7 +1652,7 @@ fn undocumented_element(resolved: &mut ResolvedModel, config: &Config, out: &mut
             .unwrap_or("<anonymous>")
             .to_string();
         let mut f = finding(
-            "undocumented-element",
+            RuleId::UndocumentedElement,
             severity,
             format!("`{name}` has no documentation body (`doc /* … */`)"),
         );
@@ -1357,7 +1669,7 @@ fn undocumented_element(resolved: &mut ResolvedModel, config: &Config, out: &mut
 /// through the specialization). Enumeration literals and transitions
 /// are off by default; scopes tune every stereotype.
 fn untyped_usage(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
-    let cfg = config.cfg("untyped-usage");
+    let cfg = config.cfg(RuleId::UntypedUsage);
     let elems: Vec<ElementRef> = resolved.user_elements().collect();
     for e in elems {
         let ty = resolved.element_type(e);
@@ -1378,7 +1690,7 @@ fn untyped_usage(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
             continue;
         }
         let mut f = finding(
-            "untyped-usage",
+            RuleId::UntypedUsage,
             severity,
             format!("usage `{name}` declares no typing, subsetting, or redefinition"),
         );
@@ -1394,6 +1706,7 @@ fn untyped_usage(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
                 let declare = |s: &String| Fix {
                     label: format!("declare the type `{s}`"),
                     deletes: false,
+                    semantic: false,
                     edits: vec![Edit {
                         unit,
                         span: Span {
@@ -1412,6 +1725,534 @@ fn untyped_usage(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
     }
 }
 
+/// `import-visibility`: an import without a visibility keyword, with the
+/// keyword its dependents require as the fix (see
+/// `ResolvedModel::import_visibility_advice`) and the other keywords as
+/// semantic alternatives.
+fn import_visibility(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
+    let severity = config.cfg(RuleId::ImportVisibility).severity("Import");
+    if severity == Severity::Off {
+        return;
+    }
+    for (import, _, _) in resolved.imports_without_visibility() {
+        let Some(advice) = resolved.import_visibility_advice(import) else {
+            continue;
+        };
+        let namespace = advice
+            .namespace
+            .as_deref()
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| "the root namespace".to_string());
+        let message = match advice.recommended {
+            "private" => format!(
+                "import declares no visibility; `private` suffices — nothing outside \
+                 {namespace} resolves through it"
+            ),
+            keyword => format!(
+                "import declares no visibility; `{keyword}` is required — {} reference(s) \
+                 outside {namespace} resolve through it",
+                advice.outside_sites.len()
+            ),
+        };
+        let declare = |keyword: &str, semantic: bool| Fix {
+            label: format!("Make the import `{keyword}`"),
+            deletes: false,
+            semantic,
+            edits: vec![Edit {
+                unit: advice.unit,
+                span: Span {
+                    start: advice.span.start,
+                    end: advice.span.start,
+                },
+                replacement: format!("{keyword} "),
+            }],
+        };
+        let mut f = finding(RuleId::ImportVisibility, severity, message);
+        f.unit = Some(advice.unit);
+        f.span = Some(advice.span);
+        f.element = edit_target(resolved, import);
+        f.suggest = Some(advice.recommended.to_string());
+        f.fix = Some(declare(advice.recommended, false));
+        f.alternatives = ["private", "protected", "public"]
+            .into_iter()
+            .filter(|k| *k != advice.recommended)
+            .map(|k| declare(k, true))
+            .collect();
+        out.push(f);
+    }
+}
+
+/// `visibility-blocked-reference`: an unresolved reference whose name
+/// exists in the searched scope under a visibility it cannot see (see
+/// `ResolvedModel::blocked_references`). The fix rewrites the member's
+/// visibility keyword to `public`; `protected` is the alternative when
+/// the reference reaches the member through a specialization. Both are
+/// semantic. Source text is needed to find the keyword; without it the
+/// finding stands with no fix.
+fn visibility_blocked_reference(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    sources: &[(usize, &str)],
+    out: &mut Vec<Finding>,
+) {
+    let severity = config.cfg(RuleId::VisibilityBlockedReference).base;
+    if severity == Severity::Off {
+        return;
+    }
+    let text_of = |unit: usize| sources.iter().find(|(i, _)| *i == unit).map(|(_, t)| *t);
+    for b in resolved.blocked_references() {
+        let member = resolved
+            .element_qualified_name(b.member)
+            .unwrap_or_else(|| b.name.to_display_string());
+        let mut f = finding(
+            RuleId::VisibilityBlockedReference,
+            severity,
+            format!(
+                "`{}` does not resolve — `{member}` exists but is {}",
+                b.spelling, b.visibility
+            ),
+        );
+        f.unit = Some(b.unit);
+        f.span = Some(b.name.span);
+        f.element = edit_target(resolved, b.member);
+        // The keyword sits at the start of the member's extent.
+        let keyword = resolved.member_extent(b.member).and_then(|(unit, span)| {
+            let text = text_of(unit)?;
+            let rest = text.get(span.start as usize..)?;
+            rest.starts_with(b.visibility)
+                .then(|| (unit, span.start, span.start + b.visibility.len() as u32))
+        });
+        if let Some((unit, start, end)) = keyword {
+            let widen = |keyword: &str| Fix {
+                label: format!("make `{member}` {keyword}"),
+                deletes: false,
+                semantic: true,
+                edits: vec![Edit {
+                    unit,
+                    span: Span { start, end },
+                    replacement: keyword.to_string(),
+                }],
+            };
+            f.suggest = Some("public".to_string());
+            f.fix = Some(widen("public"));
+            if b.protected_suffices {
+                f.alternatives = vec![widen("protected")];
+            }
+        }
+        out.push(f);
+    }
+}
+
+/// The declaration keyword of a usage metaclass, as spelled in source.
+fn usage_keyword(metaclass: &str) -> Option<&'static str> {
+    Some(match metaclass {
+        "AttributeUsage" => "attribute",
+        "PartUsage" => "part",
+        "ItemUsage" => "item",
+        "PortUsage" => "port",
+        "ActionUsage" => "action",
+        "StateUsage" => "state",
+        "ConstraintUsage" => "constraint",
+        "RequirementUsage" => "requirement",
+        "CalculationUsage" => "calc",
+        "ConnectionUsage" => "connection",
+        "InterfaceUsage" => "interface",
+        "OccurrenceUsage" => "occurrence",
+        "EnumerationUsage" => "enum",
+        "ViewUsage" => "view",
+        "ViewpointUsage" => "viewpoint",
+        "RenderingUsage" => "rendering",
+        "ConcernUsage" => "concern",
+        "CaseUsage" => "case",
+        "AnalysisCaseUsage" => "analysis",
+        "VerificationCaseUsage" => "verification",
+        "UseCaseUsage" => "use case",
+        "AllocationUsage" => "allocation",
+        "FlowUsage" => "flow",
+        "MetadataUsage" => "metadata",
+        _ => return None,
+    })
+}
+
+/// The usage keyword a definition metaclass belongs to, by the most
+/// specific definition kind it conforms to (a requirement definition is
+/// also a constraint definition; the specific kind wins).
+fn definition_usage_keyword(metaclass: &str) -> Option<&'static str> {
+    use sysmlv2_model::check::metaclass_conforms as conforms;
+    for (def, keyword) in [
+        ("ViewpointDefinition", "viewpoint"),
+        ("ConcernDefinition", "concern"),
+        ("RequirementDefinition", "requirement"),
+        ("ConstraintDefinition", "constraint"),
+        ("UseCaseDefinition", "use case"),
+        ("AnalysisCaseDefinition", "analysis"),
+        ("VerificationCaseDefinition", "verification"),
+        ("CaseDefinition", "case"),
+        ("CalculationDefinition", "calc"),
+        ("StateDefinition", "state"),
+        ("FlowDefinition", "flow"),
+        ("InterfaceDefinition", "interface"),
+        ("AllocationDefinition", "allocation"),
+        ("ConnectionDefinition", "connection"),
+        ("ViewDefinition", "view"),
+        ("RenderingDefinition", "rendering"),
+        ("ActionDefinition", "action"),
+        ("PartDefinition", "part"),
+        ("MetadataDefinition", "metadata"),
+        ("ItemDefinition", "item"),
+        ("PortDefinition", "port"),
+        ("OccurrenceDefinition", "occurrence"),
+        ("EnumerationDefinition", "attribute"),
+        ("AttributeDefinition", "attribute"),
+    ] {
+        if conforms(metaclass, def) {
+            return Some(keyword);
+        }
+    }
+    None
+}
+
+/// Byte span of `keyword` as a whole word inside `text[start..end]`.
+fn keyword_span(text: &str, start: u32, end: u32, keyword: &str) -> Option<Span> {
+    let head = text.get(start as usize..end as usize)?;
+    let mut from = 0;
+    while let Some(i) = head[from..].find(keyword) {
+        let at = from + i;
+        let word = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
+        let before_ok = at == 0 || !head[..at].chars().next_back().is_some_and(word);
+        let after_ok = !head[at + keyword.len()..].chars().next().is_some_and(word);
+        if before_ok && after_ok {
+            let s = start + at as u32;
+            return Some(Span {
+                start: s,
+                end: s + keyword.len() as u32,
+            });
+        }
+        from = at + keyword.len();
+    }
+    None
+}
+
+/// The usage keyword token of `e`'s declaration in its unit's text: the
+/// member extent up to the declared name (or the whole extent when
+/// unnamed) is scanned for the keyword its metaclass spells.
+fn usage_keyword_span(
+    resolved: &ResolvedModel,
+    e: ElementRef,
+    text: &str,
+) -> Option<(Span, &'static str)> {
+    let keyword = usage_keyword(resolved.element_type(e))?;
+    let (_, extent) = resolved.member_extent(e)?;
+    let end = resolved
+        .declaration_site(e)
+        .map_or(extent.end, |(_, name)| name.start);
+    Some((keyword_span(text, extent.start, end, keyword)?, keyword))
+}
+
+/// Where `ref` goes in a member whose usage keyword starts at
+/// `keyword_start`: before an `individual`, `snapshot` or `timeslice`
+/// prefix or a `#` metadata prefix when one precedes the keyword (the
+/// grammar reads `ref` first), else immediately before the keyword.
+fn ref_insertion_point(text: &str, extent_start: u32, keyword_start: u32) -> u32 {
+    let mut at = keyword_start;
+    for prefix in ["individual", "snapshot", "timeslice"] {
+        if let Some(span) = keyword_span(text, extent_start, at, prefix) {
+            at = at.min(span.start);
+        }
+    }
+    if let Some(head) = text.get(extent_start as usize..at as usize) {
+        if let Some(i) = head.find('#') {
+            at = at.min(extent_start + i as u32);
+        }
+    }
+    at
+}
+
+/// `usage-kind-mismatch`: the pairs the semantic check reports as `X must
+/// be typed by Y`, with a semantic fix rewriting the usage keyword to the
+/// definition's kind where that kind is known.
+fn usage_kind_mismatch(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    sources: &[(usize, &str)],
+    out: &mut Vec<Finding>,
+) {
+    let severity = config.cfg(RuleId::UsageKindMismatch).base;
+    if severity == Severity::Off {
+        return;
+    }
+    let text_of = |unit: usize| sources.iter().find(|(i, _)| *i == unit).map(|(_, t)| *t);
+    for pair in sysmlv2_model::check::incompatible_typings(resolved) {
+        let usage_ty = resolved.element_type(pair.usage);
+        let target_ty = resolved.element_type(pair.target);
+        let target = resolved
+            .element_qualified_name(pair.target)
+            .unwrap_or_else(|| target_ty.to_string());
+        let mut f = finding(
+            RuleId::UsageKindMismatch,
+            severity,
+            format!(
+                "{usage_ty} must be typed by {}; `{target}` is a {target_ty}",
+                pair.allowed
+            ),
+        );
+        f.unit = Some(pair.unit);
+        f.span = Some(pair.span);
+        f.element = edit_target(resolved, pair.usage);
+        // An enumeration body holds only literals: no keyword to rewrite.
+        let in_enum = resolved
+            .owner(pair.usage)
+            .is_some_and(|o| resolved.element_type(o) == "EnumerationDefinition");
+        let wanted = definition_usage_keyword(target_ty)
+            .filter(|k| Some(*k) != usage_keyword(usage_ty) && !in_enum);
+        if let (Some(wanted), Some(text)) = (wanted, text_of(pair.unit)) {
+            if let Some((span, current)) = usage_keyword_span(resolved, pair.usage, text) {
+                f.suggest = Some(wanted.to_string());
+                f.fix = Some(Fix {
+                    label: format!("change `{current}` to `{wanted}`"),
+                    deletes: false,
+                    semantic: true,
+                    edits: vec![Edit {
+                        unit: pair.unit,
+                        span,
+                        replacement: wanted.to_string(),
+                    }],
+                });
+            }
+        }
+        out.push(f);
+    }
+}
+
+/// `port-member-referential`: a composite non-port usage owned by a port
+/// definition or usage, with a fix inserting `ref` before its keyword.
+fn port_member_referential(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    sources: &[(usize, &str)],
+    out: &mut Vec<Finding>,
+) {
+    let severity = config.cfg(RuleId::PortMemberReferential).base;
+    if severity == Severity::Off {
+        return;
+    }
+    let text_of = |unit: usize| sources.iter().find(|(i, _)| *i == unit).map(|(_, t)| *t);
+    let elems: Vec<ElementRef> = resolved.user_elements().collect();
+    for e in elems {
+        let ty = resolved.element_type(e);
+        if !sysmlv2_model::check::metaclass_conforms(ty, "Usage")
+            || ty == "PortUsage"
+            || resolved.is_composite(e) != Some(true)
+        {
+            continue;
+        }
+        let Some(owner) = resolved.owner(e) else {
+            continue;
+        };
+        if !matches!(resolved.element_type(owner), "PortDefinition" | "PortUsage") {
+            continue;
+        }
+        let Some((unit, span)) = resolved
+            .declaration_site(e)
+            .or_else(|| resolved.member_extent(e))
+        else {
+            continue;
+        };
+        // The specification's name, else the written one: a usage named
+        // only through what it redefines is reported by that name — even
+        // when the redefinition did not resolve — rather than as "the
+        // usage".
+        let name = resolved
+            .element_effective_name(e)
+            .or_else(|| resolved.element_lookup_name(e))
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| "the usage".to_string());
+        let mut f = finding(
+            RuleId::PortMemberReferential,
+            severity,
+            format!(
+                "{name} is a composite {ty} owned by a port; a port's non-port members must be referential"
+            ),
+        );
+        f.unit = Some(unit);
+        f.span = Some(span);
+        f.element = edit_target(resolved, e);
+        if let Some(text) = text_of(unit) {
+            if let Some((kw, _)) = usage_keyword_span(resolved, e, text) {
+                let at = resolved.member_extent(e).map_or(kw.start, |(_, extent)| {
+                    ref_insertion_point(text, extent.start, kw.start)
+                });
+                f.fix = Some(Fix {
+                    label: "make it referential (`ref`)".to_string(),
+                    deletes: false,
+                    semantic: false,
+                    edits: vec![Edit {
+                        unit,
+                        span: Span { start: at, end: at },
+                        replacement: "ref ".to_string(),
+                    }],
+                });
+            }
+        }
+        out.push(f);
+    }
+}
+
+/// `inherited-name-shadow`: the semantic check's inherited-name collisions
+/// (`validateNamespaceDistinguishibility`), with a fix spelling the
+/// redefinition for an owned member that may redefine the member it
+/// hides (the collision carries the target spelling only then):
+/// `attribute x : T` becomes `attribute :>> x : T` when the hidden member's
+/// own name is the declared name and no short name is spelled; any other
+/// identification (`attribute <x> other : T`, `attribute <x> : T`) gets
+/// ` :>> target` right after it, keeping the declared name.
+fn inherited_name_shadow(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    sources: &[(usize, &str)],
+    out: &mut Vec<Finding>,
+) {
+    let severity = config.cfg(RuleId::InheritedNameShadow).base;
+    if severity == Severity::Off {
+        return;
+    }
+    let text_of = |unit: usize| sources.iter().find(|(i, _)| *i == unit).map(|(_, t)| *t);
+    for c in sysmlv2_model::check::inherited_name_collisions(resolved) {
+        if resolved.is_library_element(c.element) {
+            continue;
+        }
+        let mut f = finding(RuleId::InheritedNameShadow, severity, c.message.clone());
+        f.unit = Some(c.unit);
+        f.span = Some(c.span);
+        f.element = edit_target(resolved, c.element);
+        if let (Some(hidden), Some(target), Some(text)) =
+            (c.hidden, c.redefinition_target.as_deref(), text_of(c.unit))
+        {
+            let declared = resolved.element_name(c.element).map(str::to_string);
+            let short = resolved
+                .element_declared_short_name(c.element)
+                .map(str::to_string);
+            let hidden_name = resolved.element_name(hidden).map(str::to_string);
+            let edit = if declared.is_some() && short.is_none() && hidden_name == declared {
+                Some((c.span, format!(":>> {target}")))
+            } else if declared.is_some() {
+                Some((
+                    Span {
+                        start: c.span.end,
+                        end: c.span.end,
+                    },
+                    format!(" :>> {target}"),
+                ))
+            } else {
+                // Only a short name: the span is the token inside `<…>`;
+                // the redefinition follows the closing bracket.
+                text.get(c.span.end as usize..)
+                    .and_then(|rest| rest.find('>'))
+                    .map(|i| {
+                        let at = c.span.end + i as u32 + 1;
+                        (Span { start: at, end: at }, format!(" :>> {target}"))
+                    })
+            };
+            if let Some((span, replacement)) = edit {
+                f.suggest = Some(format!(":>> {target}"));
+                f.fix = Some(Fix {
+                    label: format!("redefine the inherited `{}` (`:>>`)", c.name),
+                    deletes: false,
+                    semantic: true,
+                    edits: vec![Edit {
+                        unit: c.unit,
+                        span,
+                        replacement,
+                    }],
+                });
+            }
+        }
+        out.push(f);
+    }
+}
+
+/// `unqualified-enum-literal`: an unresolved simple name matching exactly
+/// one enumeration literal in the model, with a fix qualifying it.
+fn unqualified_enum_literal(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
+    let severity = config.cfg(RuleId::UnqualifiedEnumLiteral).base;
+    if severity == Severity::Off {
+        return;
+    }
+    let literals = resolved.elements_of_metaclass("EnumerationUsage");
+    if literals.is_empty() {
+        return;
+    }
+    // Literal → its escaped name, user literals first: a user literal
+    // wins over a library one of the same name, and a library literal is
+    // offered only when no user literal matches.
+    let spelled: Vec<(ElementRef, String, bool)> = literals
+        .iter()
+        .filter_map(|&l| {
+            let name = resolved.element_name(l)?;
+            Some((
+                l,
+                sysmlv2_syntax::ast::escape_name(name),
+                resolved.is_library_element(l),
+            ))
+        })
+        .collect();
+    for r in resolved.unresolved_references() {
+        if resolved.is_library_element(r.owner)
+            || r.spelling.contains("::")
+            || r.spelling.contains('.')
+        {
+            continue;
+        }
+        let matching: Vec<ElementRef> = spelled
+            .iter()
+            .filter(|(_, name, _)| *name == r.spelling)
+            .map(|(l, _, _)| *l)
+            .collect();
+        let user: Vec<ElementRef> = matching
+            .iter()
+            .copied()
+            .filter(|l| !resolved.is_library_element(*l))
+            .collect();
+        let [literal] = (if user.is_empty() {
+            &matching[..]
+        } else {
+            &user[..]
+        }) else {
+            continue;
+        };
+        let literal = *literal;
+        let name = r.spelling.clone();
+        let Some(qualified) = resolved.element_qualified_name(literal) else {
+            continue;
+        };
+        let Some(spelling) = resolved.element_reference_spelling(literal) else {
+            continue;
+        };
+        let mut f = finding(
+            RuleId::UnqualifiedEnumLiteral,
+            severity,
+            format!(
+                "`{name}` does not resolve here; the enumeration literal `{qualified}` matches"
+            ),
+        );
+        f.unit = Some(r.unit);
+        f.span = Some(r.span);
+        f.element = edit_target(resolved, literal);
+        f.suggest = Some(qualified.clone());
+        f.fix = Some(Fix {
+            label: format!("qualify as `{qualified}`"),
+            deletes: false,
+            semantic: false,
+            edits: vec![Edit {
+                unit: r.unit,
+                span: r.span,
+                replacement: spelling,
+            }],
+        });
+        out.push(f);
+    }
+}
+
 /// `unused-parameter`: an `in`/`inout` parameter of a callable user
 /// definition with no reference inside the definition's own body,
 /// per-context configurable (calc / constraint / action defs). The
@@ -1419,7 +2260,16 @@ fn untyped_usage(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
 /// parameter — a call site's named argument would be stranded by the
 /// deletion, so those findings carry no fix.
 fn unused_parameter(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
-    let cfg = config.cfg("unused-parameter");
+    let cfg = config.cfg(RuleId::UnusedParameter);
+    // Reference sites by target, indexed once: `(unit, name span)` is
+    // all the in-body test reads.
+    let mut sites_by_target: HashMap<ElementRef, Vec<(usize, Span)>> = HashMap::new();
+    for s in resolved.reference_sites() {
+        sites_by_target
+            .entry(s.target)
+            .or_default()
+            .push((s.unit, s.name_span));
+    }
     for scope in UNUSED_PARAM_SCOPES {
         let severity = cfg.severity(scope.key);
         if severity == Severity::Off {
@@ -1441,10 +2291,10 @@ fn unused_parameter(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec
                 {
                     continue;
                 }
-                let sites = resolved.references_to(p);
-                let used_in_body = sites.iter().any(|s| {
+                let sites = sites_by_target.get(&p).map_or(&[][..], Vec::as_slice);
+                let used_in_body = sites.iter().any(|&(unit, name_span)| {
                     extent.is_some_and(|(u, sp)| {
-                        s.unit == u && sp.start <= s.name_span.start && s.name_span.end <= sp.end
+                        unit == u && sp.start <= name_span.start && name_span.end <= sp.end
                     })
                 });
                 if used_in_body {
@@ -1453,11 +2303,15 @@ fn unused_parameter(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec
                 let Some((unit, span)) = resolved.declaration_site(p) else {
                     continue;
                 };
-                let name = resolved.element_name(p).unwrap_or("_").to_string();
+                let name = resolved
+                    .element_effective_name(p)
+                    .or_else(|| resolved.element_lookup_name(p))
+                    .unwrap_or_else(|| "_".to_string());
                 let (message, fix) = if sites.is_empty() {
                     let fix = resolved.member_extent(p).map(|(u, sp)| Fix {
                         label: format!("delete unused parameter `{name}`"),
                         deletes: true,
+                        semantic: false,
                         edits: vec![Edit {
                             unit: u,
                             span: sp,
@@ -1477,7 +2331,7 @@ fn unused_parameter(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec
                         None,
                     )
                 };
-                let mut f = finding("unused-parameter", severity, message);
+                let mut f = finding(RuleId::UnusedParameter, severity, message);
                 f.unit = Some(unit);
                 f.span = Some(span);
                 f.element = edit_target(resolved, p);
@@ -1649,7 +2503,7 @@ fn spell_expression(factors: &[(String, i32)]) -> Option<String> {
 fn unit_spelling(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
     use sysmlv2_syntax::ast::{Expr, ExprKind};
     use sysmlv2_syntax::visit::{Visit, walk_expr};
-    let cfg = config.cfg("unit-spelling");
+    let cfg = config.cfg(RuleId::UnitSpelling);
 
     struct Brackets<'a> {
         args: Vec<&'a Expr>,
@@ -1750,7 +2604,7 @@ fn unit_spelling(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
                 continue;
             }
             let mut f = finding(
-                "unit-spelling",
+                RuleId::UnitSpelling,
                 severity,
                 format!(
                     "unit spelled `{}` here but `{majority}` at {n} of {total} sites — \
@@ -1764,6 +2618,7 @@ fn unit_spelling(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
             f.fix = Some(Fix {
                 label: format!("re-spell as `{majority}`"),
                 deletes: false,
+                semantic: false,
                 edits: vec![Edit {
                     unit: s.unit,
                     span: s.span,
@@ -1807,7 +2662,7 @@ fn unit_spelling(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
             UnitStyle::Expression => ("a unit expression", "m/s"),
         };
         let mut f = finding(
-            "unit-spelling",
+            RuleId::UnitSpelling,
             severity,
             format!(
                 "unit spelled `{}` — this project spells compound units as {want_name} \
@@ -1821,6 +2676,7 @@ fn unit_spelling(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
         f.fix = respelled.map(|r| Fix {
             label: format!("re-spell as `{r}`"),
             deletes: false,
+            semantic: false,
             edits: vec![Edit {
                 unit: s.unit,
                 span: s.span,
@@ -1831,16 +2687,22 @@ fn unit_spelling(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
     }
 }
 
-/// The declaring fix for an untyped attribute whose value determines a
-/// type: every compatible type, in preference order, spelled as the
-/// shortest reference that resolves from the declaration's scope. A
-/// unit written as a single named reference ranks the types its unit
-/// definition denotes first (`[J]` names the energy unit, so the
-/// energy type outranks torque, which merely shares the dimension),
-/// then every library type of the same dimension; a plain literal has
-/// exactly its scalar-value type. Empty whenever any link is
-/// indeterminate — no value, no library, an opaque unit, no
-/// resolvable spelling.
+/// The declaring fix for an attribute whose value determines a type:
+/// every compatible type, in preference order, spelled as the shortest
+/// reference that resolves from the declaration's scope. A unit written
+/// as a single named reference ranks the types its unit definition
+/// denotes first (`[J]` names the energy unit, so the energy type
+/// outranks torque, which merely shares the dimension), then every
+/// library type of the same dimension; a plain literal has exactly its
+/// scalar-value type. Empty whenever any link is indeterminate — no
+/// value, no library, an opaque unit, an unevaluable expression.
+/// Every candidate is verified against the semantic check's
+/// feature-value conformance verdict — for `e`'s own value and for
+/// the values of the untyped features redefining `e`, which borrow
+/// its declared types — and a candidate the check would reject is
+/// dropped: a fix must not introduce a check finding. A numeric value
+/// spelled or overridden non-integrally (`0.0`, or a redefiner
+/// assigning `0.2` over `= 0`) infers `Real`, not `Integer`.
 fn inferred_type_spellings(resolved: &mut ResolvedModel, e: ElementRef) -> Vec<String> {
     use sysmlv2_model::eval::Value;
     let Some((scope, expr)) = resolved.value_expr(e) else {
@@ -1850,6 +2712,9 @@ fn inferred_type_spellings(resolved: &mut ResolvedModel, e: ElementRef) -> Vec<S
         return Vec::new();
     };
     let mut targets: Vec<ElementRef> = Vec::new();
+    // The wider numeric type an integral inference falls back to when
+    // a dependent value is not integral.
+    let mut fallback: Option<ElementRef> = None;
     match &value {
         Value::Quantity(_, u) => {
             if let Some(unit_elem) = bracket_unit_ref(resolved, scope, &expr) {
@@ -1869,17 +2734,111 @@ fn inferred_type_spellings(resolved: &mut ResolvedModel, e: ElementRef) -> Vec<S
                 }
             }
         }
+        Value::Integer(_) => {
+            let real = resolved.resolve_qualified("ScalarValues::Real");
+            if spells_real_literal(&expr) {
+                // `0.0` evaluates to an exact integer, but the author
+                // wrote a real.
+                targets.extend(real);
+            } else {
+                targets.extend(resolved.scalar_literal_type(&value));
+                fallback = real;
+            }
+        }
         v => targets.extend(resolved.scalar_literal_type(v)),
     }
-    let mut spellings: Vec<String> = Vec::new();
+    let dependents = dependent_values(resolved, e);
+    let admitted = |resolved: &mut ResolvedModel, t: ElementRef| {
+        dependents.iter().all(|(others, v)| {
+            let mut declared = others.clone();
+            declared.push(t);
+            resolved.scalar_value_admitted(&declared, v) != Some(false)
+        })
+    };
+    let mut kept: Vec<ElementRef> = Vec::new();
     for t in targets {
-        if let Some(s) = resolved.type_spelling_at(scope, t) {
+        if admitted(resolved, t) {
+            kept.push(t);
+        }
+    }
+    if kept.is_empty() {
+        if let Some(t) = fallback.filter(|&t| admitted(resolved, t)) {
+            kept.push(t);
+        }
+    }
+    // Spelled for the unit the suggestion is written into.
+    let dialect = resolved
+        .declaration_site(e)
+        .and_then(|(unit, _)| resolved.unit_dialect(unit));
+    let mut spellings: Vec<String> = Vec::new();
+    for t in kept {
+        if let Some(s) = resolved.type_spelling_at(dialect, scope, t) {
             if !spellings.contains(&s) {
                 spellings.push(s);
             }
         }
     }
     spellings
+}
+
+/// The values a typing written on `e` must admit, each with the other
+/// declared types the check weighs alongside it: `e`'s own value
+/// (nothing else declared — the fix writes `e`'s single typing), and
+/// the value of every untyped feature redefining `e`, which borrows
+/// the declared types of all its redefinition targets (`e`'s new
+/// typing among them). Unevaluable values are skipped: the check
+/// stays silent on them too.
+fn dependent_values(
+    resolved: &mut ResolvedModel,
+    e: ElementRef,
+) -> Vec<(Vec<ElementRef>, sysmlv2_model::eval::Value)> {
+    let mut out = Vec::new();
+    if let Ok(v) = resolved.evaluate(e) {
+        out.push((Vec::new(), v));
+    }
+    for r in resolved.redefiners(e) {
+        if resolved.value_expr(r).is_none() || !resolved.typings(r).is_empty() {
+            continue;
+        }
+        let Ok(v) = resolved.evaluate(r) else {
+            continue;
+        };
+        let mut others: Vec<ElementRef> = Vec::new();
+        for t in resolved.redefinition_targets(r) {
+            if t == e {
+                continue;
+            }
+            for ty in resolved.typings(t) {
+                if !others.contains(&ty) {
+                    others.push(ty);
+                }
+            }
+        }
+        out.push((others, v));
+    }
+    out
+}
+
+/// Whether the expression is written with a real literal anywhere
+/// (`0.0`, `1e3`, `1/4000.0`) — the author's spelling of a number
+/// that may still evaluate to an exact integer.
+fn spells_real_literal(expr: &sysmlv2_syntax::ast::Expr) -> bool {
+    use sysmlv2_syntax::ast::{Expr, ExprKind, Literal};
+    use sysmlv2_syntax::visit::{Visit, walk_expr};
+    struct Finder(bool);
+    impl<'a> Visit<'a> for Finder {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if matches!(&e.kind, ExprKind::Literal(Literal::Real(_))) {
+                self.0 = true;
+            }
+            if !self.0 {
+                walk_expr(self, e);
+            }
+        }
+    }
+    let mut v = Finder(false);
+    v.visit_expr(expr);
+    v.0
 }
 
 /// The written unit reference of the value's first quantity bracket —
@@ -1941,7 +2900,7 @@ fn alternates_clause(spellings: &[String]) -> String {
 /// unevaluable value stays silent, never a guess.
 fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
     use sysmlv2_model::eval::Value;
-    let cfg = config.cfg("dimensional-consistency");
+    let cfg = config.cfg(RuleId::DimensionalConsistency);
     let mismatch_sev = cfg.severity("mismatch");
     // The untyped aspect's inventory default is warn — seeded, so it
     // holds while the rule is on and dies under `"off"`.
@@ -1974,6 +2933,7 @@ fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &
             let declare = |s: &String| Fix {
                 label: format!("declare the type `{s}`"),
                 deletes: false,
+                semantic: false,
                 edits: vec![Edit {
                     unit: unit_idx,
                     span: Span {
@@ -1984,7 +2944,7 @@ fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &
                 }],
             };
             let mut f = finding(
-                "dimensional-consistency",
+                RuleId::DimensionalConsistency,
                 untyped_sev,
                 format!(
                     "attribute `{name}` declares no type — its value infers `{first}`{}",
@@ -2048,6 +3008,7 @@ fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &
         let retype = |s: &String| Fix {
             label: format!("re-type as `{s}`"),
             deletes: false,
+            semantic: false,
             edits: vec![Edit {
                 unit: anchor_unit,
                 span: anchor_span,
@@ -2055,7 +3016,7 @@ fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &
             }],
         };
         let mut f = finding(
-            "dimensional-consistency",
+            RuleId::DimensionalConsistency,
             mismatch_sev,
             format!(
                 "attribute `{name}` is typed `{ty_name}` (dimension {}) but its value's \
@@ -2160,7 +3121,7 @@ fn split_spelling(text: &str) -> Option<Vec<String>> {
 /// no import to anchor on (the finding then carries no fix —
 /// inventing a position inside an arbitrary namespace body is how a
 /// fix breaks a model).
-fn import_anchor(resolved: &mut ResolvedModel, unit: usize, text: &str) -> Option<(u32, String)> {
+fn import_anchor(resolved: &ResolvedModel, unit: usize, text: &str) -> Option<(u32, String)> {
     let last = resolved
         .reference_sites()
         .iter()
@@ -2200,7 +3161,7 @@ fn qualified_names(
     sources: &[(usize, &str)],
     out: &mut Vec<Finding>,
 ) {
-    let severity = config.cfg("qualified-names").base;
+    let severity = config.cfg(RuleId::QualifiedNames).base;
     let text_of = |unit: usize| sources.iter().find(|(i, _)| *i == unit).map(|(_, t)| *t);
     let user_units: BTreeSet<usize> = {
         let elems: Vec<ElementRef> = resolved.user_elements().collect();
@@ -2250,7 +3211,7 @@ fn qualified_names(
                     message: String,
                     fix: Option<Fix>,
                     suggest: String| {
-        let mut f = finding("qualified-names", severity, message);
+        let mut f = finding(RuleId::QualifiedNames, severity, message);
         f.unit = Some(site.unit);
         f.span = Some(site.span);
         f.element = edit_target(resolved, site.target);
@@ -2302,10 +3263,12 @@ fn qualified_names(
                 if !adoptable {
                     continue;
                 }
+                // The specification's name, else the written one (a target
+                // reached by a written name is never anonymous here).
                 let name = resolved
-                    .element_name(target)
-                    .unwrap_or("<anonymous>")
-                    .to_string();
+                    .element_effective_name(target)
+                    .or_else(|| resolved.element_lookup_name(target))
+                    .unwrap_or_else(|| "<anonymous>".to_string());
                 push(
                     resolved,
                     site,
@@ -2317,6 +3280,7 @@ fn qualified_names(
                     Some(Fix {
                         label: format!("re-spell as `{majority}`"),
                         deletes: false,
+                        semantic: false,
                         edits: vec![Edit {
                             unit: site.unit,
                             span: site.span,
@@ -2333,7 +3297,9 @@ fn qualified_names(
     for site in &sites {
         match style {
             QualifiedStyle::Qualified => {
-                let Some(full) = resolved.full_spelling(site.target) else {
+                let Some(full) =
+                    resolved.full_spelling(resolved.unit_dialect(site.unit), site.target)
+                else {
                     continue;
                 };
                 if site.written == full {
@@ -2345,6 +3311,7 @@ fn qualified_names(
                 let fix = ok.then(|| Fix {
                     label: format!("qualify as `{full}`"),
                     deletes: false,
+                    semantic: false,
                     edits: vec![Edit {
                         unit: site.unit,
                         span: site.span,
@@ -2363,9 +3330,12 @@ fn qualified_names(
                 );
             }
             QualifiedStyle::Minimal => {
-                let Some(minimal) =
-                    resolved.reference_spelling_at(site.scope, site.exclude, site.target)
-                else {
+                let Some(minimal) = resolved.reference_spelling_at(
+                    resolved.unit_dialect(site.unit),
+                    site.scope,
+                    site.exclude,
+                    site.target,
+                ) else {
                     continue;
                 };
                 if site.written == minimal || minimal.len() >= site.written.len() {
@@ -2382,6 +3352,7 @@ fn qualified_names(
                     Some(Fix {
                         label: format!("re-spell as `{minimal}`"),
                         deletes: false,
+                        semantic: false,
                         edits: vec![Edit {
                             unit: site.unit,
                             span: site.span,
@@ -2395,7 +3366,12 @@ fn qualified_names(
                 let Some(name) = resolved.element_name(site.target).map(str::to_string) else {
                     continue;
                 };
-                let simple = sysmlv2_syntax::ast::escape_name(&name);
+                // Replacement text is source for this unit: a reserved
+                // word of its dialect must stay quoted or the fix would
+                // not parse, and a word the dialect does not reserve
+                // stays bare so the formatter agrees with the fix.
+                let simple =
+                    sysmlv2_syntax::name::spell_name_in(resolved.unit_dialect(site.unit), &name);
                 if site.written == simple {
                     continue;
                 }
@@ -2413,6 +3389,7 @@ fn qualified_names(
                         Some(Fix {
                             label: format!("re-spell as `{simple}`"),
                             deletes: false,
+                            semantic: false,
                             edits: vec![Edit {
                                 unit: site.unit,
                                 span: site.span,
@@ -2431,13 +3408,16 @@ fn qualified_names(
                 if taken {
                     continue;
                 }
-                let Some(import_qn) = resolved.full_spelling(site.target) else {
+                let Some(import_qn) =
+                    resolved.full_spelling(resolved.unit_dialect(site.unit), site.target)
+                else {
                     continue;
                 };
                 let fix = text_of(site.unit).and_then(|text| {
                     import_anchor(resolved, site.unit, text).map(|(at, indent)| Fix {
                         label: format!("import `{import_qn}` and re-spell as `{simple}`"),
                         deletes: false,
+                        semantic: false,
                         edits: vec![
                             Edit {
                                 unit: site.unit,
@@ -2487,7 +3467,7 @@ fn simple_reference(name: &str) -> sysmlv2_syntax::ast::QualifiedName {
 /// this rule's threshold via [`Config::format_chain_min`]).
 fn multiline_conditions(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
     use sysmlv2_syntax::ast::{BinaryOp, Expr, ExprKind};
-    let cfg = config.cfg("multiline-conditions");
+    let cfg = config.cfg(RuleId::MultilineConditions);
     let min = config.chain_min;
     if min == 0 {
         return;
@@ -2549,7 +3529,7 @@ fn multiline_conditions(resolved: &mut ResolvedModel, config: &Config, out: &mut
             continue; // already broken across lines
         }
         let mut f = finding(
-            "multiline-conditions",
+            RuleId::MultilineConditions,
             severity,
             format!(
                 "a {n}-condition `{op}` chain on one line — one condition per line reads \
@@ -2580,7 +3560,7 @@ fn multiline_conditions(resolved: &mut ResolvedModel, config: &Config, out: &mut
 /// rounded to the nearest level, with a floor of one — an indented line
 /// never dedents to column 0 because its indentation was narrow.
 fn indentation(config: &Config, sources: &[(usize, &str)], out: &mut Vec<Finding>) {
-    let severity = config.cfg("indentation").base;
+    let severity = config.cfg(RuleId::Indentation).base;
     if severity == Severity::Off {
         return;
     }
@@ -2643,12 +3623,13 @@ fn indentation(config: &Config, sources: &[(usize, &str)], out: &mut Vec<Finding
                 IndentStyle::Spaces => " ".repeat(levels * size),
             };
             let span = Span::new(start, start + ws.len() as u32);
-            let mut f = finding("indentation", severity, message);
+            let mut f = finding(RuleId::Indentation, severity, message);
             f.unit = Some(unit);
             f.span = Some(span);
             f.fix = Some(Fix {
                 label: format!("re-indent this line with {wanted}"),
                 deletes: false,
+                semantic: false,
                 edits: vec![Edit {
                     unit,
                     span,
@@ -2665,7 +3646,14 @@ fn plural(n: usize) -> &'static str {
 }
 
 fn unused_definition(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
-    let cfg = config.cfg("unused-definition");
+    let cfg = config.cfg(RuleId::UnusedDefinition);
+    // Every referenced element, collected once from the reference
+    // sites rather than by scanning them again per definition.
+    let referenced: HashSet<ElementRef> = resolved
+        .reference_sites()
+        .iter()
+        .map(|s| s.target)
+        .collect();
     let defs: Vec<ElementRef> = resolved
         .user_elements()
         .filter(|e| resolved.element_type(*e).ends_with("Definition"))
@@ -2675,7 +3663,7 @@ fn unused_definition(resolved: &mut ResolvedModel, config: &Config, out: &mut Ve
         if severity == Severity::Off {
             continue;
         }
-        if !resolved.references_to(def).is_empty() {
+        if referenced.contains(&def) {
             continue;
         }
         let Some((unit, span)) = resolved.declaration_site(def) else {
@@ -2686,7 +3674,7 @@ fn unused_definition(resolved: &mut ResolvedModel, config: &Config, out: &mut Ve
             .unwrap_or("<anonymous>")
             .to_string();
         let mut f = finding(
-            "unused-definition",
+            RuleId::UnusedDefinition,
             severity,
             format!(
                 "`{name}` is never referenced in these units (closed world: outside \
@@ -2720,7 +3708,7 @@ pub const CANONICALIZER_SCHEMA_VERSION: u32 = 1;
 /// options that shape their fixes — never unrelated severities. One
 /// implementation serves record writers and this crate's verifier.
 pub fn canonicalization_digest(config: &Config) -> String {
-    let fix_policy = |id: &str, contexts: &[&str]| {
+    let fix_policy = |id: RuleId, contexts: &[&str]| {
         let cfg = config.cfg(id);
         if contexts.is_empty() {
             return ((cfg.base != Severity::Off) as u8).to_string();
@@ -2751,11 +3739,11 @@ pub fn canonicalization_digest(config: &Config) -> String {
          qualified-names={},{qualified_style};unit-spelling={},{unit_style};untyped-usage={}",
         CANONICALIZER_SCHEMA_VERSION,
         config.chain_min,
-        fix_policy("dimensional-consistency", &["mismatch", "untyped"]),
-        fix_policy("indentation", &[]),
-        fix_policy("qualified-names", &[]),
-        fix_policy("unit-spelling", &[]),
-        fix_policy("untyped-usage", &["AttributeUsage"]),
+        fix_policy(RuleId::DimensionalConsistency, &["mismatch", "untyped"]),
+        fix_policy(RuleId::Indentation, &[]),
+        fix_policy(RuleId::QualifiedNames, &[]),
+        fix_policy(RuleId::UnitSpelling, &[]),
+        fix_policy(RuleId::UntypedUsage, &["AttributeUsage"]),
     );
     format!(
         "sha256:{}",
@@ -2768,6 +3756,17 @@ const GEN_EXCLUSION_QN: &str = "TransformMeta::TransformExclusion";
 const GEN_STATE_QN: &str = "TransformMeta::TransformState";
 const GEN_SOURCE_QN: &str = "TransformMeta::TransformSource";
 const STORE_KEY_PREFIX: &str = "provenance:";
+
+/// Prefix markers (`#TransformMeta::Generated …`,
+/// `#TransformMeta::ProvenanceStore …`) are metadata usages with no
+/// recorded typing — the owner's head text identifies them, exactly as
+/// the materializer does. Compiled once per process.
+static GENERATED_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^#\s*(TransformMeta\s*::\s*)?Generated\b").expect("static pattern")
+});
+static STORE_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^#\s*(TransformMeta\s*::\s*)?ProvenanceStore\b").expect("static pattern")
+});
 
 fn digest_shaped(v: &str) -> bool {
     v.len() == 71
@@ -2812,7 +3811,7 @@ fn unwrap_formatted(formatted: &str) -> String {
         .unwrap_or("");
     inner
         .iter()
-        .map(|l| l.strip_prefix(indent).unwrap_or(l.trim_start()))
+        .map(|l| l.strip_prefix(indent).unwrap_or_else(|| l.trim_start()))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2822,7 +3821,7 @@ fn unwrap_formatted(formatted: &str) -> String {
 /// the fixes, and a fix-relevant policy change reads as fingerprint
 /// drift before any byte comparison happens. Public so record writers
 /// and fixtures compute the exact bytes this crate verifies.
-pub fn canonical_member_text(raw: &str, config: &Config) -> Result<String, String> {
+pub fn canonical_member_text(raw: &str, config: &Config) -> Result<String, LintError> {
     let lf = raw.replace("\r\n", "\n");
     let wrapped = format!("package __sysmlGeneratedGuard__ {{\n{lf}\n}}");
     let formatted = sysmlv2_syntax::print::format_source_opts(
@@ -2835,9 +3834,11 @@ pub fn canonical_member_text(raw: &str, config: &Config) -> Result<String, Strin
         },
     )
     .map_err(|d| {
-        d.first()
-            .map(|d| d.message.clone())
-            .unwrap_or_else(|| "unparseable member".into())
+        LintError::UnparseableMember(
+            d.first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "no diagnostic".into()),
+        )
     })?;
     Ok(unwrap_formatted(&formatted))
 }
@@ -2984,6 +3985,134 @@ pub fn generated_inventory(
 }
 
 /// One parsed inventory feeding all three rules.
+/// State records by `(store, transform id)` — more than one only when
+/// the sidecar is corrupt.
+type StateIndex = std::collections::HashMap<(ElementRef, String), Vec<usize>>;
+
+/// What every stage of the generated-ownership guard reads: the three
+/// rules' effective configurations, the unit names and texts the
+/// sidecar contract is spelled in, and the record types. The types are
+/// resolved once — asking for typings twice and re-rendering every
+/// type's qualified name dominated large editor inventories (20k
+/// metadata usages at the 10k-member gate).
+struct GuardPass<'a> {
+    invalid_cfg: &'a RuleConfig,
+    outdated_cfg: &'a RuleConfig,
+    modified_cfg: &'a RuleConfig,
+    unit_names: std::collections::HashMap<usize, &'a str>,
+    unit_texts: std::collections::HashMap<usize, &'a str>,
+    provenance_type: Option<ElementRef>,
+    exclusion_type: Option<ElementRef>,
+    state_type: Option<ElementRef>,
+    source_type: Option<ElementRef>,
+}
+
+impl<'a> GuardPass<'a> {
+    fn new(
+        config: &'a Config,
+        units: &[(usize, &'a str, &'a str)],
+        resolved: &mut ResolvedModel,
+    ) -> GuardPass<'a> {
+        GuardPass {
+            invalid_cfg: config.cfg(RuleId::GeneratedProvenanceInvalid),
+            outdated_cfg: config.cfg(RuleId::GeneratedProvenanceBaselineOutdated),
+            modified_cfg: config.cfg(RuleId::GeneratedElementModified),
+            unit_names: units.iter().map(|&(i, n, _)| (i, n)).collect(),
+            unit_texts: units.iter().map(|&(i, _, t)| (i, t)).collect(),
+            provenance_type: resolved.resolve_qualified(GEN_PROVENANCE_QN),
+            exclusion_type: resolved.resolve_qualified(GEN_EXCLUSION_QN),
+            state_type: resolved.resolve_qualified(GEN_STATE_QN),
+            source_type: resolved.resolve_qualified(GEN_SOURCE_QN),
+        }
+    }
+}
+
+/// Every marker and record one pass over the model found, before any
+/// audit has judged them.
+struct GenScan {
+    marked_members: std::collections::HashSet<ElementRef>,
+    marked_stores: std::collections::HashSet<ElementRef>,
+    records: Vec<GenRecord>,
+    states: Vec<GenState>,
+}
+
+/// What the ownership audits establish about a scan; each audit fills
+/// its own fields, and the inventory projection and the target join
+/// read all of them.
+#[derive(Default)]
+struct GuardAudits {
+    /// Whether each provenance store met its contract completely.
+    store_ok: std::collections::HashMap<ElementRef, bool>,
+    /// The content package each keyed store owns.
+    store_targets: std::collections::HashMap<ElementRef, ElementRef>,
+    /// How many records claim each `(transform id, key, exclusion)`.
+    pair_counts: std::collections::HashMap<(String, String, bool), usize>,
+    /// Managed records by the member they claim.
+    owners_by_target: std::collections::HashMap<ElementRef, Vec<usize>>,
+    state_by_pair: StateIndex,
+    /// The `(store, transform id)` pairs managed provenance claims.
+    managed_pairs: std::collections::BTreeSet<(ElementRef, String)>,
+}
+
+/// The head of a member's source text — enough of it to read the
+/// prefix markers a typing-less metadata usage leaves behind.
+fn guard_head(
+    resolved: &ResolvedModel,
+    unit_texts: &std::collections::HashMap<usize, &str>,
+    e: ElementRef,
+) -> Option<String> {
+    let (unit, span) = resolved.member_extent(e)?;
+    let text = unit_texts.get(&unit)?;
+    let raw = text.get(span.start as usize..span.end as usize)?;
+    Some(raw.trim_start().chars().take(80).collect())
+}
+
+/// Where a finding about an element anchors: its declaration site, or
+/// its whole member extent when it declares no name of its own.
+fn guard_anchor(resolved: &ResolvedModel, e: ElementRef) -> Option<(usize, Span)> {
+    resolved
+        .declaration_site(e)
+        .or_else(|| resolved.member_extent(e))
+}
+
+/// One guard finding, anchored and attributed to its edit target.
+fn guard_push(
+    out: &mut Vec<Finding>,
+    rule: RuleId,
+    severity: Severity,
+    message: String,
+    anchor: Option<(usize, Span)>,
+    element: Option<String>,
+) {
+    let mut f = finding(rule, severity, message);
+    if let Some((unit, span)) = anchor {
+        f.unit = Some(unit);
+        f.span = Some(span);
+    }
+    f.element = element;
+    out.push(f);
+}
+
+/// Exactly one state record for the pair, with its identity intact.
+fn state_for_pair(
+    state_by_pair: &StateIndex,
+    states: &[GenState],
+    store: ElementRef,
+    id: &str,
+) -> Option<usize> {
+    match state_by_pair
+        .get(&(store, id.to_string()))
+        .map(Vec::as_slice)
+    {
+        Some([only]) if states[*only].valid => Some(*only),
+        _ => None,
+    }
+}
+
+/// One parsed inventory feeding all three rules: read the markers and
+/// records once, audit ownership in stages, project the rows that
+/// survive into the host's inventory, then classify baseline drift on
+/// the members the audits cleared.
 fn generated_guard(
     resolved: &mut ResolvedModel,
     config: &Config,
@@ -2992,58 +4121,35 @@ fn generated_guard(
     inventory: Option<&mut GeneratedInventory>,
     inventory_only: bool,
 ) {
-    let invalid_cfg = config.cfg("generated-provenance-invalid");
-    let outdated_cfg = config.cfg("generated-provenance-baseline-outdated");
-    let modified_cfg = config.cfg("generated-element-modified");
-    let unit_names: std::collections::HashMap<usize, &str> =
-        units.iter().map(|&(i, n, _)| (i, n)).collect();
-    let unit_texts: std::collections::HashMap<usize, &str> =
-        units.iter().map(|&(i, _, t)| (i, t)).collect();
+    let pass = GuardPass::new(config, units, resolved);
+    let mut scan = scan_records(&pass, resolved);
+    let mut audits = GuardAudits::default();
+    audit_stores(&pass, resolved, &scan, &mut audits, out);
+    audit_states(&pass, resolved, &mut scan.states, &mut audits, out);
+    audit_record_pairs(&pass, resolved, &mut scan.records, &mut audits, out);
+    audit_state_correspondence(&pass, resolved, &scan, &mut audits, out);
+    if let Some(inventory) = inventory {
+        fill_inventory(&pass, resolved, &scan, &audits, inventory);
+    }
+    if inventory_only {
+        return;
+    }
+    let claimed = audit_targets(&pass, resolved, config, &scan, &audits, out);
+    report_unclaimed_markers(&pass, resolved, &scan, &claimed, out);
+}
 
-    // Resolve the two record types once. Asking for typings twice and
-    // re-rendering every type's qualified name dominated large editor
-    // inventories (20k metadata usages at the 10k-member gate).
-    let provenance_type = resolved.resolve_qualified(GEN_PROVENANCE_QN);
-    let exclusion_type = resolved.resolve_qualified(GEN_EXCLUSION_QN);
-    let state_type = resolved.resolve_qualified(GEN_STATE_QN);
-    let source_type = resolved.resolve_qualified(GEN_SOURCE_QN);
-    // Prefix markers (`#TransformMeta::Generated …`) are metadata
-    // usages with no recorded typing — identify them by the owner's
-    // head text, exactly as the materializer does.
-    let generated_head = regex_lite::Regex::new(r"^#\s*(TransformMeta\s*::\s*)?Generated\b")
-        .expect("static pattern");
-    let store_head = regex_lite::Regex::new(r"^#\s*(TransformMeta\s*::\s*)?ProvenanceStore\b")
-        .expect("static pattern");
-    let head_of = |resolved: &mut ResolvedModel,
-                   unit_texts: &std::collections::HashMap<usize, &str>,
-                   e: ElementRef|
-     -> Option<String> {
-        let (unit, span) = resolved.member_extent(e)?;
-        let text = unit_texts.get(&unit)?;
-        let raw = text.get(span.start as usize..span.end as usize)?;
-        Some(raw.trim_start().chars().take(80).collect())
-    };
-    let anchor_of = |resolved: &mut ResolvedModel, e: ElementRef| {
-        resolved
-            .declaration_site(e)
-            .or_else(|| resolved.member_extent(e))
-    };
-    let push = |out: &mut Vec<Finding>,
-                rule: &'static str,
-                severity: Severity,
-                message: String,
-                anchor: Option<(usize, Span)>,
-                element: Option<String>| {
-        let mut f = finding(rule, severity, message);
-        if let Some((unit, span)) = anchor {
-            f.unit = Some(unit);
-            f.span = Some(span);
-        }
-        f.element = element;
-        out.push(f);
-    };
+/// Collect markers, stores and records: every metadata usage, sorted
+/// into provenance records, exclusions, state records, and the bare
+/// prefix markers whose owner's head text is all that identifies them.
+fn scan_records(pass: &GuardPass, resolved: &mut ResolvedModel) -> GenScan {
+    let unit_texts: &std::collections::HashMap<usize, &str> = &pass.unit_texts;
+    let (provenance_type, exclusion_type, state_type, source_type) = (
+        pass.provenance_type,
+        pass.exclusion_type,
+        pass.state_type,
+        pass.source_type,
+    );
 
-    // ---- collect markers, stores, records ----
     let user_elements: Vec<ElementRef> = resolved.user_elements().collect();
     let usages: Vec<ElementRef> = user_elements
         .iter()
@@ -3067,7 +4173,7 @@ fn generated_guard(
     // Attribute name/value pairs of one metadata usage — the shared
     // extraction records, states, and state sources all read through.
     fn metadata_fields(
-        resolved: &mut ResolvedModel,
+        resolved: &ResolvedModel,
         owned_by: &std::collections::HashMap<ElementRef, Vec<ElementRef>>,
         unit_texts: &std::collections::HashMap<usize, &str>,
         e: ElementRef,
@@ -3149,7 +4255,7 @@ fn generated_guard(
         if is_state {
             let mut st = GenState {
                 el: u,
-                anchor: anchor_of(resolved, u),
+                anchor: guard_anchor(resolved, u),
                 store: resolved.owner(u),
                 transform_id: None,
                 transformer_path: None,
@@ -3159,7 +4265,7 @@ fn generated_guard(
                 sources: Vec::new(),
                 valid: false,
             };
-            for (name, value) in metadata_fields(resolved, &owned_by, &unit_texts, u) {
+            for (name, value) in metadata_fields(resolved, &owned_by, unit_texts, u) {
                 match name.as_str() {
                     "transformId" => st.transform_id = Some(value),
                     "transformerPath" => st.transformer_path = Some(value),
@@ -3171,7 +4277,7 @@ fn generated_guard(
                     _ => {}
                 }
             }
-            st.sources = metadata_sources(resolved, &owned_by, &unit_texts, source_type, u);
+            st.sources = metadata_sources(resolved, &owned_by, unit_texts, source_type, u);
             states.push(st);
             continue;
         }
@@ -3179,10 +4285,10 @@ fn generated_guard(
             // A typing-less usage may be a prefix marker; the owner's
             // head text decides.
             if let Some(owner) = resolved.owner(u) {
-                if let Some(head) = head_of(resolved, &unit_texts, owner) {
-                    if generated_head.is_match(&head) {
+                if let Some(head) = guard_head(resolved, unit_texts, owner) {
+                    if GENERATED_HEAD.is_match(&head) {
                         marked_members.insert(owner);
-                    } else if store_head.is_match(&head) {
+                    } else if STORE_HEAD.is_match(&head) {
                         marked_stores.insert(owner);
                     }
                 }
@@ -3192,7 +4298,7 @@ fn generated_guard(
         let mut rec = GenRecord {
             el: u,
             exclusion: is_excl,
-            anchor: anchor_of(resolved, u),
+            anchor: guard_anchor(resolved, u),
             transform_id: None,
             key: None,
             source: None,
@@ -3213,7 +4319,7 @@ fn generated_guard(
             let Some((_, expr)) = resolved.value_expr(a) else {
                 continue;
             };
-            let Some((unit, _)) = anchor_of(resolved, a) else {
+            let Some((unit, _)) = guard_anchor(resolved, a) else {
                 continue;
             };
             let Some(text) = unit_texts.get(&unit) else {
@@ -3237,29 +4343,60 @@ fn generated_guard(
             }
         }
         if rec.exclusion {
-            rec.sources = metadata_sources(resolved, &owned_by, &unit_texts, source_type, u);
+            rec.sources = metadata_sources(resolved, &owned_by, unit_texts, source_type, u);
         }
         records.push(rec);
     }
 
-    // ---- store contract audit ----
-    let mut store_ok: std::collections::HashMap<ElementRef, bool> = Default::default();
-    let mut store_targets: std::collections::HashMap<ElementRef, ElementRef> = Default::default();
-    for store in marked_stores
+    GenScan {
+        marked_members,
+        marked_stores,
+        records,
+        states,
+    }
+}
+
+/// The store contract: a package holding provenance records carries the
+/// store marker, sits at the top level of the sidecar unit derived from
+/// its target, and keys itself by a short name that resolves.
+fn audit_stores(
+    pass: &GuardPass,
+    resolved: &mut ResolvedModel,
+    scan: &GenScan,
+    audits: &mut GuardAudits,
+    out: &mut Vec<Finding>,
+) {
+    let invalid_cfg = pass.invalid_cfg;
+    let unit_names: &std::collections::HashMap<usize, &str> = &pass.unit_names;
+    let GenScan {
+        marked_stores,
+        records,
+        ..
+    } = scan;
+    let GuardAudits {
+        store_ok,
+        store_targets,
+        ..
+    } = audits;
+
+    // One audit per store, in a stable order: a store several records
+    // share must not be judged twice, and its findings must land in the
+    // same order every pass.
+    let stores: std::collections::BTreeSet<ElementRef> = marked_stores
         .iter()
         .copied()
         .chain(records.iter().filter_map(|r| r.store))
-        .collect::<std::collections::BTreeSet<_>>()
-    {
+        .collect();
+    for store in stores {
         let severity = invalid_cfg.severity(resolved.element_type(store));
-        let anchor = anchor_of(resolved, store);
+        let anchor = guard_anchor(resolved, store);
         let element = edit_target(resolved, store);
         let fail = |out: &mut Vec<Finding>, detail: String, ok: &mut bool| {
             *ok = false;
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     detail,
                     anchor,
@@ -3273,7 +4410,9 @@ fn generated_guard(
             .unwrap_or_else(|| "<anonymous>".into());
         let marked = marked_stores.contains(&store);
         let ty = resolved.element_type(store).to_string();
-        let short = resolved.element_short_name(store).map(str::to_string);
+        let short = resolved
+            .element_declared_short_name(store)
+            .map(str::to_string);
         let top_level = match resolved.owner(store) {
             None => true,
             Some(parent) => {
@@ -3350,23 +4489,32 @@ fn generated_guard(
         }
         store_ok.insert(store, ok);
     }
+}
 
-    // ---- state audit (AA7h0): one TransformState per (store, id) ----
-    // The state record is the only home of transformer-level facts;
-    // managed provenance resolves through it. Missing or duplicate
-    // state is corruption under the clean-break protocol: findings
-    // here, and the affected rows never reach the inventory.
-    let mut state_by_pair: std::collections::HashMap<(ElementRef, String), Vec<usize>> =
-        Default::default();
+/// One TransformState record per `(store, transform id)`. The state
+/// record is the only home of transformer-level facts; managed
+/// provenance resolves through it. Missing or duplicate state is
+/// corruption under the clean-break protocol: findings here, and the
+/// affected rows never reach the inventory.
+fn audit_states(
+    pass: &GuardPass,
+    resolved: &mut ResolvedModel,
+    states: &mut [GenState],
+    audits: &mut GuardAudits,
+    out: &mut Vec<Finding>,
+) {
+    let invalid_cfg = pass.invalid_cfg;
+    let state_by_pair = &mut audits.state_by_pair;
+
     for (i, st) in states.iter_mut().enumerate() {
         let severity = invalid_cfg.severity(resolved.element_type(st.el));
         let element = edit_target(resolved, st.el);
         let mut problems = Vec::new();
         let Some(id) = st.transform_id.clone().filter(|id| !id.is_empty()) else {
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     "TransformState record lacks its transformId".into(),
                     st.anchor,
@@ -3429,9 +4577,9 @@ fn generated_guard(
         st.valid = problems.is_empty();
         if severity != Severity::Off {
             for detail in problems {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     detail,
                     st.anchor,
@@ -3448,9 +4596,9 @@ fn generated_guard(
             let st = &states[i];
             let severity = invalid_cfg.severity(resolved.element_type(st.el));
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!("duplicate TransformState records for `{id}`"),
                     st.anchor,
@@ -3459,35 +4607,37 @@ fn generated_guard(
             }
         }
     }
-    // Exactly one state for the pair, with its identity intact.
-    let state_for_pair =
-        |state_by_pair: &std::collections::HashMap<(ElementRef, String), Vec<usize>>,
-         store: ElementRef,
-         id: &str|
-         -> Option<usize> {
-            match state_by_pair
-                .get(&(store, id.to_string()))
-                .map(Vec::as_slice)
-            {
-                Some([only]) if states[*only].valid => Some(*only),
-                _ => None,
-            }
-        };
+}
 
-    // ---- pair maps + duplicate / conflict audit ----
+/// Pair maps and the duplicate/conflict audit: a record's identity
+/// fields, an exclusion's own source facts, and the rule that one
+/// `(transform id, key)` has at most one claimant of each kind and one
+/// generated member at most one owner.
+fn audit_record_pairs(
+    pass: &GuardPass,
+    resolved: &mut ResolvedModel,
+    records: &mut [GenRecord],
+    audits: &mut GuardAudits,
+    out: &mut Vec<Finding>,
+) {
+    let invalid_cfg = pass.invalid_cfg;
+    let GuardAudits {
+        pair_counts,
+        owners_by_target,
+        ..
+    } = audits;
+
     let mut prov_by_pair: std::collections::HashMap<(String, String), usize> = Default::default();
     let mut excl_pairs: std::collections::HashSet<(String, String)> = Default::default();
-    let mut pair_counts: std::collections::HashMap<(String, String, bool), usize> =
-        Default::default();
     for (i, rec) in records.iter_mut().enumerate() {
         let anchor = rec.anchor;
         let severity = invalid_cfg.severity(resolved.element_type(rec.el));
         let element = edit_target(resolved, rec.el);
         let (Some(id), Some(key)) = (rec.transform_id.clone(), rec.key.clone()) else {
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     "provenance record lacks its transformId/key identity fields".into(),
                     anchor,
@@ -3542,9 +4692,9 @@ fn generated_guard(
             rec.valid = problems.is_empty();
             if severity != Severity::Off {
                 for detail in problems {
-                    push(
+                    guard_push(
                         out,
-                        "generated-provenance-invalid",
+                        RuleId::GeneratedProvenanceInvalid,
                         severity,
                         detail,
                         anchor,
@@ -3559,9 +4709,9 @@ fn generated_guard(
             .or_default() += 1;
         if rec.exclusion {
             if !excl_pairs.insert(pair.clone()) && severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!("duplicate exclusions for ({id}, {key})"),
                     anchor,
@@ -3571,9 +4721,9 @@ fn generated_guard(
         } else if let Some(prev) = prov_by_pair.insert(pair.clone(), i) {
             let _ = prev;
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!("duplicate provenance claims for ({id}, {key})"),
                     anchor,
@@ -3587,9 +4737,9 @@ fn generated_guard(
             let rec = &records[prov_by_pair[pair]];
             let severity = invalid_cfg.severity(resolved.element_type(rec.el));
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!(
                         "both a provenance record and an exclusion exist for ({}, {})",
@@ -3605,8 +4755,6 @@ fn generated_guard(
     // A generated member has exactly one provenance owner, independent
     // of transform id. Two records with different pairs are still two
     // writers for the same bytes and therefore unsafe to guard.
-    let mut owners_by_target: std::collections::HashMap<ElementRef, Vec<usize>> =
-        Default::default();
     for (i, rec) in records.iter().enumerate() {
         if !rec.exclusion && rec.targets.len() == 1 {
             owners_by_target.entry(rec.targets[0]).or_default().push(i);
@@ -3621,9 +4769,9 @@ fn generated_guard(
                 let member_spelled = resolved
                     .element_qualified_name(member)
                     .unwrap_or_else(|| "<member>".into());
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!(
                         "generated member `{member_spelled}` is claimed by multiple provenance records"
@@ -3634,8 +4782,23 @@ fn generated_guard(
             }
         }
     }
+}
 
-    // ---- state ↔ managed-record correspondence (AA7h0) ----
+/// State and managed records answer for each other: every pair managed
+/// provenance claims has a state record, and every state record has
+/// managed provenance.
+fn audit_state_correspondence(
+    pass: &GuardPass,
+    resolved: &mut ResolvedModel,
+    scan: &GenScan,
+    audits: &mut GuardAudits,
+    out: &mut Vec<Finding>,
+) {
+    let invalid_cfg = pass.invalid_cfg;
+    let records = &scan.records;
+    let states = &scan.states;
+    let state_by_pair = &audits.state_by_pair;
+
     let mut managed_pairs: std::collections::BTreeSet<(ElementRef, String)> = Default::default();
     let mut first_managed_rec: std::collections::HashMap<(ElementRef, String), usize> =
         Default::default();
@@ -3656,9 +4819,9 @@ fn generated_guard(
         let rec = &records[first_managed_rec[&(*store, id.clone())]];
         let severity = invalid_cfg.severity(resolved.element_type(rec.el));
         if severity != Severity::Off {
-            push(
+            guard_push(
                 out,
-                "generated-provenance-invalid",
+                RuleId::GeneratedProvenanceInvalid,
                 severity,
                 format!(
                     "managed provenance for `{id}` has no TransformState record — the sidecar                      predates the state protocol or was hand-edited; delete it and rerun the                      transformer"
@@ -3675,9 +4838,9 @@ fn generated_guard(
         let st = &states[indices[0]];
         let severity = invalid_cfg.severity(resolved.element_type(st.el));
         if severity != Severity::Off {
-            push(
+            guard_push(
                 out,
-                "generated-provenance-invalid",
+                RuleId::GeneratedProvenanceInvalid,
                 severity,
                 format!("TransformState for `{id}` has no managed provenance records"),
                 st.anchor,
@@ -3685,55 +4848,176 @@ fn generated_guard(
             );
         }
     }
+    audits.managed_pairs = managed_pairs;
+}
 
-    if let Some(inventory) = inventory {
-        for rec in &records {
-            let (Some(transform_id), Some(key), Some(store)) =
-                (rec.transform_id.as_ref(), rec.key.as_ref(), rec.store)
-            else {
-                continue;
-            };
-            if store_ok.get(&store) != Some(&true) {
-                continue;
+/// Project the rows every audit cleared into the host's inventory:
+/// guarded member ranges, adopted exclusions, targetless tombstones,
+/// and the state records behind them.
+fn fill_inventory(
+    pass: &GuardPass,
+    resolved: &mut ResolvedModel,
+    scan: &GenScan,
+    audits: &GuardAudits,
+    inventory: &mut GeneratedInventory,
+) {
+    let unit_names = &pass.unit_names;
+    let unit_texts = &pass.unit_texts;
+    let GenScan {
+        marked_members,
+        records,
+        states,
+        ..
+    } = scan;
+    let GuardAudits {
+        store_ok,
+        store_targets,
+        pair_counts,
+        owners_by_target,
+        state_by_pair,
+        managed_pairs,
+    } = audits;
+
+    for rec in records {
+        let (Some(transform_id), Some(key), Some(store)) =
+            (rec.transform_id.as_ref(), rec.key.as_ref(), rec.store)
+        else {
+            continue;
+        };
+        if store_ok.get(&store) != Some(&true) {
+            continue;
+        }
+        if !rec.valid {
+            continue;
+        }
+        let pair = (transform_id.clone(), key.clone(), rec.exclusion);
+        if pair_counts.get(&pair) != Some(&1)
+            || pair_counts.contains_key(&(transform_id.clone(), key.clone(), !rec.exclusion))
+        {
+            continue;
+        }
+        let target_package = store_targets.get(&store).copied();
+        let malformed_digest = [
+            rec.row_digest.as_deref(),
+            rec.spelling_digest.as_deref(),
+            rec.structure_digest.as_deref(),
+            rec.policy_digest.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !digest_shaped(value));
+        if malformed_digest {
+            continue;
+        }
+        // AA7h0: a managed row's transformer-level facts resolve
+        // through the pair's unique TransformState — no state, no
+        // row (the correspondence audit already named why).
+        let state = if rec.exclusion {
+            None
+        } else {
+            match state_for_pair(state_by_pair, states, store, transform_id) {
+                Some(i) => Some(&states[i]),
+                None => continue,
             }
-            if !rec.valid {
-                continue;
-            }
-            let pair = (transform_id.clone(), key.clone(), rec.exclusion);
-            if pair_counts.get(&pair) != Some(&1)
-                || pair_counts.contains_key(&(transform_id.clone(), key.clone(), !rec.exclusion))
-            {
-                continue;
-            }
-            let target_package = store_targets.get(&store).copied();
-            let malformed_digest = [
-                rec.row_digest.as_deref(),
-                rec.spelling_digest.as_deref(),
-                rec.structure_digest.as_deref(),
-                rec.policy_digest.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|value| !digest_shaped(value));
-            if malformed_digest {
-                continue;
-            }
-            // AA7h0: a managed row's transformer-level facts resolve
-            // through the pair's unique TransformState — no state, no
-            // row (the correspondence audit already named why).
-            let state = if rec.exclusion {
-                None
-            } else {
-                match state_for_pair(&state_by_pair, store, transform_id) {
-                    Some(i) => Some(&states[i]),
-                    None => continue,
-                }
-            };
-            let source_facts = match state {
-                Some(state) => &state.sources,
-                None => &rec.sources,
-            };
-            let sources: Vec<GeneratedStateSource> = source_facts
+        };
+        let source_facts = match state {
+            Some(state) => &state.sources,
+            None => &rec.sources,
+        };
+        let sources: Vec<GeneratedStateSource> = source_facts
+            .iter()
+            .filter_map(|source| {
+                Some(GeneratedStateSource {
+                    alias: source.alias.clone()?,
+                    source_ref: source.source_ref.clone()?,
+                    input_digest: source.input_digest.clone(),
+                    row_count: source.row_count,
+                })
+            })
+            .collect();
+        if rec.exclusion && rec.targets.is_empty() {
+            inventory.tombstones.push(GeneratedTombstone {
+                key: key.clone(),
+                transform_id: transform_id.clone(),
+                source: sources.first().map(|source| source.source_ref.clone()),
+                sources,
+                transformer_path: rec.path.clone(),
+                record_id: resolved.element_id(rec.el).to_string(),
+            });
+            continue;
+        }
+        if rec.targets.len() != 1 {
+            continue;
+        }
+        let member = rec.targets[0];
+        if target_package.is_none()
+            || resolved.owner(member) != target_package
+            || (rec.exclusion && marked_members.contains(&member))
+            || (!rec.exclusion && !marked_members.contains(&member))
+            || (!rec.exclusion
+                && owners_by_target
+                    .get(&member)
+                    .is_none_or(|owners| owners.len() != 1))
+            || (!rec.exclusion
+                && resolved.element_declared_short_name(member) != Some(key.as_str()))
+        {
+            continue;
+        }
+        let Some((unit, extent)) = resolved.member_extent(member) else {
+            continue;
+        };
+        let (Some(text), Some(_name)) = (unit_texts.get(&unit), unit_names.get(&unit)) else {
+            continue;
+        };
+        let Some(raw) = text.get(extent.start as usize..extent.end as usize) else {
+            continue;
+        };
+        let row = GeneratedRange {
+            unit,
+            start: extent.start,
+            end: extent.end,
+            key: key.clone(),
+            transform_id: transform_id.clone(),
+            // Managed rows resolve through the state record (the
+            // first source is the row-level column); exclusions
+            // stay self-contained by ratified design.
+            source: sources.first().map(|source| source.source_ref.clone()),
+            sources,
+            transformer_path: match state {
+                Some(st) => st.transformer_path.clone(),
+                None => rec.path.clone(),
+            },
+            member_qn: resolved.element_qualified_name(member),
+            member_id: resolved.element_id(member).to_string(),
+            record_id: resolved.element_id(rec.el).to_string(),
+            raw: raw.to_string(),
+            excluded: rec.exclusion,
+            row_digest: rec.row_digest.clone(),
+        };
+        if rec.exclusion {
+            inventory.excluded.push(row);
+        } else {
+            inventory.members.push(row);
+        }
+    }
+    for ((store, id), indices) in state_by_pair.iter() {
+        let [only] = indices.as_slice() else {
+            continue; // duplicates already found; no surface row
+        };
+        if store_ok.get(store) != Some(&true) || !managed_pairs.contains(&(*store, id.clone())) {
+            continue;
+        }
+        let st = &states[*only];
+        if !st.valid {
+            continue;
+        }
+        inventory.states.push(GeneratedState {
+            transform_id: id.clone(),
+            transformer_path: st.transformer_path.clone().unwrap_or_default(),
+            script_digest: st.script_digest.clone(),
+            forced_schema_drift: st.forced,
+            sources: st
+                .sources
                 .iter()
                 .filter_map(|source| {
                     Some(GeneratedStateSource {
@@ -3743,128 +5027,58 @@ fn generated_guard(
                         row_count: source.row_count,
                     })
                 })
-                .collect();
-            if rec.exclusion && rec.targets.is_empty() {
-                inventory.tombstones.push(GeneratedTombstone {
-                    key: key.clone(),
-                    transform_id: transform_id.clone(),
-                    source: sources.first().map(|source| source.source_ref.clone()),
-                    sources,
-                    transformer_path: rec.path.clone(),
-                    record_id: resolved.element_id(rec.el).to_string(),
-                });
-                continue;
-            }
-            if rec.targets.len() != 1 {
-                continue;
-            }
-            let member = rec.targets[0];
-            if target_package.is_none()
-                || resolved.owner(member) != target_package
-                || (rec.exclusion && marked_members.contains(&member))
-                || (!rec.exclusion && !marked_members.contains(&member))
-                || (!rec.exclusion
-                    && owners_by_target
-                        .get(&member)
-                        .is_none_or(|owners| owners.len() != 1))
-                || (!rec.exclusion && resolved.element_short_name(member) != Some(key.as_str()))
-            {
-                continue;
-            }
-            let Some((unit, extent)) = resolved.member_extent(member) else {
-                continue;
-            };
-            let (Some(text), Some(_name)) = (unit_texts.get(&unit), unit_names.get(&unit)) else {
-                continue;
-            };
-            let Some(raw) = text.get(extent.start as usize..extent.end as usize) else {
-                continue;
-            };
-            let row = GeneratedRange {
-                unit,
-                start: extent.start,
-                end: extent.end,
-                key: key.clone(),
-                transform_id: transform_id.clone(),
-                // Managed rows resolve through the state record (the
-                // first source is the row-level column); exclusions
-                // stay self-contained by ratified design.
-                source: sources.first().map(|source| source.source_ref.clone()),
-                sources,
-                transformer_path: match state {
-                    Some(st) => st.transformer_path.clone(),
-                    None => rec.path.clone(),
-                },
-                member_qn: resolved.element_qualified_name(member),
-                member_id: resolved.element_id(member).to_string(),
-                record_id: resolved.element_id(rec.el).to_string(),
-                raw: raw.to_string(),
-                excluded: rec.exclusion,
-                row_digest: rec.row_digest.clone(),
-            };
-            if rec.exclusion {
-                inventory.excluded.push(row);
-            } else {
-                inventory.members.push(row);
-            }
-        }
-        for ((store, id), indices) in state_by_pair.iter() {
-            let [only] = indices.as_slice() else {
-                continue; // duplicates already found; no surface row
-            };
-            if store_ok.get(store) != Some(&true) || !managed_pairs.contains(&(*store, id.clone()))
-            {
-                continue;
-            }
-            let st = &states[*only];
-            if !st.valid {
-                continue;
-            }
-            inventory.states.push(GeneratedState {
-                transform_id: id.clone(),
-                transformer_path: st.transformer_path.clone().unwrap_or_default(),
-                script_digest: st.script_digest.clone(),
-                forced_schema_drift: st.forced,
-                sources: st
-                    .sources
-                    .iter()
-                    .filter_map(|source| {
-                        Some(GeneratedStateSource {
-                            alias: source.alias.clone()?,
-                            source_ref: source.source_ref.clone()?,
-                            input_digest: source.input_digest.clone(),
-                            row_count: source.row_count,
-                        })
-                    })
-                    .collect(),
-                target_qn: store_targets
-                    .get(store)
-                    .and_then(|t| resolved.element_qualified_name(*t)),
-                record_id: resolved.element_id(st.el).to_string(),
-            });
-        }
-        inventory.states.sort_by(|a, b| {
-            a.target_qn
-                .cmp(&b.target_qn)
-                .then(a.transform_id.cmp(&b.transform_id))
+                .collect(),
+            target_qn: store_targets
+                .get(store)
+                .and_then(|t| resolved.element_qualified_name(*t)),
+            record_id: resolved.element_id(st.el).to_string(),
         });
-        let by_position = |a: &GeneratedRange, b: &GeneratedRange| {
-            a.unit.cmp(&b.unit).then(a.start.cmp(&b.start))
-        };
-        inventory.members.sort_by(by_position);
-        inventory.excluded.sort_by(by_position);
-        inventory
-            .tombstones
-            .sort_by(|a, b| a.transform_id.cmp(&b.transform_id).then(a.key.cmp(&b.key)));
     }
-    if inventory_only {
-        return;
-    }
+    inventory.states.sort_by(|a, b| {
+        a.target_qn
+            .cmp(&b.target_qn)
+            .then(a.transform_id.cmp(&b.transform_id))
+    });
+    let by_position =
+        |a: &GeneratedRange, b: &GeneratedRange| a.unit.cmp(&b.unit).then(a.start.cmp(&b.start));
+    inventory.members.sort_by(by_position);
+    inventory.excluded.sort_by(by_position);
+    inventory
+        .tombstones
+        .sort_by(|a, b| a.transform_id.cmp(&b.transform_id).then(a.key.cmp(&b.key)));
+}
 
-    // ---- record → target joins, baseline audit, drift classification ----
+/// Join records to their targets, audit the baseline fields, and
+/// classify drift: fingerprint first, then structure, then canonical
+/// bytes, then raw spelling. Answers the members a record claims.
+fn audit_targets(
+    pass: &GuardPass,
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    scan: &GenScan,
+    audits: &GuardAudits,
+    out: &mut Vec<Finding>,
+) -> std::collections::HashSet<ElementRef> {
+    let invalid_cfg = pass.invalid_cfg;
+    let outdated_cfg = pass.outdated_cfg;
+    let modified_cfg = pass.modified_cfg;
+    let unit_texts = &pass.unit_texts;
+    let GenScan {
+        marked_members,
+        records,
+        states,
+        ..
+    } = scan;
+    let GuardAudits {
+        store_targets,
+        owners_by_target,
+        state_by_pair,
+        ..
+    } = audits;
+
     let policy = canonicalization_digest(config);
     let mut claimed: std::collections::HashSet<ElementRef> = Default::default();
-    for rec in &records {
+    for rec in records {
         let severity = invalid_cfg.severity(resolved.element_type(rec.el));
         let anchor = rec.anchor;
         let element = edit_target(resolved, rec.el);
@@ -3874,9 +5088,9 @@ fn generated_guard(
             .unwrap_or_else(|| "<record>".into());
         if rec.exclusion {
             if rec.targets.len() > 1 && severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!(
                         "exclusion `{spelled}` annotates {} members — at most one adopted member is allowed",
@@ -3892,9 +5106,9 @@ fn generated_guard(
             // it targets still reads as marker-only corruption too.
             for t in &rec.targets {
                 if marked_members.contains(t) && severity != Severity::Off {
-                    push(
+                    guard_push(
                         out,
-                        "generated-provenance-invalid",
+                        RuleId::GeneratedProvenanceInvalid,
                         severity,
                         format!(
                             "exclusion `{spelled}` targets a member still carrying the \
@@ -3910,9 +5124,9 @@ fn generated_guard(
                         let package = resolved
                             .element_qualified_name(target_package)
                             .unwrap_or_else(|| "<target>".into());
-                        push(
+                        guard_push(
                             out,
-                            "generated-provenance-invalid",
+                            RuleId::GeneratedProvenanceInvalid,
                             severity,
                             format!(
                                 "exclusion `{spelled}` targets a member outside its store package `{package}`"
@@ -3927,9 +5141,9 @@ fn generated_guard(
         }
         if rec.targets.len() != 1 {
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!(
                         "provenance record `{spelled}` annotates {} members — exactly one \
@@ -3949,9 +5163,9 @@ fn generated_guard(
             .unwrap_or_else(|| "<member>".into());
         if !marked_members.contains(&member) {
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!(
                         "provenance record `{spelled}` annotates `{member_spelled}`, which \
@@ -3969,9 +5183,9 @@ fn generated_guard(
                     let package = resolved
                         .element_qualified_name(target_package)
                         .unwrap_or_else(|| "<target>".into());
-                    push(
+                    guard_push(
                         out,
-                        "generated-provenance-invalid",
+                        RuleId::GeneratedProvenanceInvalid,
                         severity,
                         format!(
                             "provenance record `{spelled}` targets a member outside its store package `{package}`"
@@ -3991,12 +5205,14 @@ fn generated_guard(
         }
         if let (Some(key), Some(short)) = (
             rec.key.as_deref(),
-            resolved.element_short_name(member).map(str::to_string),
+            resolved
+                .element_declared_short_name(member)
+                .map(str::to_string),
         ) {
             if key != short && severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!(
                         "provenance record for key `{key}` annotates a member whose short \
@@ -4020,9 +5236,9 @@ fn generated_guard(
                 if !digest_shaped(v) {
                     malformed = true;
                     if severity != Severity::Off {
-                        push(
+                        guard_push(
                             out,
-                            "generated-provenance-invalid",
+                            RuleId::GeneratedProvenanceInvalid,
                             severity,
                             format!("record `{spelled}` has a malformed {label}"),
                             anchor,
@@ -4044,9 +5260,9 @@ fn generated_guard(
         ) else {
             let outdated = outdated_cfg.severity(resolved.element_type(member));
             if outdated != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-baseline-outdated",
+                    RuleId::GeneratedProvenanceBaselineOutdated,
                     outdated,
                     format!(
                         "provenance for `{member_spelled}` predates the structure/policy \
@@ -4062,7 +5278,7 @@ fn generated_guard(
         // Drift classification: fingerprint first, then
         // structure, then canonical bytes, then raw spelling.
         let drift = modified_cfg.severity(resolved.element_type(member));
-        let member_anchor = anchor_of(resolved, member);
+        let member_anchor = guard_anchor(resolved, member);
         let member_element = edit_target(resolved, member);
         let Some((unit, extent)) = resolved.member_extent(member) else {
             continue;
@@ -4075,9 +5291,9 @@ fn generated_guard(
         };
         if policy_digest != policy {
             if drift != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-element-modified",
+                    RuleId::GeneratedElementModified,
                     drift,
                     format!(
                         "canonicalization policy changed since `{member_spelled}` was \
@@ -4094,9 +5310,9 @@ fn generated_guard(
         match current_structure {
             Err(_) => {
                 if drift != Severity::Off {
-                    push(
+                    guard_push(
                         out,
-                        "generated-element-modified",
+                        RuleId::GeneratedElementModified,
                         drift,
                         format!(
                             "generated member `{member_spelled}` was modified — it no \
@@ -4116,7 +5332,7 @@ fn generated_guard(
                         rec.store
                             .zip(rec.transform_id.as_deref())
                             .and_then(|(store, id)| {
-                                state_for_pair(&state_by_pair, store, id).map(|i| &states[i])
+                                state_for_pair(state_by_pair, states, store, id).map(|i| &states[i])
                             });
                     let provenance = match state_facts.and_then(|st| {
                         st.sources
@@ -4127,9 +5343,9 @@ fn generated_guard(
                         Some((s, p)) => format!(" (synced from {s} by {p})"),
                         None => String::new(),
                     };
-                    push(
+                    guard_push(
                         out,
-                        "generated-element-modified",
+                        RuleId::GeneratedElementModified,
                         drift,
                         format!(
                             "generated member `{member_spelled}` was modified — structure \
@@ -4155,9 +5371,9 @@ fn generated_guard(
             // Equal structure and policy with disagreeing canonical
             // bytes cannot happen against an honest baseline.
             if severity != Severity::Off {
-                push(
+                guard_push(
                     out,
-                    "generated-provenance-invalid",
+                    RuleId::GeneratedProvenanceInvalid,
                     severity,
                     format!(
                         "record for `{member_spelled}` has a corrupt baseline: canonical \
@@ -4176,9 +5392,9 @@ fn generated_guard(
             sysmlv2_syntax::print::indent_unit(base, unit_text),
         );
         if raw.replace("\r\n", "\n") != expected && drift != Severity::Off {
-            push(
+            guard_push(
                 out,
-                "generated-element-modified",
+                RuleId::GeneratedElementModified,
                 drift,
                 format!(
                     "generated member `{member_spelled}` formatting drifted from the \
@@ -4189,9 +5405,22 @@ fn generated_guard(
             );
         }
     }
+    claimed
+}
 
-    // ---- marker-only members: corruption, never silently hand-written ----
-    for member in &marked_members {
+/// A member carrying the Generated marker that no provenance record
+/// claims is corruption, never silently hand-written text.
+fn report_unclaimed_markers(
+    pass: &GuardPass,
+    resolved: &mut ResolvedModel,
+    scan: &GenScan,
+    claimed: &std::collections::HashSet<ElementRef>,
+    out: &mut Vec<Finding>,
+) {
+    let invalid_cfg = pass.invalid_cfg;
+    let marked_members = &scan.marked_members;
+
+    for member in marked_members {
         if claimed.contains(member) {
             continue;
         }
@@ -4202,15 +5431,15 @@ fn generated_guard(
         let spelled = resolved
             .element_qualified_name(*member)
             .unwrap_or_else(|| "<member>".into());
-        push(
+        guard_push(
             out,
-            "generated-provenance-invalid",
+            RuleId::GeneratedProvenanceInvalid,
             severity,
             format!(
                 "`{spelled}` carries the Generated marker but no provenance record claims \
                  it — managed ownership is corrupt; resync, repair, or adopt explicitly"
             ),
-            anchor_of(resolved, *member),
+            guard_anchor(resolved, *member),
             edit_target(resolved, *member),
         );
     }

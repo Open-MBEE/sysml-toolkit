@@ -14,6 +14,7 @@
 //! Diagnostics come from the same stages as `sysmlv2 check` without
 //! `--lib`: parse diagnostics plus body-context validation.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use sysmlv2_parser::diag::Severity;
@@ -103,18 +104,19 @@ fn negative_corpus_diagnostics() {
                 .find(|e| !e.matched && e.line == line && d.message.contains(&e.substring));
             match claimed {
                 Some(e) => e.matched = true,
-                None => report.push_str(&format!(
-                    "  {name}:{line}: unexpected error: {}\n",
-                    d.message
-                )),
+                None => {
+                    writeln!(report, "  {name}:{line}: unexpected error: {}", d.message).unwrap();
+                }
             }
         }
         for e in &expected {
             if !e.matched {
-                report.push_str(&format!(
-                    "  {name}:{}: expected error not produced: {}\n",
+                writeln!(
+                    report,
+                    "  {name}:{}: expected error not produced: {}",
                     e.line, e.substring
-                ));
+                )
+                .unwrap();
             }
         }
     }

@@ -25,7 +25,7 @@ $ $sysmlv2 parse "$vehicle"
 spec-refs/SysML-v2-Release/sysml/src/examples/Vehicle Example/SysML v2 Spec Annex A SimpleVehicleModel.sysml: 1 top-level member(s), 0 diagnostic(s)
 ```
 
-Exit code 0 on a clean parse, 1 if there are diagnostics. Both dialects are supported; the dialect is chosen by extension (`.kerml` → KerML):
+Exit code 0 on a clean parse, 1 if there are diagnostics. Both dialects are supported; the dialect is chosen by extension (`.kerml` → KerML), and extensions are matched whatever case they are spelled in (`Model.SysML` is a model source, `Lib.KerML` is KerML):
 
 ```console
 $ $sysmlv2 parse "$corpus/sysml.library/Kernel Libraries/Kernel Data Type Library/ScalarValues.kerml"
@@ -57,14 +57,15 @@ SourceUnit {
 
 ---
 
-## 2. `check` — parse + body-context validation
+## 2. `check` — static validation
 
-`check` runs two stages: parse diagnostics, then post-parse validation of the rules the (deliberately permissive) parser does not enforce — member legality per body context, duplicate member names, `variant` ownership, and the mandatory import visibility.
+`check` reports parse diagnostics, validates body contexts on cleanly parsed files, then resolves those files together and runs referential and semantic checks. These local checks run even without `--lib`; supply the library to resolve standard types and enable unused-private-import warnings. Structural checks include member legality, duplicate names, `variant` ownership, and import visibility. `--strict` fails on warnings as well as errors.
 
-The whole vehicle example directory is clean:
+A self-contained model is clean without a library:
 
 ```console
-$ $sysmlv2 check "$corpus/sysml/src/examples/Vehicle Example"/*.sysml
+$ printf 'package Demo { part def Vehicle; part car : Vehicle; }\n' > clean.sysml
+$ $sysmlv2 check clean.sysml
 $ echo $?
 0
 ```
@@ -97,7 +98,7 @@ error: a transition usage is not allowed in a definition or usage body
    |
    |         transition first parked then driving;
 
-error: a `subject` member is not allowed in a definition or usage body
+error: validateSubjectMembershipOwningType: a `subject` member is not allowed in a definition or usage body
   --> broken.sysml:6:9
    |
    |         subject v;
@@ -107,6 +108,22 @@ error: a `variant` member is only allowed in the body of a `variation` definitio
    |
    |         variant part manual;
 
+warning: unresolved reference `Definitions`
+  --> broken.sysml:2:12
+   |
+   |     import Definitions::*;
+
+warning: unresolved reference `parked`
+  --> broken.sysml:5:26
+   |
+   |         transition first parked then driving;
+
+warning: unresolved reference `driving`
+  --> broken.sysml:5:38
+   |
+   |         transition first parked then driving;
+
+3 warning(s)
 4 error(s)
 $ echo $?
 1
@@ -116,7 +133,7 @@ The legality matrix is transcribed from the normative Xtext grammars' `*BodyItem
 
 ### Referential checks (`--lib`)
 
-With `--lib`, all input files form one model resolved against the standard library, and referential findings are reported as **warnings** (exit code unaffected — the resolver covers 99.9% of the corpus, and a warning must not fail a conforming model):
+With `--lib`, all input files form one model resolved against the standard library, and unresolved references, missing alias targets and import cycles are **warnings**; ambiguous references are **errors**. Without `--lib`, local references are still checked and missing standard-library dependencies may produce warnings. Warnings affect the exit code only with `--strict`:
 
 ```sysml
 package Demo {
@@ -167,9 +184,37 @@ $ echo $?
 
 (Run against the corpus, the only import cycles found are the deliberate `CircularImport.sysml` test fixture — gated by `tests/check.rs::corpus_referential_ratchet`.)
 
+A root package (or any other root declaration) named like a standard-library root package is reported at its declaration: the diagnostic states whether references resolve to the library or the name is ambiguous. In the following package collision, the library wins qualified lookup.
+
+```sysml
+package Requirements {
+    requirement def Speed;
+}
+package Uses {
+    requirement s : Requirements::Speed;
+}
+```
+
+```console
+$ $sysmlv2 check shadow.sysml --lib "$corpus/sysml.library"
+warning: root package `Requirements` shadows the standard library package `Requirements`; references resolve to the library
+  --> shadow.sysml:1:9
+   |
+   | package Requirements {
+
+warning: unresolved reference `Requirements::Speed`
+  --> shadow.sysml:5:21
+   |
+   |     requirement s : Requirements::Speed;
+
+2 warning(s)
+```
+
+Nesting the package under a differently named root, or renaming it, clears both warnings.
+
 ### Semantic constraints (`--lib`)
 
-The same `--lib` run also applies the semantic checks: multiplicity bounds (evaluated with the expression evaluator, so a bound can be an expression), self/circular specialization (errors), and duplicate specialization targets (warnings). Errors are raised only for what is *provably* wrong — a symbolic bound the evaluator cannot compute stays silent:
+Semantic checks run with or without a library; `--lib` supplies additional type and relationship information. The example below exercises multiplicity bounds (evaluated with the expression evaluator, so a bound can be an expression), self/circular specialization (errors), and duplicate specialization targets (warnings). Errors are raised only for what is *provably* wrong — a symbolic bound the evaluator cannot compute stays silent:
 
 ```sysml
 package Demo {
@@ -220,7 +265,328 @@ error: multiplicity upper bound is negative
 5 error(s)
 ```
 
-Note the last finding: `[spares]` is provably negative only because the evaluator computed `2 - 3`. These checks are corpus-gated at zero findings (`tests/check.rs`, `examples/semstats`).
+Note the last finding: `[spares]` is provably negative only because the evaluator computed `2 - 3`. The official semantic gate pins two dimensional findings in Turbojet Stage Analysis and VehicleGeometryAndCoordinateFrames (`tests/check.rs`, `examples/semstats`). Additional checks cover usage typing, redefinitions, metadata, valuation, invocation binding, dimensions, connector ends, and static action/state contracts. Unknown values stay conservative; behavioral execution is outside this checker.
+
+With `--lib`, the CLI also reports unused private imports. The analysis combines resolution provenance with enclosing-owner and source-text evidence, so uncertain usage is retained conservatively. Public imports are not candidates because they can re-export names for other models. This is a warning, promoted to failure by `--strict`.
+
+### `--format json` — one report document
+
+`--format json` writes the findings as one JSON document on stdout instead of the text above on stderr; the exit code is unchanged and the count lines are not printed. Every item carries the same keys whichever verb produced it — `lint --format json` ([2a](#2a-lint--project-policy-rules)) emits the same shape: `stage` (`parse`, `context`, `referential` or `semantic`), `severity` in the lint config spelling (`error` / `warn` / `info` / `hint`), the `message`, the input's index and name (`unit`, `unitName`), byte offsets (`start`, `end`), 1-based positions (`line`, `col`, `endLine`, `endCol`), and the lint-only fields (`rule`, `element`, `suggest`, `fix`, `alternatives`) as null or empty:
+
+```console
+$ printf 'package Q { part x : ; }\n' > broken.sysml
+$ $sysmlv2 check --format json broken.sysml
+{
+  "findings": [
+    {
+      "alternatives": [],
+      "col": 22,
+      "element": null,
+      "end": 22,
+      "endCol": 23,
+      "endLine": 1,
+      "fix": null,
+      "line": 1,
+      "message": "expected a name, found `;`",
+      "rule": null,
+      "severity": "error",
+      "stage": "parse",
+      "start": 21,
+      "suggest": null,
+      "unit": 0,
+      "unitName": "broken.sysml"
+    }
+  ],
+  "summary": {
+    "errors": 1,
+    "hints": 0,
+    "infos": 0,
+    "warnings": 0
+  }
+}
+$ echo $?
+1
+```
+
+A clean run is an empty `findings` array with a zeroed summary. Over several inputs `unit` indexes the files as given, so a consumer attributes each finding without parsing paths:
+
+```console
+$ $sysmlv2 check --format json clean.sysml
+{
+  "findings": [],
+  "summary": {
+    "errors": 0,
+    "hints": 0,
+    "infos": 0,
+    "warnings": 0
+  }
+}
+$ $sysmlv2 check --format json clean.sysml broken.sysml | jq -c '.findings[] | {stage, severity, unit, unitName, line, col}'
+{"stage":"parse","severity":"error","unit":1,"unitName":"broken.sysml","line":1,"col":22}
+```
+
+Operational failures — an unreadable input, a library that fails to load — still go to stderr with exit 1 and no document.
+
+---
+
+## 2a. `lint` — project-policy rules
+
+`lint` reports what `check` deliberately does not: style, hygiene and dead-model findings that are project policy rather than language law. It runs beside `check` and never changes its verdicts, sees only the user units (library elements are never linted, even with `--lib`), and sorts findings by unit, position and rule. Given `rig.sysml`:
+
+```sysml
+package Rig {
+    part def Wheel;
+    part def spare_wheel;
+    part axle : Wheel;
+    calc def Torque {
+        in force : Real;
+        in radius : Real;
+        return t : Real = force * 2;
+    }
+}
+```
+
+Without configuration, only the rules with a non-off default speak — here the casing nudge:
+
+```console
+$ $sysmlv2 lint rig.sysml
+warning: definition name `spare_wheel` should be PascalCase [naming-convention]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+1 warning(s)
+$ echo $?
+0
+```
+
+Every finding names its rule in brackets. The text report has two severities — `info` and `hint` findings print as `warning:` and count as warnings — while the JSON report below keeps the exact severity. `--rule ID=LEVEL` switches a rule on for one run (repeatable; it wins over the config file):
+
+```console
+$ $sysmlv2 lint --rule unused-parameter=warn --rule unused-definition=warn rig.sysml
+warning: definition name `spare_wheel` should be PascalCase [naming-convention]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+warning: `Torque` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
+  --> rig.sysml:5:14
+   |
+   |     calc def Torque {
+
+warning: input parameter `radius` of `Torque` is never used [unused-parameter]
+  --> rig.sysml:7:12
+   |
+   |         in radius : Real;
+
+4 warning(s)
+```
+
+### Configuration — `sysmlint.json`
+
+Project policy lives in a JSON file: `{"rules": {"<id>": <level> | {"severity": <level>, "scopes": {"<Metaclass>": …}, …options}}}` where a level is `off`, `hint`, `info`, `warn` or `error`. Every rule accepts `scopes`, the same knob at stereotype granularity — a metaclass name maps to a level or to an object with rule-specific keys (naming's `style` / `regex`, undocumented's `depth`); an element's effective severity is its scope's, else the rule's base. `--config` names the file; without it, a `sysmlint.json` beside the first input is picked up automatically:
+
+```console
+$ cat > sysmlint.json <<'EOF'
+{
+    "rules": {
+        "naming-convention": "off",
+        "unused-parameter": "warn",
+        "unused-definition": { "severity": "warn", "scopes": { "CalculationDefinition": "off" } }
+    }
+}
+EOF
+$ $sysmlv2 lint rig.sysml
+warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+warning: input parameter `radius` of `Torque` is never used [unused-parameter]
+  --> rig.sysml:7:12
+   |
+   |         in radius : Real;
+
+2 warning(s)
+```
+
+The scope silenced the unused `calc def` while the `part def` still reports. A typo'd rule id or option is a finding (`lint-config`, without a location), never a silent ignore:
+
+```console
+$ $sysmlv2 lint --rule no-such=warn rig.sysml
+warning: unknown lint rule `no-such` [lint-config]
+warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+2 warning(s)
+```
+
+Warnings exit 0; `error`-level findings exit 1, and `--strict` fails on any finding at all (infos and hints included):
+
+```console
+$ $sysmlv2 lint --strict rig.sysml
+warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+warning: input parameter `radius` of `Torque` is never used [unused-parameter]
+  --> rig.sysml:7:12
+   |
+   |         in radius : Real;
+
+2 warning(s)
+--strict: warnings are failures
+$ echo $?
+1
+```
+
+### `--fix` — applying the fixes
+
+Findings that carry a fix are applied in place by `--fix`, except the two guarded kinds: fixes that *delete* model text (an unused parameter's fix removes its declaration) additionally need `--fix-deletes`, and fixes that change what a declaration *means* (a usage keyword, a member's visibility) need `--fix-semantic`. Refused fixes are counted on stderr; every rewritten file must reparse cleanly before it is written back:
+
+```console
+$ $sysmlv2 lint --fix rig.sysml
+warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+warning: input parameter `radius` of `Torque` is never used [unused-parameter]
+  --> rig.sysml:7:12
+   |
+   |         in radius : Real;
+
+1 deletion fix(es) available but not applied — deleting model text needs --fix --fix-deletes
+2 warning(s)
+$ $sysmlv2 lint --fix --fix-deletes rig.sysml
+warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
+  --> rig.sysml:3:14
+   |
+   |     part def spare_wheel;
+
+warning: input parameter `radius` of `Torque` is never used [unused-parameter]
+  --> rig.sysml:7:12
+   |
+   |         in radius : Real;
+
+fixed: rig.sysml
+2 warning(s)
+$ cat rig.sysml
+package Rig {
+    part def Wheel;
+    part def spare_wheel;
+    part axle : Wheel;
+    calc def Torque {
+        in force : Real;
+        return t : Real = force * 2;
+    }
+}
+```
+
+The report still lists the findings the fixes addressed — it describes the input as read; the deleted line is gone from the file. Stdin (`-`) and archive members are linted but never written.
+
+### `--format json` — one report document
+
+`--format json` writes one JSON document on stdout — the same shape as `check --format json` above — and prints nothing else: each finding carries its `rule`, the exact `severity`, `element` (the engine's edit-target spelling, a `::`-qualified name or `@<id>` for anonymous elements), `suggest` (a naming finding's re-spelled name) and `fix` / `alternatives` with byte-offset `edits` over the unit's text, so a host can apply or offer them itself. The exit status stays the text mode's (`--strict`, refused fixes), which the summary's per-severity counts do not encode. Before the fix above:
+
+```console
+$ $sysmlv2 lint --format json rig.sysml
+{
+  "findings": [
+    {
+      "alternatives": [],
+      "col": 14,
+      "element": "Rig::spare_wheel",
+      "end": 58,
+      "endCol": 25,
+      "endLine": 3,
+      "fix": null,
+      "line": 3,
+      "message": "`spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint)",
+      "rule": "unused-definition",
+      "severity": "warn",
+      "stage": "lint",
+      "start": 47,
+      "suggest": null,
+      "unit": 0,
+      "unitName": "rig.sysml"
+    },
+    {
+      "alternatives": [],
+      "col": 12,
+      "element": "Rig::Torque::radius",
+      "end": 147,
+      "endCol": 18,
+      "endLine": 7,
+      "fix": {
+        "deletes": true,
+        "edits": [
+          {
+            "end": 155,
+            "replacement": "",
+            "start": 138,
+            "unit": 0,
+            "unitName": "rig.sysml"
+          }
+        ],
+        "label": "delete unused parameter `radius`",
+        "semantic": false
+      },
+      "line": 7,
+      "message": "input parameter `radius` of `Torque` is never used",
+      "rule": "unused-parameter",
+      "severity": "warn",
+      "stage": "lint",
+      "start": 141,
+      "suggest": null,
+      "unit": 0,
+      "unitName": "rig.sysml"
+    }
+  ],
+  "summary": {
+    "errors": 0,
+    "hints": 0,
+    "infos": 0,
+    "warnings": 2
+  }
+}
+$ $sysmlv2 lint --format json rig.sysml | jq -r '.findings[] | "\(.unitName):\(.line):\(.col) \(.severity) \(.rule)"'
+rig.sysml:3:14 warn unused-definition
+rig.sysml:7:12 warn unused-parameter
+```
+
+### The rules
+
+| Rule | Default | Flags | Fix |
+|---|---|---|---|
+| `naming-convention` | info | a declared name off the project's casing — definitions PascalCase, usages and features camelCase; per-family and per-scope presets (`camelCase`, `PascalCase`, `snake_case`, `UPPER_SNAKE_CASE`, `kebab-case`) or a `regex` | `suggest` carries the re-spelled name |
+| `undocumented-element` | off | a definition without its own `doc` body or a comment `about` it; `depth` reaches below the top level | — |
+| `untyped-usage` | off | a named usage with no typing, subsetting or redefinition clause (enumeration literals and transitions off by default) | — |
+| `unused-definition` | off | a user definition nothing in the user model references (closed world) | — |
+| `unused-parameter` | off | an input parameter of a calc / constraint / action definition never used in its body | deletes the parameter (`--fix-deletes`) |
+| `import-visibility` | info | an import without a visibility keyword — the syntax check reports the error, this finding carries the fix | declares the visibility its dependents need; the other keywords as alternatives |
+| `visibility-blocked-reference` | warn | an unresolved reference that names a member reachable only by ignoring visibility | widens the member to `public` (`--fix-semantic`) |
+| `usage-kind-mismatch` | info | a usage typed by a definition of another kind — the semantic check reports the error, this finding carries the fix | rewrites the usage keyword (`--fix-semantic`) |
+| `port-member-referential` | info | a composite non-port usage inside a port body | inserts `ref` |
+| `unqualified-enum-literal` | warn | an unresolved simple name matching exactly one enumeration literal | qualifies it |
+| `unit-spelling` | off | one unit spelled two ways across the model; the `style` option (`quoted-product` / `expression`) enforces a form | re-spells |
+| `dimensional-consistency` | warn | a quantity attribute whose declared type and value unit disagree; the `untyped` scope covers an untyped attribute whose value determines its type (needs the standard library) | re-types, or writes the inferred type |
+| `qualified-names` | off | one target spelled differently across reference sites; the `style` option (`qualified` / `minimal` / `imported`) enforces a policy | re-spells (adding an import under `imported`) |
+| `multiline-conditions` | off | a condition chain of `min` or more operands on one line (the formatter's threshold) | — |
+| `indentation` | off | leading whitespace off the project's `style` (tabs or spaces) and `size`; verbatim bodies keep their layout | re-indents |
+| `generated-provenance-invalid` | error | corrupted transformer ownership: markers without records, wrong or duplicate claims, malformed baselines | — |
+| `generated-provenance-baseline-outdated` | info | a provenance record predating the baseline fields (legacy, not tamper) | — |
+| `generated-element-modified` | warn | a generated member drifting from its provenance baseline (format-only drift, baseline drift, or a semantic edit) | — |
+
+`--lib` supplies resolution context only (`dimensional-consistency` stays silent without the standard library's quantity types); library elements are never linted.
 
 ---
 
@@ -337,6 +703,8 @@ $ $sysmlv2 convert m.sysml --to compact-json --lib "$lib" | grep -A1 '"type"'
 
 Library elements participate in resolution but are not serialized — the output stays scoped to your model.
 
+Native directory loading saves a build- and content-identified `.prepared` snapshot and shares a live prepared library across SDK sessions. Warm loads reuse the resolved graph and static facts; source trees reconstruct on demand. Set `SYSMLV2_CACHE_DIR` to choose the cache directory or `SYSMLV2_LIB_CACHE=off` to disable library caching. A fresh process with a populated disk cache is warm; a retained SDK session also avoids disk decoding. Neither means the operating-system file cache is cold. In-memory/WASM bundles use the separate resolution-only snapshot API.
+
 ### Ambient libraries
 
 Whenever a library loads, the toolkit's generated libraries load with it: `Web` (`Web::DOM`, `Web::HTML`, `Web::HTML::Elements` — the Web platform from the standards' WebIDL), `Template` and `Svelte` (the template metamodel and its engine overlay), `WebApp` and `SvelteKit` (the application and route/SSR layers) and `TransformMeta`. A model can reference them without naming their files:
@@ -348,13 +716,13 @@ $ $sysmlv2 query --lib "$lib" v.sysml 'V::shell.localName'
 "div"
 ```
 
-Their sources are `local-packages/*.sysml` in the repository; see `local-packages/README.md` for what they contain and how to regenerate them from the pinned corpus and compiler declarations.
+Their sources are `local-packages/*.sysml` in the repository; see `local-packages/README.md` for their contents, provenance, and local validation commands.
 
 ---
 
 ## 6. `convert --to full-json` — the schema-valid full form
 
-The full form adds every derived property and the implied relationships the published `SysML.json` schema requires (44,656/44,656 corpus elements validate; `tests/full_json.rs`):
+The full form adds every derived property and the implied relationships the published `SysML.json` schema requires (52,048/52,048 corpus elements validate; `tests/full_json.rs`):
 
 ```console
 $ printf 'part def Vehicle { attribute mass : Real; }\n' | $sysmlv2 convert - --to full-json > full.json
@@ -366,6 +734,8 @@ print('name:', pd['name'], '| qualifiedName:', pd['qualifiedName'])"
 84 properties on PartDefinition
 name: Vehicle | qualifiedName: Vehicle
 ```
+
+A JSON input (a stored compact or full payload) is converted by loading it into a session and emitting from the model — every element keeps the id it carried, foreign ids included, and lift problems print as warnings — so `convert` and the session API cannot disagree; text inputs emit from the parsed model as before. Without `--lib`, references into the standard library stay the library ids the payload carried.
 
 Compare: the compact form carries ~12 properties per element; the full form carries the complete metaclass property set (`name`, `qualifiedName`, `ownedFeature`, `documentation`, `isLibraryElement`, …).
 
@@ -502,7 +872,7 @@ This invariant is gated over all 345 corpus files (`tests/roundtrip.rs`).
 
 ## 10. `eval` — compute feature values
 
-The expression evaluator computes bound feature values against the resolved model: operators, sequences, feature references (following values, redefinition-aware), and Kernel Function Library intrinsics including lambda-bodied control functions.
+The expression evaluator computes bound feature values against the resolved model: operators, sequences, feature references (following values, redefinition-aware), and Kernel Function Library intrinsics including lambda-bodied control functions. Numbers are exact: decimal literals are rationals, arithmetic never rounds (`0.1 + 0.2` is `0.3`, `100 * 1.1` is `110`), integers grow past the machine word instead of wrapping, and unit conversion factors are exact. A result whose decimal expansion terminates prints as that decimal; any other rational prints as a reduced fraction (`1/3`), which is itself a valid expression. Only transcendental functions (`sqrt` of a non-square, `ln`, `exp`, trigonometry) and non-exact powers produce approximate doubles, and any operation over such a value stays approximate.
 
 ```sysml
 package Demo {
@@ -548,7 +918,7 @@ wheelbase = 2700 [mm]
 overhangs = 900 [mm]
 length = 3600 [mm]
 isLong = true
-peakPower = 157.08451146716934
+peakPower = 500000/3183
 ```
 
 Quantities (`2700 [mm]`) carry their units: same-unit values add and compare on the numbers, scalars scale them, and *different* units never mix silently — `1 [kg] + 1 [mm]` is a type error, not a wrong number. User-defined calculations invoke with positional or named arguments (`Power(rpm = 6000, torque = 250)`), and may recurse (bounded).
@@ -561,7 +931,7 @@ Demo::carTotal = 1294
 Demo::Vehicle::totalMass = 1094.5
 ```
 
-Across the corpus (with `--lib`), 81.3% of all ~4,000 feature values evaluate; the rest fail with clean errors (`tests/eval.rs` gates this).
+The `examples/evalstats` run computes 3,306/3,993 feature values (82.8%); 614 are indeterminate over unbound inputs and 73 return errors. Seventeen errors explicitly reject calculations requiring statement execution. These categories distinguish a computed value from a successful indeterminate result; `tests/eval.rs` gates evaluation without panics.
 
 ## 11. `query` — ask the model questions
 
@@ -619,7 +989,7 @@ $ $sysmlv2 query "$vehicle" "size(ownedFeature($vb))"
 
 ## 11a. `render` — evaluate a view's component template
 
-A component template imported in semantic mode (the `websysml` generator, `import --semantic`) becomes a `rendering def` plus a `view def`. A `view` usage of that definition exposes a model slice, and `render` evaluates the template over it — each blocks iterate the exposed elements, expression tags evaluate their translated KerML — printing the rendered node tree as JSON, or HTML with `--html`. The model is not modified.
+A component template represented as a `rendering def` plus a `view def` can be evaluated over a model. A `view` usage of that definition exposes a model slice, and `render` evaluates the template over it — each blocks iterate the exposed elements, expression tags evaluate their translated KerML — printing the rendered node tree as JSON, or HTML with `--html`. The model is not modified.
 
 ```console
 $ $sysmlv2 render --lib "$lib" --html PackagesView.sysml fleet.sysml Site::packagesView
@@ -656,7 +1026,7 @@ $ echo $?
 1
 ```
 
-Verdicts are deliberately cautious: a comparison involving an *unbound* feature is undecided, never a false `false` — which keeps the corpus at **0 violated** (ratcheted by `tests/check.rs`). The same discipline covers cardinality: `size(xs)` over an unbound feature answers only what the declared multiplicity proves (an exact `[3]` answers 3, `[1..*]` settles `notEmpty`, anything else stays undecided).
+Verdicts are deliberately cautious: a comparison involving an *unbound* feature is undecided, never a false `false` — which keeps the corpus at **0 violated** (ratcheted by `tests/check.rs`). A type default read through an unbound parameter or featured reference — a requirement's `subject` or `ref part`, an actor, a calculation input — is undecided because the instance bound later may override it. A fixed literal still decides; a fixed formula decides only when its inputs are known. This uncertainty survives aliases, conditionals, nested members and calculation calls, while concrete receivers still read their defaults. The same discipline covers cardinality: `size(xs)` over an unbound feature answers only what the declared multiplicity proves (an exact `[3]` answers 3, `[1..*]` settles `notEmpty`, anything else stays undecided). Propagation keeps unknown receiver members free; nested unknown receiver paths stay outside the supported fragment rather than conflating distinct instances.
 
 ### Satisfaction claims — subject-bound verdicts
 
@@ -701,8 +1071,8 @@ package Freight {
 
 ```console
 $ $sysmlv2 verify freight.sysml --lib sysml.library
-freight.sysml:21:30  <anonymous> (ConstraintUsage): undecided (type error: cannot compare <unbound feature> and <unbound feature>)
-freight.sysml:26:29  <anonymous> (ConstraintUsage): undecided (type error: cannot compare a quantity with a plain value)
+freight.sysml:21:30  <anonymous> (ConstraintUsage): undecided (result is indeterminate over unbound features)
+freight.sysml:26:29  <anonymous> (ConstraintUsage): undecided (result is indeterminate over unbound features)
 freight.sysml:21:30  <anonymous> (ConstraintUsage, satisfies Freight::wagonSpec): satisfied
 freight.sysml:21:30  <anonymous> (ConstraintUsage, satisfies Freight::wagonSpec): VIOLATED
 freight.sysml:26:29  <anonymous> (ConstraintUsage, satisfies Freight::wagonSpec): satisfied
@@ -764,7 +1134,7 @@ package Tank {
 
 ```console
 $ $sysmlv2 verify tank.sysml --solve
-tank.sysml:7:30  fits (AssertConstraintUsage): undecided (type error: numeric operands required) — z3: satisfiable, e.g. radius = 1.5
+tank.sysml:7:30  fits (AssertConstraintUsage): undecided (result is indeterminate over unbound features) — z3: satisfiable, e.g. radius = 1.5
 0 satisfied, 0 violated, 1 undecided
 ```
 
@@ -772,7 +1142,7 @@ What stays undecided is honestly undecided — a contingent constraint reports a
 
 ## 13. `viz` — PlantUML diagrams
 
-`viz` renders one view of a model as PlantUML text (`--view`, default `tree`). Feed the output to any PlantUML build for SVG/PNG; the toolkit itself has no rendering stage.
+`viz` renders one view of a model as PlantUML text (`--view tree|interconnection|state|action|sequence|case|mixed`, default `tree`; `ic` and `seq` are accepted short spellings). Feed the output to any PlantUML build for SVG/PNG; the toolkit itself has no rendering stage.
 
 The **tree** view is the structure diagram: packages, definitions, and usages with attribute compartments, plus composition (`*--`), typing (`..>`), and specialization (`--|>`) edges.
 
@@ -939,7 +1309,10 @@ package M {
 
 $ git show HEAD:model.sysml | $sysmlv2 check -            # check a past revision
 $ curl -s https://example.org/model.json | $sysmlv2 convert - --to text
+$ $sysmlv2 lint --format json src/*.sysml | jq '.summary'  # machine-readable findings (check too)
 ```
+
+A reader that stops early — `$sysmlv2 convert model.json --to text | head` — ends the run quietly: the closed pipe means no more output is wanted, so nothing is printed and the exit status is 0.
 
 ---
 
@@ -1093,7 +1466,7 @@ $ jq '{magic, versions, flags}' s2c-tables.json
 {
   "magic": "d9d9f7da24533243",
   "versions": { "layout": 1, "scheme": 1, "tables": 1 },
-  "flags": { "delta": 4, "deltaPortable": 8, "elideIds": 1, "fullForm": 2, "impliedOwners": 32, "unitPaths": 16 }
+  "flags": { "delta": 4, "deltaPortable": 8, "elideIds": 1, "explicitIds": 64, "fullForm": 2, "impliedOwners": 32, "unitPaths": 16 }
 }
 $ jq '.metaclasses[] | select(.name == "AcceptActionUsage") | .fields[15]' s2c-tables.json
 {
@@ -1108,16 +1481,17 @@ The document carries both ordinal spaces (`metaclasses` for compact payloads, `f
 
 ### 15.4 Exporting the standard library — `convert --library`
 
-A normal conversion emits just the user units' elements; its references into the standard library are bare `@id`s that dangle by design (section 9's note). `convert --library` emits the other half — the resolved library itself, every element of the `--lib` units under its normative KerML 9.1 id — so a store can materialize the library once and have every user payload's library references land exactly on its element ids:
+A normal conversion emits just the user units' elements; its references into the standard library are bare `@id`s that dangle by design (section 5's note). `convert --library` emits the other half — the resolved library itself, every element of the `--lib` units under its normative KerML 9.1 id — so a store can materialize the library once and have every user payload's library references land exactly on its element ids:
 
 ```console
-$ $sysmlv2 convert --library --lib "$SYSML_LIBRARY" --to compact-json -o stdlib.json
-$ $sysmlv2 convert --library --lib "$SYSML_LIBRARY" --to compact-cbor -o stdlib.s2c
+$ export SYSMLV2_AMBIENT=off  # measure the 94-unit official library alone
+$ $sysmlv2 convert --library --lib "$lib" --to compact-json -o stdlib.json
+$ $sysmlv2 convert --library --lib "$lib" --to compact-cbor -o stdlib.s2c
 $ jq length stdlib.json
 91405
 $ ls -l stdlib.json stdlib.s2c | awk '{print $5, $9}'
-45430871 stdlib.json
-3586863 stdlib.s2c
+45432383 stdlib.json
+3586617 stdlib.s2c
 ```
 
 (The binary form also benefits from implied ownership backpointers — `CBOR.md`, flag 0x20: backpointers that match their derivation from the forward ownership lists never reach the wire, ~10% of this payload.)
@@ -1126,12 +1500,14 @@ The export is deterministic, internally complete (no dangling references; its on
 
 ```console
 $ $sysmlv2 payload stdlib.json | jq .stateDigest
-"2480be9a-0642-5b47-8dcf-04fdf030755e"
+"c64e4daa-4a49-5052-8adb-d038c3ac6202"
 $ $sysmlv2 payload stdlib.s2c | jq .stateDigest
-"2480be9a-0642-5b47-8dcf-04fdf030755e"
+"c64e4daa-4a49-5052-8adb-d038c3ac6202"
 ```
 
-Named library elements carry ids derived from their qualified names (KerML 9.1 — identical across conforming implementations, stable across releases while the name is stable). Truly unnamed elements keep this toolkit's deterministic path-based ids: the norm's positional ids count an implementation's implied-relationship closure, so no portable spelling exists for them — and being unnamed, they are never the target of a cross-model reference. `--library` takes no inputs (the `--lib` directory is the input) and targets `compact-json` and `compact-cbor`.
+Named library elements carry ids derived from their qualified names (KerML 9.1 — identical across conforming implementations, stable across releases while the name is stable). Truly unnamed elements keep this toolkit's deterministic path-based ids: the norm's positional ids count an implementation's implied-relationship closure, so no portable spelling exists for them — and being unnamed, they are never the target of a cross-model reference. Unset `SYSMLV2_AMBIENT` after reproducing these official-library-only numbers to restore ambient libraries. Byte counts and digests above use the pinned library. `--library` takes no inputs (the `--lib` directory is the input) and targets `compact-json` and `compact-cbor`.
+
+## 16. Ambient model and library directories
 
 Every section above named its input files explicitly. When `SYSMLV2_MODEL_DIR` names a directory, its `.sysml`/`.kerml` files (collected depth-first with siblings in name order; hidden entries skipped) stand in for omitted inputs. Explicit files always win — the variable only fills an absence — and a stderr note records when it did, so output never silently depends on ambient state:
 
@@ -1222,9 +1598,9 @@ mass                         AttributeUsage
 
 `position` counts owned members only (import memberships are not members of the importing namespace); an unresolved name exits 1 with `error: cannot resolve \`…\``.
 
-## 18. `refactor` — extract / inline definitions
+## 18. `refactor` — extract / split / inline
 
-The refactoring pair moves a model between the usage-oriented and definition-oriented styles. Both directions run the transformation engine's verified commit: every carried reference is checked at its new home, and a refusal names its reason and leaves every file untouched. Given `model.sysml`:
+`extract` and `inline` move a model between the usage-oriented and definition-oriented styles. Both directions run the transformation engine's verified commit: every carried reference is checked at its new home, and a refusal names its reason and leaves every file untouched. Given `model.sysml`:
 
 ```sysml
 package Rig {
@@ -1281,6 +1657,83 @@ error: extract refused: not an extractable usage (metaclass PartDefinition)
 
 Inline reports imports its deletion leaves unused as `note:` lines on stderr and never removes them itself (that is the LSP quick fix's job). With `SYSMLV2_MODEL_DIR` set, bare invocations read the ambient model for `--dry-run` only — in-place rewriting always requires explicit file paths, the same discipline as `fmt`.
 
+### `split` — one file per nested package
+
+`refactor split` takes a package apart: every nested package moves to its own file under a directory named after the root file (`--dir` overrides it; `--slug` restricts file names to letters, digits, `.`, `_` and `-`), dedented, with every reference to something outside it spelled in full, and the root package re-exports each one with a `public import` (or a public alias when a package had to be renamed to avoid a root-level collision), so every qualified reference through the root keeps resolving. Given `model.sysml`:
+
+```sysml
+package Root {
+    part def Frame;
+    package Chassis {
+        part def Axle;
+        part body : Frame;
+    }
+    package Drive {
+        part axle : Chassis::Axle;
+    }
+}
+```
+
+`--dry-run` prints the plan, the new files and the root's hunk, and writes nothing:
+
+```console
+$ $sysmlv2 refactor split model.sysml Root --dry-run
+model/Chassis.sysml: `Root::Chassis` (73 bytes)
+model/Drive.sysml: `Root::Drive` (56 bytes)
+--- model/Chassis.sysml (new)
+package Chassis {
+    part def Axle;
+    part body : Root::Frame;
+}
+
+--- model/Drive.sysml (new)
+package Drive {
+    part axle : Root::Chassis::Axle;
+}
+
+--- model.sysml
+@@ -3,7 +3,2 @@
+-    package Chassis {
+-        part def Axle;
+-        part body : Frame;
+-    }
+-    package Drive {
+-        part axle : Chassis::Axle;
+-    }
++    public import Chassis;
++    public import Drive;
+```
+
+Without it the files are written and the root is rewritten in place; the pieces check clean together, and running `split` again on a moved file splits deeper:
+
+```console
+$ $sysmlv2 refactor split model.sysml Root
+model/Chassis.sysml: `Root::Chassis` (73 bytes)
+model/Drive.sysml: `Root::Drive` (56 bytes)
+created model/Chassis.sysml
+created model/Drive.sysml
+split `Root` — rewrote model.sysml
+$ cat model.sysml
+package Root {
+    part def Frame;
+    public import Chassis;
+    public import Drive;
+}
+$ $sysmlv2 check model.sysml model/*.sysml && echo clean
+clean
+```
+
+---
+
+## 19. `lsp` — the language server
+
+`sysmlv2 lsp` speaks the Language Server Protocol over stdio until the client ends the session — an editor runs it, not a terminal. It serves parse and body-context diagnostics on every change, whole-document formatting, outline, semantic tokens, navigation, completion, hover, inlay hints, code lenses and refactorings; `--lib` (or `SYSMLV2_LIB_DIR`) adds the standard library so hover, definition, references and rename resolve library names too, and lint findings surface as diagnostics with their fixes as quick fixes. The dialect follows the file extension (`.kerml` is KerML, everything else SysML). Client configuration for VS Code, Neovim and Helix is in [editors/vscode/README.md](editors/vscode/README.md).
+
+```console
+$ $sysmlv2 lsp --help | head -1
+Run the Language Server Protocol server over stdio
+```
+
 ---
 
 ## Exit codes
@@ -1288,17 +1741,21 @@ Inline reports imports its deletion leaves unused as `note:` lines on stderr and
 | Command | 0 | 1 |
 |---|---|---|
 | `parse` | no diagnostics | any diagnostic |
-| `check` | all files parse and validate | any parse or context error |
+| `check` | all files parse and validate | any parse or context error (`--strict`: any finding) |
+| `lint` | no error-severity finding | an error finding, a parse error, or a `--fix` that would break a file or cannot be written (`--strict`: any finding) |
 | `fmt` | formatted / already canonical | I/O or parse failure |
 | `fmt --check` | all files canonical | some file would be reformatted |
 | `convert` | conversion written | read/parse/convert failure |
 | `eval` | all named features evaluate | parse failure, unresolved name, or evaluation error |
 | `query` | the expression evaluates | expression/parse failure, unresolved reference, or evaluation error |
 | `verify` | no violated constraint | any violation (incl. Z3-proved unsatisfiable) |
-| `viz` | diagram written | read/parse failure, unknown --element, --view, or --line-style |
+| `viz` | diagram written | read/parse failure or unknown --element |
 | `describe` | element described | read/parse failure or unresolved name |
 | `members` | members listed | read/parse failure or unresolved name |
 | `refactor extract` | extracted (or `--dry-run` diff printed) | refusal (named reason), unresolved name, read/parse/write failure |
 | `refactor inline` | inlined (or `--dry-run` diff printed) | refusal (named reason), unresolved name, read/parse/write failure |
+| `refactor split` | new files written (or `--dry-run` plan printed) | refusal (named reason), unresolved name, read/parse/write failure |
+
+A value an enumerated option does not accept — `--to`, `--format`, `--view`, `--line-style` — is a usage error: the message lists the possible values and the status is 2, the same as a missing argument or an unknown flag.
 
 Every subcommand's `--help` carries worked examples (enforced by `tests/cli.rs`).

@@ -14,6 +14,8 @@
 //! session and invalidates outstanding handles — using one afterwards
 //! errors instead of silently denoting the wrong element.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
@@ -25,6 +27,47 @@ use sysmlv2_solve::{PropagateConfig, PropagateOutcome};
 use sysmlv2_syntax::parser::parse_expression;
 use sysmlv2_syntax::span::LineIndex;
 use sysmlv2_transform::{Indent, Library, Session as TSession, check_sources_with_library};
+
+/// Stack reserved for the module, in bytes (16 MiB).
+///
+/// The toolkit's passes recurse, and each bounds itself by a depth that
+/// stops unbounded input with a diagnostic instead of a crash: the parser
+/// at [`sysmlv2_syntax::parser::MAX_NESTING`] levels of bodies and
+/// expressions, the lift at [`sysmlv2_model::lift::MAX_LIFT_DEPTH`]
+/// ownership steps. A bound only does that where the stack holds it. On
+/// this target it would otherwise be the linker's default megabyte — too
+/// little for either bound, and running out of stack here is a trap the
+/// host cannot report as a finding, not an unwind.
+///
+/// So the module reserves its own, with room to spare: the deepest
+/// optimized parse measures in single megabytes and the deepest lift
+/// under three. `npm/build.mjs` reads this number and passes it to the
+/// linker; `tests/stack.rs` holds the two together.
+///
+/// This is address space in the module's linear memory, not resident
+/// pages, and it sits far below the memory cap the same build applies.
+pub const WASM_STACK_BYTES: usize = 16777216;
+
+/// The host console, for the panic hook below.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(message: &str);
+}
+
+/// Runs once when the module is instantiated: routes every panic
+/// report to the host's `console.error`. On this target a panic has no
+/// stderr to print to and then traps the instance — the host sees a
+/// bare `RuntimeError: unreachable` — so without the hook the reason
+/// is lost. The trapped instance is not recoverable (a session may be
+/// half-mutated): a host that catches a `RuntimeError` must discard
+/// the module instance and instantiate the module again.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(start)]
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
+}
 
 /// `[{name, text}]` — the JSON shape sources cross the boundary in.
 #[derive(Deserialize)]
@@ -40,10 +83,9 @@ struct SourceIn {
 /// session does not hold.
 fn resolve_edit_target(inner: &mut TSession, name: &str) -> Result<ElementRef, String> {
     let e = if let Some(id) = name.strip_prefix('@') {
-        let r = inner.resolved();
-        let all: Vec<ElementRef> = r.user_elements().collect();
-        all.into_iter()
-            .find(|e| r.element_id(*e).to_string() == id)
+        inner
+            .resolved()
+            .element_by_id(id)
             .ok_or_else(|| format!("element not found: {name}"))?
     } else {
         inner
@@ -57,9 +99,25 @@ fn resolve_edit_target(inner: &mut TSession, name: &str) -> Result<ElementRef, S
     Ok(e)
 }
 
+/// One metadata usage as `viewInfo` reports it: its (first) type and
+/// the evaluated values of the features its body declares.
+struct MetadataValues {
+    ty: Option<String>,
+    values: Vec<(String, EvalValue)>,
+}
+
 fn parse_sources(json: &str) -> Result<Vec<(String, String)>, String> {
     let sources: Vec<SourceIn> =
         serde_json::from_str(json).map_err(|e| format!("sources must be [{{name, text}}]: {e}"))?;
+    // A unit's name is its identity everywhere downstream (findings,
+    // splices, the lifted root namespace), so an empty one is refused
+    // at the boundary, by position, instead of failing deep inside a
+    // later emission.
+    if let Some(i) = sources.iter().position(|s| s.name.is_empty()) {
+        return Err(format!(
+            "sources must be [{{name, text}}]: source {i} has an empty name"
+        ));
+    }
     Ok(sources.into_iter().map(|s| (s.name, s.text)).collect())
 }
 
@@ -113,6 +171,8 @@ fn verify_status(
                 ("undecided", format!("undecided ({why}; propagation: {m})"))
             }
             Some(PropagateOutcome::Undecided) | None => ("undecided", format!("undecided ({why})")),
+            // A conclusion this build does not recognize stays undecided.
+            Some(_) => ("undecided", format!("undecided ({why})")),
         },
     }
 }
@@ -165,6 +225,42 @@ fn default_view() -> String {
 
 fn yes() -> bool {
     true
+}
+
+/// The `view` and `lineStyle` vocabularies are the diagram crate's own
+/// (`tree`, `interconnection` / `ic`, `state`, `action`, `sequence` /
+/// `seq`, `case`, `mixed`; `polyline`, `ortho`), parsed and spelled
+/// through it so this surface cannot drift from the others.
+fn parse_view(name: &str) -> Result<sysmlv2_viz::View, String> {
+    name.parse()
+        .map_err(|e: sysmlv2_viz::ParseOptionError| e.to_string())
+}
+
+/// A view's canonical spelling (its `--view` value without aliases).
+fn view_name(view: sysmlv2_viz::View) -> &'static str {
+    view.as_str()
+}
+
+/// An absent `lineStyle` is the emitter's default splines.
+fn parse_line_style(name: Option<&str>) -> Result<sysmlv2_viz::LineStyle, String> {
+    match name {
+        None => Ok(sysmlv2_viz::LineStyle::Default),
+        Some(s) => s
+            .parse()
+            .map_err(|e: sysmlv2_viz::ParseOptionError| e.to_string()),
+    }
+}
+
+/// The memoized line index of a unit, built on first use; a unit whose
+/// source the session does not hold (a library unit) indexes as empty.
+fn unit_line_index<'a>(
+    indexes: &'a mut HashMap<usize, LineIndex>,
+    session: &TSession,
+    unit: usize,
+) -> &'a LineIndex {
+    indexes
+        .entry(unit)
+        .or_insert_with(|| LineIndex::new(session.source(unit).unwrap_or("")))
 }
 
 /// One edit-batch operation as JSON (the `edit` method takes an array):
@@ -257,9 +353,9 @@ impl Session {
     /// the diagram at every top-level element.
     fn resolve_roots(
         &mut self,
-        names: &Option<Vec<String>>,
+        names: Option<&[String]>,
     ) -> Result<Option<Vec<ElementRef>>, String> {
-        let Some(names) = names.as_ref().filter(|n| !n.is_empty()) else {
+        let Some(names) = names.filter(|n| !n.is_empty()) else {
             return Ok(None);
         };
         let mut refs = Vec::with_capacity(names.len());
@@ -274,14 +370,80 @@ impl Session {
         Ok(Some(refs))
     }
 
+    /// Parse a diagram options document (absent or empty = `{}`, so
+    /// serde's field defaults apply uniformly) and resolve its scope
+    /// against the current model — the one path both diagram emitters
+    /// take, so they accept the same options and read a name the same
+    /// way. Returns the emitter options with `roots` filled in, and
+    /// the subtree root. A view usage named as `element` directs its
+    /// own diagram: the elements are what it exposes (filter conditions
+    /// applied), as the CLI renders it, while the requested view kind
+    /// stands — callers name it explicitly here. An empty exposure
+    /// comes back as `roots: Some([])`: an explicit empty selection,
+    /// never the whole model (which the emitters draw for a missing
+    /// selection).
+    fn diagram_request(
+        &mut self,
+        opts_json: Option<&str>,
+    ) -> Result<(sysmlv2_viz::VizOptions, Option<ElementRef>), String> {
+        let opts: PlantumlOpts =
+            serde_json::from_str(opts_json.filter(|s| !s.is_empty()).unwrap_or("{}"))
+                .map_err(|e| format!("bad options: {e}"))?;
+        let view = parse_view(&opts.view)?;
+        let line_style = parse_line_style(opts.line_style.as_deref())?;
+        let mut root = opts
+            .element
+            .as_deref()
+            .map(|name| {
+                self.inner
+                    .resolved()
+                    .resolve_qualified(name)
+                    .ok_or_else(|| format!("element not found: {name}"))
+            })
+            .transpose()?;
+        let mut roots = self.resolve_roots(opts.roots.as_deref())?;
+        if let Some(e) = root {
+            if let Some((_, exposed)) = sysmlv2_viz::view_directed(self.inner.resolved(), e) {
+                roots = Some(exposed);
+                root = None;
+            }
+        }
+        let viz = sysmlv2_viz::VizOptions::default()
+            .with_direction(if opts.horizontal {
+                sysmlv2_viz::Direction::LeftToRight
+            } else {
+                sysmlv2_viz::Direction::TopToBottom
+            })
+            .with_show_values(opts.show_values)
+            .with_view(view)
+            .with_show_notes(opts.show_notes)
+            .with_show_metadata(opts.show_metadata)
+            .with_show_inherited(opts.show_inherited)
+            .with_show_lib(opts.show_lib)
+            .with_show_imported(opts.show_imported)
+            .with_line_style(line_style)
+            .with_std_color(opts.std_color)
+            .with_link_template(opts.link_template)
+            .with_roots(roots);
+        Ok((viz, root))
+    }
+
     fn value_to_json(&mut self, v: &EvalValue) -> serde_json::Value {
         match v {
             EvalValue::Boolean(b) => json!(b),
             EvalValue::Integer(i) => json!(i),
-            EvalValue::Rational(f) => json!(f),
+            // A JSON number carries an exact rational only when its
+            // decimal spelling is the value; anything else crosses as an
+            // explicit fraction with a double approximation alongside.
+            EvalValue::Rational(r) if r.json_number_is_exact() => json!(r.to_f64()),
+            EvalValue::Rational(r) => {
+                let (n, d) = r.to_string_parts();
+                json!({ "@rational": format!("{n}/{d}"), "approx": r.to_f64() })
+            }
+            EvalValue::Real(f) => json!(f),
             EvalValue::String(s) => json!(s),
             EvalValue::Indeterminate => json!({ "@indeterminate": true }),
-            EvalValue::Element(e) | EvalValue::Unbound(e) => json!({
+            EvalValue::Element(e) | EvalValue::Unbound(e) | EvalValue::UnboundMember(e) => json!({
                 "@element": self.inner.resolved().element_id(*e).to_string(),
                 "qualifiedName": self.inner.resolved().element_qualified_name(*e),
             }),
@@ -306,8 +468,96 @@ impl Session {
     }
 }
 
+/// An immutable library graph reusable across session builds and edits.
+/// Prepare the final ordered source bundle once. Changed sources require a new
+/// handle. Sessions retain the library independently of this handle's lifetime.
+#[wasm_bindgen]
+pub struct PreparedLibrary {
+    inner: Library,
+}
+
+#[wasm_bindgen]
+impl PreparedLibrary {
+    /// Prepare library sources (JSON `[{name, text}]`) with an optional sealed
+    /// resolution snapshot. Stale or corrupt snapshots fall back to source.
+    #[wasm_bindgen(constructor)]
+    pub fn new(sources_json: &str, snapshot: Option<Vec<u8>>) -> Result<PreparedLibrary, String> {
+        Ok(Self {
+            inner: Library::prepared_sources(parse_sources(sources_json)?, snapshot)
+                .map_err(|e| e.to_string())?,
+        })
+    }
+}
+
 #[wasm_bindgen]
 impl Session {
+    /// Open sources against a shared prepared library in one model build.
+    #[wasm_bindgen(js_name = fromSourcesWithPreparedLibrary)]
+    pub fn from_sources_with_prepared_library(
+        sources_json: &str,
+        library: &PreparedLibrary,
+    ) -> Result<Session, String> {
+        Ok(Session {
+            inner: TSession::from_sources_with_library(
+                parse_sources(sources_json)?,
+                Some(library.inner.clone()),
+            )
+            .map_err(|e| e.to_string())?,
+            gen: 0,
+        })
+    }
+
+    /// Open interchange JSON against a shared prepared library.
+    #[allow(clippy::needless_pass_by_value)]
+    #[wasm_bindgen(js_name = fromInterchangeJsonWithPreparedLibrary)]
+    pub fn from_interchange_json_with_prepared_library(
+        json: &str,
+        library: &PreparedLibrary,
+        indent: Option<String>,
+    ) -> Result<Session, String> {
+        let value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        Ok(Session {
+            inner: TSession::from_interchange_json_indented(
+                &value,
+                Some(&library.inner),
+                &[],
+                parse_indent(indent.as_deref())?,
+            )
+            .map_err(|e| e.to_string())?,
+            gen: 0,
+        })
+    }
+
+    /// Open compact CBOR against a shared prepared library.
+    #[allow(clippy::needless_pass_by_value)]
+    #[wasm_bindgen(js_name = fromCompactCborWithPreparedLibrary)]
+    pub fn from_compact_cbor_with_prepared_library(
+        bytes: &[u8],
+        library: &PreparedLibrary,
+        indent: Option<String>,
+    ) -> Result<Session, String> {
+        Ok(Session {
+            inner: TSession::from_compact_cbor_indented(
+                bytes,
+                Some(&library.inner),
+                parse_indent(indent.as_deref())?,
+            )
+            .map_err(|e| e.to_string())?,
+            gen: 0,
+        })
+    }
+
+    /// Attach a shared prepared library and rebuild; existing element handles
+    /// become stale, just as with `loadLibrarySources`.
+    #[wasm_bindgen(js_name = loadPreparedLibrary)]
+    pub fn load_prepared_library(&mut self, library: &PreparedLibrary) -> Result<(), String> {
+        self.inner
+            .load_library_from(library.inner.clone())
+            .map_err(|e| e.to_string())?;
+        self.gen += 1;
+        Ok(())
+    }
+
     /// Open a session over in-memory sources: JSON `[{name, text}]`.
     /// Unit names ending in `.kerml` parse as KerML.
     #[wasm_bindgen(js_name = fromSources)]
@@ -317,6 +567,48 @@ impl Session {
                 .map_err(|e| e.to_string())?,
             gen: 0,
         })
+    }
+
+    /// [`Self::from_sources`] resolved against standard-library sources
+    /// (JSON `[{name, text}]`, optional sealed snapshot — see
+    /// [`Self::from_interchange_json`]) in the same build. Opening a
+    /// session and then calling [`Self::load_library_sources`] resolves
+    /// the user units twice; this resolves them once.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
+    #[wasm_bindgen(js_name = fromSourcesWithLibrary)]
+    pub fn from_sources_with_library(
+        sources_json: &str,
+        lib_sources_json: Option<String>,
+        lib_snapshot: Option<Vec<u8>>,
+    ) -> Result<Session, String> {
+        let lib = lib_sources_json
+            .as_deref()
+            .map(|s| parse_library(s, lib_snapshot))
+            .transpose()?;
+        Ok(Session {
+            inner: TSession::from_sources_with_library(parse_sources(sources_json)?, lib)
+                .map_err(|e| e.to_string())?,
+            gen: 0,
+        })
+    }
+
+    /// The session's check findings — the same JSON the free [`check`]
+    /// returns for the session's sources and library, read off this
+    /// session's build instead of a second one (no parse-stage entries:
+    /// the session holds only units that parsed; without a library the
+    /// resolution stages are skipped, as `check` skips them). A host
+    /// that partitions its units by [`check_syntax`] and opens a
+    /// session over the ones that parsed gets every stage with one
+    /// resolution.
+    pub fn check(&mut self) -> String {
+        let findings = self.inner.check_findings();
+        let indexes: HashMap<&str, LineIndex> = self
+            .inner
+            .units()
+            .map(|(_, name, text)| (name, LineIndex::new(text)))
+            .collect();
+        check_findings_json(findings, &indexes)
     }
 
     /// Open a session over an interchange JSON document (compact or full
@@ -332,6 +624,8 @@ impl Session {
     /// The optional `indent` names the indentation style for the
     /// lifted unit text: `"tabs"`, or a space count like `"4"`
     /// (default four spaces; presentation only, never identity).
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = fromInterchangeJson)]
     pub fn from_interchange_json(
         json: &str,
@@ -359,6 +653,8 @@ impl Session {
     /// Open a session over a compact-form CBOR payload (a `Uint8Array`)
     /// — the binary counterpart of [`Self::from_interchange_json`];
     /// library and indent arguments as there.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = fromCompactCbor)]
     pub fn from_compact_cbor(
         bytes: &[u8],
@@ -407,6 +703,18 @@ impl Session {
             .map(|e| Element { e, gen })
     }
 
+    /// Look up an interchange UUID, including unnamed and library elements.
+    /// Returns no handle for malformed or absent IDs. Like name-resolved
+    /// handles, the result goes stale when the session is rebuilt.
+    #[wasm_bindgen(js_name = elementById)]
+    pub fn element_by_id(&mut self, id: &str) -> Option<Element> {
+        let gen = self.gen;
+        self.inner
+            .resolved()
+            .element_by_id(id)
+            .map(|e| Element { e, gen })
+    }
+
     /// Evaluate an ad-hoc KerML query expression at the root namespace
     /// (the `sysmlv2 query` semantics). Returns the value as JSON;
     /// elements come back as `{"@element": id, "qualifiedName": …}`.
@@ -433,6 +741,8 @@ impl Session {
     /// slice (semantic mode): `qualified_name` names the view
     /// usage; the result is the rendered node tree as JSON, or HTML when
     /// `format` is `"html"`. Evaluation writes nothing into the model.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = renderView)]
     pub fn render_view(
         &mut self,
@@ -451,6 +761,103 @@ impl Session {
         })
     }
 
+    /// Describe a `view` usage for tabular consumers: the rendering it
+    /// requests (`render …;` → the rendering usage's declared name),
+    /// the elements it exposes (its `expose` imports with the view's
+    /// `filter` conditions applied — the same exposure the CLI's
+    /// view-directed diagrams use), the view usages it owns (a matrix's
+    /// `columns` sub-view), and its prefix metadata with every owned
+    /// feature value evaluated (`@MatrixConfig { relationship = "…"; }`
+    /// → `{ "type": "…::MatrixConfig", "values": { "relationship": "…" } }`).
+    /// JSON `{ qualifiedName (canonical spelling), id, rendering, exposed: [{ id, qualifiedName,
+    /// metaclass }], views: [{ name, qualifiedName, id }], metadata: [{ type,
+    /// values }] }`; errors when the name does not resolve to a view usage.
+    /// Reads only; nothing is written into the model.
+    #[wasm_bindgen(js_name = viewInfo)]
+    pub fn view_info(&mut self, qualified_name: &str) -> Result<String, String> {
+        let view = self
+            .inner
+            .resolved()
+            .resolve_qualified(qualified_name)
+            .ok_or_else(|| format!("element not found: {qualified_name}"))?;
+        if self.inner.resolved().element_type(view) != "ViewUsage" {
+            return Err(format!("{qualified_name} is not a view usage"));
+        }
+        let (qualified, id, rendering, exposed, views, metadata) = {
+            let r = self.inner.resolved();
+            // The canonical spelling, not the caller's: a request may quote
+            // names the model spells bare (`P::'Verified'` vs `P::Verified`).
+            let qualified = r.element_qualified_name(view);
+            let id = r.element_id(view).to_string();
+            let rendering = r.view_rendering(view);
+            let exposed: Vec<serde_json::Value> = r
+                .view_exposed_elements(view)
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "id": r.element_id(e).to_string(),
+                        "qualifiedName": r.element_qualified_name(e),
+                        "metaclass": r.element_type(e),
+                    })
+                })
+                .collect();
+            let owned: Vec<ElementRef> = r
+                .owned_members(view)
+                .into_iter()
+                .filter(|&m| r.element_type(m) == "ViewUsage")
+                .collect();
+            let mut views = Vec::with_capacity(owned.len());
+            for m in owned {
+                let name = r.element_name(m).map(str::to_string);
+                views.push(json!({
+                    "name": name,
+                    "qualifiedName": r.element_qualified_name(m),
+                    "id": r.element_id(m).to_string(),
+                }));
+            }
+            // Each metadata usage: its (first) type and the evaluated
+            // values of the features its body declares; unevaluable
+            // values are omitted rather than failing the whole report.
+            let mut metadata: Vec<MetadataValues> = Vec::new();
+            for m in r.metadata_of(view) {
+                let ty = r
+                    .typings(m)
+                    .first()
+                    .and_then(|&t| r.element_qualified_name(t));
+                let mut values = Vec::new();
+                for f in r.owned_members(m) {
+                    let Some(name) = r.element_name(f).map(str::to_string) else {
+                        continue;
+                    };
+                    if let Ok(v) = r.evaluate(f) {
+                        values.push((name, v));
+                    }
+                }
+                metadata.push(MetadataValues { ty, values });
+            }
+            (qualified, id, rendering, exposed, views, metadata)
+        };
+        let metadata: Vec<serde_json::Value> = metadata
+            .into_iter()
+            .map(|MetadataValues { ty, values }| {
+                let mut obj = serde_json::Map::new();
+                for (name, v) in &values {
+                    obj.insert(name.clone(), self.value_to_json(v));
+                }
+                json!({ "type": ty, "values": serde_json::Value::Object(obj) })
+            })
+            .collect();
+        Ok(json!({
+            "qualifiedName": qualified,
+            "id": id,
+            "rendering": rendering,
+            "exposed": exposed,
+            "views": views,
+            "metadata": metadata,
+        })
+        .to_string())
+    }
+
     /// Evaluate `e`'s bound feature value; JSON, as in [`Self::query`].
     pub fn evaluate(&mut self, e: &Element) -> Result<String, String> {
         self.guard(e)?;
@@ -462,29 +869,204 @@ impl Session {
         Ok(self.value_to_json(&value).to_string())
     }
 
+    // ---- derived properties (the spec-name read API) ----
+
+    /// The derived property `name` of `e`, by its specification name
+    /// (`"ownedFeature"`, `"owningNamespace"`, `"name"`, …), as JSON: `null`
+    /// for a null single value, a boolean or string, an array of strings,
+    /// an element as `{"@id": …}` and a list of elements as an array of
+    /// them; a target outside the model as `{"outside": true, "id"?: …,
+    /// "spelling"?: …}` (an element of an unloaded library or a foreign
+    /// payload by its id, or a reference that never resolved by its
+    /// spelling). Element handles for the same value come from
+    /// [`Self::derived_elements`]. Errors when the element's metaclass
+    /// does not declare the property as derived or the toolkit does not
+    /// compute it yet; `derives` tells in advance.
+    pub fn derived(&mut self, e: &Element, name: &str) -> Result<String, String> {
+        use sysmlv2_model::json::{DerivedValue, Reference, dangling_id};
+        self.guard(e)?;
+        let value = self.derived_value(e, name)?;
+        let r = self.inner.resolved();
+        let id = |x: ElementRef| serde_json::json!({ "@id": r.element_id(x).to_string() });
+        let reference = |x: &Reference| -> Result<serde_json::Value, String> {
+            Ok(match x {
+                Reference::Element(x) => id(*x),
+                Reference::External(u) => {
+                    serde_json::json!({ "outside": true, "id": u.to_string() })
+                }
+                // The full form spells an unresolved reference as its
+                // deterministic dangling id: carried beside the spelling.
+                Reference::Unresolved(s) => serde_json::json!({
+                    "outside": true,
+                    "spelling": s,
+                    "danglingId": dangling_id(s),
+                }),
+                _ => return Err("unsupported reference shape from a newer toolkit".into()),
+            })
+        };
+        let json = match &value {
+            DerivedValue::Null => serde_json::Value::Null,
+            DerivedValue::Bool(b) => serde_json::Value::Bool(*b),
+            DerivedValue::Str(s) => serde_json::Value::String(s.clone()),
+            DerivedValue::Strings(ss) => serde_json::json!(ss),
+            DerivedValue::Element(x) => id(*x),
+            DerivedValue::Elements(xs) => {
+                serde_json::Value::Array(xs.iter().map(|&x| id(x)).collect())
+            }
+            DerivedValue::Reference(x) => reference(x)?,
+            DerivedValue::References(xs) => {
+                serde_json::Value::Array(xs.iter().map(reference).collect::<Result<_, _>>()?)
+            }
+            _ => return Err("unsupported derived value shape from a newer toolkit".into()),
+        };
+        Ok(json.to_string())
+    }
+
+    /// The element handles of the derived property `name` of `e`: the
+    /// element of a single-valued value, the elements of a list, the
+    /// in-model targets of a reference-typed value — a target outside the
+    /// model has no handle and is *dropped* here (it is in
+    /// [`Self::derived`]'s JSON as an `outside` object); empty for a
+    /// string or boolean. Errors as `derived` does.
+    #[wasm_bindgen(js_name = derivedElements)]
+    pub fn derived_elements(&mut self, e: &Element, name: &str) -> Result<Vec<Element>, String> {
+        use sysmlv2_model::json::DerivedValue;
+        self.guard(e)?;
+        let gen = self.gen;
+        let value = self.derived_value(e, name)?;
+        let handles: Vec<ElementRef> = match &value {
+            DerivedValue::Element(x) => vec![*x],
+            DerivedValue::Elements(xs) => xs.clone(),
+            DerivedValue::Reference(r) => r.element().into_iter().collect(),
+            DerivedValue::References(rs) => rs.iter().filter_map(|r| r.element()).collect(),
+            _ => Vec::new(),
+        };
+        Ok(handles.into_iter().map(|x| Element { e: x, gen }).collect())
+    }
+
+    fn derived_value(
+        &mut self,
+        e: &Element,
+        name: &str,
+    ) -> Result<sysmlv2_model::json::DerivedValue, String> {
+        use sysmlv2_model::json::Derived;
+        match self.inner.resolved().derived(e.e, name) {
+            Derived::NotDeclared => Err(format!(
+                "{name} is not a derived property of {}",
+                self.inner.resolved().element_type(e.e)
+            )),
+            Derived::NotComputed => Err(format!("{name} is not computed by this toolkit yet")),
+            Derived::Value(v) => Ok(v),
+        }
+    }
+
+    /// What `derived` answers for `name` on elements of `metaclass`,
+    /// decided without a model: `"not-declared"`, `"not-computed"`,
+    /// `"passthrough"` or `"exact"`.
+    pub fn derives(metaclass: &str, name: &str) -> String {
+        use sysmlv2_model::json::Derives;
+        match sysmlv2_model::json::derives(metaclass, name) {
+            Derives::NotDeclared => "not-declared",
+            Derives::NotComputed => "not-computed",
+            Derives::Passthrough => "passthrough",
+            Derives::Exact => "exact",
+        }
+        .to_string()
+    }
+
+    /// Whether the abstract syntax owns `name` on `metaclass`.
+    #[wasm_bindgen(js_name = isOwnedProperty)]
+    pub fn is_owned_property(metaclass: &str, name: &str) -> bool {
+        sysmlv2_model::json::is_owned_property(metaclass, name)
+    }
+
+    /// Every derived property name `derived` can answer on some
+    /// metaclass.
+    #[wasm_bindgen(js_name = computedNames)]
+    pub fn computed_names() -> Vec<String> {
+        sysmlv2_model::json::computed_names()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The closure policy `derived` answers under: `"passthrough"` (the
+    /// default), `"closure"` or `"closure-implied"`.
+    #[wasm_bindgen(js_name = closurePolicy)]
+    pub fn closure_policy(&mut self) -> String {
+        use sysmlv2_model::json::ClosurePolicy;
+        match self.inner.resolved().closure_policy() {
+            ClosurePolicy::Passthrough => "passthrough",
+            ClosurePolicy::Closure {
+                include_implied: false,
+            } => "closure",
+            ClosurePolicy::Closure {
+                include_implied: true,
+            } => "closure-implied",
+        }
+        .to_string()
+    }
+
+    /// Set the closure policy (see `closurePolicy`).
+    #[wasm_bindgen(js_name = setClosurePolicy)]
+    pub fn set_closure_policy(&mut self, policy: &str) -> Result<(), String> {
+        use sysmlv2_model::json::ClosurePolicy;
+        let policy = match policy {
+            "passthrough" => ClosurePolicy::Passthrough,
+            "closure" => ClosurePolicy::Closure {
+                include_implied: false,
+            },
+            "closure-implied" => ClosurePolicy::Closure {
+                include_implied: true,
+            },
+            other => {
+                return Err(format!(
+                    "unknown closure policy {other:?}: passthrough, closure or closure-implied"
+                ));
+            }
+        };
+        self.inner.resolved().set_closure_policy(policy);
+        Ok(())
+    }
+
     // ---- navigation ----
 
-    /// The element's qualified name (undefined for anonymous elements).
+    /// The element's qualified name (undefined for anonymous elements):
+    /// the specification's derivation, in which a reserved word used as
+    /// a name stays bare (`part::view`). A model property, not source
+    /// text — splice [`Self::reference_spelling`] into generated
+    /// `import`/`expose` targets instead.
     #[wasm_bindgen(js_name = qualifiedName)]
     pub fn qualified_name(&mut self, e: &Element) -> Result<Option<String>, String> {
         self.guard(e)?;
         Ok(self.inner.resolved().element_qualified_name(e.e))
     }
 
-    /// The element's declared name.
+    /// The element's qualified name spelled as reference text that
+    /// re-parses in either dialect: reserved words and non-basic names
+    /// quoted (`'part'::'view'` where `qualifiedName` reports
+    /// `part::view`). Undefined for anonymous elements.
+    #[wasm_bindgen(js_name = referenceSpelling)]
+    pub fn reference_spelling(&mut self, e: &Element) -> Result<Option<String>, String> {
+        self.guard(e)?;
+        Ok(self.inner.resolved().element_reference_spelling(e.e))
+    }
+
+    /// The element's declared name; the specification's `name` (an
+    /// unnamed feature named by what it redefines) is `derived(e, "name")`.
     pub fn name(&mut self, e: &Element) -> Result<Option<String>, String> {
         self.guard(e)?;
         Ok(self.inner.resolved().element_name(e.e).map(str::to_string))
     }
 
-    /// The element's declared short name (`<shortName>`), when it has one.
+    /// The element's declared short name (`<shortName>`), when it has one;
+    /// the specification's `shortName` is `derived(e, "shortName")`.
     #[wasm_bindgen(js_name = shortName)]
     pub fn short_name(&mut self, e: &Element) -> Result<Option<String>, String> {
         self.guard(e)?;
         Ok(self
             .inner
             .resolved()
-            .element_short_name(e.e)
+            .element_declared_short_name(e.e)
             .map(str::to_string))
     }
 
@@ -706,8 +1288,10 @@ impl Session {
     /// payload digest. The session's library names the effective-name
     /// targets; decode against the same library version.
     #[wasm_bindgen(js_name = toCompactCborElided)]
-    pub fn to_compact_cbor_elided(&self) -> Vec<u8> {
-        self.inner.to_compact_cbor_elided()
+    pub fn to_compact_cbor_elided(&self) -> Result<Vec<u8>, String> {
+        self.inner
+            .to_compact_cbor_elided()
+            .map_err(|e| e.to_string())
     }
 
     /// The model's **state digest** — the content identity a delta
@@ -753,7 +1337,7 @@ impl Session {
             .inner
             .apply_delta_cbor(bytes, lenient)
             .map_err(|e| e.to_string())?;
-        Ok(apply_report_json(result, report))
+        Ok(apply_report_json(&result, &report))
     }
 
     /// Apply a delta payload against a caller-held base document (a
@@ -775,7 +1359,7 @@ impl Session {
             .inner
             .apply_delta_cbor_to(bytes, &base, lenient)
             .map_err(|e| e.to_string())?;
-        Ok(apply_report_json(result, report))
+        Ok(apply_report_json(&result, &report))
     }
 
     /// [`Self::apply_delta_cbor_to`] with the applied result embedded
@@ -823,65 +1407,14 @@ impl Session {
     /// Emit a PlantUML diagram of the session's model. Options as
     /// a JSON object (see `PlantumlOpts` docs); pass `undefined`/`"{}"`
     /// for the defaults (tree view). Feed the text to any PlantUML build.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = toPlantuml)]
     pub fn to_plantuml(&mut self, opts_json: Option<String>) -> Result<String, String> {
-        // Absent options deserialize as `{}` so serde's field defaults
-        // apply uniformly.
-        let opts_json = opts_json.filter(|s| !s.is_empty());
-        let opts: PlantumlOpts = serde_json::from_str(opts_json.as_deref().unwrap_or("{}"))
-            .map_err(|e| format!("bad options: {e}"))?;
-        let view = match opts.view.as_str() {
-            "tree" => sysmlv2_viz::View::Tree,
-            "interconnection" | "ic" => sysmlv2_viz::View::Interconnection,
-            "state" => sysmlv2_viz::View::State,
-            "action" => sysmlv2_viz::View::Action,
-            "sequence" | "seq" => sysmlv2_viz::View::Sequence,
-            "case" => sysmlv2_viz::View::Case,
-            "mixed" => sysmlv2_viz::View::Mixed,
-            other => {
-                return Err(format!(
-                    "unknown view: {other} (expected tree, interconnection, state, action, sequence, case, or mixed)"
-                ));
-            }
-        };
-        let line_style = match opts.line_style.as_deref() {
-            None => sysmlv2_viz::LineStyle::Default,
-            Some("polyline") => sysmlv2_viz::LineStyle::Polyline,
-            Some("ortho") => sysmlv2_viz::LineStyle::Ortho,
-            Some(other) => {
-                return Err(format!(
-                    "unknown line style: {other} (expected polyline or ortho)"
-                ));
-            }
-        };
-        let root = match opts.element.as_deref() {
-            Some(name) => Some(
-                self.inner
-                    .resolved()
-                    .resolve_qualified(name)
-                    .ok_or_else(|| format!("element not found: {name}"))?,
-            ),
-            None => None,
-        };
-        let roots = self.resolve_roots(&opts.roots)?;
-        let viz = sysmlv2_viz::VizOptions {
-            direction: if opts.horizontal {
-                sysmlv2_viz::Direction::LeftToRight
-            } else {
-                sysmlv2_viz::Direction::TopToBottom
-            },
-            show_values: opts.show_values,
-            view,
-            show_notes: opts.show_notes,
-            show_metadata: opts.show_metadata,
-            show_inherited: opts.show_inherited,
-            show_lib: opts.show_lib,
-            show_imported: opts.show_imported,
-            line_style,
-            std_color: opts.std_color,
-            link_template: opts.link_template,
-            roots,
-        };
+        let (viz, root) = self.diagram_request(opts_json.as_deref())?;
+        if viz.roots.as_ref().is_some_and(|r| r.is_empty()) {
+            return Ok("@startuml\n' the view exposes nothing\n@enduml\n".to_string());
+        }
         Ok(sysmlv2_viz::plantuml(self.inner.resolved(), root, &viz))
     }
 
@@ -889,40 +1422,27 @@ impl Session {
     /// source spans, and compartment rows; edges with kinds) for a
     /// view — the native renderer's input. Options as in
     /// [`Self::to_plantuml`]; views without a graph emitter yet error.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = toGraph)]
     pub fn to_graph(&mut self, opts_json: Option<String>) -> Result<String, String> {
-        let opts_json = opts_json.filter(|s| !s.is_empty());
-        let opts: PlantumlOpts = serde_json::from_str(opts_json.as_deref().unwrap_or("{}"))
-            .map_err(|e| format!("bad options: {e}"))?;
-        let view = match opts.view.as_str() {
-            "tree" => sysmlv2_viz::View::Tree,
-            "interconnection" | "ic" => sysmlv2_viz::View::Interconnection,
-            "state" => sysmlv2_viz::View::State,
-            "action" => sysmlv2_viz::View::Action,
-            other => return Err(format!("no structured-graph emitter for view: {other}")),
-        };
-        let root = match opts.element.as_deref() {
-            Some(name) => Some(
-                self.inner
-                    .resolved()
-                    .resolve_qualified(name)
-                    .ok_or_else(|| format!("element not found: {name}"))?,
-            ),
-            None => None,
-        };
-        let roots = self.resolve_roots(&opts.roots)?;
-        let viz = sysmlv2_viz::VizOptions {
-            view,
-            show_values: opts.show_values,
-            show_notes: opts.show_notes,
-            show_metadata: opts.show_metadata,
-            show_inherited: opts.show_inherited,
-            show_lib: opts.show_lib,
-            show_imported: opts.show_imported,
-            roots,
-            ..Default::default()
-        };
-        sysmlv2_viz::graph(self.inner.resolved(), root, &viz).map(|v| v.to_string())
+        let (viz, root) = self.diagram_request(opts_json.as_deref())?;
+        let view = view_name(viz.view);
+        if !matches!(
+            viz.view,
+            sysmlv2_viz::View::Tree
+                | sysmlv2_viz::View::Interconnection
+                | sysmlv2_viz::View::State
+                | sysmlv2_viz::View::Action
+        ) {
+            return Err(format!("no structured-graph emitter for view: {view}"));
+        }
+        if viz.roots.as_ref().is_some_and(|r| r.is_empty()) {
+            return Ok(json!({ "view": view, "nodes": [], "edges": [] }).to_string());
+        }
+        sysmlv2_viz::graph(self.inner.resolved(), root, &viz)
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
     }
 
     /// Apply an edit batch (JSON array of `EditOpIn` operations) via
@@ -936,9 +1456,16 @@ impl Session {
     /// newId]…], findings: [string…], splices: [{unit, start, end,
     /// text}…]}` — splices in pre-commit byte offsets per unit, exactly
     /// what an editor mirror needs to replay the change.
+    ///
+    /// A `rename` whose new name a sibling in the same owner already
+    /// carries (or that another rename in the batch gives a sibling)
+    /// is dropped rather than refusing the batch: the rest commits and
+    /// each dropped rename is one `findings` line. A batch of nothing
+    /// but dropped renames commits nothing and leaves handles valid.
     pub fn edit(&mut self, ops_json: &str) -> Result<String, String> {
         let resolved = self.resolve_ops(Self::parse_ops(ops_json)?)?;
         let mut batch = self.inner.edit();
+        batch.skip_colliding_renames();
         Self::stage_ops(&mut batch, &resolved);
         let report = batch.commit().map_err(|e| e.to_string())?;
         self.gen += 1;
@@ -963,6 +1490,7 @@ impl Session {
             }
         };
         let mut batch = self.inner.edit();
+        batch.skip_colliding_renames();
         Self::stage_ops(&mut batch, &resolved);
         Ok(match batch.check() {
             Ok(report) => {
@@ -1171,6 +1699,8 @@ impl Session {
     /// unitName?, line?, col?}`, empty for satisfied constraints);
     /// `features` = the free features the propagation term references
     /// (the keys into `ranges`).
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn verify(&mut self, opts_json: Option<String>) -> Result<String, String> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1193,7 +1723,9 @@ impl Session {
             .units()
             .map(|(i, n, _)| (i, n.to_string()))
             .collect();
-        let mut indexes: std::collections::HashMap<usize, LineIndex> = Default::default();
+        // One line index per unit, built on first use and shared by the
+        // constraint spans and their bindings' declaration sites.
+        let mut indexes: HashMap<usize, LineIndex> = HashMap::new();
         let (mut sat, mut vio, mut und) = (0usize, 0usize, 0usize);
         let inner = &self.inner;
         let constraints: Vec<serde_json::Value> = report
@@ -1240,11 +1772,14 @@ impl Session {
                         // Declaration site → position, when the feature
                         // lives in a user unit (library sources are not
                         // held, so library declarations carry no position).
-                        let pos = b.site.and_then(|(unit, span)| {
-                            let src = inner.source(unit)?;
-                            let lc = LineIndex::new(src).line_col(span.start);
-                            Some((unit, lc))
-                        });
+                        let pos = b
+                            .site
+                            .filter(|(unit, _)| inner.source(*unit).is_some())
+                            .map(|(unit, span)| {
+                                let lc =
+                                    unit_line_index(&mut indexes, inner, unit).line_col(span.start);
+                                (unit, lc)
+                            });
                         json!({
                             "feature": b.feature,
                             "value": b.value,
@@ -1254,9 +1789,7 @@ impl Session {
                         })
                     })
                     .collect();
-                let li = indexes
-                    .entry(c.unit)
-                    .or_insert_with(|| LineIndex::new(inner.source(c.unit).unwrap_or("")));
+                let li = unit_line_index(&mut indexes, inner, c.unit);
                 let start = li.line_col(c.span.start);
                 let end = li.line_col(c.span.end);
                 json!({
@@ -1285,6 +1818,7 @@ impl Session {
                     "feature": r.feature,
                     "unit": r.unit,
                     "range": r.range,
+                    "rangeApprox": r.range_approx,
                     "narrowed": r.narrowed,
                 })
             })
@@ -1306,24 +1840,31 @@ impl Session {
     /// | {severity, …options}}}`); absent means every rule at its
     /// default severity; unknown ids/options surface as `lint-config`
     /// findings, and unreadable JSON is the only error. Returns
-    /// `{findings: [{rule, severity, message, unit, unitName, line,
-    /// col, endLine, endCol, element, suggest, fix}], summary:
-    /// {errors, warnings, infos, hints}}` — 1-based positions over the finding's
-    /// name span; `unit` and the positions are null on `lint-config`
-    /// findings. `element` (nullable) = the finding's edit-target
-    /// spelling (`::`-qualified name or `@<id>`) for host quick fixes;
+    /// `{findings: [{stage, rule, severity, message, unit, unitName,
+    /// start, end, line, col, endLine, endCol, element, suggest, fix,
+    /// alternatives}], summary: {errors, warnings, infos, hints}}` (the
+    /// `sysmlv2_lint::json` report shape, shared with the CLI's
+    /// `--format json`; `stage` is always `lint` here) — byte offsets
+    /// and 1-based positions over the finding's name span; `unit` and
+    /// the positions are null on `lint-config` findings. `element`
+    /// (nullable) = the finding's edit-target spelling (`::`-qualified
+    /// name or `@<id>`) for host quick fixes;
     /// `suggest` (nullable) = a naming finding's style-converted
     /// replacement name. `fix` (nullable)
-    /// = `{label, deletes, edits: [{unit, unitName, start, end,
-    /// replacement}]}` with **byte** offsets over the unit's current
-    /// text (the splice currency every edit surface here uses);
-    /// `deletes` marks fixes hosts must gate behind explicit opt-in.
+    /// = `{label, deletes, semantic, edits: [{unit, unitName, start,
+    /// end, replacement}]}` with **byte** offsets over the unit's
+    /// current text (the splice currency every edit surface here uses);
+    /// `deletes` marks fixes hosts must gate behind explicit opt-in, and
+    /// `semantic` marks fixes that change what a declaration means
+    /// (never part of a fix-all sweep).
     /// `alternatives` (array, same shape as `fix`) are equally-valid
     /// remedies for a quick-fix menu — a dimensionally ambiguous unit
     /// lists every compatible quantity type — never auto-applied.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn lint(&mut self, config_json: Option<String>) -> Result<String, String> {
         let cfg = match config_json.as_deref().filter(|s| !s.trim().is_empty()) {
-            Some(text) => sysmlv2_lint::Config::from_json(text)?,
+            Some(text) => sysmlv2_lint::Config::from_json(text).map_err(|e| e.to_string())?,
             None => sysmlv2_lint::Config::default(),
         };
         // The textual tier (`indentation`) reads the units' source
@@ -1339,81 +1880,20 @@ impl Session {
             .map(|(i, n, t)| (*i, n.as_str(), t.as_str()))
             .collect();
         let findings = sysmlv2_lint::lint_units(self.inner.resolved(), &cfg, &units);
-        let names: std::collections::HashMap<usize, String> = self
-            .inner
-            .units()
-            .map(|(i, n, _)| (i, n.to_string()))
-            .collect();
-        let mut indexes: std::collections::HashMap<usize, LineIndex> = Default::default();
-        let inner = &self.inner;
-        let (mut errors, mut warnings, mut infos, mut hints) = (0usize, 0usize, 0usize, 0usize);
-        let findings_json: Vec<serde_json::Value> = findings
-            .iter()
-            .map(|f| {
-                let severity = match f.severity {
-                    sysmlv2_lint::Severity::Error => {
-                        errors += 1;
-                        "error"
-                    }
-                    sysmlv2_lint::Severity::Info => {
-                        infos += 1;
-                        "info"
-                    }
-                    sysmlv2_lint::Severity::Hint => {
-                        hints += 1;
-                        "hint"
-                    }
-                    _ => {
-                        warnings += 1;
-                        "warn"
-                    }
-                };
-                let pos = f.unit.zip(f.span).map(|(unit, span)| {
-                    let li = indexes
-                        .entry(unit)
-                        .or_insert_with(|| LineIndex::new(inner.source(unit).unwrap_or("")));
-                    (unit, li.line_col(span.start), li.line_col(span.end))
-                });
-                let fix_json = |fx: &sysmlv2_lint::Fix| {
-                    let edits: Vec<serde_json::Value> = fx
-                        .edits
-                        .iter()
-                        .map(|e| {
-                            json!({
-                                "unit": e.unit,
-                                "unitName": names.get(&e.unit),
-                                "start": e.span.start,
-                                "end": e.span.end,
-                                "replacement": e.replacement,
-                            })
-                        })
-                        .collect();
-                    json!({"label": fx.label, "deletes": fx.deletes, "edits": edits})
-                };
-                let alternatives: Vec<serde_json::Value> =
-                    f.alternatives.iter().map(fix_json).collect();
-                json!({
-                    "rule": f.rule,
-                    "severity": severity,
-                    "message": f.message,
-                    "unit": f.unit,
-                    "unitName": f.unit.and_then(|u| names.get(&u)),
-                    "line": pos.map(|(_, s, _)| s.line),
-                    "col": pos.map(|(_, s, _)| s.col),
-                    "endLine": pos.map(|(_, _, e)| e.line),
-                    "endCol": pos.map(|(_, _, e)| e.col),
-                    "element": f.element,
-                    "suggest": f.suggest,
-                    "fix": f.fix.as_ref().map(fix_json),
-                    "alternatives": alternatives,
-                })
-            })
-            .collect();
-        Ok(json!({
-            "findings": findings_json,
-            "summary": {"errors": errors, "warnings": warnings, "infos": infos, "hints": hints},
-        })
-        .to_string())
+        // The shared report shape (`sysmlv2_lint::json`): engine unit
+        // indexes are reported unchanged — they are the session's — so
+        // every unit gets an identity alias (the table reports only
+        // aliased units).
+        let mut table = sysmlv2_lint::json::Units::new();
+        for (i, name, text) in &texts {
+            table.add(*i, name, text);
+            table.alias(*i, *i);
+        }
+        let mut report = sysmlv2_lint::json::Report::new();
+        for f in &findings {
+            report.push_finding(f, &table);
+        }
+        Ok(report.into_value().to_string())
     }
 
     /// The lint engine's validated generated-ownership join, exposed
@@ -1500,6 +1980,8 @@ impl Session {
 /// stays on one line. Rejects input that is not a single well-formed
 /// expression, reporting the first diagnostic — a formatter must not
 /// guess at broken input.
+// The export boundary converts an optional string only when owned.
+#[allow(clippy::needless_pass_by_value)]
 #[wasm_bindgen(js_name = formatQuery)]
 pub fn format_query(
     text: &str,
@@ -1529,11 +2011,13 @@ pub fn format_query(
 /// diagnostics — a formatter must not guess at broken input — reporting
 /// the first as `"<line>:<col> <message>"` (1-based, byte columns) so
 /// hosts can map it onto their own spans.
+// The export boundary converts an optional string only when owned.
+#[allow(clippy::needless_pass_by_value)]
 #[wasm_bindgen(js_name = formatSource)]
 pub fn format_source_js(text: &str, config_json: Option<String>) -> Result<String, String> {
     let config = match config_json.as_deref() {
         None | Some("") => sysmlv2_lint::Config::default(),
-        Some(json) => sysmlv2_lint::Config::from_json(json)?,
+        Some(json) => sysmlv2_lint::Config::from_json(json).map_err(|e| e.to_string())?,
     };
     sysmlv2_syntax::print::format_source_opts(
         text,
@@ -1570,10 +2054,12 @@ pub fn member_structure_digest_js(text: &str) -> Result<String, String> {
 /// configuration (absent/empty = engine defaults): resolved formatter
 /// options + enabled auto-fix rules/options + the canonicalizer
 /// schema version — the `canonicalizationDigest` provenance baseline.
+// The export boundary converts an optional string only when owned.
+#[allow(clippy::needless_pass_by_value)]
 #[wasm_bindgen(js_name = canonicalizationDigest)]
 pub fn canonicalization_digest_js(config_json: Option<String>) -> Result<String, String> {
     let cfg = match config_json.as_deref().filter(|s| !s.trim().is_empty()) {
-        Some(text) => sysmlv2_lint::Config::from_json(text)?,
+        Some(text) => sysmlv2_lint::Config::from_json(text).map_err(|e| e.to_string())?,
         None => sysmlv2_lint::Config::default(),
     };
     Ok(sysmlv2_lint::canonicalization_digest(&cfg))
@@ -1590,6 +2076,7 @@ pub fn canonicalization_digest_js(config_json: Option<String>) -> Result<String,
 /// `families` the rule's family-level style options. Sourced from the
 /// engine's own registry, so a form built from it can never drift
 /// from the rules that actually run.
+#[must_use]
 #[wasm_bindgen(js_name = lintRules)]
 pub fn lint_rules() -> String {
     let rules: Vec<serde_json::Value> = sysmlv2_lint::RULES
@@ -1618,23 +2105,29 @@ pub fn lint_rules() -> String {
                 .options
                 .iter()
                 .map(|o| {
-                    let kind = match &o.kind {
-                        sysmlv2_lint::OptionKind::Int { default, min, zero } => json!({
-                            "kind": "int", "default": default, "min": min, "zero": zero,
-                        }),
-                        sysmlv2_lint::OptionKind::Choice { default, values } => json!({
-                            "kind": "choice", "default": default, "values": values,
-                        }),
-                    };
-                    let mut o = json!({"key": o.key, "label": o.label});
-                    o.as_object_mut()
-                        .unwrap()
-                        .extend(kind.as_object().unwrap().clone());
-                    o
+                    // One flat object: the option's identity followed by
+                    // the fields its kind contributes.
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("key".to_string(), json!(o.key));
+                    entry.insert("label".to_string(), json!(o.label));
+                    match &o.kind {
+                        sysmlv2_lint::OptionKind::Int { default, min, zero } => {
+                            entry.insert("kind".to_string(), json!("int"));
+                            entry.insert("default".to_string(), json!(default));
+                            entry.insert("min".to_string(), json!(min));
+                            entry.insert("zero".to_string(), json!(zero));
+                        }
+                        sysmlv2_lint::OptionKind::Choice { default, values } => {
+                            entry.insert("kind".to_string(), json!("choice"));
+                            entry.insert("default".to_string(), json!(default));
+                            entry.insert("values".to_string(), json!(values));
+                        }
+                    }
+                    serde_json::Value::Object(entry)
                 })
                 .collect();
             json!({
-                "id": r.id,
+                "id": r.id.id(),
                 "description": r.description,
                 "default": r.default.as_str(),
                 "styles": r.styles,
@@ -1644,17 +2137,64 @@ pub fn lint_rules() -> String {
             })
         })
         .collect();
-    serde_json::to_string(&rules).unwrap()
+    serde_json::Value::Array(rules).to_string()
+}
+
+/// Repair sources (JSON `[{name, text}]`) that fail to parse so a
+/// session can be built over what parsed: a member carrying a parse
+/// error is removed (a failed member the parser skipped is recovered
+/// from the tokens around the error), bodies left open at the end of a
+/// unit get their closers appended, until each unit parses. Returns JSON
+/// `{sources: [{name, text}], dropped: [{unit, start, end, line, col,
+/// endLine, endCol, text, inserted, linesRemoved, wholeLines, message}],
+/// unrepaired: [{unit, line, col, message}]}` — `dropped` in the
+/// original texts' coordinates (byte offsets and byte columns, as `check`
+/// reports; `inserted` holds appended closers, then `text` is empty and
+/// the span is empty; `linesRemoved` and `wholeLines` map a line of the
+/// repaired text back to the original), `unrepaired` naming units still
+/// broken after the repair, positioned in their repaired text. Units
+/// that parse come back unchanged.
+#[wasm_bindgen(js_name = lenientSources)]
+pub fn lenient_sources(sources_json: &str) -> Result<String, String> {
+    let sources = parse_sources(sources_json)?;
+    let result = sysmlv2_transform::lenient_sources(&sources);
+    let sources: Vec<serde_json::Value> = result
+        .sources
+        .into_iter()
+        .map(|(name, text)| json!({"name": name, "text": text}))
+        .collect();
+    let dropped: Vec<serde_json::Value> = result
+        .dropped
+        .into_iter()
+        .map(|d| {
+            json!({
+                "unit": d.unit, "start": d.start, "end": d.end,
+                "line": d.line, "col": d.col, "endLine": d.end_line, "endCol": d.end_col,
+                "text": d.text, "inserted": d.inserted, "message": d.message,
+                "linesRemoved": d.lines_removed, "wholeLines": d.whole_lines,
+            })
+        })
+        .collect();
+    let unrepaired: Vec<serde_json::Value> = result
+        .unrepaired
+        .into_iter()
+        .map(|u| json!({"unit": u.unit, "line": u.line, "col": u.col, "message": u.message}))
+        .collect();
+    Ok(json!({"sources": sources, "dropped": dropped, "unrepaired": unrepaired}).to_string())
 }
 
 /// Check sources (JSON `[{name, text}]`) the way `sysmlv2 check` does:
 /// per-unit parse and body-context validation always; referential and
 /// semantic checks against the standard library when `lib_sources_json`
 /// (same shape) is given. Returns findings as a JSON string:
-/// `[{severity, message, unit, line, col, endLine, endCol}]` (1-based
-/// positions; the end pair spans the full diagnostic, so markers cover
-/// the whole offending construct rather than just its start). A broken
-/// parse is a finding, not an error.
+/// `[{severity, stage, message, unit, line, col, endLine, endCol}]`
+/// (1-based positions; the end pair spans the full diagnostic, so
+/// markers cover the whole offending construct rather than just its
+/// start). `stage` is `parse`, `context`, `referential` or `semantic`;
+/// only `parse` findings keep a unit out of a session. A broken parse
+/// is a finding, not an error.
+// The export boundary converts an optional string only when owned.
+#[allow(clippy::needless_pass_by_value)]
 #[wasm_bindgen]
 pub fn check(
     sources_json: &str,
@@ -1667,10 +2207,33 @@ pub fn check(
         .map(|s| parse_library(s, lib_snapshot))
         .transpose()?;
     let findings = check_sources_with_library(&sources, lib.as_ref()).map_err(|e| e.to_string())?;
-    let indexes: std::collections::HashMap<&str, LineIndex> = sources
+    let indexes: HashMap<&str, LineIndex> = sources
         .iter()
         .map(|(name, src)| (name.as_str(), LineIndex::new(src)))
         .collect();
+    Ok(check_findings_json(findings, &indexes))
+}
+
+/// The parse and context stages of [`check`] alone — no model is built,
+/// so the cost is a parse per unit. The partition step of a host that
+/// then opens a [`Session`] over the units that parsed and reads the
+/// resolution stages from [`Session::check`].
+#[wasm_bindgen(js_name = checkSyntax)]
+pub fn check_syntax(sources_json: &str) -> Result<String, String> {
+    let sources = parse_sources(sources_json)?;
+    let findings = sysmlv2_transform::check_sources_syntax(&sources);
+    let indexes: HashMap<&str, LineIndex> = sources
+        .iter()
+        .map(|(name, src)| (name.as_str(), LineIndex::new(src)))
+        .collect();
+    Ok(check_findings_json(findings, &indexes))
+}
+
+/// The findings array `check` and its session twin share.
+fn check_findings_json(
+    findings: Vec<sysmlv2_transform::CheckFinding>,
+    indexes: &HashMap<&str, LineIndex>,
+) -> String {
     let findings: Vec<serde_json::Value> = findings
         .into_iter()
         .map(|f| {
@@ -1682,6 +2245,7 @@ pub fn check(
                     sysmlv2_transform::Severity::Error => "error",
                     sysmlv2_transform::Severity::Warning => "warning",
                 },
+                "stage": f.stage.as_str(),
                 "message": f.message,
                 "unit": f.unit,
                 "line": f.line,
@@ -1694,7 +2258,7 @@ pub fn check(
             obj
         })
         .collect();
-    Ok(serde_json::Value::Array(findings).to_string())
+    serde_json::Value::Array(findings).to_string()
 }
 
 /// JSON envelope shared by the delta-apply surfaces.
@@ -1714,30 +2278,60 @@ fn apply_report_value(report: &sysmlv2_cbor::ApplyReport) -> serde_json::Value {
     })
 }
 
-fn apply_report_json(result: serde_json::Value, report: sysmlv2_cbor::ApplyReport) -> String {
-    serde_json::json!({ "result": result, "report": apply_report_value(&report) }).to_string()
+fn apply_report_json(result: &serde_json::Value, report: &sysmlv2_cbor::ApplyReport) -> String {
+    serde_json::json!({ "result": result, "report": apply_report_value(report) }).to_string()
 }
 
 /// The canonical spelling of an element name:
 /// JSON `{"spelling", "quoted"}` — `spelling` is exactly what the
 /// printer emits (bare, or a single-quoted restricted name for reserved
 /// words and non-basic characters) and `quoted` says which. Errors when
-/// the string cannot be a name (empty). `dialect` is `"sysml"` (default)
-/// or `"kerml"`; the reserved-word sets differ. Generators that mint
+/// the string cannot be a name (empty). `dialect` is `"sysml"` or
+/// `"kerml"`; the reserved-word sets differ, and an omitted dialect
+/// means SysML here (unlike `spellReference`, whose omitted dialect
+/// means either). Generators that mint
 /// names from external vocabularies call this instead of copying the
 /// parser's keyword table.
+// The export boundary converts an optional string only when owned.
+#[allow(clippy::needless_pass_by_value)]
 #[wasm_bindgen(js_name = canonicalName)]
 pub fn canonical_name_js(name: &str, dialect: Option<String>) -> Result<String, String> {
-    let dialect = match dialect.as_deref() {
-        None | Some("") | Some("sysml") => sysmlv2_syntax::ast::Dialect::Sysml,
-        Some("kerml") => sysmlv2_syntax::ast::Dialect::Kerml,
-        Some(d) => return Err(format!("dialect must be \"sysml\" or \"kerml\", got {d:?}")),
-    };
+    let dialect = parse_dialect(dialect.as_deref())?.unwrap_or(sysmlv2_syntax::ast::Dialect::Sysml);
     let c = sysmlv2_syntax::name::canonical_name(dialect, name).map_err(|e| e.to_string())?;
     Ok(json!({ "spelling": c.spelling, "quoted": c.quoted }).to_string())
 }
 
+/// Respell a canonical qualified name — as `qualifiedName` reports it,
+/// or as interchange JSON carries it — as reference text that parses:
+/// reserved words and non-basic names quoted per segment
+/// (`spellReference("part::view")` is `'part'::'view'`). `dialect` is
+/// `"sysml"` or `"kerml"` for text going into a unit of that kind;
+/// omitted, the spelling re-parses in either (every reserved word of
+/// both dialects is quoted). Hosts generating `import`/`expose` lines
+/// call this instead of quoting segments themselves.
+// The export boundary converts an optional string only when owned.
+#[allow(clippy::needless_pass_by_value)]
+#[wasm_bindgen(js_name = spellReference)]
+pub fn spell_reference_js(qualified_name: &str, dialect: Option<String>) -> Result<String, String> {
+    let dialect = parse_dialect(dialect.as_deref())?;
+    Ok(sysmlv2_syntax::name::respell_canonical(
+        dialect,
+        qualified_name,
+    ))
+}
+
+/// `"sysml"` / `"kerml"` → the dialect; absent or empty → `None`.
+fn parse_dialect(dialect: Option<&str>) -> Result<Option<sysmlv2_syntax::ast::Dialect>, String> {
+    match dialect {
+        None | Some("") => Ok(None),
+        Some("sysml") => Ok(Some(sysmlv2_syntax::ast::Dialect::Sysml)),
+        Some("kerml") => Ok(Some(sysmlv2_syntax::ast::Dialect::Kerml)),
+        Some(d) => Err(format!("dialect must be \"sysml\" or \"kerml\", got {d:?}")),
+    }
+}
+
 /// The toolkit version this module was built from.
+#[must_use]
 #[wasm_bindgen]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1854,11 +2448,9 @@ pub fn delta_cbor_between(
         Some(s) => serde_json::from_str(&s).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let opts = sysmlv2_cbor::DeltaOptions {
-        portable,
-        units,
-        ..Default::default()
-    };
+    let opts = sysmlv2_cbor::DeltaOptions::new()
+        .with_portable(portable)
+        .with_units(units);
     if elide.unwrap_or(false) {
         sysmlv2_cbor::delta_compact_cbor_elided(&base, &target, &opts, &|_| None)
             .map_err(|e| e.to_string())
@@ -1875,6 +2467,7 @@ pub fn delta_cbor_between(
 /// payload. Kind codes are the `cbor_tables` constants (0 bool,
 /// 1 str, 2 str list, 3 ref, 4 ref list, 5 enum, 6 literal,
 /// 7 element id).
+#[must_use]
 #[wasm_bindgen(js_name = codecTables)]
 pub fn codec_tables(full: bool) -> String {
     let set = if full {
@@ -1935,14 +2528,20 @@ pub struct LspServer {
     inner: sysmlv2_lsp::PushServer,
 }
 
+impl Default for LspServer {
+    fn default() -> LspServer {
+        LspServer::new()
+    }
+}
+
 #[wasm_bindgen]
 impl LspServer {
     /// The syntax-tier-only server (no standard library).
     /// NOTE: a fallible `#[wasm_bindgen(constructor)]` (Result return)
     /// leaves the JS object with a null pointer — keep the constructor
     /// infallible and use [`Self::with_library`] for the library shape.
+    #[must_use]
     #[wasm_bindgen(constructor)]
-    #[allow(clippy::new_without_default)]
     pub fn new() -> LspServer {
         LspServer {
             inner: sysmlv2_lsp::PushServer::new(),

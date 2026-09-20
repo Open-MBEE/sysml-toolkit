@@ -24,7 +24,7 @@ assert_eq!(from_compact_cbor(&bytes)?, compact_value);
 
 ## Measured (real corpora)
 
-Against minified compact JSON: **~9–10×** raw and **~1.9×** after both sides deflate; with `--elide-ids` **~15–19×** raw and **~5×** after deflate (the interned UUID table is the only incompressible part, and elision removes it). Full form lands ~11×. An edit-sized delta commit is a few hundred bytes against megabyte snapshots. Decoding is faster than JSON parsing. Numbers, methodology, and the wire specification: [`CBOR.md`](../../CBOR.md) (reproduce with `cargo run --release -p sysmlv2-cbor --example corpus_bench`).
+Against minified compact JSON: **9.9–10.5×** raw and **~2.1×** after both sides deflate; with `--elide-ids` **17.5–18.9×** raw and **7.0–7.8×** after deflate (the interned UUID table is the only incompressible part, and elision removes it). Full form lands ~11×. An edit-sized delta commit is a few hundred bytes against megabyte snapshots. In the corpus benchmark, decoding takes about 1.3× JSON parsing time; the size advantage does not imply a faster decoder. Numbers, methodology, and the wire specification: [`CBOR.md`](../../CBOR.md) (reproduce with `cargo run --release -p sysmlv2-cbor --example corpus_bench`).
 
 ## Layered use
 

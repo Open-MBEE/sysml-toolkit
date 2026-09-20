@@ -64,9 +64,29 @@ pub(crate) fn emit(
         alias: HashMap::new(),
         body: String::new(),
         edges: String::new(),
+        stray: Vec::new(),
     };
     for &e in tops {
         em.collect(e);
+    }
+    // The pass owns the stray list: nothing adds to it once collection
+    // is over, and holding it apart from `em` leaves the emitter free
+    // to mutate while each edge is written.
+    let stray = std::mem::take(&mut em.stray);
+    let contexts = edge_contexts(em.r, &stray, view);
+    for e in stray {
+        let context = contexts.get(&e);
+        let prev = context.and_then(|c| anchor_alias(c.source, &em.alias));
+        let target = context
+            .and_then(|c| c.target)
+            .and_then(|t| em.alias.get(&t).cloned());
+        let mut edges = String::new();
+        if em.r.element_type(e) == "TransitionUsage" {
+            em.emit_transition_with(e, 0, &mut edges, prev.as_deref(), &mut None);
+        } else {
+            em.emit_edge_with(e, 0, &mut edges, prev.as_deref(), target.as_deref());
+        }
+        em.edges.push_str(&edges);
     }
     let (body, edges) = (em.body, em.edges);
     let header = crate::style_header(opts, &["state"]);
@@ -81,6 +101,7 @@ struct Emitter<'a> {
     body: String,
     /// Edges outside any composite (from transparent containers).
     edges: String,
+    stray: Vec<ElementRef>,
 }
 
 impl Emitter<'_> {
@@ -124,9 +145,7 @@ impl Emitter<'_> {
             return;
         }
         if self.is_edge(ty) {
-            let mut edges = String::new();
-            self.emit_edge(e, 0, &mut edges);
-            self.edges.push_str(&edges);
+            self.stray.push(e);
             return;
         }
         for m in self.r.owned_members(e) {
@@ -192,6 +211,14 @@ impl Emitter<'_> {
             }
         }
 
+        let members: Vec<_> = flow
+            .iter()
+            .filter_map(|fm| match fm {
+                BodyFlowMember::Member(e) => Some(*e),
+                _ => None,
+            })
+            .collect();
+        let contexts = edge_contexts(self.r, &members, self.view);
         let stereos = crate::stereo_text(self.r, self.opts, e, &stereo);
         let link = crate::link_suffix(self.r, self.opts, e);
         self.indent(depth);
@@ -206,7 +233,6 @@ impl Emitter<'_> {
             self.body.push_str(" {\n");
             let mut edges = String::new();
             let mut prev: Option<String> = None;
-            let mut pending: Vec<(String, String)> = Vec::new();
             let mut last_transition_source: Option<ElementRef> = None;
             for fm in flow {
                 match fm {
@@ -224,10 +250,6 @@ impl Emitter<'_> {
                         if self.is_node(&mty) {
                             self.render_node(m, depth + 1);
                             let a = self.alias_for(m);
-                            for (src, suffix) in pending.drain(..) {
-                                Self::indent_into(&mut edges, depth + 1);
-                                let _ = writeln!(edges, "{src} --> {a}{suffix}");
-                            }
                             prev = Some(a);
                         } else if mty == "TransitionUsage" {
                             self.emit_transition_with(
@@ -238,12 +260,17 @@ impl Emitter<'_> {
                                 &mut last_transition_source,
                             );
                         } else if self.is_edge(&mty) {
+                            let context = contexts.get(&m);
+                            let source = context.and_then(|c| anchor_alias(c.source, &self.alias));
+                            let target = context
+                                .and_then(|c| c.target)
+                                .and_then(|t| self.alias.get(&t).cloned());
                             self.emit_edge_with(
                                 m,
                                 depth + 1,
                                 &mut edges,
-                                prev.as_deref(),
-                                Some(&mut pending),
+                                source.as_deref(),
+                                target.as_deref(),
                             );
                         }
                     }
@@ -295,25 +322,13 @@ impl Emitter<'_> {
             .find_map(|link| self.alias.get(link).cloned())
     }
 
-    /// Stray edges found outside any rendered node have no flow-order
-    /// context: no anchor, inline-target successions dropped.
-    fn emit_edge(&mut self, e: ElementRef, depth: usize, out: &mut String) {
-        let ty = self.r.element_type(e).to_string();
-        if ty == "TransitionUsage" {
-            let mut last = None;
-            self.emit_transition_with(e, depth, out, None, &mut last);
-            return;
-        }
-        self.emit_edge_with(e, depth, out, None, None);
-    }
-
     fn emit_edge_with(
         &mut self,
         e: ElementRef,
         depth: usize,
         out: &mut String,
         prev: Option<&str>,
-        pending: Option<&mut Vec<(String, String)>>,
+        inline_target: Option<&str>,
     ) {
         let ty = self.r.element_type(e);
         let is_flow = FLOWS.contains(&ty);
@@ -336,9 +351,9 @@ impl Emitter<'_> {
         };
         let source = match ends.first() {
             Some(end) if end.chain.is_empty() && end.spelling.is_none() => {
-                // A bare source (`then x;`): the current flow anchor, or
-                // the initial pseudostate when nothing precedes.
-                Some(prev.unwrap_or("[*]").to_string())
+                // Declaration-order context supplies either the preceding
+                // node or an explicit initial/final pseudostate.
+                prev.map(str::to_string)
             }
             Some(end) => self.chain_alias(&end.chain).or_else(|| pseudo(self, end)),
             None => None,
@@ -359,15 +374,14 @@ impl Emitter<'_> {
         let target_end = ends.last().cloned().expect("two ends checked above");
         let target = self
             .chain_alias(&target_end.chain)
-            .or_else(|| pseudo(self, &target_end));
+            .or_else(|| pseudo(self, &target_end))
+            .or_else(|| {
+                (!is_flow && target_end.chain.is_empty() && target_end.spelling.is_none())
+                    .then_some(inline_target)
+                    .flatten()
+                    .map(str::to_string)
+            });
         let Some(target) = target else {
-            // An inline node declaration follows (`then fork;`,
-            // `then action sum { … }`): defer until it renders.
-            if !is_flow && target_end.chain.is_empty() && target_end.spelling.is_none() {
-                if let Some(pending) = pending {
-                    pending.push((source, suffix));
-                }
-            }
             return;
         };
         Self::indent_into(out, depth);
@@ -483,4 +497,82 @@ pub(crate) fn transition_edge_label(
         }
     }
     pieces.join(" ")
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FlowAnchor {
+    Node(ElementRef),
+    Pseudo(bool),
+}
+
+pub(crate) struct FlowContext {
+    pub source: Option<FlowAnchor>,
+    pub target: Option<ElementRef>,
+}
+
+fn anchor_alias(
+    anchor: Option<FlowAnchor>,
+    aliases: &HashMap<ElementRef, String>,
+) -> Option<String> {
+    match anchor? {
+        FlowAnchor::Node(e) => aliases.get(&e).cloned(),
+        FlowAnchor::Pseudo(_) => Some("[*]".to_string()),
+    }
+}
+
+/// Declaration-order context belongs to the owning body even when that body
+/// is transparent in the selected view. Edges do not advance the anchor, so
+/// consecutive bare `then` members after a fork remain a fan-out.
+pub(crate) fn edge_contexts(
+    r: &mut ResolvedModel,
+    edges: &[ElementRef],
+    view: View,
+) -> HashMap<ElementRef, FlowContext> {
+    let owners: std::collections::HashSet<_> = edges.iter().filter_map(|&e| r.owner(e)).collect();
+    let mut contexts: HashMap<ElementRef, FlowContext> = HashMap::new();
+    for owner in owners {
+        let mut anchor = Some(FlowAnchor::Pseudo(true));
+        let mut pending = Vec::new();
+        for member in r.body_flow_members(owner) {
+            match member {
+                BodyFlowMember::Initial(elem, spelling) => {
+                    let name = elem
+                        .and_then(|e| r.element_name(e).map(str::to_string))
+                        .or(spelling);
+                    anchor = match name.as_deref() {
+                        Some("start") => Some(FlowAnchor::Pseudo(true)),
+                        Some("done") => Some(FlowAnchor::Pseudo(false)),
+                        _ => elem.map(FlowAnchor::Node),
+                    };
+                    pending.clear();
+                }
+                BodyFlowMember::Member(e) => {
+                    let ty = r.element_type(e);
+                    let node = if view == View::State {
+                        STATES.contains(&ty)
+                    } else {
+                        ACTIONS.contains(&ty) || CONTROL_NODES.contains(&ty)
+                    };
+                    if node {
+                        for edge in pending.drain(..) {
+                            contexts.get_mut(&edge).unwrap().target = Some(e);
+                        }
+                        anchor = Some(FlowAnchor::Node(e));
+                    } else if matches!(ty, "SuccessionAsUsage" | "Succession")
+                        || FLOWS.contains(&ty)
+                    {
+                        contexts.insert(
+                            e,
+                            FlowContext {
+                                source: anchor,
+                                target: None,
+                            },
+                        );
+                        pending.push(e);
+                    }
+                }
+            }
+        }
+    }
+    contexts
 }

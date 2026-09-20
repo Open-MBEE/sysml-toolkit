@@ -27,6 +27,8 @@
 //! repair text — which the suffix path realizes as a snippet stop
 //! (see `item_edits` in `nav`) and the insertion path gets for free.
 
+use crate::position::offset32;
+
 /// What a completion accept should additionally fix.
 pub(crate) struct Repairs {
     /// Appended to the completion's inserted text.
@@ -124,7 +126,7 @@ pub(crate) fn statement_repairs(
     let at = last_closer_end
         .or(semicolon_at)
         .or(chain_end)
-        .map(|i| offset + i as u32)
+        .map(|i| offset + offset32(i))
         .unwrap_or(offset);
     Some(Repairs {
         suffix: String::new(),
@@ -195,18 +197,22 @@ fn open_brackets(stmt: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::statement_repairs;
+    use super::{offset32, statement_repairs};
 
     fn repairs(text: &str, cursor: &str) -> Option<(String, Option<(u32, String)>)> {
-        let offset = (text.find(cursor).expect("cursor") + cursor.len()) as u32;
-        let stmt_start = text[..offset as usize]
-            .rfind([';', '{', '}'])
-            .map(|i| i + 1)
-            .unwrap_or(0) as u32;
-        let prefix_end = text[..offset as usize]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map(|i| i + 1)
-            .unwrap_or(0) as u32;
+        let offset = offset32(text.find(cursor).expect("cursor") + cursor.len());
+        let stmt_start = offset32(
+            text[..offset as usize]
+                .rfind([';', '{', '}'])
+                .map(|i| i + 1)
+                .unwrap_or(0),
+        );
+        let prefix_end = offset32(
+            text[..offset as usize]
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(|i| i + 1)
+                .unwrap_or(0),
+        );
         statement_repairs(text, stmt_start, prefix_end, offset).map(|r| (r.suffix, r.insert))
     }
 
@@ -221,7 +227,7 @@ mod tests {
         let text = "package P {\n    attribute g = 9.8 [m]\n}\n";
         let (suffix, insert) = repairs(text, "[m").expect("repairs");
         assert_eq!(suffix, "");
-        let at = text.find("m]").unwrap() as u32 + 2;
+        let at = offset32(text.find("m]").unwrap()) + 2;
         assert_eq!(insert, Some((at, ";".to_string())));
     }
 
@@ -230,7 +236,7 @@ mod tests {
         let text = "package P {\n    attribute g = 9.8 [m;\n}\n";
         let (suffix, insert) = repairs(text, "[m").expect("repairs");
         assert_eq!(suffix, "");
-        let at = text.find(';').unwrap() as u32;
+        let at = offset32(text.find(';').unwrap());
         assert_eq!(insert, Some((at, "]".to_string())));
     }
 
@@ -247,7 +253,7 @@ mod tests {
         let text = "package P {\n    attribute v = fuelTank.over.volume\n}\n";
         let (suffix, insert) = repairs(text, "over").expect("repairs");
         assert_eq!(suffix, "");
-        let at = text.find(".volume").unwrap() as u32 + 7;
+        let at = offset32(text.find(".volume").unwrap()) + 7;
         assert_eq!(insert, Some((at, ";".to_string())));
     }
 
@@ -256,7 +262,7 @@ mod tests {
         let text = "package P {\n    attribute v = a[b.chain]\n}\n";
         let (suffix, insert) = repairs(text, "a[b").expect("repairs");
         assert_eq!(suffix, "");
-        let at = text.find("chain]").unwrap() as u32 + 6;
+        let at = offset32(text.find("chain]").unwrap()) + 6;
         assert_eq!(insert, Some((at, ";".to_string())));
     }
 
@@ -295,7 +301,7 @@ mod tests {
         // prefix_end sits before the quote (the completion's replace
         // range absorbs it), so the scan never sees a dangling string.
         let text = "package P {\n    attribute g = 9.8 ['m\n}\n";
-        let offset = (text.find("['m").unwrap() + 3) as u32;
+        let offset = offset32(text.find("['m").unwrap() + 3);
         let r = statement_repairs(text, 12, offset - 2, offset).expect("repairs");
         assert_eq!(r.suffix, "];");
     }

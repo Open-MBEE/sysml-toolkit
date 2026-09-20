@@ -57,9 +57,12 @@ impl Client {
             match self.conn.receiver.recv().unwrap() {
                 Message::Response(Response {
                     id: rid,
-                    result,
-                    error,
+                    response_result,
                 }) if rid == id => {
+                    let (result, error) = match response_result {
+                        Ok(v) => (Some(v), None),
+                        Err(e) => (None, Some(e)),
+                    };
                     assert!(error.is_none(), "{error:?}");
                     return serde_json::from_value(result.unwrap_or_default()).unwrap();
                 }

@@ -11,6 +11,13 @@
 //! canonical field/type/table ordering) and plain RFC 8949 — any
 //! off-the-shelf CBOR reader can walk it.
 
+// Wire integers are 64-bit and `usize` is not: a payload read on a
+// 32-bit target (the wasm hosts) must refuse an out-of-range index
+// rather than wrap into a different one. Every narrowing cast in the
+// crate is therefore either a checked conversion or carries its own
+// justification.
+#![warn(clippy::cast_possible_truncation)]
+
 mod canonical;
 mod cbor;
 mod decode;
@@ -33,9 +40,10 @@ pub use delta::{
 };
 pub use describe::describe;
 pub use encode::{
-    FLAG_ELIDE_IDS, FLAG_FULL_FORM, FLAG_IMPLIED_OWNERS, FLAG_UNIT_PATHS, to_compact_cbor,
-    to_compact_cbor_elided, to_compact_cbor_elided_with_units, to_compact_cbor_with_units,
-    to_full_cbor, to_full_cbor_with_units,
+    FLAG_ELIDE_IDS, FLAG_EXPLICIT_IDS, FLAG_FULL_FORM, FLAG_IMPLIED_OWNERS, FLAG_UNIT_PATHS,
+    to_compact_cbor, to_compact_cbor_elided, to_compact_cbor_elided_with_units,
+    to_compact_cbor_with_units, to_compact_cbor_with_units_explicit, to_full_cbor,
+    to_full_cbor_with_units,
 };
 pub use sysmlv2_model::cbor_tables as tables;
 
@@ -69,49 +77,103 @@ pub const ID_SCHEME_VERSION: u8 = 1;
 pub(crate) fn strip_magic(bytes: &[u8]) -> Result<&[u8], Error> {
     match bytes.strip_prefix(MAGIC) {
         Some(rest) => Ok(rest),
-        None => Err(Error::new(
+        None => Err(Error::of(
+            ErrorKind::MissingMagic,
             "not an s2c payload (missing the RFC 9277 magic — tag 55799 \
              wrapping tag 0x24533243, \"$S2C\")",
         )),
     }
 }
 
+/// What a codec error *is*, for callers that act on the classes
+/// differently — refetch a base, fetch a resolver, route to another
+/// entry point, or give up on the bytes. The [`fmt::Display`] text
+/// stays the explanation; this is the decision.
+///
+/// Non-exhaustive: later wire generations will distinguish more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// The bytes do not open with the payload magic — not an s2c
+    /// payload at all.
+    MissingMagic,
+    /// A version axis (wire layout, generated tables, id-derivation
+    /// scheme, base-index or resolver artifact) this build does not
+    /// implement.
+    UnsupportedVersion,
+    /// An id-elided payload reached an entry point that carries no
+    /// name resolver.
+    NeedsResolver,
+    /// A well-formed payload of the wrong kind for this entry point
+    /// (a delta to a snapshot decoder, a full form to the compact
+    /// one, and so on) — the message names the one to use.
+    WrongForm,
+    /// The held base is not the one the delta names.
+    BaseDigestMismatch,
+    /// The payload ends inside an item.
+    Truncated,
+    /// Anything else refused on the way in or out: a structure the
+    /// wire format does not allow, or a `Value` outside the compact
+    /// interchange shape.
+    Malformed,
+}
+
 /// Codec error: malformed input on decode, or a `Value` outside the
-/// compact interchange shape on encode.
+/// compact interchange shape on encode. [`Error::kind`] classifies it;
+/// the [`fmt::Display`] text explains it.
 #[derive(Debug)]
-pub struct Error(String);
+pub struct Error {
+    kind: ErrorKind,
+    message: String,
+}
 
 impl Error {
-    fn new(msg: impl Into<String>) -> Self {
-        Self(msg.into())
+    fn new(message: impl Into<String>) -> Self {
+        Self::of(ErrorKind::Malformed, message)
+    }
+
+    fn of(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The class this error falls in.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for Error {}
 
 /// Wire type code for a metaclass name, if it is a concrete metaclass.
+#[must_use]
 pub fn type_code(name: &str) -> Option<u16> {
     tables::METACLASS_FIELDS
         .binary_search_by(|(n, _)| n.cmp(&name))
         .ok()
-        .map(|i| i as u16)
+        .and_then(|i| u16::try_from(i).ok())
 }
 
 /// Field table for a wire type code.
+#[must_use]
 pub fn fields_of(code: u16) -> Option<&'static [tables::CborField]> {
     tables::METACLASS_FIELDS.get(code as usize).map(|(_, f)| *f)
 }
 
 /// Wire ordinal of `prop` within a field table.
+#[must_use]
 pub fn ordinal(fields: &'static [tables::CborField], prop: &str) -> Option<u8> {
     fields
         .binary_search_by(|(n, _, _, _)| n.cmp(&prop))
         .ok()
-        .map(|i| i as u8)
+        .and_then(|i| u8::try_from(i).ok())
 }

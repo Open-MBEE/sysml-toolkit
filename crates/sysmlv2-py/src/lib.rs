@@ -4,24 +4,124 @@
 //! Rust session, so the workspace gates (round-trip, semantic identity,
 //! splice minimality) apply identically.
 //!
-//! Handle discipline: [`Element`] and [`Reference`] handles are minted
+//! Handle discipline: `Element` and `Reference` handles are minted
 //! against one committed state of a session (a *generation*). A
 //! successful commit bumps the generation and invalidates outstanding
 //! handles — using one afterwards raises `ValueError` instead of
 //! silently denoting the wrong element.
+//!
+//! Thread discipline: every call parses on the interpreter's own thread,
+//! which this binding does not create and cannot resize. The parser
+//! bounds how deeply input may nest, and that bound assumes a stack of
+//! `sysmlv2_parser::parser::MAX_NESTING_STACK_BYTES`; below it, input
+//! the parser accepts overflows the stack, which ends the interpreter
+//! outright rather than raising. The toolkit's own entry points reserve
+//! that stack for themselves; a caller who may open deeply nested
+//! sources does the same by raising `threading.stack_size` and calling
+//! from a thread of its own (`SDK.md` shows it).
 
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple, PyType};
 
 use sysmlv2_model::eval::Value as EvalValue;
 use sysmlv2_model::json::{ElementRef, RefSite};
 use sysmlv2_syntax::parser::parse_expression;
-use sysmlv2_transform::{Session as TSession, TransformError};
+use sysmlv2_transform::Session as TSession;
+
+pyo3::create_exception!(
+    sysmlv2,
+    Error,
+    PyException,
+    "Base class of every exception this package raises, so `except sysmlv2.Error` catches all of them and nothing else."
+);
+
+/// Build a subclass of [`Error`] that also derives from one of the
+/// interpreter's own exceptions, so a caller's existing `except` clause
+/// keeps working while `except sysmlv2.Error` starts to. Two bases are
+/// what a class statement expresses and what the type constructor takes;
+/// a statically declared exception carries only one, which is why these
+/// are built here rather than declared.
+fn derived_class<'py>(
+    py: Python<'py>,
+    name: &str,
+    builtin: &Bound<'py, PyType>,
+    doc: &str,
+) -> PyResult<Py<PyType>> {
+    let namespace = PyDict::new(py);
+    namespace.set_item("__module__", "sysmlv2")?;
+    namespace.set_item("__doc__", doc)?;
+    let bases = PyTuple::new(py, [py.get_type::<Error>(), builtin.clone()])?;
+    Ok(py
+        .get_type::<PyType>()
+        .call1((name, bases, namespace))?
+        .cast_into::<PyType>()?
+        .unbind())
+}
+
+/// `sysmlv2.RefusedError`, built on first use: a refusal is recognizable
+/// as this package's and is still caught by the `except ValueError` the
+/// binding has always documented.
+static REFUSED: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn refused_class(py: Python<'_>) -> PyResult<Bound<'_, PyType>> {
+    let cls = REFUSED.get_or_try_init(py, || {
+        derived_class(
+            py,
+            "RefusedError",
+            &py.get_type::<PyValueError>(),
+            "The toolkit declined the operation: an argument it cannot use, \
+             a handle minted against a superseded session state, or an edit \
+             whose commit would change what an untouched reference denotes.",
+        )
+    })?;
+    Ok(cls.bind(py).clone())
+}
+
+/// `sysmlv2.FailedError`, built on first use. Operations that could not
+/// be carried out raised `RuntimeError` before this package had an
+/// exception of its own, so that base is kept: `except RuntimeError`
+/// around a session call still catches what it used to.
+static FAILED: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn failed_class(py: Python<'_>) -> PyResult<Bound<'_, PyType>> {
+    let cls = FAILED.get_or_try_init(py, || {
+        derived_class(
+            py,
+            "FailedError",
+            &py.get_type::<PyRuntimeError>(),
+            "The toolkit could not carry the operation out: a source it \
+             could not read, a model it could not build, or an expression \
+             it could not evaluate.",
+        )
+    })?;
+    Ok(cls.bind(py).clone())
+}
+
+/// The toolkit declined the request: `sysmlv2.RefusedError`.
+fn refused<E: std::fmt::Display>(e: E) -> PyErr {
+    let message = e.to_string();
+    Python::attach(|py| match refused_class(py) {
+        Ok(cls) => PyErr::from_type(cls, message),
+        // The class could not be built, which is itself the failure.
+        Err(err) => err,
+    })
+}
+
+/// The toolkit could not carry the request out: `sysmlv2.FailedError`.
+fn failed<E: std::fmt::Display>(e: E) -> PyErr {
+    let message = e.to_string();
+    Python::attach(|py| match failed_class(py) {
+        Ok(cls) => PyErr::from_type(cls, message),
+        // The class could not be built, which is itself the failure.
+        Err(err) => err,
+    })
+}
 
 /// An opaque handle to one element of a session's resolved model.
-#[pyclass(frozen)]
+#[pyclass(frozen, from_py_object)]
 #[derive(Clone)]
 struct Element {
     e: ElementRef,
@@ -47,8 +147,70 @@ impl Element {
     }
 }
 
+/// A derived-property target outside the model (see `Session.derived`):
+/// an element of an unloaded library or a foreign payload by its
+/// interchange id, or a reference that never resolved by its spelling.
+#[pyclass(frozen, get_all, from_py_object)]
+#[derive(Clone)]
+struct OutsideReference {
+    id: Option<String>,
+    spelling: Option<String>,
+}
+
+#[pymethods]
+impl OutsideReference {
+    fn __repr__(&self) -> String {
+        match (&self.id, &self.spelling) {
+            (Some(id), _) => format!("<OutsideReference id={id}>"),
+            (None, Some(s)) => format!("<OutsideReference unresolved={s:?}>"),
+            _ => "<OutsideReference>".to_string(),
+        }
+    }
+}
+
+fn fidelity_name(f: sysmlv2_model::json::Derives) -> &'static str {
+    use sysmlv2_model::json::Derives;
+    match f {
+        Derives::NotDeclared => "not-declared",
+        Derives::NotComputed => "not-computed",
+        Derives::Passthrough => "passthrough",
+        Derives::Exact => "exact",
+    }
+}
+
+fn closure_policy_name(p: sysmlv2_model::json::ClosurePolicy) -> &'static str {
+    use sysmlv2_model::json::ClosurePolicy;
+    match p {
+        ClosurePolicy::Passthrough => "passthrough",
+        ClosurePolicy::Closure {
+            include_implied: false,
+        } => "closure",
+        ClosurePolicy::Closure {
+            include_implied: true,
+        } => "closure-implied",
+    }
+}
+
+fn parse_closure_policy(name: &str) -> PyResult<sysmlv2_model::json::ClosurePolicy> {
+    use sysmlv2_model::json::ClosurePolicy;
+    Ok(match name {
+        "passthrough" => ClosurePolicy::Passthrough,
+        "closure" => ClosurePolicy::Closure {
+            include_implied: false,
+        },
+        "closure-implied" => ClosurePolicy::Closure {
+            include_implied: true,
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown closure policy {other:?}: passthrough, closure or closure-implied"
+            )));
+        }
+    })
+}
+
 /// One resolved reference site (see `Session.references`).
-#[pyclass(frozen)]
+#[pyclass(frozen, from_py_object)]
 #[derive(Clone)]
 struct Reference {
     site: RefSite,
@@ -216,7 +378,7 @@ impl EditBatch {
 impl EditBatch {
     fn guard(&self, gen: u64) -> PyResult<()> {
         if gen != self.gen {
-            return Err(PyValueError::new_err(
+            return Err(refused(
                 "stale handle: it belongs to a different session state",
             ));
         }
@@ -235,10 +397,6 @@ struct Session {
     gen: u64,
 }
 
-fn runtime<E: std::fmt::Display>(e: E) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
-}
-
 impl Session {
     fn mint(&self, e: ElementRef) -> Element {
         Element { e, gen: self.gen }
@@ -246,7 +404,7 @@ impl Session {
 
     fn guard(&self, gen: u64) -> PyResult<()> {
         if gen != self.gen {
-            return Err(PyValueError::new_err(
+            return Err(refused(
                 "stale handle: the session was edited since it was minted \
                  (re-resolve after commit)",
             ));
@@ -254,13 +412,26 @@ impl Session {
         Ok(())
     }
 
-    fn value_to_py(&self, py: Python<'_>, v: &EvalValue) -> PyResult<PyObject> {
+    fn value_to_py(&self, py: Python<'_>, v: &EvalValue) -> PyResult<Py<PyAny>> {
         match v {
             EvalValue::Boolean(b) => b.into_py_any(py),
             EvalValue::Integer(i) => i.into_py_any(py),
-            EvalValue::Rational(f) => f.into_py_any(py),
+            // Exact numbers stay exact: integers beyond the machine
+            // range as `int`, other rationals as `fractions.Fraction`.
+            EvalValue::Rational(r) => {
+                let (n, d) = r.to_string_parts();
+                let int = py.import("builtins")?.getattr("int")?;
+                let n = int.call1((n,))?;
+                if r.is_integer() {
+                    return Ok(n.unbind());
+                }
+                let d = int.call1((d,))?;
+                let fraction = py.import("fractions")?.getattr("Fraction")?;
+                Ok(fraction.call1((n, d))?.unbind())
+            }
+            EvalValue::Real(f) => f.into_py_any(py),
             EvalValue::String(s) => s.into_py_any(py),
-            EvalValue::Element(e) | EvalValue::Unbound(e) => {
+            EvalValue::Element(e) | EvalValue::Unbound(e) | EvalValue::UnboundMember(e) => {
                 Ok(Py::new(py, self.mint(*e))?.into_any())
             }
             // An indeterminate result (an operation over an unbound
@@ -300,7 +471,7 @@ impl Session {
         let paths: Vec<std::path::PathBuf> =
             paths.into_iter().map(std::path::PathBuf::from).collect();
         Ok(Session {
-            inner: TSession::open(&paths).map_err(runtime)?,
+            inner: TSession::open(&paths).map_err(failed)?,
             gen: 0,
         })
     }
@@ -309,7 +480,7 @@ impl Session {
     #[staticmethod]
     fn from_sources(sources: Vec<(String, String)>) -> PyResult<Session> {
         Ok(Session {
-            inner: TSession::from_sources(sources).map_err(runtime)?,
+            inner: TSession::from_sources(sources).map_err(failed)?,
             gen: 0,
         })
     }
@@ -323,13 +494,13 @@ impl Session {
     #[pyo3(signature = (json, lib = None))]
     fn from_interchange_json(json: &str, lib: Option<&str>) -> PyResult<Session> {
         let value: serde_json::Value =
-            serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            serde_json::from_str(json).map_err(|e| refused(e.to_string()))?;
         Ok(Session {
             inner: TSession::from_interchange_json_with_library(
                 &value,
                 lib.map(std::path::Path::new),
             )
-            .map_err(runtime)?,
+            .map_err(failed)?,
             gen: 0,
         })
     }
@@ -341,7 +512,7 @@ impl Session {
     fn from_compact_cbor(data: &[u8], lib: Option<&str>) -> PyResult<Session> {
         Ok(Session {
             inner: TSession::from_compact_cbor_with_library(data, lib.map(std::path::Path::new))
-                .map_err(runtime)?,
+                .map_err(failed)?,
             gen: 0,
         })
     }
@@ -351,7 +522,7 @@ impl Session {
     fn load_library(&mut self, dir: &str) -> PyResult<()> {
         self.inner
             .load_library(std::path::Path::new(dir))
-            .map_err(runtime)?;
+            .map_err(failed)?;
         self.gen += 1;
         Ok(())
     }
@@ -368,7 +539,7 @@ impl Session {
     /// Evaluate an ad-hoc KerML query expression at the root namespace
     /// (closed-world `istype`, `ownedMember(x)` / `ownedFeature(x)`
     /// reflection — the `sysmlv2 query` semantics).
-    fn query(&mut self, py: Python<'_>, expr: &str) -> PyResult<PyObject> {
+    fn query(&mut self, py: Python<'_>, expr: &str) -> PyResult<Py<PyAny>> {
         let parsed = parse_expression(expr);
         let Some(ast) = parsed.expr else {
             let msg = parsed
@@ -376,29 +547,153 @@ impl Session {
                 .first()
                 .map(|d| d.message.clone())
                 .unwrap_or_else(|| "not an expression".into());
-            return Err(PyValueError::new_err(msg));
+            return Err(refused(msg));
         };
         let root = self.inner.resolved().root_scope();
-        let value = self.inner.resolved().query(root, &ast).map_err(runtime)?;
+        let value = self.inner.resolved().query(root, &ast).map_err(failed)?;
         self.value_to_py(py, &value)
     }
 
     /// Evaluate `e`'s bound feature value.
-    fn evaluate(&mut self, py: Python<'_>, e: &Element) -> PyResult<PyObject> {
+    fn evaluate(&mut self, py: Python<'_>, e: &Element) -> PyResult<Py<PyAny>> {
         self.guard(e.gen)?;
-        let value = self.inner.resolved().evaluate(e.e).map_err(runtime)?;
+        let value = self.inner.resolved().evaluate(e.e).map_err(failed)?;
         self.value_to_py(py, &value)
+    }
+
+    // ---- derived properties (the spec-name read API) ----
+
+    /// The derived property `name` of `e`, by its specification name
+    /// (`"ownedFeature"`, `"owningNamespace"`, `"name"`, …): `None` for a
+    /// null single value, a `bool` or `str`, an `Element`, a `list` of
+    /// elements or of strings; a target outside the model comes back as
+    /// an `OutsideReference` (its id, or the spelling that never
+    /// resolved). Raises `KeyError` when the element's metaclass does
+    /// not declare the property as derived (an owned property is read
+    /// with the property accessors) and `NotImplementedError` when the
+    /// toolkit does not compute it yet; `derives` tells in advance.
+    fn derived(&mut self, py: Python<'_>, e: &Element, name: &str) -> PyResult<Py<PyAny>> {
+        use sysmlv2_model::json::{Derived, DerivedValue, Reference};
+        self.guard(e.gen)?;
+        let reference = |this: &Self, py: Python<'_>, r: Reference| -> PyResult<Py<PyAny>> {
+            match r {
+                Reference::Element(x) => Ok(Py::new(py, this.mint(x))?.into_any()),
+                Reference::External(id) => Ok(Py::new(
+                    py,
+                    OutsideReference {
+                        id: Some(id.to_string()),
+                        spelling: None,
+                    },
+                )?
+                .into_any()),
+                Reference::Unresolved(spelling) => Ok(Py::new(
+                    py,
+                    OutsideReference {
+                        id: None,
+                        spelling: Some(spelling),
+                    },
+                )?
+                .into_any()),
+                _ => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "unsupported reference shape from a newer toolkit",
+                )),
+            }
+        };
+        match self.inner.resolved().derived(e.e, name) {
+            Derived::NotDeclared => Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "{name} is not a derived property of {}",
+                self.inner.resolved().element_type(e.e)
+            ))),
+            Derived::NotComputed => Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "{name} is not computed by this toolkit yet"
+            ))),
+            Derived::Value(v) => match v {
+                DerivedValue::Null => Ok(py.None()),
+                DerivedValue::Bool(b) => b.into_py_any(py),
+                DerivedValue::Str(s) => s.into_py_any(py),
+                DerivedValue::Strings(ss) => ss.into_py_any(py),
+                DerivedValue::Element(x) => Ok(Py::new(py, self.mint(x))?.into_any()),
+                DerivedValue::Elements(xs) => {
+                    let items: Vec<Element> = xs.into_iter().map(|x| self.mint(x)).collect();
+                    items.into_py_any(py)
+                }
+                DerivedValue::Reference(r) => reference(self, py, r),
+                DerivedValue::References(rs) => {
+                    let mut items: Vec<Py<PyAny>> = Vec::with_capacity(rs.len());
+                    for r in rs {
+                        items.push(reference(self, py, r)?);
+                    }
+                    items.into_py_any(py)
+                }
+                _ => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "unsupported derived value shape from a newer toolkit",
+                )),
+            },
+        }
+    }
+
+    /// What `derived` answers for `name` on elements of `metaclass`,
+    /// decided without a model: `"not-declared"`, `"not-computed"`,
+    /// `"passthrough"` (the owned side of an inheritance-aware property
+    /// until the closure policy is on) or `"exact"`.
+    #[staticmethod]
+    fn derives(metaclass: &str, name: &str) -> &'static str {
+        fidelity_name(sysmlv2_model::json::derives(metaclass, name))
+    }
+
+    /// Whether the abstract syntax owns `name` on `metaclass` (an owned
+    /// property is read with the property accessors, never with
+    /// `derived`).
+    #[staticmethod]
+    fn is_owned_property(metaclass: &str, name: &str) -> bool {
+        sysmlv2_model::json::is_owned_property(metaclass, name)
+    }
+
+    /// Every derived property name `derived` can answer on some
+    /// metaclass.
+    #[staticmethod]
+    fn computed_names() -> Vec<&'static str> {
+        sysmlv2_model::json::computed_names().collect()
+    }
+
+    /// The closure policy `derived` answers under: `"passthrough"` (the
+    /// default — the owned side of the inheritance-aware properties),
+    /// `"closure"` (their specification definition over the inherited and
+    /// imported memberships) or `"closure-implied"` (the same, with the
+    /// implied library heritage).
+    fn closure_policy(&mut self) -> &'static str {
+        closure_policy_name(self.inner.resolved().closure_policy())
+    }
+
+    /// Set the closure policy (see `closure_policy`).
+    fn set_closure_policy(&mut self, policy: &str) -> PyResult<()> {
+        let policy = parse_closure_policy(policy)?;
+        self.inner.resolved().set_closure_policy(policy);
+        Ok(())
     }
 
     // ---- navigation ----
 
-    /// The element's qualified name (None for anonymous elements).
+    /// The element's qualified name (None for anonymous elements): the
+    /// specification's derivation, in which a reserved word used as a
+    /// name stays bare (`part::view`). A model property, not source
+    /// text — splice `reference_spelling` into generated text instead.
     fn qualified_name(&mut self, e: &Element) -> PyResult<Option<String>> {
         self.guard(e.gen)?;
         Ok(self.inner.resolved().element_qualified_name(e.e))
     }
 
-    /// The element's declared name.
+    /// The element's qualified name spelled as reference text that
+    /// re-parses in either dialect: reserved words and non-basic names
+    /// quoted (`'part'::'view'` where `qualified_name` is `part::view`).
+    /// None for anonymous elements.
+    fn reference_spelling(&mut self, e: &Element) -> PyResult<Option<String>> {
+        self.guard(e.gen)?;
+        Ok(self.inner.resolved().element_reference_spelling(e.e))
+    }
+
+    /// The element's declared name; the specification's `name` (an
+    /// unnamed feature named by what it redefines) is `derived(e, "name")`.
     fn name(&mut self, e: &Element) -> PyResult<Option<String>> {
         self.guard(e.gen)?;
         Ok(self.inner.resolved().element_name(e.e).map(str::to_string))
@@ -560,7 +855,7 @@ impl Session {
     /// qualified name: `[(input id, session id)]`.
     fn id_map_from(&mut self, json: &str) -> PyResult<Vec<(String, String)>> {
         let value: serde_json::Value =
-            serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            serde_json::from_str(json).map_err(|e| refused(e.to_string()))?;
         Ok(self
             .inner
             .id_map_from(&value)
@@ -579,10 +874,7 @@ impl Session {
     /// counts. When anything was respelled the session rebuilt:
     /// outstanding handles go stale.
     fn minimize_qualifications(&mut self) -> PyResult<(usize, usize)> {
-        let report = self
-            .inner
-            .minimize_qualifications()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let report = self.inner.minimize_qualifications().map_err(refused)?;
         if report.respelled > 0 {
             self.gen += 1;
         }
@@ -605,6 +897,34 @@ impl Session {
         let ops = std::mem::take(&mut batch.ops);
         // Consumed: a batch cannot be committed twice.
         batch.gen = u64::MAX;
+        // A library unit's text is not part of the session, so an op
+        // that would have to splice one is refused by name here, before
+        // the splice planner reaches for source it does not hold.
+        for op in &ops {
+            let read_only = match op {
+                Op::Rename(e, _)
+                | Op::SetFeatureValue(e, _)
+                | Op::InsertMember(e, _)
+                | Op::Remove(e)
+                | Op::ExtractDefinition(e, _)
+                | Op::InlineDefinition(e) => self
+                    .inner
+                    .resolved()
+                    .is_library_element(*e)
+                    .then(|| self.inner.resolved().element_qualified_name(*e)),
+                // `retarget` rewrites the site, not what the site will
+                // denote: a library element is a legitimate new target.
+                Op::Retarget(site, _) => (self.inner.source(site.unit).is_none())
+                    .then(|| self.inner.resolved().element_qualified_name(site.target)),
+                Op::InsertTopLevel(..) => None,
+            };
+            if let Some(name) = read_only {
+                return Err(refused(format!(
+                    "library elements are read-only: {}",
+                    name.as_deref().unwrap_or("an anonymous element")
+                )));
+            }
+        }
         let mut builder = self.inner.edit();
         for op in &ops {
             match op {
@@ -634,16 +954,9 @@ impl Session {
                 }
             }
         }
-        let report = builder.commit().map_err(|e| match e {
-            TransformError::InvalidName(_)
-            | TransformError::InvalidExpression { .. }
-            | TransformError::InvalidMember { .. }
-            | TransformError::UnknownUnit(_)
-            | TransformError::ExtractIneligible { .. }
-            | TransformError::InlineIneligible { .. }
-            | TransformError::NameTaken { .. } => PyValueError::new_err(e.to_string()),
-            other => PyRuntimeError::new_err(other.to_string()),
-        })?;
+        // Every way a commit can fail is a refusal: the batch was
+        // rejected at plan time or rolled back at verification.
+        let report = builder.commit().map_err(refused)?;
         self.gen += 1;
         Ok(CommitReport {
             id_map: report
@@ -710,7 +1023,7 @@ impl Session {
             "case" => sysmlv2_viz::View::Case,
             "mixed" => sysmlv2_viz::View::Mixed,
             other => {
-                return Err(PyValueError::new_err(format!(
+                return Err(refused(format!(
                     "unknown view: {other} (expected tree, interconnection, state, action, sequence, case, or mixed)"
                 )));
             }
@@ -720,7 +1033,7 @@ impl Session {
             Some("polyline") => sysmlv2_viz::LineStyle::Polyline,
             Some("ortho") => sysmlv2_viz::LineStyle::Ortho,
             Some(other) => {
-                return Err(PyValueError::new_err(format!(
+                return Err(refused(format!(
                     "unknown line style: {other} (expected polyline or ortho)"
                 )));
             }
@@ -730,28 +1043,26 @@ impl Session {
                 self.inner
                     .resolved()
                     .resolve_qualified(name)
-                    .ok_or_else(|| PyValueError::new_err(format!("element not found: {name}")))?,
+                    .ok_or_else(|| refused(format!("element not found: {name}")))?,
             ),
             None => None,
         };
-        let opts = sysmlv2_viz::VizOptions {
-            direction: if horizontal {
+        let opts = sysmlv2_viz::VizOptions::default()
+            .with_direction(if horizontal {
                 sysmlv2_viz::Direction::LeftToRight
             } else {
                 sysmlv2_viz::Direction::TopToBottom
-            },
-            show_values,
-            view,
-            show_notes,
-            show_metadata,
-            show_inherited,
-            show_lib,
-            show_imported,
-            line_style,
-            std_color,
-            link_template,
-            roots: None,
-        };
+            })
+            .with_show_values(show_values)
+            .with_view(view)
+            .with_show_notes(show_notes)
+            .with_show_metadata(show_metadata)
+            .with_show_inherited(show_inherited)
+            .with_show_lib(show_lib)
+            .with_show_imported(show_imported)
+            .with_line_style(line_style)
+            .with_std_color(std_color)
+            .with_link_template(link_template);
         Ok(sysmlv2_viz::plantuml(self.inner.resolved(), root, &opts))
     }
 
@@ -768,6 +1079,11 @@ struct Finding {
     /// `"error"` or `"warning"`.
     #[pyo3(get)]
     severity: String,
+    /// `"parse"`, `"context"`, `"referential"` or `"semantic"`: the
+    /// pipeline stage that produced the finding. Only `"parse"` findings
+    /// keep a unit out of a session.
+    #[pyo3(get)]
+    stage: String,
     #[pyo3(get)]
     message: String,
     /// Unit name of the source the finding is in (as passed to `check`).
@@ -798,11 +1114,22 @@ impl Finding {
 /// Model problems come back as [`Finding`]s — a broken parse is a
 /// finding, not an exception. Exceptions are reserved for operational
 /// failures (unreadable library directory).
+///
+/// The inputs are owned, so the check itself runs with the interpreter
+/// released: a library-backed check takes seconds, and other threads
+/// keep running for the whole of it.
+// Owned: borrowed arguments cannot cross into a released interpreter.
+#[allow(clippy::needless_pass_by_value)]
 #[pyfunction]
 #[pyo3(signature = (sources, lib = None))]
-fn check(sources: Vec<(String, String)>, lib: Option<&str>) -> PyResult<Vec<Finding>> {
-    let findings = sysmlv2_transform::check_sources(&sources, lib.map(std::path::Path::new))
-        .map_err(runtime)?;
+fn check(
+    py: Python<'_>,
+    sources: Vec<(String, String)>,
+    lib: Option<std::path::PathBuf>,
+) -> PyResult<Vec<Finding>> {
+    let findings = py
+        .detach(|| sysmlv2_transform::check_sources(&sources, lib.as_deref()))
+        .map_err(failed)?;
     Ok(findings
         .into_iter()
         .map(|f| Finding {
@@ -810,6 +1137,7 @@ fn check(sources: Vec<(String, String)>, lib: Option<&str>) -> PyResult<Vec<Find
                 sysmlv2_transform::Severity::Error => "error".to_string(),
                 sysmlv2_transform::Severity::Warning => "warning".to_string(),
             },
+            stage: f.stage.as_str().to_string(),
             message: f.message,
             unit: f.unit,
             line: f.line,
@@ -875,7 +1203,7 @@ impl LspServer {
     /// them) — relay them exactly like `handle`'s output.
     fn set_workspace(&mut self, units: Vec<(String, String)>) -> PyResult<Vec<String>> {
         self.inner.set_workspace_sources(units);
-        self.inner.take_outbound().map_err(runtime)
+        self.inner.take_outbound().map_err(failed)
     }
 
     /// Handle one JSON-RPC message string (a request or a
@@ -883,7 +1211,7 @@ impl LspServer {
     /// in order, each a JSON-RPC string. The first message of a
     /// session must be an `initialize` request.
     fn handle(&mut self, msg: &str) -> PyResult<Vec<String>> {
-        self.inner.handle(msg).map_err(runtime)
+        self.inner.handle(msg).map_err(failed)
     }
 
     /// Drop cached navigation sessions after a host-side engine
@@ -892,7 +1220,7 @@ impl LspServer {
     /// refresh requests to relay, like `set_workspace`.
     fn invalidate_sessions(&mut self) -> PyResult<Vec<String>> {
         self.inner.invalidate_sessions();
-        self.inner.take_outbound().map_err(runtime)
+        self.inner.take_outbound().map_err(failed)
     }
 
     /// Set whether evaluated-value inlay hints that restate the
@@ -900,7 +1228,7 @@ impl LspServer {
     /// Returns the refresh requests to relay, like `set_workspace`.
     fn set_hide_redundant_value_hints(&mut self, on: bool) -> PyResult<Vec<String>> {
         self.inner.set_hide_redundant_value_hints(on);
-        self.inner.take_outbound().map_err(runtime)
+        self.inner.take_outbound().map_err(failed)
     }
 
     /// Set whether accepting a unit completion inside an untyped
@@ -923,16 +1251,29 @@ fn set_unit_spelling_expansion(on: bool) {
 /// SysML v2 / KerML toolkit: sessions over textual models or interchange
 /// JSON, KerML-expression queries, and verified span-splice
 /// transformations.
+///
+/// Every call parses on the thread that makes it, which this module
+/// neither creates nor resizes. The parser bounds how deeply a source may
+/// nest, and that bound assumes a stack large enough to descend that far;
+/// a thread that has less overflows on input the parser accepts, and a
+/// stack overflow ends the interpreter rather than raising anything
+/// catchable. Sources written by hand never come close. For
+/// machine-generated ones, raise `threading.stack_size` to 16 MiB before
+/// the thread that will parse — the tour in `SDK.md` shows it.
 #[pymodule]
 fn sysmlv2(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Session>()?;
     m.add_class::<Element>()?;
+    m.add_class::<OutsideReference>()?;
     m.add_class::<Reference>()?;
     m.add_class::<EditBatch>()?;
     m.add_class::<CommitReport>()?;
     m.add_class::<Finding>()?;
     m.add_class::<LspServer>()?;
+    m.add("Error", m.py().get_type::<Error>())?;
+    m.add("RefusedError", refused_class(m.py())?)?;
+    m.add("FailedError", failed_class(m.py())?)?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(set_unit_spelling_expansion, m)?)?;
     Ok(())

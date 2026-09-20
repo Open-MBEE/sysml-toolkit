@@ -16,11 +16,9 @@
 //! * idempotency — `format(format(x)) == format(x)`.
 
 use crate::ast::*;
-use crate::diag::Diagnostic;
-use crate::lexer::tokenize;
-use crate::parser::{parse_expression, parse_kerml_source, parse_source};
+use crate::diag::Diagnostics;
+use crate::parser::parse_expression;
 use crate::span::{LineIndex, Span};
-use crate::token::TokenKind;
 
 /// Indentation style for printed text. The canonical style (and the
 /// default everywhere) is four spaces; hosts whose files are
@@ -72,11 +70,13 @@ pub const FORMAT_CHAIN_MIN: u8 = 3;
 
 /// Print an AST as canonical textual notation (no source layout available:
 /// notes are gone — they are trivia — and members are single-spaced).
+#[must_use]
 pub fn print_source(unit: &SourceUnit) -> String {
     print_source_with(unit, Indent::default())
 }
 
 /// [`print_source`] with an explicit indentation style.
+#[must_use]
 pub fn print_source_with(unit: &SourceUnit, indent: Indent) -> String {
     print_source_opts(
         unit,
@@ -88,6 +88,7 @@ pub fn print_source_with(unit: &SourceUnit, indent: Indent) -> String {
 }
 
 /// [`print_source`] with explicit [`PrintOptions`].
+#[must_use]
 pub fn print_source_opts(unit: &SourceUnit, opts: PrintOptions) -> String {
     let mut p = Printer::new_opts(unit.dialect, None, opts);
     p.print_unit(unit);
@@ -111,13 +112,13 @@ pub fn format_expression(
     dialect: Dialect,
     indent: Indent,
     width: usize,
-) -> Result<String, Vec<Diagnostic>> {
+) -> Result<String, Diagnostics> {
     let parse = parse_expression(src);
     if !parse.diagnostics.is_empty() {
-        return Err(parse.diagnostics);
+        return Err(parse.diagnostics.into());
     }
     let Some(e) = parse.expr else {
-        return Err(Vec::new());
+        return Err(Diagnostics::default());
     };
     let mut p = Printer::new_opts(
         dialect,
@@ -138,6 +139,7 @@ pub fn format_expression(
 /// Print one expression as canonical textual notation — diagram labels,
 /// diagnostics. Bodied expressions may span lines; callers that need a
 /// single line collapse the whitespace themselves.
+#[must_use]
 pub fn print_expr_source(e: &Expr, dialect: Dialect) -> String {
     let mut p = Printer::new(dialect, None);
     p.print_expr(e, 0);
@@ -151,7 +153,7 @@ pub fn print_expr_source(e: &Expr, dialect: Dialect) -> String {
 /// Format source text: parse (with the dialect's grammar), then re-print
 /// preserving notes and single blank lines. Fails if the source has parse
 /// diagnostics — a formatter must not guess at broken input.
-pub fn format_source(src: &str, dialect: Dialect) -> Result<String, Vec<Diagnostic>> {
+pub fn format_source(src: &str, dialect: Dialect) -> Result<String, Diagnostics> {
     format_source_with(src, dialect, Indent::default())
 }
 
@@ -160,7 +162,7 @@ pub fn format_source_with(
     src: &str,
     dialect: Dialect,
     indent: Indent,
-) -> Result<String, Vec<Diagnostic>> {
+) -> Result<String, Diagnostics> {
     // The formatter (unlike the canonical serializer) breaks long
     // logical chains one condition per line by default.
     format_source_opts(
@@ -181,15 +183,12 @@ pub fn format_source_opts(
     src: &str,
     dialect: Dialect,
     opts: PrintOptions,
-) -> Result<String, Vec<Diagnostic>> {
-    let parse = match dialect {
-        Dialect::Sysml => parse_source(src),
-        Dialect::Kerml => parse_kerml_source(src),
-    };
+) -> Result<String, Diagnostics> {
+    let (parse, notes) = crate::parser::parse_with_notes(src, dialect);
     if !parse.diagnostics.is_empty() {
-        return Err(parse.diagnostics);
+        return Err(parse.diagnostics.into());
     }
-    let layout = Layout::new(src);
+    let layout = Layout::with_notes(src, notes);
     let mut p = Printer::new_opts(dialect, Some(layout), opts);
     p.print_unit(&parse.unit);
     Ok(p.finish())
@@ -203,13 +202,9 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(src: &str) -> Self {
-        let (tokens, _) = tokenize(src);
-        let notes = tokens
-            .iter()
-            .filter(|t| matches!(t.kind, TokenKind::LineNote | TokenKind::BlockNote))
-            .map(|t| (t.span, t.text(src).trim_end().to_string()))
-            .collect();
+    /// The notes come from the parse: they are the trivia the parser has
+    /// already seen, so the formatter never lexes the file a second time.
+    fn with_notes(src: &str, notes: Vec<(Span, String)>) -> Self {
         Layout {
             lines: LineIndex::new(src),
             notes,
@@ -569,8 +564,12 @@ impl Printer {
     /// (`doc`/`comment`); `rep` bodies emit raw into interchange, so
     /// reflowing them would not invert — they stay verbatim always.
     fn print_comment_body(&mut self, body: &str, reflow: bool) {
-        self.trim_trailing_space();
-        if !self.out.ends_with('\n') && !self.out.ends_with(char::is_whitespace) {
+        // Only indentation so far on this line (an anonymous `/* … */`
+        // member): keep it. Trimming here used to eat the pushed indent
+        // and flush such comments to column 0.
+        let line_start = self.out.rfind('\n').map_or(0, |i| i + 1);
+        if !self.out[line_start..].trim().is_empty() {
+            self.trim_trailing_space();
             // `comment <id>` etc. already emitted: keep the body on the line.
             self.w(" ");
         }
@@ -621,8 +620,13 @@ impl Printer {
         self.out.push('\n');
     }
 
+    /// Drop the spaces a member left at the end of the line — but never
+    /// the indentation it opened the line with, so a member that spells
+    /// little or nothing still sits where it belongs.
     fn trim_trailing_space(&mut self) {
-        while self.out.ends_with(' ') {
+        let line = self.out.rfind('\n').map_or(0, |i| i + 1);
+        let floor = self.out.len() - self.out[line..].trim_start_matches(' ').len();
+        while self.out.len() > floor && self.out.ends_with(' ') {
             self.out.pop();
         }
     }
@@ -1002,7 +1006,7 @@ impl Printer {
                     self.w(" requirement ");
                     self.print_feature_declaration(&u.declaration);
                 }
-                self.print_value(&u.value);
+                self.print_value(u.value.as_deref());
                 if let Some(by) = by {
                     self.w(" by ");
                     self.print_target(by);
@@ -1023,7 +1027,7 @@ impl Printer {
                     self.w("constraint ");
                     self.print_feature_declaration(&u.declaration);
                 }
-                self.print_value(&u.value);
+                self.print_value(u.value.as_deref());
                 self.trim_trailing_space();
                 self.print_body(&u.body, span);
             }
@@ -1192,9 +1196,9 @@ impl Printer {
                 } else {
                     ("allocation", "allocate")
                 };
-                let bare = !Self::decl_present(&u.declaration)
-                    && u.value.is_none()
-                    && matches!(u.detail, UsageDetail::Connector { .. });
+                let ends = Self::connector_ends(&u.detail);
+                let clause = Self::clause_spells(ends);
+                let bare = !Self::decl_present(&u.declaration) && u.value.is_none() && clause;
                 if bare {
                     self.w(connect_kw);
                     self.w(" ");
@@ -1203,8 +1207,8 @@ impl Printer {
                     self.w(kw);
                     self.w(" ");
                     self.print_feature_declaration(&u.declaration);
-                    self.print_value(&u.value);
-                    if matches!(u.detail, UsageDetail::Connector { .. }) {
+                    self.print_value(u.value.as_deref());
+                    if clause {
                         self.w(" ");
                         self.w(connect_kw);
                         self.w(" ");
@@ -1212,50 +1216,44 @@ impl Printer {
                     }
                 }
                 self.trim_trailing_space();
-                self.print_body(&u.body, span);
+                self.print_connector_body(ends, &u.body, span);
             }
             UsageKind::Interface => {
+                let ends = Self::connector_ends(&u.detail);
                 self.w("interface ");
                 self.print_feature_declaration(&u.declaration);
-                self.print_value(&u.value);
-                if matches!(u.detail, UsageDetail::Connector { .. }) {
+                self.print_value(u.value.as_deref());
+                if Self::clause_spells(ends) {
                     if Self::decl_present(&u.declaration) {
                         self.w(" connect ");
                     }
                     self.print_connector_part(&u.detail);
                 }
                 self.trim_trailing_space();
-                self.print_body(&u.body, span);
+                self.print_connector_body(ends, &u.body, span);
             }
             UsageKind::Connector => {
+                let ends = Self::connector_ends(&u.detail);
                 self.w("connector ");
                 self.print_feature_declaration(&u.declaration);
-                self.print_value(&u.value);
-                if let UsageDetail::Connector { ends } = &u.detail {
-                    if ends.len() == 2 {
-                        self.w(" from ");
-                        self.print_connector_end(&ends[0]);
-                        self.w(" to ");
-                        self.print_connector_end(&ends[1]);
-                    } else {
-                        self.w(" (");
-                        for (i, e) in ends.iter().enumerate() {
-                            if i > 0 {
-                                self.w(", ");
-                            }
-                            self.print_connector_end(e);
-                        }
-                        self.w(")");
-                    }
+                self.print_value(u.value.as_deref());
+                if ends.len() == 2 {
+                    self.w(" from ");
+                    self.print_connector_end(&ends[0]);
+                    self.w(" to ");
+                    self.print_connector_end(&ends[1]);
+                } else if Self::clause_spells(ends) {
+                    self.w(" ");
+                    self.print_connector_ends(ends);
                 }
                 self.trim_trailing_space();
-                self.print_body(&u.body, span);
+                self.print_connector_body(ends, &u.body, span);
             }
             UsageKind::Flow | UsageKind::Message | UsageKind::SuccessionFlow => {
                 self.w(self.usage_keyword(u.kind).unwrap());
                 self.w(" ");
                 self.print_feature_declaration(&u.declaration);
-                self.print_value(&u.value);
+                self.print_value(u.value.as_deref());
                 if let UsageDetail::Flow {
                     payload,
                     source,
@@ -1356,7 +1354,7 @@ impl Printer {
             self.w(" ");
             self.print_feature_declaration(&u.declaration);
         }
-        self.print_value(&u.value);
+        self.print_value(u.value.as_deref());
         if u.is_parallel {
             self.w(" parallel");
         }
@@ -1402,14 +1400,14 @@ impl Printer {
             }
             self.print_feature_declaration(&u.declaration);
         }
-        self.print_value(&u.value);
+        self.print_value(u.value.as_deref());
         self.trim_trailing_space();
         self.print_body(&u.body, span);
     }
 
     fn print_declaration_value_body(&mut self, u: &Usage, span: Span) {
         self.print_feature_declaration(&u.declaration);
-        self.print_value(&u.value);
+        self.print_value(u.value.as_deref());
         if u.is_parallel {
             self.w(" parallel");
         }
@@ -1427,9 +1425,7 @@ impl Printer {
         let has_decl = Self::decl_present(&u.declaration);
         // A source end with no target and no name is textually unspelled
         // (the `then [mult]? x;` target-succession shorthand).
-        let unspelled_source = |src: &ConnectorEnd| {
-            src.name.is_none() && matches!(&src.target, TargetRef::Chain(links) if links.is_empty())
-        };
+        let unspelled_source = |src: &ConnectorEnd| src.name.is_none() && src.target.is_unspelled();
         match source {
             Some(src) if !unspelled_source(src) => {
                 if has_decl || self.kerml() {
@@ -1459,33 +1455,146 @@ impl Printer {
 
     fn print_binding(&mut self, u: &Usage, span: Span) {
         let has_decl = Self::decl_present(&u.declaration);
-        if self.kerml() {
-            self.w("binding ");
-            if has_decl {
-                self.print_feature_declaration(&u.declaration);
-            }
-            if let UsageDetail::Binding { ends } = &u.detail {
+        // A binding binds exactly two ends, and that is what the parser
+        // builds; a usage assembled from a partial interchange document can
+        // carry another arity, held as a plain connector detail. Print the
+        // ends that are there instead of assuming the pair.
+        let ends = Self::connector_ends(&u.detail);
+        // The notation spells a *binding's* ends as one `a = b` pair and
+        // has no form for any other count. Printing what is there behind
+        // the binding keyword regardless would emit text that is not a
+        // binding: one end reads as a missing right side, three as a
+        // chain of two whose third end is quietly lost.
+        let pair = ends.len() == 2;
+        // Ends the head could not spell, carried into the body instead.
+        let mut ends_in_body: &[ConnectorEnd] = &[];
+        if pair {
+            if self.kerml() {
+                // KerML spells the pair behind an optional `of`, and the
+                // declaration stands without it.
+                self.w("binding ");
                 if has_decl {
+                    self.print_feature_declaration(&u.declaration);
                     self.w("of ");
                 }
-                self.print_connector_end(&ends[0]);
-                self.w(" = ");
-                self.print_connector_end(&ends[1]);
+            } else {
+                if has_decl {
+                    self.w("binding ");
+                    self.print_feature_declaration(&u.declaration);
+                }
+                self.w("bind ");
             }
         } else {
-            if has_decl {
-                self.w("binding ");
-                self.print_feature_declaration(&u.declaration);
+            // Neither dialect spells a binding that is not a pair. SysML
+            // requires the `bind` clause after its keyword (SysML.xtext
+            // `BindingConnectorAsUsage`), so a head without the clause
+            // does not parse at all; KerML does take the keyword alone,
+            // but a binding connector that does not bind two features
+            // draws a finding, so the text would parse and not check.
+            //
+            // What the member can keep is everything but the binding. Its
+            // declaration prints as a usage without the keyword, and every
+            // end prints as an `end ::> …;` body member — the form the
+            // notation gives a connector end that is written out rather
+            // than listed in a clause. That spelling parses, draws no
+            // finding, and re-lifts each end as an end membership at any
+            // count. What is lost is that the connector bound its ends
+            // rather than merely relating them.
+            //
+            // Another connector keyword would keep more of that, but none
+            // either dialect offers is both unconstrained and honest: the
+            // connection form demands an association structure as its
+            // type and refuses an ordinary one, and it spells one end not
+            // at all.
+            //
+            // KerML names a metaclass on every member, so the usage that
+            // keeps the declaration is spelled `feature` — with or without
+            // one, since a member whose whole text is a body does not
+            // parse there either. SysML takes the declaration as a head on
+            // its own and spells the keyword-less usage `ref` where there
+            // is nothing to declare.
+            //
+            // Such a usage only comes from a payload, where building it
+            // already records that its end count is not two.
+            if self.kerml() {
+                self.w("feature ");
             }
-            if let UsageDetail::Binding { ends } = &u.detail {
-                self.w("bind ");
-                self.print_connector_end(&ends[0]);
-                self.w(" = ");
-                self.print_connector_end(&ends[1]);
+            if has_decl {
+                self.print_feature_declaration(&u.declaration);
+            } else if !self.kerml() {
+                self.w("ref ");
+            }
+            ends_in_body = ends;
+        }
+        if pair {
+            for (i, end) in ends.iter().enumerate() {
+                if i > 0 {
+                    self.w(" = ");
+                }
+                self.print_connector_end(end);
             }
         }
         self.trim_trailing_space();
-        self.print_body(&u.body, span);
+        if ends_in_body.is_empty() {
+            self.print_body(&u.body, span);
+        } else {
+            self.print_end_member_body(ends_in_body, &u.body, span);
+        }
+    }
+
+    /// A body that leads with the connector's ends, each spelled as an
+    /// `end ::> …;` member, ahead of whatever members the usage carried.
+    /// The notation spells an end this way wherever a clause cannot hold
+    /// it, and the lift reads it back as an end membership.
+    fn print_end_member_body(
+        &mut self,
+        ends: &[ConnectorEnd],
+        body: &Option<Vec<Member>>,
+        span: Span,
+    ) {
+        self.w(" {\n");
+        self.depth += 1;
+        for end in ends {
+            self.push_indent();
+            self.w("end ");
+            if end.name.is_none() && end.target.is_unspelled() && end.multiplicity.is_none() {
+                // Nothing at all follows the prefix. SysML reads a member
+                // that is only its prefix; KerML wants an element after
+                // one, and `end;` stops it. Naming the metaclass the end
+                // has anyway gives both a member to read, and neither
+                // spells anything the bare form did not.
+                self.w("feature ");
+            }
+            if let Some(name) = &end.name {
+                self.print_name(name);
+                self.w(" ");
+            }
+            // An end that references no feature spells no subsetting.
+            if !end.target.is_unspelled() {
+                self.w("::> ");
+                self.print_target(&end.target);
+            }
+            if let Some(mult) = &end.multiplicity {
+                // Canonical position for a feature's multiplicity is after
+                // what it specializes; ahead of that, a `[` would open the
+                // cross feature an end may declare instead.
+                self.trim_trailing_space();
+                self.print_multiplicity(mult);
+            }
+            self.trim_trailing_space();
+            self.line_end();
+        }
+        for m in body.iter().flatten() {
+            self.print_member(m);
+        }
+        self.flush_notes(span.end);
+        self.depth -= 1;
+        self.push_indent();
+        self.w("}");
+        if let Some(layout) = &self.layout {
+            self.prev_line = Some(layout.line(span.end.saturating_sub(1)));
+        }
+        self.out.push('\n');
     }
 
     fn print_transition(&mut self, u: &Usage, span: Span) {
@@ -1600,7 +1709,7 @@ impl Printer {
                     self.w("action ");
                     self.print_feature_declaration(&u.declaration);
                 }
-                self.print_value(&u.value);
+                self.print_value(u.value.as_deref());
                 self.trim_trailing_space();
                 if terminated {
                     self.print_body(&u.body, span);
@@ -1624,6 +1733,37 @@ impl Printer {
         self.print_target(&end.target);
     }
 
+    /// The ends a usage's detail carries, if it carries any.
+    fn connector_ends(detail: &UsageDetail) -> &[ConnectorEnd] {
+        match detail {
+            UsageDetail::Binding { ends } | UsageDetail::Connector { ends } => ends,
+            _ => &[],
+        }
+    }
+
+    /// Whether the notation's end clause spells this many ends. It reads
+    /// two or more — `from a to b`, `(a, b, c)` — so a connector that an
+    /// assembled tree gave fewer has no clause, and its ends go into the
+    /// body instead.
+    fn clause_spells(ends: &[ConnectorEnd]) -> bool {
+        ends.len() >= 2
+    }
+
+    /// A connector's body: its own members, behind the ends where no
+    /// clause could spell them.
+    fn print_connector_body(
+        &mut self,
+        ends: &[ConnectorEnd],
+        body: &Option<Vec<Member>>,
+        span: Span,
+    ) {
+        if ends.is_empty() || Self::clause_spells(ends) {
+            self.print_body(body, span);
+        } else {
+            self.print_end_member_body(ends, body, span);
+        }
+    }
+
     fn print_connector_part(&mut self, detail: &UsageDetail) {
         let UsageDetail::Connector { ends } = detail else {
             return;
@@ -1633,15 +1773,21 @@ impl Printer {
             self.w(" to ");
             self.print_connector_end(&ends[1]);
         } else {
-            self.w("(");
-            for (i, e) in ends.iter().enumerate() {
-                if i > 0 {
-                    self.w(", ");
-                }
-                self.print_connector_end(e);
-            }
-            self.w(")");
+            self.print_connector_ends(ends);
         }
+    }
+
+    /// The parenthesized end list, which spells any number of ends from
+    /// two up: `(a, b, c)`.
+    fn print_connector_ends(&mut self, ends: &[ConnectorEnd]) {
+        self.w("(");
+        for (i, e) in ends.iter().enumerate() {
+            if i > 0 {
+                self.w(", ");
+            }
+            self.print_connector_end(e);
+        }
+        self.w(")");
     }
 
     fn print_payload(&mut self, p: &PayloadPart) {
@@ -1800,7 +1946,7 @@ impl Printer {
         }
     }
 
-    fn print_value(&mut self, value: &Option<FeatureValue>) {
+    fn print_value(&mut self, value: Option<&FeatureValue>) {
         if let Some(v) = value {
             self.trim_trailing_space();
             self.print_feature_value(v);
@@ -1938,18 +2084,21 @@ impl Printer {
             }
             _ => return false,
         };
-        fn flatten<'a>(e: &'a Expr, op: BinaryOp, out: &mut Vec<&'a Expr>) {
-            match &e.kind {
-                ExprKind::Binary { op: o, lhs, rhs } if *o == op => {
-                    flatten(lhs, op, out);
-                    out.push(rhs);
-                }
-                _ => out.push(e),
-            }
-        }
+        // Walk the left spine iteratively: a chain of a few hundred operands
+        // is ordinary in a generated constraint, and it is the same shape
+        // that would drive this apart one stack frame per operand.
         let mut leaves: Vec<&Expr> = Vec::new();
-        flatten(e, op, &mut leaves);
-        if (leaves.len() as u8) < min {
+        let mut cur = e;
+        while let ExprKind::Binary { op: o, lhs, rhs } = &cur.kind {
+            if *o != op {
+                break;
+            }
+            leaves.push(rhs);
+            cur = lhs;
+        }
+        leaves.push(cur);
+        leaves.reverse();
+        if leaves.len() < usize::from(min) {
             return false;
         }
         let (text, prec, _) = binary_op_info(op);
@@ -2376,6 +2525,7 @@ fn expr_prec(e: &Expr) -> u8 {
 /// indented text nests with a tab, anything else with the canonical
 /// four spaces. A depth-0 owner has no indentation of its own to
 /// read, so the unit text decides.
+#[must_use]
 pub fn indent_unit(indent: &str, src: &str) -> &'static str {
     let tabs = if indent.is_empty() {
         src.lines().any(|l| l.starts_with('\t'))
@@ -2397,6 +2547,7 @@ pub fn indent_unit(indent: &str, src: &str) -> &'static str {
 /// This is both how the edit planner spells inserted members and how
 /// integrity checks reproduce that spelling — keep the two in one
 /// place.
+#[must_use]
 pub fn reindent_member_text(text: &str, base: &str, unit: &str) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     if lines.len() <= 1 {

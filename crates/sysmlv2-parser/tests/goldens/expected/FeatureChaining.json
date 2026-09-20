@@ -108,7 +108,7 @@
     "@id": "94424ec9-e9bc-5fce-ad96-903db14d9b0e",
     "@type": "FeatureChaining",
     "chainingFeature": {
-      "@ref": "mode"
+      "@id": "8baee662-5f02-512b-b671-c812c4a7bf95"
     },
     "elementId": "94424ec9-e9bc-5fce-ad96-903db14d9b0e",
     "isImplied": false,

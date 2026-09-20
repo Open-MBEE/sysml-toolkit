@@ -33,6 +33,7 @@
 //!               "importKind"?: "membership" | "namespace" | "recursive",
 //!               "visibility"?: "private" | "protected",   // imports
 //!               "portionKind"?: "timeslice" | "snapshot",
+//!               "sourcePath"?, "targetPath"?,  // projected feature paths
 //!               "sourceRole"?, "sourceMultiplicity"?,   // connector ends
 //!               "targetRole"?, "targetMultiplicity"?,
 //!               "sourceAdornments"?, "targetAdornments"?: ["ordered", …],
@@ -49,14 +50,35 @@ use crate::behavior::{ACTIONS, CONTROL_NODES, FLOWS, STATES, node_label, transit
 use crate::interconnect::{BLOCK_USAGES, CONNECTORS, KERML_BLOCKS};
 use crate::{Kind, View, VizOptions, classify, roots_of, stereotype, usage_label};
 
-/// Emit the structured graph for a view. Tree and interconnection so
-/// far — other views stay on the PlantUML path until they grow native
-/// renderers.
+/// Why [`graph`] drew nothing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum GraphError {
+    /// The view has no structured-graph emitter yet; it is reachable
+    /// through [`crate::plantuml`].
+    UnsupportedView(View),
+}
+
+impl std::fmt::Display for GraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphError::UnsupportedView(view) => {
+                write!(f, "no structured-graph emitter for view: {view}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GraphError {}
+
+/// Emit the structured graph for a view. Tree, interconnection, state
+/// and action so far — other views stay on the PlantUML path until they
+/// grow native renderers.
 pub fn graph(
     r: &mut ResolvedModel,
     root: Option<ElementRef>,
     opts: &VizOptions,
-) -> Result<Json, String> {
+) -> Result<Json, GraphError> {
     let tops = roots_of(r, root, opts);
     let mut aliases: HashMap<ElementRef, Vec<String>> = HashMap::new();
     for (name, target) in r.alias_members() {
@@ -78,7 +100,7 @@ pub fn graph(
             }
             g.reference_edges();
             emit_note_nodes(g.r, opts, &g.drawn, &mut g.nodes, &mut g.edges);
-            Ok(json!({ "view": "tree", "nodes": g.nodes, "edges": g.edges }))
+            Ok(json!({ "view": opts.view.as_str(), "nodes": g.nodes, "edges": g.edges }))
         }
         View::Interconnection => {
             let mut g = IcGraphEmitter {
@@ -90,13 +112,14 @@ pub fn graph(
                 drawn: HashMap::new(),
                 typed_port: HashMap::new(),
                 connectors: Vec::new(),
+                content: HashMap::new(),
             };
             for e in tops {
                 g.render(e, None);
             }
             g.connector_edges();
             emit_note_nodes(g.r, opts, &g.drawn, &mut g.nodes, &mut g.edges);
-            Ok(json!({ "view": "interconnection", "nodes": g.nodes, "edges": g.edges }))
+            Ok(json!({ "view": opts.view.as_str(), "nodes": g.nodes, "edges": g.edges }))
         }
         View::State | View::Action => {
             let mut g = BehaviorGraphEmitter {
@@ -112,14 +135,9 @@ pub fn graph(
                 g.collect(e, None);
             }
             g.emit_edges();
-            let name = if opts.view == View::State {
-                "state"
-            } else {
-                "action"
-            };
-            Ok(json!({ "view": name, "nodes": g.nodes, "edges": g.edges }))
+            Ok(json!({ "view": opts.view.as_str(), "nodes": g.nodes, "edges": g.edges }))
         }
-        _ => Err("no structured-graph emitter for this view yet".to_string()),
+        view => Err(GraphError::UnsupportedView(view)),
     }
 }
 
@@ -198,7 +216,7 @@ struct GraphEmitter<'a> {
 }
 
 impl GraphEmitter<'_> {
-    fn id_of(&mut self, e: ElementRef) -> String {
+    fn id_of(&self, e: ElementRef) -> String {
         self.r.element_id(e).to_string()
     }
 
@@ -464,7 +482,9 @@ impl GraphEmitter<'_> {
     /// «keyword» reference edges for the shorthand usages, and
     /// dependency edges.
     fn reference_edges(&mut self) {
-        for (e, is_usage) in self.rendered.clone() {
+        // Collection is over, so the pass takes the list rather than
+        // copying it to keep the emitter free to mutate.
+        for (e, is_usage) in std::mem::take(&mut self.rendered) {
             let id = self.drawn[&e].clone();
             let typings = if is_usage {
                 self.r.typings(e)
@@ -643,6 +663,8 @@ struct IcGraphEmitter<'a> {
     drawn: HashMap<ElementRef, String>,
     typed_port: HashMap<(ElementRef, ElementRef), String>,
     connectors: Vec<ElementRef>,
+    /// Memo of [`Self::has_content`] per element.
+    content: HashMap<ElementRef, bool>,
 }
 
 enum IcKind {
@@ -654,7 +676,7 @@ enum IcKind {
 }
 
 impl IcGraphEmitter<'_> {
-    fn id_of(&mut self, e: ElementRef) -> String {
+    fn id_of(&self, e: ElementRef) -> String {
         self.r.element_id(e).to_string()
     }
 
@@ -693,12 +715,17 @@ impl IcGraphEmitter<'_> {
     }
 
     /// Does `e`'s subtree contribute interconnection content? (The
-    /// PlantUML emitter's gate, verbatim.)
+    /// PlantUML emitter's gate, verbatim, memoized the same way.)
     fn has_content(&mut self, e: ElementRef) -> bool {
+        if let Some(&known) = self.content.get(&e) {
+            return known;
+        }
+        let mut found = false;
         for m in self.r.owned_members(e) {
             let ty = self.r.element_type(m);
             if ty == "PortUsage" || CONNECTORS.contains(&ty) || BLOCK_USAGES.contains(&ty) {
-                return true;
+                found = true;
+                break;
             }
             if (ty == "Package"
                 || ty == "LibraryPackage"
@@ -706,10 +733,12 @@ impl IcGraphEmitter<'_> {
                 || KERML_BLOCKS.contains(&ty))
                 && self.has_content(m)
             {
-                return true;
+                found = true;
+                break;
             }
         }
-        false
+        self.content.insert(e, found);
+        found
     }
 
     fn render(&mut self, e: ElementRef, parent: Option<&str>) {
@@ -792,31 +821,22 @@ impl IcGraphEmitter<'_> {
                 _ => self.render(m, Some(&id)),
             }
         }
-        // Ports declared on the usage's definitions render on the
-        // usage, not shadowed by same-named owned ports.
+        // Ports the usage inherits through its written heritage render on
+        // the usage, shadowing applied (the resolver's own walk). Implied
+        // bases stay out (every part inherits the standard library's
+        // generic `ownedPorts` through its implied base), and so do the
+        // library's abstract port usages reached by a written
+        // `:> Parts::Part` — neither is structure the model declares. A
+        // concrete port declared by a library definition the usage is
+        // typed by still arrives.
         if is_usage {
-            let own_names: Vec<String> = self
+            let inherited: Vec<ElementRef> = self
                 .r
-                .owned_members(e)
+                .inherited_features(e, false)
                 .into_iter()
                 .filter(|&m| self.r.element_type(m) == "PortUsage")
-                .filter_map(|m| self.r.element_name(m).map(str::to_string))
+                .filter(|&m| !(self.r.is_library_element(m) && self.r.is_abstract(m)))
                 .collect();
-            let mut inherited = Vec::new();
-            for t in self.r.typings(e) {
-                for m in self.r.owned_members(t) {
-                    if self.r.element_type(m) != "PortUsage" {
-                        continue;
-                    }
-                    let shadowed = self
-                        .r
-                        .element_name(m)
-                        .is_some_and(|n| own_names.iter().any(|o| o == n));
-                    if !shadowed && !inherited.contains(&m) {
-                        inherited.push(m);
-                    }
-                }
-            }
             for p in inherited {
                 self.render_port(p, Some(&id), Some(e));
             }
@@ -870,44 +890,36 @@ impl IcGraphEmitter<'_> {
         }
     }
 
-    /// The node id of the deepest rendered link of one end's feature
-    /// chain, per-usage port nodes included (the PlantUML emitter's
-    /// resolution, over ids).
-    fn end_node(&mut self, chain: &[ElementRef]) -> Option<String> {
-        let mut best = None;
-        let mut context = None;
-        for &link in chain {
-            if let Some(ctx) = context {
-                if let Some(id) = self.typed_port.get(&(ctx, link)) {
-                    best = Some(id.clone());
-                    context = None;
-                    continue;
-                }
-            }
-            if let Some(id) = self.drawn.get(&link) {
-                best = Some(id.clone());
-                context = Some(link);
-            }
-        }
-        best
-    }
-
     fn connector_edges(&mut self) {
         // Per resolved end — the notation places role, multiplicity,
         // and c-adornment keywords at each end.
         struct End {
             node: String,
             role: Option<String>,
+            path: Option<String>,
             mult: Option<String>,
             adorn: Vec<String>,
         }
-        for c in self.connectors.clone() {
+        for c in std::mem::take(&mut self.connectors) {
             let ends = self.r.connector_end_targets(c);
             let mut nodes: Vec<End> = Vec::new();
             for end in &ends {
-                let Some(node) = self.end_node(&end.chain) else {
-                    continue;
+                let projected = if end.spelling.is_none() {
+                    crate::interconnect::project_end(
+                        self.r,
+                        &end.chain,
+                        &self.drawn,
+                        &self.typed_port,
+                    )
+                } else {
+                    None
                 };
+                let Some((node, prefix)) = projected else {
+                    nodes.clear();
+                    break;
+                };
+                let path =
+                    (prefix < end.chain.len()).then(|| crate::chain_label(self.r, &end.chain));
                 let role = self
                     .r
                     .element_name(end.feature)
@@ -917,6 +929,7 @@ impl IcGraphEmitter<'_> {
                 let adorn = end_adornments(self.r, end.feature);
                 nodes.push(End {
                     node,
+                    path,
                     role,
                     mult,
                     adorn,
@@ -960,6 +973,12 @@ impl IcGraphEmitter<'_> {
                 let mut obj = base.clone();
                 obj.insert("source".into(), json!(w[0].node));
                 obj.insert("target".into(), json!(w[1].node));
+                if let Some(path) = &w[0].path {
+                    obj.insert("sourcePath".into(), json!(path));
+                }
+                if let Some(path) = &w[1].path {
+                    obj.insert("targetPath".into(), json!(path));
+                }
                 if let Some(role) = &w[0].role {
                     obj.insert("sourceRole".into(), json!(role));
                 }
@@ -1008,7 +1027,7 @@ struct BehaviorGraphEmitter<'a> {
 }
 
 impl BehaviorGraphEmitter<'_> {
-    fn id_of(&mut self, e: ElementRef) -> String {
+    fn id_of(&self, e: ElementRef) -> String {
         self.r.element_id(e).to_string()
     }
 
@@ -1156,16 +1175,21 @@ impl BehaviorGraphEmitter<'_> {
     }
 
     /// The `[*]` pseudostate of a scope, synthesized on first use.
-    fn pseudo_node(&mut self, scope: &Option<String>, initial: bool) -> String {
-        let key = (scope.clone().unwrap_or_default(), initial);
+    fn pseudo_node(
+        &mut self,
+        scope: &Option<String>,
+        initial: bool,
+        owner: Option<ElementRef>,
+    ) -> String {
+        let body = owner
+            .map(|e| self.id_of(e))
+            .or_else(|| scope.clone())
+            .unwrap_or_else(|| "root".to_string());
+        let key = (body.clone(), initial);
         if let Some(id) = self.pseudo.get(&key) {
             return id.clone();
         }
-        let id = format!(
-            "{}~{}",
-            scope.as_deref().unwrap_or("root"),
-            if initial { "initial" } else { "final" }
-        );
+        let id = format!("{}~{}", body, if initial { "initial" } else { "final" });
         let mut obj = serde_json::Map::new();
         obj.insert("id".into(), json!(id));
         obj.insert("label".into(), json!(""));
@@ -1185,7 +1209,13 @@ impl BehaviorGraphEmitter<'_> {
     }
 
     fn emit_edges(&mut self) {
-        for (e, scope) in self.edge_members.clone() {
+        // Collection is over, so the pass takes the list rather than
+        // copying it to keep the emitter free to mutate.
+        let edge_members = std::mem::take(&mut self.edge_members);
+        let members: Vec<_> = edge_members.iter().map(|(e, _)| *e).collect();
+        let contexts = crate::behavior::edge_contexts(self.r, &members, self.view);
+        for (e, scope) in edge_members {
+            let owner = self.r.owner(e);
             let ty = self.r.element_type(e).to_string();
             if ty == "TransitionUsage" {
                 let parts = self.r.transition_parts(e);
@@ -1228,21 +1258,39 @@ impl BehaviorGraphEmitter<'_> {
                 }
             };
             let target_end = ends.last().cloned().expect("two ends checked");
-            let target = match self.chain_node(&target_end.chain) {
+            let inline_target =
+                (!is_flow && target_end.chain.is_empty() && target_end.spelling.is_none())
+                    .then(|| {
+                        contexts
+                            .get(&e)
+                            .and_then(|c| c.target)
+                            .and_then(|t| self.drawn.get(&t).cloned())
+                    })
+                    .flatten();
+            let target = match self.chain_node(&target_end.chain).or(inline_target) {
                 Some(t) => t,
                 None => match pseudo_name(self.r, &target_end) {
-                    Some(initial) => self.pseudo_node(&scope, initial),
+                    Some(initial) => self.pseudo_node(&scope, initial, owner),
                     None => continue,
                 },
             };
             let source_end = ends.first().cloned().expect("two ends checked");
             let source = if source_end.chain.is_empty() && source_end.spelling.is_none() {
-                self.pseudo_node(&scope, true)
+                match contexts.get(&e).and_then(|c| c.source) {
+                    Some(crate::behavior::FlowAnchor::Node(n)) => match self.drawn.get(&n) {
+                        Some(id) => id.clone(),
+                        None => continue,
+                    },
+                    Some(crate::behavior::FlowAnchor::Pseudo(initial)) => {
+                        self.pseudo_node(&scope, initial, owner)
+                    }
+                    None => continue,
+                }
             } else {
                 match self.chain_node(&source_end.chain) {
                     Some(s) => s,
                     None => match pseudo_name(self.r, &source_end) {
-                        Some(initial) => self.pseudo_node(&scope, initial),
+                        Some(initial) => self.pseudo_node(&scope, initial, owner),
                         None => continue,
                     },
                 }

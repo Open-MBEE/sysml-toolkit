@@ -45,6 +45,96 @@ fn sole_outcome(p: &Propagation) -> PropagateOutcome {
         .expect("undecided ⇒ propagated")
 }
 
+/// Propagation must not decide a constraint from a value read *through
+/// an unbound parameter*: a requirement definition's `subject` stands
+/// for an argument bound later (`satisfy R by x`), and the `default`
+/// its type declares is exactly what such an argument may override.
+/// Inlining it would let the interval backend *prove* a verdict the
+/// model never committed to, so the step stays a free variable and the
+/// constraint stays undecided.
+#[test]
+fn a_subjects_defaults_do_not_decide_propagation() {
+    let p = prop(
+        "package P {
+            part def Valve { attribute cycleSeconds default = 8; }
+            requirement def CyclesFastEnough {
+                subject unit : Valve;
+                require constraint c { unit.cycleSeconds <= 2 }
+            }
+        }",
+    );
+    assert!(
+        !matches!(sole_outcome(&p), PropagateOutcome::Violated),
+        "{:?}",
+        p.constraints
+    );
+}
+
+#[test]
+fn unknown_receiver_formulas_and_aliases_do_not_decide_propagation() {
+    for (declaration, expression) in [
+        ("ref part unit : Device;", "unit.enabled"),
+        ("subject unit : Device;", "unit.computed"),
+        (
+            "subject unit : Device; ref part aliasUnit : Device = unit;",
+            "aliasUnit.enabled",
+        ),
+        (
+            "subject unit : Device;",
+            "(if true ? unit else unit).enabled",
+        ),
+        ("subject unit : Device;", "unit.child.enabled"),
+        ("in unit : Device;", "unit.enabled"),
+    ] {
+        let p = prop(&format!(
+            "package P {{
+                attribute def Boolean;
+                part def Child {{ attribute enabled : Boolean default = false; }}
+                part def Device {{
+                    attribute enabled : Boolean default = false;
+                    attribute computed : Boolean = enabled;
+                    part child : Child;
+                }}
+                requirement def R {{
+                    {declaration}
+                    require constraint c {{ {expression} }}
+                }}
+            }}"
+        ));
+        assert!(
+            matches!(
+                sole_outcome(&p),
+                PropagateOutcome::Undecided | PropagateOutcome::Unsupported(_)
+            ),
+            "{declaration} / {expression}: {:?}",
+            p.constraints
+        );
+    }
+}
+
+#[test]
+fn nested_unknown_receivers_do_not_share_solver_variables() {
+    let p = prop(
+        "package P {
+            attribute def Real;
+            part def Child { attribute value : Real default = 0; }
+            part def Parent { part child : Child; }
+            requirement def R {
+                subject leftUnit : Parent;
+                actor rightUnit : Parent;
+                assert constraint c {
+                    leftUnit.child.value >= 1 and rightUnit.child.value <= 0
+                }
+            }
+        }",
+    );
+    assert!(
+        matches!(sole_outcome(&p), PropagateOutcome::Unsupported(_)),
+        "{:?}",
+        p.constraints
+    );
+}
+
 // -- narrowing ---------------------------------------------------------------
 
 #[test]
@@ -61,6 +151,24 @@ fn lower_bound_narrows_to_half_line() {
     assert!(r.narrowed);
     // Holds for every value in the narrowed domain.
     assert_eq!(sole_outcome(&p), PropagateOutcome::Satisfied);
+}
+
+#[test]
+fn lower_bound_tightens_twice() {
+    // A half-line's finite side keeps moving under a second, stronger
+    // bound; a third, weaker bound is then settled by the tightened
+    // domain rather than left undecided.
+    let p = prop(
+        "package P {
+            attribute def Real;
+            attribute x : Real;
+            assert constraint open { x > 0 }
+            assert constraint strong { x >= 1000 }
+            assert constraint weak { x >= 500 }
+        }",
+    );
+    assert_eq!(range_of(&p, "x").range, "[1000, +∞]");
+    assert_eq!(outcome_of(&p, "weak"), PropagateOutcome::Satisfied);
 }
 
 #[test]
@@ -274,6 +382,109 @@ fn ranges_narrow_through_a_sum_fold() {
     assert!(range_of(&p, "x").narrowed);
 }
 
+#[test]
+fn max_fold_pins_the_result() {
+    // `max` lowers to a chain of conditionals whose steps are named by
+    // hidden auxiliaries: the result narrows like any other feature, and
+    // the auxiliaries never surface as ranges or referenced features.
+    // The narrowing itself held before the auxiliaries existed — what
+    // this pins is that naming the steps did not change the answer, and
+    // that nothing internal leaks out. The cost is pinned separately by
+    // the forty-item test below.
+    let p = prop(
+        "package P {
+            attribute def Integer;
+            attribute hi : Integer;
+            attribute a : Integer;
+            attribute b : Integer;
+            assert constraint m { hi == max((a, b)) }
+            assert constraint af { a == 2 }
+            assert constraint bf { b == 7 }
+        }",
+    );
+    assert_eq!(range_of(&p, "hi").range, "[7, 7]");
+    let declared = ["hi", "a", "b"];
+    assert!(
+        p.ranges
+            .iter()
+            .all(|r| declared.contains(&r.feature.as_str())),
+        "{:?}",
+        p.ranges
+    );
+    for c in &p.constraints {
+        assert!(
+            c.features.iter().all(|f| declared.contains(&f.as_str())),
+            "{:?}",
+            c.features
+        );
+    }
+}
+
+#[test]
+fn max_over_forty_items_stays_linear() {
+    // Each fold step references the previous step's auxiliary, so a
+    // 41-item extremum is a 41-step chain — not a term doubling per item.
+    let items: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
+    let start = std::time::Instant::now();
+    let p = prop(&format!(
+        "package P {{
+            attribute def Integer;
+            attribute x : Integer;
+            attribute y : Integer;
+            assert constraint m {{ x == max(({}, y)) }}
+            assert constraint yf {{ y == 45 }}
+        }}",
+        items.join(", ")
+    ));
+    assert_eq!(range_of(&p, "x").range, "[45, 45]");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "fold took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn separate_units_each_see_their_own_enumerations() {
+    // The enumeration literal index is derived once for the whole model
+    // and shared by every unit's translation: each unit must still reach
+    // its own enumeration, and literals of the same position in different
+    // enumerations must stay apart. This is a property of the sharing,
+    // not of the caching — a stale index would need a model that changed
+    // after the index was built, which the resolved model does not allow.
+    let mut model = Model::new();
+    for (name, src) in [
+        (
+            "a.sysml",
+            "package A {
+                enum def Phase { init; run; halt; }
+                attribute p : Phase;
+                assert constraint ap { p == Phase::halt }
+            }",
+        ),
+        (
+            "b.sysml",
+            "package B {
+                enum def Colour { red; green; blue; }
+                attribute c : Colour;
+                assert constraint bc { c != Colour::red }
+            }",
+        ),
+    ] {
+        let unit = model.add_source(name, src);
+        assert!(
+            unit.diagnostics.is_empty(),
+            "fixture must parse clean: {:?}",
+            unit.diagnostics
+        );
+    }
+    let p = propagate_constraints(&model, &PropagateConfig::default());
+    assert_eq!(range_of(&p, "p").range, "{halt}");
+    assert_eq!(range_of(&p, "c").range, "{green, blue}");
+    assert_eq!(outcome_of(&p, "ap"), PropagateOutcome::Satisfied);
+    assert_eq!(outcome_of(&p, "bc"), PropagateOutcome::Satisfied);
+}
+
 // -- finite quantifier expansion --------------------------------------------
 
 #[test]
@@ -311,6 +522,25 @@ fn inequality_removes_one_enum_literal() {
     let r = range_of(&p, "c");
     assert!(r.range.contains("halt") && r.range.contains("init"));
     assert!(!r.range.contains("mid"), "mid not excluded: {}", r.range);
+}
+
+#[test]
+fn enum_literals_past_position_128_stay_distinct() {
+    // A wide enumeration: pinning the 130th literal must narrow to that
+    // literal alone, and excluding the 2nd must not empty the domain
+    // (the two positions are distinct members, not aliases).
+    let lits: String = (1..=130).map(|i| format!("l{i}; ")).collect();
+    let p = prop(&format!(
+        "package P {{
+            enum def Wide {{ {lits} }}
+            attribute c : Wide;
+            assert constraint pin {{ c == Wide::l130 }}
+            assert constraint apart {{ c != Wide::l2 }}
+        }}"
+    ));
+    assert_eq!(range_of(&p, "c").range, "{l130}");
+    assert_eq!(outcome_of(&p, "pin"), PropagateOutcome::Satisfied);
+    assert_eq!(outcome_of(&p, "apart"), PropagateOutcome::Satisfied);
 }
 
 // -- partial conjunctions ----------------------------------------------------
@@ -391,4 +621,39 @@ fn corpus_no_false_violations() {
             );
         }
     }
+}
+
+#[test]
+fn decimal_bounds_stay_exact() {
+    // Bounds spelled as decimal literals contract the domain to exactly
+    // those decimals — not to their nearest doubles.
+    let p = prop(
+        "package Mass {
+            attribute def Real;
+            attribute airframeKg : Real;
+            attribute batteryKg : Real;
+            assert constraint airframeRange { airframeKg >= 0.8 and airframeKg <= 1.1 }
+            assert constraint batteryRange { batteryKg >= 0.2 and batteryKg <= 0.3 }
+        }",
+    );
+    let a = range_of(&p, "airframeKg");
+    assert_eq!(a.range, "[0.8, 1.1]");
+    assert_eq!(a.range_approx, "[0.8, 1.1]");
+    let b = range_of(&p, "batteryKg");
+    assert_eq!(b.range, "[0.2, 0.3]");
+    assert_eq!(b.range_approx, "[0.2, 0.3]");
+}
+
+#[test]
+fn non_terminating_bounds_print_as_fractions_and_hint_as_decimals() {
+    let p = prop(
+        "package Ratio {
+            attribute def Real;
+            attribute share : Real;
+            assert constraint c { share >= 1 / 3 and share <= 2 / 3 }
+        }",
+    );
+    let r = range_of(&p, "share");
+    assert_eq!(r.range, "[1/3, 2/3]");
+    assert_eq!(r.range_approx, "[≈0.3333333333333333, ≈0.6666666666666666]");
 }

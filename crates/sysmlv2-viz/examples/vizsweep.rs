@@ -46,10 +46,7 @@ fn main() {
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
             .collect();
         for (view, suffix) in VIEWS {
-            let opts = VizOptions {
-                view: *view,
-                ..Default::default()
-            };
+            let opts = VizOptions::default().with_view(*view);
             let out = plantuml(&mut r, None, &opts);
             if out == "@startuml\n@enduml\n" {
                 empty += 1;

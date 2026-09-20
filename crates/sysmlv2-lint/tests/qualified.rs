@@ -10,11 +10,16 @@ use sysmlv2_parser::model::Model;
 /// Lint `src` (one unit) with source text against the vendored
 /// standard library.
 fn run(src: &str, config: &Config) -> Vec<Finding> {
+    run_in("t.sysml", src, config)
+}
+
+/// [`run`] for a unit named `name` (the extension selects the dialect).
+fn run_in(name: &str, src: &str, config: &Config) -> Vec<Finding> {
     let mut model = Model::new();
     model
         .load_library_dir(&sysmlv2_testkit::library_dir())
         .expect("library");
-    model.add_source("t.sysml", src);
+    model.add_source(name, src);
     let mut resolved = ResolvedModel::build(&model);
     let unit = resolved.reference_sites().last().expect("sites").unit;
     lint_with_sources(&mut resolved, config, &[(unit, src)])
@@ -213,4 +218,59 @@ fn necessary_qualification_is_not_inconsistency() {
     for f in qualified(&findings) {
         assert!(f.fix.is_some(), "{f:?}");
     }
+}
+
+/// A reserved word used as a name stays quoted in every suggested
+/// spelling: the written `'part'::'view'` *is* the full spelling (no
+/// finding), the full and minimal re-spellings quote, and the fix
+/// parses.
+#[test]
+fn reserved_word_names_stay_quoted_in_suggestions() {
+    let src = "package 'part' {\n    part def 'view';\n    part a : 'part'::'view';\n    \
+               part b : 'view';\n}\n";
+    let findings = run(
+        src,
+        &cfg(r#"{ "rules": { "qualified-names": { "severity": "warn", "style": "qualified" } } }"#),
+    );
+    let q = qualified(&findings);
+    assert_eq!(q.len(), 1, "{findings:?}");
+    assert_eq!(q[0].suggest.as_deref(), Some("'part'::'view'"));
+    let fixed = apply_fix(src, q[0]);
+    assert!(fixed.contains("part b : 'part'::'view';"), "{fixed}");
+    let mut model = Model::new();
+    let unit = model.add_source("t.sysml", &fixed);
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+
+    let findings = run(
+        src,
+        &cfg(r#"{ "rules": { "qualified-names": { "severity": "warn", "style": "minimal" } } }"#),
+    );
+    let q = qualified(&findings);
+    assert_eq!(q.len(), 1, "{findings:?}");
+    assert_eq!(q[0].suggest.as_deref(), Some("'view'"));
+}
+
+/// The unit's dialect governs a suggested spelling: a word only the
+/// other dialect reserves stays bare, so the written text is already
+/// the full spelling (no finding) and a fix never fights the formatter.
+#[test]
+fn dialect_governs_suggested_spellings() {
+    let qualified_style =
+        cfg(r#"{ "rules": { "qualified-names": { "severity": "warn", "style": "qualified" } } }"#);
+    // `part` is a SysML word only: bare in KerML.
+    let kerml = "package part {\n    classifier x;\n    feature f : part::x;\n}\n";
+    let findings = run_in("t.kerml", kerml, &qualified_style);
+    assert!(qualified(&findings).is_empty(), "{findings:?}");
+    // `classifier` is a KerML word only: bare in SysML.
+    let sysml = "package classifier {\n    part def x;\n    part f : classifier::x;\n}\n";
+    let findings = run_in("t.sysml", sysml, &qualified_style);
+    assert!(qualified(&findings).is_empty(), "{findings:?}");
+    // And the same KerML reference under the minimal style shortens to
+    // the bare word, which is what the KerML formatter prints.
+    let minimal_style =
+        cfg(r#"{ "rules": { "qualified-names": { "severity": "warn", "style": "minimal" } } }"#);
+    let findings = run_in("t.kerml", kerml, &minimal_style);
+    let q = qualified(&findings);
+    assert_eq!(q.len(), 1, "{findings:?}");
+    assert_eq!(q[0].suggest.as_deref(), Some("x"));
 }

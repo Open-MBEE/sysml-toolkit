@@ -62,7 +62,7 @@ fn apollo_parses_and_validates() {
     }
 }
 
-/// Referential + semantic checks over the resolved model: zero findings
+/// Referential + semantic checks pin the known upstream model defects.
 /// (the one pre-fix unresolved reference was the recursive-rollup chain,
 /// resolved since — see `tests/check.rs::recursive_rollup_chain_member_resolves`).
 #[test]
@@ -70,23 +70,28 @@ fn apollo_checks_clean() {
     let files = apollo_or_skip!();
     let model = apollo_model(&files);
     assert!(!model.has_errors());
-    let findings: Vec<_> = validate_model(&model)
+    let findings = validate_model(&model)
         .into_iter()
-        .chain(validate_semantics(&model))
-        .collect();
+        .chain(validate_semantics(&model));
     // The invocation-arity check flags exactly the model's three genuine
     // under-application defects: both
     // `calculateDeltaV` call sites (4 params, 3 arguments — `mf` never
     // bound) and the `ln` shim call (their `calc <ln> naturalLogarithm`
-    // declares two parameters). Nothing else may fire.
+    // declares two parameters). The dimensional defect is pinned separately.
     let (arity, rest): (Vec<_>, Vec<_>) = findings
         .into_iter()
         .partition(|(_, d)| d.message.contains("binds"));
-    assert!(
-        rest.is_empty(),
-        "{} non-arity findings, first: {:?}",
-        rest.len(),
-        rest[0].1
+    // The LOI calculation adds speed squared to force / length because
+    // mu_Moon is declared as ISQ::force. A gravitational parameter needs
+    // length cubed / time squared. OpenSysML independently reports this.
+    assert_eq!(
+        rest.iter()
+            .map(|(unit, d)| (model.units()[*unit].name.as_str(), d.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(
+            "CalculationsPackage.sysml",
+            "expression combines incompatible quantity dimensions `L^2*T^-2` and `M*T^-2`"
+        )]
     );
     let n_deltav = arity
         .iter()

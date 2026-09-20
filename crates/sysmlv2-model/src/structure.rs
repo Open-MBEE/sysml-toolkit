@@ -95,6 +95,10 @@ const WRAP_NAME: &str = "__sysmlStructure__";
 /// The id-normalized structural digest of exactly one member's text
 /// (top-level form, as the canonical formatter emits it). Errors name
 /// the first parse diagnostic or the member-count violation.
+///
+/// The error is a message rather than a type because every caller shows
+/// it and none branches on it: a digest either describes the text or the
+/// text is not one member.
 pub fn member_structure_digest(member_text: &str) -> Result<String, String> {
     let probe = format!("package {WRAP_NAME} {{\n{member_text}\n}}");
     let parse = parse_source(&probe);

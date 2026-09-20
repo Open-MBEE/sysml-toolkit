@@ -42,14 +42,18 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff];
     out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(data, 9));
     out.extend_from_slice(&crc32(data).to_le_bytes());
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    // The trailer's size field is the input length modulo 2^32, which
+    // is what the low 32 bits of the length are.
+    #[allow(clippy::cast_possible_truncation)]
+    let isize_field = data.len() as u32;
+    out.extend_from_slice(&isize_field.to_le_bytes());
     out
 }
 
 fn crc32(data: &[u8]) -> u32 {
     let mut table = [0u32; 256];
-    for (n, slot) in table.iter_mut().enumerate() {
-        let mut c = n as u32;
+    for (n, slot) in (0u32..).zip(table.iter_mut()) {
+        let mut c = n;
         for _ in 0..8 {
             c = if c & 1 != 0 {
                 0xedb88320 ^ (c >> 1)

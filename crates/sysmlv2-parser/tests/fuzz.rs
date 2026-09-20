@@ -171,6 +171,169 @@ fn pathological_inputs_never_panic() {
     }
 }
 
+/// Input nested deeper than the parser will descend is reported, not
+/// crashed into. Bodies and expressions both recurse, and exhausting the
+/// stack ends the process instead of producing a diagnostic, so the depth
+/// is bounded.
+///
+/// The probe runs on a thread with room for the bound itself: reaching it
+/// means holding one frame per level, and an unoptimized build's frames
+/// are large. The point is that ten thousand levels of input stop at the
+/// bound with a diagnostic instead of descending until the stack is gone.
+#[test]
+fn deeply_nested_input_reports_a_diagnostic() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(deep_nesting_probe)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn deep_nesting_probe() {
+    const N: usize = 10_000;
+    for src in [
+        format!("package P {{ {}{} }}", "part x { ".repeat(N), "}".repeat(N)),
+        format!(
+            "package P {{ attribute a = {}1{}; }}",
+            "(".repeat(N),
+            ")".repeat(N)
+        ),
+        format!(
+            "package P {{ attribute a = {}1{}; }}",
+            "{ ".repeat(N),
+            " }".repeat(N)
+        ),
+        // Right-associative operators recurse into themselves rather than
+        // returning through the expression entry point; the bound is
+        // charged there too, or a chain of them descends until the stack
+        // is gone.
+        format!("package P {{ attribute a = {}1; }}", "2**".repeat(N)),
+        format!("package P {{ attribute a = {}1; }}", "2^".repeat(N)),
+    ] {
+        let parse = parse_source(&src);
+        assert!(
+            parse
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("nesting is too deep")),
+            "expected a nesting diagnostic, got {:?}",
+            parse.diagnostics.first().map(|d| d.message.clone())
+        );
+        // One report per truncated subtree, as the body path gives — not
+        // one per token of the abandoned text.
+        assert!(
+            parse.diagnostics.len() <= 2,
+            "expected the refusal to be reported once, got {:#?}",
+            parse.diagnostics
+        );
+        // The rest of the pipeline takes the bounded tree without panicking.
+        exercise(&src);
+    }
+
+    // A left-associative chain is built iteratively, so no descent is
+    // charged for it — but the tree leans one node deep per operator and
+    // every walk over it recurses, dropping it included. The operator
+    // budget bounds that, for every shape that leans the same way: a
+    // binary chain, a feature chain, an index, a bracket, an applied
+    // operator and a cast all add one node per step.
+    for src in [
+        format!("package P {{ attribute a = {}1; }}", "1+".repeat(N)),
+        format!("package P {{ attribute a = {}1; }}", "1 and ".repeat(N)),
+        format!("package P {{ attribute a = {}x; }}", "y.".repeat(N)),
+        format!("package P {{ attribute a = x{}; }}", "[1]".repeat(N)),
+        format!("package P {{ attribute a = x{}; }}", "#(1)".repeat(N)),
+        format!("package P {{ attribute a = x{}; }}", "->f(1)".repeat(N)),
+        format!("package P {{ attribute a = x{}; }}", " as T".repeat(N)),
+    ] {
+        let parse = parse_source(&src);
+        assert!(
+            parse
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("operators")),
+            "expected an operator-count diagnostic, got {:?}",
+            parse.diagnostics.first().map(|d| d.message.clone())
+        );
+        assert!(
+            parse.diagnostics.len() <= 2,
+            "expected the refusal to be reported once, got {:#?}",
+            parse.diagnostics
+        );
+        exercise(&src);
+    }
+
+    // A branch gives its chain back to its siblings, but never to what is
+    // built above it: an expression leaning a full chain at every level
+    // of nesting is refused however those levels are spelled.
+    for nested in ["f(#)", "x[#]", "(#)"] {
+        let mut inner = "1".to_string();
+        for _ in 0..120 {
+            inner = nested.replace('#', &inner) + &"+1".repeat(1000);
+        }
+        let src = format!("package P {{ attribute a = {inner}; }}");
+        let parse = parse_source(&src);
+        assert!(
+            parse
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("operators")),
+            "expected an operator-count diagnostic for `{nested}`, got {:?}",
+            parse.diagnostics.first().map(|d| d.message.clone())
+        );
+        exercise(&src);
+    }
+
+    // A chain within the budget still parses, and everything downstream
+    // still walks it.
+    let src = format!(
+        "package P {{ attribute a = {}1; }}",
+        "1+".repeat(sysmlv2_parser::parser::MAX_EXPR_OPERATORS as usize - 1)
+    );
+    assert!(parse_source(&src).diagnostics.is_empty());
+    exercise(&src);
+
+    // Operands beside one another are not operators stacked on one
+    // another: a long sequence, a long argument list, a sum of products
+    // half the budget long, and a body full of statements all stay well
+    // inside it — and a body's members each spell their own chain rather
+    // than sharing one budget with their siblings.
+    let statements: String = (0..600)
+        .map(|i| format!("attribute x{i} = 1+1+1; "))
+        .collect();
+    for src in [
+        format!(
+            "package P {{ attribute a = ({}); }}",
+            ["1+1"; 1100].join(", ")
+        ),
+        format!(
+            "package P {{ attribute a = f({}); }}",
+            ["1+1"; 1100].join(", ")
+        ),
+        format!(
+            "package P {{ attribute a = {}; }}",
+            ["2*3"; 550].join(" + ")
+        ),
+        format!("package P {{ part p {{ attribute a = xs->select {{ {statements} }}; }} }}"),
+        format!("package P {{ part p {{ {statements} }} }}"),
+    ] {
+        let parse = parse_source(&src);
+        assert!(
+            parse.diagnostics.is_empty(),
+            "expected no diagnostics, got {:#?}",
+            parse.diagnostics
+        );
+    }
+    // The bound is well clear of what written models reach: the deepest
+    // file in the published examples and libraries nests ten braces.
+    let src = format!(
+        "package P {{ {}{} }}",
+        "part x { ".repeat(12),
+        "}".repeat(12)
+    );
+    assert!(parse_source(&src).diagnostics.is_empty());
+}
+
 thread_local! {
     static LAST: std::cell::RefCell<Option<(usize, String)>> =
         const { std::cell::RefCell::new(None) };

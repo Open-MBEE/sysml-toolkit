@@ -34,6 +34,32 @@ fn resolved_named(name: &str, src: &str) -> ResolvedModel {
 }
 
 #[test]
+fn graph_redefined_nodes_and_rows_have_resolvable_qualified_names() {
+    let mut r = resolved(
+        "package P {
+        part def Tank { attribute mass = 1; }
+        part base { part tank : Tank; }
+        part actual :> base { part :>> tank { attribute :>> mass = 2; } }
+    }",
+    );
+    let graph = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    for name in ["P::actual::tank", "P::actual::tank::mass"] {
+        let element = r.resolve_qualified(name).expect(name);
+        let id = r.element_id(element).to_string();
+        let item = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|n| std::iter::once(n).chain(n["rows"].as_array().unwrap().iter()))
+            .find(|n| n["id"] == id)
+            .expect(name);
+        assert_eq!(item["qname"], name);
+        assert_eq!(item["file"], "demo.sysml");
+        assert!(item["line"].as_u64().unwrap() > 0);
+    }
+}
+
+#[test]
 fn demo_golden() {
     let mut r = resolved(DEMO);
     let out = plantuml(&mut r, None, &VizOptions::default());
@@ -74,10 +100,7 @@ fn demo_is_deterministic() {
 #[test]
 fn direction_toggle() {
     let mut r = resolved(DEMO);
-    let opts = VizOptions {
-        direction: Direction::LeftToRight,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_direction(Direction::LeftToRight);
     let out = plantuml(&mut r, None, &opts);
     assert!(out.contains("left to right direction"));
 }
@@ -85,10 +108,7 @@ fn direction_toggle() {
 #[test]
 fn values_toggle_off() {
     let mut r = resolved(DEMO);
-    let opts = VizOptions {
-        show_values: false,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_show_values(false);
     let out = plantuml(&mut r, None, &opts);
     assert!(!out.contains("= 1200"), "{out}");
 }
@@ -126,10 +146,7 @@ fn top_level_valued_usages_keep_values_as_nodes() {
     assert!(out.contains("budget = 42"), "{out}");
     let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
     assert!(serde_json::to_string(&g).unwrap().contains("budget = 42"));
-    let opts = VizOptions {
-        show_values: false,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_show_values(false);
     let out = plantuml(&mut r, None, &opts);
     assert!(!out.contains("= 42"), "{out}");
 }
@@ -167,10 +184,7 @@ fn anonymous_redefining_members_label_by_target_name() {
 
     // The borrowed name also shadows: with inherited lines on, the
     // target's own `mode : Mode` must not reappear beside it.
-    let opts = VizOptions {
-        show_inherited: true,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_show_inherited(true);
     let out = plantuml(&mut r, None, &opts);
     assert!(!out.contains("^mode"), "shadowing lost: {out}");
     assert!(out.contains("mode : Mode = run"), "{out}");
@@ -209,10 +223,7 @@ fn graph_emits_note_nodes_for_doc_bodies() {
 
     // The toggle drops both the node and its edge.
     let mut r = resolved(src);
-    let opts = VizOptions {
-        show_notes: false,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_show_notes(false);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
     assert!(
         !g["nodes"]
@@ -259,10 +270,7 @@ package Gamma { part def C; }
 
     let alpha = r.resolve_qualified("Alpha").expect("resolves");
     let gamma = r.resolve_qualified("Gamma").expect("resolves");
-    let opts = VizOptions {
-        roots: Some(vec![alpha, gamma]),
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_roots(Some(vec![alpha, gamma]));
     let out = plantuml(&mut r, None, &opts);
     assert!(out.contains("\"Alpha\""), "{out}");
     assert!(out.contains("\"Gamma\""), "{out}");
@@ -298,10 +306,7 @@ package Gamma { part def C; }
 
     // Empty selection is treated as "no filter" (whole model), never
     // an empty diagram — the panel gates the truly-empty case itself.
-    let empty_opts = VizOptions {
-        roots: Some(vec![]),
-        ..Default::default()
-    };
+    let empty_opts = VizOptions::default().with_roots(Some(vec![]));
     let out = plantuml(&mut r, None, &empty_opts);
     assert!(
         out.contains("\"Beta\""),
@@ -360,10 +365,7 @@ const IC_DEMO: &str = "package Rig {
 ";
 
 fn view_opts(view: View) -> VizOptions {
-    VizOptions {
-        view,
-        ..Default::default()
-    }
+    VizOptions::default().with_view(view)
 }
 
 /// Ports declared on a part's definition render per usage, and both
@@ -633,10 +635,7 @@ actor \"driver : Driver\" as n4
 usecase \"UnlockVehicle\" as n5 <<use case def>>
 n2 -- n3 : «subject»
 n4 -- n2
-note as o1
-«objective»
-get from A to B safely 
-end note
+note \"«objective»\\nget from A to B safely \" as o1
 o1 .. n2
 n2 ..> n1 : «include»
 @enduml
@@ -676,7 +675,7 @@ fn mixed_everything_on_one_canvas() {
     assert!(out.contains("actor \"rider\" as"), "{out}");
     // Typing edge and exhibit typing, doc note.
     assert!(out.contains("..>"), "{out}");
-    assert!(out.contains("note as c1"), "{out}");
+    assert!(out.contains("\" as c1\n"), "{out}");
     assert!(out.contains("The whole system."), "{out}");
     // Attributes stay off the canvas (no compartments in this dialect).
     assert!(!out.contains("mass"), "{out}");
@@ -693,18 +692,11 @@ fn tree_notes_toggle() {
 ";
     let mut r = resolved(src);
     let out = plantuml(&mut r, None, &VizOptions::default());
-    assert!(out.contains("note as c1"), "{out}");
+    assert!(out.contains("\" as c1\n"), "{out}");
     assert!(out.contains("documented"), "{out}");
     assert!(out.contains("commented"), "{out}");
     let mut r = resolved(src);
-    let out = plantuml(
-        &mut r,
-        None,
-        &VizOptions {
-            show_notes: false,
-            ..Default::default()
-        },
-    );
+    let out = plantuml(&mut r, None, &VizOptions::default().with_show_notes(false));
     assert!(!out.contains("note"), "{out}");
 }
 
@@ -724,10 +716,7 @@ fn metadata_stereotypes_and_hide() {
     let out = plantuml(
         &mut r,
         None,
-        &VizOptions {
-            show_metadata: false,
-            ..Default::default()
-        },
+        &VizOptions::default().with_show_metadata(false),
     );
     assert!(!out.contains("<<Safety>>"), "{out}");
 }
@@ -746,10 +735,7 @@ fn tree_inherited_compartments() {
     let out = plantuml(
         &mut r,
         None,
-        &VizOptions {
-            show_inherited: true,
-            ..Default::default()
-        },
+        &VizOptions::default().with_show_inherited(true),
     );
     assert!(out.contains("^mass"), "{out}");
     // Own `kind` shadows the inherited one.
@@ -768,14 +754,7 @@ fn tree_show_lib_nodes() {
         "package Typed { part def Sensor :> Parts::Part; }\n",
     );
     let mut r = ResolvedModel::build(&model);
-    let out = plantuml(
-        &mut r,
-        None,
-        &VizOptions {
-            show_lib: true,
-            ..Default::default()
-        },
-    );
+    let out = plantuml(&mut r, None, &VizOptions::default().with_show_lib(true));
     assert!(out.contains("<<library>>"), "{out}");
     assert!(out.contains("--|>"), "{out}");
 }
@@ -791,10 +770,7 @@ package Car { private import Lib::Wheel; part w : Wheel; }
     let out = plantuml(
         &mut r,
         None,
-        &VizOptions {
-            show_imported: true,
-            ..Default::default()
-        },
+        &VizOptions::default().with_show_imported(true),
     );
     assert!(out.contains("«import»"), "{out}");
 }
@@ -807,12 +783,10 @@ fn style_and_link_options() {
     let out = plantuml(
         &mut r,
         None,
-        &VizOptions {
-            line_style: LineStyle::Ortho,
-            std_color: true,
-            link_template: Some("vscode://file/{file}:{line}".to_string()),
-            ..Default::default()
-        },
+        &VizOptions::default()
+            .with_line_style(LineStyle::Ortho)
+            .with_std_color(true)
+            .with_link_template(Some("vscode://file/{file}:{line}".to_string())),
     );
     assert!(out.contains("skinparam linetype ortho"), "{out}");
     assert!(out.contains("BackgroundColor<<part def>>"), "{out}");
@@ -944,10 +918,7 @@ fn graph_tree_carries_identity_rows_and_edges() {
 #[test]
 fn graph_rejects_views_without_emitters() {
     let mut r = resolved(DEMO);
-    let opts = VizOptions {
-        view: View::Sequence,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::Sequence);
     assert!(sysmlv2_viz::graph(&mut r, None, &opts).is_err());
 }
 
@@ -967,10 +938,7 @@ const IC_GRAPH_DEMO: &str = "package Rig {
 #[test]
 fn graph_interconnection_edges_carry_connector_identity() {
     let mut r = resolved(IC_GRAPH_DEMO);
-    let opts = VizOptions {
-        view: View::Interconnection,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::Interconnection);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).expect("ic graph");
 
     let nodes = g["nodes"].as_array().unwrap();
@@ -1040,10 +1008,7 @@ fn graph_state_view_pseudostates_and_transition_identity() {
 }
 ";
     let mut r = resolved(SRC);
-    let opts = VizOptions {
-        view: View::State,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::State);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).expect("state graph");
     let nodes = g["nodes"].as_array().unwrap();
     let edges = g["edges"].as_array().unwrap();
@@ -1126,11 +1091,9 @@ fn view_directed_rendering() {
             && names.contains(&"VD::stage::main".to_string()),
         "{names:?}"
     );
-    let opts = VizOptions {
-        view: View::Interconnection,
-        roots: Some(roots),
-        ..Default::default()
-    };
+    let opts = VizOptions::default()
+        .with_view(View::Interconnection)
+        .with_roots(Some(roots));
     let out = plantuml(&mut r, None, &opts);
     // Exactly one connector edge: the untagged cable draws, the
     // LOUD-tagged one is filtered off. The untagged parts (including
@@ -1180,10 +1143,7 @@ fn action_view_flow_anchors() {
         }
     }";
     let mut r = resolved(src);
-    let opts = VizOptions {
-        view: View::Action,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::Action);
     let out = plantuml(&mut r, None, &opts);
     let alias = |name: &str| {
         let tag = format!("\"{name}\" as ");
@@ -1262,10 +1222,7 @@ fn state_view_anonymous_do_actions_list_steps() {
         }
     }";
     let mut r = resolved(src);
-    let opts = VizOptions {
-        view: View::State,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::State);
     let out = plantuml(&mut r, None, &opts);
     assert!(out.contains(": do / sweep : Chore; polish"), "{out}");
     assert!(out.contains(": do / rinse"), "{out}");
@@ -1357,10 +1314,7 @@ package RecUser { import Lib::**; part def B; }
 package MemUser { import Lib::L; part def C; }
 ";
     let mut r = resolved(SRC);
-    let opts = VizOptions {
-        show_imported: true,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_show_imported(true);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
     let nodes = g["nodes"].as_array().unwrap();
     let edges = g["edges"].as_array().unwrap();
@@ -1459,10 +1413,7 @@ fn graph_connector_ends_carry_roles() {
 }
 ";
     let mut r = resolved(SRC);
-    let opts = VizOptions {
-        view: View::Interconnection,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::Interconnection);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
     let edges = g["edges"].as_array().unwrap();
     let conn = edges
@@ -1490,10 +1441,7 @@ fn graph_ports_carry_direction_and_conjugation() {
 }
 ";
     let mut r = resolved(SRC);
-    let opts = VizOptions {
-        view: View::Interconnection,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::Interconnection);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
     let nodes = g["nodes"].as_array().unwrap();
     let port = |l: &str| {
@@ -1572,10 +1520,7 @@ fn graph_connector_ends_carry_adornments() {
 }
 ";
     let mut r = resolved(SRC);
-    let opts = VizOptions {
-        view: View::Interconnection,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::Interconnection);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
     let edges = g["edges"].as_array().unwrap();
     let conn = edges
@@ -1631,10 +1576,7 @@ package Priv { private import Lib::*; part def A; }
 package Pub { import Lib::*; part def B; }
 ";
     let mut r = resolved(SRC);
-    let opts = VizOptions {
-        show_imported: true,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_show_imported(true);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
     let nodes = g["nodes"].as_array().unwrap();
     let edges = g["edges"].as_array().unwrap();
@@ -1667,10 +1609,7 @@ fn graph_action_view_params_are_border_chips() {
 }
 ";
     let mut r = resolved(SRC);
-    let opts = VizOptions {
-        view: View::Action,
-        ..Default::default()
-    };
+    let opts = VizOptions::default().with_view(View::Action);
     let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
     let nodes = g["nodes"].as_array().unwrap();
     let capture = nodes

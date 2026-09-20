@@ -71,12 +71,20 @@ use std::fmt;
 use sysmlv2_syntax::Span;
 use sysmlv2_syntax::ast::*;
 
+pub use crate::rational::Rational;
+
 /// An evaluated value. KerML's `null` is the empty sequence.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Boolean(bool),
     Integer(i128),
-    Rational(f64),
+    /// An exact rational that is not an integer in `i128` range —
+    /// integral values in range are always [`Value::Integer`].
+    Rational(Rational),
+    /// An approximate binary double: the result of a transcendental
+    /// function, a non-exact power or root, or infinity. Any operation
+    /// with a `Real` operand is approximate; everything else is exact.
+    Real(f64),
     String(String),
     /// A model element used as a *closed* value: an enum literal, a
     /// query-mode reflection result, or a collected member standing for
@@ -86,10 +94,16 @@ pub enum Value {
     /// member access, chains, and classification treat it like the
     /// element itself, but cardinality/emptiness questions refuse to
     /// fabricate answers (the declared multiplicity answers when it is
-    /// exact). Minted only for user-owned features outside library
-    /// evaluation frames — library calc bodies keep the closed
-    /// one-element convention their semantics rely on.
+    /// exact). Defaults read through a parameter or reference that still
+    /// stands for an argument are indeterminate. Minted only for features
+    /// outside library evaluation frames — library calc bodies keep the
+    /// closed one-element convention their semantics rely on.
     Unbound(ElementRef),
+    /// An unvalued member reached through an unknown receiver. Like
+    /// [`Value::Unbound`], but retains the receiver's uncertainty through
+    /// aliases, conditionals, sequences and calculation arguments. A
+    /// later chain step must not read the member type's defaults.
+    UnboundMember(ElementRef),
     /// The result of an operation over an unknown operand: arithmetic,
     /// comparison, or logic over an unbound feature is not a type error —
     /// the formula is parametric and its value simply is not determined.
@@ -120,7 +134,7 @@ pub enum Value {
 /// to a reduced rational exponent (`den > 0`, `num != 0`, gcd 1). The
 /// name is the element's simple name, kept for display only — identity
 /// is the element.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Dim {
     pub(crate) elem: usize,
     pub(crate) name: String,
@@ -143,7 +157,7 @@ pub(crate) struct Dim {
 #[derive(Clone, Debug)]
 pub struct Unit {
     pub(crate) dims: Vec<Dim>,
-    pub(crate) scale: f64,
+    pub(crate) scale: Rational,
     pub(crate) display: String,
 }
 
@@ -155,16 +169,17 @@ impl Unit {
         let display = render_dims(&merged);
         Unit {
             dims: merged,
-            scale: 1.0,
+            scale: Rational::one(),
             display,
         }
     }
 
     /// Canonical identity key — units are equal iff their keys are.
     pub fn key(&self) -> String {
+        use std::fmt::Write as _;
         let mut out = self.dims_key();
-        if self.scale != 1.0 {
-            out.push_str(&format!("x{};", self.scale));
+        if !self.scale.is_one() {
+            let _ = write!(out, "x{};", self.scale);
         }
         out
     }
@@ -182,9 +197,11 @@ impl Unit {
     }
 
     /// Multiplier taking this unit's magnitudes to the reference
-    /// magnitude (`min` → 60, base units → 1).
-    pub fn scale(&self) -> f64 {
-        self.scale
+    /// magnitude (`min` → 60, base units → 1). Exact: library
+    /// conversion factors are decimals, small fractions and integer
+    /// powers, and every composition of them stays a rational.
+    pub fn scale(&self) -> &Rational {
+        &self.scale
     }
 
     /// Display spelling: the source spelling for bracket-constructed
@@ -307,11 +324,10 @@ pub fn parse_unit_spelling(name: &str) -> Option<Vec<(String, i32)>> {
                 }
                 f.neg = true;
             }
-            c if sup_digit(c).is_some() => {
+            c if let Some(d) = sup_digit(c) => {
                 if f.base.is_empty() {
                     return None;
                 }
-                let d = sup_digit(c).unwrap();
                 f.mag = Some(f.mag.unwrap_or(0).checked_mul(10)?.checked_add(d)?);
             }
             c => {
@@ -402,22 +418,34 @@ fn dims_pow(dims: &[Dim], exp: (i32, i32)) -> Vec<Dim> {
 }
 
 /// A numeric value as a reduced small rational, for unit exponents:
-/// integers directly, rationals only when a denominator up to 16
-/// represents them exactly (`^(1/2)` after rational division is 0.5).
+/// integers directly, exact rationals with a denominator up to 16 and a
+/// numerator up to 1024 in magnitude (`^(1/2)` after rational division
+/// is 1/2). An approximate double counts as the small fraction whose
+/// nearest double it is, so a computed `0.5` or `0.1` still names a
+/// root; its exact dyadic expansion would never have a small
+/// denominator.
 fn small_ratio(v: &Value) -> Option<(i32, i32)> {
-    match v {
-        Value::Integer(i) => i32::try_from(*i).ok().map(|n| (n, 1)),
-        Value::Rational(f) => (1..=16i32).find_map(|den| {
+    let small = |n: i32, d: i32| (d <= 16 && n.abs() <= 1024).then_some((n, d));
+    match v.num()? {
+        Num::Exact(r) => {
+            let (n, d) = r.to_i32_parts()?;
+            small(n, d)
+        }
+        Num::Approx(f) => (1..=16i32).find_map(|den| {
             let n = f * den as f64;
-            (n.fract() == 0.0 && n.abs() <= 1024.0 && (n as i32 as f64 / den as f64) == *f).then(
-                || {
+            (n.fract() == 0.0 && n.abs() <= 1024.0 && (n as i32 as f64 / den as f64) == f)
+                .then(|| {
                     let g = gcd(n as i64, den as i64);
                     ((n as i64 / g) as i32, (den as i64 / g) as i32)
-                },
-            )
+                })
+                .and_then(|(n, d)| small(n, d))
         }),
-        _ => None,
     }
+}
+
+/// `a / b` for unit scales, which are never zero.
+fn scale_ratio(a: &Rational, b: &Rational) -> Rational {
+    a.div(b).unwrap_or_else(Rational::one)
 }
 
 /// An integer-literal unit exponent, allowing the negated spelling the
@@ -484,10 +512,229 @@ impl Value {
     }
 
     fn as_f64(&self) -> Option<f64> {
+        self.num().map(|n| n.to_f64())
+    }
+
+    /// The scalar number this value is, if it is one.
+    pub(crate) fn num(&self) -> Option<Num> {
         match self {
-            Value::Integer(i) => Some(*i as f64),
-            Value::Rational(r) => Some(*r),
+            Value::Integer(i) => Some(Num::Exact(Rational::from_integer(*i))),
+            Value::Rational(r) => Some(Num::Exact(r.clone())),
+            Value::Real(f) => Some(Num::Approx(*f)),
             _ => None,
+        }
+    }
+
+    /// The canonical value of a number: an exact integer in `i128` range
+    /// is [`Value::Integer`], any other exact value [`Value::Rational`],
+    /// an approximate one [`Value::Real`].
+    pub(crate) fn from_num(n: Num) -> Value {
+        match n {
+            Num::Exact(r) => match r.to_i128() {
+                Some(i) => Value::Integer(i),
+                None => Value::Rational(r),
+            },
+            Num::Approx(f) => Value::Real(f),
+        }
+    }
+}
+
+/// A scalar number as the evaluator computes with it: exact, or an
+/// explicitly approximate double. Exact operands give exact results;
+/// one approximate operand makes the result approximate. Comparisons
+/// are exact in every combination — a finite double compares as the
+/// dyadic rational it denotes.
+#[derive(Clone, Debug)]
+pub(crate) enum Num {
+    Exact(Rational),
+    Approx(f64),
+}
+
+impl Num {
+    fn to_f64(&self) -> f64 {
+        match self {
+            Num::Exact(r) => r.to_f64(),
+            Num::Approx(f) => *f,
+        }
+    }
+
+    /// The exact value: itself, or the dyadic rational of a finite
+    /// double; `None` for infinities and NaN.
+    fn exact(&self) -> Option<Rational> {
+        match self {
+            Num::Exact(r) => Some(r.clone()),
+            Num::Approx(f) => Rational::from_f64(*f),
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        match self {
+            Num::Exact(r) => r.is_zero(),
+            Num::Approx(f) => *f == 0.0,
+        }
+    }
+
+    fn is_one(&self) -> bool {
+        match self {
+            Num::Exact(r) => r.is_one(),
+            Num::Approx(f) => *f == 1.0,
+        }
+    }
+
+    fn is_negative(&self) -> bool {
+        match self {
+            Num::Exact(r) => r.is_negative(),
+            Num::Approx(f) => *f < 0.0,
+        }
+    }
+
+    fn add(&self, o: &Num) -> Num {
+        match (self, o) {
+            (Num::Exact(a), Num::Exact(b)) => Num::Exact(a.add(b)),
+            _ => Num::Approx(self.to_f64() + o.to_f64()),
+        }
+    }
+
+    fn sub(&self, o: &Num) -> Num {
+        match (self, o) {
+            (Num::Exact(a), Num::Exact(b)) => Num::Exact(a.sub(b)),
+            _ => Num::Approx(self.to_f64() - o.to_f64()),
+        }
+    }
+
+    fn mul(&self, o: &Num) -> Num {
+        match (self, o) {
+            (Num::Exact(a), Num::Exact(b)) => Num::Exact(a.mul(b)),
+            _ => Num::Approx(self.to_f64() * o.to_f64()),
+        }
+    }
+
+    fn div(&self, o: &Num) -> Result<Num, EvalError> {
+        if o.is_zero() {
+            return Err(EvalError::DivisionByZero);
+        }
+        Ok(match (self, o) {
+            (Num::Exact(a), Num::Exact(b)) => Num::Exact(a.div(b).expect("non-zero divisor")),
+            _ => Num::Approx(self.to_f64() / o.to_f64()),
+        })
+    }
+
+    /// Truncated remainder.
+    fn rem(&self, o: &Num) -> Result<Num, EvalError> {
+        if o.is_zero() {
+            return Err(EvalError::DivisionByZero);
+        }
+        Ok(match (self, o) {
+            (Num::Exact(a), Num::Exact(b)) => Num::Exact(a.rem(b).expect("non-zero divisor")),
+            _ => Num::Approx(self.to_f64() % o.to_f64()),
+        })
+    }
+
+    /// `self ** e`: exact for an integer exponent and for a rational
+    /// exponent whose root exists, otherwise a double power.
+    fn pow(&self, e: &Num) -> Num {
+        if let (Num::Exact(a), Num::Exact(b)) = (self, e) {
+            let exact = match b.to_i128().and_then(|k| i32::try_from(k).ok()) {
+                Some(k) => a.pow(k),
+                None => a.pow_rational(b),
+            };
+            if let Some(r) = exact {
+                return Num::Exact(r);
+            }
+        }
+        Num::Approx(self.to_f64().powf(e.to_f64()))
+    }
+
+    /// The `n`-th root: exact when it exists, otherwise a double root.
+    fn root(&self, n: u32) -> Num {
+        if let Num::Exact(a) = self {
+            if let Some(r) = a.root(n) {
+                return Num::Exact(r);
+            }
+        }
+        let f = self.to_f64();
+        Num::Approx(if n == 2 {
+            f.sqrt()
+        } else {
+            f.powf(1.0 / n as f64)
+        })
+    }
+
+    fn neg(&self) -> Num {
+        match self {
+            Num::Exact(r) => Num::Exact(r.neg()),
+            Num::Approx(f) => Num::Approx(-f),
+        }
+    }
+
+    fn abs(&self) -> Num {
+        match self {
+            Num::Exact(r) => Num::Exact(r.abs()),
+            Num::Approx(f) => Num::Approx(f.abs()),
+        }
+    }
+
+    /// Multiply by an exact factor (a unit scale).
+    fn scale(&self, s: &Rational) -> Num {
+        self.mul(&Num::Exact(s.clone()))
+    }
+
+    /// The greatest integer not above the value; `None` for a non-finite
+    /// double.
+    fn floor(&self) -> Option<Num> {
+        self.exact().map(|r| Num::Exact(r.floor()))
+    }
+
+    /// The nearest integer, halves away from zero; `None` for a
+    /// non-finite double.
+    fn round(&self) -> Option<Num> {
+        self.exact().map(|r| Num::Exact(r.round()))
+    }
+
+    /// Exact ordering; `None` only when a NaN is involved.
+    fn cmp(&self, o: &Num) -> Option<std::cmp::Ordering> {
+        match (self, o) {
+            (Num::Exact(a), Num::Exact(b)) => Some(a.cmp(b)),
+            _ => match (self.exact(), o.exact()) {
+                (Some(a), Some(b)) => Some(a.cmp(&b)),
+                _ => self.to_f64().partial_cmp(&o.to_f64()),
+            },
+        }
+    }
+
+    fn eq(&self, o: &Num) -> bool {
+        self.cmp(o) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
+impl Value {
+    /// `Display`, except that a rational without a terminating decimal
+    /// expansion shows as an approximate decimal (`≈0.3333333333333333`)
+    /// instead of a fraction. For glanceable surfaces such as editor
+    /// hints; `Display` stays exact and re-parseable.
+    pub fn to_approx_string(&self) -> String {
+        match self {
+            Value::Rational(r) => r.to_approx_string(),
+            Value::Quantity(n, u) => format!("{} [{}]", n.to_approx_string(), u.display),
+            Value::Instance {
+                ty_name, fields, ..
+            } => {
+                let fields = fields
+                    .iter()
+                    .map(|(name, v)| format!("{name} = {}", v.to_approx_string()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{ty_name}({fields})")
+            }
+            Value::Sequence(s) if !s.is_empty() => {
+                let items = s
+                    .iter()
+                    .map(Value::to_approx_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({items})")
+            }
+            v => v.to_string(),
         }
     }
 }
@@ -498,9 +745,10 @@ impl fmt::Display for Value {
             Value::Boolean(b) => write!(f, "{b}"),
             Value::Integer(i) => write!(f, "{i}"),
             Value::Rational(r) => write!(f, "{r}"),
+            Value::Real(r) => write!(f, "{r}"),
             Value::String(s) => write!(f, "{s:?}"),
             Value::Element(_) => write!(f, "<element>"),
-            Value::Unbound(_) => write!(f, "<unbound feature>"),
+            Value::Unbound(_) | Value::UnboundMember(_) => write!(f, "<unbound feature>"),
             Value::Indeterminate => write!(f, "<indeterminate>"),
             Value::Quantity(n, u) => write!(f, "{n} [{}]", u.display),
             Value::Instance {
@@ -541,7 +789,13 @@ pub enum EvalError {
     /// A feature's value (transitively) references itself.
     Cycle(String),
     DivisionByZero,
+    /// The evaluation budget ([`MAX_STEPS`], [`MAX_SEQUENCE`],
+    /// [`MAX_STRING`], [`MAX_ALLOCATION`], [`MAX_CALL_DEPTH`]) was
+    /// exceeded.
+    Budget(String),
 }
+
+impl std::error::Error for EvalError {}
 
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -551,6 +805,7 @@ impl fmt::Display for EvalError {
             EvalError::Type(m) => write!(f, "type error: {m}"),
             EvalError::Cycle(n) => write!(f, "cyclic feature value involving `{n}`"),
             EvalError::DivisionByZero => write!(f, "division by zero"),
+            EvalError::Budget(w) => write!(f, "evaluation budget exceeded: {w}"),
         }
     }
 }
@@ -572,8 +827,11 @@ pub(crate) fn evaluate_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Resul
         env: Vec::new(),
         in_progress: HashSet::new(),
         overrides: HashMap::new(),
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: false,
     }
     .expr(scope, e)
@@ -595,8 +853,11 @@ pub(crate) fn evaluate_expr_with(
         env: Vec::new(),
         in_progress: HashSet::new(),
         overrides,
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: false,
     }
     .expr(scope, e)
@@ -613,8 +874,11 @@ pub(crate) fn unit_of_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Result
         env: Vec::new(),
         in_progress: HashSet::new(),
         overrides: HashMap::new(),
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: false,
     }
     .unit_of(scope, e)
@@ -633,8 +897,11 @@ pub(crate) fn evaluate_query_in(b: &mut Builder, scope: usize, e: &Expr) -> Resu
         env: Vec::new(),
         in_progress: HashSet::new(),
         overrides: HashMap::new(),
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: true,
     }
     .expr(scope, e)
@@ -654,8 +921,11 @@ pub(crate) fn evaluate_query_with_env(
         env,
         in_progress: HashSet::new(),
         overrides: HashMap::new(),
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: true,
     }
     .expr(scope, e)
@@ -668,8 +938,11 @@ pub(crate) fn evaluate_feature(model: &mut ResolvedModel, e: ElementRef) -> Resu
         env: Vec::new(),
         in_progress: HashSet::new(),
         overrides: HashMap::new(),
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: false,
     }
     .feature_value(e.0)
@@ -689,8 +962,11 @@ pub(crate) fn evaluate_chain_of(
         env: Vec::new(),
         in_progress: HashSet::new(),
         overrides: HashMap::new(),
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: false,
     };
     let mut v = ev.feature_value(root.0)?;
@@ -716,14 +992,18 @@ pub(crate) fn evaluate_member_of(
         env: Vec::new(),
         in_progress: HashSet::new(),
         overrides: HashMap::new(),
+        unbound_receiver: None,
         lib_frames: 0,
         call_depth: 0,
+        steps: 0,
+        allocated: 0,
         query: false,
     };
     let target = match ev.feature_value(receiver.0) {
         Ok(
             v @ (Value::Element(_)
             | Value::Unbound(_)
+            | Value::UnboundMember(_)
             | Value::Sequence(_)
             | Value::Instance { .. }),
         ) => v,
@@ -734,6 +1014,31 @@ pub(crate) fn evaluate_member_of(
         out => Some(out),
     }
 }
+
+/// Evaluation budget: an expression that would run or allocate without
+/// bound (`1..1000000000`, a calculation doubling a string on every
+/// recursion, nested collects over large ranges, a product folding into
+/// a million-digit integer) fails with [`EvalError::Budget`] instead of
+/// hanging or exhausting memory. Steps count expression nodes; the
+/// allocation budget counts the bytes of every sequence or string an
+/// operator materializes, so many individually admissible values cannot
+/// add up without bound; exact numbers are refused past
+/// [`crate::rational::MAX_BITS`]. The limits are far above anything a
+/// model's feature values or a document's query tags legitimately need.
+pub const MAX_STEPS: usize = 10_000_000;
+/// The most elements a range (`a..b`) materializes.
+pub const MAX_SEQUENCE: usize = 1_000_000;
+/// The longest string (in bytes) an operation produces.
+pub const MAX_STRING: usize = 1 << 24;
+/// The most bytes of sequences and strings one evaluation materializes
+/// through operators, cumulatively.
+pub const MAX_ALLOCATION: usize = 256 << 20;
+/// The most nested user-calculation calls one evaluation may have open.
+/// Recursion is allowed; a recursion that does not terminate exhausts
+/// this instead of the stack. Far above any legitimate call chain — a
+/// recursive calculation that needs more frames than this is a runaway,
+/// not a deep model.
+pub const MAX_CALL_DEPTH: usize = 64;
 
 struct Evaluator<'m> {
     b: &'m mut Builder,
@@ -752,8 +1057,16 @@ struct Evaluator<'m> {
     /// convention (library functions legitimately count and compare
     /// placeholders); at user level they mint [`Value::Unbound`].
     lib_frames: usize,
+    /// Receiver whose members are currently evaluated without a bound
+    /// instance. Cleared for unrelated references and concrete receivers.
+    unbound_receiver: Option<usize>,
     /// User-defined calculation call depth (recursion is allowed, bounded).
     call_depth: usize,
+    /// Expression nodes evaluated so far (the step budget, [`MAX_STEPS`]).
+    steps: usize,
+    /// Bytes of sequences and strings materialized by operators so far
+    /// (the allocation budget, [`MAX_ALLOCATION`]).
+    allocated: usize,
     /// Ad-hoc query mode ([`evaluate_query_in`]): closed-world element
     /// classification and the reflection intrinsics. Never set for model
     /// feature values — corpus evaluation semantics must not drift.
@@ -783,7 +1096,7 @@ impl Evaluator<'_> {
     /// anything inside a library evaluation frame keep the closed
     /// [`Value::Element`] convention. Non-feature elements (packages,
     /// definitions referenced as values) are closed element values.
-    fn placeholder(&self, e: usize) -> Value {
+    fn placeholder(&mut self, e: usize) -> Value {
         let ty = self.b.elements[e].ty;
         let feature_like = ty.ends_with("Usage")
             || matches!(
@@ -803,15 +1116,32 @@ impl Evaluator<'_> {
         // *starts* outside a library frame (standalone evaluation of a
         // parametric library formula) — inside an invocation frame
         // (`lib_frames > 0`) the closed one-element convention that
-        // library sequence semantics rely on still applies.
-        if feature_like && !variant && self.lib_frames == 0 {
-            Value::Unbound(ElementRef(e))
+        // library sequence semantics rely on still applies, except when
+        // navigating a receiver already known to be unbound.
+        let unknown_member = self.receiver_member(e).is_some();
+        if feature_like && !variant && (self.lib_frames == 0 || unknown_member) {
+            if unknown_member {
+                Value::UnboundMember(ElementRef(e))
+            } else {
+                Value::Unbound(ElementRef(e))
+            }
         } else {
             Value::Element(ElementRef(e))
         }
     }
 
     fn feature_value_in(&mut self, e: usize, ctx: Option<usize>) -> Result_ {
+        // Reading a local/output directly must not bypass the refusal at
+        // invocation: its initializer need not be its value after execution.
+        let mut owner = self.b.owner_elem(e);
+        while let Some(o) = owner {
+            if self.b.calculation_requires_execution(o) {
+                return Err(EvalError::Unsupported(
+                    "calculation body requires statement execution".into(),
+                ));
+            }
+            owner = self.b.owner_elem(o);
+        }
         if let Some(v) = self.overrides.get(&e) {
             return Ok(v.clone());
         }
@@ -831,6 +1161,9 @@ impl Evaluator<'_> {
                 _ => return Ok(self.placeholder(e)),
             },
         };
+        if (inherited || self.b.default_values.contains(&e)) && self.receiver_member(e).is_some() {
+            return Ok(Value::Indeterminate);
+        }
         let scope = ctx.unwrap_or(scope);
         if !self.in_progress.insert((e, scope)) {
             if inherited {
@@ -894,11 +1227,7 @@ impl Evaluator<'_> {
         else {
             return Some((1.0, 1.0));
         };
-        let as_num = |v: Value| match v {
-            Value::Integer(i) => Some(i as f64),
-            Value::Rational(f) => Some(f),
-            _ => None,
-        };
+        let as_num = |v: Value| v.as_f64();
         let hi = as_num(self.expr(scope, &m.upper).ok()?)?;
         let lo = match &m.lower {
             Some(l) => as_num(self.expr(scope, l).ok()?)?,
@@ -908,7 +1237,37 @@ impl Evaluator<'_> {
         Some((lo, hi))
     }
 
+    /// The single exit for a freshly materialized value: it charges a
+    /// sequence or string against the allocation budget and hands it
+    /// back. Every operator that *builds* one passes it through here —
+    /// arithmetic and ranges, the control functions, the intrinsics, a
+    /// lambda or function reference applied per item, and sequence
+    /// construction — so many individually admissible values cannot add
+    /// up without bound. Values that merely flow through references
+    /// (a feature read, an index, a parameter binding) are not charged
+    /// again.
+    fn charged(&mut self, value: Value) -> Result_ {
+        let bytes = match &value {
+            Value::Sequence(items) => items.len().saturating_mul(std::mem::size_of::<Value>()),
+            Value::String(s) => s.len(),
+            _ => return Ok(value),
+        };
+        self.allocated = self.allocated.saturating_add(bytes);
+        if self.allocated > MAX_ALLOCATION {
+            return Err(EvalError::Budget(format!(
+                "evaluation materialized more than {MAX_ALLOCATION} bytes of sequences and strings"
+            )));
+        }
+        Ok(value)
+    }
+
     fn expr(&mut self, scope: usize, e: &Expr) -> Result_ {
+        self.steps += 1;
+        if self.steps > MAX_STEPS {
+            return Err(EvalError::Budget(format!(
+                "evaluation exceeded {MAX_STEPS} steps"
+            )));
+        }
         match &e.kind {
             ExprKind::Literal(l) => self.literal(l),
             ExprKind::Null => Ok(Value::null()),
@@ -925,26 +1284,24 @@ impl Evaluator<'_> {
             ExprKind::Binary { op, lhs, rhs } => self.binary(scope, *op, lhs, rhs),
             ExprKind::Unary { op, operand } => {
                 let v = self.expr(scope, operand)?;
-                if matches!(v, Value::Unbound(_) | Value::Indeterminate)
-                    && !matches!(op, UnaryOp::Tilde)
+                if matches!(
+                    v,
+                    Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+                ) && !matches!(op, UnaryOp::Tilde)
                 {
                     return Ok(Value::Indeterminate);
                 }
                 match op {
                     UnaryOp::Plus => Ok(v),
                     UnaryOp::Minus => match v {
-                        Value::Integer(i) => Ok(Value::Integer(-i)),
-                        Value::Rational(r) => Ok(Value::Rational(-r)),
-                        Value::Quantity(n, u) => match *n {
-                            Value::Integer(i) => {
-                                Ok(Value::Quantity(Box::new(Value::Integer(-i)), u))
-                            }
-                            Value::Rational(r) => {
-                                Ok(Value::Quantity(Box::new(Value::Rational(-r)), u))
-                            }
-                            _ => Err(EvalError::Type("unary `-` needs a number".into())),
+                        Value::Quantity(n, u) => match n.num() {
+                            Some(x) => Ok(Value::Quantity(Box::new(Value::from_num(x.neg())), u)),
+                            None => Err(EvalError::Type("unary `-` needs a number".into())),
                         },
-                        _ => Err(EvalError::Type("unary `-` needs a number".into())),
+                        v => match v.num() {
+                            Some(x) => Ok(Value::from_num(x.neg())),
+                            None => Err(EvalError::Type("unary `-` needs a number".into())),
+                        },
                     },
                     UnaryOp::Not => match v {
                         Value::Boolean(b) => Ok(Value::Boolean(!b)),
@@ -958,7 +1315,7 @@ impl Evaluator<'_> {
                 let tval = self.expr(scope, target)?;
                 let i = match self.expr(scope, index)? {
                     Value::Integer(i) => i,
-                    Value::Unbound(_) | Value::Indeterminate => {
+                    Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
                         return Ok(Value::Indeterminate);
                     }
                     _ => return Err(EvalError::Type("index must be an integer".into())),
@@ -973,7 +1330,7 @@ impl Evaluator<'_> {
                 // sequence.
                 match &tval {
                     Value::Indeterminate => return Ok(Value::Indeterminate),
-                    Value::Unbound(ElementRef(e)) => {
+                    Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e)) => {
                         let bounds = self.unbound_cardinality(*e);
                         let admitted = i >= 1
                             && bounds.is_none_or(|(_, hi)| hi.is_infinite() || i as f64 <= hi);
@@ -998,7 +1355,10 @@ impl Evaluator<'_> {
             }
             ExprKind::Bracket { target, arg } => {
                 let num = self.expr(scope, target)?;
-                if matches!(num, Value::Unbound(_) | Value::Indeterminate) {
+                if matches!(
+                    num,
+                    Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+                ) {
                     return Ok(Value::Indeterminate);
                 }
                 let unit = self.unit_of(scope, arg)?;
@@ -1013,7 +1373,7 @@ impl Evaluator<'_> {
                 let num = match num {
                     Value::Quantity(n, u) => {
                         if same_dims(&u, &unit) && u.scale != unit.scale {
-                            scale_magnitude(*n, u.scale / unit.scale)?
+                            scale_magnitude(*n, &scale_ratio(&u.scale, &unit.scale))?
                         } else {
                             *n
                         }
@@ -1024,17 +1384,17 @@ impl Evaluator<'_> {
                     // A bracket expression that cancels completely
                     // (`[m/m]`, `[mm/m]`) is dimensionless — any
                     // residual scale folds into the number.
-                    return if unit.scale == 1.0 {
+                    return if unit.scale.is_one() {
                         Ok(num)
                     } else {
-                        match num.as_f64() {
-                            Some(f) => Ok(Value::Rational(f * unit.scale)),
+                        match num.num() {
+                            Some(n) => Ok(Value::from_num(n.scale(&unit.scale))),
                             None => Ok(num),
                         }
                     };
                 }
                 match num {
-                    Value::Integer(_) | Value::Rational(_) => {
+                    Value::Integer(_) | Value::Rational(_) | Value::Real(_) => {
                         Ok(Value::Quantity(Box::new(num), unit))
                     }
                     // A sequence magnitude is a vector quantity —
@@ -1047,8 +1407,13 @@ impl Evaluator<'_> {
                     Value::Sequence(items) => {
                         for it in &items {
                             match it {
-                                Value::Integer(_) | Value::Rational(_) | Value::Quantity(..) => {}
-                                Value::Unbound(_) | Value::Indeterminate => {
+                                Value::Integer(_)
+                                | Value::Rational(_)
+                                | Value::Real(_)
+                                | Value::Quantity(..) => {}
+                                Value::Unbound(_)
+                                | Value::UnboundMember(_)
+                                | Value::Indeterminate => {
                                     return Ok(Value::Indeterminate);
                                 }
                                 other => {
@@ -1078,7 +1443,7 @@ impl Evaluator<'_> {
                 // first (positional only), user-defined calculations after.
                 if values.iter().all(|(n, _)| n.is_none()) {
                     let positional: Vec<Value> = values.iter().map(|(_, v)| v.clone()).collect();
-                    match self.intrinsic(ty, positional) {
+                    match self.intrinsic(ty, &positional) {
                         Err(EvalError::Unsupported(_)) => {}
                         out => return out,
                     }
@@ -1093,7 +1458,7 @@ impl Evaluator<'_> {
                 for i in items {
                     out.extend(self.expr(scope, i)?.items());
                 }
-                Ok(Value::Sequence(out))
+                self.charged(Value::Sequence(out))
             }
             ExprKind::Classification { op, operand, ty } => {
                 self.classification(scope, *op, operand.as_deref(), ty)
@@ -1107,12 +1472,20 @@ impl Evaluator<'_> {
         Ok(match l {
             Literal::Bool(b) => Value::Boolean(*b),
             Literal::String(s) => Value::String(s.clone()),
-            Literal::Integer(raw) => raw
-                .parse::<i128>()
-                .map(Value::Integer)
-                .unwrap_or(Value::Rational(raw.parse().unwrap_or(f64::INFINITY))),
-            Literal::Real(raw) => Value::Rational(raw.parse().unwrap_or(f64::NAN)),
-            Literal::Infinity => Value::Rational(f64::INFINITY),
+            // Numbers are exact: an integer beyond `i128` and every
+            // decimal spelling become rationals with no intermediate
+            // double. Only an exponent too large to materialize degrades
+            // to the double parser (infinity).
+            Literal::Integer(raw) => match raw.parse::<i128>() {
+                Ok(i) => Value::Integer(i),
+                Err(_) => Rational::parse_decimal(raw)
+                    .map(|r| Value::from_num(Num::Exact(r)))
+                    .unwrap_or_else(|| Value::Real(raw.parse().unwrap_or(f64::INFINITY))),
+            },
+            Literal::Real(raw) => Rational::parse_decimal(raw)
+                .map(|r| Value::from_num(Num::Exact(r)))
+                .unwrap_or_else(|| Value::Real(raw.parse().unwrap_or(f64::INFINITY))),
+            Literal::Infinity => Value::Real(f64::INFINITY),
         })
     }
 
@@ -1121,6 +1494,9 @@ impl Evaluator<'_> {
     /// owner (the receiver, under a featuring context); a type's body
     /// reads `that` as the type's own instance.
     fn featuring_instance(&mut self, elem: usize) -> Value {
+        if let Some(receiver) = self.unbound_receiver {
+            return Value::UnboundMember(ElementRef(receiver));
+        }
         let ty = self.b.elements[elem].ty;
         let feature_like = ty.ends_with("Usage")
             || matches!(
@@ -1150,7 +1526,7 @@ impl Evaluator<'_> {
                 return Ok(v.clone());
             }
         }
-        let Some(elem) = self.b.resolve(scope, qn, 0) else {
+        let Some(mut elem) = self.b.resolve(scope, qn, 0) else {
             // KerML `that` lives on the implied root feature `things`,
             // an implied specialization the resolver does not
             // materialize — a resolved declaration always wins, and only
@@ -1169,11 +1545,84 @@ impl Evaluator<'_> {
         // redefinitions of the instance it was reached through. A
         // qualified path names an element elsewhere; its value uses its
         // own scope.
-        if qn.segments.len() == 1 && !qn.is_global {
-            self.feature_value_in(elem, Some(scope))
+        let previous = self.unbound_receiver;
+        let mut member_scope = scope;
+        if let Some(receiver) = previous {
+            let hit = if qn.segments.len() == 1 && !qn.is_global {
+                self.receiver_member(elem)
+            } else {
+                None
+            };
+            if let Some(hit) = hit {
+                // A method body resolves lexical names from its declaring
+                // type. Re-enter the receiver's redefinition context before
+                // reading them, just as a direct member chain does.
+                elem = hit;
+                member_scope = self.b.elem_scope.get(&receiver).copied().unwrap_or(scope);
+            } else if !self.receiver_context_contains(elem) {
+                self.unbound_receiver = None;
+            }
+        }
+        let value = if qn.segments.len() == 1 && !qn.is_global {
+            self.feature_value_in(elem, Some(member_scope))
         } else {
             self.feature_value(elem)
+        };
+        self.unbound_receiver = previous;
+        value
+    }
+
+    /// The receiver's version of a lexical member, including a member
+    /// reached through an inherited method and redefined by the receiver. Call-local defaults and unrelated lexical declarations
+    /// do not become unknown just because their caller has no instance.
+    fn receiver_member(&mut self, elem: usize) -> Option<usize> {
+        let receiver = self.unbound_receiver?;
+        let value = self.b.id_name(elem)?;
+        let name = Name {
+            value,
+            span: Span::default(),
+        };
+        let sub = self.b.elem_scope.get(&receiver).copied();
+        let hit = self.b.resolve_rest(receiver, sub, &[name], 0)?;
+        let hit_owner = self.b.owner_elem(hit)?;
+        if !self.b.indexed_conforms(receiver, hit_owner) {
+            return None;
         }
+        if self.b.indexed_conforms(hit, elem) {
+            return Some(hit);
+        }
+        // SysML also permits redefinition by name in a specializing
+        // type, without an explicit :>> edge (the resolver's same-name
+        // shadowing rule). Unrelated locals with the same name do not
+        // satisfy this owner relationship.
+        if self.b.elements[hit].ty.ends_with("Usage") {
+            let owner = self.b.owner_elem(hit)?;
+            let base_owner = self.b.owner_elem(elem)?;
+            if owner != base_owner
+                && self.b.indexed_conforms(owner, base_owner)
+                && !self.b.indexed_conforms(base_owner, owner)
+            {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    /// A method-local expression may still read the receiver's fields.
+    /// Preserve its lexical context without treating the local itself as
+    /// a receiver member; imported declarations have unrelated owners.
+    fn receiver_context_contains(&mut self, elem: usize) -> bool {
+        let Some(receiver) = self.unbound_receiver else {
+            return false;
+        };
+        let mut owner = self.b.owner_elem(elem);
+        while let Some(o) = owner {
+            if self.b.indexed_conforms(receiver, o) {
+                return true;
+            }
+            owner = self.b.owner_elem(o);
+        }
+        false
     }
 
     /// `new T(args)` — instantiate `T`, binding arguments to its owned
@@ -1240,11 +1689,17 @@ impl Evaluator<'_> {
             .iter()
             .filter(|(_, e)| !self.b.values.contains_key(e));
         let mut fields = Vec::with_capacity(values.len());
+        let mut bound = HashSet::new();
         for (name, v) in values {
             match name {
                 Some(n) => {
                     if !declared.iter().any(|(f, _)| *f == n) {
                         return Err(EvalError::Unresolved(format!("field `{n}` of `{ty_name}`")));
+                    }
+                    if !bound.insert(n.clone()) {
+                        return Err(EvalError::Type(format!(
+                            "constructor field `{n}` is bound more than once"
+                        )));
                     }
                     fields.push((n, v));
                 }
@@ -1254,6 +1709,11 @@ impl Evaluator<'_> {
                             "too many constructor arguments for `{ty_name}`"
                         )));
                     };
+                    if !bound.insert(f.clone()) {
+                        return Err(EvalError::Type(format!(
+                            "constructor field `{f}` is bound more than once"
+                        )));
+                    }
                     fields.push((f.clone(), v));
                 }
             }
@@ -1284,7 +1744,16 @@ impl Evaluator<'_> {
     /// possibly-equal values need `collect`, and why
     /// `engines.specificImpulseVacuum` over five identical engines is
     /// one number, not five.
+    /// Uncertainty follows the evaluated receiver, including a receiver
+    /// returned by an alias, conditional or calculation.
     fn chain_into(&mut self, target: Value, member: &QualifiedName) -> Result_ {
+        // An unknown target has nothing to resolve a member against, and
+        // the step is as parametric as the target was: strictly
+        // propagating (see [`Value::Indeterminate`]) rather than a type
+        // error, so `subject.part.attribute` stays one undecided verdict.
+        if matches!(target, Value::Indeterminate) {
+            return Ok(Value::Indeterminate);
+        }
         if let Value::Sequence(items) = target {
             let mut out: Vec<Value> = Vec::new();
             for item in items {
@@ -1312,7 +1781,15 @@ impl Evaluator<'_> {
                     EvalError::Type(format!("field `{name}` of `{ty_name}` is not bound"))
                 });
         }
-        let (Value::Element(ElementRef(elem)) | Value::Unbound(ElementRef(elem))) = target else {
+        let unbound = match &target {
+            Value::UnboundMember(_) => true,
+            Value::Unbound(e) => self.b.is_reference_feature(e.0),
+            _ => false,
+        };
+        let (Value::Element(ElementRef(elem))
+        | Value::Unbound(ElementRef(elem))
+        | Value::UnboundMember(ElementRef(elem))) = target
+        else {
             return Err(EvalError::Type(
                 "chain target must be a model element".into(),
             ));
@@ -1333,7 +1810,7 @@ impl Evaluator<'_> {
         // (SysML 8.4.2 Table 32), which the model deliberately does not
         // materialize as relationships. `p.performedActions` collects
         // p's perform usages, each standing for its referenced action.
-        if !self.b.values.contains_key(&hit) {
+        if !unbound && !self.b.values.contains_key(&hit) {
             // A named slot answers with its owned parts before the general
             // collection rule, which would otherwise collect the slot
             // itself (it specializes the member it redefines).
@@ -1350,7 +1827,14 @@ impl Evaluator<'_> {
                 return Ok(v);
             }
         }
-        self.feature_value_in(hit, sub)
+        // Evaluate fixed formulas in the unknown receiver's context too:
+        // `eligible = willing` fixes the formula, not a default on willing.
+        // A concrete receiver establishes a fresh, known context.
+        let previous = self.unbound_receiver;
+        self.unbound_receiver = unbound.then_some(elem);
+        let value = self.feature_value_in(hit, sub);
+        self.unbound_receiver = previous;
+        value
     }
 
     /// A named slot's value: when the receiver owns a part that only
@@ -1661,10 +2145,8 @@ impl Evaluator<'_> {
             let id = self.b.elements[r]
                 .props
                 .get("referencedFeature")
-                .and_then(|v| v.get("@id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            if let Some(t) = id.and_then(|id| self.b.element_index_of_id(&id)) {
+                .and_then(|v| v.as_reference());
+            if let Some(t) = id.and_then(|id| self.b.element_index_of_uuid(id)) {
                 return Some(t);
             }
         }
@@ -1687,7 +2169,11 @@ impl Evaluator<'_> {
         })
     }
 
-    fn unit_dims(&mut self, scope: usize, e: &Expr) -> Result<(Vec<Dim>, f64, String), EvalError> {
+    fn unit_dims(
+        &mut self,
+        scope: usize,
+        e: &Expr,
+    ) -> Result<(Vec<Dim>, Rational, String), EvalError> {
         match &e.kind {
             ExprKind::Ref(qn) => {
                 let elem = self
@@ -1709,7 +2195,7 @@ impl Evaluator<'_> {
                         let (rd, rs, rdisp) = self.unit_dims(scope, rhs)?;
                         Ok((
                             dims_combine(&ld, &rd, 1),
-                            ls * rs,
+                            ls.mul(&rs),
                             format!("{ldisp}*{rdisp}"),
                         ))
                     }
@@ -1717,12 +2203,16 @@ impl Evaluator<'_> {
                         let (rd, rs, rdisp) = self.unit_dims(scope, rhs)?;
                         Ok((
                             dims_combine(&ld, &rd, -1),
-                            ls / rs,
+                            scale_ratio(&ls, &rs),
                             format!("{ldisp}/{rdisp}"),
                         ))
                     }
                     BinaryOp::Pow | BinaryOp::Caret => match unit_exponent(rhs) {
-                        Some(k) => Ok((dims_pow(&ld, (k, 1)), ls.powi(k), format!("{ldisp}**{k}"))),
+                        Some(k) => Ok((
+                            dims_pow(&ld, (k, 1)),
+                            ls.pow_or_approx(k),
+                            format!("{ldisp}**{k}"),
+                        )),
                         None => Err(EvalError::Unsupported(
                             "a unit exponent that is not an integer literal".into(),
                         )),
@@ -1758,7 +2248,49 @@ impl Evaluator<'_> {
         elem: usize,
         name: String,
         depth: u32,
-    ) -> (Vec<Dim>, f64) {
+    ) -> (Vec<Dim>, Rational) {
+        // Recursive/bound evaluations can have context-dependent cutoffs.
+        // Cache only complete unbound top-level reductions, and include the
+        // spelling switch and fallback scope in the key.
+        let cacheable = self.b.semantic_ready
+            && depth == 0
+            && self.env.is_empty()
+            && self.overrides.is_empty()
+            && self.in_progress.is_empty()
+            && !self.query
+            && self.call_depth == 0;
+        if !cacheable {
+            return self.expanded_unit_uncached(scope, elem, name, depth);
+        }
+        let key = (
+            self.b.owner_scope_of(elem).unwrap_or(scope),
+            elem,
+            name.clone(),
+            unit_spelling_expansion(),
+        );
+        if let Some(hit) = self.b.semantic_memo.units.get(&key).cloned() {
+            self.b.used_imports.extend(hit.imports);
+            return hit.value;
+        }
+        let imports = std::mem::take(&mut self.b.used_imports);
+        let value = self.expanded_unit_uncached(scope, elem, name, depth);
+        self.b.semantic_memo.units.insert(
+            key,
+            crate::semantic_memo::Proven {
+                value: value.clone(),
+                imports: self.b.used_imports.iter().copied().collect(),
+            },
+        );
+        self.b.used_imports.extend(imports);
+        value
+    }
+    fn expanded_unit_uncached(
+        &mut self,
+        scope: usize,
+        elem: usize,
+        name: String,
+        depth: u32,
+    ) -> (Vec<Dim>, Rational) {
         if depth < 8 {
             if let Some(out) = self.conversion_dims(elem, depth) {
                 return out;
@@ -1787,7 +2319,7 @@ impl Evaluator<'_> {
                 num: 1,
                 den: 1,
             }],
-            1.0,
+            Rational::one(),
         )
     }
 
@@ -1804,11 +2336,11 @@ impl Evaluator<'_> {
         elem: usize,
         name: &str,
         depth: u32,
-    ) -> Option<(Vec<Dim>, f64)> {
+    ) -> Option<(Vec<Dim>, Rational)> {
         let factors = parse_unit_spelling(name)?;
         let scope = self.b.owner_scope_of(elem).unwrap_or(scope);
         let mut dims: Vec<Dim> = Vec::new();
-        let mut scale = 1.0f64;
+        let mut scale = Rational::one();
         for (sym, exp) in factors {
             let qn = QualifiedName {
                 is_global: false,
@@ -1824,7 +2356,7 @@ impl Evaluator<'_> {
             }
             let (cd, cs) = self.expanded_unit(scope, c, sym, depth + 1);
             dims = dims_combine(&dims, &dims_pow(&cd, (exp, 1)), 1);
-            scale *= cs.powi(exp);
+            scale = scale.mul(&cs.pow_or_approx(exp));
         }
         Some((dims, scale))
     }
@@ -1834,7 +2366,7 @@ impl Evaluator<'_> {
     /// `referenceUnit` to a unit element and `conversionFactor` to a
     /// finite positive number (the abstract inherited members on every
     /// `MeasurementUnit` are valueless and fall out here).
-    fn conversion_dims(&mut self, elem: usize, depth: u32) -> Option<(Vec<Dim>, f64)> {
+    fn conversion_dims(&mut self, elem: usize, depth: u32) -> Option<(Vec<Dim>, Rational)> {
         let seg = |s: &str| {
             vec![Name {
                 value: s.to_string(),
@@ -1850,34 +2382,43 @@ impl Evaluator<'_> {
         let member = |b: &mut Self, owner: usize, scope: Option<usize>, name: &str| {
             let hit = b.b.resolve_rest(owner, scope, &seg(name), 0)?;
             match b.feature_value_in(hit, scope) {
-                Ok(Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e))) if e == hit => {
-                    None
-                }
+                Ok(
+                    Value::Element(ElementRef(e))
+                    | Value::Unbound(ElementRef(e))
+                    | Value::UnboundMember(ElementRef(e)),
+                ) if e == hit => None,
                 Ok(v) => Some(v),
                 Err(_) => None,
             }
         };
         let ref_unit = match member(self, conv, conv_scope, "referenceUnit")? {
-            Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e)) => e,
+            Value::Element(ElementRef(e))
+            | Value::Unbound(ElementRef(e))
+            | Value::UnboundMember(ElementRef(e)) => e,
             _ => return None,
         };
         // `ConversionByConvention` binds `conversionFactor` directly;
         // `ConversionByPrefix` derives it as `prefix.conversionFactor`
         // (MeasurementReferences.sysml) — follow that derivation
         // explicitly when the direct member is unbound.
-        let factor =
-            match member(self, conv, conv_scope, "conversionFactor").and_then(|v| v.as_f64()) {
-                Some(f) => f,
-                None => {
-                    let prefix = match member(self, conv, conv_scope, "prefix")? {
-                        Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e)) => e,
-                        _ => return None,
-                    };
-                    let p_scope = self.b.elem_scope.get(&prefix).copied();
-                    member(self, prefix, p_scope, "conversionFactor")?.as_f64()?
-                }
-            };
-        if !factor.is_finite() || factor <= 0.0 {
+        let factor = match member(self, conv, conv_scope, "conversionFactor").and_then(|v| v.num())
+        {
+            Some(f) => f,
+            None => {
+                let prefix = match member(self, conv, conv_scope, "prefix")? {
+                    Value::Element(ElementRef(e))
+                    | Value::Unbound(ElementRef(e))
+                    | Value::UnboundMember(ElementRef(e)) => e,
+                    _ => return None,
+                };
+                let p_scope = self.b.elem_scope.get(&prefix).copied();
+                member(self, prefix, p_scope, "conversionFactor")?.num()?
+            }
+        };
+        // An approximate factor (an irrational user conversion) enters
+        // the scale as the exact value of its double.
+        let factor = factor.exact()?;
+        if !factor.is_positive() {
             return None;
         }
         let ref_name = self.b.elements[ref_unit]
@@ -1892,7 +2433,7 @@ impl Evaluator<'_> {
         // fallback.
         let ref_scope = conv_scope.unwrap_or(0);
         let (dims, ref_scale) = self.expanded_unit(ref_scope, ref_unit, ref_name, depth + 1);
-        Some((dims, factor * ref_scale))
+        Some((dims, factor.mul(&ref_scale)))
     }
 
     /// `unit_dims`, but for a candidate derived-unit *definition*: any
@@ -1903,7 +2444,7 @@ impl Evaluator<'_> {
         scope: usize,
         e: &Expr,
         depth: u32,
-    ) -> Option<(Vec<Dim>, f64)> {
+    ) -> Option<(Vec<Dim>, Rational)> {
         match &e.kind {
             ExprKind::Ref(qn) => {
                 let elem = self.b.resolve(scope, qn, 0)?;
@@ -1915,15 +2456,15 @@ impl Evaluator<'_> {
                 match op {
                     BinaryOp::Mul => {
                         let (rd, rs) = self.power_product_dims(scope, rhs, depth)?;
-                        Some((dims_combine(&ld, &rd, 1), ls * rs))
+                        Some((dims_combine(&ld, &rd, 1), ls.mul(&rs)))
                     }
                     BinaryOp::Div => {
                         let (rd, rs) = self.power_product_dims(scope, rhs, depth)?;
-                        Some((dims_combine(&ld, &rd, -1), ls / rs))
+                        Some((dims_combine(&ld, &rd, -1), scale_ratio(&ls, &rs)))
                     }
                     BinaryOp::Pow | BinaryOp::Caret => {
                         let k = unit_exponent(rhs)?;
-                        Some((dims_pow(&ld, (k, 1)), ls.powi(k)))
+                        Some((dims_pow(&ld, (k, 1)), ls.pow_or_approx(k)))
                     }
                     _ => None,
                 }
@@ -2003,7 +2544,10 @@ impl Evaluator<'_> {
             // discipline).
             ClassificationOp::AtType => {
                 for v in &items {
-                    let (Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e))) = v else {
+                    let (Value::Element(ElementRef(e))
+                    | Value::Unbound(ElementRef(e))
+                    | Value::UnboundMember(ElementRef(e))) = v
+                    else {
                         return Err(EvalError::Type(
                             "the metadata test `@` applies to model elements".into(),
                         ));
@@ -2032,7 +2576,9 @@ impl Evaluator<'_> {
                 for v in items {
                     match v {
                         Value::Instance { .. } => metas.push(v),
-                        Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e)) => {
+                        Value::Element(ElementRef(e))
+                        | Value::Unbound(ElementRef(e))
+                        | Value::UnboundMember(ElementRef(e)) => {
                             if matches!(self.b.elements[e].ty, "MetadataUsage" | "MetadataFeature")
                             {
                                 // An annotation already *is* a metaobject.
@@ -2075,7 +2621,9 @@ impl Evaluator<'_> {
         if target.segments.len() == 1 && !target.is_global {
             let name = &target.segments[0].value;
             if let Some((_, v)) = self.env.iter().rev().find(|(n, _)| n == name) {
-                let (Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e))) = v.clone()
+                let (Value::Element(ElementRef(e))
+                | Value::Unbound(ElementRef(e))
+                | Value::UnboundMember(ElementRef(e))) = v.clone()
                 else {
                     return Err(EvalError::Type(
                         "`.metadata` applies to model elements".into(),
@@ -2123,7 +2671,7 @@ impl Evaluator<'_> {
                  not loaded)"
             ))
         })?;
-        let props = self.b.elements[elem].props.clone();
+        let props = self.b.elements[elem].props.to_json();
         let mut fields = Vec::new();
         for (k, v) in props {
             let value = match v {
@@ -2131,7 +2679,12 @@ impl Evaluator<'_> {
                 serde_json::Value::Bool(b) => Value::Boolean(b),
                 serde_json::Value::Number(n) => match n.as_i64() {
                     Some(i) => Value::Integer(i as i128),
-                    None => Value::Rational(n.as_f64().unwrap_or(f64::NAN)),
+                    // A JSON number's decimal spelling is the value
+                    // meant; read it exactly rather than through a double.
+                    None => match Rational::parse_decimal(&n.to_string()) {
+                        Some(r) => Value::from_num(Num::Exact(r)),
+                        None => Value::Real(n.as_f64().unwrap_or(f64::NAN)),
+                    },
                 },
                 _ => continue,
             };
@@ -2155,7 +2708,9 @@ impl Evaluator<'_> {
     fn metaobject_conforms(&mut self, v: &Value, target: usize) -> Result<bool, EvalError> {
         let classifier = match v {
             Value::Instance { ty, .. } => ty.0,
-            Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e)) => *e,
+            Value::Element(ElementRef(e))
+            | Value::Unbound(ElementRef(e))
+            | Value::UnboundMember(ElementRef(e)) => *e,
             _ => {
                 return Err(EvalError::Type(
                     "metadata classification applies to metaobjects".into(),
@@ -2215,10 +2770,21 @@ impl Evaluator<'_> {
                 "Number",
                 "ScalarValue",
             ]),
+            Value::Rational(r) if r.is_integer() => scalar(&[
+                "Integer",
+                "Rational",
+                "Real",
+                "Complex",
+                "Number",
+                "ScalarValue",
+            ]),
             Value::Rational(_) => scalar(&["Rational", "Real", "Complex", "Number", "ScalarValue"]),
+            Value::Real(_) => scalar(&["Real", "Complex", "Number", "ScalarValue"]),
             Value::Boolean(_) => scalar(&["Boolean", "ScalarValue"]),
             Value::String(_) => scalar(&["String", "ScalarValue"]),
-            Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e)) => {
+            Value::Element(ElementRef(e))
+            | Value::Unbound(ElementRef(e))
+            | Value::UnboundMember(ElementRef(e)) => {
                 if !direct && self.conforms_upward(*e, target) {
                     return Ok(Some(true));
                 }
@@ -2337,8 +2903,10 @@ impl Evaluator<'_> {
                         .map(|(_, v)| v.clone());
                     if let Some(value) = bound {
                         return match value {
-                            Value::Element(ElementRef(elem)) | Value::Unbound(ElementRef(elem)) => {
-                                self.user_calc_elem(display, elem, args)
+                            Value::Element(ElementRef(elem))
+                            | Value::Unbound(ElementRef(elem))
+                            | Value::UnboundMember(ElementRef(elem)) => {
+                                self.user_calc_elem(&display, elem, args)
                             }
                             Value::Indeterminate => Ok(Value::Indeterminate),
                             other => Err(EvalError::Type(format!(
@@ -2369,7 +2937,7 @@ impl Evaluator<'_> {
                 (display, elem)
             }
         };
-        self.user_calc_elem(display, elem, args)
+        self.user_calc_elem(&display, elem, args)
     }
 
     /// Invoke an already-resolved calculation element. Kept separate from
@@ -2377,10 +2945,34 @@ impl Evaluator<'_> {
     /// concrete element bound in the current calculation frame.
     fn user_calc_elem(
         &mut self,
-        display: String,
+        display: &str,
         elem: usize,
         args: Vec<(Option<String>, Value)>,
     ) -> Result_ {
+        let previous = self.unbound_receiver;
+        let elem = match self.receiver_member(elem) {
+            Some(hit) => hit,
+            None => {
+                self.unbound_receiver = None;
+                elem
+            }
+        };
+        let value = self.user_calc_body(display, elem, args);
+        self.unbound_receiver = previous;
+        value
+    }
+
+    fn user_calc_body(
+        &mut self,
+        display: &str,
+        elem: usize,
+        args: Vec<(Option<String>, Value)>,
+    ) -> Result_ {
+        if self.b.calculation_requires_execution(elem) {
+            return Err(EvalError::Unsupported(
+                "calculation body requires statement execution".into(),
+            ));
+        }
         let has_body = self.b.result_exprs.iter().any(|(o, _, _)| *o == elem)
             || self
                 .b
@@ -2395,29 +2987,84 @@ impl Evaluator<'_> {
         // Validate and bind arguments before the abstract/bodiless fallback:
         // an unknown result does not make an invalid invocation well-formed.
         let params = self.callee_params(elem);
-        let depth = self.env.len();
+        // Parameters belong to this invocation. A missing argument/default
+        // must never capture a same-named parameter from the calling frame.
+        let caller_env = self.env.clone();
+        self.env.retain(|(name, _)| !params.contains(name));
         let mut positional = 0usize;
+        let mut bound = HashSet::new();
         for (name, v) in args {
             match name {
                 Some(n) => {
                     if !params.contains(&n) {
-                        self.env.truncate(depth);
+                        self.env = caller_env;
                         return Err(EvalError::Unresolved(format!(
                             "parameter `{n}` of `{display}`"
+                        )));
+                    }
+                    if !bound.insert(n.clone()) {
+                        self.env = caller_env;
+                        return Err(EvalError::Type(format!(
+                            "parameter `{n}` of `{display}` is bound more than once"
                         )));
                     }
                     self.env.push((n, v));
                 }
                 None => {
                     let Some(p) = params.get(positional) else {
-                        self.env.truncate(depth);
+                        self.env = caller_env;
                         return Err(EvalError::Type(format!(
                             "too many arguments to `{display}`"
                         )));
                     };
+                    if !bound.insert(p.clone()) {
+                        self.env = caller_env;
+                        return Err(EvalError::Type(format!(
+                            "parameter `{p}` of `{display}` is bound more than once"
+                        )));
+                    }
                     self.env.push((p.clone(), v));
                     positional += 1;
                 }
+            }
+        }
+        if has_body {
+            for name in &params {
+                if bound.contains(name) {
+                    continue;
+                }
+                let mut stack = vec![elem];
+                let mut seen = HashSet::new();
+                let mut parameter = None;
+                while let Some(owner) = stack.pop() {
+                    if !seen.insert(owner) {
+                        continue;
+                    }
+                    if let Some((_, field)) = self
+                        .b
+                        .ctor_fields
+                        .get(&owner)
+                        .and_then(|fields| fields.iter().find(|(n, _)| n == name))
+                    {
+                        parameter = Some(*field);
+                        break;
+                    }
+                    stack.extend(self.b.explicit_supertype_elems(owner));
+                }
+                let Some(parameter) = parameter.filter(|p| self.b.values.contains_key(p)) else {
+                    self.env = caller_env;
+                    return Err(EvalError::Unresolved(format!(
+                        "unbound parameter `{name}` of `{display}`"
+                    )));
+                };
+                let value = match self.feature_value(parameter) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.env = caller_env;
+                        return Err(error);
+                    }
+                };
+                self.env.push((name.clone(), value));
             }
         }
         // A calculation's result is its trailing result expression, or —
@@ -2426,13 +3073,13 @@ impl Evaluator<'_> {
             Result(usize, Expr),
             Return(usize),
         }
-        let body = match self
+        let result = self
             .b
             .result_exprs
             .iter()
             .find(|(o, _, _)| *o == elem)
-            .map(|(_, s, e)| (*s, e.clone()))
-        {
+            .map(|(_, s, e)| (*s, e.clone()));
+        let body = match result {
             Some((s, e)) => CalcBody::Result(s, e),
             None => match self.b.return_params.get(&elem) {
                 Some(&ret) if self.b.values.contains_key(&ret) => CalcBody::Return(ret),
@@ -2444,19 +3091,24 @@ impl Evaluator<'_> {
                     // Non-callable targets keep the error (degrading
                     // those would mask a genuine model defect).
                     if self.callee_is_calculation(elem) {
-                        self.env.truncate(depth);
+                        self.env = caller_env;
                         return Ok(Value::Indeterminate);
                     }
-                    self.env.truncate(depth);
+                    self.env = caller_env;
                     return Err(EvalError::Unsupported(format!(
                         "function `{display}` (no result expression)"
                     )));
                 }
             },
         };
-        if self.call_depth >= 64 {
-            self.env.truncate(depth);
-            return Err(EvalError::Cycle(display));
+        // Call depth is a budget, not a cycle: a recursion that does not
+        // terminate reaches it, and so does a legitimately deep chain of
+        // distinct calculations.
+        if self.call_depth >= MAX_CALL_DEPTH {
+            self.env = caller_env;
+            return Err(EvalError::Budget(format!(
+                "evaluation nested more than {MAX_CALL_DEPTH} calculation calls, at `{display}`"
+            )));
         }
         self.call_depth += 1;
         // A library-owned callee evaluates in a library frame: its body
@@ -2474,7 +3126,7 @@ impl Evaluator<'_> {
             self.lib_frames -= 1;
         }
         self.call_depth -= 1;
-        self.env.truncate(depth);
+        self.env = caller_env;
         out
     }
 
@@ -2493,7 +3145,8 @@ impl Evaluator<'_> {
                     .unwrap_or(false)
         };
         match (a, b) {
-            (Value::Unbound(_), _) | (_, Value::Unbound(_)) => {
+            (Value::Unbound(_) | Value::UnboundMember(_), _)
+            | (_, Value::Unbound(_) | Value::UnboundMember(_)) => {
                 Err(EvalError::Type("comparison with an unbound feature".into()))
             }
             (Value::Element(x), Value::Element(y)) => {
@@ -2510,8 +3163,8 @@ impl Evaluator<'_> {
                 if u == v {
                     Ok(value_eq(x, y))
                 } else if same_dims(u, v) {
-                    match (x.as_f64(), y.as_f64()) {
-                        (Some(a), Some(b)) => Ok(a * u.scale == b * v.scale),
+                    match (x.num(), y.num()) {
+                        (Some(a), Some(b)) => Ok(a.scale(&u.scale).eq(&b.scale(&v.scale))),
                         _ => Err(EvalError::Type("numeric operands required".into())),
                     }
                 } else {
@@ -2538,7 +3191,7 @@ impl Evaluator<'_> {
     fn tri_boolean(&mut self, scope: usize, e: &Expr) -> Result<Option<bool>, EvalError> {
         match self.expr(scope, e)? {
             Value::Boolean(b) => Ok(Some(b)),
-            Value::Unbound(_) | Value::Indeterminate => Ok(None),
+            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => Ok(None),
             other => Err(EvalError::Type(format!("expected a boolean, got {other}"))),
         }
     }
@@ -2605,12 +3258,16 @@ impl Evaluator<'_> {
         // error — a parametric formula over an unbound feature degrades
         // to an indeterminate value. Closed `Element` values still
         // type-error below (an enum literal is not a number).
-        if matches!(l, Value::Unbound(_) | Value::Indeterminate)
-            || matches!(r, Value::Unbound(_) | Value::Indeterminate)
-        {
+        if matches!(
+            l,
+            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+        ) || matches!(
+            r,
+            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+        ) {
             return Ok(Value::Indeterminate);
         }
-        match op {
+        let value = match op {
             AndAmp | Xor | OrBar => match (l, r) {
                 (Value::Boolean(a), Value::Boolean(b)) => Ok(Value::Boolean(match op {
                     AndAmp => a && b,
@@ -2632,13 +3289,27 @@ impl Evaluator<'_> {
             }
             Range => match (l, r) {
                 (Value::Integer(a), Value::Integer(b)) => {
-                    Ok(Value::Sequence((a..=b).map(Value::Integer).collect()))
+                    // Checked: the bounds may span the whole `i128` range.
+                    let count = if b < a {
+                        Some(0)
+                    } else {
+                        b.checked_sub(a).and_then(|n| n.checked_add(1))
+                    };
+                    match count {
+                        Some(n) if n <= MAX_SEQUENCE as i128 => {
+                            Ok(Value::Sequence((a..=b).map(Value::Integer).collect()))
+                        }
+                        _ => Err(EvalError::Budget(format!(
+                            "range `{a}..{b}` has more than {MAX_SEQUENCE} elements"
+                        ))),
+                    }
                 }
                 _ => Err(EvalError::Type("`..` needs integer bounds".into())),
             },
             Add | Sub | Mul | Div | Rem | Pow | Caret => arith(op, l, r),
             _ => unreachable!("short-circuit ops handled above"),
-        }
+        }?;
+        self.charged(value)
     }
 
     /// `target->Fn (args)` / `->Fn {body}` — invocation with the target as
@@ -2661,7 +3332,7 @@ impl Evaluator<'_> {
                 }
                 if values.iter().all(|(n, _)| n.is_none()) {
                     let positional: Vec<Value> = values.iter().map(|(_, v)| v.clone()).collect();
-                    match self.intrinsic(ty, positional) {
+                    match self.intrinsic(ty, &positional) {
                         Err(EvalError::Unsupported(_)) => {}
                         out => return out,
                     }
@@ -2687,12 +3358,16 @@ impl Evaluator<'_> {
 
     /// Control functions with a lambda body over a sequence.
     /// Apply a control function's per-item computation: a `{ … }` lambda
-    /// body, or a referenced function (`->reduce '+'`).
+    /// body, or a referenced function (`->reduce '+'`). A per-item result
+    /// is a materialized value like any other — a fold over a thousand
+    /// items builds a thousand of them — so it leaves through
+    /// [`Self::charged`].
     fn apply(&mut self, scope: usize, applier: &Applier<'_>, args: &[Value]) -> Result_ {
-        match applier {
-            Applier::Lambda(body) => self.apply_lambda(scope, body, args),
-            Applier::FnRef(qn) => self.apply_fn_ref(scope, qn, args.to_vec()),
-        }
+        let value = match applier {
+            Applier::Lambda(body) => self.apply_lambda(scope, body, args)?,
+            Applier::FnRef(qn) => self.apply_fn_ref(scope, qn, args.to_vec())?,
+        };
+        self.charged(value)
     }
 
     /// Apply a *referenced* function to arguments: operator spellings
@@ -2716,7 +3391,7 @@ impl Evaluator<'_> {
                 return arith(op, l.clone(), r.clone());
             }
         }
-        match self.intrinsic(&TargetRef::Name(qn.clone()), args.clone()) {
+        match self.intrinsic(&TargetRef::Name(qn.clone()), &args) {
             Err(EvalError::Unsupported(_)) => {}
             out => return out,
         }
@@ -2724,7 +3399,20 @@ impl Evaluator<'_> {
         self.user_calc(scope, &TargetRef::Name(qn.clone()), named)
     }
 
+    /// A control function's own result — the collected, selected or
+    /// folded value — through the allocation budget.
     fn control(
+        &mut self,
+        scope: usize,
+        name: &str,
+        target: Value,
+        applier: &Applier<'_>,
+    ) -> Result_ {
+        let value = self.control_uncharged(scope, name, target, applier)?;
+        self.charged(value)
+    }
+
+    fn control_uncharged(
         &mut self,
         scope: usize,
         name: &str,
@@ -2751,7 +3439,9 @@ impl Evaluator<'_> {
                                     out.push(item.clone());
                                 }
                             }
-                            Value::Unbound(_) | Value::Indeterminate => unknown = true,
+                            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
+                                unknown = true
+                            }
                             _ => {
                                 return Err(EvalError::Type(format!(
                                     "{name} body must yield a boolean"
@@ -2759,7 +3449,9 @@ impl Evaluator<'_> {
                             }
                         },
                         "forAll" => match v {
-                            Value::Unbound(_) | Value::Indeterminate => unknown = true,
+                            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
+                                unknown = true
+                            }
                             v if v != Value::Boolean(true) => {
                                 return Ok(Value::Boolean(false));
                             }
@@ -2767,7 +3459,9 @@ impl Evaluator<'_> {
                         },
                         "exists" => match v {
                             Value::Boolean(true) => return Ok(Value::Boolean(true)),
-                            Value::Unbound(_) | Value::Indeterminate => unknown = true,
+                            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
+                                unknown = true
+                            }
                             _ => {}
                         },
                         _ => unreachable!(),
@@ -2788,7 +3482,7 @@ impl Evaluator<'_> {
                         Value::Boolean(false) => {}
                         // An unknown predicate makes *which* item is
                         // selected unknown.
-                        Value::Unbound(_) | Value::Indeterminate => {
+                        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
                             return Ok(Value::Indeterminate);
                         }
                         _ => {
@@ -2835,11 +3529,17 @@ impl Evaluator<'_> {
             // A non-body lambda argument evaluates as a plain expression.
             return self.expr(scope, body);
         };
+        Self::check_expression_body(members)?;
         let mut params = Vec::new();
         let mut result = None;
         for m in members {
             match &m.kind {
-                MemberKind::Usage(u) if u.prefix.direction.is_some() => {
+                MemberKind::Usage(u)
+                    if matches!(
+                        u.prefix.direction,
+                        Some(FeatureDirection::In | FeatureDirection::InOut)
+                    ) =>
+                {
                     if let Some(n) = &u.declaration.id.name {
                         params.push(n.value.clone());
                     }
@@ -2850,6 +3550,13 @@ impl Evaluator<'_> {
         }
         let result =
             result.ok_or_else(|| EvalError::Unsupported("lambda body without a result".into()))?;
+        if params.len() != args.len() {
+            return Err(EvalError::Type(format!(
+                "lambda expects {} argument(s), got {}",
+                params.len(),
+                args.len()
+            )));
+        }
         let depth = self.env.len();
         for (p, v) in params.iter().zip(args) {
             self.env.push((p.clone(), v.clone()));
@@ -2861,6 +3568,7 @@ impl Evaluator<'_> {
 
     /// Evaluate a `{ …; result-expr }` body expression directly.
     fn body_result(&mut self, scope: usize, members: &[Member]) -> Result_ {
+        Self::check_expression_body(members)?;
         for m in members {
             if let MemberKind::Result(e) = &m.kind {
                 return self.expr(scope, e);
@@ -2869,6 +3577,23 @@ impl Evaluator<'_> {
         Err(EvalError::Unsupported(
             "body expression without a result".into(),
         ))
+    }
+
+    fn check_expression_body(members: &[Member]) -> Result<(), EvalError> {
+        if members.iter().any(crate::json::member_requires_execution) {
+            return Err(EvalError::Unsupported(
+                "calculation body requires statement execution".into(),
+            ));
+        }
+        if members
+            .iter()
+            .any(|m| matches!(&m.kind, MemberKind::Usage(u) if u.prefix.direction.is_none()))
+        {
+            return Err(EvalError::Unsupported(
+                "expression-body local declarations require scoped evaluation".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The elements owned by `e` through its owned memberships, as
@@ -2883,7 +3608,7 @@ impl Evaluator<'_> {
 
     /// One reflection answer over element `e` (empty sequence when the
     /// element has no such name).
-    fn reflect_element(&mut self, what: &str, e: usize) -> Value {
+    fn reflect_element(&self, what: &str, e: usize) -> Value {
         let props = &self.b.elements[e].props;
         let name = |k: &str| props.get(k).and_then(|v| v.as_str()).map(str::to_string);
         let some = |s: Option<String>| {
@@ -2935,35 +3660,55 @@ impl Evaluator<'_> {
     }
 
     /// Kernel Function Library intrinsics, matched by the invoked name's
-    /// last segment.
-    fn intrinsic(&mut self, ty: &TargetRef, args: Vec<Value>) -> Result_ {
+    /// last segment. An intrinsic that builds a sequence or a string
+    /// (`reverse`, `including`, `ToString`, `Substring`, …) returns it
+    /// through the allocation budget; an
+    /// [`EvalError::Unsupported`] answer is the "not an intrinsic"
+    /// sentinel invocation dispatch falls through on, and stays exactly
+    /// that.
+    fn intrinsic(&mut self, ty: &TargetRef, args: &[Value]) -> Result_ {
+        let value = self.intrinsic_uncharged(ty, args)?;
+        self.charged(value)
+    }
+
+    fn intrinsic_uncharged(&mut self, ty: &TargetRef, args: &[Value]) -> Result_ {
         let TargetRef::Name(qn) = ty else {
             return Err(EvalError::Unsupported("chained function reference".into()));
         };
         let name = qn.segments.last().unwrap().value.as_str();
         let items = |v: &Value| v.clone().items();
-        match (name, args.as_slice()) {
+        match (name, args) {
             // Reflection over the model structure (query mode only —
             // `sysmlv2 query` / `ResolvedModel::query` — so these names
             // can never shadow a user calculation in a model file): the
             // KerML derived properties `Namespace::ownedMember` /
             // `Type::ownedFeature` as functions over a model element.
-            ("ownedMember", [Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e))])
-                if self.query =>
-            {
-                Ok(Value::Sequence(self.owned_members(*e, false)))
-            }
-            ("ownedFeature", [Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e))])
-                if self.query =>
-            {
-                Ok(Value::Sequence(self.owned_members(*e, true)))
-            }
+            (
+                "ownedMember",
+                [
+                    Value::Element(ElementRef(e))
+                    | Value::Unbound(ElementRef(e))
+                    | Value::UnboundMember(ElementRef(e)),
+                ],
+            ) if self.query => Ok(Value::Sequence(self.owned_members(*e, false))),
+            (
+                "ownedFeature",
+                [
+                    Value::Element(ElementRef(e))
+                    | Value::Unbound(ElementRef(e))
+                    | Value::UnboundMember(ElementRef(e)),
+                ],
+            ) if self.query => Ok(Value::Sequence(self.owned_members(*e, true))),
             // Element reflection (query mode): names, metaclass and
             // documentation of a model element, as the rendering backend's
             // translated template expressions ask for them.
             (
                 "declaredName" | "shortName" | "qualifiedName" | "metaclass" | "docs",
-                [Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e))],
+                [
+                    Value::Element(ElementRef(e))
+                    | Value::Unbound(ElementRef(e))
+                    | Value::UnboundMember(ElementRef(e)),
+                ],
             ) if self.query => Ok(self.reflect_element(name, *e)),
             (
                 "declaredName" | "shortName" | "qualifiedName" | "metaclass" | "docs",
@@ -2971,7 +3716,10 @@ impl Evaluator<'_> {
             ) if self.query => {
                 let mut out = Vec::new();
                 for item in items {
-                    if let Value::Element(ElementRef(e)) | Value::Unbound(ElementRef(e)) = item {
+                    if let Value::Element(ElementRef(e))
+                    | Value::Unbound(ElementRef(e))
+                    | Value::UnboundMember(ElementRef(e)) = item
+                    {
                         out.extend(self.reflect_element(name, *e).items());
                     }
                 }
@@ -2993,7 +3741,7 @@ impl Evaluator<'_> {
             // emptiness; anything else is honestly undecided. Sequences
             // *containing* placeholders keep their literal arity, and
             // library frames never mint Unbound in the first place.
-            ("size", [Value::Unbound(ElementRef(e))]) => {
+            ("size", [Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))]) => {
                 match self.unbound_cardinality(*e) {
                     Some((lo, hi)) if lo == hi && lo.is_finite() => Ok(Value::Integer(lo as i128)),
                     // Indeterminate, not an error — the cardinality is
@@ -3004,16 +3752,20 @@ impl Evaluator<'_> {
                     _ => Ok(Value::Indeterminate),
                 }
             }
-            ("isEmpty", [Value::Unbound(ElementRef(e))]) => match self.unbound_cardinality(*e) {
-                Some((_, 0.0)) => Ok(Value::Boolean(true)),
-                Some((lo, _)) if lo >= 1.0 => Ok(Value::Boolean(false)),
-                _ => Ok(Value::Indeterminate),
-            },
-            ("notEmpty", [Value::Unbound(ElementRef(e))]) => match self.unbound_cardinality(*e) {
-                Some((_, 0.0)) => Ok(Value::Boolean(false)),
-                Some((lo, _)) if lo >= 1.0 => Ok(Value::Boolean(true)),
-                _ => Ok(Value::Indeterminate),
-            },
+            ("isEmpty", [Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))]) => {
+                match self.unbound_cardinality(*e) {
+                    Some((_, 0.0)) => Ok(Value::Boolean(true)),
+                    Some((lo, _)) if lo >= 1.0 => Ok(Value::Boolean(false)),
+                    _ => Ok(Value::Indeterminate),
+                }
+            }
+            ("notEmpty", [Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))]) => {
+                match self.unbound_cardinality(*e) {
+                    Some((_, 0.0)) => Ok(Value::Boolean(false)),
+                    Some((lo, _)) if lo >= 1.0 => Ok(Value::Boolean(true)),
+                    _ => Ok(Value::Indeterminate),
+                }
+            }
             // Cardinality/emptiness of an indeterminate value is itself
             // indeterminate.
             ("size" | "isEmpty" | "notEmpty", [Value::Indeterminate]) => Ok(Value::Indeterminate),
@@ -3040,8 +3792,8 @@ impl Evaluator<'_> {
                     Value::Boolean(name == "excludes")
                 })
             }
-            ("head", [s]) => Ok(items(s).first().cloned().unwrap_or(Value::null())),
-            ("last", [s]) => Ok(items(s).last().cloned().unwrap_or(Value::null())),
+            ("head", [s]) => Ok(items(s).first().cloned().unwrap_or_else(Value::null)),
+            ("last", [s]) => Ok(items(s).last().cloned().unwrap_or_else(Value::null)),
             ("tail", [s]) => {
                 let mut i = items(s);
                 if !i.is_empty() {
@@ -3068,29 +3820,35 @@ impl Evaluator<'_> {
             ("max", [a, b]) => extremum(vec![a.clone(), b.clone()], true),
             ("min", [a, b]) => extremum(vec![a.clone(), b.clone()], false),
             ("abs", [v]) => match v {
-                Value::Integer(i) => Ok(Value::Integer(i.abs())),
-                Value::Rational(r) => Ok(Value::Rational(r.abs())),
-                Value::Quantity(n, u) => match **n {
-                    Value::Integer(i) => Ok(Value::Quantity(
-                        Box::new(Value::Integer(i.abs())),
+                Value::Quantity(n, u) => match n.num() {
+                    Some(x) => Ok(Value::Quantity(
+                        Box::new(Value::from_num(x.abs())),
                         u.clone(),
                     )),
-                    Value::Rational(r) => Ok(Value::Quantity(
-                        Box::new(Value::Rational(r.abs())),
-                        u.clone(),
-                    )),
-                    _ => Err(EvalError::Type("abs needs a number".into())),
+                    None => Err(EvalError::Type("abs needs a number".into())),
                 },
-                _ => Err(EvalError::Type("abs needs a number".into())),
+                v => match v.num() {
+                    Some(x) => Ok(Value::from_num(x.abs())),
+                    None => Err(EvalError::Type("abs needs a number".into())),
+                },
             },
             // sqrt is `^(1/2)` — on a quantity it also halves the unit
-            // exponents.
-            ("sqrt", [v @ Value::Quantity(..)]) => {
-                arith(BinaryOp::Pow, v.clone(), Value::Rational(0.5))
-            }
-            ("sqrt", [v]) => num1(v, f64::sqrt),
+            // exponents. Exact when the root exists (`sqrt(0.25)` is
+            // `0.5`), otherwise a double.
+            ("sqrt", [v @ Value::Quantity(..)]) => arith(
+                BinaryOp::Pow,
+                v.clone(),
+                Value::Rational(Rational::new(1, 2).expect("non-zero denominator")),
+            ),
+            ("sqrt", [v]) => match v.num() {
+                Some(n) if n.is_negative() => {
+                    Err(EvalError::Type("sqrt of a negative number".into()))
+                }
+                Some(n) => Ok(Value::from_num(n.root(2))),
+                None => Err(EvalError::Type("sqrt needs a number".into())),
+            },
             ("ln", [v]) => match v.as_f64() {
-                Some(f) if f > 0.0 => Ok(Value::Rational(f.ln())),
+                Some(f) if f > 0.0 => Ok(Value::Real(f.ln())),
                 Some(_) => Err(EvalError::Type("ln of a non-positive number".into())),
                 None => Err(EvalError::Type("ln needs a number".into())),
             },
@@ -3099,9 +3857,12 @@ impl Evaluator<'_> {
             ("sin", [v]) => num1(v, f64::sin),
             ("cos", [v]) => num1(v, f64::cos),
             ("tan", [v]) => num1(v, f64::tan),
-            // RationalFunctions::rat — true division (our Rational is a
-            // numeric value, not a numerator/denominator pair).
+            // RationalFunctions::rat/numer/denom — exact division and the
+            // reduced fraction's parts (a double counts through its exact
+            // dyadic value).
             ("rat", [a, b]) => arith(BinaryOp::Div, a.clone(), b.clone()),
+            ("numer", [v]) => rational_part(v, true),
+            ("denom", [v]) => rational_part(v, false),
             // ComplexFunctions::re/im on real values.
             ("re", [v]) => match v.as_f64() {
                 Some(_) => Ok(v.clone()),
@@ -3112,26 +3873,26 @@ impl Evaluator<'_> {
                 None => Err(EvalError::Type("im needs a number".into())),
             },
             // NumericalFunctions::isZero/isUnit.
-            ("isZero", [v]) => match v.as_f64() {
-                Some(f) => Ok(Value::Boolean(f == 0.0)),
+            ("isZero", [v]) => match v.num() {
+                Some(n) => Ok(Value::Boolean(n.is_zero())),
                 None => Err(EvalError::Type("isZero needs a number".into())),
             },
-            ("isUnit", [v]) => match v.as_f64() {
-                Some(f) => Ok(Value::Boolean(f == 1.0)),
+            ("isUnit", [v]) => match v.num() {
+                Some(n) => Ok(Value::Boolean(n.is_one())),
                 None => Err(EvalError::Type("isUnit needs a number".into())),
             },
             ("log", [v]) => match v.as_f64() {
-                Some(f) if f > 0.0 => Ok(Value::Rational(f.log10())),
+                Some(f) if f > 0.0 => Ok(Value::Real(f.log10())),
                 Some(_) => Err(EvalError::Type("log of a non-positive number".into())),
                 None => Err(EvalError::Type("log needs a number".into())),
             },
-            ("floor", [v]) => match v.as_f64() {
-                Some(f) => Ok(Value::Integer(f.floor() as i128)),
-                None => Err(EvalError::Type("floor needs a number".into())),
+            ("floor", [v]) => match v.num().and_then(|n| n.floor()) {
+                Some(n) => Ok(Value::from_num(n)),
+                None => Err(EvalError::Type("floor needs a finite number".into())),
             },
-            ("round", [v]) => match v.as_f64() {
-                Some(f) => Ok(Value::Integer(f.round() as i128)),
-                None => Err(EvalError::Type("round needs a number".into())),
+            ("round", [v]) => match v.num().and_then(|n| n.round()) {
+                Some(n) => Ok(Value::from_num(n)),
+                None => Err(EvalError::Type("round needs a finite number".into())),
             },
             ("ToString", [v]) => Ok(Value::String(match v {
                 Value::String(s) => s.clone(),
@@ -3142,11 +3903,13 @@ impl Evaluator<'_> {
                 .parse::<i128>()
                 .map(Value::Integer)
                 .map_err(|_| EvalError::Type(format!("cannot parse `{s}` as Integer"))),
-            ("ToReal", [Value::String(s)]) => s
-                .trim()
-                .parse::<f64>()
-                .map(Value::Rational)
-                .map_err(|_| EvalError::Type(format!("cannot parse `{s}` as Real"))),
+            // A decimal or fraction spelling converts exactly, so
+            // `ToString` output reads back; anything else the double
+            // parser accepts (`inf`) is approximate.
+            ("ToReal", [Value::String(s)]) => Rational::parse(s)
+                .map(|r| Value::from_num(Num::Exact(r)))
+                .or_else(|| s.trim().parse::<f64>().ok().map(Value::Real))
+                .ok_or_else(|| EvalError::Type(format!("cannot parse `{s}` as Real"))),
             ("Length", [Value::String(s)]) => Ok(Value::Integer(s.chars().count() as i128)),
             ("Substring", [Value::String(s), Value::Integer(lo), Value::Integer(hi)]) => {
                 // KerML string indexing is 1-based and inclusive.
@@ -3169,10 +3932,12 @@ impl Evaluator<'_> {
 /// Scale a scalar or vector quantity magnitude during same-dimension unit
 /// conversion. Components that already carry their own unit are coordinates
 /// with an explicit measurement reference and remain verbatim.
-fn scale_magnitude(v: Value, factor: f64) -> Result<Value, EvalError> {
+fn scale_magnitude(v: Value, factor: &Rational) -> Result<Value, EvalError> {
     match v {
-        Value::Integer(i) => Ok(Value::Rational(i as f64 * factor)),
-        Value::Rational(r) => Ok(Value::Rational(r * factor)),
+        Value::Integer(_) | Value::Rational(_) | Value::Real(_) => {
+            let n = v.num().expect("numeric arm");
+            Ok(Value::from_num(n.scale(factor)))
+        }
         Value::Sequence(items) => items
             .into_iter()
             .map(|v| match v {
@@ -3181,7 +3946,9 @@ fn scale_magnitude(v: Value, factor: f64) -> Result<Value, EvalError> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Sequence),
-        Value::Unbound(_) | Value::Indeterminate => Ok(Value::Indeterminate),
+        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
+            Ok(Value::Indeterminate)
+        }
         other => Err(EvalError::Type(format!(
             "a quantity needs a numeric magnitude, got {other}"
         ))),
@@ -3189,14 +3956,28 @@ fn scale_magnitude(v: Value, factor: f64) -> Result<Value, EvalError> {
 }
 
 fn is_zero(v: &Value) -> bool {
-    matches!(v, Value::Integer(0)) || matches!(v, Value::Rational(r) if *r == 0.0)
+    v.num().is_some_and(|n| n.is_zero())
+}
+
+/// `numer`/`denom` of a number's reduced fraction.
+fn rational_part(v: &Value, numer: bool) -> Result<Value, EvalError> {
+    let name = if numer { "numer" } else { "denom" };
+    let Some(n) = v.num() else {
+        return Err(EvalError::Type(format!("{name} needs a number")));
+    };
+    let Some(r) = n.exact() else {
+        return Err(EvalError::Type(format!("{name} needs a finite number")));
+    };
+    let (num, den) = r.to_string_parts();
+    let part = Rational::parse_decimal(if numer { &num } else { &den }).expect("decimal digits");
+    Ok(Value::from_num(Num::Exact(part)))
 }
 
 /// Whether equality involving this value is undecidable because some part is
 /// an unbound or indeterminate value.
 fn value_is_unknown(v: &Value) -> bool {
     match v {
-        Value::Unbound(_) | Value::Indeterminate => true,
+        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => true,
         Value::Quantity(n, _) => value_is_unknown(n),
         Value::Instance { fields, .. } => fields.iter().any(|(_, v)| value_is_unknown(v)),
         Value::Sequence(items) => items.iter().any(value_is_unknown),
@@ -3206,15 +3987,19 @@ fn value_is_unknown(v: &Value) -> bool {
 
 fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Integer(i), Value::Rational(r)) | (Value::Rational(r), Value::Integer(i)) => {
-            *i as f64 == *r
-        }
+        (
+            Value::Integer(_) | Value::Rational(_) | Value::Real(_),
+            Value::Integer(_) | Value::Rational(_) | Value::Real(_),
+        ) => match (a.num(), b.num()) {
+            (Some(x), Some(y)) => x.eq(&y),
+            _ => false,
+        },
         (Value::Quantity(x, u), Value::Quantity(y, v)) => {
             if u == v {
                 value_eq(x, y)
             } else if same_dims(u, v) {
-                match (x.as_f64(), y.as_f64()) {
-                    (Some(a), Some(b)) => a * u.scale == b * v.scale,
+                match (x.num(), y.num()) {
+                    (Some(a), Some(b)) => a.scale(&u.scale).eq(&b.scale(&v.scale)),
                     _ => false,
                 }
             } else {
@@ -3248,9 +4033,10 @@ fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, EvalError> {
                 compare(x, y)
             } else if same_dims(u, v) {
                 // Convertible: compare reference magnitudes.
-                match (x.as_f64(), y.as_f64()) {
-                    (Some(a), Some(b)) => (a * u.scale)
-                        .partial_cmp(&(b * v.scale))
+                match (x.num(), y.num()) {
+                    (Some(a), Some(b)) => a
+                        .scale(&u.scale)
+                        .cmp(&b.scale(&v.scale))
                         .ok_or_else(|| EvalError::Type("NaN comparison".into())),
                     _ => Err(EvalError::Type("numeric operands required".into())),
                 }
@@ -3264,9 +4050,9 @@ fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, EvalError> {
         (Value::Quantity(..), _) | (_, Value::Quantity(..)) => Err(EvalError::Type(
             "cannot compare a quantity with a plain value".into(),
         )),
-        _ => match (a.as_f64(), b.as_f64()) {
+        _ => match (a.num(), b.num()) {
             (Some(x), Some(y)) => x
-                .partial_cmp(&y)
+                .cmp(&y)
                 .ok_or_else(|| EvalError::Type("NaN comparison".into())),
             _ => Err(EvalError::Type(format!("cannot compare {a} and {b}"))),
         },
@@ -3284,12 +4070,22 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
     let (l, r) = (unwrap(l), unwrap(r));
     // An unknown operand makes the result unknown (see `binary` — folds
     // like `sum`/`product` reach arithmetic through here directly).
-    if matches!(l, Value::Unbound(_) | Value::Indeterminate)
-        || matches!(r, Value::Unbound(_) | Value::Indeterminate)
-    {
+    if matches!(
+        l,
+        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+    ) || matches!(
+        r,
+        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+    ) {
         return Ok(Value::Indeterminate);
     }
     if let (Add, Value::String(a), Value::String(b)) = (op, &l, &r) {
+        if a.len() + b.len() > MAX_STRING {
+            return Err(EvalError::Budget(format!(
+                "string of {} bytes exceeds the {MAX_STRING}-byte limit",
+                a.len() + b.len()
+            )));
+        }
         return Ok(Value::String(format!("{a}{b}")));
     }
     // Quantities: same-dimension additive ops (converting across scales
@@ -3298,13 +4094,13 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
     // scales into the number and take the reference spelling, so the
     // printed magnitude is always true to the printed unit; dimensions
     // that cancel completely leave a plain number.
-    let quantity_or_plain = |n: Value, dims: Vec<Dim>, scale: f64| {
+    let quantity_or_plain = |n: Value, dims: Vec<Dim>, scale: Rational| {
         let unit = Unit::from_dims(dims);
-        let n = if scale == 1.0 {
+        let n = if scale.is_one() {
             n
         } else {
-            match n.as_f64() {
-                Some(f) => Value::Rational(f * scale),
+            match n.num() {
+                Some(f) => Value::from_num(f.scale(&scale)),
                 None => return Err(EvalError::Type("numeric operands required".into())),
             }
         };
@@ -3321,12 +4117,16 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
                 Ok(Value::Quantity(Box::new(n), u.clone()))
             } else if same_dims(u, v) {
                 // Convert the right operand into the left's unit.
-                let (Some(a), Some(b)) = (a.as_f64(), b.as_f64()) else {
+                let (Some(a), Some(b)) = (a.num(), b.num()) else {
                     return Err(EvalError::Type("numeric operands required".into()));
                 };
-                let b = b * (v.scale / u.scale);
-                let n = if matches!(op, Add) { a + b } else { a - b };
-                Ok(Value::Quantity(Box::new(Value::Rational(n)), u.clone()))
+                let b = b.scale(&scale_ratio(&v.scale, &u.scale));
+                let n = if matches!(op, Add) {
+                    a.add(&b)
+                } else {
+                    a.sub(&b)
+                };
+                Ok(Value::Quantity(Box::new(bounded(n)?), u.clone()))
             } else {
                 Err(EvalError::Type(format!(
                     "cannot combine quantities in `{}` and `{}`",
@@ -3336,32 +4136,44 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
         }
         (Mul, Value::Quantity(a, u), Value::Quantity(b, v)) => {
             let n = arith(Mul, (**a).clone(), (**b).clone())?;
-            return quantity_or_plain(n, dims_combine(&u.dims, &v.dims, 1), u.scale * v.scale);
+            return quantity_or_plain(n, dims_combine(&u.dims, &v.dims, 1), u.scale.mul(&v.scale));
         }
         (Div, Value::Quantity(a, u), Value::Quantity(b, v)) => {
             let n = arith(Div, (**a).clone(), (**b).clone())?;
-            return quantity_or_plain(n, dims_combine(&u.dims, &v.dims, -1), u.scale / v.scale);
+            return quantity_or_plain(
+                n,
+                dims_combine(&u.dims, &v.dims, -1),
+                scale_ratio(&u.scale, &v.scale),
+            );
         }
         (Mul, Value::Quantity(a, u), s) | (Mul, s, Value::Quantity(a, u))
-            if matches!(s, Value::Integer(_) | Value::Rational(_)) =>
+            if matches!(s, Value::Integer(_) | Value::Rational(_) | Value::Real(_)) =>
         {
             let n = arith(Mul, (**a).clone(), s.clone())?;
             return Ok(Value::Quantity(Box::new(n), u.clone()));
         }
-        (Div, Value::Quantity(a, u), s) if matches!(s, Value::Integer(_) | Value::Rational(_)) => {
+        (Div, Value::Quantity(a, u), s)
+            if matches!(s, Value::Integer(_) | Value::Rational(_) | Value::Real(_)) =>
+        {
             let n = arith(Div, (**a).clone(), s.clone())?;
             return Ok(Value::Quantity(Box::new(n), u.clone()));
         }
         // A scalar over a quantity is a reciprocal-unit quantity
         // (`2/r_leo`, failure rates in `1/h`).
-        (Div, s, Value::Quantity(a, u)) if matches!(s, Value::Integer(_) | Value::Rational(_)) => {
+        (Div, s, Value::Quantity(a, u))
+            if matches!(s, Value::Integer(_) | Value::Rational(_) | Value::Real(_)) =>
+        {
             let n = arith(Div, s.clone(), (**a).clone())?;
-            return quantity_or_plain(n, dims_pow(&u.dims, (-1, 1)), 1.0 / u.scale);
+            return quantity_or_plain(
+                n,
+                dims_pow(&u.dims, (-1, 1)),
+                scale_ratio(&Rational::one(), &u.scale),
+            );
         }
         // A quantity raised to a numeric power scales its exponents
         // (`x^2`, and after rational division `x^(1/2)` is a root).
         (Pow | Caret, Value::Quantity(a, u), s)
-            if matches!(s, Value::Integer(_) | Value::Rational(_)) =>
+            if matches!(s, Value::Integer(_) | Value::Rational(_) | Value::Real(_)) =>
         {
             let Some(exp) = small_ratio(s) else {
                 return Err(EvalError::Unsupported(
@@ -3369,7 +4181,7 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
                 ));
             };
             let n = arith(op, (**a).clone(), s.clone())?;
-            let scale = u.scale.powf(exp.0 as f64 / exp.1 as f64);
+            let scale = u.scale.pow_ratio_or_approx(exp);
             return quantity_or_plain(n, dims_pow(&u.dims, exp), scale);
         }
         // A plain *zero* is the additive identity of every dimension
@@ -3389,56 +4201,40 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
         }
         _ => {}
     }
-    match (&l, &r) {
-        (Value::Integer(a), Value::Integer(b)) => {
-            let (a, b) = (*a, *b);
-            Ok(match op {
-                Add => Value::Integer(a.wrapping_add(b)),
-                Sub => Value::Integer(a.wrapping_sub(b)),
-                Mul => Value::Integer(a.wrapping_mul(b)),
-                Div => {
-                    if b == 0 {
-                        return Err(EvalError::DivisionByZero);
-                    }
-                    // KFL `IntegerFunctions::'/'` returns Rational — true
-                    // division, not truncation (`7/2 = 3.5`, `x^(1/2)` is a
-                    // square root).
-                    Value::Rational(a as f64 / b as f64)
-                }
-                Rem => {
-                    if b == 0 {
-                        return Err(EvalError::DivisionByZero);
-                    }
-                    Value::Integer(a % b)
-                }
-                Pow | Caret => match u32::try_from(b) {
-                    Ok(e) => Value::Integer(a.wrapping_pow(e)),
-                    Err(_) => Value::Rational((a as f64).powf(b as f64)),
-                },
-                _ => unreachable!(),
-            })
-        }
-        _ => {
-            let (a, b) = match (l.as_f64(), r.as_f64()) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return Err(EvalError::Type("numeric operands required".into())),
-            };
-            Ok(Value::Rational(match op {
-                Add => a + b,
-                Sub => a - b,
-                Mul => a * b,
-                Div => {
-                    if b == 0.0 {
-                        return Err(EvalError::DivisionByZero);
-                    }
-                    a / b
-                }
-                Rem => a % b,
-                Pow | Caret => a.powf(b),
-                _ => unreachable!(),
-            }))
+    // Plain numbers: exact unless an operand is an approximate double.
+    // KFL `IntegerFunctions::'/'` returns Rational — true division, not
+    // truncation (`7/2` is `3.5`, `x^(1/2)` is a square root); integer
+    // results that outgrow `i128` promote to exact big rationals instead
+    // of wrapping.
+    let (Some(a), Some(b)) = (l.num(), r.num()) else {
+        return Err(EvalError::Type("numeric operands required".into()));
+    };
+    bounded(match op {
+        Add => a.add(&b),
+        Sub => a.sub(&b),
+        Mul => a.mul(&b),
+        Div => a.div(&b)?,
+        Rem => a.rem(&b)?,
+        Pow | Caret => a.pow(&b),
+        _ => unreachable!(),
+    })
+}
+
+/// An arithmetic result as a value, refused past
+/// [`crate::rational::MAX_BITS`]: exact integers no longer wrap, so a fold
+/// such as `product(1..1000000)` would otherwise grow without bound one
+/// multiplication at a time, each a single step.
+fn bounded(n: Num) -> Result<Value, EvalError> {
+    if let Num::Exact(r) = &n {
+        let bits = r.bits();
+        if bits > crate::rational::MAX_BITS {
+            return Err(EvalError::Budget(format!(
+                "a number of {bits} bits exceeds the {}-bit limit",
+                crate::rational::MAX_BITS
+            )));
         }
     }
+    Ok(Value::from_num(n))
 }
 
 fn extremum(items: Vec<Value>, want_max: bool) -> Result<Value, EvalError> {
@@ -3456,11 +4252,94 @@ fn extremum(items: Vec<Value>, want_max: bool) -> Result<Value, EvalError> {
             }
         });
     }
-    Ok(best.unwrap_or(Value::null()))
+    Ok(best.unwrap_or_else(Value::null))
 }
 
+/// A transcendental function: always an approximate double.
 fn num1(v: &Value, f: fn(f64) -> f64) -> Result<Value, EvalError> {
     v.as_f64()
-        .map(|x| Value::Rational(f(x)))
+        .map(|x| Value::Real(f(x)))
         .ok_or_else(|| EvalError::Type("numeric argument required".into()))
+}
+
+pub(crate) fn prepare_unit(b: &mut Builder, elem: usize) {
+    let scope = b.owner_scope_of(elem).unwrap_or(0);
+    let names: Vec<_> = ["declaredName", "declaredShortName"]
+        .into_iter()
+        .filter_map(|key| b.elements[elem].props.get(key)?.as_str().map(str::to_owned))
+        .collect();
+    let mut evaluator = Evaluator {
+        b,
+        env: Vec::new(),
+        in_progress: HashSet::new(),
+        overrides: HashMap::new(),
+        unbound_receiver: None,
+        lib_frames: 0,
+        call_depth: 0,
+        steps: 0,
+        allocated: 0,
+        query: false,
+    };
+    for name in names {
+        evaluator.expanded_unit(scope, elem, name, 0);
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    #[test]
+    fn unit_memo_replays_imports_and_bypasses_bound_or_recursive_contexts() {
+        let mut model = crate::model::Model::new();
+        model.add_source("units.sysml", "package B { attribute m; attribute s; } package U { private import B::*; attribute <'m/s'> speed; }");
+        let mut r = ResolvedModel::build(&model);
+        let elem = r.resolve_qualified("U::speed").unwrap().0;
+        let scope = r.b.owner_scope_of(elem).unwrap();
+        let mut ev = Evaluator {
+            b: &mut r.b,
+            env: Vec::new(),
+            in_progress: HashSet::new(),
+            overrides: HashMap::new(),
+            unbound_receiver: None,
+            lib_frames: 0,
+            call_depth: 0,
+            steps: 0,
+            allocated: 0,
+            query: false,
+        };
+        ev.b.used_imports.clear();
+        // A recursion cutoff must never poison a later complete reduction.
+        let shallow = ev.expanded_unit(scope, elem, "m/s".into(), 8);
+        assert_eq!(ev.b.semantic_memo.units.iter().count(), 0);
+        let full = ev.expanded_unit(scope, elem, "m/s".into(), 0);
+        assert_ne!(shallow, full);
+        let imports = ev.b.used_imports.clone();
+        assert!(
+            !imports.is_empty(),
+            "spelled components use the wildcard import"
+        );
+        // Recompute while the imports are already marked, then replay into an
+        // empty evidence set: recording only a set difference would lose them.
+        ev.b.semantic_memo.units = Default::default();
+        assert_eq!(ev.expanded_unit(scope, elem, "m/s".into(), 0), full);
+        ev.b.used_imports.clear();
+        assert_eq!(ev.expanded_unit(scope, elem, "m/s".into(), 0), full);
+        assert_eq!(ev.b.used_imports, imports);
+        ev.b.semantic_memo.units = Default::default();
+        ev.overrides.insert(elem, Value::Integer(3));
+        ev.expanded_unit(scope, elem, "m/s".into(), 0);
+        ev.overrides.clear();
+        ev.in_progress.insert((scope, elem));
+        ev.expanded_unit(scope, elem, "m/s".into(), 0);
+        ev.in_progress.clear();
+        ev.query = true;
+        ev.expanded_unit(scope, elem, "m/s".into(), 0);
+        ev.query = false;
+        ev.call_depth = 1;
+        ev.expanded_unit(scope, elem, "m/s".into(), 0);
+        ev.call_depth = 0;
+        ev.env.push(("x".into(), Value::Integer(1)));
+        ev.expanded_unit(scope, elem, "m/s".into(), 0);
+        assert_eq!(ev.b.semantic_memo.units.iter().count(), 0);
+    }
 }

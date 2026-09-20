@@ -79,7 +79,7 @@ fn every_subcommand_help_has_examples() {
 
 #[test]
 fn convert_to_compact_json() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-convert");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-convert-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(&input, "package P { part def V; part v : V; }").unwrap();
@@ -106,7 +106,10 @@ fn convert_to_compact_json() {
 
 #[test]
 fn plain_full_json_preserves_unresolved_reference_spelling() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-full-recovery");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-full-recovery-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("partial.sysml");
     fs::write(&input, "package P { part x : Missing; }").unwrap();
@@ -123,7 +126,7 @@ fn plain_full_json_preserves_unresolved_reference_spelling() {
 
 #[test]
 fn fmt_check_and_rewrite() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-fmt");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-fmt-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("messy.sysml");
     fs::write(&input, "package  P{part def  V;part v:V;}").unwrap();
@@ -155,7 +158,7 @@ fn verify_ranges_narrows_and_attributes_verdicts() {
     // narrow `wingSpan`; a separate contradictory pair empties `count`. The
     // empty domain must implicate only the constraint that references it —
     // not its innocent siblings in the same unit.
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-ranges");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-ranges-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(
@@ -197,7 +200,7 @@ fn verify_ranges_narrows_and_attributes_verdicts() {
 
 #[test]
 fn check_reports_rustc_style_diagnostics() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-check");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-check-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let good = dir.join("good.sysml");
     let bad = dir.join("bad.sysml");
@@ -216,7 +219,7 @@ fn check_reports_rustc_style_diagnostics() {
 
 #[test]
 fn lint_flags_unused_parameters_and_deletes_only_behind_the_guard() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-lint");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-lint-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     let src = "package P {\n    attribute def Real;\n    calc def T {\n        in force : Real;\n        in radius : Real;\n        return t : Real = force * 2;\n    }\n}\n";
@@ -276,7 +279,10 @@ fn lint_flags_unused_parameters_and_deletes_only_behind_the_guard() {
 
 #[test]
 fn lint_rule_overrides_and_config_findings() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-lint-rules");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-lint-rules-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(
@@ -316,7 +322,7 @@ fn lint_rule_overrides_and_config_findings() {
 
 #[test]
 fn convert_json_back_to_text() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-lift");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-lift-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(
@@ -375,7 +381,7 @@ fn convert_with_library_uses_normative_ids() {
         eprintln!("skipping: corpus not present");
         return;
     }
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-lib");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-lib-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(
@@ -548,7 +554,10 @@ fn check_reports_unused_private_imports() {
         eprintln!("skipping: corpus not present");
         return;
     }
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-unused-import");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-unused-import-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let defs = dir.join("defs.sysml");
     let uses = dir.join("uses.sysml");
@@ -585,6 +594,31 @@ fn check_reports_unused_private_imports() {
         lib.to_str().unwrap(),
     ]);
     assert!(!out.status.success());
+
+    // As JSON: a referential-stage warning located in the second
+    // input, although the library units come first in the model.
+    let out = sysmlv2(&[
+        "check",
+        "--format",
+        "json",
+        defs.to_str().unwrap(),
+        uses.to_str().unwrap(),
+        "--lib",
+        lib.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    let f = doc["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["message"] == "unused private import")
+        .unwrap_or_else(|| panic!("{doc}"));
+    assert_eq!(f["stage"], "referential");
+    assert_eq!(f["severity"], "warn");
+    assert_eq!(f["unit"], 1);
+    assert_eq!(f["unitName"], uses.display().to_string());
+    assert_eq!(f["line"], 2);
 }
 
 #[test]
@@ -906,7 +940,8 @@ fn query_reads_multiple_files_and_stdin() {
 
 #[test]
 fn viz_view_selects_diagram_and_unknown_view_fails() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-viz-view");
+    let dir =
+        std::env::temp_dir().join(format!("sysmlv2-cli-test-viz-view-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let model = dir.join("m.sysml");
     std::fs::write(
@@ -935,6 +970,8 @@ fn viz_view_selects_diagram_and_unknown_view_fails() {
     let ic = run("interconnection");
     assert!(ic.contains("rectangle"), "{ic}");
     assert!(ic.contains(" : c1\n"), "{ic}");
+    // The short spellings name the same views.
+    assert_eq!(run("ic"), ic);
     let state = run("state");
     assert!(state.contains("<<state def>>"), "{state}");
     assert!(state.contains("-->"), "{state}");
@@ -945,6 +982,7 @@ fn viz_view_selects_diagram_and_unknown_view_fails() {
     assert!(seq.contains("participant"), "{seq}");
     assert!(seq.contains(" ->> "), "{seq}");
     assert!(seq.contains(" : m1"), "{seq}");
+    assert_eq!(run("seq"), seq);
     let mixed = run("mixed");
     assert!(mixed.contains("rectangle"), "{mixed}");
     assert!(mixed.contains("<<state def>>"), "{mixed}");
@@ -967,13 +1005,21 @@ fn viz_view_selects_diagram_and_unknown_view_fails() {
     assert!(styled.contains("BackgroundColor<<part def>>"), "{styled}");
     assert!(styled.contains("[[x://"), "{styled}");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_sysmlv2"))
-        .args(["viz", model.to_str().unwrap(), "--view", "usecase"])
-        .output()
-        .expect("run");
-    assert!(!out.status.success());
-    let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("unknown view"), "{err}");
+    // A view or a routing the repertoire does not have is a usage
+    // error, listing what is accepted, like any other enumerated option.
+    for (flag, value) in [("--view", "usecase"), ("--line-style", "curvy")] {
+        let out = Command::new(env!("CARGO_BIN_EXE_sysmlv2"))
+            .args(["viz", model.to_str().unwrap(), flag, value])
+            .output()
+            .expect("run");
+        assert!(!out.status.success());
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            err.contains(&format!("invalid value '{value}' for '{flag}")),
+            "{err}"
+        );
+        assert!(err.contains("possible values"), "{err}");
+    }
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -1003,7 +1049,7 @@ fn viz_emits_structure_diagram_from_stdin() {
 
 #[test]
 fn viz_element_scopes_and_unknown_element_fails() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-viz");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-viz-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let model = dir.join("m.sysml");
     std::fs::write(
@@ -1032,7 +1078,7 @@ fn viz_element_scopes_and_unknown_element_fails() {
 
 #[test]
 fn convert_min_qual_respells_references() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-minqual");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-minqual-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(
@@ -1087,7 +1133,7 @@ fn convert_min_qual_respells_references() {
 
 #[test]
 fn convert_compact_cbor_round_trip() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-cbor");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-cbor-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(&input, "package P { part def V; part v : V; }").unwrap();
@@ -1119,6 +1165,14 @@ fn convert_compact_cbor_round_trip() {
     assert!(out.status.success(), "{}", stderr(&out));
     let via_cbor: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     let out = sysmlv2(&["convert", input.to_str().unwrap(), "--to", "compact-json"]);
+    let direct: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(via_cbor, direct);
+
+    // …through the full-form re-derivation…
+    let out = sysmlv2(&["convert", cbor_path.to_str().unwrap(), "--to", "full-json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let via_cbor: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let out = sysmlv2(&["convert", input.to_str().unwrap(), "--to", "full-json"]);
     let direct: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(via_cbor, direct);
 
@@ -1158,7 +1212,8 @@ fn convert_compact_cbor_round_trip() {
 
 #[test]
 fn convert_full_cbor_matches_full_json() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-fullcbor");
+    let dir =
+        std::env::temp_dir().join(format!("sysmlv2-cli-test-fullcbor-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(&input, "package P { part def V; part v : V; }").unwrap();
@@ -1187,7 +1242,7 @@ fn convert_full_cbor_matches_full_json() {
 
 #[test]
 fn convert_elide_ids_round_trips() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-elide");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-elide-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.sysml");
     fs::write(
@@ -1241,7 +1296,7 @@ fn convert_elide_ids_round_trips() {
 
 #[test]
 fn convert_delta_emit_and_apply() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-delta");
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-delta-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let v1 = dir.join("v1.sysml");
     let v2 = dir.join("v2.sysml");
@@ -1323,7 +1378,10 @@ fn convert_delta_emit_and_apply() {
 
 #[test]
 fn convert_elided_delta_emit_and_apply() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-elided-delta");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-elided-delta-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let v1 = dir.join("v1.sysml");
     let v2 = dir.join("v2.sysml");
@@ -1388,6 +1446,18 @@ fn convert_elided_delta_emit_and_apply() {
         "applied model lifts: {}",
         stdout(&out)
     );
+
+    // A portable delta without a base is a usage error: the dependency
+    // is declared on the argument.
+    let out = sysmlv2(&[
+        "convert",
+        v2.to_str().unwrap(),
+        "--to",
+        "compact-cbor",
+        "--delta-portable",
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--delta-base"), "{}", stderr(&out));
 
     // Portable + elided is refused with guidance.
     let out = sysmlv2(&[
@@ -1645,7 +1715,10 @@ fn lib_dir_env_enables_referential_checks() {
 
 #[test]
 fn check_runs_model_semantics_without_a_library() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-no-lib-semantics");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-no-lib-semantics-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let input = dir.join("bad.sysml");
     fs::write(&input, "package P { part def D; part x : D[2..1]; }").unwrap();
@@ -2089,7 +2162,7 @@ fn payload_ids_prints_the_delta_canonical_sequence() {
     assert_eq!(from_json["stateDigest"], from_s2c["stateDigest"]);
     assert_eq!(
         from_json["ids"].as_array().unwrap().len(),
-        from_json["elements"].as_u64().unwrap() as usize
+        usize::try_from(from_json["elements"].as_u64().unwrap()).unwrap()
     );
     fs::remove_dir_all(&dir).ok();
 }
@@ -2277,6 +2350,25 @@ fn convert_library_exports_the_resolved_stdlib() {
         "{}",
         stderr(&out)
     );
+    // The conversion flags --library does not compose with are declared
+    // on the argument, so the combination is a usage error.
+    for flag in ["--flexo", "--min-qual", "--elide-ids"] {
+        let out = sysmlv2(&[
+            "convert",
+            "--library",
+            "--lib",
+            &lib,
+            "--to",
+            "compact-json",
+            flag,
+        ]);
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains(&format!("cannot be used with '{flag}'")),
+            "{}",
+            stderr(&out)
+        );
+    }
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -2366,7 +2458,10 @@ fn refactor_help_documents_both_directions() {
 
 #[test]
 fn refactor_extract_and_inline_round_trip_in_place() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-refactor-roundtrip");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-refactor-roundtrip-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let file = dir.join("model.sysml");
     fs::write(&file, REFACTOR_RIG).unwrap();
@@ -2392,7 +2487,10 @@ fn refactor_extract_and_inline_round_trip_in_place() {
 
 #[test]
 fn refactor_dry_run_prints_the_diff_and_writes_nothing() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-refactor-dryrun");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-refactor-dryrun-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let file = dir.join("model.sysml");
     fs::write(&file, REFACTOR_RIG).unwrap();
@@ -2423,7 +2521,10 @@ fn refactor_dry_run_prints_the_diff_and_writes_nothing() {
 
 #[test]
 fn refactor_ambient_inputs_apply_to_dry_run_only() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-refactor-ambient");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-refactor-ambient-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("model.sysml"), REFACTOR_RIG).unwrap();
     let env = [("SYSMLV2_MODEL_DIR", dir.to_str().unwrap())];
@@ -2455,7 +2556,10 @@ fn refactor_ambient_inputs_apply_to_dry_run_only() {
 
 #[test]
 fn refactor_refusals_name_their_reason_and_touch_nothing() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-refactor-refuse");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-refactor-refuse-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let file = dir.join("model.sysml");
     fs::write(&file, REFACTOR_RIG).unwrap();
@@ -2494,7 +2598,10 @@ fn refactor_refusals_name_their_reason_and_touch_nothing() {
 
 #[test]
 fn refactor_inline_reports_unused_imports_cross_file() {
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-refactor-imports");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-refactor-imports-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let defs = dir.join("defs.sysml");
     let uses = dir.join("use.sysml");
@@ -2578,7 +2685,10 @@ fn lint_runs_generated_rules_with_sidecar_attribution() {
     use sysmlv2_lint::{Config, canonical_member_text, canonicalization_digest};
     use sysmlv2_model::structure::{member_structure_digest, sha256_hex};
 
-    let dir = std::env::temp_dir().join("sysmlv2-cli-test-lint-generated");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-lint-generated-{}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -2638,7 +2748,10 @@ fn lint_runs_generated_rules_with_sidecar_attribution() {
     // Clean fixture: silent, success.
     let out = sysmlv2(&["lint", paths[0], paths[1]]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(!stderr(&out).contains("generated-"), "{}", stderr(&out));
+    // The rule id as it is printed, not the bare prefix: the scratch
+    // directory's own name carries that prefix and appears in every
+    // location line.
+    assert!(!stderr(&out).contains("[generated-"), "{}", stderr(&out));
 
     // A tampered member surfaces generated-element-modified at its
     // content-unit location — warn by default (exit 0), a failure
@@ -2709,4 +2822,499 @@ fn lint_runs_generated_rules_with_sidecar_attribution() {
         paths[1],
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
+}
+
+const SPLIT_RIG: &str = "package Lib { part def Thing; }
+package R {
+    private import Lib::*;
+    package A { part def X; part t : Thing; }
+    package B { part def Y :> A::X; }
+    part r : A::X;
+}
+";
+
+#[test]
+fn refactor_split_dry_run_prints_the_tree_and_writes_nothing() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-split-dryrun-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("model.sysml");
+    fs::write(&file, SPLIT_RIG).unwrap();
+    let path = file.to_str().unwrap();
+    let out = sysmlv2(&["refactor", "split", path, "R", "--dry-run", "--slug"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("model/A.sysml: `R::A`"), "{err}");
+    assert!(err.contains("model/B.sysml: `R::B`"), "{err}");
+    let text = stdout(&out);
+    assert!(text.contains("model/A.sysml (new)"), "{text}");
+    assert!(text.contains("part t : Lib::Thing;"), "{text}");
+    assert!(text.contains("+    public import A;"), "{text}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), SPLIT_RIG);
+    assert!(!dir.join("model").exists());
+}
+
+#[test]
+fn refactor_split_writes_new_files_and_refuses_to_overwrite() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-split-write-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("model.sysml");
+    fs::write(&file, SPLIT_RIG).unwrap();
+    let path = file.to_str().unwrap();
+    let out_dir = dir.join("parts");
+    let out = sysmlv2(&[
+        "refactor",
+        "split",
+        path,
+        "R",
+        "--dir",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("split `R` — rewrote"),
+        "{}",
+        stderr(&out)
+    );
+    let a = fs::read_to_string(out_dir.join("A.sysml")).unwrap();
+    assert_eq!(a, "package A { part def X; part t : Lib::Thing; }\n");
+    let root = fs::read_to_string(&file).unwrap();
+    assert!(
+        root.contains("    public import A;\n    public import B;\n"),
+        "{root}"
+    );
+    assert!(!root.contains("package A"), "{root}");
+    // The split model checks clean as three files.
+    let out = sysmlv2(&[
+        "check",
+        path,
+        out_dir.join("A.sysml").to_str().unwrap(),
+        out_dir.join("B.sysml").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Running again refuses: the files exist and nothing is rewritten.
+    fs::write(&file, SPLIT_RIG).unwrap();
+    let out = sysmlv2(&[
+        "refactor",
+        "split",
+        path,
+        "R",
+        "--dir",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&file).unwrap(), SPLIT_RIG);
+}
+
+/// `members` lists an element by the specification's `name`: a feature
+/// that declares no name is listed by its naming feature — the return
+/// parameter `result`, the redefined feature's name — not as anonymous.
+#[test]
+fn members_list_unnamed_features_by_their_effective_name() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-members-names-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("m.sysml");
+    fs::write(
+        &file,
+        "package M {
+            part def Car { part engine; attribute mass; }
+            calc def Area { in x; return : Real = x; }
+            part car : Car { part :>> engine; attribute :>> mass = 5; part :>> nope; }
+        }",
+    )
+    .unwrap();
+    let out = sysmlv2(&["members", file.to_str().unwrap(), "M::Area"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].starts_with("x "), "{text}");
+    assert!(lines[1].starts_with("result "), "{text}");
+    // A redefining feature is listed by the redefined feature's name — as
+    // written when the redefinition did not resolve.
+    let out = sysmlv2(&["members", file.to_str().unwrap(), "M::car"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for expected in ["engine ", "mass ", "nope "] {
+        assert!(
+            text.lines().any(|l| l.starts_with(expected)),
+            "{expected}: {text}"
+        );
+    }
+    assert!(!text.contains("anonymous"), "{text}");
+    // `eval --all` labels a valued feature the same way.
+    let out = sysmlv2(&["eval", "--all", file.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("mass = 5"), "{}", stdout(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn lint_format_json_writes_one_report_to_stdout() {
+    let dir =
+        std::env::temp_dir().join(format!("sysmlv2-cli-test-lint-json-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.sysml");
+    let src = "package P {\n    attribute def Real;\n    calc def T {\n        in force : Real;\n        in radius : Real;\n        return t : Real = force * 2;\n    }\n}\n";
+    fs::write(&input, src).unwrap();
+
+    let out = sysmlv2(&[
+        "lint",
+        "--format",
+        "json",
+        "--rule",
+        "unused-parameter=warn",
+        input.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // The report is the whole of stdout; the text tallies stay off stderr.
+    assert!(!stderr(&out).contains("warning(s)"), "{}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    assert_eq!(
+        doc["summary"],
+        serde_json::json!({"errors": 0, "warnings": 1, "infos": 0, "hints": 0})
+    );
+    let f = &doc["findings"][0];
+    assert_eq!(f["stage"], "lint");
+    assert_eq!(f["rule"], "unused-parameter");
+    assert_eq!(f["severity"], "warn");
+    assert!(f["message"].as_str().unwrap().contains("`radius`"), "{f}");
+    assert_eq!(f["unit"], 0);
+    assert_eq!(f["unitName"], input.display().to_string());
+    assert_eq!(f["line"], 5);
+    assert!(f["col"].as_u64().is_some() && f["endLine"] == 5, "{f}");
+    let start = usize::try_from(f["start"].as_u64().unwrap()).unwrap();
+    let end = usize::try_from(f["end"].as_u64().unwrap()).unwrap();
+    assert_eq!(&src[start..end], "radius", "{f}");
+    assert_eq!(f["fix"]["deletes"], true);
+    assert_eq!(
+        f["fix"]["edits"][0]["unitName"],
+        input.display().to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(&input).unwrap(),
+        src,
+        "no --fix, no write"
+    );
+
+    // A configuration finding has no location: nulls, not zeros.
+    let out = sysmlv2(&[
+        "lint",
+        "--format",
+        "json",
+        "--rule",
+        "no-such=warn",
+        input.to_str().unwrap(),
+    ]);
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    let f = &doc["findings"][0];
+    assert_eq!(f["rule"], "lint-config");
+    assert!(
+        f["unit"].is_null() && f["unitName"].is_null() && f["line"].is_null(),
+        "{f}"
+    );
+}
+
+#[test]
+fn check_format_json_reports_stages_with_the_same_exit_codes() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-check-json-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.sysml");
+    let bad = dir.join("bad.sysml");
+    fs::write(&good, "package P;").unwrap();
+    fs::write(&bad, "package Q { part x : ; }").unwrap();
+
+    let out = sysmlv2(&["check", "--format", "json", good.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    assert_eq!(doc["findings"], serde_json::json!([]));
+    assert_eq!(doc["summary"]["errors"], 0);
+
+    // Two inputs: the broken one is a parse-stage error located in the
+    // right file; the clean one still goes through the model stage.
+    let out = sysmlv2(&[
+        "check",
+        "--format",
+        "json",
+        good.to_str().unwrap(),
+        bad.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(!stderr(&out).contains("error(s)"), "{}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    let f = &doc["findings"][0];
+    assert_eq!(f["stage"], "parse");
+    assert_eq!(f["severity"], "error");
+    assert!(f["rule"].is_null(), "{f}");
+    assert_eq!(f["unit"], 1);
+    assert_eq!(f["unitName"], bad.display().to_string());
+    assert_eq!(f["line"], 1);
+    assert!(
+        f["fix"].is_null() && f["alternatives"] == serde_json::json!([]),
+        "{f}"
+    );
+    assert_eq!(
+        doc["summary"]["errors"],
+        doc["findings"].as_array().unwrap().len()
+    );
+
+    // Text mode is untouched: stderr diagnostics, empty stdout.
+    let out = sysmlv2(&["check", bad.to_str().unwrap()]);
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert!(stderr(&out).contains("error(s)"), "{}", stderr(&out));
+}
+
+#[test]
+fn lint_format_json_locates_findings_past_a_parse_failure() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-lint-json-mixed-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.sysml");
+    let good = dir.join("good.sysml");
+    fs::write(&bad, "package Q { part x : ; }").unwrap();
+    let src = "package P {\n    attribute def Real;\n    calc def T {\n        in force : Real;\n        in radius : Real;\n        return t : Real = force * 2;\n    }\n}\n";
+    fs::write(&good, src).unwrap();
+
+    // The broken first input never reaches the model, so the clean
+    // second input is model unit 0 but input 1: every location in
+    // the report must say input 1.
+    let out = sysmlv2(&[
+        "lint",
+        "--format",
+        "json",
+        "--rule",
+        "unused-parameter=warn",
+        "--rule",
+        "no-such=warn",
+        bad.to_str().unwrap(),
+        good.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "parse errors fail the run");
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    let findings = doc["findings"].as_array().unwrap();
+    let by_rule = |rule: &str| {
+        findings
+            .iter()
+            .find(|f| f["rule"] == rule)
+            .unwrap_or_else(|| panic!("no {rule} finding: {doc}"))
+    };
+    let parse = findings
+        .iter()
+        .find(|f| f["stage"] == "parse")
+        .unwrap_or_else(|| panic!("{doc}"));
+    assert_eq!(parse["unit"], 0);
+    assert_eq!(parse["unitName"], bad.display().to_string());
+    let config = by_rule("lint-config");
+    assert!(
+        config["unit"].is_null() && config["unitName"].is_null(),
+        "{config}"
+    );
+    let unused = by_rule("unused-parameter");
+    assert_eq!(unused["unit"], 1);
+    assert_eq!(unused["unitName"], good.display().to_string());
+    assert_eq!(unused["line"], 5);
+    let edit = &unused["fix"]["edits"][0];
+    assert_eq!(edit["unit"], 1);
+    assert_eq!(edit["unitName"], good.display().to_string());
+    let start = usize::try_from(edit["start"].as_u64().unwrap()).unwrap();
+    let end = usize::try_from(edit["end"].as_u64().unwrap()).unwrap();
+    assert!(src[start..end].contains("radius"), "{edit}");
+    assert_eq!(doc["summary"]["errors"], 1);
+    assert_eq!(doc["summary"]["warnings"], 2);
+}
+
+#[test]
+fn piped_output_ends_quietly_when_the_reader_closes() {
+    // A reader that closes the pipe early (`sysmlv2 … | head`) must end
+    // the run without a panic banner: no message, exit status 0. The
+    // model is large enough that the writer blocks on the pipe before it
+    // can finish, so the closed read end is always observed — for one
+    // JSON document streamed to stdout, one large text dump, and one
+    // line-per-item listing.
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-pipe-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("big.sysml");
+    let mut text = String::from("package Big {\n");
+    for i in 0..3000 {
+        writeln!(text, "    part def P{i} {{ attribute a : Real = {i}; }}").unwrap();
+    }
+    text.push_str("}\n");
+    fs::write(&model, &text).unwrap();
+    let model = model.to_str().unwrap();
+    for args in [
+        vec!["convert", model, "--to", "compact-json"],
+        vec!["parse", model, "--ast"],
+        vec!["members", model, "Big"],
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sysmlv2"))
+            .env_remove("SYSMLV2_MODEL_DIR")
+            .env_remove("SYSMLV2_LIB_DIR")
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let mut head = [0u8; 64];
+        let mut child_stdout = child.stdout.take().unwrap();
+        child_stdout
+            .read_exact(&mut head)
+            .expect("some output arrives");
+        drop(child_stdout);
+        let out = child.wait_with_output().expect("wait");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {err}");
+        assert!(err.is_empty(), "{args:?}: {err}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn model_extensions_are_recognized_whatever_their_case() {
+    // A file name's extension decides both whether an argument is a
+    // model source at all and which dialect it parses in, and neither
+    // question turns on the case it is spelled in: `K.KerML` is KerML,
+    // and `M.SysML` is a file rather than a name to evaluate.
+    let dir = std::env::temp_dir().join(format!("sysmlv2-ext-case-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let kerml = dir.join("K.KerML");
+    fs::write(&kerml, "package K {\n    struct S;\n}\n").unwrap();
+    let sysml = dir.join("M.SysML");
+    fs::write(
+        &sysml,
+        "package P {\n    attribute x : ScalarValues::Integer = 3;\n}\n",
+    )
+    .unwrap();
+
+    // `struct` is KerML-only, so this parses only in the KerML dialect.
+    let out = sysmlv2(&["check", kerml.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = sysmlv2(&["eval", sysml.to_str().unwrap(), "P::x"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("P::x = 3"), "{}", stdout(&out));
+
+    // …and an archive built from such a file packs and reads back.
+    let archive = dir.join("p.kpar");
+    let out = sysmlv2(&[
+        "convert",
+        sysml.to_str().unwrap(),
+        "--to",
+        "kpar",
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = sysmlv2(&["convert", archive.to_str().unwrap(), "--to", "compact-json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("\"@id\""), "{}", stdout(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Every verb parses, and the parser's bound only turns unbounded input
+/// into a diagnostic on a stack that reaches the bound. Input nested to
+/// it is ordinary input with nothing to report — a kilobyte and a half
+/// here — and on a stack too small for it the descent ends the process:
+/// no diagnostic, no unwind, no exit status worth reading.
+///
+/// A process's own thread is the small stack: eight megabytes by
+/// default, which an unoptimized build already overruns, and less
+/// wherever the host caps it. The run is shrunk to two megabytes where
+/// the shell can shrink it, so the reservation is what carries the
+/// descent in either build.
+#[test]
+fn a_verb_parses_at_the_nesting_bound() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-deep-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let deep = dir.join("deep.sysml");
+    // One level is the package, so the braces within it stop one short.
+    let levels = sysmlv2_parser::parser::MAX_NESTING as usize - 1;
+    fs::write(
+        &deep,
+        format!(
+            "package P {{ {}part x;{} }}\n",
+            "part x { ".repeat(levels),
+            "}".repeat(levels)
+        ),
+    )
+    .unwrap();
+
+    let out = check_under_a_small_stack(deep.to_str().unwrap());
+    assert!(
+        out.status.success(),
+        "nesting the parser accepts has nothing to report: {:?}, {}",
+        out.status,
+        stderr(&out)
+    );
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+fn check_under_a_small_stack(file: &str) -> Output {
+    // `ulimit` caps the process's own thread and nothing else, so a
+    // reserved thread is unaffected by it — which is the point.
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"ulimit -s 2048 2>/dev/null; exec "$0" check "$1""#)
+        .arg(env!("CARGO_BIN_EXE_sysmlv2"))
+        .arg(file)
+        .env_remove("SYSMLV2_MODEL_DIR")
+        .env_remove("SYSMLV2_LIB_DIR")
+        .output()
+        .expect("failed to run sysmlv2")
+}
+
+#[cfg(not(unix))]
+fn check_under_a_small_stack(file: &str) -> Output {
+    sysmlv2(&["check", file])
+}
+
+/// A subprocess makes a stack-overflow regression an ordinary test
+/// failure, including when nested if-nodes omit their action keyword.
+#[test]
+fn else_if_chains_respect_the_nesting_bound() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-else-if-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("chain.sysml");
+    for prefix in ["if true {} else ", "action if true {} else "] {
+        for links in [32, 1000] {
+            fs::write(
+                &source,
+                format!("action a {{ {}{{}} }}", prefix.repeat(links)),
+            )
+            .unwrap();
+            let out = sysmlv2(&["parse", source.to_str().unwrap()]);
+            assert!(
+                out.status.code().is_some(),
+                "parser aborted: {}",
+                stderr(&out)
+            );
+            if links == 32 {
+                assert!(out.status.success(), "{}", stderr(&out));
+            } else {
+                assert!(!out.status.success());
+                assert!(
+                    stderr(&out).contains("nesting is too deep"),
+                    "{}",
+                    stderr(&out)
+                );
+            }
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

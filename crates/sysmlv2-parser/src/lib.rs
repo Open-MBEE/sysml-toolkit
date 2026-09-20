@@ -12,11 +12,14 @@
 //! crate keeps the original `sysmlv2_parser::…` paths stable. See the
 //! workspace `README.md` for the workspace architecture.
 
-pub use sysmlv2_syntax::{Diagnostic, Span};
+pub use sysmlv2_syntax::{Diagnostic, Diagnostics, Span};
 pub use sysmlv2_syntax::{ast, diag, lexer, name, parser, print, span, token, visit};
 
 #[cfg(feature = "json")]
-pub use sysmlv2_model::{ambient, eval, full, ids, json, libcache, lift, model, quantity, render};
+pub use sysmlv2_model::{
+    ambient, eval, full, ids, json, libcache, lift, loader, model, prepared, quantity, rational,
+    render,
+};
 
 /// Post-parse validation: body-context legality (syntax-level) and — with
 /// the `json` feature — model-level referential checks.
@@ -25,8 +28,9 @@ pub mod check {
 
     #[cfg(feature = "json")]
     pub use sysmlv2_model::check::{
-        ConstraintBinding, ConstraintCheck, ConstraintVerdict, check_constraints,
-        constraint_bindings, satisfaction_checks, validate_model, validate_model_with,
-        validate_semantics, validate_semantics_with,
+        ConstraintBinding, ConstraintCheck, ConstraintVerdict,
+        IMPLEMENTED_NORMATIVE_SEMANTIC_RULES, check_constraints, constraint_bindings,
+        satisfaction_checks, validate_model, validate_model_with, validate_semantics,
+        validate_semantics_with,
     };
 }

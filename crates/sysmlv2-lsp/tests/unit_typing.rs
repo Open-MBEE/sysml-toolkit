@@ -57,9 +57,12 @@ impl Client {
             match self.conn.receiver.recv().unwrap() {
                 Message::Response(Response {
                     id: rid,
-                    result,
-                    error,
+                    response_result,
                 }) if rid == id => {
+                    let (result, error) = match response_result {
+                        Ok(v) => (Some(v), None),
+                        Err(e) => (None, Some(e)),
+                    };
                     assert!(error.is_none(), "{error:?}");
                     return serde_json::from_value(result.unwrap_or_default()).unwrap();
                 }
@@ -68,7 +71,7 @@ impl Client {
         }
     }
 
-    fn notify<N: lsp_types::notification::Notification>(&mut self, params: N::Params) {
+    fn notify<N: lsp_types::notification::Notification>(&self, params: N::Params) {
         self.conn
             .sender
             .send(Message::Notification(Notification::new(
@@ -78,7 +81,7 @@ impl Client {
             .unwrap();
     }
 
-    fn open(&mut self, uri: &Uri, text: &str) {
+    fn open(&self, uri: &Uri, text: &str) {
         self.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
@@ -170,18 +173,14 @@ fn compound_spelled_units_type_through_their_alias() {
         "package G {\n    private import ISQ::*;\n    private import SI::*;\n    attribute gravity = 9.8 [m/s\n}\n",
     );
     let items = complete(&mut client, &u, 3, 32);
-    let accel: Vec<_> = items
-        .iter()
-        .filter(|i| {
-            i.additional_text_edits
-                .iter()
-                .flatten()
-                .any(|e| e.new_text == " : AccelerationValue")
-        })
-        .map(|i| i.label.clone())
-        .collect();
+    let mut accel = items.iter().filter(|i| {
+        i.additional_text_edits
+            .iter()
+            .flatten()
+            .any(|e| e.new_text == " : AccelerationValue")
+    });
     assert!(
-        !accel.is_empty(),
+        accel.next().is_some(),
         "expected an acceleration-unit item carrying the typing edit"
     );
     client.shutdown();

@@ -7,8 +7,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use sysmlv2_cbor::tables::{
-    CborField, ENUM_NAMES, ENUM_TABLES, K_BOOL, K_ELEMENT_ID, K_ENUM, K_LITERAL, K_REF, K_REF_LIST,
-    K_STR, K_STR_LIST, METACLASS_FIELDS,
+    CborField, ENUM_NAMES, ENUM_TABLES, FULL_METACLASS_FIELDS, K_BOOL, K_ELEMENT_ID, K_ENUM,
+    K_LITERAL, K_REF, K_REF_LIST, K_STR, K_STR_LIST, METACLASS_FIELDS,
 };
 
 fn goldens_expected() -> PathBuf {
@@ -82,6 +82,38 @@ fn tables_are_canonically_ordered() {
             }
         }
     }
+}
+
+/// The wire spells a metaclass as a 16-bit code and a property as an
+/// 8-bit ordinal, and the lookups convert into those widths rather than
+/// truncating — so a table that outgrew either space would start
+/// answering "unknown metaclass" / "not a compact-form property" for
+/// real names. Hold both spaces here, on both table sets.
+#[test]
+fn tables_fit_the_wire_code_spaces() {
+    for (which, tables) in [
+        ("compact", METACLASS_FIELDS),
+        ("full", FULL_METACLASS_FIELDS),
+    ] {
+        assert!(
+            u16::try_from(tables.len()).is_ok(),
+            "{which} metaclass table fits the 16-bit type-code space ({})",
+            tables.len()
+        );
+        for (name, fields) in tables {
+            assert!(
+                u8::try_from(fields.len()).is_ok(),
+                "{which} {name}: {} fields fit the 8-bit ordinal space",
+                fields.len()
+            );
+        }
+    }
+    let (last, _) = METACLASS_FIELDS[METACLASS_FIELDS.len() - 1];
+    assert_eq!(
+        sysmlv2_cbor::type_code(last),
+        u16::try_from(METACLASS_FIELDS.len() - 1).ok(),
+        "the highest metaclass still answers its own code"
+    );
 }
 
 #[test]

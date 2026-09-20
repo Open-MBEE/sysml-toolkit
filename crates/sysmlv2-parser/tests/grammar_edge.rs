@@ -284,6 +284,20 @@ fn accept_node_trigger_forms() {
     sysml_ok("package P { action def A { accept when c; } }");
     sysml_ok("package P { action def A { accept at t0; } }");
     sysml_ok("package P { action def A { accept x : T via p; } }");
+    // A trigger, a `via` clause and a payload's value each take a full
+    // expression, and a conditional is one — parenthesized or not.
+    sysml_ok("package P { action def A { accept when (if a ? b else c); } }");
+    sysml_ok("package P { action def A { accept when if a ? b else c; } }");
+    sysml_ok("package P { action def A { accept when if a ? b else if c ? d else e; } }");
+    sysml_ok("package P { action def A { accept x : T via if a ? p else q; } }");
+    sysml_ok("package P { action def A { accept x : T when if g ? b else c; } }");
+    // The word-spelled operators take an operand, and an operand may be
+    // spelled as a body.
+    sysml_ok("package P { action def A { accept when a and { b }; } }");
+    sysml_ok("package P { action def A { accept when a or { b }; } }");
+    sysml_ok("package P { action def A { accept when a xor { b }; } }");
+    sysml_ok("package P { action def A { accept when a implies { b }; } }");
+    sysml_ok("package P { action def A { accept when not { b }; } }");
 }
 
 #[test]

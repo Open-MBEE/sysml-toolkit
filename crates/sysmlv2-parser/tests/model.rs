@@ -969,3 +969,694 @@ fn view_exposure_honors_filters() {
         "{cool:?}"
     );
 }
+
+#[cfg(feature = "json")]
+#[test]
+fn anonymous_redefinition_fanout_targets_the_inherited_feature() {
+    use sysmlv2_parser::{check, json::ResolvedModel};
+    let lib = "package Lib { part def Item { attribute name; }
+        part def Container { ref part items : Item[*]; } }";
+    for count in 1..=4 {
+        for reverse_files in [false, true] {
+            let members = (0..count)
+                .map(|i| format!("ref :>> items = a{i};"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let values = (0..count)
+                .map(|i| format!("part a{i} : Item;"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let usage = format!(
+                "package Usage {{ private import Lib::*; {values}
+                part c : Container {{ {members} }} }}"
+            );
+            let mut model = Model::new();
+            let mut sources = vec![("lib.sysml", lib), ("usage.sysml", usage.as_str())];
+            if reverse_files {
+                sources.reverse();
+            }
+            for (name, text) in sources {
+                model.add_source(name, text);
+            }
+            assert!(!model.has_errors());
+            let mut resolved = ResolvedModel::build(&model);
+            let base = resolved.resolve_qualified("Lib::Container::items").unwrap();
+            let target = resolved.element_id(base).to_string();
+            let rows = emit(&model);
+            let edges: Vec<_> = rows
+                .iter()
+                .filter(|e| e["@type"] == "Redefinition")
+                .collect();
+            assert_eq!(edges.len(), count);
+            for edge in edges {
+                assert_eq!(
+                    edge["redefinedFeature"]["@id"].as_str(),
+                    Some(target.as_str()),
+                    "{count} siblings, reversed={reverse_files}: {edge}"
+                );
+            }
+            assert!(check::validate_model(&model).is_empty());
+            assert!(check::validate_semantics(&model).is_empty());
+            let sites: Vec<_> = resolved
+                .reference_sites()
+                .iter()
+                .filter(|site| site.kind == "redefinedFeature")
+                .collect();
+            assert_eq!(sites.len(), count);
+            assert!(sites.iter().all(|site| site.target == base));
+        }
+    }
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn redefinition_fanout_preserves_inherited_overrides_and_named_members() {
+    use sysmlv2_parser::{check, json::ResolvedModel};
+    for members in [
+        "ref :>> items = a; ref :>> items = b;",
+        "ref namedItem :>> items = a; ref :>> items = b;",
+        "ref :>> items = b; ref namedItem :>> items = a;",
+    ] {
+        let source = format!(
+            "package P {{
+            part def Item {{ attribute marker = 7; }}
+            part def Base {{ ref part items : Item[*]; }}
+            part def Derived :> Base {{ ref :>> items; }}
+            part a : Item; part b : Item;
+            part c : Derived {{ {members} }}
+        }}"
+        );
+        let mut model = Model::new();
+        model.add_source("inherit.sysml", &source);
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let base = r.resolve_qualified("P::Base::items").unwrap();
+        let inherited = r.resolve_qualified("P::Derived::items").unwrap();
+        assert_ne!(base, inherited);
+        let rows = emit(&model);
+        let edges: Vec<_> = rows
+            .iter()
+            .filter(|e| e["@type"] == "Redefinition")
+            .collect();
+        assert_eq!(edges.len(), 3);
+        assert_eq!(
+            edges[0]["redefinedFeature"]["@id"],
+            r.element_id(base).to_string()
+        );
+        for edge in &edges[1..] {
+            assert_eq!(
+                edge["redefinedFeature"]["@id"],
+                r.element_id(inherited).to_string()
+            );
+        }
+        assert!(check::validate_model(&model).is_empty());
+    }
+    // Declared local targets remain visible: the fix is not an
+    // inherited-only lookup, nor a blanket removal of local members.
+    let mut model = Model::new();
+    model.add_source(
+        "local.kerml",
+        "class C { feature x; feature y redefines x; }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let x = r.resolve_qualified("C::x").unwrap();
+    let rows = emit(&model);
+    let edge = rows.iter().find(|e| e["@type"] == "Redefinition").unwrap();
+    assert_eq!(edge["redefinedFeature"]["@id"], r.element_id(x).to_string());
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn redefinition_fanout_does_not_hide_missing_or_ambiguous_targets() {
+    use sysmlv2_parser::check;
+    for (definitions, typing, diagnostic) in [
+        ("part def C;", "C", "unresolved reference `items`"),
+        (
+            "part def L { ref part items : Item[*]; }
+          part def R { ref part items : Item[*]; }",
+            "L, R",
+            "ambiguous reference `items`",
+        ),
+    ] {
+        let mut model = Model::new();
+        model.add_source(
+            "invalid.sysml",
+            &format!(
+                "package P {{
+            part def Item; {definitions} part a : Item;
+            part c : {typing} {{ ref :>> items = a; ref :>> items = a; }}
+        }}"
+            ),
+        );
+        assert!(!model.has_errors());
+        let findings = check::validate_model(&model);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(
+            findings.iter().all(|(_, d)| d.message.contains(diagnostic)),
+            "{findings:?}"
+        );
+    }
+    // Ordinary references to indistinguishable siblings remain ambiguous.
+    let mut model = Model::new();
+    model.add_source(
+        "ordinary.sysml",
+        "package P {
+        part def Item; part def C { ref part items : Item[*]; }
+        part a : Item;
+        part c : C { ref :>> items = a; ref :>> items = a; }
+        attribute probe = c::items;
+    }",
+    );
+    let findings = check::validate_model(&model);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].1.message.contains("ambiguous"), "{findings:?}");
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn kerml_redefinition_fanout_keeps_inherited_member_lookup() {
+    use sysmlv2_parser::{check, json::ResolvedModel};
+    let mut model = Model::new();
+    model.add_source(
+        "fanout.kerml",
+        "package P {
+        class Item { feature marker = 7; }
+        class C { feature items : Item[*]; }
+        feature c : C {
+            feature redefines items { feature result = marker; }
+            feature redefines items { feature result = marker; }
+            feature redefines items { feature result = marker; }
+        }
+    }",
+    );
+    assert!(!model.has_errors());
+    assert!(check::validate_model(&model).is_empty());
+    let mut r = ResolvedModel::build(&model);
+    let base = r.resolve_qualified("P::C::items").unwrap();
+    let marker = r.resolve_qualified("P::Item::marker").unwrap();
+    let sites: Vec<_> = r
+        .reference_sites()
+        .iter()
+        .filter(|site| site.kind == "redefinedFeature")
+        .collect();
+    assert_eq!(sites.len(), 3);
+    assert!(sites.iter().all(|site| site.target == base));
+    assert_eq!(r.references_to(marker).len(), 3);
+}
+
+/// `inherited_memberships` / `inherited_features` /
+/// `effective_features` — the resolver's inheritance walk enumerated.
+#[cfg(feature = "json")]
+#[test]
+fn inherited_members_enumeration() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let mut model = Model::new();
+    model.add_source(
+        "m.sysml",
+        "package P {
+            part def Base {
+                attribute mass;
+                private attribute hidden;
+            }
+            part def Mid :> Base { attribute midOnly; }
+            part def Sub :> Mid { attribute own; }
+            part def Shadow :> Base { attribute mass; }
+            part def Redef :> Base { attribute total :>> mass; }
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let by_name = |r: &mut ResolvedModel, qn: &str| r.resolve_qualified(qn).unwrap();
+
+    // Transitive inheritance, private excluded; memberships returned,
+    // declaring type = the membership's owner.
+    let sub = by_name(&mut r, "P::Sub");
+    let inherited = r.inherited_memberships(sub, false);
+    let names: Vec<_> = inherited
+        .iter()
+        .map(|&m| r.membership_member_name(m).unwrap())
+        .collect();
+    assert_eq!(names, ["midOnly", "mass"], "BFS order: Mid's before Base's");
+    let mid = by_name(&mut r, "P::Mid");
+    let base = by_name(&mut r, "P::Base");
+    assert_eq!(r.owner(inherited[0]), Some(mid), "midOnly declared by Mid");
+    assert_eq!(r.owner(inherited[1]), Some(base), "mass declared by Base");
+    for &m in &inherited {
+        assert!(!r.membership_is_alias(m));
+        assert!(r.membership_member(m).is_some());
+    }
+
+    // effective = owned then inherited.
+    let eff: Vec<_> = r
+        .effective_features(sub, true)
+        .iter()
+        .map(|&m| r.element_name(m).unwrap().to_string())
+        .collect();
+    assert_eq!(eff, ["own", "midOnly", "mass"]);
+
+    // Same-name shadowing: an owned `mass` hides the inherited one.
+    let shadow = by_name(&mut r, "P::Shadow");
+    assert!(r.inherited_features(shadow, false).is_empty());
+
+    // Redefinition shadowing under a *different* name: `total :>> mass`.
+    let redef = by_name(&mut r, "P::Redef");
+    assert!(r.inherited_features(redef, false).is_empty());
+
+    // No heritage -> empty; and the definition itself is not a feature.
+    assert!(r.inherited_memberships(base, false).is_empty());
+}
+
+/// `include_implied` walks the Tables 31/32 library bases —
+/// an action usage inherits `Actions::Action`'s `start`/`done`.
+#[cfg(feature = "json")]
+#[test]
+fn inherited_members_implied_library_bases() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let lib = sysmlv2_testkit::library_dir();
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source("a.sysml", "package Q { action a { action step1; } }");
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let a = r.resolve_qualified("Q::a").unwrap();
+
+    // Explicit-only: no written heritage, nothing inherited.
+    assert!(r.inherited_features(a, false).is_empty());
+
+    // Implied: Actions::Action's members arrive, `start`/`done` included.
+    let implied: Vec<_> = r
+        .inherited_features(a, true)
+        .iter()
+        .filter_map(|&m| r.element_lookup_name(m))
+        .collect();
+    assert!(
+        implied.iter().any(|n| n == "start") && implied.iter().any(|n| n == "done"),
+        "expected start/done among implied-inherited features, got: {implied:?}"
+    );
+    for m in r.inherited_features(a, true) {
+        assert!(r.is_library_element(m));
+    }
+}
+
+/// Conformance corner cases: imported memberships inherit, unrelated
+/// same-name branches are both retained, and the OCL intersection
+/// condition removes redefinition siblings.
+#[cfg(feature = "json")]
+#[test]
+fn inherited_members_imports_and_redefinition_siblings() {
+    use sysmlv2_parser::json::ResolvedModel;
+
+    // (1) A public import in the base re-exports through heritage.
+    let mut model = Model::new();
+    model.add_source(
+        "i.sysml",
+        "package P {
+            part def Imported { attribute fromImport; }
+            part def Base { public import Imported::fromImport; }
+            part def Sub :> Base;
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let sub = r.resolve_qualified("P::Sub").unwrap();
+    let names: Vec<_> = r
+        .inherited_features(sub, false)
+        .iter()
+        .filter_map(|&m| r.element_name(m).map(str::to_string))
+        .collect();
+    assert_eq!(names, ["fromImport"], "public import must inherit");
+
+    // (1b) A private import must NOT inherit.
+    let mut model = Model::new();
+    model.add_source(
+        "ip.sysml",
+        "package P {
+            part def Imported { attribute fromImport; }
+            part def Base { private import Imported::fromImport; }
+            part def Sub :> Base;
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let sub = r.resolve_qualified("P::Sub").unwrap();
+    assert!(r.inherited_features(sub, false).is_empty());
+
+    // (2) Same-name features of unrelated branches are both retained
+    // (name lookup is ambiguous; the memberships still inherit).
+    let mut model = Model::new();
+    model.add_source(
+        "u.sysml",
+        "package P {
+            part def A { attribute x; }
+            part def B { attribute x; }
+            part def D :> B;
+            part def C :> A, D;
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let c = r.resolve_qualified("P::C").unwrap();
+    let xs: Vec<_> = r
+        .inherited_features(c, false)
+        .iter()
+        .filter_map(|&m| r.element_name(m).map(str::to_string))
+        .collect();
+    assert_eq!(xs, ["x", "x"], "both unrelated x features inherit");
+
+    // (3) Intersection condition: owned `z :>> A::x` removes both the
+    // redefined `x` and the sibling `y :>> x` arriving from `B`.
+    let mut model = Model::new();
+    model.add_source(
+        "s.sysml",
+        "package P {
+            part def A { attribute x; }
+            part def B :> A { attribute y :>> x; }
+            part def C :> B { attribute z :>> A::x; }
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let c = r.resolve_qualified("P::C").unwrap();
+    let leftover: Vec<_> = r
+        .inherited_features(c, false)
+        .iter()
+        .filter_map(|&m| r.element_name(m).map(str::to_string))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "y and x both removed by the intersection condition, got {leftover:?}"
+    );
+
+    // (4) Alias memberships inherit as memberships: `alias m for mass`
+    // in the base arrives on the subtype, navigable to its target.
+    let mut model = Model::new();
+    model.add_source(
+        "a.sysml",
+        "package P {
+            part def Base { attribute mass; alias m for mass; }
+            part def Sub :> Base;
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let sub = r.resolve_qualified("P::Sub").unwrap();
+    let memberships = r.inherited_memberships(sub, false);
+    let alias = memberships
+        .iter()
+        .copied()
+        .find(|&m| r.membership_is_alias(m))
+        .expect("inherited alias membership");
+    assert_eq!(r.membership_member_name(alias).as_deref(), Some("m"));
+    let mass = r.resolve_qualified("P::Base::mass").unwrap();
+    assert_eq!(r.membership_member(alias), Some(mass));
+    // The ordinary membership for `mass` is present too.
+    assert!(
+        memberships
+            .iter()
+            .any(|&m| !r.membership_is_alias(m) && r.membership_member(m) == Some(mass))
+    );
+}
+
+/// Composition corner cases: nested re-export filter policy,
+/// imported aliases, cross-branch redefiner independence, and the
+/// heritage of imported scopes.
+#[cfg(feature = "json")]
+#[test]
+fn inherited_members_import_policy_composition() {
+    use sysmlv2_parser::json::ResolvedModel;
+
+    // (1) A nested public re-export keeps its own filter policy.
+    let mut model = Model::new();
+    model.add_source(
+        "f.sysml",
+        "package P {
+            metadata def Safety;
+            package Lib {
+                part safe { @Safety; }
+                part plain;
+            }
+            package Reexport { public import Lib::*[@Safety]; }
+            part def Base { public import Reexport::*; }
+            part def Sub :> Base;
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let sub = r.resolve_qualified("P::Sub").unwrap();
+    let names: Vec<_> = r
+        .inherited_features(sub, false)
+        .iter()
+        .filter_map(|&m| r.element_name(m).map(str::to_string))
+        .collect();
+    assert!(names.contains(&"safe".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"plain".to_string()),
+        "nested [@Safety] filter must hold through the re-export: {names:?}"
+    );
+
+    // (2) Aliases reached through a public import are enumerated.
+    let mut model = Model::new();
+    model.add_source(
+        "a.sysml",
+        "package P {
+            package Lib {
+                part x;
+                alias a for x;
+            }
+            part def Base { public import Lib::*; }
+            part def Sub :> Base;
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let sub = r.resolve_qualified("P::Sub").unwrap();
+    let memberships = r.inherited_memberships(sub, false);
+    let alias = memberships
+        .iter()
+        .copied()
+        .find(|&m| r.membership_is_alias(m))
+        .expect("imported alias membership");
+    assert_eq!(r.membership_member_name(alias).as_deref(), Some("a"));
+    let x = r.resolve_qualified("P::Lib::x").unwrap();
+    assert_eq!(r.membership_member(alias), Some(x));
+
+    // (3) Redefiners of unrelated heritage branches never suppress one
+    // another; an owned redefiner still suppresses both.
+    let mut model = Model::new();
+    model.add_source(
+        "b.sysml",
+        "package P {
+            part def A { attribute x; }
+            part def B :> A { attribute y :>> x; }
+            part def D :> A { attribute z :>> x; }
+            part def E :> D;
+            part def C :> B, E;
+            part def F :> B, E { attribute own :>> A::x; }
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let c = r.resolve_qualified("P::C").unwrap();
+    let mut names: Vec<_> = r
+        .inherited_features(c, false)
+        .iter()
+        .filter_map(|&m| r.element_name(m).map(str::to_string))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["y", "z"], "both branch redefiners inherit");
+    let f = r.resolve_qualified("P::F").unwrap();
+    let leftover: Vec<_> = r
+        .inherited_features(f, false)
+        .iter()
+        .filter_map(|&m| r.element_name(m).map(str::to_string))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "owned `own :>> A::x` suppresses x, y, and z: {leftover:?}"
+    );
+
+    // (4) Inherited members of an *imported* type resolve through the
+    // import — enumeration follows lookup's base arm.
+    let mut model = Model::new();
+    model.add_source(
+        "h.sysml",
+        "package P {
+            part def Other { attribute deep; }
+            part def Mixin :> Other { attribute shallow; }
+            part def Base { public import Mixin::*; }
+            part def Sub :> Base;
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let sub = r.resolve_qualified("P::Sub").unwrap();
+    let names: Vec<_> = r
+        .inherited_features(sub, false)
+        .iter()
+        .filter_map(|&m| r.element_name(m).map(str::to_string))
+        .collect();
+    assert!(
+        names.contains(&"shallow".to_string()) && names.contains(&"deep".to_string()),
+        "imported type's own + inherited members both arrive: {names:?}"
+    );
+}
+
+/// `include_implied = false` holds through imported type scopes too: a
+/// base's `import T::*` contributes T's own members, not the members of
+/// T's implied library bases.
+#[cfg(feature = "json")]
+#[test]
+fn include_implied_false_holds_through_imported_type_scopes() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source(
+        "a.sysml",
+        "package Q {
+            part def T { attribute x; }
+            part def Base { public import T::*; }
+            part def Sub :> Base;
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let sub = r.resolve_qualified("Q::Sub").unwrap();
+    let names = |r: &mut ResolvedModel, implied: bool| -> Vec<String> {
+        let mut v: Vec<String> = r
+            .inherited_memberships(sub, implied)
+            .iter()
+            .filter_map(|&m| r.membership_member_name(m))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&mut r, false), ["x"]);
+    let implied = names(&mut r, true);
+    assert!(
+        implied.contains(&"x".to_string()) && implied.len() > 1,
+        "T's implied bases contribute only when asked: {implied:?}"
+    );
+}
+
+/// Written heritage is consulted before implied library heritage — the
+/// order `base_scopes` has always used, now made explicit by the
+/// written/implied split. Where a written base and an implied Tables 31/32
+/// base both declare a member of one name with non-overlapping metaclasses,
+/// lookup keeps the earlier candidate, so the written base's member wins.
+#[cfg(feature = "json")]
+#[test]
+fn written_base_precedes_implied_library_base_in_lookup() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    // `Actions::Action` (the implied base of every action definition)
+    // declares the action usage `start`; the written base declares an
+    // attribute of the same name.
+    model.add_source(
+        "p.sysml",
+        "package Q {
+            action def Base { attribute start; }
+            action def A :> Base { attribute again :>> start; }
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let again = r.resolve_qualified("Q::A::again").unwrap();
+    let base = r.resolve_qualified("Q::Base").unwrap();
+    let targets = r.redefinition_targets(again);
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert_eq!(
+        r.owner(targets[0]),
+        Some(base),
+        "the written base's member wins"
+    );
+    assert_eq!(r.element_type(targets[0]), "AttributeUsage");
+}
+
+/// A chain-source transition (`first v.a`) still reports its source
+/// through `transition_parts` now that the source membership is an
+/// OwningMembership owning the chain feature.
+#[cfg(feature = "json")]
+#[test]
+fn transition_parts_reads_a_chain_source() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+            part def V { part a; }
+            state def S {
+                part v : V;
+                state s1; state s2;
+                transition t1 first s1 then s2;
+                transition t2 first v.a then s2;
+            }
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let t1 = r.resolve_qualified("P::S::t1").unwrap();
+    let t2 = r.resolve_qualified("P::S::t2").unwrap();
+    let s1 = r.resolve_qualified("P::S::s1").unwrap();
+    assert_eq!(r.transition_parts(t1).source, Some(s1));
+    let src = r.transition_parts(t2).source.expect("chain source");
+    assert_eq!(r.element_type(src), "Feature");
+    assert!(
+        r.owned_relationships(src)
+            .iter()
+            .any(|&x| r.element_type(x) == "FeatureChaining"),
+        "the source is the synthesized chain feature"
+    );
+}
+
+/// The declared multiplicity of an element is its own written clause,
+/// read through the owner index the builder keeps for the table.
+#[test]
+fn declared_multiplicity_reads_the_element_s_own_clause() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let mut model = Model::new();
+    model.add_source(
+        "p.sysml",
+        "package P {
+            part def D;
+            part a : D[2..5];
+            part bare : D;
+            part heir :>> a;
+            part many : D[*];
+         }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let [a, bare, heir, many] =
+        ["P::a", "P::bare", "P::heir", "P::many"].map(|qn| r.resolve_qualified(qn).unwrap());
+    assert_eq!(r.declared_multiplicity(a), Some((2.0, 5.0)));
+    // Answers are stable across lookups and independent of the order.
+    assert_eq!(r.declared_multiplicity(many), Some((0.0, f64::INFINITY)));
+    assert_eq!(r.declared_multiplicity(a), Some((2.0, 5.0)));
+    // An element that declares none has none; inherited clauses are
+    // deliberately not walked.
+    assert_eq!(r.declared_multiplicity(bare), None);
+    assert_eq!(r.declared_multiplicity(heir), None);
+}
+
+/// Elements added on top of a prepared library are indexed alongside the
+/// library's own rows, and neither side shadows the other.
+#[test]
+fn declared_multiplicity_spans_a_prepared_library_and_its_model() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let mut base = Model::new();
+    base.add_library_source(
+        "lib.sysml",
+        "library package L { part def D; part shared : D[3..4]; }",
+    );
+    let prepared = base.prepare_library().unwrap();
+    let mut model = Model::new();
+    prepared.install(&mut model).unwrap();
+    model.add_source("p.sysml", "package P { part own : L::D[1..2]; }");
+    let mut r = ResolvedModel::build(&model);
+    let own = r.resolve_qualified("P::own").unwrap();
+    let shared = r.resolve_qualified("L::shared").unwrap();
+    assert_eq!(r.declared_multiplicity(own), Some((1.0, 2.0)));
+    assert_eq!(r.declared_multiplicity(shared), Some((3.0, 4.0)));
+}

@@ -88,9 +88,12 @@ impl Client {
             match self.conn.receiver.recv().unwrap() {
                 Message::Response(Response {
                     id: rid,
-                    result,
-                    error,
+                    response_result,
                 }) if rid == id => {
+                    let (result, error) = match response_result {
+                        Ok(v) => (Some(v), None),
+                        Err(e) => (None, Some(e)),
+                    };
                     if let Some(e) = error {
                         return Err(e.message);
                     }
@@ -183,6 +186,44 @@ fn definition_crosses_files() {
         }
     );
     assert_eq!(loc.range.end.character, 18, "the `Wheel` name token");
+    client.shutdown();
+}
+
+/// An `about` target naming a documentation or comment element jumps
+/// to that element's declared name — by local name and by qualified
+/// name, like any other member.
+#[test]
+fn definition_reaches_named_documentation() {
+    let mut client = Client::start();
+    let doc = uri("doc.sysml");
+    client.open(
+        &doc,
+        "package P {\n    part def Vehicle {\n        doc vehicleDoc /* A vehicle. */\n        comment about vehicleDoc /* about the doc */\n    }\n    comment about Vehicle::vehicleDoc /* qualified */\n}\n",
+    );
+    let mut definition = |line: u32, character: u32| -> Location {
+        let resp = client.request_ok::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: Client::pos_params(&doc, line, character),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        });
+        let Some(GotoDefinitionResponse::Scalar(loc)) = resp else {
+            panic!("expected a definition at {line}:{character}: {resp:?}");
+        };
+        loc
+    };
+    let declared = Position {
+        line: 2,
+        character: 12,
+    };
+    // `vehicleDoc` in `comment about vehicleDoc` — line 3, col 22.
+    let loc = definition(3, 25);
+    assert_eq!(loc.uri, doc);
+    assert_eq!(loc.range.start, declared);
+    assert_eq!(loc.range.end.character, 22, "the `vehicleDoc` name token");
+    // `vehicleDoc` in `comment about Vehicle::vehicleDoc` — line 5, col 27.
+    let loc = definition(5, 30);
+    assert_eq!(loc.uri, doc);
+    assert_eq!(loc.range.start, declared);
     client.shutdown();
 }
 
@@ -553,7 +594,8 @@ fn rename_shadow_capture_rejects() {
 /// qualified reference.
 #[test]
 fn definition_reaches_unopened_workspace_units() {
-    let dir = std::env::temp_dir().join("sysmlv2-lsp-nav-root-test");
+    let dir =
+        std::env::temp_dir().join(format!("sysmlv2-lsp-nav-root-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let defs = "package Defs {\n    part def Wheel {\n        attribute radius : Real;\n    }\n    part def Axle;\n}\n";
@@ -725,7 +767,10 @@ fn hover_inherits_metadata_vocabulary_docs() {
 /// surfaced with generated provenance stores hovering bare.
 #[test]
 fn hover_inherits_library_vocabulary_docs() {
-    let dir = std::env::temp_dir().join("sysmlv2-lsp-nav-libdocs-test");
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-lsp-nav-libdocs-test-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -767,6 +812,53 @@ fn hover_inherits_library_vocabulary_docs() {
         m.value.contains("Vocab::Record::rowDigest"),
         "attribution missing: {}",
         m.value
+    );
+    client.shutdown();
+}
+
+/// A standard-library directory that cannot be read leaves hover,
+/// definition, references and rename with nothing to answer from. The
+/// empty answers used to be all the client ever heard; the reason now
+/// reaches it too, once, before the answer.
+#[test]
+fn an_unreadable_library_reaches_the_client() {
+    use lsp_types::request::Request as _;
+    let missing = std::env::temp_dir().join(format!(
+        "sysmlv2-lsp-no-such-library-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing);
+    let client = Client::start_with_library(missing);
+    let u = uri("defs.sysml");
+    client.open(&u, DEFS);
+
+    let id = RequestId::from(99);
+    client
+        .conn
+        .sender
+        .send(Message::Request(Request::new(
+            id.clone(),
+            HoverRequest::METHOD.to_string(),
+            HoverParams {
+                text_document_position_params: Client::pos_params(&u, 1, 14),
+                work_done_progress_params: Default::default(),
+            },
+        )))
+        .unwrap();
+    let mut shown: Option<lsp_types::ShowMessageParams> = None;
+    loop {
+        match client.conn.receiver.recv().unwrap() {
+            Message::Notification(n) if n.method == "window/showMessage" => {
+                shown = Some(serde_json::from_value(n.params).unwrap());
+            }
+            Message::Response(r) if r.id == id => break,
+            _ => continue,
+        }
+    }
+    let shown = shown.expect("the library failure reaches the client");
+    assert!(
+        shown.message.contains("standard library could not be read"),
+        "{shown:?}"
     );
     client.shutdown();
 }

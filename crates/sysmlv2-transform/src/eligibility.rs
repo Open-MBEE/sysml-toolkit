@@ -65,6 +65,7 @@ const NOT_YET_GATED: &str =
 /// The matrix row for a usage kind, `None` when the kind has no textual
 /// `<keyword> def` counterpart at all (bindings, successions, control
 /// nodes, KerML feature kinds, …).
+#[must_use]
 pub fn kind_rule(kind: UsageKind) -> Option<KindRule> {
     use UsageKind::*;
     Some(match kind {
@@ -107,6 +108,7 @@ pub fn kind_rule(kind: UsageKind) -> Option<KindRule> {
 
 /// The matrix row keyed from the definition side (inline direction), by
 /// abstract-syntax metaclass. Same rows as [`kind_rule`].
+#[must_use]
 pub fn definition_kind_rule(metaclass: &str) -> Option<KindRule> {
     use UsageKind::*;
     let kind = match metaclass {
@@ -376,6 +378,7 @@ pub struct InlineEligibility {
 /// empty = legal. This is the mechanism that keeps the matrix honest —
 /// `probe_body_in_definition_context("view", "expose P::*;")` fails
 /// while the same body is legal on a view *usage*.
+#[must_use]
 pub fn probe_body_in_definition_context(keyword: &str, interior: &str) -> Vec<String> {
     let probe = format!("{keyword} def __X {{{interior}}}");
     let parse = parse_source(&probe);
@@ -488,7 +491,7 @@ fn reparse_definition(text: &str) -> Result<Definition, InlineRefusal> {
 }
 
 impl Session {
-    /// M29a0 extract gate: may `usage` be extracted into a definition,
+    /// Extract gate: may `usage` be extracted into a definition,
     /// and if so where is the moved region? Refusals are named header /
     /// kind / context policies — never a late failure downstream.
     pub fn extract_definition_eligibility(
@@ -506,7 +509,7 @@ impl Session {
             return Err(ExtractRefusal::NotAUserElement);
         }
         let local = unit - self.unit_offset;
-        if self.sources[local].0.ends_with(".kerml") {
+        if crate::is_kerml_unit(&self.sources[local].0) {
             return Err(ExtractRefusal::UnsupportedDialect);
         }
         if !metaclass.ends_with("Usage") {
@@ -598,11 +601,16 @@ impl Session {
         })
     }
 
-    /// M29a0 inline gate: has `definition` exactly one direct,
+    /// The inline gate: has `definition` exactly one direct,
     /// non-conjugated typing usage, and does every other incoming
     /// reference classify as (a) internal to the body being moved or
     /// (b) reached through that usage? Class (c) — genuine outside
     /// references through the definition — refuses, naming each site.
+    ///
+    /// # Panics
+    ///
+    /// If the sole typing site is gone by the time the eligibility is
+    /// assembled, which the count check just above rules out.
     pub fn inline_definition_eligibility(
         &mut self,
         definition: ElementRef,
@@ -617,12 +625,13 @@ impl Session {
             return Err(InlineRefusal::NotAUserElement);
         }
         let def_local = def_unit - self.unit_offset;
-        if self.sources[def_local].0.ends_with(".kerml") {
+        if crate::is_kerml_unit(&self.sources[def_local].0) {
             return Err(InlineRefusal::UnsupportedDialect);
         }
-        let rule = definition_kind_rule(&metaclass).ok_or(InlineRefusal::NotADefinition {
-            metaclass: metaclass.clone(),
-        })?;
+        let rule =
+            definition_kind_rule(&metaclass).ok_or_else(|| InlineRefusal::NotADefinition {
+                metaclass: metaclass.clone(),
+            })?;
         if !rule.enabled {
             return Err(InlineRefusal::UnsupportedKind {
                 keyword: rule.keyword,
@@ -818,13 +827,13 @@ impl Session {
             .resolved
             .owned_members(usage)
             .into_iter()
-            .filter_map(|m| self.resolved.element_effective_name(m))
+            .filter_map(|m| self.resolved.element_lookup_name(m))
             .collect();
         let mut collisions: Vec<String> = self
             .resolved
             .owned_members(definition)
             .into_iter()
-            .filter_map(|m| self.resolved.element_effective_name(m))
+            .filter_map(|m| self.resolved.element_lookup_name(m))
             .filter(|n| usage_names.contains(n))
             .collect();
         if !collisions.is_empty() {

@@ -23,10 +23,12 @@
 //! delta's base digest before trusting index resolution.
 
 use crate::cbor::{Head, Reader};
-use crate::decode::{Tables, read_element_body, read_uuid_table, read_value};
+use crate::decode::{
+    Tables, gate_flags, read_element_body, read_units, read_uuid_table, read_uuids, read_value,
+};
 use crate::delta::{Claim, FLAG_DELTA, FLAG_DELTA_PORTABLE, OP_SET, OP_SPLICE, OP_UNSET};
-use crate::encode::{FLAG_ELIDE_IDS, FLAG_IMPLIED_OWNERS, FLAG_UNIT_PATHS, table_set};
-use crate::{Error, delta_canonical};
+use crate::encode::{FLAG_ELIDE_IDS, FLAG_IMPLIED_OWNERS, FLAG_UNIT_PATHS, table_set, wire_code};
+use crate::{Error, ErrorKind};
 use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -51,9 +53,13 @@ pub struct BaseIndex {
 
 impl BaseIndex {
     /// Build (and canonicalize) from a compact element array.
+    ///
+    /// # Panics
+    /// If an element has no string `@id`. Canonicalization runs first
+    /// and refuses such a payload, so one that reached this point
+    /// carries them.
     pub fn from_compact(compact: &Value) -> Result<Self, Error> {
-        let canon = delta_canonical(compact)?;
-        let arr = canon.as_array().unwrap();
+        let arr = crate::delta::canonical_views(compact)?;
         let tables = table_set(false);
         let mut ids = Vec::with_capacity(arr.len());
         let mut types = Vec::with_capacity(arr.len());
@@ -68,8 +74,8 @@ impl BaseIndex {
                 .binary_search_by(|(n, _)| n.cmp(&ty))
                 .map_err(|_| Error::new(format!("unknown @type `{ty}`")))?;
             ids.push(Uuid::try_parse(id).map_err(|_| Error::new(format!("invalid UUID `{id}`")))?);
-            types.push(code as u16);
-            pos.entry(id).or_insert(i as u32);
+            types.push(wire_code(code)?);
+            pos.entry(id).or_insert(adjacency_pos(i)?);
         }
         let adjacency = |key: &str| -> Vec<Vec<u32>> {
             arr.iter()
@@ -92,30 +98,36 @@ impl BaseIndex {
         })
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.ids.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
 
     /// Element id at canonical position `i`.
+    #[must_use]
     pub fn id(&self, i: usize) -> Uuid {
         self.ids[i]
     }
 
     /// Concrete-metaclass wire code at canonical position `i`.
+    #[must_use]
     pub fn type_code(&self, i: usize) -> u16 {
         self.types[i]
     }
 
     /// The ids in canonical order — the strict-delta index space.
+    #[must_use]
     pub fn ids(&self) -> &[Uuid] {
         &self.ids
     }
 
     /// Versioned, checksummed binary form (the registry artifact).
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(self.ids.len() * 20 + 16);
         b.extend_from_slice(INDEX_MAGIC);
@@ -145,10 +157,13 @@ impl BaseIndex {
             return Err(Error::new("not a base-index artifact"));
         }
         if bytes[4] != INDEX_VERSION {
-            return Err(Error::new(format!(
-                "base-index version {} unsupported (this build carries {INDEX_VERSION})",
-                bytes[4]
-            )));
+            return Err(Error::of(
+                ErrorKind::UnsupportedVersion,
+                format!(
+                    "base-index version {} unsupported (this build carries {INDEX_VERSION})",
+                    bytes[4]
+                ),
+            ));
         }
         let (body, sum) = bytes.split_at(bytes.len() - 16);
         if Uuid::new_v5(&index_ns(), body).as_bytes() != sum {
@@ -158,7 +173,7 @@ impl BaseIndex {
             b: &body[5..],
             at: 0,
         };
-        let n = r.uvarint()? as usize;
+        let n = r.index()?;
         if n > body.len() / 16 {
             return Err(Error::new("base-index count longer than artifact"));
         }
@@ -166,24 +181,32 @@ impl BaseIndex {
         for _ in 0..n {
             ids.push(Uuid::from_bytes(r.take16()?));
         }
+        // Type codes index the compact field tables on every later
+        // use (patch resolution, transition), so range-check them here.
+        let n_types = table_set(false).len();
         let mut types = Vec::with_capacity(n);
         for _ in 0..n {
-            types.push(r.uvarint()? as u16);
+            let code = r.uvarint()?;
+            let code = u16::try_from(code)
+                .ok()
+                .filter(|&c| usize::from(c) < n_types)
+                .ok_or_else(|| Error::new(format!("base-index type code {code} out of range")))?;
+            types.push(code);
         }
         let lists = |r: &mut VarReader| -> Result<Vec<Vec<u32>>, Error> {
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
-                let m = r.uvarint()? as usize;
+                let m = r.index()?;
                 if m > body.len() {
                     return Err(Error::new("base-index list longer than artifact"));
                 }
                 let mut l = Vec::with_capacity(m);
                 for _ in 0..m {
-                    let x = r.uvarint()?;
-                    if x as usize >= n {
-                        return Err(Error::new("base-index adjacency out of range"));
-                    }
-                    l.push(x as u32);
+                    let x = u32::try_from(r.uvarint()?)
+                        .ok()
+                        .filter(|&x| (x as usize) < n)
+                        .ok_or_else(|| Error::new("base-index adjacency out of range"))?;
+                    l.push(x);
                 }
                 out.push(l);
             }
@@ -201,6 +224,15 @@ impl BaseIndex {
             rels,
         })
     }
+}
+
+/// An element's canonical position as a 32-bit adjacency entry. The
+/// adjacency lists address the index's own elements, so a snapshot
+/// that outgrows the 32-bit space is refused rather than aliased onto
+/// a different element.
+fn adjacency_pos(position: usize) -> Result<u32, Error> {
+    u32::try_from(position)
+        .map_err(|_| Error::new("snapshot outgrew the 32-bit adjacency index space"))
 }
 
 fn uvarint(b: &mut Vec<u8>, mut v: u64) {
@@ -227,7 +259,7 @@ impl VarReader<'_> {
             let byte = *self
                 .b
                 .get(self.at)
-                .ok_or_else(|| Error::new("truncated base-index artifact"))?;
+                .ok_or_else(|| Error::of(ErrorKind::Truncated, "truncated base-index artifact"))?;
             self.at += 1;
             v |= ((byte & 0x7f) as u64) << shift;
             if byte & 0x80 == 0 {
@@ -237,19 +269,28 @@ impl VarReader<'_> {
         Err(Error::new("overlong varint in base-index artifact"))
     }
 
+    /// Read a varint as an in-memory index, length or position
+    /// ([`Reader::index_of`]).
+    fn index(&mut self) -> Result<usize, Error> {
+        Reader::index_of(self.uvarint()?)
+    }
+
     fn take16(&mut self) -> Result<[u8; 16], Error> {
         let end = self.at + 16;
         let s = self
             .b
             .get(self.at..end)
-            .ok_or_else(|| Error::new("truncated base-index artifact"))?;
+            .ok_or_else(|| Error::of(ErrorKind::Truncated, "truncated base-index artifact"))?;
         self.at = end;
         Ok(s.try_into().unwrap())
     }
 }
 
 /// A resolved change target.
+///
+/// Non-exhaustive: further identity modes would land here.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum RecordTarget {
     /// A create; `id` comes from the created-id table.
     Create { id: Uuid },
@@ -261,7 +302,10 @@ pub enum RecordTarget {
 
 /// One field-level patch operation, values decoded to JSON shape
 /// (references as `{"@id": …}` / `{"@ref": …}`).
+///
+/// Non-exhaustive: further opcodes would land here.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum PatchOp {
     Set(Value),
     Unset,
@@ -323,28 +367,32 @@ fn resolve(bytes: &[u8], base: Option<&BaseIndex>) -> Result<ResolvedDelta, Erro
     let arity = r.array()?;
     let (_, flags) = crate::decode::parse_header(r.uint()?)?;
     if flags & FLAG_DELTA == 0 {
-        return Err(Error::new("not a delta payload"));
+        return Err(Error::of(ErrorKind::WrongForm, "not a delta payload"));
     }
     let portable = flags & FLAG_DELTA_PORTABLE != 0;
     if portable != base.is_none() {
-        return Err(Error::new(if portable {
-            "portable delta: resolve without a base index"
-        } else {
-            "strict delta: resolve with its base index"
-        }));
+        return Err(Error::of(
+            ErrorKind::WrongForm,
+            if portable {
+                "portable delta: resolve without a base index"
+            } else {
+                "strict delta: resolve with its base index"
+            },
+        ));
     }
     if flags & FLAG_ELIDE_IDS != 0 {
-        return Err(Error::new(
+        return Err(Error::of(
+            ErrorKind::NeedsResolver,
             "id-elided delta: created-id recovery derives through element names, \
              which a base index does not carry — apply against a materialized base",
         ));
     }
     let with_units = flags & FLAG_UNIT_PATHS != 0;
     let implied = flags & FLAG_IMPLIED_OWNERS != 0;
-    let known = FLAG_DELTA | FLAG_DELTA_PORTABLE | FLAG_UNIT_PATHS | FLAG_IMPLIED_OWNERS;
-    if flags & !known != 0 {
-        return Err(Error::new(format!("unknown header flags {flags:#x}")));
-    }
+    gate_flags(
+        flags,
+        FLAG_DELTA | FLAG_DELTA_PORTABLE | FLAG_UNIT_PATHS | FLAG_IMPLIED_OWNERS,
+    )?;
     let expect_arity = 6 + usize::from(implied) + usize::from(with_units);
     if arity != expect_arity {
         return Err(Error::new(format!(
@@ -373,10 +421,11 @@ fn resolve(bytes: &[u8], base: Option<&BaseIndex>) -> Result<ResolvedDelta, Erro
             _ => return Err(Error::new("claim is bstr(16) or text")),
         }
     }
-    let declared_b = r.uint()? as usize;
+    let declared_b = r.index()?;
     if let Some(base) = base {
         if declared_b != base.len() {
-            return Err(Error::new(
+            return Err(Error::of(
+                ErrorKind::BaseDigestMismatch,
                 "base element count differs from the index — wrong or stale index",
             ));
         }
@@ -386,13 +435,17 @@ fn resolve(bytes: &[u8], base: Option<&BaseIndex>) -> Result<ResolvedDelta, Erro
     let n_ext = r.array()?;
     let exts = read_uuid_table(&mut r, n_ext)?;
     let n_created = r.array()?;
-    let created = read_uuid_table(&mut r, n_created)?;
+    let created = read_uuids(&mut r, n_created)?;
+    // Reference space for decoding payload records: the base ids
+    // (strict only), then the created ids, then the externals.
     let base_ids: Vec<String> = base
-        .map(|b| b.ids.iter().map(Uuid::to_string).collect())
-        .unwrap_or_default();
-    let combined: Vec<String> = base_ids.iter().cloned().chain(created.clone()).collect();
+        .into_iter()
+        .flat_map(|b| b.ids.iter().map(Uuid::to_string))
+        .collect();
+    let created_ids: Vec<String> = created.iter().map(Uuid::to_string).collect();
     let tables = Tables {
-        ids: &combined,
+        ids: &base_ids,
+        created: &created_ids,
         exts: &exts,
     };
     let field_tables = table_set(false);
@@ -410,23 +463,21 @@ fn resolve(bytes: &[u8], base: Option<&BaseIndex>) -> Result<ResolvedDelta, Erro
         }
         let target = match r.head()? {
             Head::Null => {
-                let id = created
+                let &id = created
                     .get(next_created)
                     .ok_or_else(|| Error::new("created id table exhausted"))?;
                 next_created += 1;
-                RecordTarget::Create {
-                    id: Uuid::try_parse(id).unwrap(),
-                }
+                RecordTarget::Create { id }
             }
             Head::Uint(i) if !portable => {
-                let i = i as usize;
                 let base = base.unwrap();
-                if i >= base.len() {
-                    return Err(Error::new(format!("change target {i} out of range")));
-                }
+                let at = usize::try_from(i)
+                    .ok()
+                    .filter(|&at| at < base.len())
+                    .ok_or_else(|| Error::new(format!("change target {i} out of range")))?;
                 RecordTarget::Base {
-                    index: i,
-                    id: base.ids[i],
+                    index: at,
+                    id: base.ids[at],
                 }
             }
             Head::Bstr(16) if portable => RecordTarget::Id {
@@ -472,22 +523,11 @@ fn resolve(bytes: &[u8], base: Option<&BaseIndex>) -> Result<ResolvedDelta, Erro
         return Err(Error::new("created id table not fully consumed"));
     }
     if implied {
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 2 => m,
-            Head::Map(_) => return Err(Error::new("owner-exception map longer than payload")),
-            _ => return Err(Error::new("owner-exception map expected")),
-        };
-        let mut prev: i64 = -1;
-        for _ in 0..m {
-            let k = r.uint()? as usize;
-            if k as i64 <= prev {
-                return Err(Error::new("owner-exception indices not ascending"));
-            }
-            prev = k as i64;
-            let bits = r.uint()?;
-            if bits == 0 || bits > 3 {
-                return Err(Error::new("owner-exception bits out of range"));
-            }
+        let entries = r.ascending_map("owner-exception map", 2, |r| match r.uint()? {
+            bits @ 1..=3 => Ok(bits),
+            _ => Err(Error::new("owner-exception bits out of range")),
+        })?;
+        for (k, bits) in entries {
             let rec = records
                 .get_mut(k)
                 .ok_or_else(|| Error::new("owner-exception index out of range"))?;
@@ -499,18 +539,10 @@ fn resolve(bytes: &[u8], base: Option<&BaseIndex>) -> Result<ResolvedDelta, Erro
     }
     let mut units: Vec<(u64, String)> = Vec::new();
     if with_units {
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 2 => m,
-            Head::Map(_) => return Err(Error::new("unit-path map longer than payload")),
-            _ => return Err(Error::new("unit-path map expected")),
-        };
-        for _ in 0..m {
-            let i = r.uint()?;
-            match r.head()? {
-                Head::Tstr(n) => units.push((i, r.tstr_body(n)?.to_owned())),
-                _ => return Err(Error::new("unit path is a text string")),
-            }
-        }
+        units = read_units(&mut r)?
+            .into_iter()
+            .map(|(i, path)| (i as u64, path))
+            .collect();
     }
     if !r.done() {
         return Err(Error::new("trailing bytes after payload"));
@@ -536,15 +568,16 @@ fn parse_patch_ops(
         return Err(Error::new("patch longer than payload"));
     }
     let mut ops = Vec::with_capacity(n);
-    let mut prev: i32 = -1;
+    let mut prev: Option<u64> = None;
     for _ in 0..n {
         let ord = r.uint()?;
-        if ord as i32 <= prev {
+        if prev.is_some_and(|p| ord <= p) {
             return Err(Error::new("patch ordinals not ascending"));
         }
-        prev = ord as i32;
-        let field = fields
-            .get(ord as usize)
+        prev = Some(ord);
+        let field = usize::try_from(ord)
+            .ok()
+            .and_then(|ord| fields.get(ord))
             .ok_or_else(|| Error::new(format!("field ordinal {ord} out of range")))?;
         if r.array()? != 2 {
             return Err(Error::new("patch op is array(2)"));
@@ -561,8 +594,8 @@ fn parse_patch_ops(
                 if r.array()? != 3 {
                     return Err(Error::new("splice op is array(3)"));
                 }
-                let at = r.uint()? as usize;
-                let del = r.uint()? as usize;
+                let at = r.index()?;
+                let del = r.index()?;
                 let len = r.array()?;
                 if len > r.remaining() {
                     return Err(Error::new("splice items longer than payload"));
@@ -625,10 +658,11 @@ impl ResolvedDelta {
                 .get("@type")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::new("element record has a string @type"))?;
-            let code = tables
-                .binary_search_by(|(n, _)| n.cmp(&ty))
-                .map_err(|_| Error::new(format!("unknown @type `{ty}`")))?
-                as u16;
+            let code = wire_code(
+                tables
+                    .binary_search_by(|(n, _)| n.cmp(&ty))
+                    .map_err(|_| Error::new(format!("unknown @type `{ty}`")))?,
+            )?;
             let list = |key: &str| -> Vec<Uuid> {
                 e.get(key)
                     .and_then(Value::as_array)
@@ -697,19 +731,15 @@ impl ResolvedDelta {
             .chain(appended)
             .collect();
         // Canonical walk over structure (the delta_canonical rule).
-        let pos: HashMap<Uuid, usize> = {
+        let pos: HashMap<Uuid, u32> = {
             let mut m = HashMap::with_capacity(payload.len());
             for (i, n) in payload.iter().enumerate() {
-                m.entry(n.id).or_insert(i);
+                m.entry(n.id).or_insert(adjacency_pos(i)?);
             }
             m
         };
-        let resolve_list = |l: &[Uuid]| -> Vec<u32> {
-            l.iter()
-                .filter_map(|u| pos.get(u))
-                .map(|&i| i as u32)
-                .collect()
-        };
+        let resolve_list =
+            |l: &[Uuid]| -> Vec<u32> { l.iter().filter_map(|u| pos.get(u).copied()).collect() };
         let kids: Vec<Vec<u32>> = payload.iter().map(|n| resolve_list(&n.kids)).collect();
         let rels: Vec<Vec<u32>> = payload.iter().map(|n| resolve_list(&n.rels)).collect();
         let n = payload.len();
@@ -741,11 +771,10 @@ impl ResolvedDelta {
                 walk.push(i);
             }
         }
-        let renum: HashMap<usize, u32> = walk
-            .iter()
-            .enumerate()
-            .map(|(k, &i)| (i, k as u32))
-            .collect();
+        let mut renum: HashMap<usize, u32> = HashMap::with_capacity(walk.len());
+        for (k, &i) in walk.iter().enumerate() {
+            renum.insert(i, adjacency_pos(k)?);
+        }
         Ok(BaseIndex {
             ids: walk.iter().map(|&i| payload[i].id).collect(),
             types: walk.iter().map(|&i| payload[i].ty).collect(),
@@ -758,5 +787,92 @@ impl ResolvedDelta {
                 .map(|&i| rels[i].iter().map(|t| renum[&(*t as usize)]).collect())
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-element artifact carrying `code` as its type code, sealed
+    /// with the artifact checksum so the reader reaches the code
+    /// instead of stopping at the seal. Layout: magic, version, the
+    /// element count, one id, the type code, then that element's two
+    /// empty adjacency lists.
+    fn crafted(code: u64) -> Vec<u8> {
+        let mut body = INDEX_MAGIC.to_vec();
+        body.push(INDEX_VERSION);
+        uvarint(&mut body, 1);
+        body.extend_from_slice(&[0x11; 16]);
+        uvarint(&mut body, code);
+        body.extend_from_slice(&[0, 0]);
+        let sum = Uuid::new_v5(&index_ns(), &body);
+        body.extend_from_slice(sum.as_bytes());
+        body
+    }
+
+    /// Artifacts whose body is mutated and then **re-sealed**, so the
+    /// reader walks the mutation instead of stopping at the checksum —
+    /// the coverage a byte-level fuzz of a sealed artifact cannot
+    /// reach. Deterministic, seeded.
+    #[test]
+    fn resealed_mutations_never_panic() {
+        let compact = serde_json::json!([
+            { "@type": "Package", "@id": "00000000-0000-4000-8000-000000000001",
+              "ownedRelationship": [{ "@id": "00000000-0000-4000-8000-000000000002" }] },
+            { "@type": "OwningMembership", "@id": "00000000-0000-4000-8000-000000000002",
+              "ownedRelatedElement": [{ "@id": "00000000-0000-4000-8000-000000000003" }] },
+            { "@type": "Package", "@id": "00000000-0000-4000-8000-000000000003" },
+        ]);
+        let sealed = BaseIndex::from_compact(&compact).unwrap().to_bytes();
+        let body = &sealed[..sealed.len() - 16];
+        // xorshift64*, so the sweep is the same on every run.
+        let mut state = 0xBA5E_1DE0_0000_0001_u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..4000 {
+            let mut mutated = body.to_vec();
+            let i = usize::try_from(next() % mutated.len() as u64).expect("below a usize");
+            match next() % 3 {
+                0 => mutated[i] ^= 1u8 << (next() % 8),
+                1 => mutated.truncate(i),
+                _ => mutated[i] = next().to_le_bytes()[0],
+            }
+            let sum = Uuid::new_v5(&index_ns(), &mutated);
+            mutated.extend_from_slice(sum.as_bytes());
+            // Err is fine; panicking is not. A survivor must also
+            // round-trip, since it is by then a well-formed index.
+            if let Ok(index) = BaseIndex::from_bytes(&mutated) {
+                assert_eq!(
+                    BaseIndex::from_bytes(&index.to_bytes()).unwrap(),
+                    index,
+                    "a loaded index re-seals to itself"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crafted_type_codes_out_of_range_are_refused() {
+        let package = u64::from(crate::type_code("Package").unwrap());
+        assert!(
+            BaseIndex::from_bytes(&crafted(package)).is_ok(),
+            "the crafting reaches the code, not the checksum"
+        );
+        for code in [
+            table_set(false).len() as u64,
+            u64::from(u16::MAX),
+            70_000,
+            u64::MAX,
+        ] {
+            let err = BaseIndex::from_bytes(&crafted(code))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("type code"), "code {code}: {err}");
+        }
     }
 }

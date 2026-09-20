@@ -1,0 +1,1055 @@
+{
+  "external_revision": "d7d432ff410e60f9146c38bfe51b4db749a924b1",
+  "contracts": [
+    {
+      "fixture": "validateAssertConstraintUsageReference.sysml",
+      "rule": "validateAssertConstraintUsageReference",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateAssignmentActionUsageReferent.sysml",
+      "rule": "validateAssignmentActionUsageReferent",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateAssignmentActionUsageReferentIsTimeVarying.sysml",
+      "rule": "validateAssignmentActionUsageReferentIsTimeVarying",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateAssociationBinarySpecialization.kerml",
+      "rule": "validateAssociationBinarySpecialization",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateAssociationEndTypes.kerml",
+      "rule": "validateAssociationEndTypes",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateAssociationRelatedTypes.kerml",
+      "rule": "validateAssociationRelatedTypes",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateBehaviorSpecialization.kerml",
+      "rule": "validateBehaviorSpecialization",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateBindingConnectorIsBinary.kerml",
+      "rule": "validateBindingConnectorIsBinary",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateBindingConnectorTypeConformance.kerml",
+      "rule": "validateBindingConnectorTypeConformance",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateBindingConnectorTypeConformance.result.kerml",
+      "rule": "validateBindingConnectorTypeConformance",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateBindingConnectorTypeConformance.satisfy.sysml",
+      "rule": "validateBindingConnectorTypeConformance",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateBindingConnectorTypeConformance.subject.sysml",
+      "rule": "validateBindingConnectorTypeConformance",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateClassSpecialization.kerml",
+      "rule": "validateClassSpecialization",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateClassifierDefaultSupertype.kerml",
+      "rule": "validateClassifierDefaultSupertype",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateConnectorRelatedFeatures.sysml",
+      "rule": "validateConnectorRelatedFeatures",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateConstructorExpressionNoDuplicateFeatureRedefinition.kerml",
+      "rule": "validateConstructorExpressionNoDuplicateFeatureRedefinition",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateControlNodeIncomingSuccessions.sysml",
+      "rule": "validateControlNodeIncomingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateControlNodeOutgoingSuccessions.sysml",
+      "rule": "validateControlNodeOutgoingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateControlNodeOwningType.sysml",
+      "rule": "validateControlNodeOwningType",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateCrossSubsettingCrossingFeature.kerml",
+      "rule": "validateCrossSubsettingCrossingFeature",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateDataTypeSpecialization.kerml",
+      "rule": "validateDataTypeSpecialization",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateDecisionNodeIncomingSuccessions.sysml",
+      "rule": "validateDecisionNodeIncomingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateDecisionNodeOutgoingSuccessions.sysml",
+      "rule": "validateDecisionNodeOutgoingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateElementFilterMembershipIsBoolean.kerml",
+      "rule": "validateElementFilterMembershipIsBoolean",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateElementFilterMembershipIsModelLevelEvaluable.sysml",
+      "rule": "validateElementFilterMembershipIsModelLevelEvaluable",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateEventOccurrenceUsageReferent.sysml",
+      "rule": "validateEventOccurrenceUsageReferent",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateExhibitStateUsageReference.sysml",
+      "rule": "validateExhibitStateUsageReference",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateExpressionResultExpressionMembership.kerml",
+      "rule": "validateExpressionResultExpressionMembership",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateExpressionResultParameterMembership.kerml",
+      "rule": "validateExpressionResultParameterMembership",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureChainExpressionFeatureConformance.kerml",
+      "rule": "validateFeatureChainExpressionFeatureConformance",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureChainingFeatureConformance.kerml",
+      "rule": "validateFeatureChainingFeatureConformance",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureChainingFeatureNotOne.kerml",
+      "rule": "validateFeatureChainingFeatureNotOne",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureChainingFeaturesNotSelf.kerml",
+      "rule": "validateFeatureChainingFeaturesNotSelf",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureConstantIsVariable.sysml",
+      "rule": "validateFeatureConstantIsVariable",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureCrossFeatureType.kerml",
+      "rule": "validateFeatureCrossFeatureType",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureEndFeatureMultiplicity.kerml",
+      "rule": "validateFeatureEndFeatureMultiplicity",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureHasType.kerml",
+      "rule": "validateFeatureHasType",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureIsVariable.kerml",
+      "rule": "validateFeatureIsVariable",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureOwnedCrossSubsetting.kerml",
+      "rule": "validateFeatureOwnedCrossSubsetting",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureOwnedReferenceSubsetting.kerml",
+      "rule": "validateFeatureOwnedReferenceSubsetting",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeaturePortionNotVariable.kerml",
+      "rule": "validateFeaturePortionNotVariable",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureReferenceExpressionReferentIsFeature.kerml",
+      "rule": "validateFeatureReferenceExpressionReferentIsFeature",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureValueIsInitial.kerml",
+      "rule": "validateFeatureValueIsInitial",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureValueOverriding.kerml",
+      "rule": "validateFeatureValueOverriding",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFeatureValueOverriding.sysml",
+      "rule": "validateFeatureValueOverriding",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFlowEndImplicitSubsetting.kerml",
+      "rule": "validateFlowEndImplicitSubsetting",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFlowEndImplicitSubsetting.sysml",
+      "rule": "validateFlowEndImplicitSubsetting",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFlowEndSubsetting.kerml",
+      "rule": "validateFlowEndSubsetting",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateForkNodeIncomingSuccessions.sysml",
+      "rule": "validateForkNodeIncomingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFunctionResultExpressionMembership.kerml",
+      "rule": "validateFunctionResultExpressionMembership",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateFunctionResultParameterMembership.kerml",
+      "rule": "validateFunctionResultParameterMembership",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateIncludeUseCaseUsageReference.sysml",
+      "rule": "validateIncludeUseCaseUsageReference",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateInstantiationExpressionInstantiatedType.kerml",
+      "rule": "validateInstantiationExpressionInstantiatedType",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateInterfaceDefinitionEnd.sysml",
+      "rule": "validateInterfaceDefinitionEnd",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateInterfaceUsageEnd.sysml",
+      "rule": "validateInterfaceUsageEnd",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateInvocationExpressionInstantiatedType.kerml",
+      "rule": "validateInvocationExpressionInstantiatedType",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateJoinNodeOutgoingSuccessions.sysml",
+      "rule": "validateJoinNodeOutgoingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateLibraryPackageNotStandard.kerml",
+      "rule": "validateLibraryPackageNotStandard",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateMergeNodeIncomingSuccessions.sysml",
+      "rule": "validateMergeNodeIncomingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateMergeNodeOutgoingSuccessions.sysml",
+      "rule": "validateMergeNodeOutgoingSuccessions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateMetadataFeatureAnnotatedElement.kerml",
+      "rule": "validateMetadataFeatureAnnotatedElement",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateMetadataFeatureBody.kerml",
+      "rule": "validateMetadataFeatureBody",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateMetadataFeatureMetadataNotAbstract.kerml",
+      "rule": "validateMetadataFeatureMetadataNotAbstract",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOccurrenceUsageIndividualDefinition.sysml",
+      "rule": "validateOccurrenceUsageIndividualDefinition",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOccurrenceUsageIndividualUsage.sysml",
+      "rule": "validateOccurrenceUsageIndividualUsage",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOccurrenceUsageIsPortion.sysml",
+      "rule": "validateOccurrenceUsageIsPortion",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOperatorExpressionBracketOperator.kerml",
+      "rule": "validateOperatorExpressionBracketOperator",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOperatorExpressionCastConformance.kerml",
+      "rule": "validateOperatorExpressionCastConformance",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOperatorExpressionQuantity.sysml",
+      "rule": "validateOperatorExpressionQuantity",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOwnedDifferencingNotOne.kerml",
+      "rule": "validateOwnedDifferencingNotOne",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOwnedIntersectingNotOne.kerml",
+      "rule": "validateOwnedIntersectingNotOne",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateOwnedUnioningNotOne.kerml",
+      "rule": "validateOwnedUnioningNotOne",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validatePerformActionUsageReference.sysml",
+      "rule": "validatePerformActionUsageReference",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validatePortDefinitionOwnedUsagesNotComposite.sysml",
+      "rule": "validatePortDefinitionOwnedUsagesNotComposite",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validatePortUsageIsReference.sysml",
+      "rule": "validatePortUsageIsReference",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validatePortUsageNestedUsagesNotComposite.sysml",
+      "rule": "validatePortUsageNestedUsagesNotComposite",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateRedefinitionDirectionConformance.kerml",
+      "rule": "validateRedefinitionDirectionConformance",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateRedefinitionEndConformance.kerml",
+      "rule": "validateRedefinitionEndConformance",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateRedefinitionFeaturingTypes.kerml",
+      "rule": "validateRedefinitionFeaturingTypes",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateRequirementVerificationMembershipOwningType.sysml",
+      "rule": "validateRequirementVerificationMembershipOwningType",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSatisfyRequirementUsageReference.sysml",
+      "rule": "validateSatisfyRequirementUsageReference",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSendActionUsagePayloadArgument.sysml",
+      "rule": "validateSendActionUsagePayloadArgument",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSendActionUsageReceiver.sysml",
+      "rule": "validateSendActionUsageReceiver",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Warning",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSpecializationSpecificNotConjugated.kerml",
+      "rule": "validateSpecializationSpecificNotConjugated",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSpecializationSpecificNotConjugated.subset.kerml",
+      "rule": "validateSpecializationSpecificNotConjugated",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateStateDefinitionParallelSubactions.sysml",
+      "rule": "validateStateDefinitionParallelSubactions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateStateDefinitionSubactionKind.sysml",
+      "rule": "validateStateDefinitionSubactionKind",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateStateUsageParallelSubactions.sysml",
+      "rule": "validateStateUsageParallelSubactions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateStateUsageSubactionKind.sysml",
+      "rule": "validateStateUsageSubactionKind",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateStructureSpecialization.kerml",
+      "rule": "validateStructureSpecialization",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSubsettingConstantConformance.kerml",
+      "rule": "validateSubsettingConstantConformance",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSubsettingFeaturingTypes.kerml",
+      "rule": "validateSubsettingFeaturingTypes",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateSubsettingUniquenessConformance.kerml",
+      "rule": "validateSubsettingUniquenessConformance",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTransitionFeatureMembershipGuardExpression.sysml",
+      "rule": "validateTransitionFeatureMembershipGuardExpression",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTransitionUsageSuccession.sysml",
+      "rule": "validateTransitionUsageSuccession",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTransitionUsageTriggerActions.sysml",
+      "rule": "validateTransitionUsageTriggerActions",
+      "authority": "SysML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTriggerInvocationActionAfterArgument.sysml",
+      "rule": "validateTriggerInvocationActionAfterArgument",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTriggerInvocationActionAtArgument.sysml",
+      "rule": "validateTriggerInvocationActionAtArgument",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTriggerInvocationActionWhenArgument.sysml",
+      "rule": "validateTriggerInvocationActionWhenArgument",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "known result/argument types and resolved library classifiers",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTypeDifferencingTypesNotSelf.kerml",
+      "rule": "validateTypeDifferencingTypesNotSelf",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTypeIntersectingTypesNotSelf.kerml",
+      "rule": "validateTypeIntersectingTypesNotSelf",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTypeOwnedMultiplicity.kerml",
+      "rule": "validateTypeOwnedMultiplicity",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateTypeUnioningTypesNotSelf.kerml",
+      "rule": "validateTypeUnioningTypesNotSelf",
+      "authority": "KerML 2025-02 pinned XMI",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateViewDefinitionOnlyOnvViewRendering.sysml",
+      "rule": "validateViewDefinitionOnlyOnvViewRendering",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    },
+    {
+      "fixture": "validateViewUsageOnlyOneRendering.sysml",
+      "rule": "validateViewUsageOnlyOneRendering",
+      "authority": "OpenSysML pinned validator label; absent from 2025-02 XMI inventory",
+      "prerequisites": "resolved owning, specializing, typing, or reference relationships",
+      "severity": "Error",
+      "location": "nonempty source span after the fixture comments",
+      "full_library_verdict": "violated",
+      "missing_prerequisites": "unknown; independent structural violations may still be diagnosed"
+    }
+  ]
+}

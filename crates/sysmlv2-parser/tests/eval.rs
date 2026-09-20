@@ -6,6 +6,7 @@
 use sysmlv2_parser::eval::{EvalError, Value};
 use sysmlv2_parser::json::ResolvedModel;
 use sysmlv2_parser::model::Model;
+use sysmlv2_parser::rational::Rational;
 
 /// Evaluate `expr` as `attribute result = <expr>;` inside a package with
 /// `decls` alongside it.
@@ -33,16 +34,244 @@ fn int(i: i128) -> Value {
     Value::Integer(i)
 }
 
+fn rat(n: i128, d: i128) -> Value {
+    Value::Rational(Rational::new(n, d).unwrap())
+}
+
+#[test]
+fn unknown_member_provenance_survives_value_operations() {
+    let decls = "
+        part def Child { attribute flag default = false; }
+        part def SpecializedChild :> Child { attribute :>> flag; }
+        part def Parent { part child : SpecializedChild; part children : Child[0..*]; }
+        part installed : Child;
+        requirement def R { subject unit : Parent; }
+        calc def Identity { in x; return result = x; }
+    ";
+    for expr in [
+        "R::unit.child.flag",
+        "Identity(R::unit.child).flag",
+        "(if true ? R::unit.child else installed).flag",
+        "(R::unit.child, installed)#(1).flag",
+        "R::unit.child#(1).flag",
+        "(R::unit.child, installed)->forAll { in x; x.flag }",
+        "size(R::unit.children) == 1",
+        "notEmpty(R::unit.children)",
+    ] {
+        let value = eval_with(decls, expr);
+        // forAll includes an independently false concrete item, so it
+        // can refute even with an unknown item in the same collection.
+        let expected = if expr.contains("forAll") {
+            Value::Boolean(false)
+        } else {
+            Value::Indeterminate
+        };
+        assert_eq!(value, Ok(expected), "{expr}");
+    }
+    assert_eq!(
+        eval_with(decls, "(R::unit.child, installed).flag"),
+        Ok(Value::Sequence(vec![
+            Value::Indeterminate,
+            Value::Boolean(false)
+        ]))
+    );
+    assert_eq!(eval_with(decls, "size(R::unit.child)"), Ok(int(1)));
+    assert_eq!(
+        eval_with(decls, "Identity(installed).flag"),
+        Ok(Value::Boolean(false))
+    );
+}
+
+#[test]
+fn library_calls_preserve_unknown_receiver_members() {
+    let mut model = Model::new();
+    let lib = model.add_library_source(
+        "library.sysml",
+        "package L {
+            calc def Read { in x; return result = x.child.flag; }
+            calc def LocalDefault { in x default = true; return result = x; }
+        }",
+    );
+    assert!(lib.diagnostics.is_empty(), "{:?}", lib.diagnostics);
+    let user = model.add_source(
+        "t.sysml",
+        "package P {
+            part def Child { attribute flag default = false; }
+            part def Parent {
+                part child : Child;
+                attribute independent = L::LocalDefault();
+            }
+            requirement def R { subject unit : Parent; }
+            part installed : Parent;
+            attribute unknownResult = L::Read(R::unit);
+            attribute knownResult = L::Read(installed);
+            attribute localDefault = R::unit.independent;
+        }",
+    );
+    assert!(user.diagnostics.is_empty(), "{:?}", user.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    for (name, expected) in [
+        ("unknownResult", Value::Indeterminate),
+        ("knownResult", Value::Boolean(false)),
+        ("localDefault", Value::Boolean(true)),
+    ] {
+        let e = r.resolve_qualified(&format!("P::{name}")).unwrap();
+        assert_eq!(r.evaluate(e), Ok(expected), "{name}");
+    }
+}
+
+#[test]
+fn unknown_receivers_agree_across_evaluation_entry_points() {
+    use sysmlv2_parser::ast::{Name, QualifiedName};
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+            part def Child { attribute flag default = false; }
+            part def Parent { part child : Child; attribute flag default = false; }
+            requirement def R {
+                subject unit : Parent;
+                ref part aliasUnit : Parent = unit;
+            }
+            part installed : Parent;
+        }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let member = |value: &str| QualifiedName {
+        is_global: false,
+        segments: vec![Name {
+            value: value.into(),
+            span: Default::default(),
+        }],
+        span: Default::default(),
+    };
+    for name in ["P::R::unit", "P::R::aliasUnit"] {
+        let root = r.resolve_qualified(name).unwrap();
+        assert_eq!(
+            r.evaluate_chain(root, &[&member("child"), &member("flag")]),
+            Ok(Value::Indeterminate)
+        );
+        assert_eq!(
+            r.evaluate_qualified(&format!("{name}::flag")),
+            Ok(Value::Indeterminate)
+        );
+    }
+    let installed = r.resolve_qualified("P::installed").unwrap();
+    assert_eq!(
+        r.evaluate_chain(installed, &[&member("child"), &member("flag")]),
+        Ok(Value::Boolean(false))
+    );
+}
+
+#[test]
+fn statement_calculations_never_return_unexecuted_initializers() {
+    for statement in [
+        "assign i := i / 2;",
+        "loop { assign i := i / 2; } until i <= 1;",
+        "while i > 1 { assign i := i / 2; }",
+        "if i > 1 { assign i := 1; }",
+        "for x in (1, 2) { assign i := x; }",
+        "action update { assign i := 1; }",
+    ] {
+        let decl = format!(
+            "calc def Halve {{ in n; attribute i = n; {statement} return result = i; }}
+             calc halve : Halve;"
+        );
+        for expression in ["Halve(9)", "halve(9)", "Halve::result", "Halve::i"] {
+            let result = eval_with(&decl, expression);
+            assert!(
+                matches!(&result, Err(EvalError::Unsupported(reason)) if reason.contains("statement execution")),
+                "{statement} / {expression}: {result:?}"
+            );
+        }
+        let mut model = Model::new();
+        model.add_source("t.sysml", &decl);
+        let mut resolved = ResolvedModel::build(&model);
+        let calc = resolved.resolve_qualified("Halve").unwrap();
+        // Solver clients must not inline the return expression either.
+        assert!(resolved.calc_body(calc).is_none());
+    }
+    assert_eq!(
+        eval_with(
+            "calc half { in n; attribute i = n / 2; return result = i; }",
+            "half(9)"
+        ),
+        Ok(rat(9, 2))
+    );
+}
+
+#[test]
+fn calculation_arguments_cannot_bind_a_parameter_twice() {
+    let decl = "calc f { in x; in y; x + y }";
+    for expr in ["f(x = 1, x = 2, y = 3)", "f(1, x = 2, y = 3)"] {
+        let value = eval_with(decl, expr);
+        assert!(
+            matches!(&value, Err(EvalError::Type(m)) if m.contains("bound more than once")),
+            "{expr}: {value:?}"
+        );
+    }
+    assert_eq!(eval_with(decl, "f(y = 3, x = 2)"), Ok(int(5)));
+}
+
+#[test]
+fn calculation_defaults_and_missing_inputs_do_not_capture_caller_parameters() {
+    let declarations = "calc f { in x; x } calc g { in x; f() }";
+    assert!(
+        matches!(eval_with(declarations, "g(9)"), Err(EvalError::Unresolved(m)) if m.contains("unbound parameter `x`"))
+    );
+    assert_eq!(
+        eval_with("calc f { in x = 2; x } calc g { in x; f() }", "g(9)"),
+        Ok(int(2))
+    );
+    assert_eq!(
+        eval_with(
+            "calc f { in x = y; in y = 3; x + y } calc g { in y; f() }",
+            "g(9)"
+        ),
+        Ok(int(6))
+    );
+    assert_eq!(
+        eval_with("calc f { in x; in y = x + 1; x + y }", "f(4)"),
+        Ok(int(9))
+    );
+    assert_eq!(
+        eval_with("calc f { in x; x + 1 } calc g { in x; f(2) + x }", "g(9)"),
+        Ok(int(12))
+    );
+}
+
+#[test]
+fn lambdas_and_constructors_do_not_ignore_invalid_bindings_or_statements() {
+    assert!(
+        matches!(eval("(1, 2)->collect { in x; in y; x }"), Err(EvalError::Type(m)) if m.contains("lambda expects"))
+    );
+    assert!(
+        matches!(eval("(1, 2)->collect { in x; assign x := 9; x }"), Err(EvalError::Unsupported(m)) if m.contains("statement execution"))
+    );
+    assert!(matches!(
+        eval_with(
+            "attribute y = 7;",
+            "(1, 2)->collect { in x; attribute y = x + 1; y }"
+        ),
+        Err(EvalError::Unsupported(_))
+    ));
+    for expression in ["new P(x = 1, x = 2)", "new P(1, x = 2)"] {
+        assert!(
+            matches!(eval_with("part def P { attribute x; }", expression), Err(EvalError::Type(m)) if m.contains("bound more than once"))
+        );
+    }
+}
+
 #[test]
 fn arithmetic_and_precedence() {
     assert_eq!(eval("1 + 2 * 3"), Ok(int(7)));
     assert_eq!(eval("(1 + 2) * 3"), Ok(int(9)));
     assert_eq!(eval("2 ** 10"), Ok(int(1024)));
     // KFL `IntegerFunctions::'/'` returns Rational: true division.
-    assert_eq!(eval("7 / 2"), Ok(Value::Rational(3.5)));
-    assert_eq!(eval("7.0 / 2"), Ok(Value::Rational(3.5)));
-    assert_eq!(eval("9 ** (1/2)"), Ok(Value::Rational(3.0)));
-    assert_eq!(eval("ln(exp(2.0))"), Ok(Value::Rational(2.0)));
+    assert_eq!(eval("7 / 2"), Ok(rat(7, 2)));
+    assert_eq!(eval("7.0 / 2"), Ok(rat(7, 2)));
+    assert_eq!(eval("9 ** (1/2)"), Ok(int(3)));
+    assert_eq!(eval("ln(exp(2.0))"), Ok(Value::Real(2.0)));
     assert_eq!(eval("7 % 3"), Ok(int(1)));
     assert_eq!(eval("-5 + 3"), Ok(int(-2)));
     assert_eq!(eval("1 / 0"), Err(EvalError::DivisionByZero));
@@ -88,7 +317,7 @@ fn feature_references_and_cycles() {
 #[test]
 fn intrinsics() {
     assert_eq!(eval("sum((1, 2, 3))"), Ok(int(6)));
-    assert_eq!(eval("sum((1, 2.5))"), Ok(Value::Rational(3.5)));
+    assert_eq!(eval("sum((1, 2.5))"), Ok(rat(7, 2)));
     assert_eq!(eval("product(2..4)"), Ok(int(24)));
     assert_eq!(eval("size((7, 8))"), Ok(int(2)));
     assert_eq!(eval("isEmpty(null)"), Ok(Value::Boolean(true)));
@@ -109,9 +338,9 @@ fn intrinsics() {
     assert_eq!(eval("ToInteger(\"42\")"), Ok(int(42)));
     // TrigFunctions / RationalFunctions / NumericalFunctions /
     // ComplexFunctions-on-reals.
-    assert_eq!(eval("sin(0)"), Ok(Value::Rational(0.0)));
-    assert_eq!(eval("cos(0)"), Ok(Value::Rational(1.0)));
-    assert_eq!(eval("rat(1, 4)"), Ok(Value::Rational(0.25)));
+    assert_eq!(eval("sin(0)"), Ok(Value::Real(0.0)));
+    assert_eq!(eval("cos(0)"), Ok(Value::Real(1.0)));
+    assert_eq!(eval("rat(1, 4)"), Ok(rat(1, 4)));
     assert_eq!(eval("isZero(0)"), Ok(Value::Boolean(true)));
     assert_eq!(eval("isUnit(2)"), Ok(Value::Boolean(false)));
     assert_eq!(eval("re(7)"), Ok(int(7)));
@@ -511,10 +740,7 @@ fn quantity_brackets() {
         eval_with(units, "3 * (10 [mm])"),
         Ok(Value::Quantity(Box::new(int(30)), unit_probe("mm")))
     );
-    assert_eq!(
-        eval_with(units, "30 [mm] / (10 [mm])"),
-        Ok(Value::Rational(3.0))
-    );
+    assert_eq!(eval_with(units, "30 [mm] / (10 [mm])"), Ok(int(3)));
     // Different units never mix silently — `kg` vs `mm` is an error, not
     // `false` (no unit conversion happens either way).
     assert!(matches!(
@@ -582,10 +808,14 @@ fn user_defined_calculations() {
         ),
         Ok(int(55))
     );
-    assert!(matches!(
-        eval_with("calc def Loop { in n; Loop(n) }", "Loop(1)"),
-        Err(EvalError::Cycle(_))
-    ));
+    // A non-terminating recursion exhausts the call-depth budget — not
+    // the stack, and not the feature-value cycle guard, which sees a new
+    // invocation each time.
+    let loop_calc = eval_with("calc def Loop { in n; Loop(n) }", "Loop(1)");
+    assert!(
+        matches!(&loop_calc, Err(EvalError::Budget(m)) if m.contains("calculation calls")),
+        "{loop_calc:?}"
+    );
     // Wrong arguments error cleanly.
     assert!(matches!(
         eval_with(calc, "Torque(1, 2, 3)"),
@@ -770,7 +1000,7 @@ fn unit_normalization() {
     assert_eq!(
         eval_with(units, "(10 [m]) / (5 [m/s])"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(2.0)),
+            Box::new(int(2)),
             unit_probe_with(units, "s")
         ))
     );
@@ -778,7 +1008,7 @@ fn unit_normalization() {
     assert_eq!(
         eval_with(units, "2 / (4 [s])"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(0.5)),
+            Box::new(rat(1, 2)),
             // `m/(m*s)` cancels to the reciprocal second.
             unit_probe_with(units, "m/(m*s)")
         ))
@@ -788,21 +1018,21 @@ fn unit_normalization() {
     assert_eq!(
         eval_with(units, "(9 [m**2]) ** (1/2)"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(3.0)),
+            Box::new(int(3)),
             unit_probe_with(units, "m")
         ))
     );
     assert_eq!(
         eval_with(units, "sqrt(9 [m**2])"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(3.0)),
+            Box::new(int(3)),
             unit_probe_with(units, "m")
         ))
     );
     // Full cancellation leaves a plain number.
     assert_eq!(
         eval_with(units, "(6 [m/s]) * (2 [s]) / (4 [m])"),
-        Ok(Value::Rational(3.0))
+        Ok(int(3))
     );
     // Base units stay distinct — normalization is erasure, not conversion.
     assert!(matches!(
@@ -833,7 +1063,7 @@ fn unit_spelling_expansion() {
     assert_eq!(
         eval_with(units, "(2 ['m⋅s⁻¹']) ** 2 + 1 ['m³⋅s⁻²'] / (1 [m])"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(5.0)),
+            Box::new(int(5)),
             unit_probe_with(units, "m**2/s**2"),
         ))
     );
@@ -965,14 +1195,14 @@ fn quantity_brackets_convert_and_take_vectors() {
     assert_eq!(
         eval_with(units, "(2 [min]) [s]"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(120.0)),
+            Box::new(int(120)),
             unit_probe_with(units, "s")
         ))
     );
     assert_eq!(
         eval_with(units, "(120 [s]) [min]"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(2.0)),
+            Box::new(int(2)),
             unit_probe_with(units, "min")
         ))
     );
@@ -981,10 +1211,7 @@ fn quantity_brackets_convert_and_take_vectors() {
     assert_eq!(
         eval_with(units, "((2, 3) [min]) [s]"),
         Ok(Value::Quantity(
-            Box::new(Value::Sequence(vec![
-                Value::Rational(120.0),
-                Value::Rational(180.0),
-            ])),
+            Box::new(Value::Sequence(vec![int(120), int(180),])),
             unit_probe_with(units, "s")
         ))
     );
@@ -1010,7 +1237,7 @@ fn quantity_brackets_convert_and_take_vectors() {
         Ok(Value::Quantity(
             Box::new(Value::Sequence(vec![
                 int(0),
-                Value::Quantity(Box::new(Value::Rational(7.5)), unit_probe_with(units, "m")),
+                Value::Quantity(Box::new(rat(15, 2)), unit_probe_with(units, "m")),
                 int(0),
             ])),
             unit_probe_with(units, "f")
@@ -1050,7 +1277,7 @@ fn unit_conversion_via_measurement_references() {
     assert_eq!(
         eval_with(units, "30 [min] + 30 [s]"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(30.5)),
+            Box::new(rat(61, 2)),
             unit_probe_with(units, "min")
         ))
     );
@@ -1068,15 +1295,12 @@ fn unit_conversion_via_measurement_references() {
     assert_eq!(
         eval_with(units, "2 [km] * (2 [m])"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(4000.0)),
+            Box::new(int(4000)),
             unit_probe_with(units, "m**2")
         ))
     );
     // Division cancels dimensions across scales.
-    assert_eq!(
-        eval_with(units, "1 [km] / (500 [m])"),
-        Ok(Value::Rational(2.0))
-    );
+    assert_eq!(eval_with(units, "1 [km] / (500 [m])"), Ok(int(2)));
     // Different dimensions are still a type error — conversion applies
     // only within one dimension.
     assert!(matches!(
@@ -1104,14 +1328,14 @@ fn bracket_over_quantity() {
     assert_eq!(
         eval_with(units, "(90 [s]) [min]"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(1.5)),
+            Box::new(rat(3, 2)),
             unit_probe_with(units, "min")
         ))
     );
     assert_eq!(
         eval_with(units, "(1.5 [min]) [s]"),
         Ok(Value::Quantity(
-            Box::new(Value::Rational(90.0)),
+            Box::new(int(90)),
             unit_probe_with(units, "s")
         ))
     );
@@ -1133,10 +1357,7 @@ fn bracket_over_quantity() {
     );
     // The motivating idiom: dividing by an annotated quantity keeps the
     // whole expression computable (`100 [kg] / rho [kg]` cancels).
-    assert_eq!(
-        eval_with(units, "100 [kg] / (50 [m] [kg])"),
-        Ok(Value::Rational(2.0))
-    );
+    assert_eq!(eval_with(units, "100 [kg] / (50 [m] [kg])"), Ok(int(2)));
 }
 
 /// Classification operators (KFL BaseFunctions): `istype` walks the
@@ -1272,7 +1493,7 @@ fn performed_actions_rollup_evaluates() {
         .resolve_qualified("Tally::audit::total")
         .expect("total resolves");
     // c1 + c2 are performed (4 + 9); c3 exists but is not performed.
-    assert_eq!(r.evaluate(e), Ok(Value::Rational(13.0)));
+    assert_eq!(r.evaluate(e), Ok(int(13)));
 }
 
 /// A bare unbound feature is a placeholder for an *unknown* sequence:
@@ -1388,5 +1609,279 @@ fn verdict_helpers_evaluate_to_enum_members() {
     assert_eq!(
         name_of(&mut r, "VP::failing"),
         "VerificationCases::VerdictKind::fail"
+    );
+}
+
+/// Numbers are exact: decimal literals are rationals, arithmetic over
+/// them never rounds, integers outgrow the machine range without
+/// wrapping, and only transcendental results are approximate doubles.
+#[test]
+fn exact_rational_arithmetic() {
+    assert_eq!(eval("0.1 + 0.2"), Ok(rat(3, 10)));
+    assert_eq!(eval("0.1 + 0.2 == 0.3"), Ok(Value::Boolean(true)));
+    assert_eq!(eval("0.1 * 3"), Ok(rat(3, 10)));
+    assert_eq!(eval("100 * 1.1"), Ok(int(110)));
+    assert_eq!(eval("1.1 * 1.1"), Ok(rat(121, 100)));
+    assert_eq!(eval("0.1 + 0.7"), Ok(rat(4, 5)));
+    assert_eq!(eval("1 / 3"), Ok(rat(1, 3)));
+    assert_eq!(eval("1 / 3 * 3"), Ok(int(1)));
+    assert_eq!(eval("7 / 2 * 2"), Ok(int(7)));
+    assert_eq!(eval("2.0"), Ok(int(2)));
+    assert_eq!(eval("2 ** -2"), Ok(rat(1, 4)));
+    let text = |e: &str| eval(e).map(|v| v.to_string());
+    assert_eq!(text("2.957353E-05"), Ok("0.00002957353".into()));
+    assert_eq!(text("1 / 3"), Ok("1/3".into()));
+    assert_eq!(text("0.1 + 0.2"), Ok("0.3".into()));
+    assert_eq!(text("-0.5 * 3"), Ok("-1.5".into()));
+    // Integer results beyond `i128` stay exact instead of wrapping.
+    assert_eq!(
+        text("2 ** 200"),
+        Ok("1606938044258990275541962092341162602522202993782792835301376".into())
+    );
+    assert_eq!(eval("2 ** 200 / 2 ** 199"), Ok(int(2)));
+    assert_eq!(
+        text("170141183460469231731687303715884105727 + 1"),
+        Ok("170141183460469231731687303715884105728".into())
+    );
+    assert_eq!(
+        eval("170141183460469231731687303715884105727 + 1 - 1"),
+        Ok(int(170141183460469231731687303715884105727))
+    );
+    // Exact roots and powers; inexact ones are doubles.
+    assert_eq!(eval("sqrt(0.25)"), Ok(rat(1, 2)));
+    assert_eq!(eval("8 ** (2/3)"), Ok(int(4)));
+    assert_eq!(eval("sqrt(2)"), Ok(Value::Real(std::f64::consts::SQRT_2)));
+    assert!(matches!(eval("sqrt(-1)"), Err(EvalError::Type(_))));
+    // Comparison across exact and approximate numbers is exact.
+    assert_eq!(eval("3 == 3.0"), Ok(Value::Boolean(true)));
+    assert_eq!(eval("sqrt(0.25) == 0.5"), Ok(Value::Boolean(true)));
+    assert_eq!(eval("0.1 < 1/3"), Ok(Value::Boolean(true)));
+    assert_eq!(eval("sqrt(2) * sqrt(2) == 2"), Ok(Value::Boolean(false)));
+    assert_eq!(eval("max((0.3, 0.1 + 0.2))"), Ok(rat(3, 10)));
+    // Rational parts, rounding, and string conversion stay exact.
+    assert_eq!(eval("numer(0.75)"), Ok(int(3)));
+    assert_eq!(eval("denom(0.75)"), Ok(int(4)));
+    assert_eq!(eval("rat(1, 3) + rat(2, 3)"), Ok(int(1)));
+    assert_eq!(eval("floor(-0.5)"), Ok(int(-1)));
+    assert_eq!(eval("round(2.5)"), Ok(int(3)));
+    assert_eq!(eval("floor(sqrt(2))"), Ok(int(1)));
+    assert_eq!(eval("7.5 % 2"), Ok(rat(3, 2)));
+    assert_eq!(eval("ToReal(\"0.1\") + ToReal(\"0.2\")"), Ok(rat(3, 10)));
+    assert_eq!(eval("ToString(0.1 + 0.2)"), Ok(Value::String("0.3".into())));
+    assert_eq!(eval("ToString(1 / 3)"), Ok(Value::String("1/3".into())));
+    // `ToString` output reads back exactly, in either spelling.
+    assert_eq!(eval("ToReal(ToString(1 / 3))"), Ok(rat(1, 3)));
+    assert_eq!(eval("ToReal(\"-500000/3183\")"), Ok(rat(-500000, 3183)));
+    assert_eq!(eval("ToReal(\"2.5\") * 2"), Ok(int(5)));
+    assert!(matches!(eval("ToReal(\"1/0\")"), Err(EvalError::Type(_))));
+    // Rounding an infinite value is an error, not a saturated integer.
+    assert!(matches!(
+        eval("floor(1 / 0.0)"),
+        Err(EvalError::DivisionByZero)
+    ));
+    assert!(matches!(eval("round(*)"), Err(EvalError::Type(_))));
+}
+
+/// A computed double exponent still names a root when it is the
+/// nearest double of a small fraction, as a literal exponent does.
+#[test]
+fn approximate_unit_exponents_snap_to_small_fractions() {
+    let units = "attribute m;";
+    assert_eq!(
+        eval_with(units, "(9 [m**2]) ** (sqrt(0.25))"),
+        Ok(Value::Quantity(
+            Box::new(int(3)),
+            unit_probe_with(units, "m")
+        ))
+    );
+    // The unit exponent snaps; the magnitude stays approximate because an
+    // approximate operand took part.
+    assert_eq!(
+        eval_with(units, "(9 [m**2]) ** (cos(0) / 2)"),
+        Ok(Value::Quantity(
+            Box::new(Value::Real(3.0)),
+            unit_probe_with(units, "m")
+        ))
+    );
+    assert!(matches!(
+        eval_with(units, "(9 [m**2]) ** (sqrt(2))"),
+        Err(EvalError::Unsupported(_))
+    ));
+}
+
+/// Unit scales are exact, so conversions never round: a millimetre
+/// factor of `0.001` is one thousandth, not its nearest double.
+#[test]
+fn exact_unit_conversion() {
+    let units = "attribute m;
+                 attribute mm {
+                     attribute unitConversion {
+                         attribute referenceUnit = m;
+                         attribute conversionFactor = 0.001;
+                     }
+                 }
+                 attribute inch {
+                     attribute unitConversion {
+                         attribute referenceUnit = m;
+                         attribute conversionFactor = 2.54E-02;
+                     }
+                 }";
+    assert_eq!(
+        eval_with(units, "1 [mm] + 1 [m]"),
+        Ok(Value::Quantity(
+            Box::new(int(1001)),
+            unit_probe_with(units, "mm")
+        ))
+    );
+    assert_eq!(
+        eval_with(units, "(3 [mm]) [m]"),
+        Ok(Value::Quantity(
+            Box::new(rat(3, 1000)),
+            unit_probe_with(units, "m")
+        ))
+    );
+    assert_eq!(
+        eval_with(units, "(0.3 [m]) [mm]"),
+        Ok(Value::Quantity(
+            Box::new(int(300)),
+            unit_probe_with(units, "mm")
+        ))
+    );
+    assert_eq!(
+        eval_with(units, "0.1 [m] + 0.2 [m] == 0.3 [m]"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        eval_with(units, "300 [mm] == 0.3 [m]"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        eval_with(units, "(1 [inch]) [mm]"),
+        Ok(Value::Quantity(
+            Box::new(rat(127, 5)),
+            unit_probe_with(units, "mm")
+        ))
+    );
+    assert_eq!(
+        eval_with(units, "(1 [m]) / (3 [mm])").map(|v| v.to_string()),
+        Ok("1000/3".into())
+    );
+    assert_eq!(
+        eval_with(units, "((1 [mm]) * (1 [mm])) [m ** 2]"),
+        Ok(Value::Quantity(
+            Box::new(rat(1, 1_000_000)),
+            unit_probe_with(units, "m ** 2")
+        ))
+    );
+}
+
+/// The evaluation budget: a range, a string or a step count that would
+/// run or allocate without bound fails cleanly instead of hanging the
+/// evaluator or exhausting memory.
+#[test]
+fn evaluation_budget_bounds_ranges_strings_and_steps() {
+    let range = eval("1..1000000000");
+    assert!(
+        matches!(&range, Err(EvalError::Budget(m)) if m.contains("range")),
+        "{range:?}"
+    );
+    let wide = eval("-500000000..500000000");
+    assert!(matches!(&wide, Err(EvalError::Budget(_))), "{wide:?}");
+    assert_eq!(
+        eval("(1..3)->collect { in x; x * 2 }"),
+        Ok(Value::Sequence(vec![int(2), int(4), int(6)]))
+    );
+    let doubling = eval_with(
+        "calc def dbl { in s; in n; if n <= 0 ? s else dbl(s + s, n - 1) }",
+        "dbl(\"x\", 40)",
+    );
+    assert!(
+        matches!(&doubling, Err(EvalError::Budget(m)) if m.contains("string")),
+        "{doubling:?}"
+    );
+    // Step-heavy without allocating: every range an inner lambda built
+    // would count against the allocation budget first.
+    let steps = eval("(1..1000000)->collect { in x; x + x + x + x + x + x + x + x + x + x + x }");
+    assert!(
+        matches!(&steps, Err(EvalError::Budget(m)) if m.contains("steps")),
+        "{steps:?}"
+    );
+}
+
+/// Budgets that the step count alone cannot enforce: sequences and
+/// strings that are each admissible but add up, range bounds spanning the
+/// machine range, and exact integers that grow one multiplication at a time.
+#[test]
+fn evaluation_budget_bounds_cumulative_allocation_and_number_size() {
+    use sysmlv2_parser::eval::MAX_ALLOCATION;
+    // One full-size range is admissible; a collect that materializes one
+    // per element is not, although it needs only a few million steps.
+    assert!(1_000_000 * std::mem::size_of::<Value>() <= MAX_ALLOCATION);
+    assert_eq!(eval("size(1..1000000)"), Ok(int(1_000_000)));
+    let nested = eval("(1..1000000)->collect { in x; 1..1000000 }");
+    assert!(
+        matches!(&nested, Err(EvalError::Budget(m)) if m.contains("bytes")),
+        "{nested:?}"
+    );
+    // Strings below the per-operation limit still add up.
+    let strings = eval_with(
+        "calc def dbl { in s; in n; if n <= 0 ? s else dbl(s + s, n - 1) }",
+        "(1..40)->collect { in i; dbl(\"x\", 23) }",
+    );
+    assert!(
+        matches!(&strings, Err(EvalError::Budget(m)) if m.contains("bytes")),
+        "{strings:?}"
+    );
+    // Bounds spanning the machine range are refused, not overflowed.
+    let extreme =
+        eval("-170141183460469231731687303715884105727..170141183460469231731687303715884105727");
+    assert!(
+        matches!(&extreme, Err(EvalError::Budget(m)) if m.contains("range")),
+        "{extreme:?}"
+    );
+    assert_eq!(eval("size(5..3)"), Ok(int(0)));
+    // Exact integers stop growing at the bit limit: a fold such as
+    // `product(1..1000000)` fails the same way, one multiplication past
+    // the limit, but takes tens of thousands of large multiplications to
+    // get there, so the check is exercised here through powers instead.
+    assert_eq!(eval("product(1..20)"), Ok(int(2_432_902_008_176_640_000)));
+    assert_eq!(eval("Length(ToString(2 ** 500000))"), Ok(int(150_515)));
+    let product = eval("(2 ** 500000) * (2 ** 500000) * (2 ** 100000)");
+    assert!(
+        matches!(&product, Err(EvalError::Budget(m)) if m.contains("bits")),
+        "{product:?}"
+    );
+    // A power past the limit degrades to an approximate infinity instead;
+    // exact operands just under it still add past it.
+    assert_eq!(eval("2 ** 1000000"), Ok(Value::Real(f64::INFINITY)));
+    let sum = eval("(2 ** 524288) * (2 ** 524287) + (2 ** 524288) * (2 ** 524287)");
+    assert!(
+        matches!(&sum, Err(EvalError::Budget(m)) if m.contains("bits")),
+        "{sum:?}"
+    );
+}
+
+/// The allocation budget covers every operator that materializes a value,
+/// not only arithmetic: an intrinsic that copies a sequence and a fold
+/// that grows a string one item at a time each stay under the per-value
+/// limits while adding up far past the cumulative one.
+#[test]
+fn evaluation_budget_covers_intrinsics_and_per_item_results() {
+    // Each copy of a full-size range is admissible on its own.
+    assert_eq!(eval("size(reverse(1..1000000))"), Ok(int(1_000_000)));
+    let copies = eval("size(reverse(reverse(reverse(reverse(reverse(1..1000000))))))");
+    assert!(
+        matches!(&copies, Err(EvalError::Budget(m)) if m.contains("bytes")),
+        "{copies:?}"
+    );
+    // A fold whose accumulator grows by a kilobyte per item: every
+    // intermediate string is small, their total is not.
+    let folded = eval_with(
+        "calc def dbl { in s; in n; if n <= 0 ? s else dbl(s + s, n - 1) }",
+        "(1..1000)->collect { in i; dbl(\"x\", 10) }->reduce '+'",
+    );
+    assert!(
+        matches!(&folded, Err(EvalError::Budget(m)) if m.contains("bytes")),
+        "{folded:?}"
     );
 }

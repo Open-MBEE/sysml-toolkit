@@ -7,9 +7,9 @@ A Rust toolchain for [OMG SysML v2](https://www.omg.org/sysml/sysmlv2/) and KerM
 - **Resolve** names across files and against the vendored standard library (normative KerML 9.1 element IDs, verified against the published XMI).
 - **Interchange JSON in both directions** — emit the compact (KerML 10.4) and full (derived properties + implied relationships) forms, and read JSON back to text.
 - **Binary interchange (s2c)** — a deterministic CBOR encoding of the compact form (`.s2c`, RFC 9277 file magic): ~10× under minified JSON, optional id elision (~15–19× with an integrity digest), full-form emit, and digest-verified delta payloads for commit-sized changes.
-- **Validate** — body-context legality, duplicate names, referential checks, and semantic constraints (multiplicity bounds, specialization cycles, redefinition compatibility, invocation arity).
-- **Lint** — configurable project-policy rules (style, hygiene, dead model) with optional auto-fixes, additive beside `check`.
-- **Evaluate** expressions: KerML Function Library intrinsics, lambdas, quantities with unit conversion, user-defined calculations, featuring-context rollups.
+- **Validate** — body-context legality, duplicate names, referential checks, and semantic constraints (usage typing, multiplicity bounds, specialization cycles, redefinition compatibility, argument binding, and quantity dimensions).
+- **Lint** — configurable project-policy rules (style, hygiene, dead model) with optional auto-fixes, additive beside `check`; both verbs report as rustc-style text or as one JSON document.
+- **Evaluate** expressions exactly: rational arithmetic with no rounding (`0.1 + 0.2 == 0.3`), KerML Function Library intrinsics, lambdas, quantities with exact unit conversion, user-defined calculations, featuring-context rollups.
 - **Verify constraints** to satisfied / violated / undecided verdicts, and **solve** the undecided ones with Z3 (witnesses, unsatisfiability and validity proofs) or the built-in interval propagator.
 - **Transform** — rename, set value, insert, remove, retarget, extract and inline definitions as span-anchored text splices that preserve formatting and notes byte-for-byte, with commits that reparse, re-resolve, and verify untouched references kept their targets.
 - **Visualize** as PlantUML — seven views (structure tree, interconnection, state, action, sequence, use case, mixed) with comment notes, metadata stereotypes, inherited members, color palettes, and clickable source hyperlinks carried into rendered SVG.
@@ -44,11 +44,12 @@ sysmlv2 fmt --check src/*.sysml        # canonical formatter (notes preserved)
 sysmlv2 check model.sysml --lib sysml.library/   # validation + referential/semantic checks
 sysmlv2 check --strict --lib sysml.library/ *.sysml  # warnings fail too (gate a commit)
 sysmlv2 lint model.sysml --fix         # project-policy rules, auto-fixable ones applied
+sysmlv2 lint --format json model.sysml  # findings as one JSON document on stdout (check too)
 sysmlv2 eval model.sysml --lib sysml.library/    # evaluate feature values
 sysmlv2 verify model.sysml --solve     # constraint verdicts; Z3 for the undecided
 sysmlv2 query model.sysml 'ownedFeature(Demo::Vehicle)->select { in p; p istype Demo::Wheel }'
-sysmlv2 refactor extract model.sysml Demo::car # usage↔definition refactorings (extract / inline)
-sysmlv2 payload diff before.s2c after.s2c      # inspect, diff, and apply interchange payloads
+sysmlv2 refactor extract model.sysml Demo::car # usage↔definition refactorings (extract / split / inline)
+sysmlv2 payload after.s2c --delta-from before.s2c -o commit.s2c  # inspect, diff, and apply interchange payloads
 sysmlv2 describe model.sysml Demo::car         # one element: metaclass, owner, typing, position
 sysmlv2 viz model.sysml --view mixed --color | java -jar plantuml.jar -tsvg -p > model.svg
 sysmlv2 lsp                            # the language server over stdio
@@ -59,7 +60,7 @@ Every subcommand's `--help` carries a description and worked examples (enforced 
 
 ### Standard-library cache
 
-Loading a standard library with `--lib` is cached automatically — no flags involved. The first run against a given library builds it cold and records a *sealed snapshot* (reference resolutions plus final element ids) at `~/.cache/sysmlv2/stdlib-<hash>.libcache`; later runs replay it, cutting a warm `check --lib` to well under 0.1 s for typical models. The cache is keyed by toolkit version and library content and carries its own integrity checks, so an edited library, a toolkit upgrade, or a corrupted file just triggers a cold rebuild that rewrites the snapshot — it can never change a result (cold and warm builds are gated byte-identical in `tests/libcache.rs`).
+Loading a standard library with `--lib` is cached automatically. The first run prepares its parsed units, resolved graph and static-analysis indexes, then saves a build- and content-identified snapshot at `~/.cache/sysmlv2/stdlib-<hash>.prepared`. A resolution recording (`stdlib-<hash>.libcache`) is saved beside it for the rare builds that must resolve jointly. Later processes load the snapshot without parsing or resolving library sources. Directory-backed SDK sessions can also share a live prepared library across edits. Library snapshots store property and relationship rows in contiguous tables, share decoded property strings, and omit redundant headers from fixed-layout records. Library source text is retained and syntax trees are reconstructed only when requested or needed for joint resolution. Scope names and identity indexes load as checked sorted tables; expression metadata remains available for calculations. Typed graph properties, direct ownership indexes and cached unit/dimension results reduce repeated work. Connector checks reuse the same ownership and binary target indexes as other validators. Static-fact adjacency tables read checked offsets and contiguous values directly; only edited library rows and new model rows need private storage. Each model adds private elements, scopes and index entries over the immutable library prefix; user resolution, semantic checks and import analysis still run. Rust callers use `prepared::load_library_with_cache` for this path; `Model::load_library_dir` parses directly. `Model::units()` requests every syntax tree; `unit_count()` and `is_library_unit(index)` avoid reconstruction, and `unit(index)` requests one tree. `ModelUnit.unit` is `Arc<SourceUnit>`. Root declarations or root-level imports that supply a name the library looked up and missed select a joint build, which replays the recording for every outcome those names cannot reach. Edited libraries, toolkit changes and damaged snapshots trigger rebuilding; an unwritable cache does not prevent analysis. Initial preparation costs more than a warm load. The existing resolution-only snapshot APIs remain available for in-memory library bundles.
 
 Two environment variables control it:
 
@@ -71,6 +72,12 @@ Two environment variables control it:
 ### Ambient libraries and model context
 
 Every model that loads a library also sees the generated Web platform libraries under [local-packages/](local-packages/) (`Web::DOM`, `Web::HTML::Elements`, `Template`, `Svelte`, `WebApp`, `SvelteKit`, `TransformMeta`) without naming their files; `SYSMLV2_AMBIENT=off` switches them off. `SYSMLV2_MODEL_DIR` and `SYSMLV2_LIB_DIR` supply inputs and the library for verbs invoked without file arguments.
+
+### Calculation and static-analysis boundaries
+
+Calculations with expression results, local feature values, and positional or named inputs can be evaluated. Duplicate bindings and missing required inputs fail explicitly; omitted inputs use their own defaults without capturing same-named caller parameters. Bodies requiring assignments, loops, or action execution return `Unsupported`, including direct reads of their output initializers, and are not inlined by the solver. Behavioral execution belongs to a separate layer. Lambda bodies with unmodelled local declarations also fail explicitly.
+
+Dimensional arithmetic is checked from declared quantity types even when parameter values are unbound. Unknown dimensions remain undecided. This check is conservative: it does not yet infer dimensions through arbitrary invocations or lambda bodies. The pinned [OpenSysML negative fixtures](crates/sysmlv2-parser/tests/fixtures/opensysml/) record both diagnostic baselines and remaining gaps; accepting a negative fixture is not counted as validation success.
 
 ### Partial models
 
@@ -91,17 +98,17 @@ The repository is a Cargo workspace. Everything is licensed under Apache-2.0; th
 | [`sysmlv2-viz`](crates/sysmlv2-viz) | PlantUML emission, seven views |
 | [`sysmlv2-lsp`](crates/sysmlv2-lsp) | The Language Server Protocol server (stdio and an embeddable push-driven core) |
 | [`sysmlv2-parser`](crates/sysmlv2-parser) | Compatibility facade re-exporting `sysmlv2-syntax` and `sysmlv2-model` under one crate; hosts the corpus test suites and triage examples |
-| [`sysmlv2-cli`](crates/sysmlv2-cli) | The `sysmlv2` binary — every capability above as subcommands, plus `.kpar` project archives, Flexo change-record payloads, and a wasi build for browsers |
+| [`sysmlv2-cli`](crates/sysmlv2-cli) | The `sysmlv2` binary — every capability above as subcommands, plus `.kpar` project archives, Flexo change-record payloads, and a wasi build for browsers; the verbs are also a library (`run(args)` and one function per verb) so a host drives them in process |
 | [`sysmlv2-py`](crates/sysmlv2-py) | Python binding (module `sysmlv2`): the whole session surface — `Session.from_files(...)`, queries, find-usages, batch edits with verified commits — as abi3 wheels via maturin |
 | [`sysmlv2-wasm`](crates/sysmlv2-wasm) | WebAssembly/JavaScript binding (`@sysml/wasm`): sessions, checking, interchange, diagrams, and the language server, with the standard library bundled |
 | [`sysmlv2-testkit`](crates/sysmlv2-testkit) | Dev-only corpus helpers shared by the workspace's tests and examples (not published) |
 
 Alongside the crates:
 
-- [`editors/vscode`](editors/vscode) — the VS Code extension: dialect-aware TextMate highlighting plus the language-server client.
-- [`local-packages/`](local-packages) — the generated ambient libraries and their provenance sidecars, produced by the separate `websysml` generator (not yet published).
+- [`editors/vscode`](editors/vscode) — the VS Code extension: semantic highlighting with a TextMate fallback, plus the language-server client.
+- [`local-packages/`](local-packages) — the generated ambient libraries and their provenance sidecars; checked-in sources work without a generator.
 - [`spec-refs/`](spec-refs) — the pinned normative grammars, JSON schemas, and metamodel XMI, plus the official corpus and an external validation corpus as submodules (see [spec-refs/README.md](spec-refs/README.md)).
-- [`tools/`](tools) — the release script, the generators for the spec-derived tables (`gen_cbor_tables.py`, `xmi_props.py`), and the `SDK.md` doctest runner.
+- [`tools/`](tools) — the generators for the spec-derived tables (`gen_cbor_tables.py`, `gen_metaclass_hierarchy.py`, `xmi_props.py`), the `SDK.md` doctest runner, and the release and public-export scripts.
 
 ## Status
 
@@ -113,18 +120,18 @@ Alongside the crates:
 | Expression grammar (KerML Expressions) | ✅ complete, exact precedence ladder |
 | Corpus gate (`cargo test`) | ✅ **345/345** official files parse clean **and** emit JSON |
 | Compact JSON (KerML 10.4) | ✅ flat element array, memberships, relationships, expressions |
-| Multi-file models + standard-library resolution | ✅ `model::Model`; 99.93% of corpus references resolve |
+| Multi-file models + standard-library resolution | ✅ `model::Model`; 99.92% of corpus references resolve |
 | Normative library element IDs (KerML 9.1) | ✅ verified against published OMG XMI |
 | Textual printer + formatter (`sysmlv2 fmt`) | ✅ idempotency/semantic/note gates over the corpus |
 | `sysmlv2` CLI with example-rich `--help` | ✅ convert / payload / fmt / check / lint / verify / eval / query / render / describe / members / parse / viz / refactor / lsp |
 | JSON reader (`lift`) + conversion matrix: text ⇄ compact JSON, full-JSON input normalized | ✅ corpus round-trip gate (`emit∘parse∘print∘lift = id`) |
-| Full JSON form (derived props + implied relationships, `--to full-json`) | ✅ 44,656 corpus elements validate against the published schema |
+| Full JSON form (derived props + implied relationships, `--to full-json`) | ✅ 52,048 corpus elements validate against the published schema |
 | Binary interchange (`--to compact-cbor` / `full-cbor`, `.s2c`) | ✅ deterministic, byte-for-byte reconstructable; elided ids; digest-verified deltas |
 | `.kpar` project archives | ✅ read and write (KerML 10.3) |
-| Post-parse validation + referential checks (`sysmlv2 check [--lib]`) | ⚠️ body-context matrix, visibility/ambiguity-aware resolution, and a growing normative-rule registry; 14/180 pinned XMI `validate…` rules are explicitly mapped today |
-| Semantic constraints (`check --lib`): multiplicity bounds, circular specialization | ✅ corpus-gated, zero findings |
-| Configurable lint rules (`sysmlv2 lint`) | ✅ project-policy rules with auto-fixes, configured per project |
-| Expression evaluation (`sysmlv2 eval`) | ✅ operators (rational Int division per KFL), sequences, feature refs, featuring contexts, KFL intrinsics + lambdas, quantities (`10 [mm]`), user-defined calc invocation (incl. `return x = expr;`), `new` constructors — 81.3% of corpus feature values compute |
+| Post-parse validation + referential checks (`sysmlv2 check [--lib]`) | ⚠️ body-context matrix, visibility/ambiguity-aware resolution, and a growing normative-rule registry; 85/180 unique pinned XMI `validate…` names are registered across structural and semantic checks; this is an inventory, not a complete conformance claim |
+| Semantic constraints (`check --lib`) | Usage-kind typing, multiplicity types/ranges, specialization cycles, redefinition compatibility, invocation binding, metadata/variation, connector ends and bindings, static action/state contracts, and conservative dimensional arithmetic; official-corpus gate pins two confirmed dimensional defects |
+| Configurable lint rules (`sysmlv2 lint`) | ✅ project-policy rules with auto-fixes, configured per project; text or JSON report (`--format json`, shared with `check`) |
+| Expression evaluation (`sysmlv2 eval`) | ✅ operators (rational Int division per KFL), sequences, feature refs, featuring contexts, KFL intrinsics + lambdas, quantities (`10 [mm]`), user-defined calc invocation (incl. `return x = expr;`), `new` constructors — 82.8% of corpus feature values compute |
 | Constraint verdicts (`sysmlv2 verify`) | ✅ satisfied / violated / undecided per constraint/requirement/invariant body |
 | Constraint solving (`sysmlv2 verify --solve`, Z3) | ✅ witnesses for unbound features, unsatisfiability/validity proofs — the `sysmlv2-solve` crate drives the `z3` binary as a subprocess (no libz3 link); interval propagation answers without a solver where it can |
 | Ad-hoc model queries (`sysmlv2 query`) | ✅ KerML expressions evaluated at the root namespace, plus query-only extensions: closed-world `istype` on model elements and the reflection functions `ownedMember(x)` / `ownedFeature(x)` — find parts by usage type in one line |
@@ -134,7 +141,7 @@ Alongside the crates:
 | Python binding (`sysmlv2-py`, module `sysmlv2`) | ✅ the whole session surface from Python — abi3 wheels via maturin, generation-guarded handles (stale ones raise instead of mis-resolving) |
 | WebAssembly binding (`sysmlv2-wasm`) | ✅ the same session surface plus the language server for browsers and Node, standard library bundled with a sealed resolution snapshot |
 
-All suites are green under `cargo test` and `clippy` is clean with `-D warnings`.
+The latest implementation gate passed the full default-member release test suite and workspace/all-target Clippy with `-D warnings`. Corpus counts above use the pinned submodules; initialize them to run those gates.
 
 ## Architecture and design choices
 
@@ -169,21 +176,26 @@ source text ──lexer──▶ tokens ──parser──▶ syntax AST ──b
 ## Validation
 
 - **Spec grounding.** The grammars implemented are the normative machine-readable Xtext files of the 2025 formal specifications (KerML 1.0, SysML 2.0, metamodel `20250201`), vendored in [spec-refs/](spec-refs/) together with provenance notes. The JSON mapping follows KerML clause 10.4; owned-vs-derived property decisions come from the published XMI; implied relationships follow KerML 8.4.2 / SysML Tables 31–33.
-- **Corpus gate.** Every `cargo test` run parses all **345** official files — the complete OMG standard library (Systems, Domain, and Kernel libraries), all 42 training topics, all examples, and all validation suites — asserting zero diagnostics *and* successful compact-JSON emission for each (~119k elements corpus-wide).
+- **Corpus gate.** Every `cargo test` run parses all **345** official files — the complete OMG standard library (Systems, Domain, and Kernel libraries), all 42 training topics, all examples, and all validation suites — asserting zero diagnostics *and* successful compact-JSON emission for each (139,656 compact elements when files are emitted independently; `examples/jsoncheck` run).
+- **External rule fixtures.** [462 pinned OpenSysML fixtures](crates/sysmlv2-parser/tests/fixtures/opensysml/README.md) have per-stage baselines, with 147 paired rejection contracts and one adjudicated acceptance. An unrelated diagnostic does not establish intended-rule coverage.
 - **External corpus.** Airbus Central R&T's Apollo 11 mission model — the first substantial model independent of the OMG pilot lineage — is a pinned submodule with its own ratcheted gates (parse, checks, formatter, round-trip, evaluation, constraint verdicts, SMT solving).
-- **Resolution coverage.** Emitting the 251 non-library corpus files against the vendored library yields 137,080 resolved `{"@id"}` references with 102 (0.07%) remaining symbolic `{"@ref"}`s (a heterogeneous long tail). Feature chains (`a.b.c`) serialize per the normative grammar — an owned `Feature` with one `FeatureChaining` per link — with each link resolved in the previous link's scope (owned + inherited-via-typing members).
-- **Full-form schema validation.** `--to full-json` output — implied relationships (normative library targets, anti-redundancy) plus the complete per-metaclass property set generated from the published `SysML.json` — validates for **all 44,656 corpus elements** against the schema's exact-type definitions (`tests/full_json.rs`, `examples/fullcheck`). The representation rules, including the approximations at the API's passthrough level (expression `result`, `inheritedMembership`), are documented in [INTEROP.md](INTEROP.md).
+- **Resolution coverage.** The `examples/modelcheck` run over 251 non-library corpus files yields 48,251 compact elements, 112,245 resolved `{"@id"}` references and 90 symbolic `{"@ref"}`s (99.92% resolved). `examples/modelcheck` counts 160,496 `@id` occurrences; subtract the 48,251 element declarations to count references only. Feature chains (`a.b.c`) serialize per the normative grammar — an owned `Feature` with one `FeatureChaining` per link — with each link resolved in the previous link's scope (owned + inherited-via-typing members).
+- **Full-form schema validation.** `--to full-json` output — implied relationships (normative library targets, anti-redundancy) plus the complete per-metaclass property set generated from the published `SysML.json` — validates for **all 52,048 corpus elements** against the schema's exact-type definitions (`tests/full_json.rs`, `examples/fullcheck`). The representation rules, including the approximations at the API's passthrough level (expression `result`, `inheritedMembership`), are documented in [INTEROP.md](INTEROP.md).
 - **Normative-ID test vectors.** Library IDs are verified in [tests/model.rs](crates/sysmlv2-parser/tests/model.rs) against elementIds extracted from the published OMG XMI serializations: `ScalarValues` → `40bb440c-5036-58e1-8675-5afccb8b8f1d`, `ScalarValues::Real` → `14c0aa22-5489-59b5-b438-ded26e83ba31`, `Parts::Part` → `0774a545-39e3-5bc1-9607-63beabc6bf65`. The algorithm (UUIDv5/SHA-1, the RFC 4122 `NameSpace_URL` namespace, escaped qualified names) was confirmed against both the spec text and the pilot implementation's Java source.
 - **Round-trip gates.** Text → JSON → text, JSON → CBOR → JSON, and transformation inverses (rename and back, extract then inline) are gated over the corpus so every representation stays faithful to every other.
 
 ### Known limitations
 
 - The compact form deliberately does not satisfy the published JSON schemas' `required` lists — those describe the *full* (derived) form, which `--to full-json` produces.
-- Body contexts parse as a superset; `sysmlv2 check` closes the gap post-parse (body-context legality, duplicate names, variant ownership, import visibility). A few fidelity long-tails remain (metadata-body redefinition semantics, effect-only transition shorthands, positional rules like result-expression-last).
+- Body contexts parse as a superset; `sysmlv2 check` closes the gap post-parse (body-context legality, duplicate names, variant ownership, import visibility). Remaining syntax fidelity limits include effect-only transition shorthands and result-expression-last positioning. Metadata-body implicit redefinitions and their static value checks are implemented.
 - Unnamed library elements keep deterministic local IDs instead of the normative positional `path()` IDs (never referenced from user text).
+- The [generated Web library](local-packages/README.md) has nine invalid attribute typings when checked as user input; its generator mappings need correction. Library-mode loading suppresses those library diagnostics.
+- Behavioral execution is not implemented. Calculations that require statement execution return an explicit unsupported error; unbound inputs may yield an indeterminate value. Static action/state checks do not execute behaviors.
 - Only the decidable fragment of constraint expressions reaches the SMT translator; the rest stay `undecided` with a stated reason.
 
 ## Development
+
+Rust 1.97 or newer is required. Development and CI use the toolchain pinned in `rust-toolchain.toml`.
 
 ```sh
 git submodule update --init --filter=blob:none   # the corpus (sparse checkout is enough; see spec-refs/README.md)

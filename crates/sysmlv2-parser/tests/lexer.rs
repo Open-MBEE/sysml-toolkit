@@ -224,3 +224,19 @@ fn tokens_cover_entire_input() {
     }
     assert_eq!(pos, src.len() as u32);
 }
+
+/// Decoding a name or string value is total: text that is not a complete
+/// token — empty, unterminated, cut inside a multi-byte character, or never
+/// quoted — decodes to what it holds.
+#[test]
+fn unescape_accepts_text_that_is_not_a_complete_token() {
+    assert_eq!(unescape(""), "");
+    assert_eq!(unescape("'"), "");
+    assert_eq!(unescape("\""), "");
+    assert_eq!(unescape("''"), "");
+    assert_eq!(unescape("\"\""), "");
+    assert_eq!(unescape("'é"), "é");
+    assert_eq!(unescape("\"héllo"), "héllo");
+    assert_eq!(unescape("plain"), "plain");
+    assert_eq!(unescape(r"'a\"), "a");
+}

@@ -1,0 +1,28 @@
+# Weekly dependency advisory scan of Cargo.lock (also runnable by hand).
+# Informational: a new advisory opens a failed scheduled run, it never
+# blocks a PR or a release on its own.
+
+name: audit
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: advisory scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal
+      - name: Install the advisory scanner
+        run: cargo install cargo-audit --locked
+      - name: Scan the lockfile
+        run: cargo audit

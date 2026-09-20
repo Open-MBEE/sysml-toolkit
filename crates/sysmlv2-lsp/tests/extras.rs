@@ -58,9 +58,12 @@ impl Client {
             match self.conn.receiver.recv().unwrap() {
                 Message::Response(Response {
                     id: rid,
-                    result,
-                    error,
+                    response_result,
                 }) if rid == id => {
+                    let (result, error) = match response_result {
+                        Ok(v) => (Some(v), None),
+                        Err(e) => (None, Some(e)),
+                    };
                     assert!(error.is_none(), "{error:?}");
                     return serde_json::from_value(result.unwrap_or_default()).unwrap();
                 }
@@ -119,7 +122,7 @@ fn completion_offers_keywords_and_workspace_names() {
 
     let resp = client.request_ok::<Completion>(CompletionParams {
         text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: u.clone() },
+            text_document: TextDocumentIdentifier { uri: u },
             position: Position {
                 line: 1,
                 character: 13,
@@ -315,7 +318,7 @@ fn completion_items_carry_doc_bodies() {
 
     let resp = client.request_ok::<Completion>(CompletionParams {
         text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: u.clone() },
+            text_document: TextDocumentIdentifier { uri: u },
             position: Position {
                 line: 1,
                 character: 13,
@@ -360,7 +363,7 @@ fn inlay_hints_show_evaluated_values_and_ranges() {
     );
     let hints: Option<Vec<lsp_types::InlayHint>> =
         client.request_ok::<InlayHintRequest>(InlayHintParams {
-            text_document: TextDocumentIdentifier { uri: u.clone() },
+            text_document: TextDocumentIdentifier { uri: u },
             range: Range {
                 start: Position {
                     line: 0,
@@ -399,6 +402,53 @@ fn inlay_hints_show_evaluated_values_and_ranges() {
 }
 
 #[test]
+fn inlay_hints_show_non_terminating_rationals_as_approximate_decimals() {
+    let mut client = Client::start();
+    let u = uri("r.sysml");
+    // Exact decimals hint exactly; a rational with no terminating
+    // decimal expansion hints as a marked approximation rather than the
+    // fraction the CLI prints.
+    client.open(
+        &u,
+        "part def P {\n    attribute tenth = 0.1 + 0.2;\n    attribute third = 2 / 6;\n    attribute mm;\n    attribute pitch = (1 / 3) [mm];\n}\n",
+    );
+    let hints: Option<Vec<lsp_types::InlayHint>> =
+        client.request_ok::<InlayHintRequest>(InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: u },
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 6,
+                    character: 0,
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        });
+    let labels: Vec<String> = hints
+        .unwrap()
+        .iter()
+        .map(|h| match &h.label {
+            InlayHintLabel::String(s) => s.clone(),
+            other => panic!("unexpected label shape: {other:?}"),
+        })
+        .collect();
+    assert!(labels.iter().any(|l| l == " = 0.3"), "{labels:?}");
+    assert!(
+        labels.iter().any(|l| l == " = ≈0.3333333333333333"),
+        "{labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == " = ≈0.3333333333333333 [mm]"),
+        "{labels:?}"
+    );
+    assert!(!labels.iter().any(|l| l.contains("1/3")), "{labels:?}");
+    client.shutdown();
+}
+
+#[test]
 fn inlay_hints_land_after_closing_parenthesis() {
     let mut client = Client::start();
     let u = uri("paren.sysml");
@@ -411,7 +461,7 @@ fn inlay_hints_land_after_closing_parenthesis() {
     );
     let hints: Option<Vec<lsp_types::InlayHint>> =
         client.request_ok::<InlayHintRequest>(InlayHintParams {
-            text_document: TextDocumentIdentifier { uri: u.clone() },
+            text_document: TextDocumentIdentifier { uri: u },
             range: Range {
                 start: Position {
                     line: 0,
@@ -517,7 +567,7 @@ fn inlay_hints_name_element_values_but_skip_bare_references() {
     );
     let hints: Option<Vec<lsp_types::InlayHint>> =
         client.request_ok::<InlayHintRequest>(InlayHintParams {
-            text_document: TextDocumentIdentifier { uri: u.clone() },
+            text_document: TextDocumentIdentifier { uri: u },
             range: Range {
                 start: Position {
                     line: 0,
@@ -565,7 +615,7 @@ fn code_lenses_carry_verify_verdicts() {
     );
     let lenses: Option<Vec<lsp_types::CodeLens>> =
         client.request_ok::<CodeLensRequest>(CodeLensParams {
-            text_document: TextDocumentIdentifier { uri: u.clone() },
+            text_document: TextDocumentIdentifier { uri: u },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         });
@@ -598,5 +648,88 @@ fn code_lenses_carry_verify_verdicts() {
         ),
         "{titles:?}"
     );
+    client.shutdown();
+}
+
+/// A definition named by a reserved word completes as source: the
+/// label is the raw name, the insert text and the auto-import path
+/// quote it.
+#[test]
+fn completion_quotes_reserved_word_names_in_edits() {
+    let mut client = Client::start();
+    let defs = uri("defs.sysml");
+    let u = uri("u.sysml");
+    client.open(&defs, "package Defs { part def 'view'; }\n");
+    client.open(&u, "package U {\n    part w : \n}\n");
+    let resp = client.request_ok::<Completion>(CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: u },
+            position: Position {
+                line: 1,
+                character: 13,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    });
+    let Some(CompletionResponse::Array(items)) = resp else {
+        panic!("expected items: {resp:?}");
+    };
+    let view = items
+        .iter()
+        .find(|i| i.label == "view" && i.kind == Some(CompletionItemKind::CLASS))
+        .expect("cross-document name `view`");
+    let Some(lsp_types::CompletionTextEdit::Edit(edit)) = &view.text_edit else {
+        panic!("quoted insert text needs an edit: {view:?}");
+    };
+    assert!(edit.new_text.starts_with("'view'"), "{edit:?}");
+    let edits = view
+        .additional_text_edits
+        .as_ref()
+        .expect("out-of-scope name carries the import edit");
+    assert_eq!(edits[0].new_text, "private import Defs::'view';\n    ");
+    client.shutdown();
+}
+
+/// The document's dialect governs the spelling: in a KerML document a
+/// word only SysML reserves is a plain name, so the insert text and the
+/// auto-import path stay bare — quoting would be legal but the
+/// formatter would immediately undo it.
+#[test]
+fn completion_spells_for_the_document_dialect() {
+    let mut client = Client::start();
+    let defs = uri("defs.kerml");
+    let u = uri("u.kerml");
+    client.open(&defs, "package Defs { classifier part; }\n");
+    client.open(&u, "package U {\n    feature w : \n}\n");
+    let resp = client.request_ok::<Completion>(CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: u },
+            position: Position {
+                line: 1,
+                character: 16,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    });
+    let Some(CompletionResponse::Array(items)) = resp else {
+        panic!("expected items: {resp:?}");
+    };
+    let part = items
+        .iter()
+        .find(|i| i.label == "part" && i.kind == Some(CompletionItemKind::CLASS))
+        .expect("cross-document name `part`");
+    if let Some(lsp_types::CompletionTextEdit::Edit(edit)) = &part.text_edit {
+        assert!(edit.new_text.starts_with("part"), "{edit:?}");
+        assert!(!edit.new_text.starts_with("'"), "{edit:?}");
+    }
+    let edits = part
+        .additional_text_edits
+        .as_ref()
+        .expect("out-of-scope name carries the import edit");
+    assert_eq!(edits[0].new_text, "private import Defs::part;\n    ");
     client.shutdown();
 }

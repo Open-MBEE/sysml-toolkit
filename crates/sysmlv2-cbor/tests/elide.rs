@@ -97,7 +97,7 @@ fn foreign_ids_land_in_exceptions_and_still_round_trip() {
         .enumerate()
         .take(40)
     {
-        if i % 3 == 0 {
+        if i.is_multiple_of(3) {
             let foreign = format!("{:08x}-1234-4abc-8def-{:012x}", i, i * 7 + 1);
             e["@id"] = Value::String(foreign.clone());
             e["elementId"] = Value::String(foreign);

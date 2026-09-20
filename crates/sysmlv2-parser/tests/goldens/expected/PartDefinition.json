@@ -267,6 +267,7 @@
     "elementId": "8fba673f-bee3-5999-b909-a97fdfd8dd96",
     "isAbstract": false,
     "isImpliedIncluded": false,
+    "isIndividual": true,
     "isSufficient": false,
     "isVariation": false,
     "ownedRelationship": [

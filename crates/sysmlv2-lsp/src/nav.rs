@@ -18,16 +18,72 @@
 //! *reject atomically* and surface as request errors instead of
 //! corrupting the model.
 
-use crate::position::Mapper;
-use crate::{Document, Encoding};
+use crate::position::{Mapper, UnitMappers, offset32};
+use crate::{Document, Encoding, Report};
 use lsp_types::{Location, Position, Range, TextEdit, Uri, WorkspaceEdit};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use sysmlv2_parser::json::{ElementRef, RefSite};
 use sysmlv2_parser::span::Span;
 use sysmlv2_parser::visit::Visit as _;
-use sysmlv2_transform::{Library, Session};
+use sysmlv2_transform::{Library, Session, SessionError};
+
+/// The session fingerprint, the package, and the actions planned for it.
+type SplitCache = (Vec<(String, i32)>, ElementRef, Vec<(String, WorkspaceEdit)>);
+
+/// The package a split request names.
+pub enum SplitTarget {
+    /// The declaration whose name spans `offset` of the unit `uri`.
+    Offset { uri: Uri, offset: u32 },
+    /// A qualified name (quoted segments allowed) resolved from the
+    /// root namespace.
+    Package(String),
+}
+
+/// One planned unit of a split — see [`Nav::split_request`].
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitResponseEntry {
+    /// Qualified name before the split.
+    pub qualified_name: String,
+    pub name: String,
+    /// The root-level name the package takes when its own would collide.
+    pub new_name: Option<String>,
+    /// The package's name after the split as a request `package`
+    /// spells it: its root-level name, quoted when needed.
+    pub root_name: String,
+    /// The new unit's uri.
+    pub uri: String,
+    /// Size of the package's text.
+    pub bytes: usize,
+    /// Directly nested packages — what a deeper level would split; a
+    /// leaf has none.
+    pub nested: usize,
+}
+
+/// The package a split starts from.
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitResponseRoot {
+    pub name: String,
+    pub qualified_name: String,
+    /// The unit the package is declared in.
+    pub uri: String,
+}
+
+/// A planned split, with its annotated edit when one was asked for.
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitResponse {
+    pub root: SplitResponseRoot,
+    /// The uri prefix the new units are named under.
+    pub directory: String,
+    pub entries: Vec<SplitResponseEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<WorkspaceEdit>,
+}
 
 pub struct Nav {
     pub library: Option<Library>,
@@ -47,7 +103,7 @@ pub struct Nav {
     /// push-driven WASM frontend): `(uri string, text)`, keyed by the
     /// same uri strings the client opens documents under. Takes the
     /// role of the root walk when set.
-    workspace: Option<Vec<(String, String)>>,
+    workspace: Option<Arc<Vec<(String, String)>>>,
     /// Qualified symbols of the seeded workspace units, parsed once per
     /// seed (the [`Self::library_symbols`] pattern) — import fixes and
     /// completions must see the whole workspace, not just what happens
@@ -55,6 +111,9 @@ pub struct Nav {
     /// shadowed by an open document are filtered at query time.
     workspace_seed_symbols: Option<Vec<QualifiedSymbol>>,
     session: Option<Session>,
+    /// Failures behind an empty answer, waiting for the server to pass
+    /// them to the client ([`Nav::take_reports`]).
+    reports: Vec<Report>,
     /// (uri string, version) per open doc at the last rebuild.
     fingerprint: Vec<(String, i32)>,
     /// The solverless verify pass shared by inlay hints and code
@@ -62,6 +121,18 @@ pub struct Nav {
     /// recomputing per request would run propagation dozens of times
     /// over an unchanged model).
     verify: Option<sysmlv2_solve::VerifyReport>,
+    /// The split actions last computed for a package, keyed by the
+    /// session fingerprint: the cursor rests on a package name across
+    /// many code-action requests, and each plan is a whole-workspace
+    /// dry run.
+    split_cache: Option<SplitCache>,
+    /// The lint pass over the current session, keyed by the
+    /// configuration it ran with: code-action requests arrive per
+    /// cursor move and must not re-lint the workspace each time.
+    lint: Option<(u64, Vec<sysmlv2_lint::Finding>)>,
+    /// The workspace's lint configuration, re-read only when the file
+    /// changes.
+    config: LintConfig,
     /// Suppress evaluated-value inlay hints that would restate the
     /// declared value expression verbatim (`x = 3.63 [kg]` needs no
     /// ` = 3.63 [kg]` hint). Default on; hosts flip it via
@@ -91,6 +162,7 @@ pub struct Nav {
 impl Nav {
     pub fn new(library: Option<PathBuf>, root: Option<PathBuf>) -> Nav {
         let mut nav = Self::new_with(library.map(Library::dir));
+        nav.config = LintConfig::under(root.as_deref());
         nav.root = root;
         nav
     }
@@ -109,11 +181,21 @@ impl Nav {
             session: None,
             fingerprint: Vec::new(),
             verify: None,
+            lint: None,
+            split_cache: None,
             hide_redundant_value_hints: true,
             snippet_completions: false,
             infer_unit_types: true,
             completion_session: None,
+            reports: Vec::new(),
+            config: LintConfig::under(None),
         }
+    }
+
+    /// The workspace's lint configuration. Shared with the formatter,
+    /// whose project style comes out of the same file.
+    pub fn lint_config(&mut self) -> &sysmlv2_lint::Config {
+        self.config.get().1
     }
 
     /// Set whether completion edits may use snippet syntax (`$0`
@@ -142,7 +224,7 @@ impl Nav {
     /// Unit names must be the same uri strings the client opens
     /// documents under, or an open document duplicates its on-model
     /// unit instead of overlaying it.
-    pub fn set_workspace_sources(&mut self, units: Vec<(String, String)>) {
+    pub fn set_workspace_sources(&mut self, units: Arc<Vec<(String, String)>>) {
         self.workspace = Some(units);
         self.workspace_seed_symbols = None;
         self.invalidate();
@@ -154,6 +236,8 @@ impl Nav {
         self.session = None;
         self.fingerprint.clear();
         self.verify = None;
+        self.lint = None;
+        self.split_cache = None;
         self.completion_session = None;
     }
 
@@ -172,7 +256,7 @@ impl Nav {
     /// [`ResolvedModel::member_of`]: sysmlv2_parser::json::ResolvedModel::member_of
     fn chain_member_completions(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         cx: &CompletionCx,
         enc: Encoding,
@@ -184,8 +268,8 @@ impl Nav {
         let text = &docs.get(uri)?.text;
         let line_end = text[(cx.offset as usize).min(text.len())..]
             .find('\n')
-            .map(|i| cx.offset + i as u32)
-            .unwrap_or(text.len() as u32);
+            .map(|i| cx.offset + offset32(i))
+            .unwrap_or(offset32(text.len()));
         let session = self.completion_session(docs, uri, Span::new(cx.stmt_start, line_end))?;
         let unit = Self::unit_of_static(uri, session)?;
         let resolved = session.resolved();
@@ -262,10 +346,16 @@ impl Nav {
             details
                 .into_iter()
                 .map(|(name, kind, detail)| {
-                    let (text_edit, repair, insert_text_format) =
-                        item_edits(&d.text, &mapper, cx, &name, snippets);
+                    let (text_edit, repair, insert_text_format) = item_edits(
+                        &d.text,
+                        &mapper,
+                        cx,
+                        crate::dialect_of(uri),
+                        &name,
+                        snippets,
+                    );
                     lsp_types::CompletionItem {
-                        label: name,
+                        label: crate::outline::spell_name(&name),
                         kind: Some(kind),
                         detail,
                         text_edit,
@@ -282,7 +372,7 @@ impl Nav {
     /// version moved. `None` when a document fails to build a session
     /// (never expected — sessions tolerate parse errors — but a broken
     /// library directory reports here).
-    fn session(&mut self, docs: &HashMap<Uri, Document>) -> Option<&mut Session> {
+    fn session(&mut self, docs: &BTreeMap<Uri, Document>) -> Option<&mut Session> {
         let mut fp: Vec<(String, i32)> = docs
             .iter()
             .map(|(u, d)| (u.to_string(), d.version))
@@ -294,6 +384,8 @@ impl Nav {
             self.session = Some(session);
             self.fingerprint = fp;
             self.verify = None;
+            self.lint = None;
+            self.split_cache = None;
         }
         self.session.as_mut()
     }
@@ -304,11 +396,11 @@ impl Nav {
     /// resolve.
     fn assemble_sources(
         &self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         fp: &[(String, i32)],
     ) -> Vec<(String, String)> {
         let mut sources: Vec<(String, String)> = match (&self.workspace, &self.root) {
-            (Some(units), _) => units.clone(),
+            (Some(units), _) => units.as_ref().clone(),
             (None, Some(root)) => crate::worker::root_sources(root),
             (None, None) => Vec::new(),
         };
@@ -320,17 +412,39 @@ impl Nav {
     }
 
     /// A session over `sources`, the configured library loaded. `None`
-    /// when any unit fails to parse (sessions refuse parse errors).
-    fn build_session(&self, sources: Vec<(String, String)>) -> Option<Session> {
-        let session = Session::from_sources(sources).ok()?;
-        Some(match &self.library {
-            Some(lib) => {
-                let mut session = session;
-                session.load_library_from(lib.clone()).ok()?;
-                session
+    /// when any unit fails to parse (sessions refuse parse errors) —
+    /// the ordinary state of a document mid-edit, and the syntax tier
+    /// already shows those errors. A library that cannot be read is not
+    /// ordinary and is recorded for the client: without it every
+    /// model-backed answer here is silently empty.
+    fn build_session(&mut self, sources: Vec<(String, String)>) -> Option<Session> {
+        let mut session = match Session::from_sources(sources) {
+            Ok(session) => session,
+            Err(e) => {
+                self.note_failure(&e, false);
+                return None;
             }
-            None => session,
-        })
+        };
+        if let Some(lib) = &self.library {
+            if let Err(e) = session.load_library_from(lib.clone()) {
+                self.note_failure(&e, true);
+                return None;
+            }
+        }
+        Some(session)
+    }
+
+    /// Record a session failure for the client, unless it is a unit
+    /// that does not parse — see [`Self::build_session`]. `library`
+    /// asks for a visible message rather than a log line.
+    fn note_failure(&mut self, e: &SessionError, library: bool) {
+        self.reports.extend(Report::for_session_failure(e, library));
+    }
+
+    /// Failures behind an empty answer, for the server to pass on —
+    /// navigation has no channel to the client of its own.
+    pub(crate) fn take_reports(&mut self) -> Vec<Report> {
+        std::mem::take(&mut self.reports)
     }
 
     /// The completion tier's session: [`Self::assemble_sources`] with
@@ -345,7 +459,7 @@ impl Nav {
     /// `None` when the rest of the workspace does not parse either.
     fn completion_session(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         cut: Span,
     ) -> Option<&mut Session> {
@@ -404,7 +518,7 @@ impl Nav {
     /// cursor.
     pub fn definition(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: u32,
         enc: Encoding,
@@ -420,7 +534,7 @@ impl Nav {
     /// under the cursor, optionally plus its declaration.
     pub fn references(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: u32,
         include_declaration: bool,
@@ -533,7 +647,7 @@ impl Nav {
     /// hover: qualified name + metaclass (and declared detail later).
     pub fn hover(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: u32,
         enc: Encoding,
@@ -565,7 +679,7 @@ impl Nav {
         let doc_text = docs.get(uri).map(|d| d.text.clone());
         let site_value = match (&site, &doc_text) {
             (Some(s), Some(t)) => {
-                Self::chain_site_value(session, uri.path().as_str().ends_with(".kerml"), t, s)
+                Self::chain_site_value(session, crate::is_kerml(uri.path().as_str()), t, s)
             }
             _ => None,
         };
@@ -594,10 +708,12 @@ impl Nav {
                 }
             }
             Ok(
-                sysmlv2_parser::eval::Value::Element(_) | sysmlv2_parser::eval::Value::Unbound(_),
+                sysmlv2_parser::eval::Value::Element(_)
+                | sysmlv2_parser::eval::Value::Unbound(_)
+                | sysmlv2_parser::eval::Value::UnboundMember(_),
             )
             | Err(_) => text,
-            Ok(v) => format!("{text}  \n= `{}`", resolved.render_value(&v)),
+            Ok(v) => format!("{text}  \n= `{}`", resolved.render_value_approx(&v)),
         };
         // Documentation bodies annotating the element join the card
         // under a rule, block-comment `*` gutters stripped. A named doc
@@ -646,8 +762,11 @@ impl Nav {
                 resolved.element_name(target).map(str::to_string),
                 resolved.owner(target),
             ) {
+                // The counterpart lives among the typing's *effective*
+                // features (owned + inherited): the vocabulary attribute
+                // may itself be inherited within the library hierarchy.
                 'outer: for ty in resolved.typings(owner) {
-                    for member in resolved.owned_members(ty) {
+                    for member in resolved.effective_features(ty, true) {
                         if resolved.element_name(member) == Some(name.as_str()) {
                             inherited = docs_of(resolved, member);
                             if !inherited.is_empty() {
@@ -692,7 +811,7 @@ impl Nav {
     /// documents — the caller must `invalidate()`.
     pub fn rename(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: u32,
         new_name: &str,
@@ -743,7 +862,7 @@ impl Nav {
     /// advanced past the client's documents.
     pub fn minimize(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         enc: Encoding,
     ) -> Result<WorkspaceEdit, String> {
         let session = self
@@ -775,13 +894,421 @@ impl Nav {
         })
     }
 
+    /// "Split into files": offered when the cursor sits on the name of a
+    /// package that owns nested packages. One action per file-naming
+    /// scheme whose names differ. The edit creates the new units and
+    /// rewrites the root, every change under one annotation naming the
+    /// split (a client's refactor preview lists the files by it).
+    pub fn split_actions(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        offset: u32,
+        enc: Encoding,
+    ) -> Vec<(String, WorkspaceEdit)> {
+        let Some(session) = self.session(docs) else {
+            return Vec::new();
+        };
+        let Some(unit) = Self::unit_of_static(uri, session) else {
+            return Vec::new();
+        };
+        let Some(package) = session.resolved().declaration_at(unit, offset) else {
+            return Vec::new();
+        };
+        if session.resolved().element_type(package) != "Package" {
+            return Vec::new();
+        }
+        let Some(name) = session.resolved().element_name(package).map(str::to_string) else {
+            return Vec::new();
+        };
+        if let Some((fp, cached_package, actions)) = &self.split_cache {
+            if *fp == self.fingerprint && *cached_package == package {
+                return actions.clone();
+            }
+        }
+        let session = self.session.as_mut().expect("session built above");
+        let mut out = Vec::new();
+        let mut seen_trees: Vec<Vec<String>> = Vec::new();
+        for naming in [
+            sysmlv2_transform::SplitNaming::Keep,
+            sysmlv2_transform::SplitNaming::Slug,
+        ] {
+            let options = sysmlv2_transform::SplitOptions {
+                naming,
+                directory: None,
+                uri_units: true,
+            };
+            let Ok(plan) = session.split_plan(package, &options) else {
+                continue;
+            };
+            let tree: Vec<String> = plan.entries.iter().map(|e| e.unit.clone()).collect();
+            if seen_trees.contains(&tree) {
+                continue;
+            }
+            seen_trees.push(tree.clone());
+            let mut edit = session.edit();
+            edit.split(&plan);
+            let Ok(report) = edit.check() else {
+                continue;
+            };
+            let Some(workspace_edit) = Self::annotated_edit(session, &plan, &report.splices, enc)
+            else {
+                continue;
+            };
+            let scheme = match naming {
+                sysmlv2_transform::SplitNaming::Keep => "",
+                sysmlv2_transform::SplitNaming::Slug => " (slugged file names)",
+            };
+            let n = plan.entries.len();
+            out.push((
+                format!(
+                    "Split '{name}' into {n} file{} under {}/{scheme}",
+                    if n == 1 { "" } else { "s" },
+                    plan.directory.rsplit('/').next().unwrap_or(&plan.directory)
+                ),
+                workspace_edit,
+            ));
+        }
+        self.split_cache = Some((self.fingerprint.clone(), package, out.clone()));
+        out
+    }
+
+    /// The split behind an editor's wizard (`sysmlv2/splitPlan`,
+    /// `sysmlv2/split`): the plan for one package under one naming
+    /// scheme and directory, with the annotated workspace edit when
+    /// `with_edit` (a whole-workspace dry run — the plan alone is
+    /// cheap, so a wizard previews both naming schemes and asks for the
+    /// edit once). The package is the declaration under a cursor
+    /// offset or a qualified name resolved from the root namespace, so
+    /// a deeper level can be requested by the name a hoisted package
+    /// takes in its new unit. Unit names are uris here, so the
+    /// options' `uri_units` is forced on. Refusals name their reason.
+    pub fn split_request(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        target: &SplitTarget,
+        options: sysmlv2_transform::SplitOptions,
+        with_edit: bool,
+        enc: Encoding,
+    ) -> Result<SplitResponse, String> {
+        let session = self
+            .session(docs)
+            .ok_or_else(|| "the model could not be built".to_string())?;
+        let package = match target {
+            SplitTarget::Offset { uri, offset } => {
+                let unit = Self::unit_of_static(uri, session)
+                    .ok_or_else(|| format!("{} is not a model unit", uri.as_str()))?;
+                session
+                    .resolved()
+                    .declaration_at(unit, *offset)
+                    .ok_or_else(|| "the position is not on a declaration's name".to_string())?
+            }
+            SplitTarget::Package(name) => session
+                .resolved()
+                .resolve_qualified(name)
+                .ok_or_else(|| format!("cannot resolve `{name}`"))?,
+        };
+        let options = sysmlv2_transform::SplitOptions {
+            uri_units: true,
+            ..options
+        };
+        // The plan judges eligibility (a package, something nested).
+        let plan = session
+            .split_plan(package, &options)
+            .map_err(|e| e.to_string())?;
+        let edit = if with_edit {
+            let mut edit = session.edit();
+            edit.split(&plan);
+            let report = edit.check().map_err(|e| e.to_string())?;
+            Some(
+                Self::annotated_edit(session, &plan, &report.splices, enc)
+                    .ok_or_else(|| "the new units' names do not spell URIs".to_string())?,
+            )
+        } else {
+            None
+        };
+        let resolved = session.resolved();
+        let nested_packages = |e: ElementRef| {
+            resolved
+                .owned_members(e)
+                .into_iter()
+                .filter(|&m| {
+                    resolved.element_type(m) == "Package" && resolved.element_name(m).is_some()
+                })
+                .count()
+        };
+        let entries = plan
+            .entries
+            .iter()
+            .map(|e| SplitResponseEntry {
+                qualified_name: e.qualified.clone(),
+                name: e.name.clone(),
+                new_name: e.new_name.clone(),
+                root_name: sysmlv2_transform::spell_name(e.new_name.as_deref().unwrap_or(&e.name)),
+                uri: e.unit.clone(),
+                bytes: e.bytes,
+                nested: nested_packages(e.package),
+            })
+            .collect();
+        let name = resolved
+            .element_name(plan.root)
+            .unwrap_or_default()
+            .to_string();
+        let qualified_name = resolved
+            .element_qualified_name(plan.root)
+            .unwrap_or_else(|| name.clone());
+        Ok(SplitResponse {
+            root: SplitResponseRoot {
+                name,
+                qualified_name,
+                uri: plan.root_unit.clone(),
+            },
+            directory: plan.directory,
+            entries,
+            edit,
+        })
+    }
+
+    /// A split's splices as one annotated workspace edit: a create
+    /// operation plus the full text for every new unit, ranged edits for
+    /// the existing ones, all under one change annotation that names
+    /// the split and its files in a client's refactor preview. The
+    /// annotation does not ask for confirmation: editors take that flag
+    /// as "opt in to each change" and open their preview with every
+    /// change unticked, while a split is one whole.
+    fn annotated_edit(
+        session: &Session,
+        plan: &sysmlv2_transform::SplitPlan,
+        splices: &[sysmlv2_transform::AppliedSplice],
+        enc: Encoding,
+    ) -> Option<WorkspaceEdit> {
+        const ANNOTATION: &str = "split";
+        let mut ops: Vec<lsp_types::DocumentChangeOperation> = Vec::new();
+        for entry in &plan.entries {
+            let uri = Uri::from_str(&entry.unit).ok()?;
+            ops.push(lsp_types::DocumentChangeOperation::Op(
+                lsp_types::ResourceOp::Create(lsp_types::CreateFile {
+                    uri: uri.clone(),
+                    options: None,
+                    annotation_id: Some(ANNOTATION.to_string()),
+                }),
+            ));
+            let text: String = splices
+                .iter()
+                .filter(|s| s.unit == entry.unit)
+                .map(|s| s.text.as_str())
+                .collect();
+            ops.push(lsp_types::DocumentChangeOperation::Edit(
+                lsp_types::TextDocumentEdit {
+                    text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                        uri,
+                        version: None,
+                    },
+                    edits: vec![lsp_types::OneOf::Right(lsp_types::AnnotatedTextEdit {
+                        text_edit: TextEdit {
+                            range: lsp_types::Range::default(),
+                            new_text: text,
+                        },
+                        annotation_id: ANNOTATION.to_string(),
+                    })],
+                },
+            ));
+        }
+        for (_, unit_name, text) in session.units() {
+            let mut edits: Vec<lsp_types::OneOf<TextEdit, lsp_types::AnnotatedTextEdit>> =
+                Vec::new();
+            let mapper = Mapper::new(text, enc);
+            let mut unit_splices: Vec<&sysmlv2_transform::AppliedSplice> =
+                splices.iter().filter(|s| s.unit == unit_name).collect();
+            unit_splices.sort_by_key(|s| (s.start, s.end));
+            for s in unit_splices {
+                edits.push(lsp_types::OneOf::Right(lsp_types::AnnotatedTextEdit {
+                    text_edit: TextEdit {
+                        range: mapper.range(Span::new(s.start, s.end)),
+                        new_text: s.text.clone(),
+                    },
+                    annotation_id: ANNOTATION.to_string(),
+                }));
+            }
+            if edits.is_empty() {
+                continue;
+            }
+            ops.push(lsp_types::DocumentChangeOperation::Edit(
+                lsp_types::TextDocumentEdit {
+                    text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                        uri: Uri::from_str(unit_name).ok()?,
+                        version: None,
+                    },
+                    edits,
+                },
+            ));
+        }
+        let files: Vec<&str> = plan.entries.iter().map(|e| e.unit.as_str()).collect();
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            ANNOTATION.to_string(),
+            lsp_types::ChangeAnnotation {
+                label: format!("Split into {} new file(s)", plan.entries.len()),
+                needs_confirmation: None,
+                description: Some(files.join("\n")),
+            },
+        );
+        Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp_types::DocumentChanges::Operations(ops)),
+            change_annotations: Some(annotations),
+        })
+    }
+
+    /// The lint findings of `uri`'s unit that carry a fix, with every fix
+    /// rendered as a workspace edit over the session's texts. The pass
+    /// runs once per session build and `sysmlint.json` text (read from
+    /// the workspace root, as the push tier does).
+    pub fn lint_fixes(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        enc: Encoding,
+    ) -> Vec<LintFixSet> {
+        let Some(unit) = self.lint_unit(docs, uri) else {
+            return Vec::new();
+        };
+        self.lint_fix_sets(enc, |f| f.unit == Some(unit))
+    }
+
+    /// Every finding of `rule` across the workspace that carries a fix,
+    /// as fix sets — the requesting document's among them. Behind the
+    /// "fix every finding of this rule" actions.
+    pub fn lint_rule_fixes(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        enc: Encoding,
+        rule: &str,
+    ) -> Vec<LintFixSet> {
+        if self.lint_unit(docs, uri).is_none() {
+            return Vec::new();
+        }
+        self.lint_fix_sets(enc, |f| f.rule == rule)
+    }
+
+    /// Builds the session and caches the lint pass (per session build and
+    /// config text); the unit `uri` names, when the session holds it.
+    fn lint_unit(&mut self, docs: &BTreeMap<Uri, Document>, uri: &Uri) -> Option<usize> {
+        let generation = self.config.get().0;
+        self.session(docs)?;
+        let cached = self
+            .lint
+            .as_ref()
+            .filter(|(g, _)| *g == generation)
+            .is_some();
+        if !cached {
+            let config = self.config.get().1;
+            let session = self.session.as_mut().expect("session built above");
+            let texts: Vec<(usize, String)> = session
+                .units()
+                .map(|(i, _, t)| (i, t.to_string()))
+                .collect();
+            let sources: Vec<(usize, &str)> = texts.iter().map(|(i, t)| (*i, t.as_str())).collect();
+            let findings = sysmlv2_lint::lint_with_sources(session.resolved(), config, &sources);
+            self.lint = Some((generation, findings));
+        }
+        let session: &Session = self.session.as_ref().expect("session built above");
+        Self::unit_of_static(uri, session)
+    }
+
+    /// The cached findings `keep` admits, as fix sets (findings without a
+    /// fix, or whose fix names a unit the session does not hold, drop).
+    fn lint_fix_sets(
+        &self,
+        enc: Encoding,
+        keep: impl Fn(&sysmlv2_lint::Finding) -> bool,
+    ) -> Vec<LintFixSet> {
+        let session: &Session = self.session.as_ref().expect("session built above");
+        let findings = &self.lint.as_ref().expect("lint pass cached above").1;
+        // One line index per unit for every edit of every fix (see
+        // `UnitMappers`).
+        let mut mappers = UnitMappers::new(enc);
+        findings
+            .iter()
+            .filter(|f| keep(f))
+            .filter_map(|f| {
+                let fix = f.fix.as_ref()?;
+                let (unit, span) = (f.unit?, f.span?);
+                let edit = Self::fix_edit(session, fix, &mut mappers)?;
+                let alternatives = f
+                    .alternatives
+                    .iter()
+                    .filter_map(|a| {
+                        Self::fix_edit(session, a, &mut mappers)
+                            .map(|e| (a.label.clone(), a.semantic, e))
+                    })
+                    .collect();
+                let range = mappers.get(unit, || unit_of(session, unit))?.1.range(span);
+                Some(LintFixSet {
+                    rule: f.rule.id(),
+                    range,
+                    label: fix.label.clone(),
+                    semantic: fix.semantic,
+                    deletes: fix.deletes,
+                    edit,
+                    alternatives,
+                })
+            })
+            .collect()
+    }
+
+    /// A lint fix's byte-offset edits over session units as a workspace
+    /// edit; `None` when an edit names a unit the session does not hold.
+    /// `mappers` memoizes each unit's name and line index across calls.
+    fn fix_edit<'s>(
+        session: &'s Session,
+        fix: &sysmlv2_lint::Fix,
+        mappers: &mut UnitMappers<'s, usize>,
+    ) -> Option<WorkspaceEdit> {
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        for e in &fix.edits {
+            let (name, mapper) = mappers.get(e.unit, || unit_of(session, e.unit))?;
+            changes
+                .entry(Uri::from_str(name).ok()?)
+                .or_default()
+                .push(TextEdit {
+                    range: mapper.range(e.span),
+                    new_text: e.replacement.clone(),
+                });
+        }
+        Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        })
+    }
+
+    /// Visibility advice for the import declared at `offset` in `uri`,
+    /// from the workspace model (see
+    /// `ResolvedModel::import_visibility_advice`).
+    pub fn import_visibility_advice(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        offset: u32,
+    ) -> Option<sysmlv2_parser::json::ImportVisibilityAdvice> {
+        let session = self.session(docs)?;
+        let unit = Self::unit_of_static(uri, session)?;
+        let resolved = session.resolved();
+        let (import, _, _) = resolved
+            .imports_without_visibility()
+            .into_iter()
+            .find(|(_, u, span)| *u == unit && span.start <= offset && offset <= span.end)?;
+        resolved.import_visibility_advice(import)
+    }
+
     /// "Extract definition": offered when the cursor sits on the
     /// declaration of a usage the eligibility gate admits. The edit is a
     /// dry-run's splices as ranged edits (cross-file capable); the
     /// session is left untouched, so no invalidation is needed.
     pub fn refactor_extract_action(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: u32,
         enc: Encoding,
@@ -808,7 +1335,7 @@ impl Nav {
     /// the inline. Same dry-run contract as extract.
     pub fn refactor_inline_action(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: u32,
         enc: Encoding,
@@ -862,9 +1389,13 @@ impl Nav {
     /// every name declared in the open documents, kinds mapped from the
     /// outline. Deliberately position-blind in this first cut — the
     /// body-context inversion of the validation matrix is the noted follow-up.
-    /// The library's `(unit name, text)` sources, both variants.
+    /// The library's `(unit name, text)` sources.
     fn library_sources(lib: &Library) -> Vec<(String, String)> {
         match lib {
+            Library::Prepared(library) => library
+                .sources()
+                .map(|(name, text)| (name.to_owned(), text.to_owned()))
+                .collect(),
             Library::Sources { units, .. } => units.as_ref().clone(),
             Library::Dir(dir) => {
                 fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
@@ -901,7 +1432,7 @@ impl Nav {
             let mut symbols: Vec<QualifiedSymbol> = Vec::new();
             if let Some(lib) = &self.library {
                 for (name, text) in Self::library_sources(lib) {
-                    let parse = if name.ends_with(".kerml") {
+                    let parse = if crate::is_kerml(name.as_str()) {
                         sysmlv2_parser::parser::parse_kerml_source(&text)
                     } else {
                         sysmlv2_parser::parser::parse_source(&text)
@@ -925,15 +1456,15 @@ impl Nav {
     /// this — the open-documents map alone hides most of the workspace.
     fn all_workspace_symbols(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         enc: Encoding,
     ) -> Vec<QualifiedSymbol> {
         let mut out = workspace_symbols(docs, enc);
         if self.workspace_seed_symbols.is_none() {
             if let Some(units) = &self.workspace {
                 let mut symbols: Vec<QualifiedSymbol> = Vec::new();
-                for (name, text) in units {
-                    let parse = if name.ends_with(".kerml") {
+                for (name, text) in units.iter() {
+                    let parse = if crate::is_kerml(name) {
                         sysmlv2_parser::parser::parse_kerml_source(text)
                     } else {
                         sysmlv2_parser::parser::parse_source(text)
@@ -975,7 +1506,7 @@ impl Nav {
     /// no invalidate needed.
     pub fn optimize_imports(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         enc: Encoding,
     ) -> Option<Vec<TextEdit>> {
@@ -1020,7 +1551,7 @@ impl Nav {
     /// Returns `(title, document, edit, preferred)`.
     pub fn unresolved_reference_fixes(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: u32,
         enc: Encoding,
@@ -1038,7 +1569,7 @@ impl Nav {
         };
         let mut out: Vec<(String, Uri, TextEdit, bool)> = Vec::new();
         let bare = match (&token, &quoted) {
-            (Some((t, segs)), _) if segs.len() == 1 => Some((segs[0].clone(), t.len() as u32)),
+            (Some((t, segs)), _) if segs.len() == 1 => Some((segs[0].clone(), offset32(t.len()))),
             (None, Some((name, len))) => Some((name.clone(), *len)),
             _ => None,
         };
@@ -1060,8 +1591,8 @@ impl Nav {
         };
         let mapper = Mapper::new(&text, enc);
         // The last segment's own range (what a respelling replaces).
-        let last_start = offset + (token.len() - last.len()) as u32;
-        let last_range = mapper.range(Span::new(last_start, offset + token.len() as u32));
+        let last_start = offset + offset32(token.len() - last.len());
+        let last_range = mapper.range(Span::new(last_start, offset + offset32(token.len())));
 
         if prefix.is_empty() {
             // Bare name: suggest near-miss workspace names.
@@ -1098,7 +1629,7 @@ impl Nav {
         // not); fallback: a unique workspace element carrying the
         // qualifier's final segment as its name.
         let prefix_last = prefix.last().expect("non-empty prefix").clone();
-        let prefix_end = offset + (token.len() - last.len() - 2) as u32;
+        let prefix_end = offset + offset32(token.len() - last.len() - 2);
         let target = {
             let resolved = session.resolved();
             let by_site = resolved
@@ -1190,7 +1721,7 @@ impl Nav {
     #[allow(clippy::too_many_arguments)]
     fn import_fixes(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         text: &str,
         offset: u32,
@@ -1199,7 +1730,7 @@ impl Nav {
         enc: Encoding,
         out: &mut Vec<(String, Uri, TextEdit, bool)>,
     ) {
-        let parse = if uri.path().as_str().ends_with(".kerml") {
+        let parse = if crate::is_kerml(uri.path().as_str()) {
             sysmlv2_parser::parser::parse_kerml_source(text)
         } else {
             sysmlv2_parser::parser::parse_source(text)
@@ -1234,7 +1765,7 @@ impl Nav {
             out.push((
                 format!(
                     "Add import {}",
-                    crate::autoimport::escape_qualified(&s.qualified)
+                    crate::autoimport::escape_qualified(crate::dialect_of(uri), &s.qualified)
                 ),
                 uri.clone(),
                 TextEdit {
@@ -1257,7 +1788,7 @@ impl Nav {
     /// qualified) it was built from.
     fn append_unit_type_edits(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         enc: Encoding,
         (cx, tcx): (&CompletionCx, &UnitTypeCx),
@@ -1281,7 +1812,7 @@ impl Nav {
         let mapper = Mapper::new(text, enc);
         let insert_at = mapper.range(Span::new(tcx.name_end, tcx.name_end));
         let Some(session) =
-            self.completion_session(docs, uri, Span::new(cx.stmt_start, line_end as u32))
+            self.completion_session(docs, uri, Span::new(cx.stmt_start, offset32(line_end)))
         else {
             return;
         };
@@ -1325,7 +1856,8 @@ impl Nav {
                 }
             }
             let [target] = types[..] else { continue };
-            let Some(spelling) = resolved.type_spelling_at(scope, target) else {
+            let dialect = Some(crate::dialect_of(uri));
+            let Some(spelling) = resolved.type_spelling_at(dialect, scope, target) else {
                 continue;
             };
             out[*idx]
@@ -1350,7 +1882,7 @@ impl Nav {
     ///   direct members.
     pub fn completions(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: Option<u32>,
         enc: Encoding,
@@ -1406,12 +1938,14 @@ impl Nav {
                 }
                 if s.is_member_of(&path) && seen.insert(s.name.clone()) {
                     let (text_edit, repair, insert_text_format) = match &quoting {
-                        Some((mapper, text)) => item_edits(text, mapper, cx, &s.name, snippets),
+                        Some((mapper, text)) => {
+                            item_edits(text, mapper, cx, crate::dialect_of(uri), &s.name, snippets)
+                        }
                         None => (None, None, None),
                     };
                     meta.push((out.len(), s.name.clone(), s.qualified.clone()));
                     out.push(CompletionItem {
-                        label: s.name.clone(),
+                        label: crate::outline::spell_name(&s.name),
                         kind: Some(s.kind),
                         detail: Some(s.qualified.clone()),
                         documentation: s.documentation(),
@@ -1467,9 +2001,10 @@ impl Nav {
                 if is_phantom(s) || s.depth > 2 || !seen.insert(s.qualified.clone()) {
                     continue;
                 }
-                let qualified = crate::autoimport::escape_qualified(&s.qualified);
+                let qualified =
+                    crate::autoimport::escape_qualified(crate::dialect_of(uri), &s.qualified);
                 out.push(CompletionItem {
-                    label: s.name.clone(),
+                    label: crate::outline::spell_name(&s.name),
                     kind: Some(s.kind),
                     detail: Some(if s.depth == 0 {
                         "standard library".to_string()
@@ -1502,7 +2037,7 @@ impl Nav {
         // declaration, an admitting import).
         let doc = docs.get(uri);
         let parsed = match (cx.as_ref(), doc) {
-            (Some(_), Some(d)) => Some(if uri.path().as_str().ends_with(".kerml") {
+            (Some(_), Some(d)) => Some(if crate::is_kerml(uri.path().as_str()) {
                 sysmlv2_parser::parser::parse_kerml_source(&d.text)
             } else {
                 sysmlv2_parser::parser::parse_source(&d.text)
@@ -1546,7 +2081,14 @@ impl Nav {
         // The main edit (quoting + repair suffix) and the repair
         // insertion, per item; merged with the import edit below.
         let edits_for = |s: &QualifiedSymbol| match cx.as_ref().zip(mapper.as_ref().zip(doc)) {
-            Some((cx, (mapper, d))) => item_edits(&d.text, mapper, cx, &s.name, snippets),
+            Some((cx, (mapper, d))) => item_edits(
+                &d.text,
+                mapper,
+                cx,
+                crate::dialect_of(uri),
+                &s.name,
+                snippets,
+            ),
             None => (None, None, None),
         };
         let assemble = |s: &QualifiedSymbol| {
@@ -1580,7 +2122,7 @@ impl Nav {
                     assemble(s);
                 meta.push((out.len(), s.name.clone(), s.qualified.clone()));
                 out.push(CompletionItem {
-                    label: s.name.clone(),
+                    label: crate::outline::spell_name(&s.name),
                     kind: Some(s.kind),
                     detail: (!s.qualified.eq(&s.name)).then(|| s.qualified.clone()),
                     documentation: s.documentation(),
@@ -1602,7 +2144,7 @@ impl Nav {
             let (text_edit, additional_text_edits, label_details, insert_text_format) = assemble(s);
             meta.push((out.len(), s.name.clone(), s.qualified.clone()));
             out.push(CompletionItem {
-                label: s.name.clone(),
+                label: crate::outline::spell_name(&s.name),
                 kind: Some(s.kind),
                 detail: Some(if s.depth == 0 {
                     "standard library".to_string()
@@ -1629,7 +2171,7 @@ impl Nav {
     /// feature whose domain the asserted constraints narrow).
     pub fn inlay_hints(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         enc: Encoding,
     ) -> Vec<lsp_types::InlayHint> {
@@ -1649,7 +2191,7 @@ impl Nav {
 
         // Evaluated values: every declared feature whose value expression
         // is not already a literal and whose value the evaluator settles.
-        let parse = if uri.path().as_str().ends_with(".kerml") {
+        let parse = if crate::is_kerml(uri.path().as_str()) {
             sysmlv2_parser::parser::parse_kerml_source(&doc_text)
         } else {
             sysmlv2_parser::parser::parse_source(&doc_text)
@@ -1692,7 +2234,8 @@ impl Nav {
             // name — except after a bare reference, which already spells
             // the same element, and for the unbound self-result.
             let rendered = match value {
-                sysmlv2_parser::eval::Value::Unbound(_) => continue,
+                sysmlv2_parser::eval::Value::Unbound(_)
+                | sysmlv2_parser::eval::Value::UnboundMember(_) => continue,
                 sysmlv2_parser::eval::Value::Element(t) => {
                     if bare_ref || t == e {
                         continue;
@@ -1702,7 +2245,9 @@ impl Nav {
                         None => continue,
                     }
                 }
-                v => session.resolved().render_value(&v),
+                // Editor hints favour a glanceable decimal over an exact
+                // fraction (`≈0.3333333333333333`, not `1/3`).
+                v => session.resolved().render_value_approx(&v),
             };
             // A hint that restates the declared expression token for
             // token (`x = 3.63 [kg]` ⇒ ` = 3.63 [kg]`) adds nothing.
@@ -1776,9 +2321,12 @@ impl Nav {
                 if dunit != unit {
                     continue;
                 }
+                // Editor hints take the glanceable spelling: a bound
+                // without a terminating decimal expansion shows as an
+                // approximate decimal rather than a fraction.
                 let label = match &r.unit {
-                    Some(u) => format!(" ∈ {} [{u}]", r.range),
-                    None => format!(" ∈ {}", r.range),
+                    Some(u) => format!(" ∈ {} [{u}]", r.range_approx),
+                    None => format!(" ∈ {}", r.range_approx),
                 };
                 out.push(lsp_types::InlayHint {
                     position: mapper.position(dspan.end),
@@ -1800,7 +2348,7 @@ impl Nav {
     /// then interval propagation (solverless; Z3 stays a CLI concern).
     pub fn code_lenses(
         &mut self,
-        docs: &HashMap<Uri, Document>,
+        docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         enc: Encoding,
     ) -> Vec<lsp_types::CodeLens> {
@@ -1911,14 +2459,7 @@ impl Nav {
         enc: Encoding,
     ) -> Option<Location> {
         if let Some((name, text)) = session.library_unit(unit) {
-            let mut uri = String::from("sysmlv2-lib:/");
-            for c in name.chars() {
-                match c {
-                    ' ' => uri.push_str("%20"),
-                    '%' => uri.push_str("%25"),
-                    c => uri.push(c),
-                }
-            }
+            let uri = format!("sysmlv2-lib:/{}", crate::worker::encode_uri_path(name));
             let mapper = Mapper::new(text, enc);
             return Some(Location {
                 uri: Uri::from_str(&uri).ok()?,
@@ -1935,6 +2476,85 @@ impl Nav {
     }
 }
 
+/// The workspace's `sysmlint.json`, read from disk only when it
+/// changes. Formatting and every code-action request consult it, both
+/// of which fire per keystroke or per cursor move, and each consult
+/// used to be a directory read, a file read and a JSON parse.
+struct LintConfig {
+    path: Option<PathBuf>,
+    /// The file's `(modified, len)` at the last read, `None` for no
+    /// readable file — a file written twice inside one clock tick, at
+    /// the same length, is the one change this misses.
+    stamp: Option<(std::time::SystemTime, u64)>,
+    /// Bumped whenever the configuration changes, so a cache built on
+    /// it can tell one from another without keeping its text.
+    generation: u64,
+    config: sysmlv2_lint::Config,
+    read: bool,
+}
+
+impl LintConfig {
+    fn under(root: Option<&std::path::Path>) -> LintConfig {
+        LintConfig {
+            path: root.map(|r| r.join("sysmlint.json")),
+            stamp: None,
+            generation: 0,
+            config: sysmlv2_lint::Config::default(),
+            read: false,
+        }
+    }
+
+    /// The configuration and the generation it belongs to, re-reading
+    /// the file when its timestamp or size moved. An absent or
+    /// unparseable file is every rule at its default severity — the
+    /// worker publishes the parse error on the file itself.
+    fn get(&mut self) -> (u64, &sysmlv2_lint::Config) {
+        let stamp = self
+            .path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        if self.read && stamp == self.stamp {
+            return (self.generation, &self.config);
+        }
+        self.stamp = stamp;
+        self.read = true;
+        self.generation += 1;
+        self.config = self
+            .path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|text| sysmlv2_lint::Config::from_json(&text).ok())
+            .unwrap_or_default();
+        (self.generation, &self.config)
+    }
+}
+
+/// The name and text of a session's user unit by model unit index.
+fn unit_of(session: &Session, unit: usize) -> Option<(&str, &str)> {
+    session
+        .units()
+        .find(|(i, _, _)| *i == unit)
+        .map(|(_, name, text)| (name, text))
+}
+
+/// One lint finding's fixes, ready for a code-action response: the
+/// finding's rule and range identify the diagnostic it rides, `edit` is
+/// the preferred fix and `alternatives` the equally valid ones (label,
+/// semantic, edit).
+pub struct LintFixSet {
+    pub rule: &'static str,
+    pub range: lsp_types::Range,
+    pub label: String,
+    /// The fix changes what a declaration means: its own quick fix,
+    /// never part of fix-all.
+    pub semantic: bool,
+    /// The fix deletes model text: never part of fix-all.
+    pub deletes: bool,
+    pub edit: WorkspaceEdit,
+    pub alternatives: Vec<(String, bool, WorkspaceEdit)>,
+}
+
 /// Flatten one document's outline into (name, kind, range) triples for
 /// `workspace/symbol`.
 pub fn flatten_symbols(
@@ -1947,7 +2567,7 @@ pub fn flatten_symbols(
         if query.is_empty() || s.name.to_lowercase().contains(&query.to_lowercase()) {
             #[allow(deprecated)]
             out.push(lsp_types::SymbolInformation {
-                name: s.name.clone(),
+                name: crate::outline::spell_name(&s.name),
                 kind: s.kind,
                 tags: None,
                 deprecated: None,
@@ -2022,7 +2642,7 @@ fn quoted_name_at(text: &str, offset: u32) -> Option<(String, u32)> {
     let inner = rest.strip_prefix('\'')?;
     let end = inner.find('\'')?;
     let name = &inner[..end];
-    (!name.is_empty() && !name.contains('\\')).then(|| (name.to_string(), end as u32 + 2))
+    (!name.is_empty() && !name.contains('\\')).then(|| (name.to_string(), offset32(end) + 2))
 }
 
 fn is_identifier(s: &str) -> bool {
@@ -2109,7 +2729,7 @@ fn enum_member_insertion(text: &str, decl: Span, name: &str) -> Option<(Span, St
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect();
         Some((
-            Span::new(line_start as u32, line_start as u32),
+            Span::new(offset32(line_start), offset32(line_start)),
             format!("{indent}    {name};\n"),
         ))
     } else {
@@ -2118,7 +2738,7 @@ fn enum_member_insertion(text: &str, decl: Span, name: &str) -> Option<(Span, St
         } else {
             format!(" {name}; ")
         };
-        Some((Span::new(close as u32, close as u32), insert))
+        Some((Span::new(offset32(close), offset32(close)), insert))
     }
 }
 
@@ -2137,12 +2757,12 @@ fn whole_line_removal(text: &str, span: Span) -> Span {
         le += 1;
     }
     if indent_only && le < bytes.len() && bytes[le] == b'\n' {
-        return Span::new(ls as u32, (le + 1) as u32);
+        return Span::new(offset32(ls), offset32(le + 1));
     }
     if indent_only && le == bytes.len() {
-        return Span::new(ls as u32, le as u32);
+        return Span::new(offset32(ls), offset32(le));
     }
-    Span::new(start as u32, end as u32)
+    Span::new(offset32(start), offset32(end))
 }
 
 /// "Sort imports": alphabetize each contiguous run of import
@@ -2400,10 +3020,10 @@ fn collect_qualified(
 }
 
 /// Every open document's outline, flattened to qualified symbols.
-fn workspace_symbols(docs: &HashMap<Uri, Document>, enc: Encoding) -> Vec<QualifiedSymbol> {
+fn workspace_symbols(docs: &BTreeMap<Uri, Document>, enc: Encoding) -> Vec<QualifiedSymbol> {
     let mut out = Vec::new();
     for (uri, doc) in docs {
-        let parse = if uri.path().as_str().ends_with(".kerml") {
+        let parse = if crate::is_kerml(uri.path().as_str()) {
             sysmlv2_parser::parser::parse_kerml_source(&doc.text)
         } else {
             sysmlv2_parser::parser::parse_source(&doc.text)
@@ -2528,8 +3148,8 @@ pub(crate) fn untyped_attribute_unit_context(text: &str, cx: &CompletionCx) -> O
     }
     let bracket_open = open?;
     Some(UnitTypeCx {
-        name_end: cx.stmt_start + name_end as u32,
-        bracket_open: cx.stmt_start + bracket_open as u32,
+        name_end: cx.stmt_start + offset32(name_end),
+        bracket_open: cx.stmt_start + offset32(bracket_open),
     })
 }
 
@@ -2705,6 +3325,7 @@ fn item_edits(
     text: &str,
     mapper: &Mapper<'_>,
     cx: &CompletionCx,
+    dialect: sysmlv2_parser::ast::Dialect,
     name: &str,
     snippets: bool,
 ) -> (
@@ -2712,7 +3333,10 @@ fn item_edits(
     Option<TextEdit>,
     Option<lsp_types::InsertTextFormat>,
 ) {
-    let escaped = sysmlv2_parser::ast::escape_name(name);
+    // Insert text is source for this document: a name the dialect
+    // reserves (`'view'`) and a non-basic name are quoted, a word the
+    // dialect does not reserve stays bare — the label keeps the raw name.
+    let escaped = sysmlv2_parser::name::spell_name_in(Some(dialect), name);
     let range = crate::autoimport::replace_range_for(text, cx.partial_start, cx.offset, name);
     let repairs = crate::autofix::statement_repairs(text, cx.stmt_start, range.start, cx.offset);
     let (suffix, insert) = match repairs {
@@ -2822,10 +3446,10 @@ pub(crate) fn completion_context(text: &str, offset: u32) -> CompletionCx {
     CompletionCx {
         qualifier,
         dot_chain,
-        partial_start: partial_start as u32,
-        offset: offset as u32,
+        partial_start: offset32(partial_start),
+        offset: offset32(offset),
         import,
-        stmt_start: stmt_start as u32,
+        stmt_start: offset32(stmt_start),
     }
 }
 

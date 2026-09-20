@@ -67,6 +67,13 @@ env:
 jobs:
   test:
     name: test (full corpus gates)
+    timeout-minutes: 45
+    # Release PRs (release/* -> main, opened and admin-merged by
+    # tools/release.sh in one step) run these gates like any other PR.
+    # Skipping them costs less than it looks: the tag is pushed by the
+    # same command that merged, so a skipped release PR makes the tag run
+    # the first time CI ever sees the tree — and a failure there lands
+    # after main has already moved, with the version spent.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -83,19 +90,24 @@ jobs:
         run: git submodule update --init spec-refs/apollo-11-sysml-v2
       - name: Install z3
         run: sudo apt-get update && sudo apt-get install -y z3
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Formatting
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        shell: bash
         run: |
-          rustup component add rustfmt
-          cargo fmt --check
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          rustup show active-toolchain
+      - name: Formatting
+        run: cargo fmt --all -- --check
       - name: Run the full test suite
         run: cargo test --release
       - name: Clippy
-        run: |
-          rustup component add clippy
-          cargo clippy --release --all-targets -- -D warnings
+        run: cargo clippy --release --all-targets -- -D warnings
       - name: Clippy (slim CLI — no default features)
         run: cargo clippy --release -p sysmlv2-cli --no-default-features -- -D warnings
+      - name: Documentation (public docs build warning-free)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
       - name: Generated libraries (strict check against the stdlib, canonical formatting)
         # The committed files are checked as candidates: SYSMLV2_AMBIENT=off
         # keeps the toolkit's built-in copies out so they cannot collide.
@@ -109,8 +121,25 @@ jobs:
           printf 'package V { part shell : Web::HTML::Elements::Div { :>> id = "app"; } part t : Template::Text; part k : Svelte::KeyBlock; part a : WebApp::Application; part r : SvelteKit::RouteSegment; }\n' > /tmp/ambient.sysml
           cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library /tmp/ambient.sysml
 
+  msrv:
+    name: msrv (declared rust-version still builds)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the declared minimum toolchain
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          echo "rust-version: $msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - name: Check every target on the minimum toolchain
+        # The `+toolchain` override wins over rust-toolchain.toml.
+        run: cargo +"$MSRV" check --all-targets --locked
+
   wasm:
     name: wasm (wasm32 gate + npm package + node smoke)
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -127,15 +156,16 @@ jobs:
           git sparse-checkout set sysml.library
           git fetch --filter=blob:none origin "$sha"
           git checkout "$sha"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          # unknown-unknown for the bindgen module, wasip1 for the CLI
-          # artifact the package ships under cli/.
-          targets: wasm32-unknown-unknown,wasm32-wasip1
-      - name: Clippy (wasm32)
+      # unknown-unknown for the bindgen module, wasip1 for the CLI
+      # artifact the package ships under cli/.
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        shell: bash
         run: |
-          rustup component add clippy
-          cargo clippy --release -p sysmlv2-wasm --target wasm32-unknown-unknown -- -D warnings
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown --target wasm32-wasip1
+          rustup show active-toolchain
+      - name: Clippy (wasm32)
+        run: cargo clippy --release -p sysmlv2-wasm --target wasm32-unknown-unknown -- -D warnings
       - name: Install wasm-pack
         # Pinned release binary. The rustwasm.github.io installer script
         # is stale (the project moved to drager/wasm-pack) and serves
@@ -145,12 +175,39 @@ jobs:
           curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${v}/wasm-pack-v${v}-x86_64-unknown-linux-musl.tar.gz" | tar xz
           mv "wasm-pack-v${v}-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/"
           wasm-pack --version
+      # The runtime the smokes run under is pinned, not inherited. The
+      # image's own Node 22 on x86_64 faults inside its WASI host on this
+      # module: measured over 40 runs of the unchanged cli smoke against
+      # one artifact, 6 died with SIGSEGV, while Node 20 and 24 on the
+      # same architecture, and Node 22 on arm64, were clean 40/40. The
+      # rate tracks the module's declared initial memory, which the
+      # stack reservation the recursion bounds need makes 16 MiB, so the
+      # trigger is ours even though the fault is the host's. Consumers on
+      # that combination are told about it in the package README.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
       - name: Build the npm package (wasm module + stdlib bundle/snapshot)
-        run: node crates/sysmlv2-wasm/npm/build.mjs
+        run: node --version && node crates/sysmlv2-wasm/npm/build.mjs
       - name: Node smoke test (module load, stdlib check, snapshot replay)
         run: node crates/sysmlv2-wasm/npm/smoke.mjs
       - name: CLI wasi smoke (ambient context, provenance, size budget)
         run: node crates/sysmlv2-wasm/npm/cli_smoke.mjs
+      # A failing smoke is only diagnosable from the bytes it ran, and
+      # those are built here and never uploaded on a red run. Keep them
+      # when something fails; a green run publishes the tarball below and
+      # this costs nothing. It is a separate artifact deliberately — the
+      # release job merges every artifact into one directory and attaches
+      # the lot, so this must not ride along with the tarball.
+      - name: Keep the wasm artifacts a failure needs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sysmlv2-wasm-failed
+          path: |
+            crates/sysmlv2-wasm/npm/pkg/cli/sysmlv2-cli.wasm
+            crates/sysmlv2-wasm/npm/pkg/sysmlv2_bg.wasm
+          if-no-files-found: warn
       - name: Upload the package tarball (release artifact)
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v7
@@ -219,23 +276,29 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --target ${{ matrix.target }}
+          rustup show active-toolchain
       - name: Install system packages
         if: matrix.packages != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+      # Shipped binaries build under the whole-program-optimised `dist`
+      # profile (Cargo.toml); the slim variant uses it too so the size
+      # comparison stays like for like.
       - name: Build (slim — size measurement only, not shipped)
-        run: cargo build --release -p sysmlv2-cli --no-default-features --target ${{ matrix.target }}
+        run: cargo build --profile dist -p sysmlv2-cli --no-default-features --target ${{ matrix.target }}
       - name: Stash the slim binary
         shell: bash
         run: |
           bin=sysmlv2
           [[ "${{ matrix.target }}" == *windows* ]] && bin=sysmlv2.exe
           mkdir slim
-          cp "target/${{ matrix.target }}/release/$bin" slim/
+          cp "target/${{ matrix.target }}/dist/$bin" slim/
       - name: Build (complete)
-        run: cargo build --release -p sysmlv2-cli --target ${{ matrix.target }}
+        run: cargo build --profile dist -p sysmlv2-cli --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
@@ -245,7 +308,7 @@ jobs:
           [[ "$target" == *windows* ]] && bin=sysmlv2.exe
           name="sysmlv2-${version}-${target}"
           mkdir "$name"
-          cp "target/${target}/release/$bin" "$name/"
+          cp "target/${target}/dist/$bin" "$name/"
           cp README.md LICENSE "$name/"
           if [[ "$target" == *windows* ]]; then
             7z a "${name}.zip" "$name"
@@ -253,7 +316,7 @@ jobs:
             tar czf "${name}.tar.gz" "$name"
           fi
           # One row of the release-wide size table (SIZES.md, release job).
-          complete=$(wc -c < "target/${target}/release/$bin")
+          complete=$(wc -c < "target/${target}/dist/$bin")
           slim=$(wc -c < "slim/$bin")
           hsize() { awk -v b="$1" 'BEGIN { printf "%.1f MiB", b / 1048576 }'; }
           printf '| %s | %s (%s) | %s (%s) | %s |\n' \

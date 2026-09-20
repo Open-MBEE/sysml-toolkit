@@ -66,9 +66,12 @@ impl Client {
             match self.conn.receiver.recv().unwrap() {
                 Message::Response(Response {
                     id: rid,
-                    result,
-                    error,
+                    response_result,
                 }) if rid == id => {
+                    let (result, error) = match response_result {
+                        Ok(v) => (Some(v), None),
+                        Err(e) => (None, Some(e)),
+                    };
                     assert!(error.is_none(), "{}: {error:?}", R::METHOD);
                     return serde_json::from_value(result.unwrap_or_default()).unwrap();
                 }
@@ -275,7 +278,7 @@ fn formatting_a_broken_document_warns_and_leaves_it_alone() {
             id.clone(),
             "textDocument/formatting".to_string(),
             DocumentFormattingParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                text_document: TextDocumentIdentifier { uri },
                 options: FormattingOptions::default(),
                 work_done_progress_params: Default::default(),
             },
@@ -289,9 +292,12 @@ fn formatting_a_broken_document_warns_and_leaves_it_alone() {
             }
             Message::Response(Response {
                 id: rid,
-                result,
-                error,
+                response_result,
             }) if rid == id => {
+                let (result, error) = match response_result {
+                    Ok(v) => (Some(v), None),
+                    Err(e) => (None, Some(e)),
+                };
                 assert!(error.is_none(), "{error:?}");
                 break serde_json::from_value(result.unwrap_or_default()).unwrap();
             }
@@ -354,7 +360,7 @@ fn document_symbols_form_the_expected_tree() {
     );
     let resp: Option<DocumentSymbolResponse> =
         client.request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         });
@@ -484,9 +490,379 @@ fn unknown_request_gets_method_not_found() {
     loop {
         if let Message::Response(r) = client.conn.receiver.recv().unwrap() {
             assert_eq!(r.id, RequestId::from(99));
-            assert!(r.error.is_some(), "signatureHelp is not implemented");
+            assert!(
+                r.response_result.is_err(),
+                "signatureHelp is not implemented"
+            );
             break;
         }
     }
+    client.shutdown();
+}
+
+/// A request whose parameters do not deserialize is answered with
+/// `InvalidParams`, a malformed notification is logged and dropped, and
+/// the session goes on serving either way.
+#[test]
+fn malformed_messages_are_answered_and_the_session_continues() {
+    let (mut client, _) = Client::start(false);
+    let uri = uri("m.sysml");
+    client.open(&uri, 1, "package P { part def X; }\n");
+
+    // A uri that is a number, not a string.
+    client
+        .conn
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(42),
+            "textDocument/hover".to_string(),
+            serde_json::json!({"textDocument": {"uri": 5}, "position": {"line": 0, "character": 0}}),
+        )))
+        .unwrap();
+    let error = loop {
+        if let Message::Response(r) = client.conn.receiver.recv().unwrap() {
+            assert_eq!(r.id, RequestId::from(42));
+            break r.response_result.expect_err("malformed params are refused");
+        }
+    };
+    assert_eq!(error.code, lsp_server::ErrorCode::InvalidParams as i32);
+    assert!(
+        error.message.starts_with("textDocument/hover: "),
+        "{error:?}"
+    );
+
+    // A didOpen without its text: logged, not fatal.
+    client
+        .conn
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_string(),
+            serde_json::json!({"textDocument": {"uri": "file:///harness/n.sysml"}}),
+        )))
+        .unwrap();
+    let logged = loop {
+        if let Message::Notification(n) = client.conn.receiver.recv().unwrap() {
+            if n.method == "window/logMessage" {
+                let p: lsp_types::LogMessageParams = serde_json::from_value(n.params).unwrap();
+                break p;
+            }
+        }
+    };
+    assert!(
+        logged.message.starts_with("textDocument/didOpen: "),
+        "{logged:?}"
+    );
+
+    // The session still answers.
+    use lsp_types::request::DocumentSymbolRequest;
+    let resp: Option<lsp_types::DocumentSymbolResponse> =
+        client.request::<DocumentSymbolRequest>(lsp_types::DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        });
+    assert!(
+        matches!(resp, Some(lsp_types::DocumentSymbolResponse::Nested(ref s)) if s.len() == 1),
+        "{resp:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn document_symbols_never_carry_an_empty_name() {
+    // `''` is a legal (empty) unrestricted name, distinct from an
+    // anonymous member. VS Code rejects a `DocumentSymbol` whose name is
+    // falsy and drops the whole response, so the outline must spell it.
+    use lsp_types::request::DocumentSymbolRequest;
+    use lsp_types::{DocumentSymbolParams, DocumentSymbolResponse};
+    let (mut client, _) = Client::start(false);
+    let uri = uri("e.sysml");
+    client.open(
+        &uri,
+        1,
+        "package P {\n\
+         \x20   enum def K {\n\
+         \x20       '';\n\
+         \x20       Key;\n\
+         \x20   }\n\
+         \x20   part def '' {\n\
+         \x20       attribute <''> x;\n\
+         \x20       attribute <''>;\n\
+         \x20   }\n\
+         }\n",
+    );
+    let resp: Option<DocumentSymbolResponse> =
+        client.request::<DocumentSymbolRequest>(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        });
+    let Some(DocumentSymbolResponse::Nested(top)) = resp else {
+        panic!("expected a nested response: {resp:?}");
+    };
+    fn walk(symbols: &[lsp_types::DocumentSymbol], names: &mut Vec<String>) {
+        for s in symbols {
+            assert!(!s.name.is_empty(), "empty symbol name at {:?}", s.range);
+            names.push(s.name.clone());
+            if let Some(children) = &s.children {
+                walk(children, names);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    walk(&top, &mut names);
+    assert_eq!(names, ["P", "K", "''", "Key", "''", "x", "''"]);
+
+    // The same spelling reaches workspace/symbol.
+    use lsp_types::request::WorkspaceSymbolRequest;
+    use lsp_types::{WorkspaceSymbolParams, WorkspaceSymbolResponse};
+    let resp: Option<WorkspaceSymbolResponse> =
+        client.request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
+            query: String::new(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        });
+    let Some(WorkspaceSymbolResponse::Flat(flat)) = resp else {
+        panic!("expected a flat response: {resp:?}");
+    };
+    assert!(flat.iter().all(|s| !s.name.is_empty()));
+    assert_eq!(flat.iter().filter(|s| s.name == "''").count(), 3);
+    client.shutdown();
+}
+
+#[test]
+fn import_visibility_quick_fix_leads_with_the_computed_keyword() {
+    use lsp_types::request::CodeActionRequest;
+    use lsp_types::{CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionResponse};
+    let (mut client, _) = Client::start(false);
+    let lib = uri("lib.sysml");
+    client.open(&lib, 1, "package Lib { part def Thing; }\n");
+    let p = uri("p.sysml");
+    let diags = client.open(&p, 1, "package P { import Lib::*; }\n");
+    let q = uri("q.sysml");
+    client.open(&q, 1, "package Q { part b : P::Thing; }\n");
+    let visibility = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.message
+                .starts_with("an import must declare an explicit visibility")
+        })
+        .cloned()
+        .expect("the bare import is diagnosed");
+    let resp: Option<CodeActionResponse> = client.request::<CodeActionRequest>(CodeActionParams {
+        text_document: TextDocumentIdentifier { uri: p },
+        range: visibility.range,
+        context: CodeActionContext {
+            diagnostics: vec![visibility],
+            only: None,
+            trigger_kind: None,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    });
+    let titles: Vec<(String, bool)> = resp
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|a| match a {
+            CodeActionOrCommand::CodeAction(a) if a.title.starts_with("Make the import") => {
+                Some((a.title, a.is_preferred.unwrap_or(false)))
+            }
+            _ => None,
+        })
+        .collect();
+    // Q reaches Lib::Thing through P's import, so `public` is required
+    // and leads; the other keywords follow unpreferred.
+    assert_eq!(titles.len(), 3, "{titles:?}");
+    assert_eq!(
+        titles[0],
+        (
+            "Make the import `public` (1 reference(s) beyond the importing namespace resolve through it)".to_string(),
+            true
+        )
+    );
+    assert!(
+        titles[1..].iter().all(|(_, preferred)| !preferred),
+        "{titles:?}"
+    );
+
+    // Two bare imports in one file: the advice is for the one under the
+    // diagnostic.
+    let r = uri("r.sysml");
+    let diags = client.open(
+        &r,
+        1,
+        "package R {\n    import Lib::*;\n    import P::*;\n    part a : Thing;\n}\n",
+    );
+    let second = diags
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            d.message
+                .starts_with("an import must declare an explicit visibility")
+        })
+        .nth(1)
+        .cloned()
+        .expect("both bare imports are diagnosed");
+    let resp: Option<CodeActionResponse> = client.request::<CodeActionRequest>(CodeActionParams {
+        text_document: TextDocumentIdentifier { uri: r },
+        range: second.range,
+        context: CodeActionContext {
+            diagnostics: vec![second],
+            only: None,
+            trigger_kind: None,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    });
+    let first_title = resp
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(a) if a.title.starts_with("Make the import") => {
+                Some(a.title)
+            }
+            _ => None,
+        })
+        .unwrap();
+    // `import P::*` is only ever walked with full access.
+    assert_eq!(
+        first_title,
+        "Make the import `private` (nothing outside uses it)"
+    );
+    client.shutdown();
+}
+
+/// Successive edits each replace the document's text outright. The
+/// store shares a document's text with every snapshot taken of it —
+/// jobs, requests — so an edit has to hand out a new one rather than
+/// leave a reader on the old: diagnostics, the outline and formatting
+/// all answer from the latest version.
+#[test]
+fn successive_edits_all_answer_from_the_latest_text() {
+    use lsp_types::request::DocumentSymbolRequest;
+    let (mut client, _) = Client::start(false);
+    let target = uri("m.sysml");
+    let symbols = |client: &mut Client| -> Vec<String> {
+        let resp: Option<lsp_types::DocumentSymbolResponse> = client
+            .request::<DocumentSymbolRequest>(lsp_types::DocumentSymbolParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("m.sysml"),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            });
+        match resp {
+            Some(lsp_types::DocumentSymbolResponse::Nested(s)) => {
+                s.into_iter().map(|s| s.name).collect()
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    client.open(&target, 1, "package First;\n");
+    assert_eq!(symbols(&mut client), ["First"]);
+
+    client.change(&target, 2, "package Second;\n");
+    assert_eq!(symbols(&mut client), ["Second"]);
+
+    // A version that does not parse, then one that does again.
+    let p = client.change(&target, 3, "package Third {\n");
+    assert!(!p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+    let p = client.change(&target, 4, "package Fourth;\n");
+    assert_eq!(p.diagnostics, Vec::new(), "{:?}", p.diagnostics);
+    assert_eq!(symbols(&mut client), ["Fourth"]);
+
+    // Formatting reads the same text: an already-formatted document
+    // has nothing to change.
+    let edits: Option<Vec<lsp_types::TextEdit>> =
+        client.request::<Formatting>(lsp_types::DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri: target },
+            options: Default::default(),
+            work_done_progress_params: Default::default(),
+        });
+    assert_eq!(edits, Some(Vec::new()));
+    client.shutdown();
+}
+
+/// The unit order every tier derives from the open documents is the
+/// document order, and that is by uri — not the order the client
+/// happened to open them in, and not a hash order that varies run to
+/// run. Unit indexes, the resolver's tie-break on an ambiguous name and
+/// the order of workspace symbols all ride on it.
+#[test]
+fn the_document_order_is_by_uri_whatever_order_they_arrive_in() {
+    use lsp_types::request::WorkspaceSymbolRequest;
+    use lsp_types::{WorkspaceSymbolParams, WorkspaceSymbolResponse};
+    let names = |client: &mut Client| -> Vec<String> {
+        let resp: Option<WorkspaceSymbolResponse> =
+            client.request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
+                query: String::new(),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            });
+        match resp {
+            Some(WorkspaceSymbolResponse::Flat(flat)) => flat.into_iter().map(|s| s.name).collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    let expected = ["Pa", "Pb", "Pc", "Pd", "Pe"];
+
+    let (mut client, _) = Client::start(false);
+    for (name, package) in [
+        ("d.sysml", "Pd"),
+        ("a.sysml", "Pa"),
+        ("e.sysml", "Pe"),
+        ("c.sysml", "Pc"),
+        ("b.sysml", "Pb"),
+    ] {
+        client.open(&uri(name), 1, &format!("package {package};\n"));
+    }
+    assert_eq!(names(&mut client), expected);
+    client.shutdown();
+
+    // A second server, opened in the opposite order, answers the same.
+    let (mut client, _) = Client::start(false);
+    for (name, package) in [
+        ("b.sysml", "Pb"),
+        ("c.sysml", "Pc"),
+        ("e.sysml", "Pe"),
+        ("a.sysml", "Pa"),
+        ("d.sysml", "Pd"),
+    ] {
+        client.open(&uri(name), 1, &format!("package {package};\n"));
+    }
+    assert_eq!(names(&mut client), expected);
+    client.shutdown();
+}
+
+/// The syntax tier parses on the server's own loop thread, and the
+/// parser's bound only turns unbounded input into a diagnostic on a
+/// stack that reaches the bound. A document nested to it is ordinary
+/// input with nothing to report — a kilobyte and a half here — and on
+/// the stack a thread gets when it asks for nothing, the descent ends
+/// the whole process: no diagnostic, no unwind, no server, and an
+/// editor session goes with it.
+///
+/// The harness starts the server on exactly such a thread, so the loop's
+/// own reservation is what carries this. A server whose reservation went
+/// missing does not fail this test — it ends the test process.
+#[test]
+fn the_server_parses_at_the_nesting_bound() {
+    let (client, _) = Client::start(false);
+    let uri = uri("deep.sysml");
+    // One level is the package, so the braces within it stop one short.
+    let levels = sysmlv2_parser::parser::MAX_NESTING as usize - 1;
+    let text = format!(
+        "package P {{ {}part x;{} }}\n",
+        "part x { ".repeat(levels),
+        "}".repeat(levels)
+    );
+    let diags = client.open(&uri, 1, &text);
+    assert_eq!(diags.uri, uri);
+    assert!(
+        diags.diagnostics.is_empty(),
+        "nesting the parser accepts has nothing to report: {:?}",
+        diags.diagnostics
+    );
     client.shutdown();
 }

@@ -5,7 +5,7 @@
 //! here would render as a mysteriously incomplete Outline view.
 
 use lsp_types::DocumentSymbol;
-use sysmlv2_lsp::{Encoding, Mapper, document_symbols};
+use sysmlv2_lsp::{Encoding, Mapper, document_symbols, spell_symbols};
 use sysmlv2_parser::parser::{parse_kerml_source, parse_source};
 
 fn check(
@@ -55,7 +55,8 @@ fn corpus_outlines_satisfy_containment() {
             parse_source(&src)
         };
         let mapper = Mapper::new(&src, Encoding::Utf16);
-        let tree = document_symbols(&parse.unit, &src, &mapper);
+        let mut tree = document_symbols(&parse.unit, &src, &mapper);
+        spell_symbols(&mut tree);
         check(&tree, None, &path.display().to_string(), &mut symbols);
         files += 1;
     }

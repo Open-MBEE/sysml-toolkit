@@ -34,6 +34,53 @@ The running example is a small two-package model:
 
 ---
 
+## Exceptions
+
+Everything this module raises derives from `sysmlv2.Error`, so `except sysmlv2.Error` separates the toolkit's failures from the interpreter's own. A refusal — an argument the toolkit cannot use, a handle minted against a superseded session state, an edit whose commit would change what an untouched reference denotes — is `sysmlv2.RefusedError`, which derives from `sysmlv2.Error` and from `ValueError`, so `except ValueError` keeps catching every refusal it caught before. Anything else the toolkit could not carry out, such as an unreadable library directory, is a plain `sysmlv2.Error`.
+
+Model problems are not exceptions at all: `check` reports them as findings, and a broken parse is a finding rather than a raise.
+
+## Deeply nested sources
+
+Every call parses on the thread that makes it. The parser bounds how deeply a source may nest — 128 levels of braces — and that bound assumes a stack large enough to descend that far; a thread that has less overflows on input the parser accepts, and a stack overflow ends the interpreter rather than raising anything catchable. The toolkit's own command line and language server reserve that stack for themselves, but a thread the interpreter made is the caller's to size.
+
+Sources from an editor never come close (the published example and library models nest ten levels). Machine-generated ones can. To be safe with those, ask for the stack before the thread that will parse, and hand back what the work returned — or raised, since an exception on a thread is otherwise printed there and lost:
+
+```pycon
+>>> import threading
+>>> def on_a_parsing_stack(work):
+...     threading.stack_size(16 * 1024 * 1024)   # what the parser's bound assumes
+...     outcome = []
+...     def run():
+...         try:
+...             outcome.append((work(), None))
+...         except BaseException as raised:
+...             outcome.append((None, raised))
+...     thread = threading.Thread(target=run)
+...     thread.start()
+...     thread.join()
+...     value, raised = outcome[0]
+...     if raised is not None:
+...         raise raised
+...     return value
+...
+>>> on_a_parsing_stack(lambda: 1 / 0)
+Traceback (most recent call last):
+  ...
+ZeroDivisionError: division by zero
+```
+
+A session lives on the thread that opened it, and so does every handle into it, so the work that *uses* the deep sources runs on that thread too — what comes back is its answer, not the session:
+
+```pycon
+>>> def unresolved_in(sources):
+...     session = sysmlv2.Session.from_sources(sources)
+...     return session.unresolved_count()
+...
+>>> on_a_parsing_stack(lambda: unresolved_in([("deep.sysml", MODEL)]))
+0
+```
+
 ## 1. Sessions
 
 A `Session` owns the parsed, resolved model and every handle into it. Open one from files on disk, from in-memory sources, or from interchange JSON (section 6):
@@ -44,7 +91,7 @@ A `Session` owns the parsed, resolved model and every handle into it. Open one f
 0
 ```
 
-`from_files([...])` does the same for paths (dialect by extension, `.kerml` → KerML). To resolve names from the OMG standard library, call `load_library(dir)` with a checkout of its `sysml.library/` directory — resolution outcomes come from the same warm cache the CLI uses, and quantity values (`10 [mm]`) then evaluate to `(magnitude, unit)` tuples.
+`from_files([...])` does the same for paths (dialect by extension, `.kerml` → KerML). To resolve names from the OMG standard library, call `load_library(dir)` with a checkout of its `sysml.library/` directory — native directory loading shares the CLI’s prepared graph and static-analysis cache, with library source trees reconstructed on demand, and quantity values (`10 [mm]`) then evaluate to `(magnitude, unit)` tuples.
 
 `units()` lists the model's units as `(index, name, source)`; `source(i)` returns one unit's current text:
 
@@ -86,7 +133,7 @@ False
 False
 ```
 
-`element_id(e)` returns the element's interchange id — the same UUID the JSON emitters use.
+`element_id(e)` returns the element's interchange id — the same UUID the JSON emitters use. Every derived property of the abstract syntax is reachable by its specification name through `s.derived(e, "ownedFeature")`, `s.derived(e, "owningNamespace")`, `s.derived(e, "name")`, …; `Session.derives(metaclass, name)` says in advance whether a name is computed (`"exact"`, `"passthrough"`, `"not-computed"`) or not a derived property there (`"not-declared"`), and `s.set_closure_policy("closure")` switches the inheritance-aware properties to their definition over the inherited and imported memberships (API.md §3.2a).
 
 ## 3. Find usages
 
@@ -104,7 +151,7 @@ type (226, 231)
 
 ## 4. Queries and evaluation
 
-`query(expr)` evaluates a KerML expression at the root namespace with the CLI's query-mode semantics — closed-world `istype` on model elements plus the reflection functions `ownedMember(x)` / `ownedFeature(x)`. Elements come back as handles, scalars as native Python values:
+`query(expr)` evaluates a KerML expression at the root namespace with the CLI's query-mode semantics — closed-world `istype` on model elements plus the reflection functions `ownedMember(x)` / `ownedFeature(x)`. Elements come back as handles, scalars as native Python values — integers as `int` (arbitrary size), exact non-integral rationals as `fractions.Fraction`, approximate results of transcendental functions as `float`: (Exact numbers arrived with toolkit 0.7; before that every non-integer was a `float`.)
 
 ```pycon
 >>> hits = s.query("ownedFeature(Rig::Vehicle)->select { in p; p istype Defs::Wheel }")
@@ -121,7 +168,7 @@ type (226, 231)
 660
 ```
 
-Malformed expressions raise `ValueError` with the parser's diagnostics.
+Malformed expressions raise `sysmlv2.RefusedError` with the parser's diagnostics.
 
 ## 5. Batch edits with verified commits
 
@@ -165,7 +212,7 @@ The report's `id_map` lists `(old id, new id)` for every element whose interchan
 2
 ```
 
-Renames only respell sites written with the element's own name — alias and effective-name spellings stay untouched. New text is validated at plan time: unparsable member text, renames to reserved words, and overlapping splices raise `ValueError` before anything is applied.
+Renames only respell sites written with the element's own name — alias and effective-name spellings stay untouched. New text is validated at plan time: unparsable member text, renames to reserved words, and overlapping splices raise `sysmlv2.RefusedError` before anything is applied.
 
 A successful commit is a new model state: handles minted before it — including the consumed batch itself — are **stale** and raise rather than silently denoting the wrong element:
 
@@ -173,11 +220,11 @@ A successful commit is a new model state: handles minted before it — including
 >>> s.name(wheel)
 Traceback (most recent call last):
   ...
-ValueError: stale handle: the session was edited since it was minted (re-resolve after commit)
+sysmlv2.RefusedError: stale handle: the session was edited since it was minted (re-resolve after commit)
 >>> s.commit(edit)
 Traceback (most recent call last):
   ...
-ValueError: stale handle: the session was edited since it was minted (re-resolve after commit)
+sysmlv2.RefusedError: stale handle: the session was edited since it was minted (re-resolve after commit)
 ```
 
 `remove(e)` deletes a member's whole extent, but the commit pre-fails (nothing applied) if other sites still reference the removed element:
@@ -189,10 +236,10 @@ ValueError: stale handle: the session was edited since it was minted (re-resolve
 >>> s.commit(bad)
 Traceback (most recent call last):
   ...
-RuntimeError: removing `Defs::RoadWheel` breaks 4 reference(s)
+sysmlv2.RefusedError: removing `Defs::RoadWheel` breaks 4 reference(s)
 ```
 
-And commit-time semantic breakage — here a rename that would let an inner declaration shadow-capture an outer reference — rolls back bit-exact and raises `RuntimeError`:
+And commit-time semantic breakage — here a rename that would let an inner declaration shadow-capture an outer reference — rolls back bit-exact and raises `sysmlv2.RefusedError`:
 
 ```pycon
 >>> t = sysmlv2.Session.from_sources(
@@ -202,7 +249,7 @@ And commit-time semantic breakage — here a rename that would let an inner decl
 >>> t.commit(shadow)
 Traceback (most recent call last):
   ...
-RuntimeError: edit refused: 1 reference would break: `T` at u.sysml:1:58 (bytes 57..58) would resolve to `P::Q::T` instead of `P::T`
+sysmlv2.RefusedError: edit refused: 1 reference would break: `T` at u.sysml:1:58 (bytes 57..58) would resolve to `P::Q::T` instead of `P::T`
 >>> t.resolve("P::Q::U") is not None
 True
 ```
@@ -259,7 +306,7 @@ package Rig {
 <BLANKLINE>
 ```
 
-Refusals are named `ValueError`s — an ineligible kind or header, a taken definition name, outside references through the definition — and the session is left untouched.
+Refusals are named `sysmlv2.RefusedError`s — an ineligible kind or header, a taken definition name, outside references through the definition — and the session is left untouched.
 
 ## 6. Interchange JSON sessions
 
@@ -342,14 +389,16 @@ True
 
 Id-elided payloads (`Session::to_compact_cbor_elided` in Rust, CLI `--elide-ids`) and digest-named delta payloads (`delta_cbor_from`, CLI `--delta-base`) are covered in `CBOR.md`.
 
+**Explicit ids.** A loaded document keeps the ids it carried: the session pairs the document's elements with the rebuilt model's by ownership path (roots in document order, then relationship and element positions, trusted only between elements of the same metaclass) and overlays every id the derivation would have replaced — foreign producers' ids, or a toolkit payload loaded under different unit names — on the resolved model and on every emission. Elements that could not be paired keep derived ids and are counted in `warnings()`. Such a session's compact CBOR carries the `explicitIds` header flag, and the Rust `to_compact_cbor_elided` / `delta_cbor_elided_from` return `Err(SessionError::ExplicitIds)`: every given id would ride the exception map anyway, and the elided form cannot carry the flag (the Python binding does not expose the elided forms or `has_explicit_ids()`; the JS binding's `toCompactCborElided` reports the refusal as an error). References to elements the text cannot name — unnamed targets, or library elements when no library is loaded — bind by id on load instead of degrading to a spelling. After an edit, an element keeps its given id only while it still derives the key it was loaded under with the same metaclass; a renamed, moved or deleted element's entry retires, and elements created after the load derive from their parents' *given* ids, so under the flag no id in a payload is guaranteed graph-derivable.
+
 ## 8. Checking models
 
-`sysmlv2.check(sources, lib=None)` runs the `sysmlv2 check` pipeline as a library call: per-unit parse and body-context validation always, plus referential and semantic checks against the standard library when `lib` is given (loaded through the same sealed-snapshot cache as sessions). It returns `Finding`s — severity, message, unit name, and a 1-based line/column — and never raises for model problems, so a broken parse is data, not an exception:
+`sysmlv2.check(sources, lib=None)` exposes the checking stages as a library call: per-unit parse and body-context validation always, plus referential and semantic checks against the standard library when `lib` is given (loaded through the same native prepared-library cache as sessions). Unlike CLI `check`, this API currently runs model-level checks only when `lib` is supplied and does not include unused-private-import analysis. It returns `Finding`s — severity, stage (`parse`, `context`, `referential` or `semantic`; only `parse` findings keep a unit out of a session), message, unit name, and a 1-based line/column — and never raises for model problems, so a broken parse is data, not an exception:
 
 ```pycon
 >>> bad = sysmlv2.check([("bad.sysml", "package Bad {\n  part p : ;\n}")])
->>> (bad[0].severity, bad[0].unit, bad[0].line, bad[0].col)
-('error', 'bad.sysml', 2, 12)
+>>> (bad[0].severity, bad[0].stage, bad[0].unit, bad[0].line, bad[0].col)
+('error', 'parse', 'bad.sysml', 2, 12)
 >>> sysmlv2.check([("ok.sysml", "package Ok { part def A; part a : A; }")])
 []
 ```
@@ -440,17 +489,14 @@ n1 ->> n2 : ping
 usecase "Drive" as n1 <<use case def>>
 actor "driver : Driver" as n2
 n2 -- n1
-note as o1
-«objective»
-arrive 
-end note
+note "«objective»\narrive " as o1
 o1 .. n1
 @enduml
 ```
 
 Every view takes the same keyword options: comment/doc bodies attach as notes (`show_notes=False` omits), prefix metadata joins the stereotype list (`show_metadata=False` hides metadata), `show_inherited=True` adds `^`-marked inherited compartment lines, `show_lib=True` gives referenced library types marked nodes, `show_imported=True` draws `«import»` edges, `line_style="polyline"|"ortho"` picks edge routing, `std_color=True` colors nodes by metaclass family, and `link_template="vscode://file/{file}:{line}"` embeds `[[hyperlinks]]` (placeholders `{file}`/`{line}`/`{col}`/`{qname}`/`{id}`) that PlantUML carries into rendered SVG — diagram nodes click through to source.
 
-`element="V::A"` roots the diagram at one element (unknown names raise `ValueError`, as do an unknown `view` or `line_style`); sessions lifted from interchange JSON diagram the same way — fetch a Flexo element list, `from_interchange_json`, `to_plantuml`.
+`element="V::A"` roots the diagram at one element (unknown names raise `sysmlv2.RefusedError`, as do an unknown `view` or `line_style`); sessions lifted from interchange JSON diagram the same way — fetch a Flexo element list, `from_interchange_json`, `to_plantuml`.
 
 ---
 

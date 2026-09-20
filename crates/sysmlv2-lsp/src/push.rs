@@ -20,9 +20,14 @@
 use lsp_server::{Connection, ErrorCode, Message, Request, Response};
 use lsp_types::request::{Initialize, Request as _, Shutdown};
 use lsp_types::{InitializeParams, InitializeResult, ServerInfo};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::{Error, Server, capabilities, negotiate_encoding, worker};
+
+/// The server endpoint is held from construction until `initialize`
+/// builds the server around it, and `server` is `Some` from then on, so
+/// exactly one of the two is always available to answer on.
+const HELD_UNTIL_BUILT: &str = "the server endpoint is held until the server is built";
 
 /// A server driven by [`PushServer::handle`] calls instead of a
 /// blocking main loop.
@@ -33,7 +38,7 @@ pub struct PushServer {
     library: Option<sysmlv2_transform::Library>,
     /// In-memory workspace units, held when seeded before `initialize`
     /// (applied to the server's navigation at build time).
-    workspace: Option<Vec<(String, String)>>,
+    workspace: Option<std::sync::Arc<Vec<(String, String)>>>,
     /// Held until `initialize` arrives (the server is built from its
     /// params); `None` afterwards.
     server_conn: Option<Connection>,
@@ -70,6 +75,7 @@ impl Default for PushServer {
 }
 
 impl PushServer {
+    #[must_use]
     pub fn new() -> PushServer {
         Self::new_with(None)
     }
@@ -77,6 +83,7 @@ impl PushServer {
     /// A push server whose navigation and completions see an in-memory
     /// standard library (`(unit name, text)` units, optionally with a
     /// sealed resolution snapshot recorded against the same units).
+    #[must_use]
     pub fn with_library_sources(
         units: Vec<(String, String)>,
         snapshot: Option<Vec<u8>>,
@@ -141,6 +148,7 @@ impl PushServer {
     /// like any [`Self::handle`] output; without the drain they ride
     /// along with the next dispatch).
     pub fn set_workspace_sources(&mut self, units: Vec<(String, String)>) {
+        let units = std::sync::Arc::new(units);
         if let Some(server) = &mut self.server {
             server.nav.set_workspace_sources(units.clone());
             self.send_refreshes();
@@ -213,15 +221,11 @@ impl PushServer {
                         )))?;
                 }
                 Some(server) => server.handle_request(req)?,
-                None => {
-                    self.client_conn
-                        .sender
-                        .send(Message::Response(Response::new_err(
-                            req.id,
-                            ErrorCode::ServerNotInitialized as i32,
-                            "initialize first".to_string(),
-                        )))?;
-                }
+                None => self.reply(Response::new_err(
+                    req.id,
+                    ErrorCode::ServerNotInitialized as i32,
+                    "initialize first".to_string(),
+                ))?,
             },
             Message::Notification(n) => {
                 // `initialized` and `exit` need nothing here; the rest
@@ -239,19 +243,41 @@ impl PushServer {
         Ok(out)
     }
 
-    fn initialize(&mut self, req: Request) -> Result<(), Error> {
-        let Some(connection) = self.server_conn.take() else {
-            // Double initialize: protocol error.
-            self.client_conn
-                .sender
-                .send(Message::Response(Response::new_err(
-                    req.id,
-                    ErrorCode::InvalidRequest as i32,
-                    "already initialized".to_string(),
-                )))?;
-            return Ok(());
+    /// A response produced outside a built server's own dispatch, on
+    /// the server→client channel [`Self::handle`] drains — the channel
+    /// the built server answers on, or, before `initialize`, the one it
+    /// will be built around. (The client endpoint's sender feeds the
+    /// server's inbox, which nothing here reads.)
+    fn reply(&self, response: Response) -> Result<(), Error> {
+        let sender = match &self.server {
+            Some(server) => &server.connection.sender,
+            None => &self.server_conn.as_ref().expect(HELD_UNTIL_BUILT).sender,
         };
-        let init: InitializeParams = serde_json::from_value(req.params)?;
+        sender.send(Message::Response(response))?;
+        Ok(())
+    }
+
+    fn initialize(&mut self, req: Request) -> Result<(), Error> {
+        if self.server.is_some() {
+            // Double initialize: protocol error.
+            return self.reply(Response::new_err(
+                req.id,
+                ErrorCode::InvalidRequest as i32,
+                "already initialized".to_string(),
+            ));
+        }
+        let init: InitializeParams = match serde_json::from_value(req.params) {
+            Ok(init) => init,
+            Err(e) => {
+                // Malformed: answered, and still initializable.
+                return self.reply(Response::new_err(
+                    req.id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("initialize: invalid params: {e}"),
+                ));
+            }
+        };
+        let connection = self.server_conn.take().expect(HELD_UNTIL_BUILT);
         let encoding = negotiate_encoding(&init);
         let ws = init.capabilities.workspace.as_ref();
         self.inlay_refresh = ws
@@ -288,10 +314,11 @@ impl PushServer {
         self.server = Some(Server {
             connection,
             encoding,
-            docs: HashMap::new(),
+            docs: BTreeMap::new(),
             nav,
             worker: worker::Worker::disabled(),
             root: None,
+            reported: std::collections::HashSet::new(),
         });
         Ok(())
     }
@@ -301,7 +328,7 @@ impl PushServer {
 mod tests {
     use super::PushServer;
 
-    fn responses(server: &mut PushServer, msg: serde_json::Value) -> Vec<serde_json::Value> {
+    fn responses(server: &mut PushServer, msg: &serde_json::Value) -> Vec<serde_json::Value> {
         server
             .handle(&msg.to_string())
             .expect("handled")
@@ -318,7 +345,7 @@ mod tests {
         let mut s = PushServer::new();
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}}}}),
         );
         assert_eq!(out.len(), 1);
@@ -330,13 +357,13 @@ mod tests {
 
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+            &serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
         );
 
         // A document with a syntax-tier problem publishes diagnostics.
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///workspace/m.sysml", "languageId": "sysml",
                                  "version": 1, "text": "package P { part def X; part x : X; "}}}),
         );
@@ -348,7 +375,7 @@ mod tests {
 
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentSymbol",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentSymbol",
                 "params": {"textDocument": {"uri": "file:///workspace/m.sysml"}}}),
         );
         let symbols = out[0]["result"].as_array().expect("symbol tree");
@@ -357,9 +384,145 @@ mod tests {
 
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": null}),
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": null}),
         );
         assert_eq!(out[0]["result"], serde_json::Value::Null);
+    }
+
+    /// Malformed messages are answered (requests) or logged
+    /// (notifications) and never end the session — a bad `initialize`
+    /// included, which leaves the server initializable.
+    #[test]
+    fn malformed_messages_do_not_end_the_session() {
+        let mut s = PushServer::new();
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 0, "method": "textDocument/hover",
+                "params": {}}),
+        );
+        assert_eq!(out[0]["error"]["code"], -32002, "{out:?}");
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": 7}}),
+        );
+        assert_eq!(out[0]["error"]["code"], -32602, "{out:?}");
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                "params": {"capabilities": {}}}),
+        );
+        assert_eq!(out[0]["result"]["serverInfo"]["name"], "sysmlv2-lsp");
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                "params": {"capabilities": {}}}),
+        );
+        assert_eq!(out[0]["error"]["code"], -32600, "{out:?}");
+
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "version": "one"}}}),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0]["method"], "window/logMessage");
+        assert!(
+            out[0]["params"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("textDocument/didOpen: invalid params"),
+            "{out:?}"
+        );
+
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/documentSymbol",
+                "params": {"textDocument": {"uri": null}}}),
+        );
+        assert_eq!(out[0]["id"], 3);
+        assert_eq!(out[0]["error"]["code"], -32602, "{out:?}");
+
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                 "version": 1, "text": "package P { part def X; }"}}}),
+        );
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/documentSymbol",
+                "params": {"textDocument": {"uri": "file:///w/m.sysml"}}}),
+        );
+        assert_eq!(out[0]["result"][0]["name"], "P", "{out:?}");
+    }
+
+    /// A handler that panics answers the request with an internal
+    /// error, says so once, and leaves the session serving — the same
+    /// for a notification, which has no reply to carry the error. (The
+    /// panics these two messages provoke print to stderr as usual; the
+    /// point is that the session outlives them.)
+    #[test]
+    fn a_panicking_handler_does_not_end_the_session() {
+        let mut s = PushServer::new();
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {}}}),
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                 "version": 1, "text": "package P { part def X; }"}}}),
+        );
+
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": crate::PANIC_METHOD,
+                "params": null}),
+        );
+        let shown: Vec<&serde_json::Value> = out
+            .iter()
+            .filter(|m| m["method"] == "window/showMessage")
+            .collect();
+        assert_eq!(shown.len(), 1, "{out:?}");
+        assert!(
+            shown[0]["params"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::PANIC_REASON),
+            "{out:?}"
+        );
+        let answer = out.iter().find(|m| m["id"] == 2).expect("answered");
+        assert_eq!(answer["error"]["code"], -32603, "{out:?}");
+
+        // The same failure a second time is not announced again.
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": crate::PANIC_METHOD,
+                "params": null}),
+        );
+        assert!(
+            !out.iter().any(|m| m["method"] == "window/showMessage"),
+            "{out:?}"
+        );
+        assert_eq!(out[0]["error"]["code"], -32603, "{out:?}");
+
+        // A notification whose handling panics is dropped, not fatal.
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": crate::PANIC_METHOD, "params": null}),
+        );
+        assert!(out.is_empty(), "{out:?}");
+
+        // Still serving.
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/documentSymbol",
+                "params": {"textDocument": {"uri": "file:///w/m.sysml"}}}),
+        );
+        assert_eq!(out[0]["result"][0]["name"], "P", "{out:?}");
     }
 
     /// With in-memory library sources, completions offer the library's
@@ -375,18 +538,18 @@ mod tests {
         );
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": {}}}),
         );
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1, "text": "package P { part def X; }"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 0, "character": 12}}}),
         );
@@ -408,14 +571,14 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    private import OtherLib::*;\n    part w : \n}\n"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 2, "character": 13}}}),
         );
@@ -457,14 +620,14 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    attribute g = 9.8 [m/s];\n}\n"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 26}}}),
         );
@@ -501,14 +664,14 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    attribute gravity = 9.8 [m\n}\n"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 30}}}),
         );
@@ -533,14 +696,14 @@ mod tests {
         // becomes its own insertion behind it.
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "version": 2},
                 "contentChanges": [
                     {"text": "package P {\n    attribute gravity = 9.8 [m]\n}\n"}]}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 30}}}),
         );
@@ -565,14 +728,14 @@ mod tests {
         // Already terminated: nothing to repair.
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "version": 3},
                 "contentChanges": [
                     {"text": "package P {\n    attribute gravity = 9.8 [m];\n}\n"}]}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 30}}}),
         );
@@ -591,19 +754,19 @@ mod tests {
     /// before the auto-inserted `];`, where typing continues.
     #[test]
     fn snippet_client_gets_cursor_stop_before_repairs() {
-        let mut s = two_package_server_with_caps(serde_json::json!({
+        let mut s = two_package_server_with_caps(&serde_json::json!({
             "general": {"positionEncodings": ["utf-8"]},
             "textDocument": {"completion": {"completionItem": {"snippetSupport": true}}}}));
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    attribute gravity = 9.8 [m\n}\n"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 30}}}),
         );
@@ -618,14 +781,14 @@ mod tests {
         // An import-context accept carries its `;` the same way.
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "version": 2},
                 "contentChanges": [
                     {"text": "package P {\n    private import Widge\n}\n"}]}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 24}}}),
         );
@@ -640,14 +803,14 @@ mod tests {
         // No repairs → no snippet: the plain quoting edit stays plain.
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "version": 3},
                 "contentChanges": [
                     {"text": "package P {\n    attribute gravity = 9.8 [m];\n}\n"}]}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 30}}}),
         );
@@ -666,14 +829,14 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    attribute g = Widge.value\n}\n"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 1, "character": 23}}}),
         );
@@ -719,13 +882,13 @@ mod tests {
                     }\n";
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1, "text": text}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 12, "character": 38}}}),
         );
@@ -753,13 +916,13 @@ mod tests {
         );
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "version": 2},
                 "contentChanges": [{"text": two}]}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 12, "character": 46}}}),
         );
@@ -774,13 +937,13 @@ mod tests {
         let broken = text.replace("= oxidizerTank.", "= noSuchTank.");
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "version": 3},
                 "contentChanges": [{"text": broken}]}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 12, "character": 36}}}),
         );
@@ -798,7 +961,7 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    part w : Widget;\n}\n"}}}),
@@ -807,7 +970,7 @@ mod tests {
                                        "end": {"line": 1, "character": 19}});
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "range": range,
                            "context": {"diagnostics": [
@@ -829,7 +992,7 @@ mod tests {
         // Quoted reference: the diagnostic starts at the quote.
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "version": 2},
                 "contentChanges": [
                     {"text": "package P {\n    attribute g = 9.8 ['m/s²'];\n}\n"}]}}),
@@ -838,7 +1001,7 @@ mod tests {
                                        "end": {"line": 1, "character": 29}});
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/codeAction",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/codeAction",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "range": range,
                            "context": {"diagnostics": [
@@ -870,7 +1033,7 @@ mod tests {
         ]);
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    part e : Engine;\n}\n"}}}),
@@ -879,7 +1042,7 @@ mod tests {
                                        "end": {"line": 1, "character": 19}});
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "range": range,
                            "context": {"diagnostics": [
@@ -902,7 +1065,7 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    private import Widget;\n}\n"}}}),
@@ -911,7 +1074,7 @@ mod tests {
                                        "end": {"line": 1, "character": 25}});
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "range": range,
                            "context": {"diagnostics": [
@@ -927,11 +1090,11 @@ mod tests {
     }
 
     fn two_package_server() -> PushServer {
-        two_package_server_with_caps(serde_json::json!(
+        two_package_server_with_caps(&serde_json::json!(
             {"general": {"positionEncodings": ["utf-8"]}}))
     }
 
-    fn two_package_server_with_caps(capabilities: serde_json::Value) -> PushServer {
+    fn two_package_server_with_caps(capabilities: &serde_json::Value) -> PushServer {
         let mut s = PushServer::with_library_sources(
             vec![(
                 "MiniLib.kerml".to_string(),
@@ -944,7 +1107,7 @@ mod tests {
         );
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": capabilities}}),
         );
         s
@@ -968,13 +1131,13 @@ mod tests {
             let mut s = two_package_server();
             responses(
                 &mut s,
-                serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                     "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                      "version": 1, "text": text}}}),
             );
             let out = responses(
                 &mut s,
-                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+                &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                     "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                                "position": {"line": 0, "character": character}}}),
             );
@@ -1002,14 +1165,14 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P { private import Widg }"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 0, "character": 31}}}),
         );
@@ -1037,12 +1200,12 @@ mod tests {
         )]);
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}}}}),
         );
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/uses.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package Uses {\n    private import Defs::*;\n    part w : Wheel;\n}\n"}}}),
@@ -1050,7 +1213,7 @@ mod tests {
         let definition = |s: &mut PushServer, id: i32| -> serde_json::Value {
             let out = responses(
                 s,
-                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/definition",
+                &serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/definition",
                     "params": {"textDocument": {"uri": "file:///w/uses.sysml"},
                                "position": {"line": 2, "character": 14}}}),
             );
@@ -1082,19 +1245,19 @@ mod tests {
         );
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}}}}),
         );
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P {\n    private import MiniLib::*;\n    part w : Widget;\n}\n"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/definition",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/definition",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 2, "character": 14}}}),
         );
@@ -1115,14 +1278,14 @@ mod tests {
         let mut s = two_package_server();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
                 "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
                                  "version": 1,
                                  "text": "package P { private import Widg }"}}}),
         );
         let out = responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
                 "params": {"textDocument": {"uri": "file:///w/m.sysml"},
                            "position": {"line": 0, "character": 31}}}),
         );
@@ -1158,7 +1321,7 @@ mod tests {
         let mut s = PushServer::new();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": {"workspace": {
                     "inlayHint": {"refreshSupport": true},
                     "codeLens": {"refreshSupport": true}}}}}),
@@ -1175,7 +1338,7 @@ mod tests {
         let mut s = PushServer::new();
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": {}}}),
         );
         s.set_workspace_sources(seed());
@@ -1209,7 +1372,7 @@ mod tests {
         assert_eq!(outbound(&mut s), Vec::<String>::new());
         responses(
             &mut s,
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"capabilities": {"workspace": {
                     "inlayHint": {"refreshSupport": true}}}}}),
         );

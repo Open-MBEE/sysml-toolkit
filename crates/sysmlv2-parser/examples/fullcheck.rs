@@ -59,7 +59,7 @@ fn main() {
             any = true;
             let key = format!(
                 "{t} @ {}: {}",
-                err.instance_path,
+                err.instance_path(),
                 err.to_string().chars().take(90).collect::<String>()
             );
             *messages.entry(key).or_default() += 1;

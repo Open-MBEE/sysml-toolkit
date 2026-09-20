@@ -1,7 +1,7 @@
 //! Standard-library resolution cache: recording, replay, and the
 //! cold/warm equivalence gate.
 
-use sysmlv2_parser::json::model_to_compact_json;
+use sysmlv2_parser::json::{library_to_compact_json, model_to_compact_json};
 use sysmlv2_parser::libcache::{LibraryCache, TOOLKIT_BUILD, hash_library_dir};
 use sysmlv2_parser::model::Model;
 
@@ -49,6 +49,46 @@ fn cold_and_warm_builds_are_identical() {
     model.set_library_cache(cache);
     let warm = serde_json::to_string(&model_to_compact_json(&model)).unwrap();
     assert_eq!(cold, warm, "replayed build diverged from cold build");
+}
+
+/// A recorded miss that a user root import completes must resolve afresh
+/// under replay: outcomes carry the root names they missed, and replay
+/// skips exactly the entries a model's root additions reach.
+#[test]
+fn replay_re_resolves_outcomes_a_root_import_completes() {
+    let library = "package Other { part def X; } package L { part def A :> X; }";
+    let mut recorder = Model::new();
+    recorder.add_library_source("Lib.sysml", library);
+    recorder.record_library_cache();
+    let _ = model_to_compact_json(&recorder);
+    let cache = recorder.take_recorded_library_cache().unwrap();
+    let cache = LibraryCache::from_bytes(&cache.to_bytes()).expect("miss names round-trip");
+    for user in [
+        "private import Other::*; package U { part a : L::A; }",
+        "package U { part a : L::A; }",
+    ] {
+        let graphs = |cache: Option<LibraryCache>| {
+            let mut model = Model::new();
+            model.add_library_source("Lib.sysml", library);
+            model.add_source("t.sysml", user);
+            if let Some(cache) = cache {
+                model.set_library_cache(cache);
+            }
+            (
+                serde_json::to_string(&model_to_compact_json(&model)).unwrap(),
+                serde_json::to_string(&library_to_compact_json(&model)).unwrap(),
+            )
+        };
+        let cold = graphs(None);
+        let warm = graphs(Some(cache.clone()));
+        assert_eq!(cold, warm, "{user}");
+        let completed = user.starts_with("private import");
+        assert_eq!(
+            !warm.1.contains("\"@ref\":\"X\""),
+            completed,
+            "{user}: the library reference resolves only through the import"
+        );
+    }
 }
 
 /// A user reference that disambiguates through a *library-internal*
@@ -207,6 +247,31 @@ fn invalid_cache_files_are_rejected() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Both cache loaders refuse a file too large to be one of theirs before
+/// reading it, so a wrong or hostile file at the cache path costs a file
+/// size lookup rather than its length in memory. The snapshot loader is
+/// the sibling of the resolution-recording loader here: they share the
+/// limit and the capped read.
+#[test]
+fn oversized_cache_files_are_refused_without_reading_them() {
+    use sysmlv2_parser::prepared::PreparedLibrary;
+    let dir = std::env::temp_dir().join(format!("sysmlv2-libcache-huge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("huge.libcache");
+    // Sparse: the bytes are never allocated on disk either.
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(256 * 1024 * 1024 + 1).unwrap();
+    drop(file);
+    let started = std::time::Instant::now();
+    assert!(LibraryCache::load(&path).is_none());
+    assert!(PreparedLibrary::load(&path, 0).is_none());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the file must be refused by size, not read"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The header's build identity must be finer than the crate version: two
 /// working-tree states share a version, and a semantics change that
 /// leaves the pending queue unchanged slips past the sequence
@@ -230,7 +295,7 @@ fn header_carries_a_source_fingerprint_beyond_the_crate_version() {
 fn cache_from_another_toolkit_build_is_rejected() {
     fn sealed_empty_cache(build: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"SYSML5LC");
+        buf.extend_from_slice(b"SYSML6LC");
         buf.push(build.len() as u8);
         buf.extend_from_slice(build);
         buf.extend_from_slice(&0u64.to_le_bytes()); // pending fingerprint
@@ -284,4 +349,35 @@ fn library_hash_is_content_keyed() {
     let h2 = hash_library_dir(&dir).unwrap();
     assert_ne!(h1, h2);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn anonymous_redefinition_fanout_survives_library_replay() {
+    if !sysmlv2_testkit::library_dir().exists() {
+        return;
+    }
+    let source = "package Demo {
+        part def Item;
+        part def Container { ref part items : Item[*]; }
+        part a : Item;
+        part c : Container {
+            ref :>> items = a; ref :>> items = a; ref :>> items = a;
+        }
+    }";
+    let mut model = lib_model(source);
+    model.record_library_cache();
+    let cold = model_to_compact_json(&model);
+    let cache = model.take_recorded_library_cache().unwrap();
+    let rows = cold.as_array().unwrap();
+    let base = &rows.iter().find(|e| e["declaredName"] == "items").unwrap()["@id"];
+    let edges: Vec<_> = rows
+        .iter()
+        .filter(|e| e["@type"] == "Redefinition")
+        .collect();
+    assert_eq!(edges.len(), 3);
+    assert!(edges.iter().all(|e| &e["redefinedFeature"]["@id"] == base));
+    let mut model = lib_model(source);
+    model.set_library_cache(cache);
+    assert_eq!(model_to_compact_json(&model), cold);
+    assert!(sysmlv2_parser::check::validate_model(&model).is_empty());
 }

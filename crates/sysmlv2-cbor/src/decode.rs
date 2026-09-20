@@ -4,7 +4,6 @@
 //! ordinal keys re-expand to property names, reference indices
 //! re-expand to `{"@id": …}` objects, `@ref` text survives verbatim.
 
-use crate::Error;
 use crate::cbor::{Head, Reader};
 use crate::encode::{
     FLAG_ELIDE_IDS, FLAG_FULL_FORM, FLAG_IMPLIED_OWNERS, FLAG_UNIT_PATHS, OWNER_SLOTS,
@@ -13,6 +12,7 @@ use crate::encode::{
 use crate::tables::{
     CBOR_TABLES_VERSION, CborField, ENUM_TABLES, K_ENUM, K_LITERAL, K_REF, K_REF_LIST, K_STR_LIST,
 };
+use crate::{Error, ErrorKind};
 use serde_json::{Map, Number, Value, json};
 use uuid::Uuid;
 
@@ -36,7 +36,7 @@ impl Presence<'_> {
             Presence::Small(bits) => n_fields >= 64 || bits >> n_fields == 0,
             Presence::Big(bytes) => {
                 bytes.len() == n_fields.div_ceil(8)
-                    && (n_fields % 8 == 0 || bytes[n_fields / 8] >> (n_fields % 8) == 0)
+                    && (n_fields.is_multiple_of(8) || bytes[n_fields / 8] >> (n_fields % 8) == 0)
             }
         };
         if ok {
@@ -47,7 +47,7 @@ impl Presence<'_> {
     }
 }
 
-pub(crate) fn read_uuid_table(r: &mut Reader, n: usize) -> Result<Vec<String>, Error> {
+pub(crate) fn read_uuids(r: &mut Reader, n: usize) -> Result<Vec<Uuid>, Error> {
     // Each entry takes a 1-byte head + 16 UUID bytes.
     if n > r.remaining() / 17 {
         return Err(Error::new("UUID table longer than payload"));
@@ -55,24 +55,37 @@ pub(crate) fn read_uuid_table(r: &mut Reader, n: usize) -> Result<Vec<String>, E
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let b: [u8; 16] = r.bstr(16)?.try_into().unwrap();
-        out.push(Uuid::from_bytes(b).to_string());
+        out.push(Uuid::from_bytes(b));
     }
     Ok(out)
 }
 
+/// [`read_uuids`] spelled the way the reference tables want it.
+pub(crate) fn read_uuid_table(r: &mut Reader, n: usize) -> Result<Vec<String>, Error> {
+    Ok(read_uuids(r, n)?.iter().map(Uuid::to_string).collect())
+}
+
+/// The reference index space, in wire order: the payload's own ids,
+/// then (delta forms) the created ids, then the externals. The three
+/// stay separate tables so a delta never has to concatenate a copy of
+/// the base's id table to read one reference.
 pub(crate) struct Tables<'a> {
     pub(crate) ids: &'a [String],
+    pub(crate) created: &'a [String],
     pub(crate) exts: &'a [String],
 }
 
 impl Tables<'_> {
     pub(crate) fn reference(&self, index: u64) -> Result<Value, Error> {
-        let i = index as usize;
+        let out_of_range = || Error::new(format!("reference index {index} out of range"));
+        let i = usize::try_from(index).map_err(|_| out_of_range())?;
+        let locals = self.ids.len() + self.created.len();
         let id = self
             .ids
             .get(i)
-            .or_else(|| self.exts.get(i.wrapping_sub(self.ids.len())))
-            .ok_or_else(|| Error::new(format!("reference index {index} out of range")))?;
+            .or_else(|| self.created.get(i.wrapping_sub(self.ids.len())))
+            .or_else(|| self.exts.get(i.wrapping_sub(locals)))
+            .ok_or_else(out_of_range)?;
         Ok(json!({ "@id": id }))
     }
 }
@@ -120,8 +133,9 @@ pub(crate) fn read_value(r: &mut Reader, t: &Tables, field: &CborField) -> Resul
         }
         (K_ENUM, Head::Uint(i)) => {
             let table = ENUM_TABLES[etbl as usize];
-            let s = *table
-                .get(i as usize)
+            let s = *usize::try_from(i)
+                .ok()
+                .and_then(|i| table.get(i))
                 .ok_or_else(|| Error::new(format!("{prop}: enum index {i} out of range")))?;
             Value::String(s.to_owned())
         }
@@ -169,8 +183,9 @@ pub(crate) fn read_element_body(
     id: &str,
 ) -> Result<Value, Error> {
     let code = r.uint()?;
-    let (ty, fields) = tables
-        .get(code as usize)
+    let (ty, fields) = usize::try_from(code)
+        .ok()
+        .and_then(|c| tables.get(c))
         .ok_or_else(|| Error::new(format!("type code {code} out of range")))?;
     let presence = match r.head()? {
         Head::Uint(bits) => Presence::Small(bits),
@@ -185,17 +200,19 @@ pub(crate) fn read_element_body(
         Head::Map(n) => n,
         _ => return Err(Error::new("element fields are a map")),
     };
-    let mut prev: i32 = -1;
+    let mut prev: Option<u64> = None;
     for _ in 0..entries {
         let ord = r.uint()?;
-        if ord as i32 <= prev {
+        if prev.is_some_and(|p| ord <= p) {
             return Err(Error::new(format!("{ty}: field ordinals not ascending")));
         }
-        prev = ord as i32;
-        let field = fields
-            .get(ord as usize)
+        prev = Some(ord);
+        let at = usize::try_from(ord)
+            .ok()
+            .filter(|&at| at < fields.len())
             .ok_or_else(|| Error::new(format!("{ty}: field ordinal {ord} out of range")))?;
-        if presence.get(ord as usize) {
+        let field = &fields[at];
+        if presence.get(at) {
             return Err(Error::new(format!(
                 "{ty}.{}: both presence bit and value",
                 field.0
@@ -256,24 +273,60 @@ type Resolver<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// decode reads element records through the generated tables; the
 /// scheme axis is returned `(scheme, flags)` for the caller to gate
 /// only where id derivation is actually in play.
-pub(crate) fn parse_header(header: u64) -> Result<(u8, u8), Error> {
+/// The header word's four axes, unpacked: `layout u8 · tables u16 ·
+/// scheme u8 · flags u8`. Unpacking only — which axes gate is the
+/// caller's call (payload inspection reports them all and gates only
+/// the layout).
+// Each cast takes one whole field of the word, whose width the range
+// check pins — the narrowing is the unpacking.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn header_axes(header: u64) -> Result<(u8, u16, u8, u8), Error> {
     if header >> 40 != 0 {
         return Err(Error::new("unrecognized header word"));
     }
-    let layout = (header >> 32) as u8;
-    let tables = (header >> 16) as u16;
-    let scheme = (header >> 8) as u8;
-    let flags = header as u8;
+    Ok((
+        (header >> 32) as u8,
+        (header >> 16) as u16,
+        (header >> 8) as u8,
+        header as u8,
+    ))
+}
+
+/// Refuse a flag this reader does not implement: the payload comes
+/// from a newer writer and must not be read as though it did not set
+/// one.
+pub(crate) fn gate_flags(flags: u8, known: u8) -> Result<(), Error> {
+    if flags & !known != 0 {
+        return Err(Error::new(format!("unknown header flags {flags:#x}")));
+    }
+    Ok(())
+}
+
+/// The units section: element index in the payload's own order → that
+/// unit's source path, ascending.
+pub(crate) fn read_units(r: &mut Reader) -> Result<Vec<(usize, String)>, Error> {
+    r.ascending_map("unit-path map", 2, |r| match r.head()? {
+        Head::Tstr(n) => Ok(r.tstr_body(n)?.to_owned()),
+        _ => Err(Error::new("unit path is a text string")),
+    })
+}
+
+pub(crate) fn parse_header(header: u64) -> Result<(u8, u8), Error> {
+    let (layout, tables, scheme, flags) = header_axes(header)?;
     if layout != crate::LAYOUT_VERSION {
-        return Err(Error::new(format!(
-            "layout version {layout} unsupported (decoder carries {})",
-            crate::LAYOUT_VERSION
-        )));
+        return Err(Error::of(
+            ErrorKind::UnsupportedVersion,
+            format!(
+                "layout version {layout} unsupported (decoder carries {})",
+                crate::LAYOUT_VERSION
+            ),
+        ));
     }
     if tables != CBOR_TABLES_VERSION {
-        return Err(Error::new(format!(
-            "table version {tables} unsupported (decoder carries {CBOR_TABLES_VERSION})"
-        )));
+        return Err(Error::of(
+            ErrorKind::UnsupportedVersion,
+            format!("table version {tables} unsupported (decoder carries {CBOR_TABLES_VERSION})"),
+        ));
     }
     Ok((scheme, flags))
 }
@@ -290,13 +343,19 @@ fn decode(
     let arity = r.array()?;
     let (scheme, flags) = parse_header(r.uint()?)?;
     if flags & crate::delta::FLAG_DELTA != 0 {
-        return Err(Error::new(
+        return Err(Error::of(
+            ErrorKind::WrongForm,
             "delta payload; apply with apply_delta_cbor against its base",
         ));
     }
-    if flags & !(FLAG_ELIDE_IDS | FLAG_FULL_FORM | FLAG_UNIT_PATHS | FLAG_IMPLIED_OWNERS) != 0 {
-        return Err(Error::new(format!("unknown header flags {flags:#x}")));
-    }
+    gate_flags(
+        flags,
+        FLAG_ELIDE_IDS
+            | FLAG_FULL_FORM
+            | FLAG_UNIT_PATHS
+            | FLAG_IMPLIED_OWNERS
+            | crate::encode::FLAG_EXPLICIT_IDS,
+    )?;
     let with_units = flags & FLAG_UNIT_PATHS != 0;
     let implied = flags & FLAG_IMPLIED_OWNERS != 0;
     let expect_arity = 4 + usize::from(implied) + usize::from(with_units);
@@ -313,20 +372,27 @@ fn decode(
     // The derivation-scheme axis gates only payloads that actually
     // derive ids; explicit-id payloads decode regardless of it.
     if elided && scheme != crate::ID_SCHEME_VERSION {
-        return Err(Error::new(format!(
-            "id-derivation scheme {scheme} unsupported (decoder carries {}); \
-             the payload's ids cannot be recovered here",
-            crate::ID_SCHEME_VERSION
-        )));
+        return Err(Error::of(
+            ErrorKind::UnsupportedVersion,
+            format!(
+                "id-derivation scheme {scheme} unsupported (decoder carries {}); \
+                 the payload's ids cannot be recovered here",
+                crate::ID_SCHEME_VERSION
+            ),
+        ));
     }
     match expect_full {
         Some(false) if full => {
-            return Err(Error::new(
+            return Err(Error::of(
+                ErrorKind::WrongForm,
                 "full-form payload; decode with from_full_cbor (compact is the ingest form)",
             ));
         }
         Some(true) if !full => {
-            return Err(Error::new("compact payload; decode with from_compact_cbor"));
+            return Err(Error::of(
+                ErrorKind::WrongForm,
+                "compact payload; decode with from_compact_cbor",
+            ));
         }
         _ => {}
     }
@@ -335,7 +401,8 @@ fn decode(
     }
     let resolver = if elided {
         Some(resolver.ok_or_else(|| {
-            Error::new(
+            Error::of(
+                ErrorKind::NeedsResolver,
                 "id-elided payload; decode with from_compact_cbor_elided (or from_cbor_with) \
                  and, for library-typed models, the library name resolver",
             )
@@ -348,30 +415,17 @@ fn decode(
     let exts = read_uuid_table(&mut r, n_ext)?;
 
     // Id section: the id table, or (elided) the exception map + digest.
-    let mut exceptions: Vec<(u64, Uuid)> = Vec::new();
+    let mut exceptions: Vec<(usize, Uuid)> = Vec::new();
     let mut digest: Option<Uuid> = None;
     let mut ids: Vec<String> = Vec::new();
     if elided {
         if r.array()? != 2 {
             return Err(Error::new("elided id section is array(2)"));
         }
-        let m = match r.head()? {
-            Head::Map(m) => m,
-            _ => return Err(Error::new("exception map expected")),
-        };
-        if m > r.remaining() / 18 {
-            return Err(Error::new("exception map longer than payload"));
-        }
-        let mut prev: i64 = -1;
-        for _ in 0..m {
-            let k = r.uint()?;
-            if k as i64 <= prev {
-                return Err(Error::new("exception indices not ascending"));
-            }
-            prev = k as i64;
+        exceptions = r.ascending_map("exception map", 18, |r| {
             let b: [u8; 16] = r.bstr(16)?.try_into().unwrap();
-            exceptions.push((k, Uuid::from_bytes(b)));
-        }
+            Ok(Uuid::from_bytes(b))
+        })?;
         let d: [u8; 16] = r.bstr(16)?.try_into().unwrap();
         digest = Some(Uuid::from_bytes(d));
     } else {
@@ -385,7 +439,7 @@ fn decode(
             return Err(Error::new("element count longer than payload"));
         }
         ids = (0..n).map(placeholder).collect();
-        if exceptions.last().is_some_and(|&(k, _)| k as usize >= n) {
+        if exceptions.last().is_some_and(|&(k, _)| k >= n) {
             return Err(Error::new("exception index out of range"));
         }
     } else if ids.len() != n {
@@ -393,6 +447,7 @@ fn decode(
     }
     let tables = Tables {
         ids: &ids,
+        created: &[],
         exts: &exts,
     };
     let mut out = Vec::with_capacity(n);
@@ -405,51 +460,24 @@ fn decode(
     let mut owner_exceptions: std::collections::HashMap<usize, u64> =
         std::collections::HashMap::new();
     if implied {
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 2 => m,
-            Head::Map(_) => return Err(Error::new("owner-exception map longer than payload")),
-            _ => return Err(Error::new("owner-exception map expected")),
-        };
-        let mut prev: i64 = -1;
-        for _ in 0..m {
-            let k = r.uint()?;
-            if k as i64 <= prev {
-                return Err(Error::new("owner-exception indices not ascending"));
-            }
-            if k as usize >= n {
-                return Err(Error::new("owner-exception index out of range"));
-            }
-            prev = k as i64;
-            let bits = r.uint()?;
-            if bits == 0 || bits > 3 {
-                return Err(Error::new("owner-exception bits out of range"));
-            }
-            owner_exceptions.insert(k as usize, bits);
+        let entries = r.ascending_map("owner-exception map", 2, |r| match r.uint()? {
+            bits @ 1..=3 => Ok(bits),
+            _ => Err(Error::new("owner-exception bits out of range")),
+        })?;
+        if entries.last().is_some_and(|&(k, _)| k >= n) {
+            return Err(Error::new("owner-exception index out of range"));
         }
+        owner_exceptions = entries.into_iter().collect();
     }
     // Unit structure: element index of each unit's root namespace →
     // that unit's source path.
     let mut units: Vec<(u64, String)> = Vec::new();
     if with_units {
-        let m = match r.head()? {
-            Head::Map(m) => m,
-            _ => return Err(Error::new("unit-path map expected")),
-        };
-        if m > r.remaining() / 2 {
-            return Err(Error::new("unit-path map longer than payload"));
+        let entries = read_units(&mut r)?;
+        if entries.last().is_some_and(|&(k, _)| k >= n) {
+            return Err(Error::new("unit root index out of range"));
         }
-        let mut prev: i64 = -1;
-        for _ in 0..m {
-            let k = r.uint()?;
-            if k as i64 <= prev {
-                return Err(Error::new("unit root indices not ascending"));
-            }
-            if k as usize >= n {
-                return Err(Error::new("unit root index out of range"));
-            }
-            prev = k as i64;
-            units.push((k, read_string(&mut r)?));
-        }
+        units = entries.into_iter().map(|(k, p)| (k as u64, p)).collect();
     }
     if !r.done() {
         return Err(Error::new("trailing bytes after payload"));
@@ -495,10 +523,7 @@ fn decode(
         // means library skew (the effective-name chains resolved
         // against a different library), derivation drift across codec
         // versions, or exception-map corruption. Never continue.
-        let exceptions: std::collections::HashMap<usize, Uuid> = exceptions
-            .into_iter()
-            .map(|(k, u)| (k as usize, u))
-            .collect();
+        let exceptions: std::collections::HashMap<usize, Uuid> = exceptions.into_iter().collect();
         let finals = sysmlv2_model::ids::assign_ids(&value, &exceptions, external_name)
             .map_err(Error::new)?;
         let expect = digest.unwrap();

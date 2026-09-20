@@ -6,7 +6,7 @@
 
 use sysmlv2_wasm::{
     Session, canonical_name_js, canonicalize_compact, check, graph_normalize_compact,
-    state_digest_of, version,
+    spell_reference_js, state_digest_of, version,
 };
 
 fn sources(pairs: &[(&str, &str)]) -> String {
@@ -17,6 +17,11 @@ fn sources(pairs: &[(&str, &str)]) -> String {
             .collect::<Vec<_>>(),
     )
     .unwrap()
+}
+
+/// A byte offset reported as a JSON number, as an index.
+fn offset(v: &serde_json::Value) -> usize {
+    usize::try_from(v.as_u64().expect("offset is a number")).expect("offset indexes this host")
 }
 
 const FLASHLIGHT: &str = "package Flashlight {\n    part def Body;\n    part def Battery {\n        attribute voltage = 3;\n    }\n    part flashlight {\n        part body : Body;\n        part battery : Battery;\n    }\n}\n";
@@ -281,6 +286,50 @@ fn check_findings_shape() {
     );
 }
 
+/// A user root package named like a standard-library root: `check`
+/// reports the collision at the user declaration, and `resolve` keeps
+/// landing on the library package (the behavior the warning describes).
+#[test]
+fn check_reports_user_roots_shadowing_library_roots() {
+    let lib = sources(&[(
+        "MiniLib.sysml",
+        "standard library package Requirements { requirement def Base; }",
+    )]);
+    let user = sources(&[(
+        "shadow.sysml",
+        "package Requirements {\n    requirement def Speed;\n}\n",
+    )]);
+    let findings = check(&user, Some(lib.clone()), None).unwrap();
+    let findings: serde_json::Value = serde_json::from_str(&findings).unwrap();
+    assert_eq!(
+        findings,
+        serde_json::json!([{
+            "severity": "warning",
+            "stage": "referential",
+            "message": "root package `Requirements` shadows the standard library package \
+                        `Requirements`; references resolve to the library",
+            "unit": "shadow.sysml",
+            "line": 1,
+            "col": 9,
+            "endLine": 1,
+            "endCol": 9 + "Requirements".len(),
+        }])
+    );
+    // Without a library there is nothing to shadow.
+    let alone = check(&user, None, None).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&alone).unwrap(),
+        serde_json::json!([])
+    );
+
+    let mut s = Session::from_sources(&user).unwrap();
+    s.load_library_sources(&lib, None).unwrap();
+    let pkg = s.resolve("Requirements").expect("the root name resolves");
+    assert_eq!(s.metaclass(&pkg).unwrap(), "LibraryPackage");
+    assert!(s.is_library_element(&pkg).unwrap());
+    assert!(s.resolve("Requirements::Speed").is_none());
+}
+
 #[test]
 fn version_matches_crate() {
     assert_eq!(version(), env!("CARGO_PKG_VERSION"));
@@ -447,9 +496,9 @@ fn edit_batch_renames_and_reports_splices() {
     let mut cursor = 0usize;
     for sp in splices {
         assert_eq!(sp["unit"].as_str().unwrap(), "flashlight.sysml");
-        replayed.push_str(&FLASHLIGHT[cursor..sp["start"].as_u64().unwrap() as usize]);
+        replayed.push_str(&FLASHLIGHT[cursor..offset(&sp["start"])]);
         replayed.push_str(sp["text"].as_str().unwrap());
-        cursor = sp["end"].as_u64().unwrap() as usize;
+        cursor = offset(&sp["end"]);
     }
     replayed.push_str(&FLASHLIGHT[cursor..]);
     let post = s.source(0).unwrap();
@@ -688,10 +737,9 @@ fn value_source_reports_the_bound_expression() {
     // the declared name.
     let site: serde_json::Value =
         serde_json::from_str(&s.declaration_site(&v).unwrap().expect("v has a site")).unwrap();
-    let unit = site["unit"].as_u64().unwrap() as usize;
+    let unit = offset(&site["unit"]);
     let src = s.source(unit).unwrap();
-    let text =
-        &src[site["start"].as_u64().unwrap() as usize..site["end"].as_u64().unwrap() as usize];
+    let text = &src[offset(&site["start"])..offset(&site["end"])];
     assert_eq!(text, "v");
 }
 
@@ -804,9 +852,8 @@ fn lint_reports_configurable_findings_with_positions_and_fixes() {
     let fix = &unused["fix"];
     assert_eq!(fix["deletes"], true);
     let edit = &fix["edits"].as_array().unwrap()[0];
-    let unit = edit["unit"].as_u64().unwrap() as usize;
-    let cut = &s.source(unit).unwrap()
-        [edit["start"].as_u64().unwrap() as usize..edit["end"].as_u64().unwrap() as usize];
+    let unit = offset(&edit["unit"]);
+    let cut = &s.source(unit).unwrap()[offset(&edit["start"])..offset(&edit["end"])];
     assert_eq!(cut, "in radius : Real;");
     assert_eq!(report["summary"]["warnings"], 2);
     assert_eq!(report["summary"]["errors"], 0);
@@ -1005,10 +1052,11 @@ fn codec_tables_expose_the_wire_vocabulary() {
 fn foreign_payload_base_digests_and_applies_raw() {
     use sysmlv2_wasm::{delta_cbor_between, describe_cbor, state_digest_of};
     // A payload produced elsewhere: a session under its own unit name,
-    // exported to compact JSON. The receiving session decodes it and
-    // must recognize it as a strict delta's base by its *content* —
-    // lifting it into a session re-derives ids, so only the raw digest
-    // can match.
+    // exported to compact JSON. The receiving session loads it keeping
+    // the document's ids (explicit ids), so the loaded session *is* the
+    // file's identity: its state digest equals the raw digest, and a
+    // strict delta recorded against the file applies to the session as
+    // well as to the caller-held base document.
     let producer = Session::from_sources(&sources(&[("v1.sysml", FLASHLIGHT)])).unwrap();
     let base_json = producer.to_compact_json();
     let target = Session::from_sources(&sources(&[(
@@ -1028,23 +1076,21 @@ fn foreign_payload_base_digests_and_applies_raw() {
     let d: serde_json::Value = serde_json::from_str(&describe_cbor(&delta).unwrap()).unwrap();
     let base_digest = d["delta"]["baseDigest"].as_str().unwrap();
 
-    // Raw digest of the payload document = the delta's base digest;
-    // the session lift digests differently (ids re-derive).
+    // Raw digest of the payload document = the delta's base digest = the
+    // loaded session's digest.
     assert_eq!(state_digest_of(&base_json).unwrap(), base_digest);
     let receiver = Session::from_interchange_json(&base_json, None, None, None).unwrap();
-    assert_ne!(
+    assert_eq!(
         receiver.state_digest(),
         base_digest,
-        "session lift is not the file's identity"
+        "a loaded payload keeps its ids, so the session is the file's identity"
     );
 
-    // Strict apply: refused against the receiver's lifted model, clean
-    // against the caller-held base document.
-    let against_session = receiver.apply_delta_cbor(&delta, false);
-    assert!(
-        against_session.is_err(),
-        "lifted base diverges, strict apply refuses"
-    );
+    // Strict apply: clean against the receiver's loaded model and
+    // against the caller-held base document alike.
+    let against_session: serde_json::Value =
+        serde_json::from_str(&receiver.apply_delta_cbor(&delta, false).unwrap()).unwrap();
+    assert_eq!(against_session["report"]["baseMatched"], true);
     let applied: serde_json::Value = serde_json::from_str(
         &receiver
             .apply_delta_cbor_to(&delta, &base_json, false)
@@ -1648,4 +1694,621 @@ fn render_view_accepts_plain_dom_parts_without_a_template_root() {
             .unwrap(),
         "<article><h2>Overview</h2><p class=\"lead\">A rendered view.</p></article>"
     );
+}
+
+#[test]
+fn anonymous_graph_elements_are_reachable_by_id() {
+    let source = "package P { action a; action b; succession first a then b; constraint { true } }";
+    let mut s = Session::from_sources(&sources(&[("anonymous.sysml", source)])).unwrap();
+    let graph: serde_json::Value =
+        serde_json::from_str(&s.to_graph(Some(r#"{"view":"tree"}"#.into())).unwrap()).unwrap();
+    for kind in ["ConstraintUsage", "SuccessionAsUsage"] {
+        let node = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["metaclass"] == kind)
+            .unwrap();
+        let id = node["id"].as_str().unwrap();
+        assert!(node.get("qname").is_none_or(serde_json::Value::is_null));
+        assert!(s.resolve(&format!("@{id}")).is_none());
+        let e = s.element_by_id(id).expect("graph ID resolves");
+        assert_eq!(s.metaclass(&e).unwrap(), kind);
+        assert_eq!(s.element_id(&e).unwrap(), id);
+        assert_eq!(s.qualified_name(&e).unwrap(), None);
+        assert!(s.declaration_site(&e).unwrap().is_some());
+        assert!(s.member_source(&format!("@{id}")).is_ok());
+    }
+    assert_eq!(s.source(0).unwrap(), source);
+    for id in [
+        "",
+        "not-an-id",
+        "P::a",
+        "00000000-0000-0000-0000-000000000000",
+    ] {
+        assert!(s.element_by_id(id).is_none());
+    }
+    let a = s.resolve("P::a").unwrap();
+    let id = s.element_id(&a).unwrap();
+    let a_by_id = s.element_by_id(&id).unwrap();
+    s.edit(r#"[{"op":"rename","target":"P::a","newName":"renamed"}]"#)
+        .unwrap();
+    assert!(s.metaclass(&a_by_id).is_err());
+    assert!(s.element_by_id(&id).is_none());
+    let renamed = s.resolve("P::renamed").unwrap();
+    let new_id = s.element_id(&renamed).unwrap();
+    assert!(s.element_by_id(&new_id).is_some());
+}
+
+#[test]
+fn id_lookup_preserves_library_read_only_and_handle_generation() {
+    let mut s = Session::from_sources(&sources(&[("main.sysml", "package P;")])).unwrap();
+    let p = s.resolve("P").unwrap();
+    let id = s.element_id(&p).unwrap();
+    let old = s.element_by_id(&id).unwrap();
+    s.load_library_sources(
+        &sources(&[(
+            "mini.kerml",
+            "standard library package Mini { class Thing; }",
+        )]),
+        None,
+    )
+    .unwrap();
+    assert!(s.metaclass(&old).is_err());
+    assert!(s.element_by_id(&id).is_some());
+    let lib = s.resolve("Mini::Thing").unwrap();
+    let lib_id = s.element_id(&lib).unwrap();
+    let found = s.element_by_id(&lib_id).unwrap();
+    assert!(s.is_library_element(&found).unwrap());
+    let before = s.units();
+    let error = s
+        .edit(&serde_json::json!([{"op":"remove","target":format!("@{lib_id}")}]).to_string())
+        .unwrap_err();
+    assert!(error.contains("read-only"), "{error}");
+    assert_eq!(s.units(), before);
+}
+
+/// A stand-in for the standard `Views` library package, loaded as a
+/// library so that `asElementTable` is a library element — referenced
+/// by spelling, never by id, exactly as the shipped library is.
+const VIEWS_LIBRARY: &str = "standard library package Views {\n    rendering def Rendering;\n    rendering def TabularRendering :> Rendering;\n    rendering asElementTable : TabularRendering;\n}\n";
+
+/// A matrix-view fixture over [`VIEWS_LIBRARY`]: the generated support
+/// package, a model, and two views — one per tabular rendering — plus
+/// a non-view.
+fn matrix_view_session() -> Session {
+    let mut s = Session::from_sources(&matrix_view_sources()).unwrap();
+    s.load_library_sources(&sources(&[("Views.sysml", VIEWS_LIBRARY)]), None)
+        .unwrap();
+    s
+}
+
+fn matrix_view_sources() -> String {
+    sources(&[
+        (
+            "matrix.sysml",
+            "package MatrixViews {\n    import Views::*;\n    metadata def MatrixConfig {\n        attribute attributes[0..*];\n        attribute relationship[0..1];\n    }\n    rendering def RelationshipMatrix :> TabularRendering;\n    rendering asRelationshipMatrix : RelationshipMatrix;\n}\n",
+        ),
+        (
+            "m.sysml",
+            "package M {\n    part def A;\n    part def B;\n    part a : A;\n    part b : B;\n    part c {\n        part d;\n    }\n}\n",
+        ),
+        (
+            "s.sysml",
+            "package S {\n    import Views::*;\n    import MatrixViews::*;\n    view 'Part allocations' {\n        @MatrixConfig { relationship = \"allocation\"; }\n        expose M::a;\n        expose M::b;\n        view columns {\n            expose M::c::**;\n        }\n        render asRelationshipMatrix;\n    }\n    view masses {\n        @MatrixConfig { attributes = (\"mass\", \"voltage\"); }\n        expose M::*;\n        render asElementTable;\n    }\n    view nobody;\n    part notAView;\n}\n",
+        ),
+    ])
+}
+
+fn exposed_names(info: &serde_json::Value) -> Vec<&str> {
+    info["exposed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["qualifiedName"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn view_info_reports_exposure_rendering_and_metadata() {
+    let mut s = matrix_view_session();
+    let before = s.to_compact_json();
+    let info: serde_json::Value =
+        serde_json::from_str(&s.view_info("S::'Part allocations'").unwrap()).unwrap();
+    assert_eq!(info["qualifiedName"], "S::'Part allocations'");
+    assert_eq!(info["rendering"], "asRelationshipMatrix");
+    assert_eq!(exposed_names(&info), ["M::a", "M::b"]);
+    assert_eq!(info["exposed"][0]["metaclass"], "PartUsage");
+    assert!(info["exposed"][0]["id"].as_str().unwrap().len() == 36);
+    assert_eq!(info["views"][0]["name"], "columns");
+    assert_eq!(
+        info["views"][0]["qualifiedName"],
+        "S::'Part allocations'::columns"
+    );
+    assert_eq!(info["metadata"][0]["type"], "MatrixViews::MatrixConfig");
+    assert_eq!(info["metadata"][0]["values"]["relationship"], "allocation");
+    // The recursive expose names its target and everything under it.
+    let columns: serde_json::Value =
+        serde_json::from_str(&s.view_info("S::'Part allocations'::columns").unwrap()).unwrap();
+    assert_eq!(exposed_names(&columns), ["M::c", "M::c::d"]);
+    assert_eq!(columns["rendering"], serde_json::Value::Null);
+    assert!(columns["views"].as_array().unwrap().is_empty());
+    let masses: serde_json::Value =
+        serde_json::from_str(&s.view_info("S::masses").unwrap()).unwrap();
+    // The standard rendering is a library element: found by its spelling.
+    assert_eq!(masses["rendering"], "asElementTable");
+    // The reported name is the model's canonical spelling, whatever the
+    // caller quoted.
+    assert_eq!(masses["qualifiedName"], "S::masses");
+    let quoted: serde_json::Value =
+        serde_json::from_str(&s.view_info("S::'masses'").unwrap()).unwrap();
+    assert_eq!(quoted["qualifiedName"], "S::masses");
+    assert_eq!(quoted["id"], masses["id"]);
+    assert_eq!(
+        masses["metadata"][0]["values"]["attributes"],
+        serde_json::json!(["mass", "voltage"])
+    );
+    assert_eq!(
+        exposed_names(&masses),
+        ["M::A", "M::B", "M::a", "M::b", "M::c"]
+    );
+    assert!(s.view_info("S::notAView").is_err());
+    assert!(s.view_info("S::missing").is_err());
+    assert_eq!(s.to_compact_json(), before, "reading a view writes nothing");
+}
+
+#[test]
+fn view_directed_diagrams_show_the_exposure() {
+    let mut s = matrix_view_session();
+    let graph: serde_json::Value = serde_json::from_str(
+        &s.to_graph(Some(
+            r#"{"view": "tree", "element": "S::'Part allocations'"}"#.into(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["qname"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"M::a") && names.contains(&"M::b"),
+        "{names:?}"
+    );
+    assert!(!names.iter().any(|n| n.starts_with("S::")), "{names:?}");
+    assert!(!names.contains(&"M::c"), "{names:?}");
+    // A non-view element still scopes the diagram to its own subtree.
+    let graph: serde_json::Value = serde_json::from_str(
+        &s.to_graph(Some(r#"{"view": "tree", "element": "M::c"}"#.into()))
+            .unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["qname"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"M::c") && names.contains(&"M::c::d"),
+        "{names:?}"
+    );
+    let uml = s
+        .to_plantuml(Some(r#"{"element": "S::'Part allocations'"}"#.into()))
+        .unwrap();
+    assert!(uml.starts_with("@startuml"));
+    assert!(!uml.contains("Part allocations"), "{uml}");
+    // A view exposing nothing draws nothing — never the whole model.
+    let graph: serde_json::Value = serde_json::from_str(
+        &s.to_graph(Some(r#"{"view": "tree", "element": "S::nobody"}"#.into()))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(graph["nodes"].as_array().unwrap().is_empty(), "{graph}");
+    let uml = s
+        .to_plantuml(Some(r#"{"element": "S::nobody"}"#.into()))
+        .unwrap();
+    assert!(!uml.contains("M::a") && !uml.contains("\"a\""), "{uml}");
+}
+
+/// A reserved word used as a name: `qualifiedName` keeps the
+/// specification's bare spelling, `referenceSpelling` and
+/// `spellReference` quote it, and only the quoted form parses when a
+/// host splices it into an `expose`.
+#[test]
+fn reference_spelling_re_parses_in_an_expose() {
+    const MODEL: &str =
+        "package 'part' {\n    part def 'action';\n    part 'view' : 'action';\n}\n";
+    let mut s = Session::from_sources(&sources(&[("m.sysml", MODEL)])).unwrap();
+    let view = s.resolve("'part'::'view'").expect("quoted lookup");
+    assert_eq!(
+        s.qualified_name(&view).unwrap().as_deref(),
+        Some("part::view")
+    );
+    assert_eq!(
+        s.reference_spelling(&view).unwrap().as_deref(),
+        Some("'part'::'view'")
+    );
+    assert_eq!(
+        spell_reference_js("part::view", None).unwrap(),
+        "'part'::'view'"
+    );
+    // The dialect selects the reserved set: neither word is KerML's.
+    assert_eq!(
+        spell_reference_js("part::view", Some("kerml".into())).unwrap(),
+        "part::view"
+    );
+    assert_eq!(
+        spell_reference_js("'My Views'::x", None).unwrap(),
+        "'My Views'::x"
+    );
+    assert!(
+        spell_reference_js("x", Some("cobol".into()))
+            .unwrap_err()
+            .contains("dialect")
+    );
+    let expose = |target: &str| -> serde_json::Value {
+        let views =
+            format!("package Views {{\n    view v {{\n        expose {target};\n    }}\n}}\n");
+        let out = check(
+            &sources(&[("m.sysml", MODEL), ("v.sysml", &views)]),
+            None,
+            None,
+        )
+        .unwrap();
+        serde_json::from_str(&out).unwrap()
+    };
+    assert_eq!(expose("'part'::'view'"), serde_json::json!([]));
+    let bare = expose("part::view");
+    assert_eq!(bare[0]["severity"], "error", "{bare}");
+    assert_eq!(
+        bare[0]["stage"], "parse",
+        "the bare form fails to parse: {bare}"
+    );
+}
+
+#[test]
+fn derived_properties_by_specification_name() {
+    let mut s = Session::from_sources(&sources(&[("flashlight.sysml", FLASHLIGHT)])).unwrap();
+    let flashlight = s.resolve("Flashlight::flashlight").unwrap();
+    // A composition: element handles, and `{"@id"}` references as JSON.
+    let features = s.derived_elements(&flashlight, "ownedFeature").unwrap();
+    assert_eq!(features.len(), 2);
+    let json: serde_json::Value =
+        serde_json::from_str(&s.derived(&flashlight, "ownedFeature").unwrap()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 2);
+    assert_eq!(
+        json[0]["@id"].as_str(),
+        Some(s.element_id(&features[0]).unwrap().as_str())
+    );
+    // A string and a null.
+    assert_eq!(s.derived(&flashlight, "name").unwrap(), "\"flashlight\"");
+    assert_eq!(s.derived(&flashlight, "shortName").unwrap(), "null");
+    assert!(s.derived_elements(&flashlight, "name").unwrap().is_empty());
+    // A reference-typed property: the typing's target as a handle and as JSON.
+    let battery = s.resolve("Flashlight::flashlight::battery").unwrap();
+    let types = s.derived_elements(&battery, "type").unwrap();
+    assert_eq!(types.len(), 1);
+    assert_eq!(
+        s.qualified_name(&types[0]).unwrap().as_deref(),
+        Some("Flashlight::Battery")
+    );
+    // Fidelity and the owned side, without a model.
+    assert_eq!(Session::derives("PartUsage", "ownedFeature"), "exact");
+    assert_eq!(Session::derives("PartUsage", "feature"), "passthrough");
+    assert_eq!(Session::derives("PartUsage", "mayTimeVary"), "not-computed");
+    assert_eq!(
+        Session::derives("PartUsage", "declaredName"),
+        "not-declared"
+    );
+    assert!(Session::is_owned_property("PartUsage", "declaredName"));
+    assert!(
+        Session::computed_names()
+            .iter()
+            .any(|n| n == "owningNamespace")
+    );
+    // A name the metaclass does not derive throws.
+    assert!(s.derived(&flashlight, "declaredName").is_err());
+    // A name the toolkit does not compute yet throws too.
+    assert!(s.derived(&battery, "mayTimeVary").is_err());
+    // A target outside the model: in the JSON, not among the handles.
+    let mut s = Session::from_sources(&sources(&[(
+        "m.sysml",
+        "package P { part w : Missing; part def A { part x; } part def B :> A; }",
+    )]))
+    .unwrap();
+    let w = s.resolve("P::w").unwrap();
+    let json: serde_json::Value = serde_json::from_str(&s.derived(&w, "type").unwrap()).unwrap();
+    assert_eq!(json[0]["outside"], true);
+    assert_eq!(json[0]["spelling"], "Missing");
+    assert!(json[0]["danglingId"].is_string());
+    assert!(s.derived_elements(&w, "type").unwrap().is_empty());
+    // The closure policy switches the inheritance-aware families, and
+    // survives an edit of the session.
+    let b = s.resolve("P::B").unwrap();
+    assert_eq!(s.closure_policy(), "passthrough");
+    assert!(s.derived_elements(&b, "feature").unwrap().is_empty());
+    s.set_closure_policy("closure").unwrap();
+    assert_eq!(s.closure_policy(), "closure");
+    assert_eq!(s.derived_elements(&b, "feature").unwrap().len(), 1);
+    s.edit(r#"[{"op": "moveMember", "target": "P::w", "index": 0}]"#)
+        .expect("edit commits");
+    assert_eq!(s.closure_policy(), "closure");
+    let b = s.resolve("P::B").unwrap();
+    assert_eq!(s.derived_elements(&b, "feature").unwrap().len(), 1);
+    assert!(s.set_closure_policy("nonsense").is_err());
+    s.set_closure_policy("passthrough").unwrap();
+}
+
+/// A rename clashing with a sibling's name is dropped from the batch
+/// and reported; the rest of the batch (an ancestor-qualified respell
+/// included) still commits.
+#[test]
+fn edit_batch_drops_colliding_renames_and_reports_them() {
+    let src = "package 'A B' {\n    part def X;\n    part def x;\n}\npackage Q {\n    part def other_def;\n    part a : 'A B'::X;\n    part b : 'A B'::x;\n}\n";
+    let mut s = Session::from_sources(&sources(&[("ab.sysml", src)])).unwrap();
+    let result = s
+        .edit(
+            &serde_json::json!([
+                {"op": "rename", "target": "'A B'", "newName": "AB"},
+                {"op": "rename", "target": "'A B'::x", "newName": "X"},
+                {"op": "rename", "target": "Q::other_def", "newName": "OtherDef"},
+            ])
+            .to_string(),
+        )
+        .expect("the batch commits without the clashing rename");
+    let report: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let f = findings[0].as_str().unwrap();
+    assert!(f.contains("rename of `'A B'::x` to `X` skipped"), "{f}");
+    assert!(f.contains("`'A B'::X` is already named `X`"), "{f}");
+    let post = s.source(0).unwrap();
+    assert!(post.contains("package AB {"), "{post}");
+    assert!(post.contains("part def x;"), "{post}");
+    assert!(post.contains("part a : AB::X;"), "{post}");
+    assert!(post.contains("part b : AB::x;"), "{post}");
+    assert!(post.contains("part def OtherDef;"), "{post}");
+}
+
+/// A session opened with its library reports the same check findings
+/// as the free `check` over the same sources (minus the parse stage,
+/// which `checkSyntax` carries) — one resolution instead of two.
+#[test]
+fn session_check_matches_free_check() {
+    use sysmlv2_wasm::check_syntax;
+    let lib = sources(&[(
+        "MiniLib.kerml",
+        "standard library package MiniLib { class Thing; datatype Num; }",
+    )]);
+    let user = sources(&[
+        (
+            "dangling.sysml",
+            "package Dangling { part def W; part w : Missing; attribute a : W; }",
+        ),
+        (
+            "ctx.sysml",
+            "package Ctx { attribute def A { part p : Thing; } }",
+        ),
+    ]);
+    let free: serde_json::Value =
+        serde_json::from_str(&check(&user, Some(lib.clone()), None).unwrap()).unwrap();
+    let mut s = Session::from_sources_with_library(&user, Some(lib), None).unwrap();
+    let unresolved_before = s.unresolved_count();
+    let session: serde_json::Value = serde_json::from_str(&s.check()).unwrap();
+    assert_eq!(session, free, "session findings match the free check");
+    let stages: Vec<&str> = free
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["stage"].as_str().unwrap())
+        .collect();
+    assert!(
+        stages.contains(&"referential") && stages.contains(&"semantic"),
+        "{stages:?}"
+    );
+    // The syntax stages alone: a parse-broken unit's findings, no model.
+    let mixed = sources(&[
+        ("bad.sysml", "part def {"),
+        (
+            "ctx.sysml",
+            "package Ctx { attribute def A { part p : Thing; } }",
+        ),
+    ]);
+    let syntax: serde_json::Value = serde_json::from_str(&check_syntax(&mixed).unwrap()).unwrap();
+    let stages: Vec<&str> = syntax
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["stage"].as_str().unwrap())
+        .collect();
+    assert!(
+        stages.iter().all(|s| *s == "parse" || *s == "context"),
+        "{stages:?}"
+    );
+    assert!(stages.contains(&"parse"), "{stages:?}");
+    // The session stays usable after checking: navigation and the
+    // unresolved count read the same model.
+    assert!(s.resolve("Dangling::w").is_some());
+    assert!(unresolved_before >= 1);
+    assert_eq!(
+        s.unresolved_count(),
+        unresolved_before,
+        "checking drains nothing"
+    );
+    // Without a library the resolution stages are skipped, as in `check`.
+    let mut bare = Session::from_sources(&user).unwrap();
+    let bare: serde_json::Value = serde_json::from_str(&bare.check()).unwrap();
+    let free_bare: serde_json::Value =
+        serde_json::from_str(&check(&user, None, None).unwrap()).unwrap();
+    assert_eq!(bare, free_bare);
+}
+
+/// Checking a session must not change what lint reports afterwards
+/// (the import-visibility rule reads the resolver's import provenance).
+#[test]
+fn session_check_leaves_lint_findings_unchanged() {
+    let lib = sources(&[(
+        "MiniLib.kerml",
+        "standard library package MiniLib { class Thing; datatype Num; }",
+    )]);
+    let user = sources(&[(
+        "u.sysml",
+        "package U { import MiniLib::*; part def W; part w : Thing; attribute n : Num = 3; }",
+    )]);
+    let rules = |s: &mut Session| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(&s.lint(None).unwrap()).unwrap();
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["rule"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let mut fresh = Session::from_sources_with_library(&user, Some(lib.clone()), None).unwrap();
+    let before = rules(&mut fresh);
+    let mut checked = Session::from_sources_with_library(&user, Some(lib), None).unwrap();
+    let _ = checked.check();
+    let after = rules(&mut checked);
+    assert!(
+        before.iter().any(|r| r == "import-visibility"),
+        "{before:?}"
+    );
+    assert_eq!(after, before, "lint after check == lint without check");
+}
+
+#[test]
+fn sources_with_an_empty_unit_name_are_refused_at_the_boundary() {
+    let bad = r#"[{"name": "ok.sysml", "text": "package A;"}, {"name": "", "text": "package B;"}]"#;
+    let err = Session::from_sources(bad).err().expect("refused");
+    assert!(err.contains("source 1 has an empty name"), "{err}");
+    assert!(check(bad, None, None).unwrap_err().contains("empty name"));
+    assert!(
+        sysmlv2_wasm::check_syntax(bad)
+            .unwrap_err()
+            .contains("empty name")
+    );
+    assert!(
+        sysmlv2_wasm::lenient_sources(bad)
+            .unwrap_err()
+            .contains("empty name")
+    );
+    // A library bundle is sources too.
+    let err = Session::from_sources_with_library(
+        &sources(&[("u.sysml", "package U;")]),
+        Some(bad.to_string()),
+        None,
+    )
+    .err()
+    .expect("refused");
+    assert!(err.contains("empty name"), "{err}");
+}
+
+#[test]
+fn diagram_emitters_share_one_option_vocabulary() {
+    let mut s = Session::from_sources(&sources(&[
+        ("flashlight.sysml", FLASHLIGHT),
+        ("extra.sysml", "package Extra { part def Case; }"),
+    ]))
+    .unwrap();
+    // Unknown names are unknown on both paths, with the same message…
+    let uml = s
+        .to_plantuml(Some(r#"{"view": "nope"}"#.into()))
+        .unwrap_err();
+    assert!(uml.contains("unknown view: nope"), "{uml}");
+    assert_eq!(
+        s.to_graph(Some(r#"{"view": "nope"}"#.into())).unwrap_err(),
+        uml
+    );
+    let uml = s
+        .to_plantuml(Some(r#"{"lineStyle": "curvy"}"#.into()))
+        .unwrap_err();
+    assert!(uml.contains("unknown line style: curvy"), "{uml}");
+    assert_eq!(
+        s.to_graph(Some(r#"{"lineStyle": "curvy"}"#.into()))
+            .unwrap_err(),
+        uml
+    );
+    let uml = s
+        .to_plantuml(Some(r#"{"element": "No::Such"}"#.into()))
+        .unwrap_err();
+    assert!(uml.contains("element not found: No::Such"), "{uml}");
+    assert_eq!(
+        s.to_graph(Some(r#"{"element": "No::Such"}"#.into()))
+            .unwrap_err(),
+        uml
+    );
+    let uml = s
+        .to_plantuml(Some(r#"{"roots": ["No::Such"]}"#.into()))
+        .unwrap_err();
+    assert_eq!(
+        s.to_graph(Some(r#"{"roots": ["No::Such"]}"#.into()))
+            .unwrap_err(),
+        uml
+    );
+    // …while a view the graph emitter lacks is a different refusal,
+    // named canonically whatever alias the caller wrote.
+    let err = s.to_graph(Some(r#"{"view": "seq"}"#.into())).unwrap_err();
+    assert_eq!(err, "no structured-graph emitter for view: sequence");
+    assert!(s.to_plantuml(Some(r#"{"view": "seq"}"#.into())).is_ok());
+    // Every PlantUML option is accepted on the graph path, aliases included.
+    let g: serde_json::Value = serde_json::from_str(
+        &s.to_graph(Some(
+            r#"{"view": "ic", "horizontal": true, "lineStyle": "ortho", "stdColor": true,
+                "linkTemplate": "x://{file}:{line}", "showInherited": true, "roots": ["Extra"]}"#
+                .into(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(g["view"], "interconnection");
+    // `roots` scopes the graph exactly as it scopes the PlantUML.
+    let g: serde_json::Value =
+        serde_json::from_str(&s.to_graph(Some(r#"{"roots": ["Extra"]}"#.into())).unwrap()).unwrap();
+    let labels: Vec<&str> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["label"].as_str())
+        .collect();
+    assert!(
+        labels.contains(&"Case") && !labels.contains(&"Battery"),
+        "{labels:?}"
+    );
+    let uml = s
+        .to_plantuml(Some(r#"{"roots": ["Extra"]}"#.into()))
+        .unwrap();
+    assert!(uml.contains("Case") && !uml.contains("Battery"), "{uml}");
+}
+
+#[test]
+fn verify_positions_bindings_in_their_own_unit() {
+    // The bound feature is declared in one unit and the constraints
+    // that reference it in another: every position comes from its own
+    // unit's line index, and one report shares the indexes.
+    let defs = "package P {\n    attribute def Real;\n\n    attribute margin : Real = 1;\n}\n";
+    let checks = "package Q {\n    private import P::*;\n    assert constraint short { margin >= 2 }\n    assert constraint wide { margin <= 2 }\n}\n";
+    let mut s =
+        Session::from_sources(&sources(&[("defs.sysml", defs), ("checks.sysml", checks)])).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&s.verify(None).unwrap()).unwrap();
+    let constraints = report["constraints"].as_array().unwrap();
+    assert_eq!(constraints.len(), 2);
+    let short = constraints.iter().find(|c| c["name"] == "short").unwrap();
+    assert_eq!(short["unitName"], "checks.sysml");
+    assert_eq!(short["line"], 3);
+    assert_eq!(short["status"], "violated");
+    assert_eq!(short["detail"], "VIOLATED (with margin = 1)");
+    let b = &short["bindings"].as_array().unwrap()[0];
+    assert_eq!(b["feature"], "margin");
+    assert_eq!(b["value"], "1");
+    assert_eq!(b["unitName"], "defs.sysml");
+    assert_eq!(b["line"], 4);
+    let wide = constraints.iter().find(|c| c["name"] == "wide").unwrap();
+    assert_eq!(wide["status"], "satisfied");
+    assert_eq!(wide["unitName"], "checks.sysml");
+    assert_eq!(wide["line"], 4);
+    assert_eq!(report["summary"]["satisfied"], 1);
+    assert_eq!(report["summary"]["violated"], 1);
 }

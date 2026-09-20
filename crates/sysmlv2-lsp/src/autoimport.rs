@@ -15,7 +15,8 @@
 //! redundant, never wrong: the qualified target resolves from the root
 //! namespace regardless.
 
-use sysmlv2_parser::ast::{Import, Member, MemberKind, Name, SourceUnit, Visibility, escape_name};
+use crate::position::offset32;
+use sysmlv2_parser::ast::{Dialect, Import, Member, MemberKind, Name, SourceUnit, Visibility};
 use sysmlv2_parser::span::Span;
 
 /// One namespace body on the cursor's ancestor chain.
@@ -31,6 +32,9 @@ struct Scope<'a> {
 /// word being completed (the phantom declaration guard).
 pub(crate) struct AutoImport<'a> {
     text: &'a str,
+    /// The unit's dialect: the reserved-word table an inserted import
+    /// path must respect.
+    dialect: Dialect,
     scopes: Vec<Scope<'a>>,
     partial: Span,
 }
@@ -60,6 +64,7 @@ impl<'a> AutoImport<'a> {
         }
         AutoImport {
             text,
+            dialect: unit.dialect,
             scopes,
             partial,
         }
@@ -108,7 +113,7 @@ impl<'a> AutoImport<'a> {
     /// before the first substantive member as a `private import` (the
     /// non-re-exporting default).
     fn insertion(&self, qualified: &str) -> (u32, String) {
-        let path = escape_qualified(qualified);
+        let path = escape_qualified(self.dialect, qualified);
         let scope = self
             .scopes
             .iter()
@@ -160,7 +165,7 @@ impl<'a> AutoImport<'a> {
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect();
         (
-            line_start as u32,
+            offset32(line_start),
             format!("{indent}private import {path};\n"),
         )
     }
@@ -271,13 +276,11 @@ fn path_matches(p: &str, t: &str) -> bool {
     p == t || p.ends_with(&format!("::{t}")) || t.ends_with(&format!("::{p}"))
 }
 
-/// A root-qualified path in textual notation, restricted names quoted.
-pub(crate) fn escape_qualified(qualified: &str) -> String {
-    qualified
-        .split("::")
-        .map(escape_name)
-        .collect::<Vec<_>>()
-        .join("::")
+/// A root-qualified path in the textual notation of `dialect`:
+/// restricted names and the dialect's reserved words quoted, so the
+/// import statement parses and the formatter keeps it.
+pub(crate) fn escape_qualified(dialect: Dialect, qualified: &str) -> String {
+    sysmlv2_parser::name::spell_path(Some(dialect), qualified.split("::"))
 }
 
 /// The byte range a completion for `name` should replace. The partial
@@ -298,12 +301,12 @@ pub(crate) fn replace_range_for(text: &str, partial_start: u32, offset: u32, nam
     if text[..start].ends_with('\'') {
         start -= 1;
     }
-    Span::new(start as u32, offset)
+    Span::new(offset32(start), offset)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AutoImport;
+    use super::{AutoImport, offset32};
     use sysmlv2_parser::span::Span;
 
     /// Cursor at the end of `cursor`'s first occurrence; the partial
@@ -318,8 +321,8 @@ mod tests {
         let auto = AutoImport::new(
             text,
             &parse.unit,
-            at as u32,
-            Span::new(word_start as u32, at as u32),
+            offset32(at),
+            Span::new(offset32(word_start), offset32(at)),
         );
         auto.import_edit(name, qualified)
     }

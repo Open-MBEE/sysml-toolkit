@@ -22,7 +22,7 @@ fn main() {
         if let Some(SolveOutcome::Unknown(reason)) = &s.solve {
             by_reason.entry(reason.clone()).or_default().push(format!(
                 "{} — {:?}",
-                model.units()[s.unit].name,
+                model.unit(s.unit).name,
                 s.name
             ));
         }

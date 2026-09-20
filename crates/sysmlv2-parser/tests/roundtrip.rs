@@ -7,7 +7,7 @@
 #![cfg(feature = "json")]
 
 use std::fs;
-use sysmlv2_parser::ast::Dialect;
+use sysmlv2_parser::ast::{Dialect, MemberKind, UsageDetail, UsageKind};
 use sysmlv2_parser::json::to_compact_json;
 use sysmlv2_parser::lift::from_compact_json;
 use sysmlv2_parser::parser::{Parse, parse_kerml_source, parse_source};
@@ -73,14 +73,13 @@ fn corpus_json_roundtrip() {
 /// Full-form leg of the round-trip gate: lifting a model's *full* JSON
 /// must print exactly what the compact leg prints. The full form
 /// materializes derived properties (`memberElement`, `memberName`, …)
-/// that the lift must ignore — 2026-07-17: view `filter` clauses and
+/// that the lift must ignore — view `filter` clauses and
 /// positional invocation arguments regressed exactly there.
 ///
 /// One measured loss is normalized away: associations are `isSufficient`
-/// at the model level whatever the text spells (INTEROP.md adjudication,
-/// 2026-07-16), so the full form cannot recover a KerML `assoc all`
-/// keyword — the lift canonicalizes it off, and the comparison drops it
-/// from the reference too.
+/// at the model level whatever the text spells (see INTEROP.md), so the
+/// full form cannot recover a KerML `assoc all` keyword — the lift
+/// canonicalizes it off, and the comparison drops it from the reference too.
 fn drop_assoc_all(text: &str) -> String {
     text.replace("assoc all ", "assoc ")
         .replace("assoc struct all ", "assoc struct ")
@@ -543,4 +542,477 @@ fn lift_with_names_keeps_lambda_parameter_references_relative() {
         json,
         "JSON changed across the named lift: {text}"
     );
+}
+
+/// A payload whose ownership pointers loop (`A` owns `B`, whose membership
+/// owns `A` again) is refused instead of returning a partial model;
+/// an expression element that nests itself is caught the same way.
+#[test]
+fn cyclic_ownership_payload_lifts_with_an_error() {
+    use serde_json::json;
+    let cyclic = json!([
+        {"@id": "root", "@type": "Namespace", "ownedRelationship": [{"@id": "m0"}]},
+        {"@id": "m0", "@type": "OwningMembership", "owningRelatedElement": {"@id": "root"},
+         "ownedRelatedElement": [{"@id": "a"}]},
+        {"@id": "a", "@type": "Package", "declaredName": "A", "owningRelationship": {"@id": "m0"},
+         "ownedRelationship": [{"@id": "m1"}]},
+        {"@id": "m1", "@type": "OwningMembership", "owningRelatedElement": {"@id": "a"},
+         "ownedRelatedElement": [{"@id": "b"}]},
+        {"@id": "b", "@type": "Package", "declaredName": "B", "owningRelationship": {"@id": "m1"},
+         "ownedRelationship": [{"@id": "m2"}]},
+        {"@id": "m2", "@type": "OwningMembership", "owningRelatedElement": {"@id": "b"},
+         "ownedRelatedElement": [{"@id": "a"}]},
+    ]);
+    let Err(sysmlv2_parser::lift::LiftError::Incomplete { errors }) = from_compact_json(&cyclic)
+    else {
+        panic!("a cycle must refuse the document")
+    };
+    assert!(errors.iter().any(|e| e.contains("cycle")), "{errors:?}");
+
+    let self_nested = json!([
+        {"@id": "root", "@type": "Namespace", "ownedRelationship": [{"@id": "m0"}]},
+        {"@id": "m0", "@type": "OwningMembership", "owningRelatedElement": {"@id": "root"},
+         "ownedRelatedElement": [{"@id": "x"}]},
+        {"@id": "x", "@type": "AttributeUsage", "declaredName": "x", "owningRelationship": {"@id": "m0"},
+         "ownedRelationship": [{"@id": "fv"}]},
+        {"@id": "fv", "@type": "FeatureValue", "owningRelatedElement": {"@id": "x"},
+         "ownedRelatedElement": [{"@id": "e"}]},
+        {"@id": "e", "@type": "FeatureReferenceExpression", "owningRelationship": {"@id": "fv"},
+         "ownedRelationship": [{"@id": "em"}]},
+        {"@id": "em", "@type": "Membership", "owningRelatedElement": {"@id": "e"},
+         "ownedRelatedElement": [{"@id": "e"}]},
+    ]);
+    let Err(sysmlv2_parser::lift::LiftError::Incomplete { errors }) =
+        from_compact_json(&self_nested)
+    else {
+        panic!("a cycle must refuse the document")
+    };
+    assert!(errors.iter().any(|e| e.contains("cycle")), "{errors:?}");
+}
+
+/// Nested packages `depth` levels deep, as compact interchange JSON.
+fn nested_packages(depth: usize) -> serde_json::Value {
+    use serde_json::json;
+    let mut elements = vec![json!({
+        "@id": "root", "@type": "Namespace", "ownedRelationship": [{"@id": "m0"}]
+    })];
+    let mut owner = "root".to_string();
+    for i in 0..depth {
+        let membership = format!("m{i}");
+        let package = format!("p{i}");
+        let mut element = json!({
+            "@id": package, "@type": "Package", "declaredName": format!("P{i}"),
+            "owningRelationship": {"@id": membership}
+        });
+        if i + 1 < depth {
+            element["ownedRelationship"] = json!([{"@id": format!("m{}", i + 1)}]);
+        }
+        elements.push(json!({
+            "@id": membership, "@type": "OwningMembership",
+            "owningRelatedElement": {"@id": owner}, "ownedRelatedElement": [{"@id": package}]
+        }));
+        elements.push(element);
+        owner = package;
+    }
+    serde_json::Value::Array(elements)
+}
+
+/// The names of the nested-package chain a lift produced, outermost
+/// first — read without recursion, so the reader never costs more stack
+/// than the chain it is checking.
+fn package_chain(unit: &sysmlv2_parser::ast::SourceUnit) -> Vec<&str> {
+    use sysmlv2_parser::ast::{Member, MemberKind, Package};
+    fn sole_package(members: &[Member]) -> Option<&Package> {
+        match members {
+            [only] => match &only.kind {
+                MemberKind::Package(package) => Some(package),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let mut names = Vec::new();
+    let mut level = sole_package(&unit.members);
+    while let Some(package) = level {
+        names.push(package.id.name.as_ref().map_or("", |n| n.value.as_str()));
+        level = package.body.as_deref().and_then(sole_package);
+    }
+    names
+}
+
+/// Ownership nesting is bounded: a chain far past the limit is refused
+/// without exhausting the caller's stack; a chain within the limit lifts
+/// completely.
+#[test]
+fn deep_ownership_chain_lifts_without_overflowing() {
+    use sysmlv2_parser::lift::MAX_LIFT_DEPTH;
+    // Each package level costs two lift steps: its membership and the
+    // package itself.
+    let levels = MAX_LIFT_DEPTH / 2;
+    let Err(sysmlv2_parser::lift::LiftError::Incomplete { errors }) =
+        from_compact_json(&nested_packages(10_000))
+    else {
+        panic!("an over-budget document must not return a partial AST")
+    };
+    assert!(
+        errors.iter().any(|e| e.contains("deeper than")),
+        "{errors:?}"
+    );
+
+    // A chain that fits lifts completely, and the whole-list name map
+    // walks it too.
+    let within = nested_packages(levels - 1);
+    let lifted = from_compact_json(&within).expect("well-formed");
+    assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+    assert_eq!(package_chain(&lifted.unit).len(), levels - 1);
+    let names = sysmlv2_parser::lift::document_name_map(&within);
+    assert_eq!(
+        names.get("p3").map(Vec::len),
+        Some(4),
+        "P3 sits four segments below the root"
+    );
+}
+
+/// One naming rule, several representations: an unnamed feature is named
+/// by the feature it redefines, references, or chains to. The lift reads
+/// that rule off payload JSON (for the qualified names a cross-document
+/// reference prints), the full form derives it over its own element maps
+/// (for `name` and `memberName`), and the id derivation runs it as a
+/// fixpoint (for named id segments). Feed the same shapes through all
+/// three and they must answer the same.
+#[test]
+fn the_effective_name_rule_agrees_across_its_implementations() {
+    let source = "package P {
+             part def D { attribute mass; attribute count; }
+             part p : D {
+                 attribute :>> mass = 1;
+                 attribute :>> count = 2;
+             }
+             part q : D {
+                 attribute :>> mass = 3;
+             }
+         }";
+    let compact = to_compact_json(&parse(source, Dialect::Sysml).unit);
+    let elements = compact.as_array().expect("a flat element array");
+
+    // The anonymous redefining attributes, by the id the payload gives
+    // them, with the name each is expected to be findable by.
+    let anonymous: Vec<(&str, String)> = elements
+        .iter()
+        .filter(|e| e["@type"] == "AttributeUsage" && e["declaredName"].as_str().is_none())
+        .map(|e| {
+            let redefined = e["ownedRelationship"]
+                .as_array()
+                .expect("owned relationships")
+                .iter()
+                .filter_map(|r| elements.iter().find(|x| x["@id"] == r["@id"]))
+                .find(|r| r["@type"] == "Redefinition")
+                .expect("a redefinition");
+            let target = redefined["redefinedFeature"]["@id"]
+                .as_str()
+                .expect("an in-document target");
+            let name = elements
+                .iter()
+                .find(|x| x["@id"] == target)
+                .expect("the redefined attribute")["declaredName"]
+                .as_str()
+                .expect("a declared name")
+                .to_string();
+            (e["@id"].as_str().expect("an id"), name)
+        })
+        .collect();
+    assert_eq!(anonymous.len(), 3, "three anonymous redefiners");
+
+    // The lift's reading: the last segment of the whole-list name map.
+    let lifted_names = sysmlv2_parser::lift::document_name_map(&compact);
+    // The full form's reading: the materialized `name` property.
+    let full = sysmlv2_parser::full::from_compact_value(
+        compact.clone(),
+        &std::collections::HashMap::new(),
+        true,
+    );
+    let full_elements = full.as_array().expect("a flat element array");
+    // The id derivation's reading: the named segment of the path.
+    let paths = sysmlv2_parser::ids::segment_paths(&compact, &|_| None).expect("well-formed");
+
+    for (id, expected) in anonymous {
+        assert_eq!(
+            lifted_names.get(id).and_then(|segments| segments.last()),
+            Some(&expected),
+            "the lift names {id}"
+        );
+        let full_element = full_elements
+            .iter()
+            .find(|e| e["@id"] == id)
+            .expect("the same element in the full form");
+        assert_eq!(
+            full_element["name"].as_str(),
+            Some(expected.as_str()),
+            "the full form names {id}"
+        );
+        let index = elements
+            .iter()
+            .position(|e| e["@id"] == id)
+            .expect("payload order");
+        let (_, path) = paths[index].as_ref().expect("a reachable element");
+        assert_eq!(
+            path.rsplit('/').next(),
+            Some(format!("::{expected}").as_str()),
+            "the id derivation names {id} — {path}"
+        );
+    }
+}
+
+/// Remove the element `id` and everything it owns from a compact-form
+/// element array.
+fn remove_subtree(arr: &mut Vec<serde_json::Value>, id: &str) {
+    let mut pending = vec![id.to_string()];
+    while let Some(id) = pending.pop() {
+        let Some(i) = arr.iter().position(|e| e["@id"] == id.as_str()) else {
+            continue;
+        };
+        let el = arr.remove(i);
+        for key in ["ownedRelationship", "ownedRelatedElement"] {
+            if let Some(children) = el[key].as_array() {
+                pending.extend(
+                    children
+                        .iter()
+                        .filter_map(|c| c["@id"].as_str().map(str::to_owned)),
+                );
+            }
+        }
+    }
+}
+
+/// A binding connector with a single end (a partial document: the other
+/// end's membership is missing) lifts with an error entry, and prints text
+/// that parses: the notation spells a binding's ends as a pair and has no
+/// form for one, so the end is left unspelled rather than printed as
+/// `bind a;`, which does not parse.
+///
+/// What is lost, pinned below so it is not lost silently: the SysML
+/// grammar requires the `bind` clause after the `binding` keyword, so
+/// nothing in that dialect spells a binding whose ends are not a pair —
+/// the binding does not survive, and re-lifting the printed text gives an
+/// ordinary usage rather than a connector. What does survive is the
+/// member, as its declaration alone, so the name, the short name and the
+/// typing come through; the end comes with it, spelled as an `end ::> …;`
+/// body member; and a connector with nothing declared at all prints `ref`
+/// rather than a bare terminator.
+#[test]
+fn one_ended_binding_keeps_the_member_it_cannot_spell() {
+    let src = "package P { part def B; part a; part b; binding <b1> bd : B bind a = b; }";
+    let text = print_one_ended_binding(src);
+    let member = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("bd"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(member.starts_with("<b1> bd : "), "{text}");
+    assert!(
+        !member.contains("binding") && !member.contains("bind "),
+        "{text}"
+    );
+    let reparsed = parse_source(&text);
+    assert!(
+        reparsed.diagnostics.is_empty(),
+        "{text}: {:#?}",
+        reparsed.diagnostics
+    );
+    let MemberKind::Package(p) = &reparsed.unit.members[0].kind else {
+        panic!("{:?}", reparsed.unit.members[0].kind)
+    };
+    let kept = p
+        .body
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find_map(|m| match &m.kind {
+            MemberKind::Usage(u)
+                if u.declaration.id.name.as_ref().map(|n| n.value.as_str()) == Some("bd") =>
+            {
+                Some(u)
+            }
+            _ => None,
+        })
+        .expect("the member survives");
+    assert_eq!(
+        kept.kind,
+        UsageKind::Default,
+        "the binding is not spelled, the member is"
+    );
+    assert_eq!(end_members(kept), 1, "the end survives: {text}");
+
+    // With nothing declared there is no head, and a member whose whole
+    // text is a body does not parse, so the keyword-less usage spells
+    // itself out — indented where it belongs, with its end kept.
+    let text = print_one_ended_binding("package P { part a; part b; bind a = b; part z; }");
+    assert!(text.contains("\n    ref {\n"), "{text}");
+    let reparsed = parse_source(&text);
+    assert!(
+        reparsed.diagnostics.is_empty(),
+        "{text}: {:#?}",
+        reparsed.diagnostics
+    );
+    let MemberKind::Package(p) = &reparsed.unit.members[0].kind else {
+        panic!("{:?}", reparsed.unit.members[0].kind)
+    };
+    let kept = p
+        .body
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find_map(|m| match &m.kind {
+            MemberKind::Usage(u) if u.kind == UsageKind::Ref => Some(u),
+            _ => None,
+        })
+        .expect("the member survives");
+    assert_eq!(end_members(kept), 1, "the end survives: {text}");
+}
+
+/// How many of a usage's body members are ends.
+fn end_members(u: &sysmlv2_parser::ast::Usage) -> usize {
+    u.body
+        .iter()
+        .flatten()
+        .filter(|m| matches!(&m.kind, MemberKind::Usage(e) if e.prefix.is_end))
+        .count()
+}
+
+/// Lift `src`, drop one of its binding's two ends, and print what is left.
+fn print_one_ended_binding(src: &str) -> String {
+    let mut json = to_compact_json(&parse_source(src).unit);
+    let arr = json.as_array_mut().unwrap();
+    let types: std::collections::HashMap<String, String> = arr
+        .iter()
+        .map(|e| {
+            (
+                e["@id"].as_str().unwrap().to_owned(),
+                e["@type"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let binding = arr
+        .iter()
+        .position(|e| e["@type"] == "BindingConnectorAsUsage")
+        .expect("binding element");
+    let rels = arr[binding]["ownedRelationship"].as_array_mut().unwrap();
+    let ends: Vec<String> = rels
+        .iter()
+        .filter_map(|r| r["@id"].as_str())
+        .filter(|id| types[*id] == "EndFeatureMembership")
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(ends.len(), 2, "{types:#?}");
+    let dropped = ends[1].clone();
+    rels.retain(|r| r["@id"] != dropped.as_str());
+    remove_subtree(arr, &dropped);
+
+    let lifted = from_compact_json(&json).unwrap();
+    assert!(
+        lifted
+            .errors
+            .iter()
+            .any(|e| e.contains("binding connector") && e.contains("1 end(s)")),
+        "{:?}",
+        lifted.errors
+    );
+    let text = print_source(&lifted.unit);
+    // The `bind` clause, wherever it sits: a declared binding spells the
+    // keyword and the declaration before it.
+    let bind_line = |text: &str| {
+        text.lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("bind ") || l.contains(" bind "))
+            .map(str::to_owned)
+    };
+    assert!(bind_line(&text).is_none(), "{text}");
+    // The one-ended usage is no longer a binding detail: the invariant
+    // that a binding detail has two ends holds for lifted trees.
+    let MemberKind::Package(p) = &lifted.unit.members[0].kind else {
+        panic!("{:?}", lifted.unit.members[0].kind)
+    };
+    let usage = p
+        .body
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find_map(|m| match &m.kind {
+            MemberKind::Usage(u) if u.kind == UsageKind::Binding => Some(u),
+            _ => None,
+        })
+        .expect("binding usage");
+    assert!(matches!(&usage.detail, UsageDetail::Connector { ends } if ends.len() == 1));
+    // Lifting the intact document still yields the two-ended binding.
+    let intact = from_compact_json(&to_compact_json(&parse_source(src).unit)).unwrap();
+    assert!(intact.errors.is_empty(), "{:?}", intact.errors);
+    let intact_text = print_source(&intact.unit);
+    let line = bind_line(&intact_text).unwrap_or_else(|| panic!("{intact_text}"));
+    assert!(
+        line.contains(" = ") && line.ends_with("b;"),
+        "{intact_text}"
+    );
+    text
+}
+
+/// Long expressions use the parser's expression budget independently of
+/// structural nesting. Compact and full form must retain every operand.
+#[test]
+fn expression_budget_roundtrips_without_changing_operands() {
+    sysmlv2_parser::parser::on_parsing_stack(
+        "expression-roundtrip",
+        |e| panic!("cannot reserve parsing stack: {e}"),
+        || {
+            for operators in [399, sysmlv2_parser::parser::MAX_EXPR_OPERATORS as usize] {
+                let expression = vec!["1"; operators + 1].join(" + ");
+                let source = format!("attribute a = {expression};\n");
+                let parsed = parse_source(&source);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let compact = to_compact_json(&parsed.unit);
+                let full = sysmlv2_parser::full::to_full_json(&parsed.unit);
+                assert_eq!(
+                    compact.as_array().unwrap().len(),
+                    full.as_array().unwrap().len()
+                );
+                for json in [&compact, &full] {
+                    let lifted = from_compact_json(json).unwrap_or_else(|e| panic!("{e}"));
+                    assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+                    let reparsed = parse_source(&print_source(&lifted.unit));
+                    assert!(
+                        reparsed.diagnostics.is_empty(),
+                        "{:?}",
+                        reparsed.diagnostics
+                    );
+                    assert_eq!(to_compact_json(&reparsed.unit), compact);
+                }
+            }
+        },
+    );
+}
+
+/// Full-form enrichment retains owned elements even when no source model
+/// can represent them. The array-level fallback must not delete a payload.
+#[test]
+fn full_form_preserves_elements_the_lifter_cannot_reconstruct() {
+    let parsed = parse_source("attribute a = 1 + 2;");
+    let mut compact = to_compact_json(&parsed.unit);
+    for element in compact.as_array_mut().unwrap() {
+        if element["@type"] == "LiteralInteger" && element["value"] == 1 {
+            element["@type"] = "Expression".into();
+            element["declaredName"] = "foreignExpression".into();
+            element.as_object_mut().unwrap().remove("value");
+        }
+    }
+    let full = sysmlv2_parser::full::from_compact_value(compact.clone(), &Default::default(), true);
+    for element in compact.as_array().unwrap() {
+        let output = full
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["@id"] == element["@id"])
+            .expect("every input element survives full-form enrichment");
+        assert_eq!(output["@type"], element["@type"]);
+        assert_eq!(output["declaredName"], element["declaredName"]);
+        assert_eq!(output["ownedRelationship"], element["ownedRelationship"]);
+    }
 }

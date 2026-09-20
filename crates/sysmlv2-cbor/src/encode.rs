@@ -50,6 +50,14 @@ pub const FLAG_UNIT_PATHS: u8 = 16;
 /// (`to_compact_cbor_canonical`), which always spells owners.
 pub const FLAG_IMPLIED_OWNERS: u8 = 32;
 
+/// Header flag marking a compact payload whose element ids are
+/// **explicit**: at least one id is not the graph derivation of IDS.md
+/// (a document loaded from another producer, or one carrying foreign
+/// ids), so a receiver must not re-derive ids from the structure. Set by
+/// a session that holds explicit ids; informational for decoders, which
+/// always read the id table. Id elision is refused for such payloads.
+pub const FLAG_EXPLICIT_IDS: u8 = 64;
+
 /// The two backpointers and the forward list each derives from:
 /// slot 0 = `owningRelationship` ← membership in some element's
 /// `ownedRelatedElement`; slot 1 = `owningRelatedElement` ←
@@ -69,15 +77,22 @@ pub(crate) fn owner_bit(slot: usize) -> u64 {
 /// null). The first claimant in element order, then list order, wins;
 /// encoder and decoder agree by running this identical rule over the
 /// identical arrays.
-pub(crate) fn derive_owners(arr: &[Value]) -> Vec<[Option<usize>; 2]> {
-    let mut index: HashMap<&str, usize> = HashMap::with_capacity(arr.len());
-    for (i, e) in arr.iter().enumerate() {
+pub(crate) fn derive_owners<'a, I>(elements: I) -> Vec<[Option<usize>; 2]>
+where
+    I: IntoIterator<Item = &'a Value>,
+    I::IntoIter: Clone,
+{
+    let elements = elements.into_iter();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut n = 0usize;
+    for (i, e) in elements.clone().enumerate() {
+        n = i + 1;
         if let Some(id) = e.get("@id").and_then(Value::as_str) {
             index.entry(id).or_insert(i);
         }
     }
-    let mut owners = vec![[None, None]; arr.len()];
-    for (i, e) in arr.iter().enumerate() {
+    let mut owners = vec![[None, None]; n];
+    for (i, e) in elements.enumerate() {
         for (slot, (_, forward)) in OWNER_SLOTS.iter().enumerate() {
             let targets = e.get(*forward).and_then(Value::as_array);
             for t in targets.into_iter().flatten() {
@@ -119,6 +134,17 @@ pub(crate) fn ctx(ty: &str, prop: &str, what: &str) -> Error {
     Error::new(format!("{ty}.{prop}: {what}"))
 }
 
+/// A metaclass's position in a field table as the 16-bit wire type
+/// code. The generated tables are far shorter than that code space —
+/// `tables_fit_the_wire_code_spaces` holds it — so this never fails in
+/// practice; it is spelled as a conversion rather than a narrowing cast
+/// so a regenerated table could never wrap a code into another
+/// metaclass's.
+pub(crate) fn wire_code(position: usize) -> Result<u16, Error> {
+    u16::try_from(position)
+        .map_err(|_| Error::new("metaclass table outgrew the wire type-code space"))
+}
+
 fn parse_uuid(s: &str) -> Result<Uuid, Error> {
     Uuid::try_parse(s).map_err(|_| Error::new(format!("invalid UUID `{s}`")))
 }
@@ -133,15 +159,23 @@ pub(crate) struct Elem<'a> {
     pub(crate) uuid: Uuid,
 }
 
+/// The payload's elements as borrowed views, in payload order — the
+/// form every encoding pass walks, so a re-ordered or filtered element
+/// list costs a vector of pointers instead of a copy of the model.
+pub(crate) fn element_views(value: &Value) -> Result<Vec<&Value>, Error> {
+    Ok(value
+        .as_array()
+        .ok_or_else(|| Error::new("interchange payload is a flat element array"))?
+        .iter()
+        .collect())
+}
+
 pub(crate) fn elems_of<'a>(
-    value: &'a Value,
+    elements: &[&'a Value],
     tables: &'static [(&'static str, &'static [CborField])],
 ) -> Result<Vec<Elem<'a>>, Error> {
-    let arr = value
-        .as_array()
-        .ok_or_else(|| Error::new("interchange payload is a flat element array"))?;
-    let mut out = Vec::with_capacity(arr.len());
-    for e in arr {
+    let mut out = Vec::with_capacity(elements.len());
+    for &e in elements {
         let obj = e
             .as_object()
             .ok_or_else(|| Error::new("element is an object"))?;
@@ -149,9 +183,11 @@ pub(crate) fn elems_of<'a>(
             .get("@type")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new("element has a string @type"))?;
-        let code = tables
-            .binary_search_by(|(n, _)| n.cmp(&ty))
-            .map_err(|_| Error::new(format!("unknown @type `{ty}`")))? as u16;
+        let code = wire_code(
+            tables
+                .binary_search_by(|(n, _)| n.cmp(&ty))
+                .map_err(|_| Error::new(format!("unknown @type `{ty}`")))?,
+        )?;
         let id = obj
             .get("@id")
             .and_then(Value::as_str)
@@ -185,13 +221,52 @@ pub(crate) fn default_value(field: &CborField, id: &str) -> Option<Value> {
     })
 }
 
-/// `{"@id": …}` target UUID, if the value is an id-based reference.
-pub(crate) fn ref_uuid(v: &Value) -> Result<Option<Uuid>, Error> {
-    let Value::Object(o) = v else { return Ok(None) };
+/// Is `value` the field's default — [`default_value`]'s
+/// allocation-free twin, for the callers that only compare. `id` feeds
+/// the `elementId` mirror rule; a kind with no default (a literal) is
+/// never equal to one.
+pub(crate) fn is_default_value(field: &CborField, id: &str, value: &Value) -> bool {
+    let (_, kind, etbl, dflt) = *field;
+    match kind {
+        K_BOOL => value.as_bool() == Some(dflt == 1),
+        K_STR | K_REF => value.is_null(),
+        K_STR_LIST | K_REF_LIST => value.as_array().is_some_and(Vec::is_empty),
+        K_ENUM => match dflt {
+            255 => value.is_null(),
+            d => {
+                value.is_string()
+                    && value.as_str()
+                        == ENUM_TABLES
+                            .get(etbl as usize)
+                            .and_then(|t| t.get(d as usize))
+                            .copied()
+            }
+        },
+        K_ELEMENT_ID => value.as_str() == Some(id),
+        _ => false,
+    }
+}
+
+/// What a reference value points at.
+pub(crate) enum RefTarget<'a> {
+    /// `{"@id": …}` — an element identity, interned to a wire index.
+    Id(Uuid),
+    /// `{"@ref": …}` — a symbolic reference, carried verbatim.
+    Symbolic(&'a str),
+}
+
+/// Classify a reference value. Every other shape — a non-object, an
+/// empty object, extra keys, a non-string target — is an error, so no
+/// caller has to assume the shape a reference list item did not have.
+pub(crate) fn ref_target(v: &Value) -> Result<RefTarget<'_>, Error> {
+    let bad = || Error::new("reference is {\"@id\": …} or {\"@ref\": …}");
+    let Value::Object(o) = v else {
+        return Err(bad());
+    };
     match (o.len(), o.get("@id"), o.get("@ref")) {
-        (1, Some(Value::String(s)), None) => parse_uuid(s).map(Some),
-        (1, None, Some(Value::String(_))) => Ok(None),
-        _ => Err(Error::new("reference is {\"@id\": …} or {\"@ref\": …}")),
+        (1, Some(Value::String(s)), None) => parse_uuid(s).map(RefTarget::Id),
+        (1, None, Some(Value::String(s))) => Ok(RefTarget::Symbolic(s)),
+        _ => Err(bad()),
     }
 }
 
@@ -225,13 +300,17 @@ impl Interner {
                 let ord = ordinal(e.fields, key)
                     .ok_or_else(|| ctx(e.ty, key, "not a compact-form property"))?;
                 let kind = e.fields[ord as usize].1;
-                let targets: Box<dyn Iterator<Item = &Value>> = match (kind, value) {
-                    (K_REF, v) => Box::new(std::iter::once(v)),
-                    (K_REF_LIST, Value::Array(a)) => Box::new(a.iter()),
+                // A null single reference is the non-default null
+                // `write_value` spells; any other non-object shape is
+                // refused there with the field's own message.
+                let targets: &[Value] = match (kind, value) {
+                    (K_REF, Value::Object(_)) => std::slice::from_ref(value),
+                    (K_REF_LIST, Value::Array(a)) => a,
                     _ => continue,
                 };
                 for t in targets {
-                    if let Some(u) = ref_uuid(t)? {
+                    let target = ref_target(t).map_err(|err| ctx(e.ty, key, &err.to_string()))?;
+                    if let RefTarget::Id(u) = target {
                         if !local.contains_key(&u) {
                             ext.insert(u);
                         }
@@ -258,9 +337,9 @@ impl Interner {
 }
 
 pub(crate) fn write_ref(w: &mut Writer, interner: &Interner, v: &Value) -> Result<(), Error> {
-    match ref_uuid(v)? {
-        Some(u) => w.uint(interner.index(u)),
-        None => w.tstr(v["@ref"].as_str().unwrap()),
+    match ref_target(v)? {
+        RefTarget::Id(u) => w.uint(interner.index(u)),
+        RefTarget::Symbolic(s) => w.tstr(s),
     }
     Ok(())
 }
@@ -285,11 +364,13 @@ pub(crate) fn write_value(
                 w.tstr(s.as_str().ok_or_else(|| bad("string list holds strings"))?);
             }
         }
-        (K_REF, Value::Object(_)) => write_ref(w, interner, v)?,
+        (K_REF, Value::Object(_)) => {
+            write_ref(w, interner, v).map_err(|err| ctx(ty, prop, &err.to_string()))?;
+        }
         (K_REF_LIST, Value::Array(a)) => {
             w.array(a.len());
             for t in a {
-                write_ref(w, interner, t)?;
+                write_ref(w, interner, t).map_err(|err| ctx(ty, prop, &err.to_string()))?;
             }
         }
         (K_ENUM, Value::String(s)) => {
@@ -323,9 +404,11 @@ pub(crate) fn write_element(
     implied_owners: Option<&[Option<&str>; 2]>,
 ) -> Result<(), Error> {
     // Presence bits: u64 fast path, byte-string bitmap for the wide
-    // full-form field lists (bit i of byte i/8, little-endian).
-    let mut bits = vec![0u8; e.fields.len().div_ceil(8)];
-    let mut entries: Vec<(u8, &Value)> = Vec::new();
+    // full-form field lists (bit i of byte i/8, little-endian). The
+    // wire ordinal is a byte, so no field list is longer than 256 and
+    // no bitmap wider than 32 — it rides the stack.
+    let mut bits = [0u8; 32];
+    let mut entries: Vec<(u8, &Value)> = Vec::with_capacity(e.obj.len());
     'keys: for (key, value) in e.obj {
         if key == "@id" || key == "@type" {
             continue;
@@ -351,23 +434,19 @@ pub(crate) fn write_element(
         // Interner::build verified every key.
         let ord = ordinal(e.fields, key).unwrap();
         let field = &e.fields[ord as usize];
-        if default_value(field, e.id).is_some_and(|d| d == *value) {
+        if is_default_value(field, e.id, value) {
             bits[ord as usize / 8] |= 1 << (ord % 8);
         } else {
             entries.push((ord, value));
         }
     }
-    entries.sort_by_key(|&(ord, _)| ord);
+    entries.sort_unstable_by_key(|&(ord, _)| ord);
     w.array(3);
     w.uint(e.code as u64);
     if e.fields.len() <= 64 {
-        let mut presence = 0u64;
-        for (i, b) in bits.iter().enumerate() {
-            presence |= (*b as u64) << (i * 8);
-        }
-        w.uint(presence);
+        w.uint(u64::from_le_bytes(std::array::from_fn(|i| bits[i])));
     } else {
-        w.bstr(&bits);
+        w.bstr(&bits[..e.fields.len().div_ceil(8)]);
     }
     w.map(entries.len());
     for (ord, value) in entries {
@@ -416,9 +495,8 @@ fn write_units(w: &mut Writer, units: &[(usize, String)]) {
 /// the two ingredients [`FLAG_IMPLIED_OWNERS`] encoding needs.
 pub(crate) type OwnerPlan<'a> = (Vec<[Option<&'a str>; 2]>, Vec<(u64, u64)>);
 
-pub(crate) fn owner_plan<'a>(value: &'a Value, elems: &[Elem<'a>]) -> OwnerPlan<'a> {
-    let arr = value.as_array().expect("elems_of validated the array");
-    let owners = derive_owners(arr);
+pub(crate) fn owner_plan<'a>(elements: &[&Value], elems: &[Elem<'a>]) -> OwnerPlan<'a> {
+    let owners = derive_owners(elements.iter().copied());
     let derived: Vec<[Option<&str>; 2]> = owners
         .iter()
         .map(|o| o.map(|s| s.map(|j| elems[j].id)))
@@ -455,24 +533,35 @@ fn write_owner_exceptions(w: &mut Writer, exceptions: &[(u64, u64)]) {
 }
 
 fn encode(
-    value: &Value,
+    elements: &[&Value],
     full: bool,
     units: &[(usize, String)],
     implied_owners: bool,
 ) -> Result<Vec<u8>, Error> {
-    let elems = elems_of(value, table_set(full))?;
+    encode_flagged(elements, full, units, implied_owners, 0)
+}
+
+fn encode_flagged(
+    elements: &[&Value],
+    full: bool,
+    units: &[(usize, String)],
+    implied_owners: bool,
+    extra_flags: u8,
+) -> Result<Vec<u8>, Error> {
+    let elems = elems_of(elements, table_set(full))?;
     let units = check_units(units, elems.len())?;
     let interner = Interner::build(&elems)?;
     let implied = implied_owners && !full;
-    let owners = implied.then(|| owner_plan(value, &elems));
+    let owners = implied.then(|| owner_plan(elements, &elems));
     let mut flags = if full { FLAG_FULL_FORM } else { 0 };
+    flags |= extra_flags;
     if units.is_some() {
         flags |= FLAG_UNIT_PATHS;
     }
     if implied {
         flags |= FLAG_IMPLIED_OWNERS;
     }
-    let mut w = Writer::with_magic();
+    let mut w = Writer::with_magic_for(elems.len());
     w.array(4 + usize::from(implied) + usize::from(units.is_some()));
     w.uint(header_word(flags));
     w.array(interner.ext.len());
@@ -500,14 +589,14 @@ fn encode(
 /// backpointers travel implied ([`FLAG_IMPLIED_OWNERS`]) — decode
 /// re-derives them, Value-identically.
 pub fn to_compact_cbor(value: &Value) -> Result<Vec<u8>, Error> {
-    encode(value, false, &[], true)
+    encode(&element_views(value)?, false, &[], true)
 }
 
 /// The digest-space encoding: owners always spelled, no
 /// [`FLAG_IMPLIED_OWNERS`]. State digests canonicalize through this,
 /// so wire-format elision never moves a digest. Not a wire emitter.
-pub(crate) fn to_compact_cbor_canonical(value: &Value) -> Result<Vec<u8>, Error> {
-    encode(value, false, &[], false)
+pub(crate) fn to_compact_cbor_canonical(elements: &[&Value]) -> Result<Vec<u8>, Error> {
+    encode(elements, false, &[], false)
 }
 
 /// [`to_compact_cbor`] carrying the model's **unit structure**: each
@@ -519,7 +608,23 @@ pub fn to_compact_cbor_with_units(
     value: &Value,
     units: &[(usize, String)],
 ) -> Result<Vec<u8>, Error> {
-    encode(value, false, units, true)
+    encode(&element_views(value)?, false, units, true)
+}
+
+/// [`to_compact_cbor_with_units`] for a model whose ids are **explicit**
+/// (not all graph-derived): the payload carries [`FLAG_EXPLICIT_IDS`] so
+/// a receiver never re-derives them. The element records are identical.
+pub fn to_compact_cbor_with_units_explicit(
+    value: &Value,
+    units: &[(usize, String)],
+) -> Result<Vec<u8>, Error> {
+    encode_flagged(
+        &element_views(value)?,
+        false,
+        units,
+        true,
+        FLAG_EXPLICIT_IDS,
+    )
 }
 
 /// The digest namespace for [`id_digest`] (fixed, versioned with the
@@ -562,7 +667,8 @@ pub fn to_compact_cbor_elided_with_units(
     external_name: &dyn Fn(&str) -> Option<String>,
     units: &[(usize, String)],
 ) -> Result<Vec<u8>, Error> {
-    let elems = elems_of(value, table_set(false))?;
+    let elements = element_views(value)?;
+    let elems = elems_of(&elements, table_set(false))?;
     let units = check_units(units, elems.len())?;
     let interner = Interner::build(&elems)?;
     let derived = sysmlv2_model::ids::derive_ids(value, external_name).map_err(Error::new)?;
@@ -573,12 +679,12 @@ pub fn to_compact_cbor_elided_with_units(
         .map(|(i, e)| (i as u64, e.uuid))
         .collect();
     let digest = id_digest(elems.iter().map(|e| e.uuid));
-    let (owner_derived, owner_exceptions) = owner_plan(value, &elems);
+    let (owner_derived, owner_exceptions) = owner_plan(&elements, &elems);
     let mut flags = FLAG_ELIDE_IDS | FLAG_IMPLIED_OWNERS;
     if units.is_some() {
         flags |= FLAG_UNIT_PATHS;
     }
-    let mut w = Writer::with_magic();
+    let mut w = Writer::with_magic_for(elems.len());
     w.array(5 + usize::from(units.is_some()));
     w.uint(header_word(flags));
     w.array(interner.ext.len());
@@ -611,11 +717,66 @@ pub fn to_compact_cbor_elided_with_units(
 /// without running derivation — full-form CBOR is never an ingest
 /// format: lift consumes the compact form.
 pub fn to_full_cbor(value: &Value) -> Result<Vec<u8>, Error> {
-    encode(value, true, &[], false)
+    encode(&element_views(value)?, true, &[], false)
 }
 
 /// [`to_full_cbor`] carrying the model's unit structure (see
 /// [`to_compact_cbor_with_units`]).
 pub fn to_full_cbor_with_units(value: &Value, units: &[(usize, String)]) -> Result<Vec<u8>, Error> {
-    encode(value, true, units, false)
+    encode(&element_views(value)?, true, units, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Building a field's default and recognizing one are the same
+    /// rule, stated twice for the callers that only need to compare.
+    /// Over every field of every metaclass in both table sets, the two
+    /// agree on the default itself and on a spread of other values.
+    #[test]
+    fn the_two_default_rules_agree_on_every_field() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let other = "00000000-0000-4000-8000-000000000002";
+        let probes = [
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::String(id.to_owned()),
+            Value::String(other.to_owned()),
+            Value::String(String::new()),
+            Value::Array(Vec::new()),
+            Value::Array(vec![Value::Null]),
+            serde_json::json!(0),
+            serde_json::json!({ "@id": id }),
+        ];
+        for tables in [table_set(false), table_set(true)] {
+            for (ty, fields) in tables {
+                for field in *fields {
+                    let built = default_value(field, id);
+                    for probe in &probes {
+                        assert_eq!(
+                            is_default_value(field, id, probe),
+                            built.as_ref() == Some(probe),
+                            "{ty}.{}: {probe} against {built:?}",
+                            field.0
+                        );
+                    }
+                    // Every enum vocabulary word, so the default word
+                    // is told apart from its neighbours.
+                    if field.1 == K_ENUM && field.2 != 255 {
+                        for word in ENUM_TABLES[field.2 as usize] {
+                            let probe = Value::String((*word).to_owned());
+                            assert_eq!(
+                                is_default_value(field, id, &probe),
+                                built.as_ref() == Some(&probe),
+                                "{ty}.{}: enum word {word}",
+                                field.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

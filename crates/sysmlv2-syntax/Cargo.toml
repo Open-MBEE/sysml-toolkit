@@ -11,4 +11,9 @@ license.workspace = true
 repository.workspace = true
 include = ["src/**", "Cargo.toml"]
 
+[features]
+# Internal prepared-library persistence; the default syntax crate stays dependency-free.
+serde = ["dep:serde"]
+
 [dependencies]
+serde = { workspace = true, optional = true }

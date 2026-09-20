@@ -35,6 +35,7 @@ mod translate;
 mod z3;
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 pub use sysmlv2_model::check::ConstraintBinding;
 use sysmlv2_model::check::{ConstraintVerdict, constraint_bindings, constraint_verdict};
@@ -69,11 +70,19 @@ impl SolverConfig {
 }
 
 /// A witness value for one unbound feature.
+///
+/// New kinds of value may be decoded in future releases, so a `match`
+/// over this needs a catch-all arm.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum WitnessValue {
+    /// A boolean value.
     Bool(bool),
+    /// An integer value, exact within the machine range.
     Int(i128),
-    Real(f64),
+    /// An exact real value, as the solver printed it (a decimal or a
+    /// fraction), with no rounding through a double.
+    Real(sysmlv2_model::rational::Rational),
     /// An enumeration literal, by declared name.
     Enum(String),
     /// A value in an inferred measurement unit (e.g. `30 [d]`) — units are
@@ -97,7 +106,11 @@ impl fmt::Display for WitnessValue {
 }
 
 /// What solving concluded about one undecided constraint.
+///
+/// New conclusions may be added in future releases, so a `match` over
+/// this needs a catch-all arm; treat an unrecognized one as undecided.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum SolveOutcome {
     /// Holds for every assignment of the unbound features.
     Valid,
@@ -134,25 +147,67 @@ pub struct SolvedConstraint {
 }
 
 /// Why solving could not run at all.
+///
+/// New reasons may be added in future releases, so a `match` over this
+/// needs a catch-all arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SolveError {
-    /// The Z3 binary was not found or did not identify itself.
-    SolverUnavailable(String),
+    /// The Z3 binary could not be started, or started but did not
+    /// identify itself.
+    SolverUnavailable {
+        /// The binary that was tried: [`SolverConfig::z3_path`], or plain
+        /// `z3` to be looked up on `PATH`.
+        path: PathBuf,
+        /// What the operating system reported — `NotFound` when there is
+        /// no such binary, `PermissionDenied` when it is not executable,
+        /// and so on. `None` when the binary did run but printed no
+        /// version banner. Also reachable as
+        /// [`std::error::Error::source`].
+        source: Option<std::io::Error>,
+    },
 }
 
 impl fmt::Display for SolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SolveError::SolverUnavailable(m) => write!(f, "Z3 is not available: {m}"),
+            SolveError::SolverUnavailable {
+                path,
+                source: Some(e),
+            } => write!(
+                f,
+                "Z3 is not available: cannot run `{}`: {e}",
+                path.display()
+            ),
+            SolveError::SolverUnavailable { path, source: None } => write!(
+                f,
+                "Z3 is not available: `{} -version` printed nothing",
+                path.display()
+            ),
         }
     }
 }
 
-impl std::error::Error for SolveError {}
+impl std::error::Error for SolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SolveError::SolverUnavailable { source, .. } => source
+                .as_ref()
+                .map(|e| e as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
 
 /// The configured Z3's version banner (the availability probe).
+///
+/// # Errors
+///
+/// [`SolveError::SolverUnavailable`] when the binary cannot be started —
+/// its `source` distinguishes a missing binary from an unreadable one —
+/// or when it starts but prints no banner.
 pub fn z3_version(cfg: &SolverConfig) -> Result<String, SolveError> {
-    z3::version(&cfg.z3()).map_err(SolveError::SolverUnavailable)
+    let path = cfg.z3();
+    z3::version(&path).map_err(|source| SolveError::SolverUnavailable { path, source })
 }
 
 /// Check every constraint of `model` (library units skipped) exactly like
@@ -163,14 +218,15 @@ pub fn solve_constraints(
 ) -> Result<Vec<SolvedConstraint>, SolveError> {
     z3_version(cfg)?;
     let mut r = ResolvedModel::build(model);
+    let tables = translate::EnumTables::build(&r);
     let mut out = Vec::new();
     for c in r.constraints() {
-        if model.units()[c.unit].is_library {
+        if model.is_library_unit(c.unit) {
             continue;
         }
         let verdict = constraint_verdict(&mut r, &c);
         let solve = match &verdict {
-            ConstraintVerdict::Undecided(_) => Some(solve_one(&mut r, &c, cfg, None)),
+            ConstraintVerdict::Undecided(_) => Some(solve_one(&mut r, &tables, &c, cfg, None)),
             _ => None,
         };
         let bindings = match verdict {
@@ -216,8 +272,14 @@ pub struct FeatureRange {
     pub feature: String,
     /// Inferred measurement unit (display spelling), if any.
     pub unit: Option<String>,
-    /// Rendered range or set (`[10, +∞]`, `[3, 7]`, `{Red, Green}`).
+    /// Rendered range or set (`[10, +∞]`, `[3, 7]`, `{Red, Green}`), with
+    /// exact real endpoints: a terminating decimal or a reduced fraction.
     pub range: String,
+    /// [`Self::range`] for glanceable surfaces such as editor hints: a
+    /// real endpoint without a terminating decimal expansion renders as
+    /// a marked approximate decimal (`≈0.3333333333333333`) instead of a
+    /// fraction.
+    pub range_approx: String,
     /// Whether propagation tightened the domain past its declared type.
     pub narrowed: bool,
 }
@@ -225,7 +287,11 @@ pub struct FeatureRange {
 /// What propagation concluded about one undecided constraint. All verdicts
 /// are definitive (the narrowed domains contain every satisfying
 /// assignment), never heuristic.
+///
+/// New conclusions may be added in future releases, so a `match` over
+/// this needs a catch-all arm; treat an unrecognized one as undecided.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum PropagateOutcome {
     /// The body's forward interval is `{true}`: holds for every assignment
     /// consistent with the narrowed domains.
@@ -285,12 +351,14 @@ pub struct Propagation {
 /// interval propagation over each unit's asserted constraints jointly —
 /// narrowing every free feature's domain, upgrading verdicts definitively,
 /// and proving empty domains inconsistent — without any external solver.
+#[must_use]
 pub fn propagate_constraints(model: &Model, cfg: &PropagateConfig) -> Propagation {
     let mut r = ResolvedModel::build(model);
+    let tables = translate::EnumTables::build(&r);
     let all = user_constraints(&mut r, model);
     let verdicts: Vec<ConstraintVerdict> =
         all.iter().map(|c| constraint_verdict(&mut r, c)).collect();
-    let (outcomes, ranges, features) = propagate_core(&mut r, &all, &verdicts, cfg);
+    let (outcomes, ranges, features) = propagate_core(&mut r, &tables, &all, &verdicts, cfg);
     let constraints = all
         .iter()
         .enumerate()
@@ -325,7 +393,7 @@ fn user_constraints(
 ) -> Vec<sysmlv2_model::json::ConstraintInfo> {
     r.constraints()
         .into_iter()
-        .filter(|c| !model.units()[c.unit].is_library)
+        .filter(|c| !model.is_library_unit(c.unit))
         .collect()
 }
 
@@ -350,6 +418,7 @@ fn propagation_is_definitive(o: &Option<PropagateOutcome>) -> bool {
 /// [`verify_constraints`].
 fn propagate_core(
     r: &mut ResolvedModel,
+    tables: &translate::EnumTables,
     all: &[sysmlv2_model::json::ConstraintInfo],
     verdicts: &[ConstraintVerdict],
     cfg: &PropagateConfig,
@@ -376,7 +445,7 @@ fn propagate_core(
 
     for (_, idxs) in &by_unit {
         let cs: Vec<&sysmlv2_model::json::ConstraintInfo> = idxs.iter().map(|&i| &all[i]).collect();
-        let jt = match translate::translate_all(r, &cs) {
+        let jt = match translate::translate_all(r, tables, &cs) {
             Ok(jt) => jt,
             Err(translate::Unsupported(m)) => {
                 for &i in idxs {
@@ -417,10 +486,14 @@ fn propagate_core(
         let (doms, _unsat) = ival::drive(baseline.clone(), &facts, cfg.max_iters);
 
         for (vi, v) in jt.vars.iter().enumerate() {
+            if v.aux {
+                continue;
+            }
             ranges.push(FeatureRange {
                 feature: v.display.clone(),
                 unit: v.unit.clone(),
-                range: ival::fmt_dom(doms[vi], &jt.enums),
+                range: ival::fmt_dom(&doms[vi], &jt.enums, false),
+                range_approx: ival::fmt_dom(&doms[vi], &jt.enums, true),
                 narrowed: doms[vi] != baseline[vi],
             });
         }
@@ -440,7 +513,11 @@ fn propagate_core(
                     }
                     translate::JointRoot::Skipped(_) => {}
                 }
-                features[i] = vs.iter().map(|&v| jt.vars[v].display.clone()).collect();
+                features[i] = vs
+                    .iter()
+                    .filter(|&&v| !jt.vars[v].aux)
+                    .map(|&v| jt.vars[v].display.clone())
+                    .collect();
             }
             outcomes[i] = Some(match &jt.roots[k] {
                 translate::JointRoot::Skipped(m) => PropagateOutcome::Unsupported(m.clone()),
@@ -519,7 +596,10 @@ pub struct VerifiedConstraint {
 /// narrowed feature ranges.
 #[derive(Clone, Debug)]
 pub struct VerifyReport {
+    /// One entry per non-library constraint, in model order.
     pub constraints: Vec<VerifiedConstraint>,
+    /// Narrowed feature domains, in first-encountered order (see
+    /// [`Propagation::ranges`]).
     pub ranges: Vec<FeatureRange>,
 }
 
@@ -539,10 +619,11 @@ pub fn verify_constraints(
         z3_version(cfg)?;
     }
     let mut r = ResolvedModel::build(model);
+    let tables = translate::EnumTables::build(&r);
     let all = user_constraints(&mut r, model);
     let verdicts: Vec<ConstraintVerdict> =
         all.iter().map(|c| constraint_verdict(&mut r, c)).collect();
-    let (propagate, ranges, features) = propagate_core(&mut r, &all, &verdicts, prop_cfg);
+    let (propagate, ranges, features) = propagate_core(&mut r, &tables, &all, &verdicts, prop_cfg);
 
     let mut constraints = Vec::with_capacity(all.len());
     for (i, c) in all.iter().enumerate() {
@@ -553,7 +634,7 @@ pub fn verify_constraints(
                 if matches!(verdicts[i], ConstraintVerdict::Undecided(_))
                     && !propagation_is_definitive(&propagate[i]) =>
             {
-                Some(solve_one(&mut r, c, cfg, Some(prop_cfg)))
+                Some(solve_one(&mut r, &tables, c, cfg, Some(prop_cfg)))
             }
             _ => None,
         };
@@ -584,6 +665,9 @@ pub fn verify_constraints(
 /// (`(assert (>= x lo))`, enum membership, boolean fixing). Infinite /
 /// saturated endpoints and full domains contribute nothing. These are
 /// sound to add **only** to the "can it hold?" query — see [`solve_one`].
+///
+/// Writing into a `String` cannot fail, so the formatting results are
+/// discarded rather than propagated.
 fn domain_bound_asserts(
     vars: &[translate::VarInfo],
     doms: &[ival::Dom],
@@ -591,51 +675,45 @@ fn domain_bound_asserts(
 ) -> String {
     let mut out = String::new();
     for (i, v) in vars.iter().enumerate() {
-        match doms[i] {
+        match &doms[i] {
             ival::Dom::R(iv) => {
-                if iv.lo.is_finite() {
-                    if let Some(l) = term::real_from_f64(iv.lo) {
-                        out.push_str(&format!("(assert (>= {} {l}))\n", v.sym));
-                    }
+                if let ival::Ext::Fin(l) = &iv.lo {
+                    let l = term::render_real(l);
+                    let _ = writeln!(out, "(assert (>= {} {l}))", v.sym);
                 }
-                if iv.hi.is_finite() {
-                    if let Some(h) = term::real_from_f64(iv.hi) {
-                        out.push_str(&format!("(assert (<= {} {h}))\n", v.sym));
-                    }
+                if let ival::Ext::Fin(h) = &iv.hi {
+                    let h = term::render_real(h);
+                    let _ = writeln!(out, "(assert (<= {} {h}))", v.sym);
                 }
             }
             ival::Dom::I(iv) => {
                 if iv.lo != i128::MIN {
-                    out.push_str(&format!(
-                        "(assert (>= {} {}))\n",
-                        v.sym,
-                        term::render_int(iv.lo)
-                    ));
+                    let _ = writeln!(out, "(assert (>= {} {}))", v.sym, term::render_int(iv.lo));
                 }
                 if iv.hi != i128::MAX {
-                    out.push_str(&format!(
-                        "(assert (<= {} {}))\n",
-                        v.sym,
-                        term::render_int(iv.hi)
-                    ));
+                    let _ = writeln!(out, "(assert (<= {} {}))", v.sym, term::render_int(iv.hi));
                 }
             }
-            ival::Dom::B(ival::Tri::True) => out.push_str(&format!("(assert {})\n", v.sym)),
-            ival::Dom::B(ival::Tri::False) => out.push_str(&format!("(assert (not {}))\n", v.sym)),
+            ival::Dom::B(ival::Tri::True) => {
+                let _ = writeln!(out, "(assert {})", v.sym);
+            }
+            ival::Dom::B(ival::Tri::False) => {
+                let _ = writeln!(out, "(assert (not {}))", v.sym);
+            }
             ival::Dom::E(s, set) => {
                 // A strict, non-empty subset of the enum's literals.
-                let lits: Vec<String> = enums[s]
+                let lits: Vec<String> = enums[*s]
                     .ctors
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| set.contains(*j))
                     .map(|(_, ctor)| format!("(= {} {ctor})", v.sym))
                     .collect();
-                if !lits.is_empty() && lits.len() < enums[s].ctors.len() {
+                if !lits.is_empty() && lits.len() < enums[*s].ctors.len() {
                     if lits.len() == 1 {
-                        out.push_str(&format!("(assert {})\n", lits[0]));
+                        let _ = writeln!(out, "(assert {})", lits[0]);
                     } else {
-                        out.push_str(&format!("(assert (or {}))\n", lits.join(" ")));
+                        let _ = writeln!(out, "(assert (or {}))", lits.join(" "));
                     }
                 }
             }
@@ -659,11 +737,12 @@ fn domain_bound_asserts(
 /// clipping it away would fake a validity proof.
 fn solve_one(
     r: &mut ResolvedModel,
+    tables: &translate::EnumTables,
     c: &sysmlv2_model::json::ConstraintInfo,
     cfg: &SolverConfig,
     propagate_bounds: Option<&PropagateConfig>,
 ) -> SolveOutcome {
-    let tr = match translate::translate(r, c) {
+    let tr = match translate::translate(r, tables, c) {
         Ok(tr) => tr,
         Err(translate::Unsupported(m)) => {
             return SolveOutcome::Unknown(format!("not in the solvable fragment: {m}"));
@@ -681,26 +760,27 @@ fn solve_one(
         Ok(g) => g,
         Err(e) => return internal(e),
     };
+    // Writing into a `String` cannot fail, so every formatting result
+    // here is discarded rather than propagated.
     let mut decls = String::new();
-    decls.push_str(&format!("(set-option :timeout {})\n", cfg.timeout_ms));
+    let _ = writeln!(decls, "(set-option :timeout {})", cfg.timeout_ms);
     for e in &tr.enums {
         let ctors: Vec<String> = e.ctors.iter().map(|c| format!("({c})")).collect();
-        decls.push_str(&format!(
-            "(declare-datatypes (({} 0)) (({})))\n",
+        let _ = writeln!(
+            decls,
+            "(declare-datatypes (({} 0)) (({})))",
             e.sym,
             ctors.join(" ")
-        ));
+        );
     }
     for v in &tr.vars {
-        decls.push_str(&format!(
-            "(declare-const {} {})\n",
-            v.sym,
-            ctx.sort_name(v.sort)
-        ));
+        let _ = writeln!(decls, "(declare-const {} {})", v.sym, ctx.sort_name(v.sort));
     }
     for s in &tr.side {
         match ctx.render(s) {
-            Ok((t, _)) => decls.push_str(&format!("(assert {t})\n")),
+            Ok((t, _)) => {
+                let _ = writeln!(decls, "(assert {t})");
+            }
             Err(e) => return internal(e),
         }
     }
@@ -760,6 +840,7 @@ fn solve_one(
         .vars
         .iter()
         .zip(&witness)
+        .filter(|(v, _)| !v.aux)
         .map(|(v, val)| {
             let decoded = decode_value(val, &tr.enums);
             let decoded = match &v.unit {
@@ -796,8 +877,8 @@ fn decode_value(s: &SExpr, enums: &[term::EnumSort]) -> WitnessValue {
                     return Some(WitnessValue::Int(i));
                 }
                 if a.contains('.') {
-                    if let Ok(f) = a.parse::<f64>() {
-                        return Some(WitnessValue::Real(f));
+                    if let Some(r) = sysmlv2_model::rational::Rational::parse_decimal(a) {
+                        return Some(WitnessValue::Real(r));
                     }
                 }
                 for e in enums {
@@ -810,21 +891,22 @@ fn decode_value(s: &SExpr, enums: &[term::EnumSort]) -> WitnessValue {
             SExpr::List(items) => match items.as_slice() {
                 [SExpr::Atom(op), x] if op == "-" => match go(x, enums)? {
                     WitnessValue::Int(i) => Some(WitnessValue::Int(-i)),
-                    WitnessValue::Real(f) => Some(WitnessValue::Real(-f)),
+                    WitnessValue::Real(r) => Some(WitnessValue::Real(r.neg())),
                     _ => None,
                 },
                 [SExpr::Atom(op), a, b] if op == "/" => {
+                    use sysmlv2_model::rational::Rational;
                     let num = match go(a, enums)? {
-                        WitnessValue::Int(i) => i as f64,
-                        WitnessValue::Real(f) => f,
+                        WitnessValue::Int(i) => Rational::from_integer(i),
+                        WitnessValue::Real(r) => r,
                         _ => return None,
                     };
                     let den = match go(b, enums)? {
-                        WitnessValue::Int(i) => i as f64,
-                        WitnessValue::Real(f) => f,
+                        WitnessValue::Int(i) => Rational::from_integer(i),
+                        WitnessValue::Real(r) => r,
                         _ => return None,
                     };
-                    Some(WitnessValue::Real(num / den))
+                    Some(WitnessValue::Real(num.div(&den)?))
                 }
                 _ => None,
             },
@@ -846,7 +928,7 @@ mod witness_containment {
     use crate::ival::Dom;
     use crate::term::EnumSort;
 
-    fn dom_contains(val: &WitnessValue, d: Dom, enums: &[EnumSort]) -> bool {
+    fn dom_contains(val: &WitnessValue, d: &Dom, enums: &[EnumSort]) -> bool {
         // A quantity witness carries its magnitude in the same reference
         // scale the term (and thus the domain) uses.
         let val = match val {
@@ -855,9 +937,11 @@ mod witness_containment {
         };
         match (val, d) {
             (WitnessValue::Int(i), Dom::I(iv)) => iv.contains(*i),
-            (WitnessValue::Int(i), Dom::R(rv)) => rv.contains(*i as f64),
-            (WitnessValue::Real(f), Dom::R(rv)) => rv.contains(*f),
-            (WitnessValue::Real(f), Dom::I(iv)) => iv.to_ival().contains(*f),
+            (WitnessValue::Int(i), Dom::R(rv)) => {
+                rv.contains_rational(&sysmlv2_model::rational::Rational::from_integer(*i))
+            }
+            (WitnessValue::Real(r), Dom::R(rv)) => rv.contains_rational(r),
+            (WitnessValue::Real(r), Dom::I(iv)) => iv.to_ival().contains_rational(r),
             (WitnessValue::Bool(b), Dom::B(t)) => {
                 if *b {
                     t.may_true()
@@ -865,7 +949,7 @@ mod witness_containment {
                     t.may_false()
                 }
             }
-            (WitnessValue::Enum(name), Dom::E(s, set)) => enums[s]
+            (WitnessValue::Enum(name), Dom::E(s, set)) => enums[*s]
                 .displays
                 .iter()
                 .enumerate()
@@ -891,9 +975,10 @@ mod witness_containment {
             model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
         }
         let mut r = ResolvedModel::build(&model);
+        let tables = translate::EnumTables::build(&r);
         let mut checked = 0usize;
         for c in r.constraints() {
-            if model.units()[c.unit].is_library {
+            if model.is_library_unit(c.unit) {
                 continue;
             }
             if !matches!(
@@ -902,14 +987,15 @@ mod witness_containment {
             ) {
                 continue;
             }
-            let SolveOutcome::Satisfiable(pairs) = solve_one(&mut r, &c, &cfg, None) else {
+            let SolveOutcome::Satisfiable(pairs) = solve_one(&mut r, &tables, &c, &cfg, None)
+            else {
                 continue;
             };
             // Re-translate the identical single constraint and propagate its
             // asserted system {root} ∪ declared-type side facts — exactly
             // what Z3's first query asserted. Determinism guarantees the
             // variable order matches the witness pairs.
-            let Ok(tr) = translate::translate(&mut r, &c) else {
+            let Ok(tr) = translate::translate(&mut r, &tables, &c) else {
                 continue;
             };
             let enum_sizes: Vec<usize> = tr.enums.iter().map(|e| e.ctors.len()).collect();
@@ -921,18 +1007,21 @@ mod witness_containment {
             let mut facts = tr.side.clone();
             facts.push(tr.root.clone());
             let (doms, unsat) = ival::drive(init, &facts, PropagateConfig::default().max_iters);
-            let where_ = &model.units()[c.unit].name;
+            let where_ = &model.unit(c.unit).name;
             assert!(
                 !unsat,
                 "propagation proved unsat but Z3 found a witness: {:?} in {where_}",
                 c.name
             );
-            assert_eq!(pairs.len(), tr.vars.len(), "witness/var count mismatch");
-            for (k, (disp, val)) in pairs.iter().enumerate() {
+            // Auxiliaries are part of the variable space but never
+            // witnessed; the reported pairs align with the rest.
+            let reported: Vec<usize> = (0..tr.vars.len()).filter(|&k| !tr.vars[k].aux).collect();
+            assert_eq!(pairs.len(), reported.len(), "witness/var count mismatch");
+            for (&k, (disp, val)) in reported.iter().zip(&pairs) {
                 assert!(
-                    dom_contains(val, doms[k], &tr.enums),
+                    dom_contains(val, &doms[k], &tr.enums),
                     "witness {disp} = {val} escapes propagated range {} ({:?} in {where_})",
-                    ival::fmt_dom(doms[k], &tr.enums),
+                    ival::fmt_dom(&doms[k], &tr.enums, false),
                     c.name
                 );
             }
@@ -959,6 +1048,7 @@ mod bound_injection {
             sym: sym.into(),
             sort,
             unit: None,
+            aux: false,
         }
     }
 
@@ -977,11 +1067,11 @@ mod bound_injection {
             var("free", Sort::Real),
         ];
         let doms = vec![
-            Dom::R(Ival::new(10.0, f64::INFINITY)), // one-sided real
-            Dom::I(IntIval::new(0, 5)),             // closed integer
-            Dom::B(Tri::True),                      // fixed boolean
-            Dom::E(0, EnumSet { bits: 0b101 }),     // {halt, init}
-            Dom::R(Ival::TOP),                      // nothing to say
+            Dom::R(Ival::from_f64(10.0, f64::INFINITY)), // one-sided real
+            Dom::I(IntIval::new(0, 5)),                  // closed integer
+            Dom::B(Tri::True),                           // fixed boolean
+            Dom::E(0, EnumSet::all(3).minus(&EnumSet::point(1))), // {halt, init}
+            Dom::R(Ival::top()),                         // nothing to say
         ];
         let out = domain_bound_asserts(&vars, &doms, &enums);
         assert!(out.contains("(assert (>= x 10.0))"), "{out}");
@@ -1027,9 +1117,10 @@ mod bound_injection {
             model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
         }
         let mut r = ResolvedModel::build(&model);
+        let tables = translate::EnumTables::build(&r);
         let (mut agree, mut improved, mut regressed) = (0usize, 0usize, 0usize);
         for c in r.constraints() {
-            if model.units()[c.unit].is_library {
+            if model.is_library_unit(c.unit) {
                 continue;
             }
             if !matches!(
@@ -1038,9 +1129,9 @@ mod bound_injection {
             ) {
                 continue;
             }
-            let plain = solve_one(&mut r, &c, &cfg, None);
-            let bounded = solve_one(&mut r, &c, &cfg, Some(&PropagateConfig::default()));
-            let where_ = &model.units()[c.unit].name;
+            let plain = solve_one(&mut r, &tables, &c, &cfg, None);
+            let bounded = solve_one(&mut r, &tables, &c, &cfg, Some(&PropagateConfig::default()));
+            let where_ = &model.unit(c.unit).name;
             match (discriminant(&plain), discriminant(&bounded)) {
                 (Some(a), Some(b)) => {
                     assert_eq!(

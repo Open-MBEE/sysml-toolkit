@@ -86,6 +86,7 @@ pub enum TokenKind {
 
 impl TokenKind {
     /// Trivia tokens are skipped by the parser (Xtext "hidden" terminals).
+    #[must_use]
     pub fn is_trivia(self) -> bool {
         matches!(
             self,
@@ -101,16 +102,19 @@ pub struct Token {
 }
 
 impl Token {
+    #[must_use]
     pub fn new(kind: TokenKind, span: Span) -> Self {
         Token { kind, span }
     }
 
     /// The source text of this token.
+    #[must_use]
     pub fn text<'a>(&self, src: &'a str) -> &'a str {
         self.span.slice(src)
     }
 
     /// True if this token is the word `kw` (used for contextual keywords).
+    #[must_use]
     pub fn is_kw(&self, src: &str, kw: &str) -> bool {
         self.kind == TokenKind::Ident && self.text(src) == kw
     }

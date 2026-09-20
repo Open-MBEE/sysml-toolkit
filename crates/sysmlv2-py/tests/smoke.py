@@ -1,5 +1,6 @@
 """Smoke test of the sysmlv2 Python binding — the whole public surface."""
 import json
+import pathlib
 import sysmlv2
 
 DEMO = """package Defs {
@@ -37,6 +38,42 @@ assert s.typings(front) == [wheel]
 assert len(s.elements_of_metaclass("PartDefinition")) == 3
 assert not s.is_library_element(wheel)
 
+# --- derived properties by specification name ---
+assert [s.name(f) for f in s.derived(vehicle, "ownedFeature")] == ["front", "spare", "count"]
+assert s.derived(vehicle, "name") == "Vehicle"
+assert s.derived(vehicle, "shortName") is None
+assert s.derived(front, "owningType") == vehicle
+assert s.derived(front, "type") == [wheel]
+assert sysmlv2.Session.derives("PartUsage", "ownedFeature") == "exact"
+assert sysmlv2.Session.derives("PartUsage", "feature") == "passthrough"
+assert sysmlv2.Session.derives("PartUsage", "declaredName") == "not-declared"
+assert sysmlv2.Session.is_owned_property("PartUsage", "declaredName")
+assert "owningNamespace" in sysmlv2.Session.computed_names()
+try:
+    s.derived(vehicle, "declaredName")
+    assert False, "an owned property is not derived"
+except KeyError:
+    pass
+try:
+    s.derived(front, "mayTimeVary")
+    assert False, "not computed yet"
+except NotImplementedError:
+    pass
+# A target outside the model, and the closure policy's effect.
+s2 = sysmlv2.Session.from_sources([("o.sysml", "package O { part w : Missing; part def A { part x; } part def B :> A; }")])
+w = s2.resolve("O::w")
+[outside] = s2.derived(w, "type")
+assert isinstance(outside, sysmlv2.OutsideReference) and outside.spelling == "Missing" and outside.id is None
+b = s2.resolve("O::B")
+assert s2.derived(b, "feature") == []
+assert s2.closure_policy() == "passthrough"
+s2.set_closure_policy("closure")
+assert s2.closure_policy() == "closure"
+assert [s2.name(f) for f in s2.derived(b, "feature")] == ["x"]
+s2.edit([{"op": "moveMember", "target": "O::w", "index": 0}])
+assert s2.closure_policy() == "closure"
+s2.set_closure_policy("passthrough")
+
 # --- find-usages ---
 refs = s.references(wheel)
 assert len(refs) == 3, refs
@@ -48,6 +85,15 @@ q = s.query("ownedFeature(Rig::Vehicle)->select { in p; p istype Defs::Wheel }")
 assert [s.name(e) for e in q] == ["front", "spare"], q
 assert s.query("Rig::Vehicle::count + 1") == 3
 assert s.query("2 ** 10") == 1024
+# Exact arithmetic: decimals are rationals, integers are unbounded, and
+# only transcendental results are floats.
+from fractions import Fraction
+assert s.query("0.1 + 0.2") == Fraction(3, 10)
+assert s.query("0.1 + 0.2 == 0.3") is True
+assert s.query("1 / 3") == Fraction(1, 3)
+assert s.query("2.5 * 2") == 5 and isinstance(s.query("2.5 * 2"), int)
+assert s.query("2 ** 200") == 2 ** 200
+assert isinstance(s.query("sqrt(2)"), float)
 count = s.resolve("Rig::Vehicle::count")
 assert s.evaluate(count) == 2
 
@@ -90,7 +136,7 @@ bad.rename(u, "T")
 try:
     t.commit(bad)
     raise AssertionError("shadow capture must raise")
-except RuntimeError as e:
+except sysmlv2.RefusedError as e:
     assert "would resolve to" in str(e), e
 assert t.resolve("P::Q::U") is not None       # rolled back
 
@@ -126,15 +172,26 @@ r2 = sysmlv2.Session.from_interchange_json(p.to_full_json(recover_refs=False))
 assert "Missing" not in r2.units()[0][2]      # the opt-out stays lossy
 
 # --- error surfaces ---
+# Everything the package raises is a sysmlv2.Error; a refusal is also a
+# ValueError, which is what callers caught before the base class existed.
+assert issubclass(sysmlv2.RefusedError, sysmlv2.Error)
+assert issubclass(sysmlv2.RefusedError, ValueError)
+assert not issubclass(sysmlv2.Error, ValueError)
+assert sysmlv2.Error.__module__ == sysmlv2.RefusedError.__module__ == "sysmlv2"
 try:
     s2.query("1 +")
     raise AssertionError("bad expression must raise")
-except ValueError:
-    pass
+except ValueError as e:
+    assert isinstance(e, sysmlv2.RefusedError), type(e)
+try:
+    s2.to_plantuml(element="Nope::Gone")
+    raise AssertionError("unknown element must raise")
+except sysmlv2.Error as e:
+    assert "element not found" in str(e), e
 
 # --- check: the CLI check pipeline as a library call ---
 bad = sysmlv2.check([("bad.sysml", "package Bad {\n  part p : ;\n}")])
-assert bad and bad[0].severity == "error"
+assert bad and bad[0].severity == "error" and bad[0].stage == "parse"
 assert (bad[0].unit, bad[0].line, bad[0].col) == ("bad.sysml", 2, 12)
 assert sysmlv2.check([("ok.sysml", "package Ok { part def A; part a : A; }")]) == []
 
@@ -215,7 +272,7 @@ b.inline_definition(rf.resolve("Rig::Engine"))
 rf.commit(b)
 assert rf.source(0) == RIG  # inline(extract(usage)) is byte-identical
 
-# explicit name, and named refusals surface as ValueError
+# explicit name, and named refusals surface as sysmlv2.RefusedError
 rf2 = sysmlv2.Session.from_sources([("rig.sysml", RIG)])
 b = rf2.edit()
 b.extract_definition(rf2.resolve("Rig::engine"), name="Motor")
@@ -244,6 +301,49 @@ b.inline_definition(imp.resolve("Defs::Tool"))
 report = imp.commit(b)
 assert any("import now unused" in f for f in report.findings), report.findings
 assert "private import Defs::*;" in imp.source(1)  # reported, not removed
+
+# --- library elements are read-only ---
+# Their declarations live in units the session does not hold, so an edit
+# naming one is refused before anything is spliced. Needs the standard
+# library checkout; skipped without it.
+LIBRARY = pathlib.Path(__file__).resolve().parents[3] / "spec-refs/SysML-v2-Release/sysml.library"
+if LIBRARY.is_dir():
+    lb = sysmlv2.Session.from_sources(
+        [("u.sysml", "package U {\n    attribute def A;\n    attribute x : A;\n}\n")]
+    )
+    lb.load_library(str(LIBRARY))
+    real = lb.resolve("ScalarValues::Real")
+    assert lb.is_library_element(real)
+    for stage in (
+        lambda b: b.rename(real, "Reel"),
+        lambda b: b.remove(real),
+        lambda b: b.insert_member(real, "attribute q;"),
+        lambda b: b.set_feature_value(real, "1"),
+        lambda b: b.extract_definition(real),
+        lambda b: b.inline_definition(real),
+    ):
+        batch = lb.edit()
+        stage(batch)
+        try:
+            lb.commit(batch)
+            raise AssertionError("editing a library element must raise")
+        except sysmlv2.RefusedError as e:
+            assert "read-only" in str(e) and "ScalarValues::Real" in str(e), e
+    # `check` accepts the library as a path object as well as a string,
+    # and reports the same findings either way.
+    typo = [("t.sysml", "package T {\n    part p : Nope;\n}\n")]
+    by_path = [repr(f) for f in sysmlv2.check(typo, LIBRARY)]
+    assert by_path == [repr(f) for f in sysmlv2.check(typo, str(LIBRARY))]
+    assert any("Nope" in line for line in by_path), by_path
+
+    # Retargeting a user site *to* a library element stays legal.
+    site = next(r for r in lb.references(lb.resolve("U::A")) if r.kind == "type")
+    batch = lb.edit()
+    batch.retarget(site, real)
+    lb.commit(batch)
+    assert "attribute x : ScalarValues::Real;" in lb.units()[0][2]
+else:
+    print("smoke: no standard library checkout — library refusals not exercised")
 
 assert tuple(int(x) for x in sysmlv2.__version__.split(".")) >= (0, 1, 0)
 

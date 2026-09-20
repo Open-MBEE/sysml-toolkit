@@ -35,8 +35,8 @@ use testkit::xmi_props::{XMI_DERIVED, XMI_HAS_DEFAULT, XMI_OPTIONAL, XmiProp};
 /// properties (KerML 10.4: `@type` = metaclass, `@id` = elementId).
 const BOOKKEEPING: [&str; 2] = ["@type", "@id"];
 
-#[test]
-fn normative_validation_rule_inventory_and_implemented_registry() {
+/// Every `validate…` rule the pinned metamodel XMI declares.
+fn pinned_rules() -> BTreeSet<String> {
     let root = testkit::workspace_root();
     let mut rules = BTreeSet::new();
     for file in ["spec-refs/KerML.xmi", "spec-refs/SysML.xmi"] {
@@ -54,17 +54,97 @@ fn normative_validation_rule_inventory_and_implemented_registry() {
             }
         }
     }
+    rules
+}
+
+#[test]
+fn normative_validation_rule_inventory_and_implemented_registry() {
+    let rules = pinned_rules();
     assert_eq!(
         rules.len(),
         180,
         "the pinned normative validation-rule inventory changed; classify the delta"
     );
-    for implemented in sysmlv2_parser::check::IMPLEMENTED_NORMATIVE_VALIDATION_RULES {
+    for implemented in sysmlv2_parser::check::IMPLEMENTED_NORMATIVE_VALIDATION_RULES
+        .iter()
+        .chain(sysmlv2_parser::check::IMPLEMENTED_NORMATIVE_SEMANTIC_RULES)
+    {
         assert!(
             rules.contains(*implemented),
             "implemented rule `{implemented}` is not present in the pinned XMI"
         );
     }
+}
+
+/// A finding that reports a named rule carries the identifier as a
+/// field, so a consumer never has to read it back out of the message,
+/// and the identifier it carries is the one the pinned metamodel spells.
+/// Where a rule reached this implementation under a different spelling,
+/// the message keeps that spelling and only the field is normalized.
+#[test]
+fn semantic_findings_carry_the_rule_they_report() {
+    use sysmlv2_parser::{check, json::ResolvedModel};
+    let rules = pinned_rules();
+    let implemented: BTreeSet<&str> = check::IMPLEMENTED_NORMATIVE_SEMANTIC_RULES
+        .iter()
+        .copied()
+        .collect();
+    let library = sysmlv2_testkit::library_dir();
+    if !library.is_dir() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut base = Model::new();
+    base.load_library_dir(&library).unwrap();
+    // One prepared library, shared by every probe build.
+    let prepared = base.prepare_library().unwrap();
+    let probes =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opensysml/probes");
+    let mut coded = 0usize;
+    for entry in std::fs::read_dir(&probes).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        if !name.ends_with(".sysml") && !name.ends_with(".kerml") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        let mut model = Model::new();
+        prepared.clone().install(&mut model).unwrap();
+        model.add_source(&name, &source);
+        let mut r = ResolvedModel::build(&model);
+        for (_, d) in check::validate_semantics_with(&mut r, &model) {
+            let spelled = d
+                .message
+                .strip_suffix(']')
+                .and_then(|head| head.rsplit_once(" ["))
+                .map(|(_, rule)| rule)
+                .filter(|rule| rule.starts_with("validate"));
+            let Some(spelled) = spelled else {
+                assert!(
+                    d.code.is_none(),
+                    "{name}: a finding naming no rule carries a code: {d:?}"
+                );
+                continue;
+            };
+            let code = d
+                .code
+                .unwrap_or_else(|| panic!("{name}: finding reports `{spelled}` with no code"));
+            assert!(
+                code == spelled || (rules.contains(code) && !rules.contains(spelled)),
+                "{name}: code `{code}` differs from the message's `{spelled}` \
+                 without being the pinned spelling of it"
+            );
+            if rules.contains(code) {
+                assert!(
+                    implemented.contains(code),
+                    "{name}: rule `{code}` is reported and pinned, but missing \
+                     from the implemented-rule registry"
+                );
+            }
+            coded += 1;
+        }
+    }
+    assert!(coded > 100, "the probe sweep reported only {coded} rules");
 }
 
 /// Documented omissions: required or coverage-expected properties the
@@ -86,9 +166,9 @@ const OMISSIONS: [(&str, &str, &str); 3] = [
     (
         "ConjugatedPortTyping",
         "conjugatedPortDefinition",
-        "TRACKED GAP (INTEROP.md 'Known gaps'): the implicit `~P` \
-         ConjugatedPortDefinition element is not modeled yet — conjugated \
-         typings carry the metaclass but reference the base definition",
+        "TRACKED GAP (INTEROP.md 'Known gaps'): the compact owner-side \
+         property remains omitted; the implicit `~P` element and the \
+         full-form owner-side property are emitted",
     ),
 ];
 

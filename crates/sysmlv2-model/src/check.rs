@@ -2,12 +2,143 @@
 
 use sysmlv2_syntax::diag::Diagnostic;
 
+mod actions;
+mod chains;
+mod connectors;
+mod dimensions;
+mod distinguishability;
+mod endpoints;
+mod expressions;
+pub(crate) mod facts;
+mod invocations;
+mod multiplicities;
+mod relationships;
+mod scalars;
+mod specialization;
+mod structural;
+mod typing;
+mod values;
+
+pub use distinguishability::InheritedNameCollision;
+pub use typing::IncompatibleTyping;
+
+/// Every inherited-name collision among the user elements — the pairs
+/// the semantic check reports as `validateNamespaceDistinguishibility` —
+/// for repairs that spell the missing redefinition.
+pub fn inherited_name_collisions(
+    r: &mut crate::json::ResolvedModel,
+) -> Vec<InheritedNameCollision> {
+    distinguishability::collisions(r)
+}
+
+/// Whether `metaclass` is `base` or one of its specializations in the
+/// KerML/SysML metamodel (`PortDefinition` conforms to `Definition`).
+#[must_use]
+pub fn metaclass_conforms(metaclass: &str, base: &str) -> bool {
+    crate::metaclass::conforms(metaclass, base)
+}
+
+/// Every user usage typed by a definition its own kind cannot take — the
+/// pairs the semantic check reports as `X must be typed by Y` — for
+/// repairs that rewrite the usage keyword.
+#[must_use]
+pub fn incompatible_typings(r: &crate::json::ResolvedModel) -> Vec<IncompatibleTyping> {
+    typing::incompatible_typings(r)
+}
+
+/// Semantic diagnostics whose rule names occur in the pinned XMI. Labels
+/// introduced by later validator versions are tracked separately in the
+/// external-fixture contracts and do not enlarge the normative denominator.
+pub const IMPLEMENTED_NORMATIVE_SEMANTIC_RULES: &[&str] = &[
+    "validateAssertConstraintUsageReference",
+    "validateAssignmentActionUsageReferent",
+    "validateAssociationBinarySpecialization",
+    "validateAssociationEndTypes",
+    "validateAssociationRelatedTypes",
+    "validateBehaviorSpecialization",
+    "validateBindingConnectorIsBinary",
+    "validateCaseDefinitionOnlyOneObjective",
+    "validateCaseUsageOnlyOneObjective",
+    "validateClassSpecialization",
+    "validateConnectorRelatedFeatures",
+    "validateConstructorExpressionNoDuplicateFeatureRedefinition",
+    "validateControlNodeIncomingSuccessions",
+    "validateControlNodeOutgoingSuccessions",
+    "validateControlNodeOwningType",
+    "validateCrossSubsettingCrossedFeature",
+    "validateCrossSubsettingCrossingFeature",
+    "validateDataTypeSpecialization",
+    "validateDecisionNodeIncomingSuccessions",
+    "validateDecisionNodeOutgoingSuccessions",
+    "validateDefinitionVariationSpecialization",
+    "validateExhibitStateUsageReference",
+    "validateExpressionResultExpressionMembership",
+    "validateExpressionResultParameterMembership",
+    "validateFeatureChainingFeatureConformance",
+    "validateFeatureChainingFeatureNotOne",
+    "validateFeatureChainingFeaturesNotSelf",
+    "validateFeatureConstantIsVariable",
+    "validateFeatureCrossFeatureSpecialization",
+    "validateFeatureCrossFeatureType",
+    "validateFeatureIsVariable",
+    "validateFeatureOwnedCrossSubsetting",
+    "validateFeatureOwnedReferenceSubsetting",
+    "validateFeaturePortionNotVariable",
+    "validateFeatureReferenceExpressionReferentIsFeature",
+    "validateFeatureValueIsInitial",
+    "validateFeatureValueOverriding",
+    "validateForkNodeIncomingSuccessions",
+    "validateFunctionResultExpressionMembership",
+    "validateFunctionResultParameterMembership",
+    "validateIncludeUseCaseUsageReference",
+    "validateInstantiationExpressionInstantiatedType",
+    "validateInvocationExpressionInstantiatedType",
+    "validateJoinNodeOutgoingSuccessions",
+    "validateMergeNodeIncomingSuccessions",
+    "validateMergeNodeOutgoingSuccessions",
+    "validateMetadataFeatureAnnotatedElement",
+    "validateMetadataFeatureBody",
+    "validateNamespaceDistinguishibility",
+    "validateOccurrenceUsageIndividualDefinition",
+    "validateOccurrenceUsageIndividualUsage",
+    "validateOccurrenceUsageIsPortion",
+    "validatePerformActionUsageReference",
+    "validatePortDefinitionOwnedUsagesNotComposite",
+    "validatePortUsageIsReference",
+    "validatePortUsageNestedUsagesNotComposite",
+    "validateRedefinitionDirectionConformance",
+    "validateRedefinitionEndConformance",
+    "validateRedefinitionFeaturingTypes",
+    "validateRequirementDefinitionOnlyOneSubject",
+    "validateRequirementUsageOnlyOneSubject",
+    "validateRequirementVerificationMembershipOwningType",
+    "validateSatisfyRequirementUsageReference",
+    "validateStateDefinitionParallelSubactions",
+    "validateStateUsageParallelSubactions",
+    "validateStructureSpecialization",
+    "validateSubsettingConstantConformance",
+    "validateSubsettingFeaturingTypes",
+    "validateSubsettingUniquenessConformance",
+    "validateTransitionFeatureMembershipGuardExpression",
+    "validateTransitionUsageSuccession",
+    "validateTransitionUsageTriggerActions",
+    "validateTypeDifferencingTypesNotSelf",
+    "validateTypeIntersectingTypesNotSelf",
+    "validateTypeOwnedMultiplicity",
+    "validateTypeUnioningTypesNotSelf",
+    "validateUsageVariationSpecialization",
+    "validateViewDefinitionOnlyOneViewRendering",
+    "validateViewUsageOnlyOneViewRendering",
+];
+
 /// Referential checks over a resolved multi-file model:
-/// unresolved references, unresolvable alias targets, and circular
-/// namespace imports, attributed to the unit they were written in (index
-/// into [`crate::model::Model::units`]).
+/// unresolved references, unresolvable alias targets, circular
+/// namespace imports, and user root declarations that share a name with
+/// a standard-library root (reported as library-winning or ambiguous), attributed to the
+/// unit they were written in (index into [`crate::model::Model::units`]).
 ///
-/// These are **warnings**: the resolver covers 99.9%+ of the corpus, but a
+/// Unresolved names, aliases, import cycles and root collisions are warnings;
+/// ambiguous references are errors. The resolver covers 99.9%+ of the corpus, but a
 /// small long tail of legitimate spellings is still beyond it (and some
 /// corpus files contain genuine reference errors) — so unresolved names
 /// must not fail conforming models. Library units are skipped.
@@ -17,8 +148,9 @@ pub fn validate_model(model: &crate::model::Model) -> Vec<(usize, Diagnostic)> {
 }
 
 /// [`validate_model`] over an already-built [`crate::json::ResolvedModel`] —
-/// lets one build serve both referential and semantic checks (drains the
-/// builder's unresolved list; run this before [`validate_semantics_with`]).
+/// lets one build serve both referential and semantic checks (the
+/// builder's unresolved list stays readable; run this before
+/// [`validate_semantics_with`]).
 pub fn validate_model_with(
     r: &mut crate::json::ResolvedModel,
     model: &crate::model::Model,
@@ -31,21 +163,32 @@ pub fn validate_model_with(
         .iter()
         .map(|(unit, qn)| (*unit, qn.span.start))
         .collect();
+    let blocked: std::collections::HashMap<(usize, u32), (String, &'static str)> = report
+        .blocked
+        .iter()
+        .map(|b| {
+            let member = r
+                .element_qualified_name(b.member)
+                .unwrap_or_else(|| b.name.to_display_string());
+            ((b.unit, b.name.span.start), (member, b.visibility))
+        })
+        .collect();
     let mut out = Vec::new();
     for (unit, qn) in report.unresolved {
-        if model.units()[unit].is_library || alias_spans.contains(&(unit, qn.span.start)) {
+        if model.is_library_unit(unit) || alias_spans.contains(&(unit, qn.span.start)) {
             continue;
         }
-        out.push((
-            unit,
-            Diagnostic::warning(
-                qn.span,
-                format!("unresolved reference `{}`", qn.to_display_string()),
+        let message = match blocked.get(&(unit, qn.span.start)) {
+            Some((member, visibility)) => format!(
+                "unresolved reference `{}` — `{member}` exists but is {visibility}",
+                qn.to_display_string()
             ),
-        ));
+            None => format!("unresolved reference `{}`", qn.to_display_string()),
+        };
+        out.push((unit, Diagnostic::warning(qn.span, message)));
     }
     for (unit, qn) in report.ambiguous {
-        if model.units()[unit].is_library {
+        if model.is_library_unit(unit) {
             continue;
         }
         out.push((
@@ -60,7 +203,7 @@ pub fn validate_model_with(
         ));
     }
     for (unit, qn) in report.unresolved_aliases {
-        if model.units()[unit].is_library {
+        if model.is_library_unit(unit) {
             continue;
         }
         out.push((
@@ -72,7 +215,7 @@ pub fn validate_model_with(
         ));
     }
     for (unit, qn) in report.import_cycles {
-        if model.units()[unit].is_library {
+        if model.is_library_unit(unit) {
             continue;
         }
         out.push((
@@ -87,9 +230,117 @@ pub fn validate_model_with(
             ),
         ));
     }
+    for s in report.shadowed_roots {
+        if model.is_library_unit(s.unit) {
+            continue;
+        }
+        let tail = if s.resolves_to_library {
+            "references resolve to the library"
+        } else {
+            "references to the name are ambiguous"
+        };
+        out.push((
+            s.unit,
+            Diagnostic::warning(
+                s.span,
+                format!(
+                    "root {} `{}` shadows the standard library {} `{}`; {tail}",
+                    root_kind_word(s.metaclass),
+                    s.name,
+                    root_kind_word(s.library_metaclass),
+                    s.name,
+                ),
+            ),
+        ));
+    }
     // Report in source order per unit.
     out.sort_by_key(|(unit, d)| (*unit, d.span.start));
     out
+}
+
+/// The everyday word for a root declaration's metaclass in the
+/// root-shadowing finding.
+fn root_kind_word(metaclass: &str) -> &'static str {
+    match metaclass {
+        "Package" | "LibraryPackage" => "package",
+        "Namespace" => "namespace",
+        _ => "declaration",
+    }
+}
+
+/// The rows of a builder table that user elements own, copied once so a
+/// pass can evaluate against `&mut r.b` while walking them. Library rows
+/// never produce findings; skipping them by reference leaves the shared
+/// library prefix untouched.
+pub(crate) fn user_rows<'a, T: Clone + 'a>(
+    b: &crate::json::Builder,
+    model: &crate::model::Model,
+    rows: impl IntoIterator<Item = &'a T>,
+    owner: impl Fn(&T) -> usize,
+) -> Vec<T> {
+    rows.into_iter()
+        .filter(|row| !model.is_library_unit(b.unit_of_elem(owner(row))))
+        .cloned()
+        .collect()
+}
+
+/// A finding reporting the semantic rule `rule` names. The identifier
+/// lands in the finding's `code`; it also stays spelled at the end of
+/// the message, where the command-line and editor surfaces read it.
+pub(crate) fn rule_error(
+    span: sysmlv2_syntax::Span,
+    rule: &'static str,
+    message: impl std::fmt::Display,
+) -> Diagnostic {
+    Diagnostic::error(span, format!("{message} [{rule}]")).with_code(normative_rule(rule))
+}
+
+/// [`rule_error`] at warning severity.
+pub(crate) fn rule_warning(
+    span: sysmlv2_syntax::Span,
+    rule: &'static str,
+    message: impl std::fmt::Display,
+) -> Diagnostic {
+    Diagnostic::warning(span, format!("{message} [{rule}]")).with_code(normative_rule(rule))
+}
+
+/// The identifier of a rule in the spelling the pinned abstract syntax
+/// uses. Two rules reached this implementation through an imported probe
+/// suite that names them differently; their messages keep that spelling,
+/// which the imported contracts are keyed by, while the finding carries
+/// the pinned one.
+fn normative_rule(rule: &'static str) -> &'static str {
+    match rule {
+        "validateViewDefinitionOnlyOnvViewRendering" => {
+            "validateViewDefinitionOnlyOneViewRendering"
+        }
+        "validateViewUsageOnlyOneRendering" => "validateViewUsageOnlyOneViewRendering",
+        other => other,
+    }
+}
+
+/// The number an evaluated value is, as `f64` — the reading the bound
+/// checks share. `None` for anything that is not a scalar number.
+pub(crate) fn scalar_f64(v: &crate::eval::Value) -> Option<f64> {
+    match v {
+        crate::eval::Value::Integer(i) => Some(*i as f64),
+        crate::eval::Value::Rational(r) => Some(r.to_f64()),
+        crate::eval::Value::Real(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// [`user_rows`] over a table keyed by owning element.
+pub(crate) fn user_entries<'a, V: Clone + 'a>(
+    b: &crate::json::Builder,
+    model: &crate::model::Model,
+    entries: impl IntoIterator<Item = (&'a usize, &'a V)>,
+) -> Vec<(usize, V)> {
+    entries
+        .into_iter()
+        .filter(|(&e, _)| !model.is_library_unit(b.unit_of_elem(e)))
+        .map(|(&e, v)| (e, v.clone()))
+        .collect()
 }
 
 /// KerML 8.4-style semantic constraints over the resolved graph,
@@ -120,1047 +371,38 @@ pub fn validate_semantics(model: &crate::model::Model) -> Vec<(usize, Diagnostic
 }
 
 /// [`validate_semantics`] over an already-built [`crate::json::ResolvedModel`].
+/// Preserves import provenance: speculative validation lookups are not source
+/// references and must not hide unused imports from later analyses.
 pub fn validate_semantics_with(
     r: &mut crate::json::ResolvedModel,
     model: &crate::model::Model,
 ) -> Vec<(usize, Diagnostic)> {
     let r = &mut *r;
+    let used_imports = r.b.used_imports.clone();
     let mut out = Vec::new();
 
-    // --- multiplicity bounds ---
-    for (owner, scope, mult) in r.b.multiplicities.clone() {
-        if model.units()[r.b.unit_of_elem(owner)].is_library {
-            continue;
-        }
-        let upper = crate::eval::evaluate_expr_in(&mut r.b, scope, &mult.upper).ok();
-        let lower = match &mult.lower {
-            Some(l) => crate::eval::evaluate_expr_in(&mut r.b, scope, l).ok(),
-            None => None,
-        };
-        let as_num = |v: &crate::eval::Value| match v {
-            crate::eval::Value::Integer(i) => Some(*i as f64),
-            crate::eval::Value::Rational(f) => Some(*f),
-            _ => None,
-        };
-        let lo = lower.as_ref().and_then(as_num);
-        let hi = upper.as_ref().and_then(as_num);
-        if let Some(lo) = lo {
-            if lo < 0.0 {
-                out.push((
-                    r.b.unit_of_elem(owner),
-                    Diagnostic::error(mult.span, "multiplicity lower bound is negative"),
-                ));
-                continue;
-            }
-        }
-        if let Some(hi) = hi {
-            if hi < 0.0 {
-                out.push((
-                    r.b.unit_of_elem(owner),
-                    Diagnostic::error(mult.span, "multiplicity upper bound is negative"),
-                ));
-                continue;
-            }
-        }
-        if let (Some(lo), Some(hi)) = (lo, hi) {
-            if lo > hi {
-                out.push((
-                    r.b.unit_of_elem(owner),
-                    Diagnostic::error(
-                        mult.span,
-                        format!("multiplicity lower bound {lo} exceeds upper bound {hi}"),
-                    ),
-                ));
-            }
-        }
-    }
-
-    // --- subclassification self-reference / cycles / duplicates ---
-    use std::collections::{HashMap, HashSet};
-    let specs = r.b.spec_targets.clone();
-    // Resolve every recorded target once.
-    let mut resolved: Vec<(
-        usize,
-        &'static str,
-        usize,
-        &sysmlv2_syntax::ast::QualifiedName,
-    )> = Vec::new();
-    for (owner, kind, scope, qn) in &specs {
-        // Library-owned specializations can't produce findings (every check
-        // below skips library owners) and can't participate in a user-visible
-        // cycle (no library edge points into a user definition) — skipping
-        // them keeps the semantic pass proportional to the user model.
-        if model.units()[r.b.unit_of_elem(*owner)].is_library {
-            continue;
-        }
-        if let Some(t) = r.b.resolve(*scope, qn, 0) {
-            resolved.push((*owner, kind, t, qn));
-        }
-    }
-    let mut subcl_edges: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut seen_per_owner: HashSet<(usize, &'static str, usize)> = HashSet::new();
-    for (owner, kind, target, qn) in &resolved {
-        let unit = r.b.unit_of_elem(*owner);
-        let is_lib = model.units()[unit].is_library;
-        if *kind == "Subclassification" {
-            if target == owner && !is_lib {
-                out.push((
-                    unit,
-                    Diagnostic::error(
-                        qn.span,
-                        format!("`{}` cannot specialize itself", qn.to_display_string()),
-                    ),
-                ));
-                continue;
-            }
-            subcl_edges.entry(*owner).or_default().push(*target);
-        }
-        if !seen_per_owner.insert((*owner, kind, *target)) && !is_lib {
-            out.push((
-                unit,
-                Diagnostic::warning(
-                    qn.span,
-                    format!("duplicate specialization of `{}`", qn.to_display_string()),
-                ),
-            ));
-        }
-    }
-    // Cycle detection over subclassification edges (self-edges reported above).
-    for (owner, kind, _, qn) in &resolved {
-        if *kind != "Subclassification" {
-            continue;
-        }
-        let unit = r.b.unit_of_elem(*owner);
-        if model.units()[unit].is_library {
-            continue;
-        }
-        // DFS from each of owner's supertypes back to owner.
-        let mut stack: Vec<usize> = subcl_edges.get(owner).cloned().unwrap_or_default();
-        let mut seen: HashSet<usize> = HashSet::new();
-        let mut cyclic = false;
-        while let Some(s) = stack.pop() {
-            if s == *owner {
-                cyclic = true;
-                break;
-            }
-            if seen.insert(s) {
-                if let Some(next) = subcl_edges.get(&s) {
-                    stack.extend(next);
-                }
-            }
-        }
-        if cyclic {
-            out.push((
-                unit,
-                Diagnostic::error(
-                    qn.span,
-                    "circular specialization: this definition transitively \
-                     specializes itself"
-                        .to_string(),
-                ),
-            ));
-        }
-    }
-
-    // --- metadata feature typing ---
-    // A metadata feature must be typed by exactly one metaclass — a
-    // `metadata def` (SysML) or `metaclass` (KerML). A typing that
-    // resolves to any other kind of element is provably wrong (error);
-    // unresolved targets stay referential warnings, per checker policy.
-    let mut metadata_typing_count: HashMap<usize, usize> = HashMap::new();
-    for (owner, kind, _, _) in &specs {
-        if *kind == "FeatureTyping"
-            && matches!(r.b.elements[*owner].ty, "MetadataUsage" | "MetadataFeature")
-        {
-            *metadata_typing_count.entry(*owner).or_insert(0) += 1;
-        }
-    }
-    let mut metadata_first_typing: HashSet<usize> = HashSet::new();
-    for (owner, kind, target, qn) in &resolved {
-        if *kind != "FeatureTyping"
-            || !matches!(r.b.elements[*owner].ty, "MetadataUsage" | "MetadataFeature")
-        {
-            continue;
-        }
-        let unit = r.b.unit_of_elem(*owner);
-        if model.units()[unit].is_library {
-            continue;
-        }
-        let target_ty = r.b.elements[*target].ty;
-        if !matches!(target_ty, "MetadataDefinition" | "Metaclass") {
-            out.push((
-                unit,
-                Diagnostic::error(
-                    qn.span,
-                    format!(
-                        "metadata must be typed by a metadata definition or \
-                         metaclass; `{}` is a {}",
-                        qn.to_display_string(),
-                        target_ty
-                    ),
-                ),
-            ));
-        } else if metadata_typing_count.get(owner).copied().unwrap_or(0) > 1
-            && !metadata_first_typing.insert(*owner)
-        {
-            out.push((
-                unit,
-                Diagnostic::error(
-                    qn.span,
-                    "metadata must be typed by exactly one metaclass".to_string(),
-                ),
-            ));
-        }
-    }
-
-    // Explicit multiplicities by owner, for redefinition conformance.
-    let mults: HashMap<usize, (usize, sysmlv2_syntax::ast::Multiplicity)> =
-        r.b.multiplicities
-            .iter()
-            .map(|(o, s, m)| (*o, (*s, m.clone())))
-            .collect();
-    // Numeric bounds of a multiplicity: `[l..u]` directly, `[u]` is
-    // exact (`l = u`) except `[*]`, whose missing lower is 0.
-    let bounds = |r: &mut crate::json::ResolvedModel,
-                  scope: usize,
-                  m: &sysmlv2_syntax::ast::Multiplicity|
-     -> Option<(f64, f64)> {
-        let as_num = |v: crate::eval::Value| match v {
-            crate::eval::Value::Integer(i) => Some(i as f64),
-            crate::eval::Value::Rational(f) => Some(f),
-            _ => None,
-        };
-        let hi = as_num(crate::eval::evaluate_expr_in(&mut r.b, scope, &m.upper).ok()?)?;
-        let lo = match &m.lower {
-            Some(l) => as_num(crate::eval::evaluate_expr_in(&mut r.b, scope, l).ok()?)?,
-            None if hi.is_infinite() => 0.0,
-            None => hi,
-        };
-        Some((lo, hi))
-    };
-
-    // --- redefinition type-compatibility ---
-    // A redefining feature's declared types should conform to the
-    // redefined feature's declared types (KerML 8.4 redefinition
-    // conformance). Checked only when both sides carry explicit typings
-    // and the target's type is user-owned — the explicit closure is
-    // complete between user types, while conformance to a *library*
-    // type may ride implied bases this walk cannot see (those stay
-    // silent). Deliberately NOT checked for `Subsetting`: KerML's
-    // multiple classification lets a value be both a `Cause` and a
-    // `Situation` without `Cause` specializing `Situation`, and the
-    // official `Model Library Example.sysml` uses exactly that pattern
-    // (`causes : Cause[*] :> situations`). Warnings, per checker policy.
-    for i in 0..r.b.spec_targets.len() {
-        let (owner, kind) = {
-            let t = &r.b.spec_targets[i];
-            (t.0, t.1)
-        };
-        if kind != "Redefinition" {
-            continue;
-        }
-        let unit = r.b.unit_of_elem(owner);
-        if model.units()[unit].is_library {
-            continue;
-        }
-        // The builder's pending pass already resolved this target with the
-        // owner excluded (`:>> x` names the *inherited* feature) — read the
-        // recorded outcome instead of re-resolving, which self-hits and
-        // falls through to full import scans (~0.2 ms per redefinition).
-        let Some(target) = r.b.spec_resolved.get(i).copied().flatten() else {
-            continue; // unresolved targets are the referential checks' job
-        };
-        if target == owner {
-            continue;
-        }
-        let qn = r.b.spec_targets[i].3.clone();
-        // Multiplicity conformance: when both sides declare
-        // explicit numeric multiplicities, the redefining range must
-        // lie within the redefined one.
-        if let (Some((os, om)), Some((ts, tm))) = (mults.get(&owner), mults.get(&target)) {
-            let (os, om, ts, tm) = (*os, om.clone(), *ts, tm.clone());
-            let span = om.span;
-            if let (Some((olo, ohi)), Some((tlo, thi))) = (bounds(r, os, &om), bounds(r, ts, &tm)) {
-                if olo < tlo || ohi > thi {
-                    out.push((
-                        unit,
-                        Diagnostic::warning(
-                            span,
-                            format!(
-                                "redefining multiplicity [{}..{}] is not within \
-                                 the redefined feature's [{}..{}]",
-                                olo, ohi, tlo, thi
-                            ),
-                        ),
-                    ));
-                }
-            }
-        }
-        let own_types = r.b.direct_typing_elems(owner);
-        if own_types.is_empty() {
-            continue;
-        }
-        for tt in r.b.direct_typing_elems(target) {
-            if tt < r.b.lib_boundary {
-                continue; // may conform via implied bases
-            }
-            if own_types.iter().any(|&ot| r.b.conforms_upward(ot, tt)) {
-                continue;
-            }
-            out.push((
-                unit,
-                Diagnostic::warning(
-                    qn.span,
-                    format!(
-                        "feature redefines `{}` but none of its declared types \
-                         conform to the target's type `{}`",
-                        qn.to_display_string(),
-                        r.b.elements[tt]
-                            .props
-                            .get("declaredName")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("<anonymous>")
-                    ),
-                ),
-            ));
-        }
-    }
-
-    // --- invocation arity ---
-    // A user-defined calculation invoked with fewer positional arguments
-    // than its declared `in`/`inout` parameters leaves the trailing
-    // parameters unbound — the result can never compute unless they carry
-    // defaults. Warnings, conservatively scoped: all-positional calls
-    // only (named arguments bind explicitly), lambda bodies skipped,
-    // zero-argument spellings skipped (type-reference idioms), and both
-    // caller and callee must be outside the standard library (KFL
-    // functions overload their parameter lists).
-    let mut value_exprs: Vec<(usize, usize, sysmlv2_syntax::ast::Expr)> =
-        r.b.values
-            .iter()
-            .map(|(o, (s, e))| (*o, *s, e.clone()))
-            .collect();
-    value_exprs.extend(r.b.result_exprs.iter().cloned());
-    for (owner, scope, expr) in value_exprs {
-        let unit = r.b.unit_of_elem(owner);
-        if model.units()[unit].is_library {
-            continue;
-        }
-        let mut sites = Vec::new();
-        collect_invocations(&expr, &mut sites);
-        for (qn, n_args, span) in sites {
-            if n_args == 0 {
-                continue;
-            }
-            let Some(callee) = r.b.resolve(scope, qn, 0) else {
-                continue; // unresolved refs are the referential checks' job
-            };
-            let Some(params) = r.b.in_params.get(&callee).cloned() else {
-                continue; // not a parameterized calculation
-            };
-            if model.units()[r.b.unit_of_elem(callee)].is_library {
-                continue;
-            }
-            // Over-application: more positional arguments than declared
-            // parameters can never bind (the arrow spelling passes its
-            // target as the first argument — `x->f(a)` supplies two).
-            if n_args > params.len() {
-                out.push((
-                    unit,
-                    Diagnostic::warning(
-                        span,
-                        format!(
-                            "invocation of `{}` supplies {n_args} arguments for {} parameter(s)",
-                            qn.to_display_string(),
-                            params.len(),
-                        ),
-                    ),
-                ));
-                continue;
-            }
-            if n_args == params.len() {
-                continue;
-            }
-            // Unbound trailing parameters that all carry their own
-            // (default) values are fine.
-            let fields = r.b.ctor_fields.get(&callee);
-            let all_defaulted = params[n_args..].iter().all(|p| {
-                fields
-                    .and_then(|fs| fs.iter().find(|(n, _)| n == p))
-                    .map(|(_, e)| r.b.values.contains_key(e))
-                    .unwrap_or(false)
-            });
-            if all_defaulted {
-                continue;
-            }
-            out.push((
-                unit,
-                Diagnostic::warning(
-                    span,
-                    format!(
-                        "invocation of `{}` binds {n_args} of its {} parameters \
-                         (`{}` never bound)",
-                        qn.to_display_string(),
-                        params.len(),
-                        params[n_args..].join("`, `")
-                    ),
-                ),
-            ));
-        }
-    }
-
-    // --- feature-value scalar conformance ---
-    // Narrowed to what is provable. A stricter static rule — the value
-    // expression's *declared* result type must conform to the feature's
-    // declared type — would reject 15 official corpus files whose bindings
-    // are legal under KerML multiple classification: a `Rational`-typed
-    // literal's value may well inhabit a sibling subtype of `Real`
-    // (`ScalarValues::Rational does not conform to EnumerationTest::Size`
-    // is exactly the corpus's enum-restriction idiom, and the ISO-8601
-    // string encodings and metadata levels follow the same shape). What
-    // *is* provable is kind-level disjointness of the evaluated value:
-    // `ScalarValues` partitions its scalars into Boolean, String, and the
-    // Number tower, and a value of one partition is never an instance of
-    // a type in another; within the tower, a non-integral rational is
-    // never an instance of an `Integer`-conforming type. Declared types
-    // classify by simple scalar names over the explicit supertype closure
-    // (the solver's `declared_sort` discipline — works with or without
-    // the standard library); an untyped redefining feature borrows the
-    // redefinition target's declared types (one hop). Unclassifiable
-    // declared types, unevaluable values, quantities, sequences, and
-    // element values all stay silent. Warnings, per checker policy.
-    let value_sites: Vec<(usize, usize, sysmlv2_syntax::ast::Expr)> =
-        r.b.values
-            .iter()
-            .map(|(o, (s, e))| (*o, *s, e.clone()))
-            .collect();
-    for (owner, scope, expr) in value_sites {
-        let unit = r.b.unit_of_elem(owner);
-        if model.units()[unit].is_library {
-            continue;
-        }
-        let mut tys = r.b.direct_typing_elems(owner);
-        if tys.is_empty() {
-            for t in r.b.redefinition_target_elems(owner) {
-                for ty in r.b.direct_typing_elems(t) {
-                    if !tys.contains(&ty) {
-                        tys.push(ty);
-                    }
-                }
-            }
-        }
-        // Every declared type must classify — a type this walk cannot
-        // place may admit the value through bases it cannot see.
-        let kinds: Vec<ScalarKind> = tys
-            .iter()
-            .filter_map(|&ty| declared_scalar_kind(&mut r.b, ty))
-            .collect();
-        if kinds.is_empty() || kinds.len() != tys.len() {
-            continue;
-        }
-        let Ok(v) = crate::eval::evaluate_expr_in(&mut r.b, scope, &expr) else {
-            continue; // undecided, not wrong
-        };
-        let value_kind = match &v {
-            crate::eval::Value::Boolean(_) => ScalarKind::Boolean,
-            crate::eval::Value::String(_) => ScalarKind::Str,
-            crate::eval::Value::Integer(_) => ScalarKind::Number { integral: true },
-            crate::eval::Value::Rational(f) => ScalarKind::Number {
-                integral: f.fract() == 0.0 && f.is_finite(),
-            },
-            _ => continue, // quantities, sequences, instances, elements
-        };
-        let admits = |decl: ScalarKind| match (decl, value_kind) {
-            (ScalarKind::Boolean, ScalarKind::Boolean) => true,
-            (ScalarKind::Str, ScalarKind::Str) => true,
-            (ScalarKind::Number { integral: need }, ScalarKind::Number { integral: have }) => {
-                !need || have
-            }
-            _ => false, // cross-partition: provably disjoint
-        };
-        if kinds.iter().any(|&k| admits(k)) {
-            continue;
-        }
-        let ty_name = r.b.elements[tys[0]]
-            .props
-            .get("declaredName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<anonymous>")
-            .to_string();
-        let msg = match value_kind {
-            ScalarKind::Number { integral: false }
-                if matches!(kinds[0], ScalarKind::Number { .. }) =>
-            {
-                format!(
-                    "feature value {v} is not an integer and can never conform \
-                     to the declared type `{ty_name}`"
-                )
-            }
-            _ => {
-                let vdesc = match value_kind {
-                    ScalarKind::Boolean => "a Boolean",
-                    ScalarKind::Str => "a String",
-                    ScalarKind::Number { .. } => "a number",
-                };
-                format!(
-                    "feature value evaluates to {vdesc}, which can never \
-                     conform to the declared type `{ty_name}`"
-                )
-            }
-        };
-        out.push((unit, Diagnostic::warning(expr.span, msg)));
-    }
-
-    // --- connector binary specialization (KerML
-    // checkConnectorBinarySpecialization) ---
-    // A connector with more than two ends must not specialize a *binary*
-    // connector: binary means a library binary-links family element, or a
-    // user connector-family element with exactly two ends (the two-end
-    // shape implies the binary library base). The n-ary declaration
-    // itself is legal — the offending edge is the typing/subsetting/
-    // redefinition that demands binariness, so the diagnostic lands on
-    // that target's spelling.
-    {
-        let connector_family = |ty: &str| {
-            matches!(
-                ty,
-                "ConnectionUsage"
-                    | "ConnectionDefinition"
-                    | "InterfaceUsage"
-                    | "InterfaceDefinition"
-                    | "AllocationUsage"
-                    | "AllocationDefinition"
-                    | "Connector"
-                    | "BindingConnector"
-            )
-        };
-        let end_count = |b: &crate::json::Builder, e: usize| {
-            b.elements[e]
-                .owned_relationships
-                .iter()
-                .filter(|&&rel| b.elements[rel].ty == "EndFeatureMembership")
-                .count()
-        };
-        // The library binary-links family, resolved once (absent without
-        // the library — the user-side two-end test still applies).
-        let mut binary_lib: HashSet<usize> = HashSet::new();
-        for qn in [
-            "Links::binaryLinks",
-            "Links::BinaryLink",
-            "Connections::binaryConnections",
-            "Connections::BinaryConnection",
-            "Interfaces::binaryInterfaces",
-            "Interfaces::BinaryInterface",
-        ] {
-            if let Some(t) = r.b.resolve(0, &crate::json::lib_qn(qn), 0) {
-                binary_lib.insert(t);
-            }
-        }
-        let is_binary_node = |b: &mut crate::json::Builder,
-                              binary_lib: &HashSet<usize>,
-                              n: usize| {
-            binary_lib.contains(&n) || (connector_family(b.elements[n].ty) && end_count(b, n) == 2)
-        };
-        for (owner, kind, target, qn) in &resolved {
-            if !matches!(*kind, "FeatureTyping" | "Subsetting" | "Redefinition") {
-                continue;
-            }
-            if !connector_family(r.b.elements[*owner].ty) || end_count(&r.b, *owner) <= 2 {
-                continue;
-            }
-            // Binary directly, or anywhere up the target's explicit closure.
-            let mut binary = is_binary_node(&mut r.b, &binary_lib, *target);
-            if !binary {
-                let mut seen: HashSet<usize> = HashSet::new();
-                let mut stack = vec![*target];
-                while let Some(n) = stack.pop() {
-                    if !seen.insert(n) {
-                        continue;
-                    }
-                    if is_binary_node(&mut r.b, &binary_lib, n) {
-                        binary = true;
-                        break;
-                    }
-                    stack.extend(r.b.explicit_supertype_elems(n));
-                }
-            }
-            if binary {
-                let ends = end_count(&r.b, *owner);
-                out.push((
-                    r.b.unit_of_elem(*owner),
-                    Diagnostic::warning(
-                        qn.span,
-                        format!(
-                            "connector with {ends} ends specializes a binary connector (a binary connector cannot have more than two ends)"
-                        ),
-                    ),
-                ));
-            }
-        }
-    }
-
-    // --- chain-target subsetting featuring accessibility (KerML
-    // validateSubsettingFeaturingTypes, narrowed to chain-written
-    // targets) ---
-    // `part m :> a.b;` subsets a feature reached *through* `a`, so the
-    // chain's root fixes the featuring context: some owning type of the
-    // subsetting feature must conform to the root's featuring type, or
-    // the subsetted feature is not accessible from the subsetter
-    // (nesting the subsetter in a conforming type fixes it). Lenient on
-    // unresolved roots, package-owned roots (featured by Base::Anything,
-    // accessible anywhere), and library featuring — the connector-end
-    // precedent.
-    {
-        let is_type = |ty: &str| {
-            ty.ends_with("Definition")
-                || ty.ends_with("Usage")
-                || matches!(
-                    ty,
-                    "Classifier"
-                        | "Structure"
-                        | "Class"
-                        | "DataType"
-                        | "Behavior"
-                        | "Function"
-                        | "Association"
-                        | "AssociationStructure"
-                        | "Interaction"
-                        | "Metaclass"
-                        | "Feature"
-                        | "Step"
-                )
-        };
-        let owning_type = |r: &mut crate::json::ResolvedModel, e: usize| -> Option<usize> {
-            let mut cur = r.owner(crate::json::ElementRef(e));
-            while let Some(o) = cur {
-                let ty = r.element_type(o);
-                if is_type(ty) {
-                    return Some(o.0);
-                }
-                if matches!(ty, "Package" | "LibraryPackage" | "Namespace") {
-                    return None;
-                }
-                cur = r.owner(o);
-            }
-            None
-        };
-        for (owner, scope, links, span) in r.b.chain_subsettings.clone() {
-            let unit = r.b.unit_of_elem(owner);
-            if model.units()[unit].is_library {
-                continue;
-            }
-            let Some(root) = r.b.resolve(scope, &links[0], 0) else {
-                continue;
-            };
-            let Some(root_type) = owning_type(r, root) else {
-                continue;
-            };
-            if root_type < r.b.lib_boundary {
-                continue;
-            }
-            let mut anc = owning_type(r, owner);
-            let mut ok = false;
-            while let Some(t) = anc {
-                if r.b.conforms_upward(t, root_type) {
-                    ok = true;
-                    break;
-                }
-                anc = owning_type(r, t);
-            }
-            if !ok {
-                let root_name = r.b.elements[root_type]
-                    .props
-                    .get("declaredName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<anonymous>")
-                    .to_string();
-                out.push((
-                    unit,
-                    Diagnostic::warning(
-                        span,
-                        format!(
-                            "subsetted feature chain is featured in `{root_name}`, which \
-                             no owner of the subsetting feature conforms to (nest the \
-                             subsetting feature in a type conforming to `{root_name}`)"
-                        ),
-                    ),
-                ));
-            }
-        }
-    }
-
-    // --- connector-end featuring accessibility (KerML canAccess /
-    // checkConnectorTypeFeaturing) ---
-    // A connector's related features must share a featuring context the
-    // connector can be featured within. Statically: some candidate type T
-    // — a lexical ancestor of the connector, or a featuring type of one of
-    // the related features (or its ancestors) — must *admit* every
-    // featured related feature, where T admits a feature featured in F
-    // when T conforms to F or T (or a supertype) owns a member typed by /
-    // referencing something conforming to F (the one-hop featuring lift:
-    // a part that performs/exhibits a behavior gives access to the
-    // behavior's features). Package-owned targets have no featuringTypes
-    // and are accessible from anywhere — that is what makes the corpus's
-    // sibling-namespace binds legal. Lenient by construction: unresolved
-    // targets, library featuring, explicit `featured by`, and unresolved
-    // chain roots all pass silently.
-    {
-        let n = r.b.elements.len();
-        let mut rel_owner: Vec<Option<usize>> = vec![None; n];
-        for (i, e) in r.b.elements.iter().enumerate() {
-            for &rel in &e.owned_relationships {
-                rel_owner[rel] = Some(i);
-            }
-        }
-        let mut owned_of_rel: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (i, e) in r.b.elements.iter().enumerate() {
-            if let Some(rel) = e.owning_relationship {
-                owned_of_rel[rel].push(i);
-            }
-        }
-        let by_id: HashMap<uuid::Uuid, usize> = (0..n).map(|i| (r.b.elem_id(i), i)).collect();
-        let is_featuring_membership = |ty: &str| {
-            ty.ends_with("Membership")
-                && !matches!(ty, "OwningMembership" | "Membership" | "VariantMembership")
-        };
-        let deref = |b: &crate::json::Builder, v: &serde_json::Value| {
-            v.get("@id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                .and_then(|id| by_id.get(&id).copied())
-                .map(|i| (i, b.elements[i].ty))
-        };
-        let _ = &deref;
-        let rel_target = |b: &crate::json::Builder, e: usize, rel_ty: &str, key: &str| {
-            b.elements[e]
-                .owned_relationships
-                .iter()
-                .find(|&&rel| b.elements[rel].ty == rel_ty)
-                .and_then(|&rel| b.elements[rel].props.get(key))
-                .and_then(|v| v.get("@id"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                .and_then(|id| by_id.get(&id).copied())
-        };
-        let has_type_featuring = |b: &crate::json::Builder, e: usize| {
-            b.elements[e]
-                .owned_relationships
-                .iter()
-                .any(|&rel| b.elements[rel].ty == "TypeFeaturing")
-        };
-        // Group ends by connector.
-        let mut per_connector: HashMap<usize, Vec<(usize, sysmlv2_syntax::span::Span)>> =
-            HashMap::new();
-        let mut order: Vec<usize> = Vec::new();
-        for (connector, end_elem, span) in r.b.connector_ends.clone() {
-            per_connector
-                .entry(connector)
-                .or_insert_with(|| {
-                    order.push(connector);
-                    Vec::new()
-                })
-                .push((end_elem, span));
-        }
-        for connector in order {
-            let unit = r.b.unit_of_elem(connector);
-            if model.units()[unit].is_library {
-                continue;
-            }
-            let ends = &per_connector[&connector];
-            // Featured related features: (target, its featuring type, span).
-            let mut featured: Vec<(usize, usize, sysmlv2_syntax::span::Span)> = Vec::new();
-            let mut lenient = false;
-            for &(end_elem, span) in ends {
-                let Some(mut target) =
-                    rel_target(&r.b, end_elem, "ReferenceSubsetting", "referencedFeature")
-                else {
-                    continue; // empty or unresolved end
-                };
-                // A chain end's featuring is the first link's.
-                if let Some(link_v) = r.b.elements[target]
-                    .owned_relationships
-                    .iter()
-                    .find(|&&rel| r.b.elements[rel].ty == "FeatureChaining")
-                    .and_then(|&rel| r.b.elements[rel].props.get("chainingFeature"))
-                    .cloned()
-                {
-                    let Some(link) = link_v
-                        .get("@id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                        .and_then(|id| by_id.get(&id).copied())
-                    else {
-                        lenient = true;
-                        break;
-                    };
-                    target = link;
-                }
-                if model.units()[r.b.unit_of_elem(target)].is_library {
-                    continue;
-                }
-                if has_type_featuring(&r.b, target) {
-                    lenient = true;
-                    break;
-                }
-                let f = match r.b.elements[target].owning_relationship {
-                    Some(rel) if is_featuring_membership(r.b.elements[rel].ty) => rel_owner[rel],
-                    _ => None, // namespace-owned: featured by Anything
-                };
-                let Some(f) = f else { continue };
-                if model.units()[r.b.unit_of_elem(f)].is_library {
-                    continue;
-                }
-                featured.push((target, f, span));
-            }
-            if lenient || featured.is_empty() {
-                continue;
-            }
-            // Candidate contexts: lexical ancestors of the connector
-            // (through any membership) plus each featuring type and its
-            // lexical ancestors.
-            let mut candidates: Vec<usize> = Vec::new();
-            let push_chain = |b: &crate::json::Builder, start: usize, out: &mut Vec<usize>| {
-                let mut cur = start;
-                for _ in 0..64 {
-                    if !out.contains(&cur) {
-                        out.push(cur);
-                    }
-                    let Some(rel) = b.elements[cur].owning_relationship else {
-                        break;
-                    };
-                    let Some(owner) = rel_owner[rel] else { break };
-                    cur = owner;
-                }
-            };
-            push_chain(&r.b, connector, &mut candidates);
-            for &(_, f, _) in &featured {
-                push_chain(&r.b, f, &mut candidates);
-            }
-            // T admits a feature featured in F when T conforms to F, or a
-            // member of T (or of a type T explicitly specializes) is typed
-            // by / references something conforming to F.
-            let mut admits_cache: HashMap<(usize, usize), bool> = HashMap::new();
-            let mut admits = |r: &mut crate::json::ResolvedModel, t: usize, f: usize| -> bool {
-                if let Some(&hit) = admits_cache.get(&(t, f)) {
-                    return hit;
-                }
-                let mut ok = t == f || r.b.conforms_upward(t, f);
-                if !ok {
-                    // One-hop featuring lift over T's own supertype closure.
-                    let mut types: Vec<usize> = vec![t];
-                    let mut qi = 0;
-                    while qi < types.len() && types.len() <= 64 {
-                        let cur = types[qi];
-                        qi += 1;
-                        for s in r.b.explicit_supertype_elems(cur) {
-                            if !types.contains(&s) {
-                                types.push(s);
-                            }
-                        }
-                    }
-                    'outer: for &ty_el in &types {
-                        for &rel in &r.b.elements[ty_el].owned_relationships.clone() {
-                            for &m in &owned_of_rel[rel].clone() {
-                                for key in ["type", "referencedFeature"] {
-                                    let rel_ty = if key == "type" {
-                                        "FeatureTyping"
-                                    } else {
-                                        "ReferenceSubsetting"
-                                    };
-                                    if let Some(g) = rel_target(&r.b, m, rel_ty, key) {
-                                        if g == f || r.b.conforms_upward(g, f) {
-                                            ok = true;
-                                            break 'outer;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                admits_cache.insert((t, f), ok);
-                ok
-            };
-            // Pick the candidate that admits the most related features;
-            // the finding names the first feature it cannot reach.
-            let mut best: Option<(usize, usize)> = None; // (admitted, cand idx)
-            for (i, &t) in candidates.iter().enumerate() {
-                let admitted = featured
-                    .iter()
-                    .filter(|&&(_, f, _)| admits(r, t, f))
-                    .count();
-                if best.is_none_or(|(b, _)| admitted > b) {
-                    best = Some((admitted, i));
-                }
-            }
-            let accessible = best.is_some_and(|(a, _)| a == featured.len());
-            if !accessible {
-                let best_t = candidates[best.map_or(0, |(_, i)| i)];
-                let (target, f, span) = *featured
-                    .iter()
-                    .find(|&&(_, f, _)| !admits(r, best_t, f))
-                    .unwrap_or(&featured[0]);
-                let name = |e: usize| {
-                    r.b.elements[e]
-                        .props
-                        .get("declaredName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("<unnamed>")
-                        .to_string()
-                };
-                out.push((
-                    unit,
-                    Diagnostic::warning(
-                        span,
-                        format!(
-                            "connector end references `{}`, which is featured in \
-                             `{}` — no featuring context of the connector reaches \
-                             it",
-                            name(target),
-                            name(f),
-                        ),
-                    ),
-                ));
-            }
-        }
-    }
-
+    out.extend(multiplicities::validate(r, model));
+    out.extend(specialization::validate(r, model));
+    out.extend(invocations::validate(r, model));
+    out.extend(scalars::validate(r, model));
+    out.extend(chains::validate(r, model));
+    // The immutable facts already index ownership and binary relationship
+    // targets for every later validator. Reuse them for connector checks too.
+    let facts = facts::Facts::new(&mut r.b);
+    out.extend(connectors::validate(r, model, &facts));
+    out.extend(structural::validate(r, model, &facts));
+    out.extend(endpoints::validate(r, model, &facts));
+    out.extend(values::validate(r, model, &facts));
+    out.extend(relationships::validate(r, model, &facts));
+    out.extend(expressions::validate(r, model, &facts));
+    out.extend(actions::validate(r, model, &facts));
+    out.extend(typing::validate(r, model));
+    out.extend(dimensions::validate(r, model));
+    out.extend(distinguishability::validate(r, model));
     out.sort_by_key(|(unit, d)| (*unit, d.span.start));
     out.dedup_by(|a, b| a.0 == b.0 && a.1.span == b.1.span && a.1.message == b.1.message);
+    r.b.used_imports = used_imports;
     out
-}
-
-/// The provably-disjoint `ScalarValues` partitions: Boolean, String, and
-/// the Number tower (with `Integer`-and-below tracked for integrality).
-#[derive(Clone, Copy, PartialEq)]
-enum ScalarKind {
-    Boolean,
-    Str,
-    Number { integral: bool },
-}
-
-/// Classify a declared type into its scalar partition by walking the
-/// explicit typing/specialization closure and matching the `ScalarValues`
-/// simple names — the same name-based discipline as the solver's
-/// `declared_sort`, so it works with or without the standard library.
-/// Breadth-first, first match wins: the nearest scalar ancestor decides
-/// integrality (`Size :> Real` classifies non-integral even though `Real`
-/// has integral subtypes). `None` = not provably a scalar type.
-fn declared_scalar_kind(b: &mut crate::json::Builder, ty: usize) -> Option<ScalarKind> {
-    use std::collections::{HashSet, VecDeque};
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    queue.push_back(ty);
-    let mut seen: HashSet<usize> = HashSet::new();
-    let mut steps = 0;
-    while let Some(t) = queue.pop_front() {
-        if !seen.insert(t) {
-            continue;
-        }
-        steps += 1;
-        if steps > 64 {
-            break;
-        }
-        let name = b.elements[t]
-            .props
-            .get("declaredName")
-            .and_then(|v| v.as_str());
-        match name {
-            Some("Boolean") => return Some(ScalarKind::Boolean),
-            Some("String") => return Some(ScalarKind::Str),
-            Some("Integer" | "Natural" | "Positive") => {
-                return Some(ScalarKind::Number { integral: true });
-            }
-            Some("NumericalValue" | "Number" | "Complex" | "Real" | "Rational") => {
-                return Some(ScalarKind::Number { integral: false });
-            }
-            _ => {}
-        }
-        for s in b.explicit_supertype_elems(t) {
-            queue.push_back(s);
-        }
-    }
-    None
-}
-
-/// Collect every all-positional invocation site in an expression:
-/// `(callee, positional-argument count, span)`. Lambda bodies (`Body`,
-/// arrow/collect/select bodies) are not entered — their invocations
-/// bind through runtime parameters this static pass cannot see.
-fn collect_invocations<'a>(
-    e: &'a sysmlv2_syntax::ast::Expr,
-    out: &mut Vec<(
-        &'a sysmlv2_syntax::ast::QualifiedName,
-        usize,
-        sysmlv2_syntax::Span,
-    )>,
-) {
-    use sysmlv2_syntax::ast::{ArrowArgs, ExprKind, TargetRef};
-    match &e.kind {
-        ExprKind::Literal(_)
-        | ExprKind::Null
-        | ExprKind::Ref(_)
-        | ExprKind::Extent { .. }
-        | ExprKind::MetadataAccess { .. }
-        | ExprKind::Body { .. }
-        | ExprKind::BodyTerminator => {}
-        ExprKind::Conditional {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_invocations(cond, out);
-            collect_invocations(then_branch, out);
-            collect_invocations(else_branch, out);
-        }
-        ExprKind::Binary { lhs, rhs, .. } => {
-            collect_invocations(lhs, out);
-            collect_invocations(rhs, out);
-        }
-        ExprKind::Unary { operand, .. } => collect_invocations(operand, out),
-        ExprKind::Classification { operand, .. } => {
-            if let Some(o) = operand {
-                collect_invocations(o, out);
-            }
-        }
-        ExprKind::ChainStep { target, .. } => collect_invocations(target, out),
-        ExprKind::Index { target, index } => {
-            collect_invocations(target, out);
-            collect_invocations(index, out);
-        }
-        ExprKind::Bracket { target, arg } => {
-            collect_invocations(target, out);
-            collect_invocations(arg, out);
-        }
-        ExprKind::Arrow { target, args, .. } => {
-            collect_invocations(target, out);
-            if let ArrowArgs::List(list) = args {
-                for a in list {
-                    collect_invocations(&a.value, out);
-                }
-            }
-        }
-        ExprKind::Collect { target, .. } | ExprKind::Select { target, .. } => {
-            collect_invocations(target, out)
-        }
-        ExprKind::Invocation { ty, args } => {
-            if let (TargetRef::Name(qn), true) = (ty, args.iter().all(|a| a.name.is_none())) {
-                out.push((qn, args.len(), e.span));
-            }
-            for a in args {
-                collect_invocations(&a.value, out);
-            }
-        }
-        ExprKind::Constructor { args, .. } => {
-            for a in args {
-                collect_invocations(&a.value, out);
-            }
-        }
-        ExprKind::Sequence(items) => {
-            for i in items {
-                collect_invocations(i, out);
-            }
-        }
-    }
 }
 
 /// Collect every feature reference of an expression, in source order:
@@ -1273,9 +515,17 @@ pub fn constraint_bindings(
         };
         // An unvalued feature evaluates to itself as a bare element,
         // which renders opaquely (`<element>`) — that is the unbound
-        // case for diagnostic purposes, not a value worth showing.
+        // case for diagnostic purposes, not a value worth showing. A
+        // reference *through* an unbound feature is undetermined for the
+        // same reason and renders just as opaquely (`<indeterminate>`).
         let value = match r.evaluate_in(c.scope, &probe) {
-            Ok(crate::eval::Value::Element(_) | crate::eval::Value::Unbound(_)) | Err(_) => None,
+            Ok(
+                crate::eval::Value::Element(_)
+                | crate::eval::Value::Unbound(_)
+                | crate::eval::Value::UnboundMember(_)
+                | crate::eval::Value::Indeterminate,
+            )
+            | Err(_) => None,
             Ok(v) => Some(v.to_string()),
         };
         out.push(ConstraintBinding {
@@ -1334,7 +584,7 @@ pub fn check_constraints(model: &crate::model::Model) -> Vec<ConstraintCheck> {
     let mut r = crate::json::ResolvedModel::build(model);
     let mut out = Vec::new();
     for c in r.constraints() {
-        if model.units()[c.unit].is_library {
+        if model.is_library_unit(c.unit) {
             continue;
         }
         let verdict = constraint_verdict(&mut r, &c);
@@ -1372,7 +622,7 @@ pub fn satisfaction_checks(
     let mut out = Vec::new();
     for s in r.satisfactions() {
         for c in &s.constraints {
-            if model.units()[c.unit].is_library {
+            if model.is_library_unit(c.unit) {
                 continue;
             }
             let verdict = match r.evaluate_in_with(c.scope, &c.expr, &s.overrides) {
@@ -1426,5 +676,58 @@ pub fn constraint_verdict(
         ),
         Ok(other) => ConstraintVerdict::Undecided(format!("result is not a boolean: {other}")),
         Err(e) => ConstraintVerdict::Undecided(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{json::ResolvedModel, model::Model};
+
+    const LIBRARY: &str = "package L {
+        class A;
+        class B :> A;
+        feature n : A [1..2] = 1;
+        feature m : B [0..1] :> n;
+        function f { in x : A; return x; }
+    }";
+    const USER: &str = "package U {
+        feature a : L::A [2..1];
+        feature b :> L::n = 2;
+    }";
+
+    fn findings(model: &Model) -> Vec<(usize, String)> {
+        let mut r = ResolvedModel::build(model);
+        let before = crate::layered::copied_rows();
+        let out = super::validate_semantics_with(&mut r, model);
+        assert_eq!(
+            crate::layered::copied_rows(),
+            before,
+            "a semantic pass must not copy any builder table"
+        );
+        out.into_iter().map(|(u, d)| (u, d.message)).collect()
+    }
+
+    #[test]
+    fn semantic_checks_walk_tables_without_copying_them() {
+        // Fresh build: library rows and user rows share one storage.
+        let mut cold = Model::new();
+        cold.add_library_source("lib.kerml", LIBRARY);
+        cold.add_source("user.kerml", USER);
+        let cold_findings = findings(&cold);
+        assert!(
+            cold_findings
+                .iter()
+                .any(|(_, m)| m.contains("lower bound 2 exceeds upper bound 1")),
+            "{cold_findings:?}"
+        );
+        // Prepared build: the library rows are a shared prefix.
+        let mut base = Model::new();
+        base.add_library_source("lib.kerml", LIBRARY);
+        let prepared = base.prepare_library().unwrap();
+        let mut warm = Model::new();
+        prepared.install(&mut warm).unwrap();
+        warm.add_source("user.kerml", USER);
+        assert!(ResolvedModel::build(&warm).b.library_facts.is_some());
+        assert_eq!(findings(&warm), cold_findings);
     }
 }

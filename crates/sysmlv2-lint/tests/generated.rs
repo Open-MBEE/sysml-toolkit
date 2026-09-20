@@ -2,9 +2,10 @@
 //! classes classify distinctly, every ownership-corruption shape is
 //! found, and clean models stay silent.
 
+use std::fmt::Write as _;
 use sysmlv2_lint::{
-    Config, Finding, Severity, canonical_member_text, canonicalization_digest, generated_inventory,
-    lint_units,
+    Config, Finding, LintError, Severity, canonical_member_text, canonicalization_digest,
+    generated_inventory, lint_units,
 };
 use sysmlv2_model::structure::{member_structure_digest, sha256_hex};
 use sysmlv2_parser::json::ResolvedModel;
@@ -63,7 +64,7 @@ fn run(sources: &[(&str, &str)], config: &Config) -> Vec<Finding> {
 fn guard_findings(sources: &[(&str, &str)], config: &Config) -> Vec<Finding> {
     run(sources, config)
         .into_iter()
-        .filter(|f| f.rule.starts_with("generated-"))
+        .filter(|f| f.rule.id().starts_with("generated-"))
         .collect()
 }
 
@@ -134,13 +135,10 @@ fn fields(b: &Baseline, with_baseline: bool) -> String {
     let mut out = String::new();
     out.push_str("\t\ttransformId = \"sync\";\n");
     out.push_str("\t\tkey = \"R-1\";\n");
-    out.push_str(&format!("\t\tspellingDigest = \"{}\";\n", b.text_digest));
+    writeln!(out, "\t\tspellingDigest = \"{}\";", b.text_digest).unwrap();
     if with_baseline {
-        out.push_str(&format!(
-            "\t\tstructureDigest = \"{}\";\n",
-            b.structure_digest
-        ));
-        out.push_str(&format!("\t\tpolicyDigest = \"{}\";\n", b.policy));
+        writeln!(out, "\t\tstructureDigest = \"{}\";", b.structure_digest).unwrap();
+        writeln!(out, "\t\tpolicyDigest = \"{}\";", b.policy).unwrap();
     }
     out
 }
@@ -903,5 +901,19 @@ fn row_digest_and_state_digests_surface() {
     assert_eq!(
         state.sources[0].input_digest.as_deref(),
         Some(input_digest.as_str())
+    );
+}
+
+/// A member whose text does not parse on its own has no canonical form,
+/// and says so by kind: the guard skips its baseline comparison rather
+/// than guessing at bytes.
+#[test]
+fn a_member_that_does_not_parse_has_no_canonical_text() {
+    let err = canonical_member_text("part def Broken { {{{", &Config::default())
+        .expect_err("does not parse");
+    assert!(matches!(err, LintError::UnparseableMember(_)), "{err:?}");
+    assert!(
+        err.to_string().starts_with("member does not parse: "),
+        "{err}"
     );
 }

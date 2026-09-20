@@ -22,7 +22,7 @@
 //! library_state_digest`] against a store's pinned stdlib commit
 //! digest is the caller's binding check.
 
-use crate::Error;
+use crate::{Error, ErrorKind};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -57,9 +57,13 @@ impl StdlibResolver {
         }
         let version = v.get("formatVersion").and_then(Value::as_u64).unwrap_or(0);
         if version != 1 {
-            return Err(Error::new(format!(
-                "resolver artifact format version {version} unsupported (this build carries 1)"
-            )));
+            return Err(Error::of(
+                ErrorKind::UnsupportedVersion,
+                format!(
+                    "resolver artifact format version {version} unsupported \
+                     (this build carries 1)"
+                ),
+            ));
         }
         let uint = |key: &str| -> Result<u64, Error> {
             v.get(key)
@@ -111,12 +115,22 @@ impl StdlibResolver {
                     .collect()
             })
             .unwrap_or_default();
+        // Each version axis is compared against this build's, so a
+        // value that does not fit its width must refuse rather than
+        // narrow into a version it is not (65537 is not tables
+        // version 1).
+        let tables_version = uint("tablesVersion")?;
+        let scheme_version = uint("schemeVersion")?;
+        let units = uint("units")?;
         Ok(Self {
             toolkit: str_field("toolkit")?,
-            tables_version: uint("tablesVersion")? as u16,
-            scheme_version: uint("schemeVersion")? as u8,
+            tables_version: u16::try_from(tables_version)
+                .map_err(|_| Error::new("resolver artifact `tablesVersion` is out of range"))?,
+            scheme_version: u8::try_from(scheme_version)
+                .map_err(|_| Error::new("resolver artifact `schemeVersion` is out of range"))?,
             library_state_digest: str_field("libraryStateDigest")?,
-            units: uint("units")? as usize,
+            units: usize::try_from(units)
+                .map_err(|_| Error::new("resolver artifact `units` is out of range"))?,
             forward,
             inverse,
             collisions,
@@ -127,18 +141,24 @@ impl StdlibResolver {
     /// this build decodes with — same doctrine as the wire header.
     pub fn assert_compatible(&self) -> Result<(), Error> {
         if self.tables_version != crate::tables::CBOR_TABLES_VERSION {
-            return Err(Error::new(format!(
-                "resolver artifact tables version {} unsupported (this build carries {})",
-                self.tables_version,
-                crate::tables::CBOR_TABLES_VERSION
-            )));
+            return Err(Error::of(
+                ErrorKind::UnsupportedVersion,
+                format!(
+                    "resolver artifact tables version {} unsupported (this build carries {})",
+                    self.tables_version,
+                    crate::tables::CBOR_TABLES_VERSION
+                ),
+            ));
         }
         if self.scheme_version != crate::ID_SCHEME_VERSION {
-            return Err(Error::new(format!(
-                "resolver artifact id-scheme version {} unsupported (this build carries {})",
-                self.scheme_version,
-                crate::ID_SCHEME_VERSION
-            )));
+            return Err(Error::of(
+                ErrorKind::UnsupportedVersion,
+                format!(
+                    "resolver artifact id-scheme version {} unsupported (this build carries {})",
+                    self.scheme_version,
+                    crate::ID_SCHEME_VERSION
+                ),
+            ));
         }
         Ok(())
     }
@@ -146,6 +166,7 @@ impl StdlibResolver {
     /// The last effective-name segment for a library id — the exact
     /// signature id-elided decode wants. Pass as
     /// `&|s| resolver.external_name(s)`.
+    #[must_use]
     pub fn external_name(&self, id: &str) -> Option<String> {
         self.forward.get(id).and_then(|s| s.last()).cloned()
     }
@@ -163,26 +184,32 @@ impl StdlibResolver {
 
     /// Whether a qualified name was excluded from the inverse because
     /// distinct elements claim it.
+    #[must_use]
     pub fn is_collision(&self, qname: &str) -> bool {
         self.collisions.contains(qname)
     }
 
+    #[must_use]
     pub fn library_state_digest(&self) -> &str {
         &self.library_state_digest
     }
 
+    #[must_use]
     pub fn toolkit(&self) -> &str {
         &self.toolkit
     }
 
+    #[must_use]
     pub fn units(&self) -> usize {
         self.units
     }
 
+    #[must_use]
     pub fn forward_len(&self) -> usize {
         self.forward.len()
     }
 
+    #[must_use]
     pub fn inverse_len(&self) -> usize {
         self.inverse.len()
     }

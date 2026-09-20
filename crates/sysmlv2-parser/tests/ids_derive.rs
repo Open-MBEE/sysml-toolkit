@@ -114,3 +114,57 @@ fn foreign_ids_mismatch_without_panic() {
         .count();
     assert!(mismatches >= 1, "foreign id surfaces as a mismatch");
 }
+
+/// Ids and segment paths come out of the same walk, so deriving ids
+/// without materializing paths cannot change them: an element has a
+/// derived id exactly when it has a non-empty path, and re-deriving
+/// along that path from its root reproduces the id the derivation gave.
+#[test]
+fn segment_paths_describe_the_id_derivation() {
+    use sysmlv2_parser::ids::segment_paths;
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+             part def Car { attribute mass = 1; }
+             part c : Car { attribute :>> mass = 2; }
+             alias wheels for c;
+         }",
+    );
+    let compact = model_to_compact_json(&model);
+    let elements = compact.as_array().unwrap();
+    let none = |_: &str| None;
+    let derived = derive_ids(&compact, &none).expect("payload well-formed");
+    let paths = segment_paths(&compact, &none).expect("payload well-formed");
+    assert_eq!(derived.len(), elements.len());
+    assert_eq!(paths.len(), elements.len());
+    let mut chained = 0usize;
+    for (i, (id, path)) in derived.iter().zip(&paths).enumerate() {
+        let Some((root, path)) = path else {
+            assert!(id.is_none(), "element {i} has an id but no path");
+            continue;
+        };
+        if path.is_empty() {
+            assert_eq!(*root, i, "only a root carries the empty path");
+            assert!(id.is_none(), "a root's id is assigned, not derived");
+            continue;
+        }
+        let mut namespace =
+            Uuid::parse_str(elements[*root]["@id"].as_str().unwrap()).expect("a root id");
+        for segment in path.split('/') {
+            namespace = Uuid::new_v5(&namespace, segment.as_bytes());
+        }
+        assert_eq!(Some(namespace), *id, "element {i} at {path}");
+        chained += 1;
+    }
+    assert!(chained > 10, "the model has a body to walk: {chained}");
+    // The named chain skips the membership level: a named member takes
+    // the owner-scope segment, and its membership hangs off the member.
+    assert!(
+        paths
+            .iter()
+            .flatten()
+            .any(|(_, p)| p.ends_with("::P/::Car/m")),
+        "{paths:?}"
+    );
+}

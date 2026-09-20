@@ -120,7 +120,7 @@ fn decode_rejects_malformed_payloads() {
     odd_scheme[16] = 0xFF;
     assert!(from_compact_cbor(&odd_scheme).is_ok());
     // The id-elision flag needs the resolver-aware decoder.
-    let mut elided = good.clone();
+    let mut elided = good;
     elided[17] |= FLAG_ELIDE_IDS;
     let err = from_compact_cbor(&elided).unwrap_err().to_string();
     assert!(
@@ -240,7 +240,7 @@ fn implied_owners_round_trip_every_deviation() {
     let wrong = json!({"@id": "22222222-2222-4222-8222-222222222222"});
     let by_ref = json!({"@ref": "Some::Path"});
     for (name, owner_state) in [
-        ("consistent-derived", consistent.clone()),
+        ("consistent-derived", consistent),
         ("inconsistent-value", wrong),
         ("explicit-null-under-owner", Value::Null),
         ("ref-spelled", by_ref),
@@ -290,4 +290,65 @@ fn digest_space_is_pinned_across_wire_revisions() {
         sysmlv2_cbor::state_digest(&back).unwrap().to_string(),
         "4d2d226c-0d83-5bd7-81f9-7b366288ecbe",
     );
+}
+
+/// Callers act on the error classes differently — refetch a base,
+/// fetch a resolver, route to another entry point, give up on the
+/// bytes — so each class is reachable and says which it is. The
+/// `Display` text stays the explanation.
+#[test]
+fn errors_classify_what_the_caller_should_do() {
+    use sysmlv2_cbor::{
+        DeltaOptions, ErrorKind, apply_delta_cbor, delta_compact_cbor, from_full_cbor,
+        to_compact_cbor_elided,
+    };
+    let model = |name: &str| {
+        let parsed = parse_source(&format!("package {name} {{ part def V; }}"));
+        to_compact_json(&parsed.unit)
+    };
+    let one = model("P");
+    let other = model("Q");
+    let payload = to_compact_cbor(&one).unwrap();
+
+    let kind = |e: sysmlv2_cbor::Error| e.kind();
+    assert_eq!(
+        kind(from_compact_cbor(b"not an s2c payload at all").unwrap_err()),
+        ErrorKind::MissingMagic
+    );
+    // The header word sits right after the magic and the body's array
+    // head, spelled as a full-width uint: its fourth byte is the wire
+    // layout generation.
+    let mut wrong_layout = payload.clone();
+    wrong_layout[13] = 9;
+    assert_eq!(
+        kind(from_compact_cbor(&wrong_layout).unwrap_err()),
+        ErrorKind::UnsupportedVersion
+    );
+    let elided = to_compact_cbor_elided(&one, &|_| None).unwrap();
+    assert_eq!(
+        kind(from_compact_cbor(&elided).unwrap_err()),
+        ErrorKind::NeedsResolver
+    );
+    assert_eq!(
+        kind(from_full_cbor(&payload).unwrap_err()),
+        ErrorKind::WrongForm
+    );
+    let delta = delta_compact_cbor(&one, &other, &DeltaOptions::default()).unwrap();
+    assert_eq!(
+        kind(from_compact_cbor(&delta).unwrap_err()),
+        ErrorKind::WrongForm
+    );
+    assert_eq!(
+        kind(apply_delta_cbor(&delta, &other).unwrap_err()),
+        ErrorKind::BaseDigestMismatch
+    );
+    assert_eq!(
+        kind(from_compact_cbor(&payload[..payload.len() - 1]).unwrap_err()),
+        ErrorKind::Truncated
+    );
+    let unknown =
+        json!([{ "@type": "NotAMetaclass", "@id": "00000000-0000-4000-8000-000000000001" }]);
+    let err = to_compact_cbor(&unknown).unwrap_err();
+    assert!(err.to_string().contains("unknown @type"), "{err}");
+    assert_eq!(kind(err), ErrorKind::Malformed);
 }

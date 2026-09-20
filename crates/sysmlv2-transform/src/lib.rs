@@ -18,7 +18,7 @@
 pub mod eligibility;
 pub mod projection;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +27,7 @@ pub use sysmlv2_model::model::Model as ModelHandle;
 
 use sysmlv2_model::libcache;
 use sysmlv2_model::model::Model;
-use sysmlv2_syntax::ast::{Dialect, escape_name};
+use sysmlv2_syntax::ast::escape_name;
 use sysmlv2_syntax::diag::Diagnostic;
 pub use sysmlv2_syntax::diag::Severity;
 use sysmlv2_syntax::lexer::{tokenize, unescape};
@@ -52,16 +52,11 @@ fn decode_name(spelled: &str) -> String {
 /// Spell `name` as a source token: [`escape_name`] quoting for
 /// non-identifier characters, plus quotes for words reserved in *either*
 /// dialect (a rename batch can touch `.sysml` and `.kerml` units at
-/// once, and a quoted spelling is legal everywhere).
+/// once, and a quoted spelling is legal everywhere) —
+/// [`sysmlv2_syntax::name::spell_name_in`] without a dialect.
+#[must_use]
 pub fn spell_name(name: &str) -> String {
-    let escaped = escape_name(name);
-    if !escaped.starts_with('\'')
-        && (sysmlv2_syntax::parser::is_reserved(Dialect::Sysml, name)
-            || sysmlv2_syntax::parser::is_reserved(Dialect::Kerml, name))
-    {
-        return format!("'{name}'");
-    }
-    escaped
+    sysmlv2_syntax::name::spell_name_in(None, name)
 }
 
 /// Stable identity for one unresolved reference across a semantics-preserving
@@ -160,9 +155,8 @@ fn validation_finding_key(
     diagnostic: &Diagnostic,
     map_qn: &dyn Fn(&str) -> String,
 ) -> ValidationFindingKey {
-    let elements: Vec<ElementRef> = resolved.user_elements().collect();
-    let source_anchor = elements
-        .into_iter()
+    let source_anchor = resolved
+        .user_elements()
         .filter_map(|e| {
             let (u, extent) = resolved.member_extent(e)?;
             (u == unit
@@ -207,12 +201,27 @@ fn validation_finding_key(
     }
 }
 
-fn syntax_validation(unit_name: &str, text: &str) -> Vec<Diagnostic> {
-    let parse = if unit_name.ends_with(".kerml") {
+/// Whether a unit name spells the KerML dialect. The extension is read
+/// without case, so a unit named `Model.KerML` is KerML like
+/// `model.kerml` — the file systems these names come from do not
+/// distinguish the two.
+pub(crate) fn is_kerml_unit(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("kerml"))
+}
+
+/// Parse a unit's text in the dialect its name spells.
+fn parse_unit_source(name: &str, text: &str) -> sysmlv2_syntax::parser::Parse {
+    if is_kerml_unit(name) {
         parse_kerml_source(text)
     } else {
         parse_source(text)
-    };
+    }
+}
+
+fn syntax_validation(unit_name: &str, text: &str) -> Vec<Diagnostic> {
+    let parse = parse_unit_source(unit_name, text);
     sysmlv2_syntax::check::validate(&parse.unit)
 }
 
@@ -283,6 +292,7 @@ fn terminal_name_span(spelling: &str) -> Span {
 /// The definition name [`EditBuilder::extract_definition`] synthesizes
 /// when none is given — exposed so surfaces (the LSP action title, the
 /// CLI's dry-run output) can spell the name the engine will use.
+#[must_use]
 pub fn synthesized_definition_name(usage_name: &str) -> String {
     upper_camel(usage_name)
 }
@@ -307,8 +317,21 @@ fn upper_camel(name: &str) -> String {
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Failure opening (or rebuilding) a session.
+/// The leading diagnostic's message, for the error messages that quote
+/// one. The diagnostic list belongs to whoever built the error, so an
+/// empty one reads as a missing detail instead of ending the message
+/// in a fault.
+fn first_message(diagnostics: &[Diagnostic]) -> &str {
+    diagnostics
+        .first()
+        .map_or("no diagnostic reported", |d| d.message.as_str())
+}
+
+/// Failure opening (or rebuilding) a session. Variants are added as
+/// new ways to refuse a session appear, so a host matches with a
+/// fallback arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SessionError {
     Io(std::io::Error),
     /// A unit does not parse; the session cannot be built.
@@ -318,16 +341,30 @@ pub enum SessionError {
     },
     /// A compact-form CBOR payload does not decode.
     Cbor(sysmlv2_cbor::Error),
+    /// The session holds explicit ids, which an id-elided encoding
+    /// would lose.
+    ExplicitIds,
+    /// A unit name is blank. Every unit is laid out under its name (the
+    /// binary payloads carry it), so a blank one is refused when the
+    /// session is built rather than when it is emitted.
+    InvalidUnitName(String),
 }
 
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            SessionError::ExplicitIds => write!(
+                f,
+                "the session holds explicit ids; an id-elided payload would lose them"
+            ),
             SessionError::Io(e) => write!(f, "{e}"),
             SessionError::Parse { unit, diagnostics } => {
-                write!(f, "{unit} does not parse: {}", diagnostics[0].message)
+                write!(f, "{unit} does not parse: {}", first_message(diagnostics))
             }
             SessionError::Cbor(e) => write!(f, "invalid CBOR payload: {e}"),
+            SessionError::InvalidUnitName(n) => {
+                write!(f, "invalid unit name {n:?}: a unit name must not be blank")
+            }
         }
     }
 }
@@ -338,9 +375,17 @@ impl From<std::io::Error> for SessionError {
     }
 }
 
+impl From<sysmlv2_cbor::Error> for SessionError {
+    fn from(e: sysmlv2_cbor::Error) -> Self {
+        SessionError::Cbor(e)
+    }
+}
+
 /// Failure planning or committing an edit batch. The session is left in
-/// its pre-commit state in every case.
+/// its pre-commit state in every case. Variants are added as new
+/// refusals appear, so a host matches with a fallback arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TransformError {
     /// The element has no declaration site (anonymous or synthesized).
     NotDeclared(ElementRef),
@@ -369,6 +414,8 @@ pub enum TransformError {
     UnknownUnit(String),
     /// `add_unit` with a name the session already holds.
     UnitExists(String),
+    /// A package cannot be split as asked; the reason names the member.
+    SplitIneligible { reason: String },
     /// Two edits touch overlapping text.
     OverlappingEdits { unit: usize, at: Span },
     /// Removing the element would strand references outside the removed
@@ -397,10 +444,10 @@ pub enum TransformError {
     /// not admit definitions. `rebuild` only parses; relocation ops
     /// additionally hold the syntax checker's verdict constant.
     NewValidationFindings { findings: Vec<String> },
-    /// `extract_definition` on a usage the M29a0 eligibility policy
+    /// `extract_definition` on a usage the eligibility policy
     /// refuses (kind, header shape, dialect, body context, …).
     ExtractIneligible { reason: eligibility::ExtractRefusal },
-    /// `inline_definition` on a definition the M29a0 eligibility policy
+    /// `inline_definition` on a definition the eligibility policy
     /// refuses (kind, header, usage count, provenance, collisions, …).
     InlineIneligible { reason: eligibility::InlineRefusal },
     /// The requested definition name is already declared by a sibling
@@ -427,6 +474,7 @@ impl fmt::Display for TransformError {
             TransformError::InvalidMember { text, message } => {
                 write!(f, "member text `{text}` does not parse: {message}")
             }
+            TransformError::SplitIneligible { reason } => write!(f, "cannot split: {reason}"),
             TransformError::NoEditableValue(e) => {
                 write!(f, "element {e:?} has no editable feature value")
             }
@@ -465,7 +513,7 @@ impl fmt::Display for TransformError {
                 write!(
                     f,
                     "edited {unit} does not parse: {}",
-                    diagnostics[0].message
+                    first_message(diagnostics)
                 )
             }
             TransformError::SemanticIdentity { broken } => write!(
@@ -507,7 +555,18 @@ impl fmt::Display for TransformError {
     }
 }
 
-impl std::error::Error for SessionError {}
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SessionError::Io(e) => Some(e),
+            SessionError::Cbor(e) => Some(e),
+            SessionError::Parse { .. }
+            | SessionError::InvalidUnitName(_)
+            | SessionError::ExplicitIds => None,
+        }
+    }
+}
+
 impl std::error::Error for TransformError {}
 
 // ---------------------------------------------------------------------------
@@ -529,6 +588,18 @@ pub struct Session {
     /// Non-fatal problems from lifting interchange JSON (unknown
     /// constructs, unresolvable references) — empty for text sessions.
     warnings: Vec<String>,
+    /// Explicit ids: graph-derived id → (the id the loaded document
+    /// carried, the element's metaclass) for every element whose given
+    /// id is not its derivation. Re-applied after every rebuild, keyed by
+    /// the derived id, and pruned to the entries that still land on an
+    /// element of the recorded metaclass: an edit that restructures an
+    /// element's ownership path (rename, move, delete) retires that
+    /// subtree's entries, so a later element deriving the same key never
+    /// inherits a vanished element's identity.
+    explicit_ids: HashMap<Uuid, (Uuid, &'static str)>,
+    /// Whether the loaded document carried references the lift could only
+    /// spell as ids, so emissions must bind them.
+    binds_ids: bool,
 }
 
 /// Where a session's standard library comes from: a directory on disk
@@ -538,6 +609,8 @@ pub struct Session {
 #[derive(Clone)]
 pub enum Library {
     Dir(PathBuf),
+    /// An immutable graph shared across session builds and edits.
+    Prepared(std::sync::Arc<sysmlv2_model::prepared::PreparedLibrary>),
     Sources {
         units: std::sync::Arc<Vec<(String, String)>>,
         /// A sealed snapshot (`LibraryCache::to_bytes`) recorded against
@@ -550,12 +623,30 @@ pub enum Library {
 }
 
 impl Library {
+    /// Prepare ordered in-memory library sources once for repeated session builds.
+    /// The optional resolution snapshot has the same fallback behavior as
+    /// [`Self::sources_with_snapshot`]. Changed or appended sources require a new
+    /// library; sessions cloned from this value share only immutable library data.
+    pub fn prepared_sources(
+        units: Vec<(String, String)>,
+        snapshot: Option<Vec<u8>>,
+    ) -> Result<Library, SessionError> {
+        let source = Library::Sources {
+            units: std::sync::Arc::new(units),
+            snapshot: snapshot.map(std::sync::Arc::new),
+        };
+        let mut model = Model::new();
+        load_library_into(&mut model, &source)?;
+        Ok(Library::Prepared(model.prepare_library()?))
+    }
+
     pub fn dir(path: impl Into<PathBuf>) -> Library {
         Library::Dir(path.into())
     }
 
     /// An in-memory library from `(unit name, text)` pairs. Unit names
     /// ending in `.kerml` parse as KerML.
+    #[must_use]
     pub fn sources(units: Vec<(String, String)>) -> Library {
         Library::Sources {
             units: std::sync::Arc::new(units),
@@ -566,6 +657,7 @@ impl Library {
     /// [`Self::sources`] with a sealed resolution snapshot
     /// ([`sysmlv2_model::libcache::LibraryCache::to_bytes`]) recorded
     /// against the same units in the same order.
+    #[must_use]
     pub fn sources_with_snapshot(units: Vec<(String, String)>, snapshot: Vec<u8>) -> Library {
         Library::Sources {
             units: std::sync::Arc::new(units),
@@ -574,13 +666,16 @@ impl Library {
     }
 }
 
-/// Load a [`Library`] into `model`. For a directory, the sealed-snapshot
-/// cache is wired exactly like the CLI (replay when present, record when
-/// not) and the cache path to save a fresh recording to is returned;
-/// in-memory sources have no disk cache.
+/// Load a [`Library`] into `model`. Directories share the CLI's prepared
+/// graph cache; a returned path is for saving a legacy resolution recording
+/// when preparation is unavailable. In-memory sources have no disk cache.
 fn load_library_into(model: &mut Model, lib: &Library) -> Result<Option<PathBuf>, SessionError> {
     match lib {
         Library::Dir(dir) => load_library_with_cache(model, dir),
+        Library::Prepared(library) => {
+            library.clone().install(model)?;
+            Ok(None)
+        }
         Library::Sources { units, snapshot } => {
             for (name, src) in units.iter() {
                 model.add_library_source(name.clone(), src);
@@ -596,27 +691,43 @@ fn load_library_into(model: &mut Model, lib: &Library) -> Result<Option<PathBuf>
     }
 }
 
-/// Load the standard library into `model` with the sealed-snapshot
-/// cache wired exactly like the CLI: replay when present, record when
-/// not. Returns the cache path to save a fresh recording to.
+/// Use the same prepared-library loader as the CLI. Live models keep the shared
+/// library alive across session edits; changing its content selects a new base.
+///
+/// A cache the loader could not write is dropped here for the same reason the
+/// recording's own `save` result is: a session's hosts (a language server, a
+/// browser, an embedding process) have no stream this could be written to, and
+/// the cache is an optimization the session never depends on.
 fn load_library_with_cache(model: &mut Model, dir: &Path) -> Result<Option<PathBuf>, SessionError> {
-    model.load_library_dir(dir)?;
-    // The ambient libraries load with every directory library (an
-    // in-memory bundle carries them itself — see gen_stdlib_bundle).
-    sysmlv2_model::ambient::add_to(model);
-    let mut cache_path = None;
-    if std::env::var_os("SYSMLV2_LIB_CACHE").is_none_or(|v| v != "off") {
-        if let Ok(key) = libcache::hash_library_dir(dir).map(sysmlv2_model::ambient::mix_key) {
-            if let Some(path) = libcache::default_cache_path(key) {
-                match libcache::LibraryCache::load(&path) {
-                    Some(cache) => model.set_library_cache(cache),
-                    None => model.record_library_cache(),
-                }
-                cache_path = Some(path);
-            }
+    Ok(sysmlv2_model::prepared::load_library_with_cache(model, dir)?.recording_path)
+}
+
+/// The pipeline stage a check finding came from. A session refuses only
+/// units with `Parse` findings; a host that degrades gracefully keys on
+/// this rather than on severity alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckStage {
+    /// The unit did not parse; the remaining stages did not run on it.
+    Parse,
+    /// Body-context legality (a member the grammar does not allow in its
+    /// surrounding body).
+    Context,
+    /// Reference resolution against the model and library.
+    Referential,
+    /// Semantic constraints on a resolved model.
+    Semantic,
+}
+
+impl CheckStage {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckStage::Parse => "parse",
+            CheckStage::Context => "context",
+            CheckStage::Referential => "referential",
+            CheckStage::Semantic => "semantic",
         }
     }
-    Ok(cache_path)
 }
 
 /// One finding from [`check_sources`]: the CLI `check` verdict shape with
@@ -633,12 +744,539 @@ pub struct CheckFinding {
     pub col: u32,
     /// The diagnostic's byte span in the unit's text.
     pub span: Span,
+    /// The stage that produced the finding.
+    pub stage: CheckStage,
 }
 
-/// Check in-memory sources the way `sysmlv2 check` does: per-unit parse
+/// Text a lenient parse removed from a unit, or closers it appended —
+/// see [`lenient_sources`]. Offsets are bytes and columns byte-based, as
+/// in [`CheckFinding`].
+#[derive(Clone, Debug)]
+pub struct DroppedText {
+    pub unit: String,
+    /// Byte span in the unit's original text (empty when text was
+    /// appended).
+    pub start: u32,
+    pub end: u32,
+    /// 1-based positions of the span's start and end in the original
+    /// text.
+    pub line: u32,
+    pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    /// The removed text (empty when text was appended).
+    pub text: String,
+    /// Line breaks the removal took out of the text as it stood (so the
+    /// counts of a unit's records are disjoint even when a later removal
+    /// encloses an earlier one), and whether it took whole lines (the
+    /// indentation before the text and the line break after it): what
+    /// maps a line of the repaired text back to the original, records
+    /// taken in order of `start`.
+    pub lines_removed: u32,
+    pub whole_lines: bool,
+    /// Text appended at `start`: the closers of bodies left open at the
+    /// end of the unit (empty when text was removed).
+    pub inserted: String,
+    /// The parse message the repair answered.
+    pub message: String,
+}
+
+/// A unit a lenient parse could not repair — see [`lenient_sources`].
+#[derive(Clone, Debug)]
+pub struct UnrepairedUnit {
+    pub unit: String,
+    /// The first parse message still standing, at its 1-based position
+    /// in the repaired text.
+    pub message: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// What [`lenient_sources`] produced.
+#[derive(Clone, Debug, Default)]
+pub struct LenientSources {
+    /// Every unit in input order, repaired where it had to be.
+    pub sources: Vec<(String, String)>,
+    /// What the repairs removed or appended, in unit order.
+    pub dropped: Vec<DroppedText>,
+    /// Units still failing to parse after the repair; their entry in
+    /// `sources` carries the partially repaired text.
+    pub unrepaired: Vec<UnrepairedUnit>,
+}
+
+/// Rounds of parse-and-cut per unit: each round answers every diagnostic
+/// of one parse, so a unit needs several only when a cut uncovers new
+/// errors.
+const LENIENT_ROUNDS: usize = 64;
+
+/// The sources with every unit that fails to parse repaired so that a
+/// session can be built over what parsed. Each round parses the unit and
+/// answers every diagnostic at once. An error inside a member's
+/// declaration removes that member; a zero-width error at a member's end
+/// (the parser kept the member but it lacks its `;`) removes that member;
+/// an error inside a body where the parser skipped a failed member
+/// removes that member's text, recovered from the trivia-free tokens
+/// between the end of the previous sibling (or the body's `{`) and the
+/// `;` that ends it, the body it opens, or the `}` that closes the
+/// enclosing body — the way the parser skips it; an error at the end of
+/// the unit with bodies left open appends the missing closers. Text that
+/// stands alone on its lines goes with its indentation and line break.
+/// The unit is parsed again until it is clean; a unit that stays broken
+/// is named in [`LenientSources::unrepaired`]. Every record is in the
+/// original text's coordinates. The syntax tree is partial, never
+/// absent, so a broken file is not a blank file.
+#[must_use]
+pub fn lenient_sources(sources: &[(String, String)]) -> LenientSources {
+    use sysmlv2_syntax::token::TokenKind;
+    let mut out = LenientSources::default();
+    for (name, text) in sources {
+        let parse_unit = |t: &str| parse_unit_source(name, t);
+        let original = text.as_str();
+        let orig_len = original.len() as u32;
+        let index = LineIndex::new(original);
+        let mut current = text.clone();
+        // Removed spans in original coordinates: disjoint and sorted, so
+        // a position in the current text maps back by adding the length
+        // of every removal before it. Appended closers sit past the end.
+        let mut drops: Vec<(u32, u32)> = Vec::new();
+        let to_original = |pos: u32, drops: &[(u32, u32)], exclusive_end: bool| -> u32 {
+            let mut p = pos;
+            for (s, e) in drops {
+                let before = if exclusive_end { *s < p } else { *s <= p };
+                if before {
+                    p += e - s;
+                } else {
+                    break;
+                }
+            }
+            p.min(orig_len)
+        };
+        let record_drop = |drops: &mut Vec<(u32, u32)>, mut s: u32, mut e: u32| {
+            // A removal enclosing or touching earlier ones absorbs them.
+            drops.retain(|(a, b)| {
+                let touches = *a <= e && *b >= s;
+                if touches {
+                    s = s.min(*a);
+                    e = e.max(*b);
+                }
+                !touches
+            });
+            drops.push((s, e));
+            drops.sort_unstable();
+        };
+        let mut remaining: Option<Diagnostic> = None;
+        for round in 0..=LENIENT_ROUNDS {
+            let parse = parse_unit(&current);
+            let Some(first) = parse.diagnostics.first().cloned() else {
+                remaining = None;
+                break;
+            };
+            if round == LENIENT_ROUNDS {
+                remaining = Some(first);
+                break;
+            }
+            let len = current.len() as u32;
+            let (mut tokens, _) = tokenize(&current);
+            tokens.retain(|t| !t.kind.is_trivia() && t.kind != TokenKind::Eof);
+            // Plan this round's cuts against the current text: the
+            // recorded span, the widened cut, and the message.
+            let mut cuts: Vec<(Span, Span, String)> = Vec::new();
+            let mut closers = 0usize;
+            let mut closer_message = String::new();
+            for d in &parse.diagnostics {
+                let mut at = d.span.start.min(len);
+                if at >= len {
+                    let depth = tokens.iter().fold(0i64, |n, t| match t.kind {
+                        TokenKind::LBrace => n + 1,
+                        TokenKind::RBrace => (n - 1).max(0),
+                        _ => n,
+                    });
+                    if depth > 0 {
+                        if closers == 0 {
+                            closer_message = d.message.clone();
+                        }
+                        closers = closers.max(depth as usize);
+                        continue;
+                    }
+                    if len == 0 {
+                        continue;
+                    }
+                    at = len - 1;
+                }
+                let zero_width = d.span.end <= d.span.start;
+                let span = failed_extent(&parse.unit.members, &tokens, at, zero_width);
+                if span.end <= span.start {
+                    continue;
+                }
+                cuts.push((span, widen_to_own_lines(&current, span), d.message.clone()));
+            }
+            // Disjoint cuts: ones that overlap, touch, or sit on one line
+            // with only blanks between them become one record, widened
+            // again as a whole (three stray closers on one line go with
+            // their line). A cut that already took its line break is a
+            // record of its own.
+            cuts.sort_by_key(|(s, _, _)| (s.start, s.end));
+            let bytes = current.as_bytes();
+            cuts.dedup_by(|later, earlier| {
+                let end = earlier.1.end as usize;
+                let joins = later.1.start < earlier.1.end
+                    || (end > 0
+                        && bytes[end - 1] != b'\n'
+                        && bytes[end..later.1.start as usize]
+                            .iter()
+                            .all(|b| matches!(b, b' ' | b'\t')));
+                if joins {
+                    earlier.0 = Span::new(
+                        earlier.0.start.min(later.0.start),
+                        earlier.0.end.max(later.0.end),
+                    );
+                    earlier.1 = Span::new(
+                        earlier.1.start.min(later.1.start),
+                        earlier.1.end.max(later.1.end),
+                    );
+                }
+                joins
+            });
+            for cut in &mut cuts {
+                cut.1 = widen_to_own_lines(&current, cut.1);
+            }
+            // Records in original coordinates, planned before any cut. A
+            // cut lying entirely in appended closers has nothing original
+            // to record and is applied silently.
+            let mut planned: Vec<(u32, u32, u32, u32, u32, String)> = Vec::new();
+            for (span, cut, message) in &cuts {
+                let cs = to_original(cut.start, &drops, false);
+                if cs >= orig_len {
+                    // Appended closers being cut again: the record that
+                    // appended them gives the text back.
+                    let text = &current[cut.start as usize..cut.end as usize];
+                    if let Some(rec) = out
+                        .dropped
+                        .iter_mut()
+                        .rev()
+                        .find(|d| d.unit == *name && !d.inserted.is_empty())
+                    {
+                        rec.inserted = rec.inserted.replacen(text, "", 1);
+                    }
+                    continue;
+                }
+                let os = to_original(span.start, &drops, false);
+                let oe = to_original(span.end, &drops, true);
+                let ce = to_original(cut.end, &drops, true);
+                let lines = current[cut.start as usize..cut.end as usize]
+                    .matches('\n')
+                    .count() as u32;
+                planned.push((os, oe, cs, ce, lines, message.clone()));
+            }
+            if cuts.is_empty() && closers == 0 {
+                remaining = Some(first);
+                break;
+            }
+            // Closers were counted over tokens this round's cuts may take
+            // away: the next parse decides on the cut text.
+            if !cuts.is_empty() {
+                closers = 0;
+            }
+            for (os, oe, cs, ce, lines, message) in &planned {
+                let start = index.line_col(*os);
+                let end = index.line_col(*oe);
+                out.dropped.push(DroppedText {
+                    unit: name.clone(),
+                    start: *os,
+                    end: *oe,
+                    line: start.line,
+                    col: start.col,
+                    end_line: end.line,
+                    end_col: end.col,
+                    text: original[*os as usize..*oe as usize].to_string(),
+                    lines_removed: *lines,
+                    whole_lines: (*cs, *ce) != (*os, *oe),
+                    inserted: String::new(),
+                    message: message.clone(),
+                });
+                record_drop(&mut drops, *cs, *ce);
+            }
+            for (_, cut, _) in cuts.iter().rev() {
+                current.replace_range(cut.start as usize..cut.end as usize, "");
+            }
+            if closers > 0 {
+                let mut inserted = String::new();
+                if !current.is_empty() && !current.ends_with('\n') {
+                    inserted.push('\n');
+                }
+                for _ in 0..closers {
+                    inserted.push_str("}\n");
+                }
+                let pos = index.line_col(orig_len);
+                out.dropped.push(DroppedText {
+                    unit: name.clone(),
+                    start: orig_len,
+                    end: orig_len,
+                    line: pos.line,
+                    col: pos.col,
+                    end_line: pos.line,
+                    end_col: pos.col,
+                    text: String::new(),
+                    lines_removed: 0,
+                    whole_lines: false,
+                    inserted: inserted.clone(),
+                    message: closer_message.clone(),
+                });
+                current.push_str(&inserted);
+            }
+        }
+        if let Some(d) = remaining {
+            let pos = LineIndex::new(&current).line_col(d.span.start.min(current.len() as u32));
+            out.unrepaired.push(UnrepairedUnit {
+                unit: name.clone(),
+                message: d.message,
+                line: pos.line,
+                col: pos.col,
+            });
+        }
+        out.sources.push((name.clone(), current));
+    }
+    out
+}
+
+/// The start of the run of spaces and tabs ending at `pos` — where the
+/// line's indentation begins, when only indentation precedes `pos`.
+fn indent_start(bytes: &[u8], pos: u32) -> u32 {
+    let mut start = pos;
+    while start > 0 && matches!(bytes[start as usize - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    start
+}
+
+/// The text a removal takes with the member at `extent`: its own lines,
+/// indentation and line break included (either line ending), when the
+/// member stands alone on them. A member that shares its line keeps the
+/// line as written, and so does one with no line break after it —
+/// there, only the blanks trailing the member go with it.
+///
+/// Sibling of [`widen_to_own_lines`], which repairs unparseable text
+/// rather than planning an edit and so also takes the indentation of a
+/// member that ends the file.
+fn cut_whole_lines(src: &str, extent: Span) -> Span {
+    let bytes = src.as_bytes();
+    let start = indent_start(bytes, extent.start);
+    if start > 0 && bytes[start as usize - 1] != b'\n' {
+        return extent;
+    }
+    let mut end = extent.end;
+    while (end as usize) < bytes.len() && matches!(bytes[end as usize], b' ' | b'\t') {
+        end += 1;
+    }
+    let rest = &bytes[end as usize..];
+    if rest.starts_with(b"\r\n") {
+        Span::new(start, end + 2)
+    } else if rest.starts_with(b"\n") {
+        Span::new(start, end + 1)
+    } else {
+        // Nothing closes the line, so the indentation stays where it is.
+        Span::new(extent.start, end)
+    }
+}
+
+/// Widen `span` to whole lines when its text stands alone on them: the
+/// indentation before it and the line break after it go with it.
+fn widen_to_own_lines(text: &str, span: Span) -> Span {
+    let bytes = text.as_bytes();
+    let start = indent_start(bytes, span.start);
+    if start > 0 && bytes[start as usize - 1] != b'\n' {
+        return span;
+    }
+    let mut end = span.end;
+    while (end as usize) < bytes.len() && matches!(bytes[end as usize], b' ' | b'\t') {
+        end += 1;
+    }
+    let rest = &bytes[end as usize..];
+    if rest.starts_with(b"\r\n") {
+        Span::new(start, end + 2)
+    } else if rest.starts_with(b"\n") {
+        Span::new(start, end + 1)
+    } else if rest.is_empty() {
+        Span::new(start, end)
+    } else {
+        span
+    }
+}
+
+/// The body members of a member, for every kind that owns a body. The
+/// sub-bodies of control usages (`if`/`while`/`for` branches) are not
+/// descended: an error in one charges the whole control usage.
+fn member_body(m: &sysmlv2_syntax::ast::Member) -> Option<&[sysmlv2_syntax::ast::Member]> {
+    use sysmlv2_syntax::ast::MemberKind;
+    match &m.kind {
+        MemberKind::Package(p) => p.body.as_deref(),
+        MemberKind::Definition(d) => d.body.as_deref(),
+        MemberKind::Usage(u)
+        | MemberKind::Subject(u)
+        | MemberKind::Actor(u)
+        | MemberKind::Stakeholder(u)
+        | MemberKind::Objective(u)
+        | MemberKind::FramedConcern(u)
+        | MemberKind::RequirementVerification(u)
+        | MemberKind::Render(u)
+        | MemberKind::Return(u)
+        | MemberKind::RequirementConstraint { usage: u, .. }
+        | MemberKind::StateSubaction {
+            action: Some(u), ..
+        } => u.body.as_deref(),
+        MemberKind::MultiplicityDecl(d) => d.body.as_deref(),
+        _ => None,
+    }
+}
+
+/// The innermost member whose span holds `offset`, across nested bodies.
+fn innermost_member(
+    members: &[sysmlv2_syntax::ast::Member],
+    offset: u32,
+) -> Option<&sysmlv2_syntax::ast::Member> {
+    for m in members {
+        if m.span.start <= offset && offset < m.span.end {
+            if let Some(inner) = member_body(m).and_then(|b| innermost_member(b, offset)) {
+                return Some(inner);
+            }
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// The deepest member whose span ends exactly at `offset`: where the
+/// parser reports a missing terminator.
+fn deepest_member_ending_at(
+    members: &[sysmlv2_syntax::ast::Member],
+    offset: u32,
+) -> Option<&sysmlv2_syntax::ast::Member> {
+    let m = members.iter().find(|m| m.span.end == offset)?;
+    Some(
+        member_body(m)
+            .and_then(|b| deepest_member_ending_at(b, offset))
+            .unwrap_or(m),
+    )
+}
+
+/// The end offset of the `{` that opens the member's own body: the one
+/// the member's last `}` closes, or — for a member the parser left open
+/// at the end of the unit — the outermost `{` inside it without a match.
+/// `None` when the member has no braces.
+fn member_body_open(
+    m: &sysmlv2_syntax::ast::Member,
+    tokens: &[sysmlv2_syntax::token::Token],
+) -> Option<u32> {
+    use sysmlv2_syntax::token::TokenKind;
+    let first = tokens.partition_point(|t| t.span.start < m.span.start);
+    let mut open: Vec<u32> = Vec::new();
+    let mut last_closed: Option<u32> = None;
+    for t in tokens[first..]
+        .iter()
+        .take_while(|t| t.span.start < m.span.end)
+    {
+        match t.kind {
+            TokenKind::LBrace => open.push(t.span.end),
+            TokenKind::RBrace => {
+                if let Some(o) = open.pop() {
+                    last_closed = Some(o);
+                }
+            }
+            _ => {}
+        }
+    }
+    open.first().copied().or(last_closed)
+}
+
+/// The text a diagnostic at `at` condemns: the member whose declaration
+/// holds it; the member ending there when the diagnostic is zero-width
+/// (it lacks its terminator); otherwise the failed statement the parser
+/// skipped in the enclosing body, recovered from the tokens after the
+/// previous sibling (or the body's `{`).
+fn failed_extent(
+    members: &[sysmlv2_syntax::ast::Member],
+    tokens: &[sysmlv2_syntax::token::Token],
+    at: u32,
+    zero_width: bool,
+) -> Span {
+    let (siblings, floor): (&[sysmlv2_syntax::ast::Member], u32) =
+        match innermost_member(members, at) {
+            Some(m) => match (member_body(m), member_body_open(m, tokens)) {
+                (Some(body), Some(open_end)) if at >= open_end => (body, open_end),
+                _ => return m.span,
+            },
+            None => (members, 0),
+        };
+    if zero_width {
+        if let Some(c) = deepest_member_ending_at(siblings, at) {
+            return c.span;
+        }
+    }
+    let anchor = siblings
+        .iter()
+        .filter(|c| c.span.end <= at)
+        .map(|c| c.span.end)
+        .max()
+        .unwrap_or(floor)
+        .max(floor);
+    statement_extent(tokens, anchor, at)
+}
+
+/// The failed statement between `anchor` (the end of the last parsed
+/// text before it) and the diagnostic at `at`, recovered from the
+/// trivia-free tokens the way the parser skips it: from the first token
+/// at or after `anchor`, forward through the next `;` at depth zero or
+/// the end of a body opened inside it, stopping before the `}` that
+/// closes the enclosing body. A diagnostic sitting on a brace at the
+/// statement's start names a stray brace: that token alone.
+fn statement_extent(tokens: &[sysmlv2_syntax::token::Token], anchor: u32, at: u32) -> Span {
+    use sysmlv2_syntax::token::TokenKind;
+    let start = tokens.partition_point(|t| t.span.start < anchor);
+    let i = tokens.partition_point(|t| t.span.end <= at);
+    if start >= tokens.len() {
+        return Span::new(at, at);
+    }
+    let i = i.max(start).min(tokens.len() - 1);
+    if i == start && matches!(tokens[i].kind, TokenKind::LBrace | TokenKind::RBrace) {
+        return tokens[i].span;
+    }
+    let mut end = i;
+    let mut depth = 0i64;
+    let mut k = i;
+    while k < tokens.len() {
+        match tokens[k].kind {
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    end = k + 1;
+                    break;
+                }
+            }
+            TokenKind::Semi if depth == 0 => {
+                end = k + 1;
+                break;
+            }
+            _ => {}
+        }
+        k += 1;
+        end = k;
+    }
+    if end <= start {
+        return tokens[i].span;
+    }
+    Span::new(tokens[start].span.start, tokens[end - 1].span.end)
+}
+
+/// Check in-memory sources: per-unit parse
 /// and body-context validation always; referential and semantic checks
 /// against the standard library when `lib_dir` is given (loaded through
-/// the same sealed-snapshot cache as [`Session`]). Unit names ending in
+/// the same prepared-library cache as [`Session`]). Unlike CLI `check`,
+/// model-level checks require a library here, and unused-import analysis is
+/// not included. Unit names ending in
 /// `.kerml` parse as KerML.
 ///
 /// Model problems come back as [`CheckFinding`]s — a broken parse is a
@@ -657,85 +1295,184 @@ pub fn check_sources_with_library(
     sources: &[(String, String)],
     lib: Option<&Library>,
 ) -> Result<Vec<CheckFinding>, SessionError> {
-    fn findings_for(name: &str, src: &str, diags: &[Diagnostic]) -> Vec<CheckFinding> {
-        let index = LineIndex::new(src);
-        diags
-            .iter()
-            .map(|d| {
-                let pos = index.line_col(d.span.start);
-                CheckFinding {
-                    severity: d.severity,
-                    message: d.message.clone(),
-                    unit: name.to_string(),
-                    line: pos.line,
-                    col: pos.col,
-                    span: d.span,
-                }
-            })
-            .collect()
-    }
-
-    let mut findings = Vec::new();
-    // Per-unit stages: parse diagnostics; body-context checks only on a
-    // clean parse (context checks on a broken parse would mislead).
-    let mut parsed: Vec<&(String, String)> = Vec::new();
-    for entry in sources {
-        let (name, src) = entry;
-        let parse = if name.ends_with(".kerml") {
-            parse_kerml_source(src)
-        } else {
-            parse_source(src)
-        };
-        if !parse.diagnostics.is_empty() {
-            findings.extend(findings_for(name, src, &parse.diagnostics));
-            continue;
+    let mut parsed = Vec::new();
+    let mut findings = syntax_findings(sources, |source| {
+        if lib.is_some() {
+            parsed.push(source);
         }
-        findings.extend(findings_for(
-            name,
-            src,
-            &sysmlv2_syntax::check::validate(&parse.unit),
-        ));
-        parsed.push(entry);
-    }
+    });
 
     // Referential + semantic checks: all cleanly-parsed units as one
     // model against the library.
     if let Some(lib) = lib {
         let mut model = Model::new();
         let cache_path = load_library_into(&mut model, lib)?;
-        let boundary = model.units().len();
-        for (name, src) in &parsed {
-            model.add_source(name.clone(), src);
+        for source in parsed {
+            model.add_parsed_source(source);
         }
         let mut resolved = ResolvedModel::build(&model);
         if let (Some(path), Some(cache)) = (cache_path, model.take_recorded_library_cache()) {
             let _ = cache.save(&path);
         }
-        for (unit, d) in sysmlv2_model::check::validate_model_with(&mut resolved, &model)
-            .into_iter()
-            .chain(sysmlv2_model::check::validate_semantics_with(
-                &mut resolved,
-                &model,
-            ))
-        {
-            let (name, src) = parsed[unit - boundary];
-            findings.extend(findings_for(name, src, &[d]));
+        for (unit, d) in sysmlv2_model::check::validate_model_with(&mut resolved, &model) {
+            let name = &model.unit(unit).name;
+            let index = &model.unit(unit).lines;
+            findings.extend(findings_for(name, index, &[d], CheckStage::Referential));
+        }
+        for (unit, d) in sysmlv2_model::check::validate_semantics_with(&mut resolved, &model) {
+            let name = &model.unit(unit).name;
+            let index = &model.unit(unit).lines;
+            findings.extend(findings_for(name, index, &[d], CheckStage::Semantic));
         }
     }
 
     Ok(findings)
 }
 
+/// Re-apply a session's explicit ids after a rebuild and bind the
+/// references the lift could only spell as ids.
+fn apply_explicit_ids(
+    resolved: &mut ResolvedModel,
+    explicit_ids: &mut HashMap<Uuid, (Uuid, &'static str)>,
+    binds_ids: bool,
+    warnings: &mut Vec<String>,
+) {
+    if explicit_ids.is_empty() && !binds_ids {
+        // A text session: nothing to overlay, and a quoted name that
+        // happens to look like an id stays a name.
+        return;
+    }
+    let map: HashMap<Uuid, Uuid> = explicit_ids.iter().map(|(d, (g, _))| (*d, *g)).collect();
+    let applied = resolved.override_ids(&map);
+    // Prune: an entry survives only while it lands on an element of the
+    // metaclass it was recorded for; a vanished or restructured element's
+    // entry dies with it.
+    let kept: HashMap<Uuid, (Uuid, &'static str)> = applied
+        .into_iter()
+        .filter(|(d, _, ty)| explicit_ids.get(d).is_some_and(|(_, t)| t == ty))
+        .map(|(d, g, ty)| (d, (g, ty)))
+        .collect();
+    let stale: Vec<Uuid> = explicit_ids
+        .keys()
+        .filter(|d| !kept.contains_key(*d))
+        .copied()
+        .collect();
+    if !stale.is_empty() {
+        // Undo any override applied to an element of another metaclass.
+        let undo: HashMap<Uuid, Uuid> = stale
+            .iter()
+            .filter_map(|d| explicit_ids.get(d).map(|(g, _)| (*g, *d)))
+            .collect();
+        resolved.override_ids(&undo);
+    }
+    *explicit_ids = kept;
+    if !binds_ids {
+        return;
+    }
+    let bound = resolved.bind_id_spelled_references();
+    if !bound.is_empty() {
+        // The lift's "cannot name reference target" notes for the ids
+        // that are now bound no longer apply. A bound id with no element
+        // in the model (a library element with no library loaded) is
+        // kept as spelled and reported once, so a library-typed payload
+        // loaded without its library still says so.
+        let spellings: Vec<String> = bound.iter().map(|u| u.to_string()).collect();
+        warnings.retain(|w| {
+            !(w.contains("cannot name reference target") && spellings.iter().any(|s| w.contains(s)))
+        });
+        let outside = bound
+            .iter()
+            .filter(|id| resolved.element_by_id(&id.to_string()).is_none())
+            .count();
+        // Re-applied after every rebuild: state the count once.
+        warnings.retain(|w| !w.contains("target elements outside the document"));
+        if outside > 0 {
+            warnings.push(format!(
+                "{outside} reference(s) target elements outside the document and are kept by id \
+                 (load the library to resolve them)"
+            ));
+        }
+    }
+}
+
+/// The per-unit stages of [`check_sources_with_library`] alone: parse
+/// diagnostics, and body-context checks on every unit that parsed
+/// cleanly (context checks on a broken parse would mislead). No model
+/// is built — the host that goes on to open a [`Session`] over the
+/// units that parsed gets the resolution stages from
+/// [`Session::check_findings`] without resolving the sources twice.
+#[must_use]
+pub fn check_sources_syntax(sources: &[(String, String)]) -> Vec<CheckFinding> {
+    syntax_findings(sources, |_| {})
+}
+
+fn findings_for(
+    name: &str,
+    index: &LineIndex,
+    diags: &[Diagnostic],
+    stage: CheckStage,
+) -> Vec<CheckFinding> {
+    diags
+        .iter()
+        .map(|d| {
+            let pos = index.line_col(d.span.start);
+            CheckFinding {
+                severity: d.severity,
+                message: d.message.clone(),
+                unit: name.to_string(),
+                line: pos.line,
+                col: pos.col,
+                span: d.span,
+                stage,
+            }
+        })
+        .collect()
+}
+
+/// Report syntax findings and pass each clean parse to its consumer. A
+/// syntax-only caller drops each tree before the next source is parsed.
+fn syntax_findings(
+    sources: &[(String, String)],
+    mut clean: impl FnMut(sysmlv2_model::model::ParsedSource),
+) -> Vec<CheckFinding> {
+    let mut findings = Vec::new();
+    for (name, src) in sources {
+        let parsed = sysmlv2_model::model::ParsedSource::new(name.clone(), src);
+        if !parsed.diagnostics().is_empty() {
+            findings.extend(findings_for(
+                name,
+                parsed.lines(),
+                parsed.diagnostics(),
+                CheckStage::Parse,
+            ));
+            continue;
+        }
+        findings.extend(findings_for(
+            name,
+            parsed.lines(),
+            &sysmlv2_syntax::check::validate(parsed.unit()),
+            CheckStage::Context,
+        ));
+        clean(parsed);
+    }
+    findings
+}
+
 fn rebuild(
     sources: &[(String, String)],
     lib: Option<&Library>,
 ) -> Result<(Model, ResolvedModel, usize), SessionError> {
+    // Checked before the library loads: the payload emitters key every
+    // unit by its name, so a blank one has no place to be laid out.
+    if let Some((name, _)) = sources.iter().find(|(name, _)| name.trim().is_empty()) {
+        return Err(SessionError::InvalidUnitName(name.clone()));
+    }
     let mut model = Model::new();
     let mut cache_path = None;
     if let Some(lib) = lib {
         cache_path = load_library_into(&mut model, lib)?;
     }
-    let unit_offset = model.units().len();
+    let unit_offset = model.unit_count();
     for (name, src) in sources {
         let unit = model.add_source(name.clone(), src);
         if !unit.diagnostics.is_empty() {
@@ -762,16 +1499,27 @@ pub fn unused_private_imports_with(
     resolved: &mut ResolvedModel,
     texts: &[(usize, String)],
 ) -> Vec<(usize, Span)> {
-    let candidates = resolved.unused_private_imports();
+    let units: Vec<_> = texts.iter().map(|(unit, _)| *unit).collect();
+    let candidates = resolved.unused_private_imports_for_units(&units);
+    let mut by_unit = std::collections::HashMap::new();
+    for (unit, text) in texts {
+        by_unit.entry(*unit).or_insert(text);
+    }
+    let targets: Vec<_> = candidates.iter().map(|(_, target, _, _)| *target).collect();
+    let names = resolved.namespace_member_names_many(&targets);
+    let mut occurrences = std::collections::HashMap::new();
     let mut out = Vec::new();
     for (_, target, unit, span) in candidates {
-        let Some((_, text)) = texts.iter().find(|(i, _)| *i == unit) else {
-            continue; // library unit — never reported
+        let Some(text) = by_unit.get(&unit) else {
+            continue;
         };
-        let names = resolved.namespace_member_names(target);
-        let mentioned = names
-            .iter()
-            .any(|name| !name.is_empty() && mentions_outside(text, name, span));
+        let names = &names[&target];
+        let mentioned = names.iter().any(|name| {
+            occurrences
+                .entry((unit, name.clone()))
+                .or_insert_with(|| mention_extent(text, name))
+                .is_some_and(|(start, end)| start < span.start as usize || end > span.end as usize)
+        });
         if !mentioned {
             out.push((unit, span));
         }
@@ -789,24 +1537,29 @@ fn line_col(text: &str, pos: usize) -> (usize, usize) {
     }
 }
 
-fn mentions_outside(text: &str, name: &str, skip: Span) -> bool {
+// Whole-source ASCII word boundaries intentionally include comments and
+// restricted names. Changing to identifier tokens would change the contract.
+fn mention_extent(text: &str, name: &str) -> Option<(usize, usize)> {
+    if name.is_empty() {
+        return None;
+    }
     let bytes = text.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut from = 0;
+    let mut extent: Option<(usize, usize)> = None;
     while let Some(i) = text[from..].find(name) {
         let start = from + i;
         let end = start + name.len();
-        from = start + 1;
-        if start >= skip.start as usize && end <= skip.end as usize {
-            continue;
-        }
+        // Include overlapping occurrences, without slicing inside a UTF-8
+        // character when a restricted name starts with a non-ASCII letter.
+        from = start + name.chars().next().unwrap().len_utf8();
         let left_ok = start == 0 || !is_word(bytes[start - 1]);
         let right_ok = end >= bytes.len() || !is_word(bytes[end]);
         if left_ok && right_ok {
-            return true;
+            extent = Some(extent.map_or((start, end), |(first, _)| (first, end)));
         }
     }
-    false
+    extent
 }
 
 impl Session {
@@ -822,14 +1575,26 @@ impl Session {
     /// Open a session over in-memory sources: `(unit name, text)` pairs.
     /// Unit names ending in `.kerml` parse as KerML.
     pub fn from_sources(sources: Vec<(String, String)>) -> Result<Session, SessionError> {
-        let (model, resolved, unit_offset) = rebuild(&sources, None)?;
+        Self::from_sources_with_library(sources, None)
+    }
+
+    /// [`Self::from_sources`] resolved against a library in the same
+    /// build — [`Self::from_sources`] followed by
+    /// [`Self::load_library_from`] would resolve the user units twice.
+    pub fn from_sources_with_library(
+        sources: Vec<(String, String)>,
+        lib: Option<Library>,
+    ) -> Result<Session, SessionError> {
+        let (model, resolved, unit_offset) = rebuild(&sources, lib.as_ref())?;
         Ok(Session {
             sources,
-            lib: None,
+            lib,
             unit_offset,
             model,
             resolved,
             warnings: Vec::new(),
+            explicit_ids: HashMap::new(),
+            binds_ids: false,
         })
     }
 
@@ -944,7 +1709,24 @@ impl Session {
                 ),
             ));
         }
-        let (model, resolved, unit_offset) = rebuild(&sources, lib)?;
+        let (model, mut resolved, unit_offset) = rebuild(&sources, lib)?;
+        // Explicit ids: pair the loaded document's elements with the
+        // rebuilt model's by ownership path (roots by document order),
+        // and keep every id the document carried that the derivation
+        // would have replaced.
+        let external = |s: &str| names.get(s).and_then(|segs| segs.last().cloned());
+        let (mut explicit_ids, unmatched) =
+            sysmlv2_model::loader::explicit_id_map(&value, &model, &external, &mut warnings);
+        if unmatched > 0 {
+            warnings.push(format!(
+                "{unmatched} element(s) of the document have no structural counterpart in the \
+                 rebuilt model; their ids are not preserved"
+            ));
+        }
+        let binds_ids = warnings
+            .iter()
+            .any(|w| w.contains("cannot name reference target"));
+        apply_explicit_ids(&mut resolved, &mut explicit_ids, binds_ids, &mut warnings);
         Ok(Session {
             sources,
             lib: lib.cloned(),
@@ -952,7 +1734,37 @@ impl Session {
             model,
             resolved,
             warnings,
+            explicit_ids,
+            binds_ids,
         })
+    }
+
+    /// The session's compact element array with the explicit-id overlay.
+    fn compact_json_overlaid(&self) -> serde_json::Value {
+        let mut v = sysmlv2_model::json::model_to_compact_json(&self.model);
+        self.overlay(&mut v);
+        v
+    }
+
+    fn compact_json_with_units_overlaid(&self) -> (serde_json::Value, Vec<(usize, String)>) {
+        let (mut v, units) = sysmlv2_model::json::model_to_compact_json_with_units(&self.model);
+        self.overlay(&mut v);
+        (v, units)
+    }
+
+    fn overlay(&self, v: &mut serde_json::Value) {
+        if self.explicit_ids.is_empty() && !self.binds_ids {
+            return;
+        }
+        sysmlv2_model::loader::overlay_explicit_ids(v, &self.explicit_ids);
+    }
+
+    /// Whether the session holds **explicit ids** — ids the loaded
+    /// document carried that are not this toolkit's graph derivation
+    /// (IDS.md). Such a session's compact payloads carry
+    /// [`sysmlv2_cbor::FLAG_EXPLICIT_IDS`], and id elision is refused.
+    pub fn has_explicit_ids(&self) -> bool {
+        !self.explicit_ids.is_empty()
     }
 
     /// Non-fatal problems from lifting interchange JSON (empty for
@@ -977,32 +1789,52 @@ impl Session {
     /// [`Self::load_library`] over any [`Library`] source — in-memory
     /// `(unit name, text)` library units included (the WASM shape).
     pub fn load_library_from(&mut self, lib: Library) -> Result<(), SessionError> {
-        let (model, resolved, unit_offset) = rebuild(&self.sources, Some(&lib))?;
+        let (model, mut resolved, unit_offset) = rebuild(&self.sources, Some(&lib))?;
+        apply_explicit_ids(
+            &mut resolved,
+            &mut self.explicit_ids,
+            self.binds_ids,
+            &mut self.warnings,
+        );
         self.lib = Some(lib);
         self.unit_offset = unit_offset;
         self.model = model;
+        // The closure policy is a session setting: it survives a rebuild.
+        let policy = self.resolved.closure_policy();
         self.resolved = resolved;
+        self.resolved.set_closure_policy(policy);
         Ok(())
     }
 
     /// Emit the session's model as compact interchange JSON (KerML 10.4;
     /// user units only — library elements resolve but never serialize).
     pub fn to_compact_json(&self) -> serde_json::Value {
-        sysmlv2_model::json::model_to_compact_json(&self.model)
+        self.compact_json_overlaid()
     }
 
     /// Emit the session's model as compact-form CBOR — the
     /// deterministic binary re-encoding of [`Self::to_compact_json`],
     /// decodable back to the identical element array.
+    ///
+    /// # Panics
+    ///
+    /// If the model's compact form falls outside the codec tables. The
+    /// codec's corpus gate pins the compact emitter to those tables, and
+    /// a session refuses a blank unit name, which is the one input the
+    /// encoder rejects outright.
     pub fn to_compact_cbor(&self) -> Vec<u8> {
         // The corpus gate in sysmlv2-cbor pins the compact emitter's
         // output to the codec tables, so the session's own compact form
         // always encodes. Payloads carry the model's unit structure —
         // each unit root's element index paired with its source path —
         // so decoders can lay the model back out as its original files.
-        let (json, units) = sysmlv2_model::json::model_to_compact_json_with_units(&self.model);
-        sysmlv2_cbor::to_compact_cbor_with_units(&json, &units)
-            .expect("session compact form is covered by the codec tables")
+        let (json, units) = self.compact_json_with_units_overlaid();
+        if self.has_explicit_ids() {
+            sysmlv2_cbor::to_compact_cbor_with_units_explicit(&json, &units)
+        } else {
+            sysmlv2_cbor::to_compact_cbor_with_units(&json, &units)
+        }
+        .expect("session compact form is covered by the codec tables")
     }
 
     /// The unit structure the session's binary payloads carry: for
@@ -1019,11 +1851,22 @@ impl Session {
     /// targets, so the exception map stays roots-only; decode against
     /// the **same library version** (`from_compact_cbor_elided` /
     /// `from_cbor_with`), or the digest refuses the payload.
-    pub fn to_compact_cbor_elided(&self) -> Vec<u8> {
+    ///
+    /// Refused (`Err`) for a session holding explicit ids: every given id
+    /// would ride the exception map anyway, and the payload must carry
+    /// the explicit-id flag, which the elided form does not.
+    pub fn to_compact_cbor_elided(&self) -> Result<Vec<u8>, SessionError> {
+        if self.has_explicit_ids() {
+            return Err(SessionError::ExplicitIds);
+        }
         let names = self.library_id_names();
-        let (json, units) = sysmlv2_model::json::model_to_compact_json_with_units(&self.model);
-        sysmlv2_cbor::to_compact_cbor_elided_with_units(&json, &|s| names.get(s).cloned(), &units)
-            .expect("session compact form is covered by the codec tables")
+        let (json, units) = self.compact_json_with_units_overlaid();
+        Ok(sysmlv2_cbor::to_compact_cbor_elided_with_units(
+            &json,
+            &|s| names.get(s).cloned(),
+            &units,
+        )
+        .expect("session compact form is covered by the codec tables"))
     }
 
     /// Encode the delta from `base` (a compact element array, any
@@ -1039,16 +1882,14 @@ impl Session {
         // One emission feeds both the target and its unit table so the
         // indices line up by construction. Unit paths ride strict
         // deltas only — portable result indices are not exact.
-        let (target, units) = sysmlv2_model::json::model_to_compact_json_with_units(&self.model);
+        let (target, units) = self.compact_json_with_units_overlaid();
         let units = if portable { Vec::new() } else { units };
         sysmlv2_cbor::delta_compact_cbor(
             base,
             &target,
-            &sysmlv2_cbor::DeltaOptions {
-                portable,
-                units,
-                ..Default::default()
-            },
+            &sysmlv2_cbor::DeltaOptions::new()
+                .with_portable(portable)
+                .with_units(units),
         )
         .map_err(SessionError::Cbor)
     }
@@ -1064,15 +1905,17 @@ impl Session {
         &self,
         base: &serde_json::Value,
     ) -> Result<Vec<u8>, SessionError> {
+        // Same policy as the elided snapshot: an explicit-id session
+        // produces no elided form.
+        if self.has_explicit_ids() {
+            return Err(SessionError::ExplicitIds);
+        }
         let names = self.library_id_names();
-        let (target, units) = sysmlv2_model::json::model_to_compact_json_with_units(&self.model);
+        let (target, units) = self.compact_json_with_units_overlaid();
         sysmlv2_cbor::delta_compact_cbor_elided(
             base,
             &target,
-            &sysmlv2_cbor::DeltaOptions {
-                units,
-                ..Default::default()
-            },
+            &sysmlv2_cbor::DeltaOptions::new().with_units(units),
             &|s| names.get(s).cloned(),
         )
         .map_err(SessionError::Cbor)
@@ -1091,6 +1934,11 @@ impl Session {
     /// The model's **state digest** — the content identity
     /// a delta names its base by. Emission-order-independent: the same
     /// model state digests identically however it was produced.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::to_compact_cbor`] — the digest runs over the same
+    /// compact form.
     pub fn state_digest(&self) -> Uuid {
         sysmlv2_cbor::state_digest(&self.to_compact_json())
             .expect("session compact form is covered by the codec tables")
@@ -1124,11 +1972,11 @@ impl Session {
 
     /// [`Self::apply_delta_cbor`] against a caller-held base document
     /// (a compact element array) instead of the session's own model —
-    /// the payload-file base path. A file base's identity is the
-    /// file's content: lifting it into a session re-derives ids and
-    /// re-seeds units, so the lifted model digests differently and a
-    /// strict delta would refuse its own true base. The session still
-    /// serves as the library context for elided created ids.
+    /// the payload-file base path, for a caller that holds the base
+    /// document without having loaded it into a session (a loaded
+    /// session keeps the document's ids, so [`Self::apply_delta_cbor`]
+    /// serves that case). The session still serves as the library
+    /// context for elided created ids.
     pub fn apply_delta_cbor_to(
         &self,
         bytes: &[u8],
@@ -1180,8 +2028,7 @@ impl Session {
         lib: Option<&Library>,
         indent: Indent,
     ) -> Result<Session, SessionError> {
-        let (value, units) =
-            sysmlv2_cbor::from_compact_cbor_units(bytes).map_err(SessionError::Cbor)?;
+        let (value, units) = sysmlv2_cbor::from_compact_cbor_units(bytes)?;
         // Payloads carrying their unit structure restore the model's
         // original file layout: unit-path order is document order.
         let unit_names: Vec<String> = units.into_iter().map(|(_, path)| path).collect();
@@ -1200,18 +2047,24 @@ impl Session {
     /// a partial model survives emit → lift losslessly (the Flexo
     /// change-record path).
     pub fn to_full_json_with(&self, recover_refs: bool) -> serde_json::Value {
-        sysmlv2_model::full::model_to_full_json_with(&self.model, recover_refs)
+        let mut v = sysmlv2_model::full::model_to_full_json_with(&self.model, recover_refs);
+        self.overlay(&mut v);
+        v
     }
 
     /// Emit the session's model as **full-form CBOR** — the binary
     /// re-encoding of [`Self::to_full_json_with`]. An emit view
     /// only: transport the compact form; expand at the edge.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::to_compact_cbor`], for the full form's tables.
     pub fn to_full_cbor(&self, recover_refs: bool) -> Vec<u8> {
         let full = self.to_full_json_with(recover_refs);
         // Root indices differ between the compact and full arrays
         // (implied relationships join the full form): re-locate each
         // unit root by element id.
-        let (compact, units) = sysmlv2_model::json::model_to_compact_json_with_units(&self.model);
+        let (compact, units) = self.compact_json_with_units_overlaid();
         let by_id: HashMap<&str, usize> = full
             .as_array()
             .map(|arr| {
@@ -1234,10 +2087,12 @@ impl Session {
     }
 
     /// Map an interchange document's element ids to this session's ids
-    /// by qualified name — the identity mapping a change record needs
-    /// when a payload from another producer (or another unit naming) was
-    /// lifted into this session: `(input id, session id)` for every
-    /// named input element present here under a different id.
+    /// by qualified name — `(input id, session id)` for every named
+    /// input element present here under a different id. A document
+    /// loaded into this session keeps its ids and maps nothing; the
+    /// mapping is for an input whose structure the session no longer
+    /// has (after a rename, or a text session compared with an earlier
+    /// export).
     pub fn id_map_from(&mut self, input: &serde_json::Value) -> Vec<(Uuid, Uuid)> {
         let input = unwrap_flexo(input);
         let names = sysmlv2_model::lift::document_name_map(&input);
@@ -1266,6 +2121,50 @@ impl Session {
         }
         out.sort();
         out
+    }
+
+    /// The check findings of the session's own model: what
+    /// [`check_sources_with_library`] reports for the same sources and
+    /// library, read off the session's build instead of a second one.
+    /// Parse findings never occur (a session holds only units that
+    /// parsed); context findings come from each unit's syntax, and the
+    /// referential and semantic stages — like `check`, only with a
+    /// library — from the resolved model, whose unresolved list and
+    /// import provenance both passes leave intact. Same order as
+    /// `check`: each unit's context findings, then referential, then
+    /// semantic.
+    pub fn check_findings(&mut self) -> Vec<CheckFinding> {
+        let mut findings = Vec::new();
+        for (unit, name, _) in self.units() {
+            let mu = self.model.unit(unit);
+            findings.extend(findings_for(
+                name,
+                &mu.lines,
+                &sysmlv2_syntax::check::validate(&mu.unit),
+                CheckStage::Context,
+            ));
+        }
+        if self.lib.is_none() {
+            return findings;
+        }
+        let stage =
+            |diags: Vec<(usize, Diagnostic)>, stage: CheckStage, out: &mut Vec<CheckFinding>| {
+                for (unit, d) in diags {
+                    let Some(i) = unit.checked_sub(self.unit_offset) else {
+                        continue;
+                    };
+                    let name = &self.sources[i].0;
+                    let index = &self.model.unit(unit).lines;
+                    out.extend(findings_for(name, index, &[d], stage));
+                }
+            };
+        let referential =
+            sysmlv2_model::check::validate_model_with(&mut self.resolved, &self.model);
+        stage(referential, CheckStage::Referential, &mut findings);
+        let semantic =
+            sysmlv2_model::check::validate_semantics_with(&mut self.resolved, &self.model);
+        stage(semantic, CheckStage::Semantic, &mut findings);
+        findings
     }
 
     /// The resolved model — navigation, `query`, evaluation.
@@ -1310,6 +2209,7 @@ impl Session {
             return None;
         }
         match &self.lib {
+            Some(Library::Prepared(library)) => library.source(unit),
             Some(Library::Sources { units, .. }) => {
                 units.get(unit).map(|(n, s)| (n.as_str(), s.as_str()))
             }
@@ -1331,6 +2231,120 @@ impl Session {
                 .nth(unit),
             _ => None,
         }
+    }
+
+    /// Plan splitting `root` (a package in a user unit) into one unit
+    /// per directly nested package: the file tree, the root-level name
+    /// collisions and their renames. Apply it with
+    /// [`EditBuilder::split`]. Deeper levels split by running the plan
+    /// again on a hoisted package.
+    ///
+    /// New units take the root unit's extension; a root named without one
+    /// parses as SysML, so its new units take `.sysml`.
+    pub fn split_plan(
+        &mut self,
+        root: ElementRef,
+        options: &SplitOptions,
+    ) -> Result<SplitPlan, TransformError> {
+        let unit_offset = self.unit_offset;
+        let r = &mut self.resolved;
+        if r.element_type(root) != "Package" {
+            return Err(TransformError::SplitIneligible {
+                reason: format!("`{}` is not a package", r.element_type(root)),
+            });
+        }
+        let (unit, _) = r
+            .member_extent(root)
+            .ok_or(TransformError::NoExtent(root))?;
+        if unit < unit_offset {
+            return Err(TransformError::NotDeclared(root));
+        }
+        let root_name = r
+            .element_name(root)
+            .ok_or(TransformError::NotDeclared(root))?
+            .to_string();
+        let unit_name = self.sources[unit - unit_offset].0.clone();
+        // The file segment alone carries the extension: a dot in a
+        // directory name must not be read as one.
+        let (dir_prefix, file) = unit_name
+            .rsplit_once('/')
+            .map_or(("", unit_name.as_str()), |(d, f)| (d, f));
+        let (stem, extension) = file
+            .rsplit_once('.')
+            .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+            .unwrap_or((file, "sysml"));
+        let directory = match &options.directory {
+            Some(d) => d.trim_end_matches('/').to_string(),
+            None if dir_prefix.is_empty() => stem.to_string(),
+            None => format!("{dir_prefix}/{stem}"),
+        };
+        let children: Vec<ElementRef> = r
+            .owned_members(root)
+            .into_iter()
+            .filter(|&m| r.element_type(m) == "Package" && r.element_name(m).is_some())
+            .collect();
+        if children.is_empty() {
+            return Err(TransformError::SplitIneligible {
+                reason: format!("`{root_name}` owns no nested package"),
+            });
+        }
+        let mut entries: Vec<SplitEntry> = Vec::new();
+        let mut taken_names: Vec<String> = Vec::new();
+        let mut taken_units: Vec<String> = Vec::new();
+        for child in children {
+            let name = r.element_name(child).unwrap_or_default().to_string();
+            let qualified = r
+                .element_qualified_name(child)
+                .ok_or(TransformError::NotDeclared(child))?;
+            let (_, extent) = r
+                .member_extent(child)
+                .ok_or(TransformError::NoExtent(child))?;
+            // A hoisted package becomes a root-level name: it must not
+            // collide with one the model already resolves (user or
+            // library) or with another hoisted package.
+            let mut top = name.clone();
+            let mut attempt = 0;
+            while r.resolve_qualified(&escape_name(&top)).is_some() || taken_names.contains(&top) {
+                attempt += 1;
+                top = if attempt == 1 {
+                    format!("{root_name} {name}")
+                } else {
+                    format!("{root_name} {name} {attempt}")
+                };
+            }
+            taken_names.push(top.clone());
+            let new_name = (top != name).then_some(top.clone());
+            let file = match options.naming {
+                SplitNaming::Keep => file_segment(&top),
+                SplitNaming::Slug => slug(&top),
+            };
+            let file = if options.uri_units {
+                uri_segment(&file)
+            } else {
+                file
+            };
+            let mut unit = format!("{directory}/{file}.{extension}");
+            let mut n = 1;
+            while taken_units.contains(&unit) || self.sources.iter().any(|(u, _)| *u == unit) {
+                n += 1;
+                unit = format!("{directory}/{file}-{n}.{extension}");
+            }
+            taken_units.push(unit.clone());
+            entries.push(SplitEntry {
+                package: child,
+                qualified,
+                name,
+                new_name,
+                unit,
+                bytes: (extent.end - extent.start) as usize,
+            });
+        }
+        Ok(SplitPlan {
+            root,
+            root_unit: unit_name,
+            directory,
+            entries,
+        })
     }
 
     /// Textual `private import` members that provably feed nothing in
@@ -1361,6 +2375,7 @@ impl Session {
         EditBuilder {
             session: self,
             ops: Vec::new(),
+            skip_colliding_renames: false,
         }
     }
 
@@ -1374,12 +2389,11 @@ impl Session {
     /// as [`Self::minimize_qualifications`], without any rewriting.
     pub fn minimal_spelling(&mut self, context: ElementRef, target: ElementRef) -> Option<String> {
         use sysmlv2_syntax::ast::{Name, QualifiedName};
-        let full_qn = self.resolved.element_qualified_name(target)?;
-        let full = full_qn
-            .split("::")
-            .map(|s| spell_name(&decode_name(s)))
-            .collect::<Vec<_>>()
-            .join("::");
+        // The lookup-name spelling: it re-resolves, where the
+        // specification's `qualifiedName` may name an unnamed end by its
+        // implied positional name.
+        let full_qn = self.resolved.element_reference_spelling(target)?;
+        let full = sysmlv2_syntax::name::respell_canonical(None, &full_qn);
         let Some((unit, extent)) = self.resolved.member_extent(context) else {
             return Some(full);
         };
@@ -1392,7 +2406,7 @@ impl Session {
         let Some(scope) = scope else {
             return Some(full);
         };
-        let segs: Vec<String> = full_qn.split("::").map(decode_name).collect();
+        let segs = sysmlv2_syntax::name::split_canonical(&full_qn);
         for k in 1..=segs.len() {
             let suffix = &segs[segs.len() - k..];
             let qn = QualifiedName {
@@ -1431,6 +2445,11 @@ impl Session {
     /// every untouched site must be unaffected, or the offending
     /// respells are dropped and the pass retried. Declarations never
     /// move, so interchange ids are untouched by construction.
+    ///
+    /// # Panics
+    ///
+    /// If a feature-chain run is assembled with no sites in it, which
+    /// the grouping cannot produce.
     pub fn minimize_qualifications(&mut self) -> Result<MinimizeReport, TransformError> {
         use sysmlv2_syntax::ast::{Name, QualifiedName};
         struct Cand {
@@ -1440,6 +2459,11 @@ impl Session {
             text: String,
             qn: String,
             name_len: u32,
+        }
+        impl Cand {
+            fn range(&self) -> (usize, u32, u32) {
+                (self.unit, self.start, self.end)
+            }
         }
         // Candidate respells: per plain site, the shortest suffix of the
         // target's qualified name that resolves back to the same element
@@ -1514,7 +2538,7 @@ impl Session {
             let Some(head_qn) = self.resolved.element_qualified_name(first.target) else {
                 continue;
             };
-            let segs: Vec<String> = head_qn.split("::").map(decode_name).collect();
+            let segs = sysmlv2_syntax::name::split_canonical(&head_qn);
             let mut head: Option<String> = None;
             for k in 1..=segs.len() {
                 let suffix = &segs[segs.len() - k..];
@@ -1577,6 +2601,14 @@ impl Session {
 
         let mut report = MinimizeReport::default();
         let mut banned: HashSet<(usize, u32)> = HashSet::new();
+        // Candidates come from disjoint reference spans, so they should
+        // not overlap — but the pass below splices them in one cursor
+        // sweep per unit, which would slice backwards if two ever did.
+        // An overlapping candidate is banned outright: the first of the
+        // run is respelled and the rest keep their printed spelling.
+        for i in overlapping_candidates(&cands.iter().map(Cand::range).collect::<Vec<_>>()) {
+            banned.insert((cands[i].unit, cands[i].start));
+        }
         loop {
             let active: Vec<&Cand> = cands
                 .iter()
@@ -1690,11 +2722,38 @@ impl Session {
             }
             report.respelled = active.len();
             self.sources = new_sources;
+            apply_explicit_ids(
+                &mut new_resolved,
+                &mut self.explicit_ids,
+                self.binds_ids,
+                &mut self.warnings,
+            );
             self.model = new_model;
+            let policy = self.resolved.closure_policy();
             self.resolved = new_resolved;
+            self.resolved.set_closure_policy(policy);
             return Ok(report);
         }
     }
+}
+
+/// Indexes of the ranges that overlap one kept before them, over
+/// `(unit, start, end)` ranges sorted by `(unit, start)`: the first
+/// range of an overlapping run is kept and every later range that
+/// reaches back into it is reported. Applying the kept ranges in order
+/// is then a single forward sweep per unit.
+fn overlapping_candidates(ranges: &[(usize, u32, u32)]) -> Vec<usize> {
+    let mut overlapping = Vec::new();
+    let mut kept: Option<(usize, u32, u32)> = None;
+    for (i, &r) in ranges.iter().enumerate() {
+        match kept {
+            // A later range that starts before the kept one ends —
+            // nested in it, or straddling its end.
+            Some((unit, _, end)) if unit == r.0 && r.1 < end => overlapping.push(i),
+            _ => kept = Some(r),
+        }
+    }
+    overlapping
 }
 
 /// Outcome of a [`Session::minimize_qualifications`] pass.
@@ -1750,6 +2809,11 @@ enum Op {
         usage: ElementRef,
         name: Option<String>,
     },
+    HoistToUnit {
+        e: ElementRef,
+        unit_name: String,
+        new_name: Option<String>,
+    },
     InlineDefinition {
         definition: ElementRef,
     },
@@ -1758,6 +2822,31 @@ enum Op {
         new_owner: ElementRef,
         index: Option<usize>,
     },
+}
+
+impl Op {
+    /// The element whose text the edit reads or rewrites, when it has
+    /// one — the handle the library guard checks. A move's destination
+    /// and a retarget's new target are checked by their own planners;
+    /// extract and inline answer through their eligibility gates, which
+    /// name the refusal precisely.
+    fn subject(&self) -> Option<ElementRef> {
+        match self {
+            Op::Rename { e, .. }
+            | Op::SetFeatureValue { e, .. }
+            | Op::SetFeatureType { e, .. }
+            | Op::Remove { e }
+            | Op::ReplaceMember { e, .. }
+            | Op::HoistToUnit { e, .. }
+            | Op::MoveMember { e, .. } => Some(*e),
+            Op::InsertMember { owner, .. } => Some(*owner),
+            Op::Retarget { site, .. } => Some(site.owner),
+            Op::InsertTopLevel { .. }
+            | Op::AddUnit { .. }
+            | Op::ExtractDefinition { .. }
+            | Op::InlineDefinition { .. } => None,
+        }
+    }
 }
 
 /// One committed batch's outcome.
@@ -1793,10 +2882,150 @@ pub struct AppliedSplice {
     pub text: String,
 }
 
+/// How a split names the files it creates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SplitNaming {
+    /// The package name as written (`02 JPL.sysml`).
+    #[default]
+    Keep,
+    /// Letters, digits, `.`, `_` and `-` only; runs of anything else
+    /// become one `-` (`02-JPL.sysml`).
+    Slug,
+}
+
+/// Options for [`Session::split_plan`].
+#[derive(Clone, Debug, Default)]
+pub struct SplitOptions {
+    pub naming: SplitNaming,
+    /// Directory (unit-name prefix) for the new units; by default the
+    /// root's unit name without its extension (`models/TMT.sysml` →
+    /// `models/TMT`).
+    pub directory: Option<String>,
+    /// Unit names are URIs (an editor's workspace): the new units' file
+    /// segments are percent-encoded the way editors spell a path
+    /// segment — every byte outside the unreserved set (letters,
+    /// digits, `-` `.` `_` `~`) as `%XX` — so a name with a space or a
+    /// sub-delimiter yields the exact string the editor opens the
+    /// created file under. Off for path-named (CLI) sessions.
+    pub uri_units: bool,
+}
+
+/// One package of a split: where it goes and what it is called there.
+#[derive(Clone, Debug)]
+pub struct SplitEntry {
+    pub package: ElementRef,
+    /// Qualified name before the split.
+    pub qualified: String,
+    pub name: String,
+    /// The root-level name the package takes when its own would collide
+    /// with a name the model already resolves or another hoisted package.
+    pub new_name: Option<String>,
+    /// Name of the new unit (a relative file path for CLI sessions).
+    pub unit: String,
+    /// Size of the package's text, for reporting.
+    pub bytes: usize,
+}
+
+/// A planned split — see [`Session::split_plan`].
+#[derive(Clone, Debug)]
+pub struct SplitPlan {
+    pub root: ElementRef,
+    /// Unit the root package is declared in.
+    pub root_unit: String,
+    pub directory: String,
+    pub entries: Vec<SplitEntry>,
+}
+
+/// A name as one path segment: path separators and NUL become `-`, and
+/// a name that would climb or vanish becomes `package`.
+fn file_segment(name: &str) -> String {
+    let out: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | '\0') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if out.is_empty() || out == "." || out == ".." {
+        "package".to_string()
+    } else {
+        out
+    }
+}
+
+/// A file segment as a URI path segment: bytes outside the unreserved
+/// set (`A-Z a-z 0-9 - . _ ~`) become `%XX` (uppercase hex, UTF-8
+/// bytes), the spelling editors give a created file's uri.
+fn uri_segment(name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[usize::from(b >> 4)] as char);
+            out.push(HEX[usize::from(b & 0x0F)] as char);
+        }
+    }
+    out
+}
+
+/// A file-name slug: letters, digits, `.`, `_`, `-`; anything else
+/// collapses to one `-`.
+fn slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut dash = false;
+    for c in name.chars() {
+        if c.is_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        "package".to_string()
+    } else {
+        out
+    }
+}
+
+/// Remove `indent` from the start of every line after the first that
+/// carries it. Returns the text and, per line, (old start, new start)
+/// offsets for mapping positions.
+fn dedent_lines(text: &str, indent: &str) -> (String, Vec<(u32, u32)>) {
+    let mut out = String::with_capacity(text.len());
+    let mut lines = Vec::new();
+    let mut old_pos = 0u32;
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let stripped = if i > 0 && !indent.is_empty() && line.starts_with(indent) {
+            &line[indent.len()..]
+        } else {
+            line
+        };
+        let new_start = out.len() as u32;
+        let old_start = old_pos + (line.len() - stripped.len()) as u32;
+        lines.push((old_start, new_start));
+        out.push_str(stripped);
+        old_pos += line.len() as u32;
+    }
+    (out, lines)
+}
+
 /// An accumulating edit batch over a [`Session`].
+#[must_use = "an edit batch does nothing until committed"]
 pub struct EditBuilder<'s> {
     session: &'s mut Session,
     ops: Vec<Op>,
+    /// Colliding renames (see [`Self::skip_colliding_renames`]) are
+    /// dropped from the batch and reported instead of refusing it.
+    skip_colliding_renames: bool,
 }
 
 /// One planned text replacement, in pre-commit coordinates.
@@ -1839,6 +3068,21 @@ impl EditBuilder<'_> {
             e,
             new_name: new_name.to_string(),
         });
+        self
+    }
+
+    /// Drop, instead of refusing on, every rename whose new name a
+    /// sibling in the same owner already carries after the batch (a
+    /// declared or short name the batch leaves in place, or a name
+    /// another rename in the batch gives a sibling). By default such a
+    /// rename refuses the whole batch with
+    /// [`TransformError::NameTaken`] before anything is planned; with
+    /// this policy the rest of the batch commits and each dropped
+    /// rename is one line of [`CommitReport::findings`]. Built for
+    /// bulk fix-all batches, where one clashing suggestion must not
+    /// hold up thousands of legal renames.
+    pub fn skip_colliding_renames(&mut self) -> &mut Self {
+        self.skip_colliding_renames = true;
         self
     }
 
@@ -1888,9 +3132,9 @@ impl EditBuilder<'_> {
     }
 
     /// Create a new, empty unit under `name`. Refuses a name the
-    /// session already holds. Ops are planned against the pre-commit
-    /// state, so an `insert_top_level` into the born unit belongs in a
-    /// *following* batch, not this one.
+    /// session already holds. Later ops in the same batch may write into
+    /// it (`insert_top_level`, `hoist_to_unit`); it joins the session at
+    /// commit.
     pub fn add_unit(&mut self, name: &str) -> &mut Self {
         self.ops.push(Op::AddUnit {
             name: name.to_string(),
@@ -1955,6 +3199,54 @@ impl EditBuilder<'_> {
         self
     }
 
+    /// Hoist the member declaration that created `e` (a package, as a
+    /// rule) to the top level of `unit_name` — an existing unit, or one
+    /// this batch adds — under `new_name` when given. The moved text is
+    /// dedented to the top level and every reference written inside it
+    /// to something outside it is respelled by its reference spelling,
+    /// so the moved body resolves on its own; references from elsewhere
+    /// keep resolving when the old owner re-exports the moved package
+    /// (see [`Session::split_plan`]). Verified like a move.
+    pub fn hoist_to_unit(
+        &mut self,
+        e: ElementRef,
+        unit_name: &str,
+        new_name: Option<&str>,
+    ) -> &mut Self {
+        self.ops.push(Op::HoistToUnit {
+            e,
+            unit_name: unit_name.to_string(),
+            new_name: new_name.map(str::to_string),
+        });
+        self
+    }
+
+    /// Apply a [`SplitPlan`]: every entry's package is hoisted into its
+    /// own new unit and the root package re-exports it — `public import
+    /// <name>;`, or `public alias <old> for <new>;` when the package was
+    /// renamed to avoid a root-level collision — so every qualified
+    /// reference through the root keeps resolving.
+    pub fn split(&mut self, plan: &SplitPlan) -> &mut Self {
+        for entry in &plan.entries {
+            self.add_unit(&entry.unit);
+        }
+        for entry in &plan.entries {
+            self.hoist_to_unit(entry.package, &entry.unit, entry.new_name.as_deref());
+        }
+        for entry in &plan.entries {
+            let text = match &entry.new_name {
+                Some(new) => format!(
+                    "public alias {} for {};",
+                    spell_name(&entry.name),
+                    spell_name(new)
+                ),
+                None => format!("public import {};", spell_name(&entry.name)),
+            };
+            self.insert_member(plan.root, &text);
+        }
+        self
+    }
+
     /// Extract `usage`'s inline body into a fresh definition: the
     /// body region moves byte-preserved into a
     /// `<keyword> def` inserted as the sibling immediately before the
@@ -1966,7 +3258,7 @@ impl EditBuilder<'_> {
     /// `name` `None` synthesizes UpperCamel from the usage's declared
     /// name (`fuel_tank` → `FuelTank`); a sibling already declaring the
     /// name refuses with [`TransformError::NameTaken`]. Eligibility is
-    /// the M29a0 policy ([`eligibility::ExtractRefusal`] via
+    /// the eligibility policy ([`eligibility::ExtractRefusal`] via
     /// [`TransformError::ExtractIneligible`]). The commit runs under
     /// relocation discipline: every generated reference target is
     /// expectation-verified, any newly unresolved reference refuses,
@@ -1991,7 +3283,7 @@ impl EditBuilder<'_> {
     /// Inlining a definition just produced by
     /// [`Self::extract_definition`] restores the original usage
     /// byte-for-byte; no reverse-placement or body-partition promise is
-    /// made for arbitrary definitions. Eligibility is the M29a0 policy
+    /// made for arbitrary definitions. Eligibility is the policy
     /// ([`eligibility::InlineRefusal`] via
     /// [`TransformError::InlineIneligible`]): sole plain FeatureTyping,
     /// provenance-classified incoming references, no member-name
@@ -2020,11 +3312,28 @@ impl EditBuilder<'_> {
     }
 
     fn run(self, dry_run: bool) -> Result<CommitReport, TransformError> {
-        let EditBuilder { session, ops } = self;
+        let EditBuilder {
+            session,
+            ops,
+            skip_colliding_renames,
+        } = self;
         let mut planner = Planner::new(session);
-        for op in &ops {
+        let skipped = planner.rename_collisions(&ops, skip_colliding_renames)?;
+        if !ops.is_empty() && skipped.len() == ops.len() {
+            // Every op was dropped: nothing to splice, the session is
+            // untouched, and the report says why.
+            return Ok(CommitReport {
+                findings: skipped.into_values().collect(),
+                ..CommitReport::default()
+            });
+        }
+        for (i, op) in ops.iter().enumerate() {
+            if skipped.contains_key(&i) {
+                continue;
+            }
             planner.plan(op)?;
         }
+        planner.findings.extend(skipped.into_values());
         planner.commit(dry_run)
     }
 }
@@ -2067,6 +3376,9 @@ struct Planner<'s> {
     /// Units this batch creates (empty, appended at commit before the
     /// rebuild). Not splices — splices key existing unit indices.
     new_units: Vec<String>,
+    /// Findings recorded while planning (dropped colliding renames);
+    /// they lead the committed report's findings.
+    findings: Vec<String>,
 }
 
 /// One `move_member`'s carried reference sites: the destination
@@ -2093,14 +3405,61 @@ impl<'s> Planner<'s> {
             projection_subjects: Vec::new(),
             report_unused_imports: false,
             new_units: Vec::new(),
+            findings: Vec::new(),
         }
     }
 
-    fn src(&self, unit: usize) -> &str {
-        self.session.source(unit).expect("user unit")
+    /// Text of a user unit, or the empty text of a unit this batch
+    /// adds. `None` for a library unit: no edit reads one.
+    fn src(&self, unit: usize) -> Option<&str> {
+        self.session
+            .source(unit)
+            .or_else(|| self.is_born(unit).then_some(""))
+    }
+
+    /// [`Self::src`] for the unit `subject` lives in — a library unit
+    /// refuses with [`TransformError::NotDeclared`].
+    fn user_src(&self, unit: usize, subject: ElementRef) -> Result<&str, TransformError> {
+        self.src(unit).ok_or(TransformError::NotDeclared(subject))
+    }
+
+    /// Whether `unit` is a unit this batch adds — it joins the session
+    /// empty at commit, after every existing unit.
+    fn is_born(&self, unit: usize) -> bool {
+        let first = self.session.unit_offset + self.session.sources.len();
+        (first..first + self.new_units.len()).contains(&unit)
+    }
+
+    /// Name of an existing or born unit by model unit index.
+    fn unit_name(&self, unit: usize) -> String {
+        let local = unit - self.session.unit_offset;
+        match self.session.sources.get(local) {
+            Some((name, _)) => name.clone(),
+            None => self.new_units[local - self.session.sources.len()].clone(),
+        }
+    }
+
+    /// Model unit index of an existing or born unit by name.
+    fn unit_by_name(&self, name: &str) -> Option<usize> {
+        if let Some((u, _, _)) = self.session.units().find(|(_, n, _)| *n == name) {
+            return Some(u);
+        }
+        let first = self.session.unit_offset + self.session.sources.len();
+        self.new_units
+            .iter()
+            .position(|n| n == name)
+            .map(|k| first + k)
     }
 
     fn plan(&mut self, op: &Op) -> Result<(), TransformError> {
+        // Library elements are resolution targets only. An edit whose
+        // subject lives in a library unit is refused here, before any
+        // op reads the subject's text or plans a splice into its unit.
+        if let Some(subject) = op.subject() {
+            if self.session.resolved.is_library_element(subject) {
+                return Err(TransformError::NotDeclared(subject));
+            }
+        }
         match op {
             Op::Rename { e, new_name } => self.plan_rename(*e, new_name),
             Op::SetFeatureValue { e, expr } => self.plan_set_value(*e, expr),
@@ -2117,8 +3476,132 @@ impl<'s> Planner<'s> {
                 index,
             } => self.plan_move(*e, *new_owner, *index),
             Op::ExtractDefinition { usage, name } => self.plan_extract(*usage, name.as_deref()),
+            Op::HoistToUnit {
+                e,
+                unit_name,
+                new_name,
+            } => self.plan_hoist(*e, unit_name, new_name.as_deref()),
             Op::InlineDefinition { definition } => self.plan_inline(*definition),
         }
+    }
+
+    /// The renames in `ops` whose new name collides with a sibling's:
+    /// a name another member of the same owner still carries after the
+    /// batch (its declared name unless the batch renames it away, its
+    /// short name regardless, the effective name of an unnamed
+    /// feature), or a name an earlier rename in the batch already gives
+    /// a sibling. Two members of one namespace sharing a name make every
+    /// qualified reference to either ambiguous — the commit's
+    /// verification would refuse the batch at each such site, without
+    /// saying which rename caused it. Returns op index → finding text;
+    /// without `skip`, the first collision is a
+    /// [`TransformError::NameTaken`] refusal instead.
+    fn rename_collisions(
+        &mut self,
+        ops: &[Op],
+        skip: bool,
+    ) -> Result<BTreeMap<usize, String>, TransformError> {
+        let renamed: HashSet<ElementRef> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Rename { e, .. } => Some(*e),
+                _ => None,
+            })
+            .collect();
+        let mut out = BTreeMap::new();
+        if renamed.is_empty() {
+            return Ok(out);
+        }
+        let r = self.session.resolved();
+        // Per owner (`None` = the root namespace): the names its members
+        // keep, and the names the batch's renames claim, each to the
+        // element carrying it.
+        let mut taken: HashMap<Option<ElementRef>, HashMap<String, ElementRef>> = HashMap::new();
+        let mut claimed: HashMap<Option<ElementRef>, HashMap<String, ElementRef>> = HashMap::new();
+        let mut roots: Option<Vec<ElementRef>> = None;
+        for (i, op) in ops.iter().enumerate() {
+            let Op::Rename { e, new_name } = op else {
+                continue;
+            };
+            let owner = r.owner(*e);
+            let names = taken.entry(owner).or_insert_with(|| {
+                let siblings: Vec<ElementRef> = match owner {
+                    Some(o) => r.owned_members(o),
+                    None => roots
+                        .get_or_insert_with(|| {
+                            // Owner lookups memoize, so the candidates
+                            // are read out before they are filtered.
+                            let mut all: Vec<ElementRef> = r.user_elements().collect();
+                            all.retain(|x| r.owner(*x).is_none());
+                            all
+                        })
+                        .clone(),
+                };
+                let mut names: HashMap<String, ElementRef> = HashMap::new();
+                for sib in siblings {
+                    if !renamed.contains(&sib) {
+                        // What lookup finds the sibling by, not the
+                        // specification's effective name.
+                        if let Some(n) = r.element_lookup_name(sib) {
+                            names.entry(n).or_insert(sib);
+                        }
+                    }
+                    if let Some(sn) = r.element_declared_short_name(sib) {
+                        names.entry(sn.to_string()).or_insert(sib);
+                    }
+                }
+                names
+            });
+            let existing = names
+                .get(new_name.as_str())
+                .copied()
+                .filter(|x| x != e)
+                .map(|x| (x, false))
+                .or_else(|| {
+                    claimed
+                        .get(&owner)
+                        .and_then(|c| c.get(new_name.as_str()))
+                        .copied()
+                        .map(|x| (x, true))
+                });
+            let Some((other, by_batch)) = existing else {
+                claimed
+                    .entry(owner)
+                    .or_default()
+                    .entry(new_name.clone())
+                    .or_insert(*e);
+                continue;
+            };
+            let other_qn = r
+                .element_qualified_name(other)
+                .unwrap_or_else(|| format!("{other:?}"));
+            if !skip {
+                return Err(TransformError::NameTaken {
+                    name: new_name.clone(),
+                    existing: if by_batch {
+                        format!("{other_qn} (renamed to `{new_name}` in the same batch)")
+                    } else {
+                        other_qn
+                    },
+                });
+            }
+            let old_qn = r
+                .element_qualified_name(*e)
+                .unwrap_or_else(|| format!("{e:?}"));
+            out.insert(
+                i,
+                if by_batch {
+                    format!(
+                        "rename of `{old_qn}` to `{new_name}` skipped: the batch already renames its sibling `{other_qn}` to `{new_name}`"
+                    )
+                } else {
+                    format!(
+                        "rename of `{old_qn}` to `{new_name}` skipped: its sibling `{other_qn}` is already named `{new_name}`"
+                    )
+                },
+            );
+        }
+        Ok(out)
     }
 
     fn plan_rename(&mut self, e: ElementRef, new_name: &str) -> Result<(), TransformError> {
@@ -2132,7 +3615,7 @@ impl<'s> Planner<'s> {
         let old_qn = r
             .element_qualified_name(e)
             .ok_or(TransformError::NotDeclared(e))?;
-        let old_raw = decode_name(slice(self.src(decl_unit), decl_span));
+        let old_raw = decode_name(slice(self.user_src(decl_unit, e)?, decl_span));
         let spelled = spell_name(new_name);
         // Qualified-name strings follow `element_qualified_name`'s
         // convention (escape_name, reserved words unquoted) — the
@@ -2154,8 +3637,12 @@ impl<'s> Planner<'s> {
         });
         for site in self.session.resolved().references_to(e) {
             // Only sites written with the element's own name are
-            // respelled; alias/effective-name spellings stay.
-            if decode_name(slice(self.src(site.unit), site.name_span)) == old_raw {
+            // respelled; alias/effective-name spellings stay. (Sites
+            // are recorded in user units only.)
+            let Some(site_src) = self.src(site.unit) else {
+                continue;
+            };
+            if decode_name(slice(site_src, site.name_span)) == old_raw {
                 self.splices.push(Splice {
                     unit: site.unit,
                     start: site.name_span.start,
@@ -2205,7 +3692,7 @@ impl<'s> Planner<'s> {
         let (unit, extent) = r
             .member_extent(e)
             .ok_or(TransformError::NoEditableValue(e))?;
-        let src = self.src(unit);
+        let src = self.user_src(unit, e)?;
         if !slice(src, extent).ends_with(';') {
             return Err(TransformError::NoEditableValue(e));
         }
@@ -2290,7 +3777,7 @@ impl<'s> Planner<'s> {
             .resolved()
             .member_extent(owner)
             .ok_or(TransformError::NoExtent(owner))?;
-        let src = self.src(unit);
+        let src = self.user_src(unit, owner)?;
         let indent = line_indent(src, extent.start);
         let child = child_indent(&indent, src);
         // The member arrives in top-level form; every line is
@@ -2346,13 +3833,13 @@ impl<'s> Planner<'s> {
 
     fn plan_insert_top(&mut self, unit_name: &str, text: &str) -> Result<(), TransformError> {
         Self::validate_member_text(text)?;
-        let (unit, src_len) = self
-            .session
-            .units()
-            .find(|(_, n, _)| *n == unit_name)
-            .map(|(u, _, s)| (u, s.len() as u32))
+        let unit = self
+            .unit_by_name(unit_name)
             .ok_or_else(|| TransformError::UnknownUnit(unit_name.to_string()))?;
-        let src = self.src(unit);
+        let src = self
+            .src(unit)
+            .ok_or_else(|| TransformError::UnknownUnit(unit_name.to_string()))?;
+        let src_len = src.len() as u32;
         let needs_newline = !src.is_empty() && !src.ends_with('\n');
         // Top level: no base indent, but internal levels still convert
         // to the unit's own indent style.
@@ -2372,7 +3859,8 @@ impl<'s> Planner<'s> {
     }
 
     fn plan_add_unit(&mut self, name: &str) -> Result<(), TransformError> {
-        if name.is_empty() {
+        // A blank name would open a unit the session could not emit.
+        if name.trim().is_empty() {
             return Err(TransformError::InvalidName(name.to_string()));
         }
         if self.session.units().any(|(_, n, _)| n == name)
@@ -2386,7 +3874,27 @@ impl<'s> Planner<'s> {
 
     fn plan_remove(&mut self, e: ElementRef) -> Result<(), TransformError> {
         let r = self.session.resolved();
-        let (unit, extent) = r.member_extent(e).ok_or(TransformError::NoExtent(e))?;
+        let (unit, mut extent) = r.member_extent(e).ok_or(TransformError::NoExtent(e))?;
+        if r.element_type(e) == "SuccessionAsUsage" {
+            // A leading `then` and its following declaration share an outer
+            // source extent. Removing the relationship must retain the action.
+            let source = slice(self.user_src(unit, e)?, extent);
+            let parsed = parse_source(source);
+            if let Some(member) = parsed.unit.members.first().filter(|m| m.leading_then) {
+                let (tokens, _) = sysmlv2_syntax::lexer::tokenize(source);
+                if let Some(token) = tokens.iter().find(|t| {
+                    t.kind == TokenKind::Ident
+                        && &source[t.span.start as usize..t.span.end as usize] == "then"
+                }) {
+                    let end = member
+                        .leading_then_multiplicity
+                        .as_ref()
+                        .map_or(token.span.end, |m| m.span.end);
+                    extent = Span::new(extent.start + token.span.start, extent.start + end);
+                }
+            }
+        }
+        let r = self.session.resolved();
         let element = r
             .element_qualified_name(e)
             .unwrap_or_else(|| format!("{:?}", e));
@@ -2424,27 +3932,9 @@ impl<'s> Planner<'s> {
         }
         // Consume surrounding whitespace: the line's leading indentation
         // and the trailing newline, when nothing else shares the line.
-        let src = self.src(unit);
-        let bytes = src.as_bytes();
-        let mut start = extent.start;
-        while start > 0 && matches!(bytes[start as usize - 1], b' ' | b'\t') {
-            start -= 1;
-        }
-        let own_line = start == 0 || bytes[start as usize - 1] == b'\n';
-        let mut end = extent.end;
-        if own_line {
-            while (end as usize) < bytes.len() && matches!(bytes[end as usize], b' ' | b'\t') {
-                end += 1;
-            }
-            if (end as usize) < bytes.len() && bytes[end as usize] == b'\n' {
-                end += 1;
-            } else {
-                start = extent.start; // keep the indentation if no newline followed
-            }
-        } else {
-            start = extent.start;
-        }
-        self.consumed.push((unit, Span::new(start, end)));
+        let cut = cut_whole_lines(self.user_src(unit, e)?, extent);
+        let (start, end) = (cut.start, cut.end);
+        self.consumed.push((unit, cut));
         self.splices.push(Splice {
             unit,
             start,
@@ -2498,13 +3988,14 @@ impl<'s> Planner<'s> {
         let old_qn = r.element_qualified_name(e);
         let old_raw = r
             .declaration_site(e)
-            .map(|(u, sp)| decode_name(slice(self.src(u), sp)));
+            .and_then(|(u, sp)| Some(decode_name(slice(self.src(u)?, sp))));
 
         // The replacement arrives in top-level form; continuation lines
         // are re-spelled at the member's own depth (the splice starts
         // past the first line's indentation, which survives as-is).
-        let base = line_indent(self.src(unit), extent.start);
-        let text = reindent_member_text(text, &base, indent_unit(&base, self.src(unit)));
+        let src = self.user_src(unit, e)?;
+        let base = line_indent(src, extent.start);
+        let text = reindent_member_text(text, &base, indent_unit(&base, src));
 
         // The whole extent is consumed: references inside it vanish with
         // the old text, and untouched-site verification skips them.
@@ -2553,7 +4044,10 @@ impl<'s> Planner<'s> {
                     if inside || already_consumed {
                         continue;
                     }
-                    if decode_name(slice(self.src(site.unit), site.name_span)) == old_raw {
+                    let Some(site_src) = self.src(site.unit) else {
+                        continue;
+                    };
+                    if decode_name(slice(site_src, site.name_span)) == old_raw {
                         self.splices.push(Splice {
                             unit: site.unit,
                             start: site.name_span.start,
@@ -2574,10 +4068,15 @@ impl<'s> Planner<'s> {
     }
 
     fn plan_retarget(&mut self, site: &RefSite, to: ElementRef) -> Result<(), TransformError> {
+        // The rewrite lands in the site's own unit, so that unit must be
+        // one the session owns: a site handed in against a library unit
+        // is refused rather than spliced into text that is read-only.
+        self.user_src(site.unit, site.owner)?;
+        // Spliced as reference text, so the re-resolvable spelling.
         let qn = self
             .session
             .resolved()
-            .element_qualified_name(to)
+            .element_reference_spelling(to)
             .ok_or(TransformError::AnonymousTarget(to))?;
         let last_len = qn.rsplit("::").next().unwrap_or(&qn).len() as u32;
         self.consumed.push((site.unit, site.span));
@@ -2667,51 +4166,27 @@ impl<'s> Planner<'s> {
 
         // Excise, with remove's whitespace discipline (no stranding
         // check — the text comes back; verification decides what broke).
-        let src = self.src(unit);
+        let src = self.user_src(unit, e)?;
         let member_text = slice(src, extent).to_string();
-        let bytes = src.as_bytes();
-        let mut cut_start = extent.start;
-        while cut_start > 0 && matches!(bytes[cut_start as usize - 1], b' ' | b'\t') {
-            cut_start -= 1;
-        }
-        let own_line = cut_start == 0 || bytes[cut_start as usize - 1] == b'\n';
-        let mut cut_end = extent.end;
-        if own_line {
-            while (cut_end as usize) < bytes.len()
-                && matches!(bytes[cut_end as usize], b' ' | b'\t')
-            {
-                cut_end += 1;
-            }
-            if (cut_end as usize) < bytes.len() && bytes[cut_end as usize] == b'\n' {
-                cut_end += 1;
-            } else {
-                cut_start = extent.start;
-            }
-        } else {
-            cut_start = extent.start;
-        }
-        self.consumed.push((unit, Span::new(cut_start, cut_end)));
+        let cut = cut_whole_lines(src, extent);
+        self.consumed.push((unit, cut));
         self.splices.push(Splice {
             unit,
-            start: cut_start,
-            end: cut_end,
+            start: cut.start,
+            end: cut.end,
             text: String::new(),
             expects: Vec::new(),
         });
 
         // Insert at the destination slot (plan_insert's composition for
         // the append shapes; before-a-sibling lands at its line start).
-        let dsrc = self.src(dunit);
+        let dsrc = self.user_src(dunit, new_owner)?;
         let indent = line_indent(dsrc, dextent.start);
         let child = child_indent(&indent, dsrc);
         let slot = index.unwrap_or(usize::MAX);
         let (ins_start, ins_end, ins_text) = if slot < sibs.len() {
             let sib = sibs[slot];
-            let dbytes = dsrc.as_bytes();
-            let mut at = sib.start;
-            while at > 0 && matches!(dbytes[at as usize - 1], b' ' | b'\t') {
-                at -= 1;
-            }
+            let at = indent_start(dsrc.as_bytes(), sib.start);
             (at, at, format!("{child}{member_text}\n"))
         } else {
             let last = dextent.end - 1;
@@ -2770,6 +4245,262 @@ impl<'s> Planner<'s> {
     /// bookkeeping (correspondence per moved member, expectation per
     /// generated target, carried-site re-verification, strict
     /// unresolved net, projection subject).
+    fn plan_hoist(
+        &mut self,
+        e: ElementRef,
+        unit_name: &str,
+        new_name: Option<&str>,
+    ) -> Result<(), TransformError> {
+        let unit_offset = self.session.unit_offset;
+        let dunit = self
+            .unit_by_name(unit_name)
+            .ok_or_else(|| TransformError::UnknownUnit(unit_name.to_string()))?;
+        if let Some(new) = new_name {
+            if new.is_empty() {
+                return Err(TransformError::InvalidName(new.to_string()));
+            }
+        }
+        let (unit, extent) = self
+            .session
+            .resolved()
+            .member_extent(e)
+            .ok_or(TransformError::NoExtent(e))?;
+        if unit < unit_offset {
+            return Err(TransformError::NotDeclared(e));
+        }
+        let source: String = self.user_src(unit, e)?.to_string();
+        let r = self.session.resolved();
+        let old_qn = r
+            .element_qualified_name(e)
+            .ok_or(TransformError::NotDeclared(e))?;
+        let name = r
+            .element_name(e)
+            .ok_or(TransformError::NotDeclared(e))?
+            .to_string();
+        let top = new_name.map_or(name, str::to_string);
+        self.correspondence.push((old_qn, escape_name(&top)));
+        let decl = r.declaration_site(e).map(|(_, sp)| sp);
+        // Every reference written inside the moved text. Those whose
+        // target lies outside the moved subtree and that were written as
+        // a name resolved from here (a plain lexical reference or an
+        // import target) are respelled by the target's reference
+        // spelling, so the text no longer depends on its old surroundings.
+        // Every site is verified at its destination.
+        struct Rewrite {
+            start: u32,
+            end: u32,
+            text: String,
+        }
+        let mut rewrites: Vec<Rewrite> = Vec::new();
+        let mut sites: Vec<(u32, u32, Option<String>, Option<usize>)> = Vec::new();
+        let all: Vec<RefSite> = r
+            .reference_sites()
+            .iter()
+            .filter(|s| s.unit == unit && s.span.start >= extent.start && s.span.end <= extent.end)
+            .cloned()
+            .collect();
+        for site in &all {
+            let mut inside = false;
+            let mut cur = Some(site.target);
+            while let Some(c) = cur {
+                if c == e {
+                    inside = true;
+                    break;
+                }
+                cur = r.owner(c);
+            }
+            let qn = r.element_qualified_name(site.target);
+            // A site that resolved only through imports the moved text
+            // owns keeps resolving through them: leave it as written.
+            let through_own_imports = !site.via_imports.is_empty()
+                && site.via_imports.iter().all(|(imp, _)| {
+                    r.import_extent(*imp).is_some_and(|(u, sp)| {
+                        u == unit && sp.start >= extent.start && sp.end <= extent.end
+                    })
+                });
+            let respell = !inside
+                && !through_own_imports
+                && site.chain_root.is_none()
+                && (site.plain || site.kind.starts_with("imported"));
+            let mut rewritten = None;
+            // The package names itself as the first segment (`Lib::K`
+            // inside `Lib`): under the new name the old one would denote
+            // the colliding root element. Qualified through the owner
+            // (`R::Lib::K`) it keeps resolving through the root's alias.
+            let names_itself = site.target == e && site.span.start == site.name_span.start;
+            if let (Some(new), true) = (new_name, names_itself) {
+                rewritten = Some(rewrites.len());
+                rewrites.push(Rewrite {
+                    start: site.name_span.start,
+                    end: site.name_span.end,
+                    text: spell_name(new),
+                });
+            } else if respell {
+                if let Some(mut spelling) = r.element_reference_spelling(site.target) {
+                    let written = &source[site.span.start as usize..site.span.end as usize];
+                    // A reference written from the global root stays
+                    // global: the prefix escapes a nearer member of the
+                    // same name, and the moved text keeps those scopes.
+                    // The same prefix is added when the spelling's first
+                    // segment would not denote the target's root ancestor
+                    // from where the text sits: a member of the moved text
+                    // (or of the vanishing owner) shadows it.
+                    let shadowed = !written.starts_with("$::") && {
+                        let first = sysmlv2_syntax::name::split_canonical(&spelling)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default();
+                        let probe = sysmlv2_syntax::ast::QualifiedName {
+                            is_global: false,
+                            segments: vec![sysmlv2_syntax::ast::Name {
+                                value: first.clone(),
+                                span: Span::default(),
+                            }],
+                            span: Span::default(),
+                        };
+                        // The root-level element the spelling starts from.
+                        let top = r.resolve_qualified(&spell_name(&first));
+                        top.is_none()
+                            || r.resolve_in_excluding(site.scope, &probe, site.exclude) != top
+                    };
+                    if written.starts_with("$::") || shadowed {
+                        spelling = format!("$::{spelling}");
+                    }
+                    if spelling != written {
+                        rewritten = Some(rewrites.len());
+                        rewrites.push(Rewrite {
+                            start: site.span.start,
+                            end: site.span.end,
+                            text: spelling,
+                        });
+                    }
+                }
+            }
+            sites.push((site.name_span.start, site.name_span.end, qn, rewritten));
+        }
+        if let (Some(new), Some(decl)) = (new_name, decl) {
+            rewrites.push(Rewrite {
+                start: decl.start,
+                end: decl.end,
+                text: spell_name(new),
+            });
+        }
+        self.report_unused_imports = true;
+        // Sites index `rewrites` by push order; the text is assembled in
+        // source order through this permutation.
+        let mut order: Vec<usize> = (0..rewrites.len()).collect();
+        order.sort_by_key(|&i| (rewrites[i].start, rewrites[i].end));
+        for pair in order.windows(2) {
+            let (a, b) = (&rewrites[pair[0]], &rewrites[pair[1]]);
+            if b.start < a.end {
+                return Err(TransformError::OverlappingEdits {
+                    unit,
+                    at: Span::new(b.start, b.end),
+                });
+            }
+        }
+        // A site inside a respelled reference (its qualifier segments) is
+        // re-derived from the new spelling; the respelled site's own
+        // expectation covers it.
+        let sites = sites.into_iter().filter(|(ns, ne, _, rw)| {
+            rw.is_some() || !rewrites.iter().any(|w| *ns < w.end && w.start < *ne)
+        });
+        // The moved text: the member's extent with the rewrites applied
+        // and the member's own indentation removed from every line.
+        let src = self.user_src(unit, e)?;
+        let indent = line_indent(src, extent.start);
+        let raw = &src[extent.start as usize..extent.end as usize];
+        // Position map from raw offsets (relative to the extent) to the
+        // rewritten text, then through the dedent.
+        let mut rewritten = String::with_capacity(raw.len());
+        let mut cursor = 0u32;
+        let mut deltas: Vec<(u32, i64)> = Vec::new(); // (raw offset after which delta applies, cumulative delta)
+        let mut delta = 0i64;
+        for w in order.iter().map(|&i| &rewrites[i]) {
+            let (ws, we) = (w.start - extent.start, w.end - extent.start);
+            rewritten.push_str(&raw[cursor as usize..ws as usize]);
+            rewritten.push_str(&w.text);
+            delta += w.text.len() as i64 - (we - ws) as i64;
+            deltas.push((we, delta));
+            cursor = we;
+        }
+        rewritten.push_str(&raw[cursor as usize..]);
+        let map_rewrite = |pos: u32| -> u32 {
+            let d = deltas
+                .iter()
+                .rev()
+                .find(|(after, _)| *after <= pos)
+                .map_or(0, |(_, d)| *d);
+            (pos as i64 + d) as u32
+        };
+        let (dedented, lines) = dedent_lines(&rewritten, &indent);
+        let map_dedent = |pos: u32| -> u32 {
+            let (old_start, new_start) = lines
+                .iter()
+                .rev()
+                .find(|(old_start, _)| *old_start <= pos)
+                .copied()
+                .unwrap_or((0, 0));
+            new_start + (pos - old_start)
+        };
+        let expects = sites.map(|(ns, ne, qn, rw)| match rw {
+            Some(i) => {
+                let w = &rewrites[i];
+                // The spelled last segment (a quoted one may hold `::`).
+                let last_len = sysmlv2_syntax::name::split_canonical(&w.text)
+                    .pop()
+                    .map_or(w.text.len(), |seg| {
+                        sysmlv2_syntax::name::spell_name_in(None, &seg).len()
+                    }) as u32;
+                let start = map_rewrite(w.start - extent.start) + w.text.len() as u32 - last_len;
+                (map_dedent(start), last_len, qn)
+            }
+            None => {
+                let start = map_rewrite(ns - extent.start);
+                (map_dedent(start), ne - ns, qn)
+            }
+        });
+        // Cut the member from its unit, whole lines when it stands alone.
+        let cut = cut_whole_lines(src, extent);
+        self.consumed.push((unit, cut));
+        self.splices.push(Splice {
+            unit,
+            start: cut.start,
+            end: cut.end,
+            text: String::new(),
+            expects: Vec::new(),
+        });
+        // Append at the destination's top level.
+        let dsrc = self
+            .src(dunit)
+            .ok_or_else(|| TransformError::UnknownUnit(unit_name.to_string()))?;
+        let at = dsrc.len() as u32;
+        let ins_text = if dsrc.is_empty() || dsrc.ends_with('\n') {
+            format!("{dedented}\n")
+        } else {
+            format!("\n{dedented}\n")
+        };
+        let prefix = ins_text
+            .find(&dedented)
+            .expect("insert text is composed around the member text") as u32;
+        self.moved_expects.push(MovedExpects {
+            unit: dunit,
+            at,
+            text: ins_text.clone(),
+            sites: expects
+                .map(|(off, len, qn)| (off + prefix, len, qn))
+                .collect(),
+        });
+        self.splices.push(Splice {
+            unit: dunit,
+            start: at,
+            end: at,
+            text: ins_text,
+            expects: Vec::new(),
+        });
+        Ok(())
+    }
+
     fn plan_extract(
         &mut self,
         usage: ElementRef,
@@ -2793,7 +4524,7 @@ impl<'s> Planner<'s> {
         };
         let owner = r.owner(usage).ok_or(TransformError::NotDeclared(usage))?;
         for sib in r.owned_members(owner) {
-            if r.element_effective_name(sib).as_deref() == Some(def_name.as_str()) {
+            if r.element_lookup_name(sib).as_deref() == Some(def_name.as_str()) {
                 return Err(TransformError::NameTaken {
                     existing: r
                         .element_qualified_name(sib)
@@ -2851,7 +4582,7 @@ impl<'s> Planner<'s> {
             .into_iter()
             .filter_map(|m| {
                 let qn = r.element_qualified_name(m)?;
-                let name = r.element_effective_name(m)?;
+                let name = r.element_lookup_name(m)?;
                 Some((qn, escape_name(&name)))
             })
             .collect();
@@ -2878,7 +4609,7 @@ impl<'s> Planner<'s> {
 
         let spelled = spell_name(&def_name);
         let (cut, ins_at, interior_text, indent) = {
-            let src = self.src(unit);
+            let src = self.user_src(unit, usage)?;
             let bytes = src.as_bytes();
             // Body removal starts at the whitespace before the opening
             // brace (the brace is the byte before the interior).
@@ -2889,10 +4620,7 @@ impl<'s> Planner<'s> {
                 cut -= 1;
             }
             // The definition inserts at the usage's line start.
-            let mut ins_at = extent.start;
-            while ins_at > 0 && matches!(bytes[ins_at as usize - 1], b' ' | b'\t') {
-                ins_at -= 1;
-            }
+            let ins_at = indent_start(bytes, extent.start);
             (
                 (cut, slice(src, Span::new(cut, brace)).to_string()),
                 ins_at,
@@ -3037,7 +4765,7 @@ impl<'s> Planner<'s> {
             .into_iter()
             .filter_map(|m| {
                 let qn = r.element_qualified_name(m)?;
-                let name = r.element_effective_name(m)?;
+                let name = r.element_lookup_name(m)?;
                 Some((qn, escape_name(&name)))
             })
             .collect();
@@ -3066,16 +4794,15 @@ impl<'s> Planner<'s> {
         };
 
         // ---- text geometry ----
-        let def_interior_text = elig
-            .body_interior
-            .map(|sp| slice(self.src(def_unit), sp).to_string());
+        let def_src = self.user_src(def_unit, definition)?;
+        let def_interior_text = elig.body_interior.map(|sp| slice(def_src, sp).to_string());
         // The whitespace the definition wrote between its header and
         // opening brace — reused when the usage grows a body, so
         // `inline(extract(usage))` restores the original spelling
         // byte-exactly whatever its brace style was.
         let def_pre_brace_ws: String = match elig.body_interior {
             Some(interior) => {
-                let src = self.src(def_unit);
+                let src = self.user_src(def_unit, definition)?;
                 let bytes = src.as_bytes();
                 let brace = interior.start - 1;
                 let mut ws = brace;
@@ -3087,31 +4814,9 @@ impl<'s> Planner<'s> {
             None => String::new(),
         };
         // Definition removal, with remove's whitespace discipline.
-        let (def_cut_start, def_cut_end) = {
-            let src = self.src(def_unit);
-            let bytes = src.as_bytes();
-            let extent = elig.def_extent;
-            let mut start = extent.start;
-            while start > 0 && matches!(bytes[start as usize - 1], b' ' | b'\t') {
-                start -= 1;
-            }
-            let own_line = start == 0 || bytes[start as usize - 1] == b'\n';
-            let mut end = extent.end;
-            if own_line {
-                while (end as usize) < bytes.len() && matches!(bytes[end as usize], b' ' | b'\t') {
-                    end += 1;
-                }
-                if (end as usize) < bytes.len() && bytes[end as usize] == b'\n' {
-                    end += 1;
-                } else {
-                    start = extent.start;
-                }
-            } else {
-                start = extent.start;
-            }
-            (start, end)
-        };
-        let usage_text = slice(self.src(u_unit), u_extent).to_string();
+        let def_cut = cut_whole_lines(self.user_src(def_unit, definition)?, elig.def_extent);
+        let (def_cut_start, def_cut_end) = (def_cut.start, def_cut.end);
+        let usage_text = slice(self.user_src(u_unit, usage)?, u_extent).to_string();
         let usage_interior_rel = eligibility::body_interior(&usage_text);
 
         // 1. The usage's typing entry: retargeted to the definition's
@@ -3177,7 +4882,7 @@ impl<'s> Planner<'s> {
                             unit: u_unit,
                             at,
                             text: ins.clone(),
-                            sites: inner_sites.clone(),
+                            sites: inner_sites,
                         });
                     }
                     self.splices.push(Splice {
@@ -3319,6 +5024,12 @@ impl<'s> Planner<'s> {
         // Apply the splices to copies of the sources, tracking the new
         // position of every splice.
         let mut new_sources = self.session.sources.clone();
+        // Born units join empty, after the existing ones — indices of
+        // existing units (and every splice) are untouched, and a splice
+        // may already write into a born unit.
+        for name in &self.new_units {
+            new_sources.push((name.clone(), String::new()));
+        }
         let mut new_positions: Vec<u32> = Vec::with_capacity(self.splices.len());
         {
             let mut per_unit: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -3328,7 +5039,11 @@ impl<'s> Planner<'s> {
             new_positions.resize(self.splices.len(), 0);
             for (unit, idxs) in per_unit {
                 let local = unit - self.session.unit_offset;
-                let src = &self.session.sources[local].1;
+                let src: &str = self
+                    .session
+                    .sources
+                    .get(local)
+                    .map_or("", |(_, s)| s.as_str());
                 let mut out = String::with_capacity(src.len());
                 let mut cursor = 0usize;
                 for &i in &idxs {
@@ -3342,12 +5057,6 @@ impl<'s> Planner<'s> {
                 new_sources[local].1 = out;
             }
         }
-        // Born units join empty, after the existing ones — indices of
-        // existing units (and every splice) are untouched.
-        for name in &self.new_units {
-            new_sources.push((name.clone(), String::new()));
-        }
-
         // Reparse + rebuild (rollback = return before swapping state).
         let (new_model, mut new_resolved, unit_offset) =
             rebuild(&new_sources, self.session.lib.as_ref()).map_err(|e| match e {
@@ -3409,7 +5118,13 @@ impl<'s> Planner<'s> {
                     let (line, col) = line_col(text, pos as usize);
                     format!("{name}:{line}:{col}")
                 }
-                None => format!("library unit {unit}"),
+                None => match unit
+                    .checked_sub(pre_offset + pre_sources.len())
+                    .and_then(|k| self.new_units.get(k))
+                {
+                    Some(name) => format!("{name} (new)"),
+                    None => format!("library unit {unit}"),
+                },
             }
         };
         let spelled_at = |unit: usize, span: Span| -> &str {
@@ -3453,7 +5168,9 @@ impl<'s> Planner<'s> {
                         s.name_span.end
                     );
                     if let Some(q) = expected.as_deref() {
-                        msg.push_str(&format!(" (expected target: `{q}`)"));
+                        msg.push_str(" (expected target: `");
+                        msg.push_str(q);
+                        msg.push_str("`)");
                     }
                     broken.push(msg);
                 }
@@ -3551,7 +5268,9 @@ impl<'s> Planner<'s> {
                             place(unit, me.at)
                         );
                         if let Some(qn) = qn {
-                            msg.push_str(&format!(" (expected target: `{}`)", map_qn(qn)));
+                            msg.push_str(" (expected target: `");
+                            msg.push_str(&map_qn(qn));
+                            msg.push_str("`)");
                         }
                         broken.push(msg);
                     }
@@ -3619,7 +5338,10 @@ impl<'s> Planner<'s> {
             let mut fresh: Vec<String> = Vec::new();
             for unit in touched {
                 let local = unit - self.session.unit_offset;
-                let (unit_name, pre_text) = &self.session.sources[local];
+                // A born unit had no text before the batch.
+                let Some((unit_name, pre_text)) = self.session.sources.get(local) else {
+                    continue;
+                };
                 let pre_diagnostics = syntax_validation(unit_name, pre_text);
                 let mut pre_counts: HashMap<ValidationFindingKey, usize> = HashMap::new();
                 for diagnostic in &pre_diagnostics {
@@ -3655,7 +5377,7 @@ impl<'s> Planner<'s> {
             }
         }
         // Relocated subjects keep their effective-member projection
-        // (M29a0's authoritative structural gate): pre-commit rows under
+        // (the authoritative structural gate): pre-commit rows under
         // the correspondence map must equal prospective rows exactly.
         for qn in self.projection_subjects.clone() {
             let Some(pre_e) = self.session.resolved.resolve_qualified(&qn) else {
@@ -3716,7 +5438,10 @@ impl<'s> Planner<'s> {
                 }
             }
         }
-        let mut report = CommitReport::default();
+        let mut report = CommitReport {
+            findings: std::mem::take(&mut self.findings),
+            ..CommitReport::default()
+        };
         for (qn, old_id) in old_qn_ids {
             if let Some(&new_id) = new_ids.get(&map_qn(&qn)) {
                 if new_id != old_id {
@@ -3781,9 +5506,7 @@ impl<'s> Planner<'s> {
             .splices
             .iter()
             .map(|s| AppliedSplice {
-                unit: self.session.sources[s.unit - self.session.unit_offset]
-                    .0
-                    .clone(),
+                unit: self.unit_name(s.unit),
                 start: s.start,
                 end: s.end,
                 text: s.text.clone(),
@@ -3805,8 +5528,16 @@ impl<'s> Planner<'s> {
         // Success — swap the session to the new state.
         if !dry_run {
             self.session.sources = new_sources;
+            apply_explicit_ids(
+                &mut new_resolved,
+                &mut self.session.explicit_ids,
+                self.session.binds_ids,
+                &mut self.session.warnings,
+            );
             self.session.model = new_model;
+            let policy = self.session.resolved.closure_policy();
             self.session.resolved = new_resolved;
+            self.session.resolved.set_closure_policy(policy);
         }
         Ok(report)
     }
@@ -3883,7 +5614,10 @@ fn doc_unit_name(root_name: Option<&str>, index: usize) -> String {
             && base
                 .chars()
                 .all(|c| c != ':' && c != '*' && c != '?' && c != '"');
-        if safe && (base.ends_with(".sysml") || base.ends_with(".kerml")) {
+        let model_file = Path::new(&base)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("sysml") || e.eq_ignore_ascii_case("kerml"));
+        if safe && model_file {
             return base;
         }
     }
@@ -3916,7 +5650,7 @@ fn child_indent(indent: &str, src: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// M29a0 planner-internal gates: multi-expectation splices, relocation
+// Planner-internal gates: multi-expectation splices, relocation
 // discipline (new unresolved references are fatal), rollback.
 // ---------------------------------------------------------------------------
 
@@ -4191,3 +5925,45 @@ mod relocation_tests {
         assert!(s.source(s.unit_offset).unwrap().contains("part def Alpha;"));
     }
 }
+
+#[cfg(test)]
+mod minimize_tests {
+    use super::overlapping_candidates;
+
+    #[test]
+    fn disjoint_ranges_all_survive() {
+        let ranges = [(1, 0, 5), (1, 5, 9), (1, 20, 24), (2, 0, 4)];
+        assert!(overlapping_candidates(&ranges).is_empty());
+    }
+
+    #[test]
+    fn a_nested_range_is_reported() {
+        // The second range sits inside the first: applying both in one
+        // forward sweep would slice backwards.
+        let ranges = [(1, 0, 12), (1, 4, 8), (1, 14, 18)];
+        assert_eq!(overlapping_candidates(&ranges), vec![1]);
+    }
+
+    #[test]
+    fn a_straddling_range_is_reported() {
+        let ranges = [(1, 0, 12), (1, 8, 20)];
+        assert_eq!(overlapping_candidates(&ranges), vec![1]);
+    }
+
+    #[test]
+    fn a_whole_overlapping_run_is_reported_against_the_first_kept_range() {
+        // The third range clears the second but still reaches into the
+        // first, which is the one that will be applied.
+        let ranges = [(1, 0, 30), (1, 4, 8), (1, 10, 40), (1, 40, 44)];
+        assert_eq!(overlapping_candidates(&ranges), vec![1, 2]);
+    }
+
+    #[test]
+    fn ranges_in_different_units_never_overlap() {
+        let ranges = [(1, 0, 30), (2, 4, 8), (3, 4, 8)];
+        assert!(overlapping_candidates(&ranges).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unused_imports_tests;

@@ -11,6 +11,7 @@
 //! not compute with it.
 
 use crate::cbor::{Head, Reader};
+use crate::decode::{gate_flags, header_axes, read_units};
 use crate::delta::{FLAG_DELTA, FLAG_DELTA_PORTABLE};
 use crate::encode::{FLAG_ELIDE_IDS, FLAG_FULL_FORM};
 use crate::{Error, strip_magic};
@@ -21,6 +22,14 @@ use uuid::Uuid;
 /// truncating (the counts stay exact either way).
 const TARGET_CAP: usize = 64;
 
+/// The units section, rendered for the summary.
+fn unit_summary(r: &mut Reader) -> Result<Vec<Value>, Error> {
+    Ok(read_units(r)?
+        .into_iter()
+        .map(|(index, path)| json!({ "index": index, "path": path }))
+        .collect())
+}
+
 fn uuid16(r: &mut Reader) -> Result<Uuid, Error> {
     Ok(Uuid::from_bytes(r.bstr(16)?.try_into().unwrap()))
 }
@@ -30,6 +39,7 @@ fn uuid16(r: &mut Reader) -> Result<Uuid, Error> {
 /// ```json
 /// {
 ///   "form": "compact" | "full" | "delta",
+///   "explicitIds": bool (compact: the ids are not all graph-derived),
 ///   "bytes": 1234,
 ///   "versions": { "layout": 1, "tables": 1, "scheme": 1,
 ///                 "supported": true },
@@ -59,17 +69,17 @@ fn uuid16(r: &mut Reader) -> Result<Uuid, Error> {
 /// (only the wire layout must match — without it the structure cannot
 /// be read); `versions.supported` says whether this build's decoders
 /// would accept the payload outright.
+///
+/// # Panics
+/// Never in practice: the only unwrapping is of literal JSON objects
+/// this function has just built.
 pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
     let mut r = Reader::new(strip_magic(bytes)?);
     let arity = r.array()?;
-    let header = r.uint()?;
-    if header >> 40 != 0 {
-        return Err(Error::new("unrecognized header word"));
-    }
-    let layout = (header >> 32) as u8;
-    let tables = (header >> 16) as u16;
-    let scheme = (header >> 8) as u8;
-    let flags = header as u8;
+    // Inspection reports the version axes rather than gating them —
+    // all but the layout, without which the structure cannot be read
+    // at all.
+    let (layout, tables, scheme, flags) = header_axes(r.uint()?)?;
     if layout != crate::LAYOUT_VERSION {
         return Err(Error::new(format!(
             "layout version {layout} unsupported (this build carries {})",
@@ -81,15 +91,17 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
     let full = flags & FLAG_FULL_FORM != 0;
     let with_units = flags & crate::FLAG_UNIT_PATHS != 0;
     let implied = flags & crate::FLAG_IMPLIED_OWNERS != 0;
-    let known = FLAG_DELTA
-        | FLAG_DELTA_PORTABLE
-        | FLAG_ELIDE_IDS
-        | FLAG_FULL_FORM
-        | crate::FLAG_UNIT_PATHS
-        | crate::FLAG_IMPLIED_OWNERS;
-    if flags & !known != 0 {
-        return Err(Error::new(format!("unknown header flags {flags:#x}")));
-    }
+    let explicit_ids = flags & crate::FLAG_EXPLICIT_IDS != 0;
+    gate_flags(
+        flags,
+        FLAG_DELTA
+            | FLAG_DELTA_PORTABLE
+            | FLAG_ELIDE_IDS
+            | FLAG_FULL_FORM
+            | crate::FLAG_UNIT_PATHS
+            | crate::FLAG_IMPLIED_OWNERS
+            | crate::FLAG_EXPLICIT_IDS,
+    )?;
     let supported = tables == crate::tables::CBOR_TABLES_VERSION
         && (!elided || scheme == crate::ID_SCHEME_VERSION);
     let mut out = Map::new();
@@ -119,6 +131,7 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
         }
         out.insert("idsElided".into(), json!(elided));
         out.insert("impliedOwners".into(), json!(implied));
+        out.insert("explicitIds".into(), json!(explicit_ids));
         let n_ext = r.array()?;
         if n_ext > r.remaining() / 17 {
             return Err(Error::new("UUID table longer than payload"));
@@ -131,15 +144,9 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
             if r.array()? != 2 {
                 return Err(Error::new("elided id section is array(2)"));
             }
-            let m = match r.head()? {
-                Head::Map(m) if m <= r.remaining() / 18 => m,
-                Head::Map(_) => return Err(Error::new("exception map longer than payload")),
-                _ => return Err(Error::new("exception map expected")),
-            };
-            for _ in 0..m {
-                r.uint()?;
-                r.bstr(16)?;
-            }
+            let m = r
+                .ascending_map("exception map", 18, |r| r.bstr(16).map(|_| ()))?
+                .len();
             out.insert("exceptions".into(), json!(m));
             out.insert("idDigest".into(), json!(uuid16(&mut r)?.to_string()));
         } else {
@@ -159,34 +166,14 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
         r.skip_items(elements as u64)?;
         if implied {
             // Owner exceptions: element index → absent-key bits.
-            let m = match r.head()? {
-                Head::Map(m) if m <= r.remaining() / 2 => m,
-                Head::Map(_) => return Err(Error::new("owner-exception map longer than payload")),
-                _ => return Err(Error::new("owner-exception map expected")),
-            };
-            for _ in 0..m {
-                r.uint()?;
-                r.uint()?;
-            }
+            let m = r
+                .ascending_map("owner-exception map", 2, |r| r.uint().map(|_| ()))?
+                .len();
             out.insert("ownerExceptions".into(), json!(m));
         }
         if with_units {
             // Unit structure: root element index → source path.
-            let m = match r.head()? {
-                Head::Map(m) if m <= r.remaining() / 2 => m,
-                Head::Map(_) => return Err(Error::new("unit-path map longer than payload")),
-                _ => return Err(Error::new("unit-path map expected")),
-            };
-            let mut units = Vec::with_capacity(m);
-            for _ in 0..m {
-                let index = r.uint()?;
-                let path = match r.head()? {
-                    Head::Tstr(n) => r.tstr_body(n)?.to_owned(),
-                    _ => return Err(Error::new("unit path is a text string")),
-                };
-                units.push(json!({ "index": index, "path": path }));
-            }
-            out.insert("units".into(), json!(units));
+            out.insert("units".into(), json!(unit_summary(&mut r)?));
         }
         if !r.done() {
             return Err(Error::new("trailing bytes after payload"));
@@ -239,19 +226,13 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
         if r.array()? != 3 {
             return Err(Error::new("elided created-id section is array(3)"));
         }
-        let n = r.uint()? as usize;
+        let n = r.index()?;
         if n > r.remaining() {
             return Err(Error::new("created count longer than payload"));
         }
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 18 => m,
-            Head::Map(_) => return Err(Error::new("exception map longer than payload")),
-            _ => return Err(Error::new("exception map expected")),
-        };
-        for _ in 0..m {
-            r.uint()?;
-            r.bstr(16)?;
-        }
+        let m = r
+            .ascending_map("exception map", 18, |r| r.bstr(16).map(|_| ()))?
+            .len();
         exceptions = Some(m);
         id_digest = Some(uuid16(&mut r)?);
         n
@@ -315,6 +296,9 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
                 }
             },
             // Field-patch update: map of ordinal → op pairs.
+            Head::Map(m) if m > r.remaining() / 2 => {
+                return Err(Error::new("patch longer than payload"));
+            }
             Head::Map(m) => match identity {
                 Some(id) => {
                     updates += 1;
@@ -333,33 +317,15 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
     // bits on records that shipped whole elements.
     let mut owner_exceptions: Option<usize> = None;
     if implied {
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 2 => m,
-            Head::Map(_) => return Err(Error::new("owner-exception map longer than payload")),
-            _ => return Err(Error::new("owner-exception map expected")),
-        };
-        for _ in 0..m {
-            r.uint()?;
-            r.uint()?;
-        }
-        owner_exceptions = Some(m);
+        owner_exceptions = Some(
+            r.ascending_map("owner-exception map", 2, |r| r.uint().map(|_| ()))?
+                .len(),
+        );
     }
     // Units section: result element index → source path.
     let mut units = Vec::new();
     if with_units {
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 2 => m,
-            Head::Map(_) => return Err(Error::new("unit-path map longer than payload")),
-            _ => return Err(Error::new("unit-path map expected")),
-        };
-        for _ in 0..m {
-            let index = r.uint()?;
-            let path = match r.head()? {
-                Head::Tstr(n) => r.tstr_body(n)?.to_owned(),
-                _ => return Err(Error::new("unit path is a text string")),
-            };
-            units.push(json!({ "index": index, "path": path }));
-        }
+        units = unit_summary(&mut r)?;
     }
     if !r.done() {
         return Err(Error::new("trailing bytes after payload"));

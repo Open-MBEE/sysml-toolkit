@@ -46,7 +46,7 @@ pub fn read(bytes: &[u8]) -> Result<Kpar, String> {
                 meta = serde_json::from_slice(data)
                     .map_err(|e| format!(".meta.json is not valid JSON: {e}"))?;
             }
-            n if n.ends_with(".sysml") || n.ends_with(".kerml") => {
+            n if crate::is_model_source(n) => {
                 let source =
                     String::from_utf8(data.clone()).map_err(|_| format!("`{n}` is not UTF-8"))?;
                 units.push(KparUnit {
@@ -82,55 +82,104 @@ pub fn read(bytes: &[u8]) -> Result<Kpar, String> {
     })
 }
 
+/// A little-endian field of `header`, which the caller has already
+/// bounded: `at` is a fixed offset inside a fixed-size header, so the
+/// slicing cannot fail.
+fn u16_of(header: &[u8], at: usize) -> usize {
+    u16::from_le_bytes([header[at], header[at + 1]]) as usize
+}
+
+fn u32_of(header: &[u8], at: usize) -> usize {
+    u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]) as usize
+}
+
+/// Everything one archive may expand to.
+///
+/// A project archive holds model sources; the largest real ones are a few
+/// megabytes. The archive's own headers say how far each entry expands,
+/// so they cannot also be the budget — a crafted directory can declare an
+/// entry that inflates to far more than the file's own size suggests, and
+/// can name it as many times as it has records. One ceiling over
+/// everything the archive expands to bounds both.
+const MAX_INFLATED: usize = 512 * 1024 * 1024;
+
+/// Every offset and length below comes from the archive itself, so none
+/// of them is trusted: each header and each span is taken with a checked
+/// addition and a bounds-checked slice, and an archive that points past
+/// its own end is rejected with a message instead of an index panic.
+/// The additions matter on a 32-bit target, where an offset near the top
+/// of the `u32` field range would otherwise wrap and slip past a guard.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut inflated_total = 0usize;
     // End-of-central-directory: scan backwards for PK\x05\x06.
     let eocd = bytes
         .windows(4)
         .rposition(|w| w == b"PK\x05\x06")
         .ok_or("not a ZIP archive (no end-of-central-directory)")?;
-    let u16_at = |o: usize| -> usize { u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize };
-    let u32_at = |o: usize| -> usize {
-        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
-    };
-    if eocd + 22 > bytes.len() {
-        return Err("truncated end-of-central-directory".into());
-    }
-    let count = u16_at(eocd + 10);
-    let mut off = u32_at(eocd + 16);
+    let end = bytes
+        .get(eocd..eocd + 22)
+        .ok_or("truncated end-of-central-directory")?;
+    let count = u16_of(end, 10);
+    let mut off = u32_of(end, 16);
     let mut out = Vec::new();
     for _ in 0..count {
-        if off + 46 > bytes.len() || &bytes[off..off + 4] != b"PK\x01\x02" {
-            return Err("malformed central directory".into());
-        }
-        let method = u16_at(off + 10);
-        let csize = u32_at(off + 20);
-        let usize_ = u32_at(off + 24);
-        let name_len = u16_at(off + 28);
-        let extra_len = u16_at(off + 30);
-        let comment_len = u16_at(off + 32);
-        let local_off = u32_at(off + 42);
-        let name = String::from_utf8_lossy(&bytes[off + 46..off + 46 + name_len]).into_owned();
+        let header = off
+            .checked_add(46)
+            .and_then(|to| bytes.get(off..to))
+            .filter(|h| h.starts_with(b"PK\x01\x02"))
+            .ok_or("malformed central directory")?;
+        let method = u16_of(header, 10);
+        let csize = u32_of(header, 20);
+        let declared = u32_of(header, 24);
+        let name_len = u16_of(header, 28);
+        let extra_len = u16_of(header, 30);
+        let comment_len = u16_of(header, 32);
+        let local_off = u32_of(header, 42);
+        let name_at = off + 46;
+        let name = name_at
+            .checked_add(name_len)
+            .and_then(|to| bytes.get(name_at..to))
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .ok_or("malformed central directory")?;
         // Local header: skip its (possibly different) name/extra lengths.
-        if local_off + 30 > bytes.len() || &bytes[local_off..local_off + 4] != b"PK\x03\x04" {
-            return Err(format!("malformed local header for `{name}`"));
-        }
-        let lname = u16_at(local_off + 26);
-        let lextra = u16_at(local_off + 28);
-        let data_start = local_off + 30 + lname + lextra;
-        let data = bytes
-            .get(data_start..data_start + csize)
+        let local = local_off
+            .checked_add(30)
+            .and_then(|to| bytes.get(local_off..to))
+            .filter(|h| h.starts_with(b"PK\x03\x04"))
+            .ok_or_else(|| format!("malformed local header for `{name}`"))?;
+        let lname = u16_of(local, 26);
+        let lextra = u16_of(local, 28);
+        let data = local_off
+            .checked_add(30)
+            .and_then(|at| at.checked_add(lname))
+            .and_then(|at| at.checked_add(lextra))
+            .and_then(|at| Some((at, at.checked_add(csize)?)))
+            .and_then(|(at, to)| bytes.get(at..to))
             .ok_or_else(|| format!("truncated data for `{name}`"))?;
+        // What is left of the archive-wide ceiling also caps this entry,
+        // so a declared size larger than the budget is refused before a
+        // byte of it is decompressed.
+        let budget = MAX_INFLATED - inflated_total;
+        if declared > budget {
+            return Err(format!("`{name}` expands past the archive size limit"));
+        }
         let inflated = match method {
             0 => data.to_vec(),
-            8 => miniz_oxide::inflate::decompress_to_vec(data)
+            // The central directory declares the inflated size, so it
+            // also caps it: an entry that expands past what it claims is
+            // refused rather than allowed to exhaust memory.
+            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(data, declared)
                 .map_err(|e| format!("cannot inflate `{name}`: {e}"))?,
             m => return Err(format!("`{name}` uses unsupported compression method {m}")),
         };
-        if inflated.len() != usize_ {
+        if inflated.len() != declared {
             return Err(format!("size mismatch for `{name}`"));
         }
+        inflated_total += inflated.len();
         out.push((name, inflated));
-        off += 46 + name_len + extra_len + comment_len;
+        off = off
+            .checked_add(46 + name_len + extra_len + comment_len)
+            .ok_or("malformed central directory")?;
     }
     Ok(out)
 }
@@ -141,9 +190,16 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// given root names, metamodel URI chosen by dialect, SHA-256 checksums,
 /// `created` = now), then the units — deflate entries with the normative
 /// zeroed date (1980-01-01), so archives are byte-deterministic apart
-/// from the creation timestamp.
-pub fn write(project_name: &str, version: &str, units: &[(String, String, String)]) -> Vec<u8> {
-    let sysml = units.iter().any(|(f, _, _)| f.ends_with(".sysml"));
+/// from the creation timestamp. Fails when a name, an entry or the whole
+/// archive outgrows the 16/32-bit header fields.
+pub fn write(
+    project_name: &str,
+    version: &str,
+    units: &[(String, String, String)],
+) -> Result<Vec<u8>, String> {
+    let sysml = units
+        .iter()
+        .any(|(f, _, _)| crate::has_extension(f, "sysml"));
     let metamodel = if sysml {
         "https://www.omg.org/spec/SysML/20250201"
     } else {
@@ -182,7 +238,15 @@ pub fn write(project_name: &str, version: &str, units: &[(String, String, String
     zip_write(&entries)
 }
 
-fn zip_write(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+/// The ZIP headers this writer emits hold offsets and sizes in 32 bits
+/// and counts and name lengths in 16, and there is no ZIP64 record to
+/// escape into; anything that does not fit is refused rather than
+/// silently truncated into a header that describes a different archive.
+fn too_large(what: impl std::fmt::Display) -> String {
+    format!("archive too large (no ZIP64 support): {what}")
+}
+
+fn zip_write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     // The normative archives' zeroed timestamp: 1980-01-01 00:00.
@@ -198,7 +262,13 @@ fn zip_write(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         } else {
             (0, data)
         };
-        let local_off = out.len() as u32;
+        let local_off =
+            u32::try_from(out.len()).map_err(|_| too_large(format_args!("entry offset")))?;
+        let csize = u32::try_from(payload.len())
+            .map_err(|_| too_large(format_args!("compressed `{name}`")))?;
+        let usize_ = u32::try_from(data.len()).map_err(|_| too_large(format_args!("`{name}`")))?;
+        let name_len =
+            u16::try_from(name.len()).map_err(|_| too_large(format_args!("the name `{name}`")))?;
         out.extend_from_slice(b"PK\x03\x04");
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
         out.extend_from_slice(&0u16.to_le_bytes()); // flags
@@ -206,9 +276,9 @@ fn zip_write(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         out.extend_from_slice(&dos_time.to_le_bytes());
         out.extend_from_slice(&dos_date.to_le_bytes());
         out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&csize.to_le_bytes());
+        out.extend_from_slice(&usize_.to_le_bytes());
+        out.extend_from_slice(&name_len.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // extra
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(payload);
@@ -221,24 +291,28 @@ fn zip_write(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         central.extend_from_slice(&dos_time.to_le_bytes());
         central.extend_from_slice(&dos_date.to_le_bytes());
         central.extend_from_slice(&crc.to_le_bytes());
-        central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&csize.to_le_bytes());
+        central.extend_from_slice(&usize_.to_le_bytes());
+        central.extend_from_slice(&name_len.to_le_bytes());
         central.extend_from_slice(&[0u8; 8]); // extra/comment/disk/internal
         central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
         central.extend_from_slice(&local_off.to_le_bytes());
         central.extend_from_slice(name.as_bytes());
     }
-    let cd_off = out.len() as u32;
+    let cd_off = u32::try_from(out.len())
+        .map_err(|_| too_large(format_args!("central-directory offset")))?;
+    let cd_len =
+        u32::try_from(central.len()).map_err(|_| too_large(format_args!("central directory")))?;
+    let count = u16::try_from(entries.len()).map_err(|_| too_large(format_args!("entry count")))?;
     out.extend_from_slice(&central);
     out.extend_from_slice(b"PK\x05\x06");
     out.extend_from_slice(&[0u8; 4]); // disk numbers
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&cd_len.to_le_bytes());
     out.extend_from_slice(&cd_off.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // comment
-    out
+    Ok(out)
 }
 
 // ---- hashing ---------------------------------------------------------------
@@ -371,12 +445,154 @@ mod tests {
             "package M;\n".to_string(),
             "M".to_string(),
         )];
-        let bytes = write("Test", "1.0.0", &units);
+        let bytes = write("Test", "1.0.0", &units).expect("writable");
         let kpar = read(&bytes).expect("readable");
         assert_eq!(kpar.units.len(), 1);
         assert_eq!(kpar.units[0].source, "package M;\n");
         assert!(kpar.checksum_mismatches.is_empty());
         assert_eq!(kpar.project["name"], "Test");
         assert_eq!(kpar.meta["index"]["M"], "M.sysml");
+    }
+
+    /// An archive whose one unit is repetitive enough to be stored
+    /// deflated, so the inflation path is exercised.
+    fn sample() -> Vec<u8> {
+        let units = vec![(
+            "M.sysml".to_string(),
+            format!("package M {{\n{}}}\n", "    part def P;\n".repeat(200)),
+            "M".to_string(),
+        )];
+        write("Test", "1.0.0", &units).expect("writable")
+    }
+
+    fn u16_at(bytes: &[u8], at: usize) -> usize {
+        u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize
+    }
+
+    fn put_u16(bytes: &mut [u8], at: usize, v: u16) {
+        bytes[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8], at: usize, v: u32) {
+        bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Offsets of the central-directory headers, in archive order. The
+    /// archive carries no trailing comment, so its end record is the
+    /// last 22 bytes.
+    fn headers(bytes: &[u8]) -> Vec<usize> {
+        let end = bytes.len() - 22;
+        let count = u16_at(bytes, end + 10);
+        let mut off = u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            out.push(off);
+            off += 46 + u16_at(bytes, off + 28) + u16_at(bytes, off + 30) + u16_at(bytes, off + 32);
+        }
+        out
+    }
+
+    /// The message from an archive the reader must refuse.
+    fn refusal(bytes: &[u8]) -> String {
+        match read(bytes) {
+            Ok(_) => panic!("the archive was accepted"),
+            Err(e) => e,
+        }
+    }
+
+    fn deflated_header(bytes: &[u8]) -> usize {
+        headers(bytes)
+            .into_iter()
+            .find(|&h| u16_at(bytes, h + 10) == 8)
+            .expect("one entry is stored deflated")
+    }
+
+    #[test]
+    fn a_name_running_past_the_end_is_refused() {
+        let mut bytes = sample();
+        let header = headers(&bytes)[0];
+        put_u16(&mut bytes, header + 28, u16::MAX);
+        let err = refusal(&bytes);
+        assert!(err.contains("malformed central directory"), "{err}");
+    }
+
+    #[test]
+    fn a_central_directory_running_past_the_end_is_refused() {
+        // Both a directory that starts just short of the end and one
+        // whose offset is near the top of the 32-bit field — the latter
+        // is what wraps where a pointer is 32 bits wide.
+        for start in [u32::MAX - 10, u32::try_from(sample().len() - 2).unwrap()] {
+            let mut bytes = sample();
+            let end = bytes.len() - 22;
+            put_u32(&mut bytes, end + 16, start);
+            let err = refusal(&bytes);
+            assert!(err.contains("malformed central directory"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_local_offset_running_past_the_end_is_refused() {
+        for local in [u32::MAX - 10, 1] {
+            let mut bytes = sample();
+            let header = headers(&bytes)[0];
+            put_u32(&mut bytes, header + 42, local);
+            let err = refusal(&bytes);
+            assert!(err.contains("malformed local header"), "{err}");
+        }
+    }
+
+    #[test]
+    fn entry_data_running_past_the_end_is_refused() {
+        let mut bytes = sample();
+        let header = headers(&bytes)[0];
+        put_u32(&mut bytes, header + 20, u32::MAX);
+        let err = refusal(&bytes);
+        assert!(err.contains("truncated data"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_size_that_understates_the_entry_caps_inflation() {
+        let mut bytes = sample();
+        let header = deflated_header(&bytes);
+        put_u32(&mut bytes, header + 24, 4);
+        let err = refusal(&bytes);
+        assert!(err.contains("cannot inflate"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_size_that_overstates_the_entry_is_refused() {
+        let mut bytes = sample();
+        let header = deflated_header(&bytes);
+        put_u32(&mut bytes, header + 24, 10_000_000);
+        let err = refusal(&bytes);
+        assert!(err.contains("size mismatch"), "{err}");
+    }
+
+    /// The ceiling is over everything the archive expands to, not over
+    /// one entry: a declared size past it is refused before a byte is
+    /// decompressed, and a size that would fit on its own is refused once
+    /// the entries before it have spent part of the budget.
+    #[test]
+    fn a_declared_size_past_the_archive_ceiling_is_refused() {
+        let mut bytes = sample();
+        let header = deflated_header(&bytes);
+        put_u32(&mut bytes, header + 24, MAX_INFLATED as u32 + 1);
+        let err = refusal(&bytes);
+        assert!(err.contains("expands past the archive size limit"), "{err}");
+
+        // Exactly the ceiling, on an entry that is not the first: what
+        // the entries before it expanded to is already spent.
+        let mut bytes = sample();
+        let header = headers(&bytes)[1];
+        put_u32(&mut bytes, header + 24, MAX_INFLATED as u32);
+        let err = refusal(&bytes);
+        assert!(err.contains("expands past the archive size limit"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_archive_is_refused() {
+        let bytes = sample();
+        let err = refusal(&bytes[..bytes.len() / 2]);
+        assert!(err.contains("not a ZIP archive"), "{err}");
     }
 }

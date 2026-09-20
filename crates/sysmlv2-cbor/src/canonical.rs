@@ -20,11 +20,8 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
-use crate::encode::{ctx, default_value};
-use crate::tables::{
-    CborField, ENUM_TABLES, FULL_METACLASS_FIELDS, K_BOOL, K_ELEMENT_ID, K_ENUM, K_REF_LIST,
-    K_STR_LIST, METACLASS_FIELDS,
-};
+use crate::encode::{ctx, default_value, is_default_value};
+use crate::tables::{CborField, FULL_METACLASS_FIELDS, K_ELEMENT_ID, K_LITERAL, METACLASS_FIELDS};
 use crate::{Error, ordinal};
 
 /// Canonicalize a compact interchange document (the flat element array
@@ -241,23 +238,16 @@ fn normalize_element(e: &Value) -> Result<Value, Error> {
 }
 
 /// Is `value` the metaclass default the graph-normal spelling elides?
+/// The metaclass defaults themselves are the encoder's rule; this
+/// spelling parts from it exactly twice, and says so.
 fn is_wire_default(field: &CborField, value: &Value) -> bool {
-    let (_, kind, etbl, dflt) = *field;
-    match kind {
-        K_BOOL => value.as_bool() == Some(dflt == 1),
-        K_ENUM => match dflt {
-            255 => value.is_null(),
-            d => {
-                value.as_str().is_some()
-                    && value.as_str()
-                        == ENUM_TABLES
-                            .get(etbl as usize)
-                            .and_then(|t| t.get(d as usize))
-                            .copied()
-            }
-        },
-        K_REF_LIST | K_STR_LIST => value.as_array().is_some_and(Vec::is_empty),
+    match field.1 {
+        // A store derives `elementId` from the element identity, so
+        // the stored form always carries it.
         K_ELEMENT_ID => false,
-        _ => value.is_null(),
+        // A literal-valued field has no metaclass default, but the
+        // stored form still elides a null one.
+        K_LITERAL => value.is_null(),
+        _ => is_default_value(field, "", value),
     }
 }

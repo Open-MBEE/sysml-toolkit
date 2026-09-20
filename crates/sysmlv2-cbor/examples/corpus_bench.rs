@@ -177,10 +177,7 @@ fn bench(c: &Corpus) {
     let portable = sysmlv2_cbor::delta_compact_cbor(
         &value,
         &target,
-        &sysmlv2_cbor::DeltaOptions {
-            portable: true,
-            ..Default::default()
-        },
+        &sysmlv2_cbor::DeltaOptions::new().with_portable(true),
     )
     .unwrap();
     let snapshot = to_compact_cbor(&target).unwrap();

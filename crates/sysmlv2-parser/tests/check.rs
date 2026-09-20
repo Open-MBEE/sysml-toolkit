@@ -497,6 +497,42 @@ fn referential_unresolved_reference() {
     assert!(model_warnings("package P { part def V; part x : V; }").is_empty());
 }
 
+/// A `doc`, `comment`, `rep`, or `dependency` written with an
+/// identification is an owned member of its namespace under that name,
+/// so an `about` clause reaches it by local name, short name, or
+/// qualified name — exactly like a type or feature member.
+#[test]
+fn referential_named_annotating_elements() {
+    assert!(
+        model_warnings(
+            "package P {
+                 metadata def Note;
+                 part def V {
+                     doc <vd> vDoc /* the definition */
+                     comment named /* a named comment */
+                     rep inOCL language \"ocl\" /* self.x > 0 */
+                     comment about named /* local name */
+                     comment about vd /* short name */
+                     comment about inOCL /* textual representation */
+                     @Note about vDoc;
+                 }
+                 comment about V::vDoc /* qualified */
+                 comment about P::V::named /* fully qualified */
+                 dependency vDep from V to Note;
+                 comment about vDep /* dependency */
+                 @Note about P::vDep;
+             }"
+        )
+        .is_empty()
+    );
+    // An annotating element owns no members, so nothing resolves through it.
+    let msgs = model_warnings(
+        "package P { part def V { doc vDoc /* … */ } comment about V::vDoc::x /* */ }",
+    );
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    assert!(msgs[0].contains("unresolved reference `V::vDoc::x`"));
+}
+
 #[test]
 fn referential_alias_target() {
     let msgs = model_warnings("package P { part def V; alias W for Vehicel; }");
@@ -558,7 +594,7 @@ fn expose_makes_members_referencable() {
 /// instead of binding the first declaration/import. Improvements should
 /// lower these numbers; semantic corrections require a deliberate update.
 ///
-/// Ambiguity rose 47 -> 48 on the 2026-05 corpus, and the added finding
+/// Ambiguity rose 47 -> 48 on the pinned corpus, and the added finding
 /// is ours, not the corpus's: correcting the individual-analysis
 /// example's typing made a second inheritance path visible, and we do
 /// not yet collapse a usage's re-declared feature onto the identically
@@ -572,23 +608,114 @@ fn expose_makes_members_referencable() {
 /// ```
 ///
 /// (95, 48, 2, 2) -> (66, 25, 2, 2) when inherited-member merges gained
-/// *explicit*-redefinition shadowing (2026-08-03): a candidate that
+/// *explicit*-redefinition shadowing: a candidate that
 /// transitively redefines another candidate wins instead of the pair
 /// reading as ambiguous, so diamonds like a subject redefinition seen
 /// beside the definition's original subject resolve — and the chain
 /// members reached through the formerly ambiguous features resolve
 /// with them (the 29-unresolved drop is entirely that cascade).
 ///
-/// -> (66, 24, 2, 2) with *implicit* redefinition by name (2026-08-03,
-/// the shape documented above): a usage owned by a type that strictly
+/// -> (66, 24, 2, 2) with *implicit* redefinition by name (the shape
+/// documented above): a usage owned by a type that strictly
 /// specializes another candidate's owning type shadows the same-named
 /// inherited feature without a spelled `:>>`. The remaining ambiguities
 /// are recursive-import multi-hits (several same-named declarations in
 /// unrelated containers made visible by `import ::**`) — genuine
 /// indistinguishability, not inheritance diamonds.
 ///
+/// A user root declaration named like a standard-library root is silently
+/// bypassed by resolution: root lookups keep the library declaration (the
+/// two metaclasses do not overlap, so the earlier candidate stands), and
+/// every qualified reference through the name lands in the library. The
+/// referential check reports the collision at the user declaration's
+/// name; resolution itself is unchanged.
+#[test]
+fn referential_root_shadows_library_root() {
+    const LIB: &str = "standard library package Requirements { requirement def Base; }";
+    let shadowing = |user: &str| {
+        let mut model = Model::new();
+        model.add_library_source("MiniLib.sysml", LIB);
+        model.add_source("t.sysml", user);
+        assert!(!model.has_errors(), "test source must parse cleanly");
+        model
+    };
+
+    let src = "package Requirements {\n    requirement def Speed;\n}\npackage Uses {\n    \
+               requirement s : Requirements::Speed;\n}\n";
+    let model = shadowing(src);
+    let diags = validate_model(&model);
+    let msgs: Vec<&str> = diags.iter().map(|(_, d)| d.message.as_str()).collect();
+    assert_eq!(
+        msgs,
+        [
+            "root package `Requirements` shadows the standard library package `Requirements`; \
+             references resolve to the library",
+            "unresolved reference `Requirements::Speed`",
+        ],
+        "{msgs:#?}"
+    );
+    // Attributed to the user unit, at the declared name.
+    let (unit, d) = &diags[0];
+    assert_eq!(*unit, 1);
+    assert_eq!(
+        &src[d.span.start as usize..d.span.end as usize],
+        "Requirements"
+    );
+    // Resolution behavior is unchanged: the root name reaches the library.
+    let mut r = sysmlv2_parser::json::ResolvedModel::build(&model);
+    let pkg = r.resolve_qualified("Requirements").expect("resolves");
+    assert!(r.is_library_element(pkg));
+    assert!(r.resolve_qualified("Requirements::Speed").is_none());
+    assert!(r.resolve_qualified("Requirements::Base").is_some());
+
+    // Any root declaration kind collides, not only packages.
+    let msgs = validate_model(&shadowing("part def Requirements;"))
+        .into_iter()
+        .map(|(_, d)| d.message)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        msgs,
+        [
+            "root declaration `Requirements` shadows the standard library package \
+             `Requirements`; references resolve to the library"
+        ],
+        "{msgs:#?}"
+    );
+
+    // A same-kind user root makes the name ambiguous instead — the
+    // finding says so, alongside the per-reference ambiguity findings.
+    let msgs = validate_model(&shadowing(
+        "library package Requirements { requirement def Speed; }\n\
+         package Uses { requirement s : Requirements::Speed; }\n",
+    ))
+    .into_iter()
+    .map(|(_, d)| d.message)
+    .collect::<Vec<_>>();
+    assert_eq!(msgs.len(), 2, "{msgs:#?}");
+    assert_eq!(
+        msgs[0],
+        "root package `Requirements` shadows the standard library package `Requirements`; \
+         references to the name are ambiguous"
+    );
+    assert!(msgs[1].starts_with("ambiguous reference"), "{msgs:#?}");
+
+    // Nested packages and differently named roots never collide.
+    assert!(
+        validate_model(&shadowing(
+            "package Reqs { package Requirements { requirement def Speed; } \
+             requirement s : Requirements::Speed; }"
+        ))
+        .is_empty()
+    );
+    // Without a library there is nothing to shadow.
+    assert!(model_warnings("package Requirements { requirement def Speed; }").is_empty());
+}
+
 /// -> (65, 24, 2, 2) after trigger-bearing accept payload names stopped
-/// being lowered as unresolved type references (2026-08-14).
+/// being lowered as unresolved type references.
+/// -> (63, 24, 2, 2) once named documentation and comment elements
+/// became members their namespace binds, so `comment about cmt` reaches
+/// a `comment cmt /* … */` sibling.
 #[test]
 fn corpus_referential_ratchet() {
     let root = sysmlv2_testkit::corpus_root();
@@ -620,7 +747,7 @@ fn corpus_referential_ratchet() {
         .count();
     assert_eq!(
         (unresolved, ambiguous, aliases, cycles),
-        (65, 24, 2, 2),
+        (63, 24, 2, 2),
         "referential ratchet moved — improvements should only lower these"
     );
 }
@@ -655,6 +782,168 @@ fn semantic_multiplicity_bounds() {
 }
 
 #[test]
+fn multiplicity_bounds_require_natural_values() {
+    for bound in ["\"two\"", "true", "1.5", "*..2"] {
+        let findings = sem_warnings(&format!("part p[{bound}];"));
+        assert!(
+            findings.iter().any(|m| m.contains("Natural number")),
+            "{bound}: {findings:?}"
+        );
+    }
+    for bound in ["0..*", "2"] {
+        assert!(
+            sem_warnings(&format!("part p[{bound}];")).is_empty(),
+            "{bound}"
+        );
+    }
+    assert!(!sem_warnings("attribute n = (1, 2); part p[n];").is_empty());
+    assert!(sem_warnings("attribute n = 4 / 2; part p[n];").is_empty());
+}
+
+#[test]
+fn usage_typing_respects_metaclass_inheritance_and_single_type_rules() {
+    for usage in [
+        "attribute",
+        "port",
+        "action",
+        "state",
+        "calc",
+        "constraint",
+        "requirement",
+        "analysis",
+        "verification",
+        "use case",
+        "view",
+        "rendering",
+    ] {
+        let findings = sem_warnings(&format!("part def D; {usage} x : D;"));
+        assert!(
+            findings.iter().any(|m| m.contains("must be typed by")),
+            "{usage}: {findings:?}"
+        );
+    }
+    assert!(!sem_warnings("attribute def D; occurrence x : D;").is_empty());
+    assert!(sem_warnings("interface def I; connection x : I;").is_empty());
+    assert!(sem_warnings("requirement def R; constraint x : R;").is_empty());
+    assert!(sem_warnings("calc def C; action x : C;").is_empty());
+    assert!(sem_warnings("metadata def M; item x : M;").is_empty());
+    assert!(
+        sem_warnings("calc def C { in part x : ScalarValues::Real; return : ScalarValues::Real; }")
+            .is_empty()
+    );
+    for kind in [
+        "calc",
+        "constraint",
+        "requirement",
+        "case",
+        "analysis",
+        "verification",
+        "use case",
+        "view",
+        "viewpoint",
+        "rendering",
+        "enum",
+    ] {
+        let findings = sem_warnings(&format!("{kind} def A; {kind} def B; {kind} x : A, B;"));
+        assert!(
+            findings
+                .iter()
+                .any(|m| m.contains("one non-redundant type")),
+            "{kind}: {findings:?}"
+        );
+        let findings = sem_warnings(&format!(
+            "{kind} def A; {kind} def B :> A; {kind} x : B, A;"
+        ));
+        if kind == "enum" {
+            assert!(
+                findings
+                    .iter()
+                    .any(|m| m.contains("validateDefinitionVariationSpecialization")),
+                "{findings:?}"
+            );
+        } else {
+            assert!(findings.is_empty(), "redundant {kind}: {findings:?}");
+        }
+    }
+}
+
+#[test]
+fn subsetting_cannot_widen_an_explicit_upper_bound() {
+    let declaration = "part def A { part x[2..3]; }";
+    let bad = sem_warnings(&format!(
+        "{declaration} part def B :> A {{ part y[0..4] :> x; }}"
+    ));
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    assert!(bad[0].contains("subsetting multiplicity upper bound"));
+    let good = sem_warnings(&format!(
+        "{declaration} part def B :> A {{ part y[0..1] :> x; }}"
+    ));
+    assert!(good.is_empty(), "a subset may have fewer values: {good:?}");
+}
+
+#[test]
+fn invocation_bindings_are_checked_by_name_and_position() {
+    let calc = "calc def F { in a; in b = 2; a + b }";
+    for (args, expected) in [
+        ("a = 1, a = 2", "more than once"),
+        ("1, a = 2", "more than once"),
+        ("typo = 1", "unknown parameter"),
+    ] {
+        let findings = sem_warnings(&format!("{calc} attribute result = F({args});"));
+        assert!(
+            findings.iter().any(|m| m.contains(expected)),
+            "{args}: {findings:?}"
+        );
+    }
+    for args in ["a = 1", "b = 3, a = 1", "1", "1, b = 3"] {
+        assert!(
+            sem_warnings(&format!("{calc} attribute result = F({args});")).is_empty(),
+            "{args}"
+        );
+    }
+}
+
+#[test]
+fn arithmetic_dimensions_are_checked_even_when_parameters_are_unbound() {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .unwrap();
+    model.add_source(
+        "dimensions.sysml",
+        r#"
+        package Dimensions {
+            private import SI::*;
+            calc bad {
+                in v :> ISQ::speed; in mu :> ISQ::force; in r :> ISQ::length;
+                return result = v ** 2 + 2 * mu / r;
+            }
+            calc good {
+                in v :> ISQ::speed; in a :> ISQ::acceleration; in r :> ISQ::length;
+                return result = v ** 2 + 2 * a * r;
+            }
+            attribute badValue = 1 [m] + 1 [s];
+            attribute zero = 1 [m] + 0;
+            attribute unknown;
+            attribute open = unknown + 1 [m];
+        }
+    "#,
+    );
+    assert!(!model.has_errors());
+    let diagnostics = sysmlv2_parser::check::validate_semantics(&model);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|(_, d)| d.message.as_str())
+        .collect();
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert!(
+        messages
+            .iter()
+            .all(|m| m.contains("incompatible quantity dimensions"))
+    );
+}
+
+#[test]
 fn semantic_self_and_circular_specialization() {
     let msgs = sem_warnings("package P { part def A :> A; }");
     assert_eq!(msgs.len(), 1, "{msgs:#?}");
@@ -682,8 +971,8 @@ fn semantic_duplicate_specializations() {
     assert!(sem_warnings("package P { part def A; part def B; part x : A, B; }").is_empty());
 }
 
-/// Corpus gate: the semantic constraints must produce zero findings on the
-/// conforming corpus (same policy as the body-context gate).
+/// Corpus gate: every finding must be an adjudicated defect in the input,
+/// rather than an implementation limitation or an unreviewed false positive.
 #[test]
 fn corpus_semantic_constraints_clean() {
     let mut model = Model::new();
@@ -695,16 +984,28 @@ fn corpus_semantic_constraints_clean() {
         model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
     }
     let diags = sysmlv2_parser::check::validate_semantics(&model);
-    // Zero findings. The single long-standing exception here was a
+    // The single long-standing exception here was a
     // corpus defect in `AnalysisIndividualExample.sysml`, where the
     // redefinition typed the wrong individual (the *analysis* def
-    // rather than the action def declared for it); the 2026-05 corpus
-    // corrects the typing, so the gate is unconditional again.
+    // rather than the action def declared for it); the pinned corpus
+    // corrects the typing. Dimensional inference reveals two independent
+    // defects, also reported by OpenSysML at d7d432ff4:
+    // - Total Temperature declares V : VolumeValue and Cp : DimensionOneValue,
+    //   then adds V^2/(2*Cp) (L^6) to T_static (temperature).
+    // - The wheel expression adds 22/2*25.4 (dimensionless) to 110[mm]; the
+    //   intended whole sum needs parentheses before its unit annotation.
     let msgs: Vec<String> = diags
         .iter()
         .map(|(u, d)| format!("{} — {}", model.units()[*u].name, d.message))
         .collect();
-    assert_eq!(msgs.len(), 0, "semantic findings on the corpus: {msgs:#?}");
+    assert_eq!(
+        msgs,
+        [
+            "Turbojet Stage Analysis.sysml — expression combines incompatible quantity dimensions `L^6` and `Θ`",
+            "VehicleGeometryAndCoordinateFrames.sysml — expression combines incompatible quantity dimensions `1` and `L`",
+        ],
+        "unexpected semantic findings on the corpus"
+    );
 }
 
 /// Constraint verdicts for one source (no library).
@@ -763,6 +1064,191 @@ fn unbound_feature_comparisons_are_undecided() {
     assert_eq!(vs[0].1, Satisfied, "{vs:#?}");
 }
 
+/// A member read *through an unbound parameter* — a requirement's
+/// `subject`, a calc parameter — is not the type's default: the default
+/// belongs to the type and the argument bound later may override it, so
+/// a definition-level constraint over the subject stays undecided
+/// instead of accusing the type's defaults. A value the declaration
+/// *fixes* to a literal holds for every argument and still decides,
+/// and an ordinary usage still reads the defaults it inherits.
+#[test]
+fn defaults_read_through_an_unbound_subject_are_undecided() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let vs = verdicts(
+        "package P {
+             part def Cartridge { attribute micron default = 5; }
+             part def Filter {
+                 attribute ratedHours default = 40;
+                 attribute portCount = 3;
+                 part cartridge : Cartridge;
+             }
+             requirement def FitForService {
+                 subject unit : Filter;
+                 require constraint fromDefault { unit.ratedHours >= 250 }
+                 require constraint fromFixed { unit.portCount == 6 }
+                 require constraint throughChain { unit.cartridge.micron <= 1 }
+             }
+             part installed : Filter;
+             assert constraint onAUsage { installed.ratedHours == 40 }
+         }",
+    );
+    let by_name = |n: &str| {
+        vs.iter()
+            .find(|(name, _)| name.as_deref() == Some(n))
+            .unwrap_or_else(|| panic!("no constraint `{n}` in {vs:#?}"))
+            .1
+            .clone()
+    };
+    assert!(matches!(by_name("fromDefault"), Undecided(_)), "{vs:#?}");
+    assert!(matches!(by_name("throughChain"), Undecided(_)), "{vs:#?}");
+    assert_eq!(by_name("fromFixed"), Violated, "{vs:#?}");
+    assert_eq!(by_name("onAUsage"), Satisfied, "{vs:#?}");
+}
+
+#[test]
+fn unknown_receivers_do_not_commit_to_type_defaults() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let vs = verdicts(
+        "package P {
+            part def Choice { attribute enabled default = false; }
+            part installed : Choice;
+            attribute externalDefault default = true;
+            calc def Identity { in x; return y = x; }
+            calc def Read { in x : Choice; return y = x.enabled; }
+            part def Device {
+                attribute ready default = false;
+                attribute intermediate = ready;
+                attribute enabled = intermediate;
+                attribute external = installed.enabled;
+                attribute externalScalar = externalDefault;
+                attribute fixed = true;
+                calc def LocalDefault { in x default = true; return y = x; }
+                calc def ReadReady { return y = ready; }
+                attribute localDefault = LocalDefault();
+                attribute localUnknown = ReadReady();
+                part choice : Choice;
+                part concrete : Choice = installed;
+            }
+            requirement def Eligibility {
+                subject unit : Device;
+                ref part requested : Choice;
+                ref part aliasUnit : Device = unit;
+                require constraint referenceDefault { requested.enabled }
+                require constraint fixedFormula { unit.enabled }
+                require constraint aliasFormula { aliasUnit.enabled }
+                require constraint conditionalDefault {
+                    (if true ? requested else installed).enabled
+                }
+                require constraint returnedReference { Identity(requested).enabled }
+                require constraint argumentReference { Read(requested) }
+                require constraint nestedDefault { unit.choice.enabled }
+                require constraint nestedAlias { Identity(unit.choice).enabled }
+                require constraint fixedLiteral { unit.fixed }
+                require constraint localDefault { unit.localDefault }
+                require constraint localUnknown { unit.localUnknown }
+                require constraint concreteMember { not unit.concrete.enabled }
+                require constraint unrelatedReceiver { not unit.external }
+                require constraint unrelatedScalar { unit.externalScalar }
+                require constraint concreteConditional {
+                    not (if false ? requested else installed).enabled
+                }
+                require constraint concreteArgument { not Read(installed) }
+            }
+            calc def Input {
+                in requested : Choice;
+                return result = requested.enabled;
+                assert constraint inputDefault { requested.enabled }
+            }
+        }",
+    );
+    let unknown = [
+        "referenceDefault",
+        "fixedFormula",
+        "aliasFormula",
+        "conditionalDefault",
+        "returnedReference",
+        "argumentReference",
+        "nestedDefault",
+        "nestedAlias",
+        "inputDefault",
+        "localUnknown",
+    ];
+    assert_eq!(vs.len(), 17, "{vs:#?}");
+    for (name, verdict) in &vs {
+        if unknown.contains(&name.as_deref().unwrap()) {
+            assert!(
+                matches!(verdict, Undecided(reason) if reason.contains("indeterminate")),
+                "{name:?}: {verdict:?}"
+            );
+        } else {
+            assert_eq!(*verdict, Satisfied, "{name:?}");
+        }
+    }
+}
+
+#[test]
+fn unknown_receiver_methods_follow_redefined_defaults() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    for declaration in ["attribute :>> ready", "attribute ready"] {
+        for value in ["default = true", "= true"] {
+            let vs = verdicts(&format!(
+                "package P {{
+                part def Base {{
+                    attribute ready default = false;
+                    calc def Read {{ attribute local = ready; return result = local; }}
+                    attribute enabled = Read();
+                }}
+                part def Specialized :> Base {{ {declaration} {value}; }}
+                requirement def R {{
+                    subject unit : Specialized;
+                    require constraint direct {{ unit.ready }}
+                    require constraint method {{ unit.enabled }}
+                }}
+            }}"
+            ));
+            assert_eq!(vs.len(), 2, "{vs:?}");
+            for (_, verdict) in vs {
+                if value.starts_with("default") {
+                    assert!(
+                        matches!(verdict, Undecided(reason) if reason.contains("indeterminate")),
+                        "{value}"
+                    );
+                } else {
+                    assert_eq!(verdict, Satisfied, "{value}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_receivers_do_not_taint_imported_concrete_values() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let vs = verdicts(
+        "package Globals {
+            attribute flag default = true;
+            part def Child { attribute flag default = true; }
+            part installed : Child;
+        }
+        package P {
+            part def Device {
+                private import Globals::*;
+                attribute scalar = flag;
+                attribute nested = installed.flag;
+            }
+            requirement def R {
+                subject unit : Device;
+                require constraint scalar { unit.scalar }
+                require constraint nested { unit.nested }
+            }
+        }",
+    );
+    assert_eq!(vs.len(), 2, "{vs:?}");
+    for (_, verdict) in vs {
+        assert_eq!(verdict, Satisfied);
+    }
+}
+
 /// Corpus ratchet for constraint verdicts: a conforming corpus must have
 /// **zero violated**; the satisfied/undecided split moves only through
 /// deliberate evaluator improvements.
@@ -787,12 +1273,12 @@ fn corpus_constraint_verdicts_ratchet() {
     assert_eq!(
         (sat, vio, und),
         // 80 → 90 when asserted constraints with *inherited* bodies
-        // (`assert c : Def;`) gained verdicts (2026-07-17); 90 → 116 when
+        // (`assert c : Def;`) gained verdicts; 90 → 116 when
         // satisfaction claims (`satisfy R by x;`) began expanding to
         // subject-bound verdicts — all 26 corpus expansions enter
         // undecided (their remaining parameters are unbound); the
         // evaluator/solver may promote them. Satisfied 7 → 4 when
-        // unbound-feature cardinality stopped fabricating (2026-07-23):
+        // unbound-feature cardinality stopped fabricating:
         // the three lost verdicts were `(1..size(xs)-1)->forAll` bodies
         // over unbound `[0..*]` collections, where the placeholder's
         // fabricated size of 1 emptied the range and made the forAll
@@ -863,15 +1349,12 @@ fn semantic_invocation_arity() {
     // A defaulted tail is clean.
     let defaulted = "calc def G { in a; in b = 10; a + b }";
     assert!(sem_warnings(&format!("package P {{ {defaulted} attribute x = G(1); }}")).is_empty());
-    // Named arguments are not checked (they bind explicitly).
-    assert!(
-        sem_warnings(&format!(
-            "package P {{ {calc} attribute x = F(a = 1, b = 2); }}"
-        ))
-        .is_empty()
-    );
-    // Zero-argument spellings are not checked (type-reference idioms).
-    assert!(sem_warnings(&format!("package P {{ {calc} attribute x = F(); }}")).is_empty());
+    // Named and empty calls must not silently leave required inputs unbound.
+    for args in ["a = 1, b = 2", ""] {
+        let msgs = sem_warnings(&format!("package P {{ {calc} attribute x = F({args}); }}"));
+        assert_eq!(msgs.len(), 1, "{msgs:#?}");
+        assert!(msgs[0].contains("never bound"));
+    }
     // Nested call sites are found.
     let msgs = sem_warnings(&format!(
         "package P {{ {calc} attribute x = 1 + F(1, 2) * 3; }}"
@@ -1226,8 +1709,8 @@ fn nary_connector_binary_specialization() {
             "package N {
              part def P;
              connection def Tri {
-                 end part a : P[*];
-                 end part b : P[*];
+                 end part a : P[1];
+                 end part b : P[1];
                  end part c : P[1];
              }
              part ctx {
@@ -1244,8 +1727,8 @@ fn nary_connector_binary_specialization() {
         "package N {
              part def P;
              connection def Tri {
-                 end part a : P[*];
-                 end part b : P[*];
+                 end part a : P[1];
+                 end part b : P[1];
                  end part c : P[1];
              }
              part ctx {

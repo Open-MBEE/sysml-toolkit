@@ -46,11 +46,14 @@ mod graph;
 mod interconnect;
 mod sequence;
 
-pub use graph::graph;
+pub use graph::{GraphError, graph};
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fmt::Write as _;
+use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use sysmlv2_model::eval::Value;
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
 
@@ -63,18 +66,32 @@ pub enum Direction {
 }
 
 /// Which diagram to emit (the Pilot Implementation's view repertoire).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+///
+/// The variants carry the spelling hosts use on a command line or in an
+/// options object, through [`FromStr`], [`Display`](fmt::Display) and
+/// serde:
+///
+/// ```
+/// use sysmlv2_viz::View;
+///
+/// assert_eq!("ic".parse::<View>().unwrap(), View::Interconnection);
+/// assert_eq!(View::Interconnection.to_string(), "interconnection");
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum View {
     /// Structure ("tree") view: packages, definitions, usages.
     #[default]
     Tree,
     /// Parts, ports, and connector edges.
+    #[serde(alias = "ic")]
     Interconnection,
     /// State machines: states, transitions, entry/do/exit.
     State,
     /// Action flows: actions, control nodes, successions, flows.
     Action,
     /// Lifelines and messages, ordered by event successions.
+    #[serde(alias = "seq")]
     Sequence,
     /// Use cases: actors, subjects, objectives, includes.
     Case,
@@ -83,8 +100,63 @@ pub enum View {
     Mixed,
 }
 
+impl View {
+    /// The spelling of each view, canonical spellings only.
+    const SPELLINGS: &'static [(&'static str, View)] = &[
+        ("tree", View::Tree),
+        ("interconnection", View::Interconnection),
+        ("state", View::State),
+        ("action", View::Action),
+        ("sequence", View::Sequence),
+        ("case", View::Case),
+        ("mixed", View::Mixed),
+    ];
+
+    /// The short spellings hosts also accept, beside the canonical ones.
+    const SHORTHANDS: &'static [(&'static str, View)] =
+        &[("ic", View::Interconnection), ("seq", View::Sequence)];
+
+    /// The canonical spelling — what [`Display`](fmt::Display), serde
+    /// and the structured graph's `view` field write. Matched rather
+    /// than looked up, so a view added without a spelling is a compile
+    /// error instead of a silent misspelling of another one.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            View::Tree => "tree",
+            View::Interconnection => "interconnection",
+            View::State => "state",
+            View::Action => "action",
+            View::Sequence => "sequence",
+            View::Case => "case",
+            View::Mixed => "mixed",
+        }
+    }
+}
+
+impl fmt::Display for View {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for View {
+    type Err = ParseOptionError;
+
+    fn from_str(s: &str) -> Result<View, ParseOptionError> {
+        Self::SPELLINGS
+            .iter()
+            .chain(Self::SHORTHANDS)
+            .find(|(spelling, _)| *spelling == s)
+            .map(|(_, v)| *v)
+            .ok_or_else(|| ParseOptionError::new("view", s, Self::SPELLINGS))
+    }
+}
+
 /// Edge routing (PlantUML `skinparam linetype`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+///
+/// Spelled the same way as [`View`] on every host surface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LineStyle {
     /// PlantUML's default splines.
     #[default]
@@ -93,10 +165,108 @@ pub enum LineStyle {
     Ortho,
 }
 
+impl LineStyle {
+    const SPELLINGS: &'static [(&'static str, LineStyle)] = &[
+        ("default", LineStyle::Default),
+        ("polyline", LineStyle::Polyline),
+        ("ortho", LineStyle::Ortho),
+    ];
+
+    /// The canonical spelling — what [`Display`](fmt::Display) and
+    /// serde write. Matched rather than looked up, for the reason
+    /// [`View::as_str`] gives.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineStyle::Default => "default",
+            LineStyle::Polyline => "polyline",
+            LineStyle::Ortho => "ortho",
+        }
+    }
+}
+
+impl fmt::Display for LineStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LineStyle {
+    type Err = ParseOptionError;
+
+    fn from_str(s: &str) -> Result<LineStyle, ParseOptionError> {
+        Self::SPELLINGS
+            .iter()
+            .find(|(spelling, _)| *spelling == s)
+            .map(|(_, v)| *v)
+            .ok_or_else(|| ParseOptionError::new("line style", s, Self::SPELLINGS))
+    }
+}
+
+/// A spelling that names no member of one of the option enums —
+/// the error of [`View`]'s and [`LineStyle`]'s [`FromStr`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ParseOptionError {
+    option: &'static str,
+    spelling: String,
+    expected: Vec<&'static str>,
+}
+
+impl ParseOptionError {
+    fn new<T>(option: &'static str, spelling: &str, expected: &[(&'static str, T)]) -> Self {
+        ParseOptionError {
+            option,
+            spelling: spelling.to_string(),
+            expected: expected.iter().map(|(s, _)| *s).collect(),
+        }
+    }
+
+    /// What was being named: `view`, `line style`.
+    pub fn option(&self) -> &str {
+        self.option
+    }
+
+    /// The spelling that named nothing.
+    pub fn spelling(&self) -> &str {
+        &self.spelling
+    }
+
+    /// The canonical spellings, in declaration order.
+    pub fn expected(&self) -> &[&'static str] {
+        &self.expected
+    }
+}
+
+impl fmt::Display for ParseOptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown {}: {}", self.option, self.spelling)?;
+        match self.expected.split_last() {
+            Some((last, [])) => write!(f, " (expected {last})"),
+            Some((last, rest)) => write!(f, " (expected {}, or {last})", rest.join(", ")),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for ParseOptionError {}
+
 /// Options for [`plantuml`]. `show_values` renders `= value` on
 /// attribute lines when the attribute's value expression evaluates to a
 /// scalar (evaluation failures are silently skipped; tree view only).
+///
+/// Build one from [`VizOptions::default`] and the `with_…` setters, so
+/// that a later option does not break callers:
+///
+/// ```
+/// use sysmlv2_viz::{View, VizOptions};
+///
+/// let opts = VizOptions::default()
+///     .with_view(View::Case)
+///     .with_show_notes(false);
+/// assert_eq!(opts.view, View::Case);
+/// assert!(!opts.show_notes);
+/// ```
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct VizOptions {
     pub direction: Direction,
     pub show_values: bool,
@@ -148,6 +318,83 @@ impl Default for VizOptions {
             link_template: None,
             roots: None,
         }
+    }
+}
+
+/// One setter per option, each consuming and returning the options so
+/// they chain from [`VizOptions::default`].
+impl VizOptions {
+    /// Layout direction.
+    pub fn with_direction(mut self, direction: Direction) -> VizOptions {
+        self.direction = direction;
+        self
+    }
+
+    /// Render `= value` on attribute lines.
+    pub fn with_show_values(mut self, on: bool) -> VizOptions {
+        self.show_values = on;
+        self
+    }
+
+    /// Which diagram to emit.
+    pub fn with_view(mut self, view: View) -> VizOptions {
+        self.view = view;
+        self
+    }
+
+    /// Attach comment/documentation bodies as notes.
+    pub fn with_show_notes(mut self, on: bool) -> VizOptions {
+        self.show_notes = on;
+        self
+    }
+
+    /// Show metadata as stereotypes and nodes.
+    pub fn with_show_metadata(mut self, on: bool) -> VizOptions {
+        self.show_metadata = on;
+        self
+    }
+
+    /// Add inherited compartment lines.
+    pub fn with_show_inherited(mut self, on: bool) -> VizOptions {
+        self.show_inherited = on;
+        self
+    }
+
+    /// Give referenced library types their own marked nodes.
+    pub fn with_show_lib(mut self, on: bool) -> VizOptions {
+        self.show_lib = on;
+        self
+    }
+
+    /// Draw `«import»` edges.
+    pub fn with_show_imported(mut self, on: bool) -> VizOptions {
+        self.show_imported = on;
+        self
+    }
+
+    /// Edge routing.
+    pub fn with_line_style(mut self, line_style: LineStyle) -> VizOptions {
+        self.line_style = line_style;
+        self
+    }
+
+    /// Color nodes by metaclass family.
+    pub fn with_std_color(mut self, on: bool) -> VizOptions {
+        self.std_color = on;
+        self
+    }
+
+    /// Hyperlink template for node declarations; `None` draws no links.
+    pub fn with_link_template(mut self, link_template: Option<String>) -> VizOptions {
+        self.link_template = link_template;
+        self
+    }
+
+    /// Restrict the diagram to these top-level elements; `None` or
+    /// empty is the whole model.
+    pub fn with_roots(mut self, roots: Option<Vec<ElementRef>>) -> VizOptions {
+        self.roots = roots;
+        self
     }
 }
 
@@ -333,7 +580,7 @@ const LINE_USAGES: &[&str] = &["AttributeUsage", "ReferenceUsage", "EnumerationU
 /// PlantUML tree emitter and the structured graph emitter, so the two
 /// backends can never disagree about what is a node, a compartment
 /// line, or invisible.
-pub(crate) fn classify(r: &mut ResolvedModel, show_metadata: bool, e: ElementRef) -> Kind {
+pub(crate) fn classify(r: &ResolvedModel, show_metadata: bool, e: ElementRef) -> Kind {
     let ty = r.element_type(e);
     match ty {
         _ if !show_metadata && matches!(ty, "MetadataUsage" | "MetadataFeature") => Kind::Skip,
@@ -378,7 +625,7 @@ impl Emitter<'_> {
         a
     }
 
-    fn classify(&mut self, e: ElementRef) -> Kind {
+    fn classify(&self, e: ElementRef) -> Kind {
         classify(self.r, self.opts.show_metadata, e)
     }
 
@@ -589,7 +836,10 @@ impl Emitter<'_> {
     /// (their names already appear in node labels) — `show_lib` gives
     /// referenced library types their own marked nodes instead.
     fn emit_reference_edges(&mut self) {
-        for (e, is_usage) in self.rendered.clone() {
+        // Collection is over, so the pass takes the list rather than
+        // copying it to keep the emitter free to mutate.
+        let rendered = std::mem::take(&mut self.rendered);
+        for &(e, is_usage) in &rendered {
             let alias = self.alias[&e].clone();
             let typings = if is_usage {
                 self.r.typings(e)
@@ -619,6 +869,11 @@ impl Emitter<'_> {
                 }
             }
         }
+        // Library nodes drawn on demand during the pass were appended
+        // to the emptied list; the walked nodes go back in front of
+        // them, so the node list stays complete and in draw order.
+        let drawn_during = std::mem::replace(&mut self.rendered, rendered);
+        self.rendered.extend(drawn_during);
     }
 
     /// The alias an edge target draws to: its node when rendered; under
@@ -710,12 +965,14 @@ pub(crate) fn value_suffix(r: &mut ResolvedModel, e: ElementRef) -> Option<Strin
     let rendered = match r.evaluate(e).ok()? {
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
-        Value::Rational(f) => format!("{f}"),
+        Value::Rational(r) => r.to_string(),
+        Value::Real(f) => format!("{f}"),
         Value::String(s) => format!("\"{s}\""),
         Value::Quantity(n, unit) => {
             let magnitude = match *n {
                 Value::Integer(i) => i.to_string(),
-                Value::Rational(f) => format!("{f}"),
+                Value::Rational(r) => r.to_string(),
+                Value::Real(f) => format!("{f}"),
                 _ => return None,
             };
             format!("{magnitude} [{}]", unit.display())
@@ -778,7 +1035,7 @@ pub(crate) fn stereotype(ty: &str) -> String {
 
 /// The dotted spelling of a resolved feature chain (`a.b`) — edge-end
 /// and reference labels.
-pub(crate) fn chain_label(r: &mut ResolvedModel, chain: &[ElementRef]) -> String {
+pub(crate) fn chain_label(r: &ResolvedModel, chain: &[ElementRef]) -> String {
     chain
         .iter()
         .filter_map(|&link| r.element_name(link).map(str::to_string))
@@ -802,9 +1059,47 @@ pub(crate) fn payload_label(r: &mut ResolvedModel, e: ElementRef) -> Option<Stri
     (!label.trim().is_empty()).then(|| inline_label(&label))
 }
 
-/// PlantUML quoted-label escaping.
+/// Quoted-label escaping for the diagram language. A double quote would
+/// end the label (it becomes two single quotes), a line break would end
+/// the command and leave the rest of the label as a stray line of
+/// diagram text (it becomes the `\n` escape the renderer honours inside
+/// quotes), and a carriage return has no rendering at all (dropped).
+///
+/// A backslash is doubled, which is what makes the mapping reversible:
+/// without it a name containing the two characters `\n` would reach the
+/// renderer spelled exactly like one containing a line break.
 pub(crate) fn escape(s: &str) -> String {
-    s.replace('"', "''")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("''"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Percent-encode the characters that would end or restructure a
+/// `[[url]]` link: whitespace (ends the URL part), `]` (closes the
+/// link), and braces (open a tooltip).
+fn encode_link(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    for ch in url.chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '\t' => out.push_str("%09"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            ']' => out.push_str("%5D"),
+            '{' => out.push_str("%7B"),
+            '}' => out.push_str("%7D"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The STDCOLOR palette: stereotype → background color, one hue family
@@ -883,7 +1178,7 @@ pub(crate) fn link_suffix(r: &mut ResolvedModel, opts: &VizOptions, e: ElementRe
     if url.contains("{id}") {
         url = url.replace("{id}", &r.element_id(e).to_string());
     }
-    format!(" [[{}]]", url.replace(' ', "%20"))
+    format!(" [[{}]]", encode_link(&url))
 }
 
 /// `<<stereo>>` plus one `<<Meta>>` per prefix metadata annotating `e`
@@ -921,7 +1216,7 @@ pub(crate) fn stereo_text(
     out
 }
 
-/// Floating `note` blocks for every comment/documentation body whose
+/// Floating notes for every comment/documentation body whose
 /// annotated element is on the diagram (`alias` map), attached with
 /// `..`. Note aliases are `c1…` — disjoint from the node `n…` space.
 pub(crate) fn emit_notes(
@@ -939,26 +1234,31 @@ pub(crate) fn emit_notes(
             continue;
         };
         k += 1;
-        let _ = writeln!(out, "note as c{k}");
-        for line in body.lines() {
-            // A body line PlantUML would read as the block terminator
-            // gets an indent.
-            if line.trim() == "end note" {
-                let _ = writeln!(out, " {line}");
-            } else {
-                let _ = writeln!(out, "{line}");
-            }
-        }
-        let _ = writeln!(out, "end note");
+        let _ = writeln!(out, "note \"{}\" as c{k}", note_text(&body));
         let _ = writeln!(out, "c{k} .. {a}");
     }
 }
 
+/// A note body as the text of a quoted single-line `note "…" as x`:
+/// one `\n` escape per line break. The block form (`note as x` …
+/// `end note`) is not used because the renderer ends it at any body
+/// line spelling the terminator (`end note`, `endnote`, in any case,
+/// after any indent) and reads the rest as diagram commands; inside
+/// quotes no body text can end the note.
+pub(crate) fn note_text(body: &str) -> String {
+    body.lines().map(escape).collect::<Vec<_>>().join("\\n")
+}
+
 /// Compartment lines are unquoted PlantUML member syntax; strip the
 /// characters that would change their parse (braces open a block,
-/// leading `-`/`+`/`#` set visibility).
+/// leading `-`/`+`/`#` set visibility, a line break ends the member —
+/// it becomes a space; a carriage return is dropped).
 fn sanitize_line(s: &str) -> String {
-    let cleaned: String = s.chars().filter(|c| *c != '{' && *c != '}').collect();
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !matches!(c, '{' | '}' | '\r'))
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     let trimmed = cleaned.trim().to_string();
     match trimmed.chars().next() {
         Some('-') | Some('+') | Some('#') | Some('~') => format!("\\{trimmed}"),

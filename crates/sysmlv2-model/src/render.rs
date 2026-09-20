@@ -279,7 +279,8 @@ fn truthy(v: &Value) -> bool {
     match v {
         Value::Boolean(b) => *b,
         Value::Integer(i) => *i != 0,
-        Value::Rational(f) => *f != 0.0,
+        Value::Rational(r) => !r.is_zero(),
+        Value::Real(f) => *f != 0.0,
         Value::String(s) => !s.is_empty(),
         Value::Sequence(items) => !items.is_empty(),
         Value::Indeterminate => false,
@@ -318,9 +319,9 @@ impl ResolvedModel {
     fn bound_text(&mut self, e: ElementRef, name: &str) -> Option<String> {
         match self.evaluate_chain(e, &[&qn(name)]) {
             Ok(Value::String(s)) => Some(s),
-            Ok(v @ (Value::Integer(_) | Value::Rational(_) | Value::Boolean(_))) => {
-                Some(self.render_value(&v))
-            }
+            Ok(
+                v @ (Value::Integer(_) | Value::Rational(_) | Value::Real(_) | Value::Boolean(_)),
+            ) => Some(self.render_value(&v)),
             _ => None,
         }
     }
@@ -383,6 +384,12 @@ impl ResolvedModel {
 
     /// Render the tree a `view` usage presents: its exposed elements bind
     /// the rendering's inputs. Returns the rendered nodes of the root.
+    ///
+    /// Rendering errors are messages rather than a type throughout this
+    /// module: each one names a specific thing the view's own text is
+    /// missing or has wrong, for a reader to act on, and every caller
+    /// passes it straight to one — a command-line message, a rejected
+    /// call in a host binding.
     pub fn render_view(&mut self, view: ElementRef) -> Result<Vec<RenderNode>, String> {
         // Annotations (documentation, comments, textual representations)
         // are members too, but never a template's subject matter.
@@ -398,7 +405,7 @@ impl ResolvedModel {
             .map(Value::Element)
             .collect();
         let root = self.view_template_root(view)?;
-        self.render_root(root, Value::Sequence(exposed))
+        self.render_root(root, &Value::Sequence(exposed))
     }
 
     /// The `Root` usage of the rendering a view (or its definition) names.
@@ -453,7 +460,7 @@ impl ResolvedModel {
     pub fn render_root(
         &mut self,
         root: ElementRef,
-        exposed: Value,
+        exposed: &Value,
     ) -> Result<Vec<RenderNode>, String> {
         let kinds = self.kinds()?;
         let mut env: Vec<(String, Value)> = vec![("exposed".into(), exposed.clone())];
@@ -464,7 +471,7 @@ impl ResolvedModel {
         };
         let mut first = true;
         for input in inputs {
-            let (Value::Element(e) | Value::Unbound(e)) = input else {
+            let (Value::Element(e) | Value::Unbound(e) | Value::UnboundMember(e)) = input else {
                 continue;
             };
             let Some(name) = self.bound_text(e, "name") else {

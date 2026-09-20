@@ -2,7 +2,7 @@
 //! human-readable terms: the spelled reference text, unit:line:col, the
 //! raw byte span, and the expected target's qualified name.
 
-use sysmlv2_transform::{Session, TransformError};
+use sysmlv2_transform::{Session, SessionError, TransformError};
 
 #[test]
 fn refusal_names_broken_sites() {
@@ -36,4 +36,26 @@ package Rig {
     assert!(msg.contains("bytes "), "{msg}");
     assert!(msg.contains("Other::Wheel"), "{msg}");
     println!("{msg}");
+}
+
+#[test]
+fn a_parse_failure_with_no_diagnostics_still_prints() {
+    // The diagnostic lists are public fields, so a host can hand back an
+    // error it built itself (a relay across a process boundary, say).
+    // An empty list must read as a missing detail, not end in a fault.
+    let session = SessionError::Parse {
+        unit: "t.sysml".into(),
+        diagnostics: Vec::new(),
+    };
+    let msg = session.to_string();
+    assert!(msg.starts_with("t.sysml does not parse: "), "{msg}");
+    assert!(msg.contains("no diagnostic"), "{msg}");
+
+    let reparse = TransformError::ReparseFailed {
+        unit: "t.sysml".into(),
+        diagnostics: Vec::new(),
+    };
+    let msg = reparse.to_string();
+    assert!(msg.starts_with("edited t.sysml does not parse: "), "{msg}");
+    assert!(msg.contains("no diagnostic"), "{msg}");
 }

@@ -29,6 +29,7 @@ fn main() {
                     sysmlv2_parser::eval::EvalError::Type(_) => "type error".into(),
                     sysmlv2_parser::eval::EvalError::Cycle(_) => "cycle".into(),
                     sysmlv2_parser::eval::EvalError::DivisionByZero => "div0".into(),
+                    sysmlv2_parser::eval::EvalError::Budget(_) => "budget".into(),
                 };
                 *by_err.entry(key).or_default() += 1;
             }

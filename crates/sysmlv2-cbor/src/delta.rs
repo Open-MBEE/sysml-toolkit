@@ -37,10 +37,10 @@
 //! replay owner changes as explicit ops and base copies are never
 //! touched), and the units section (flag 0x10).
 
-use crate::Error;
 use crate::cbor::{Head, Reader, Writer};
-use crate::decode::{Tables, read_element_body, read_uuid_table};
+use crate::decode::{Tables, gate_flags, read_element_body, read_units, read_uuid_table};
 use crate::encode::{Interner, elems_of, table_set, write_element};
+use crate::{Error, ErrorKind};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -57,14 +57,21 @@ pub(crate) const OP_SPLICE: u64 = 2;
 
 /// A spec-canonical version identifier carried as an opaque claim
 /// (e.g. key 0 = project id, 1 = commit id, 2 = a service URI).
+///
+/// Non-exhaustive: the wire may learn further claim shapes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Claim {
     Id(Uuid),
     Text(String),
 }
 
-/// Delta encoding options.
+/// Delta encoding options. Build one from [`DeltaOptions::new`] (or
+/// [`Default`]) and the `with_*` setters; the fields stay readable and
+/// assignable, but the struct is non-exhaustive, so later options
+/// never break a caller that spelled its own literal.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct DeltaOptions {
     /// Id-keyed identities and external base references — larger, but
     /// applicable best-effort to a divergent base.
@@ -82,6 +89,35 @@ pub struct DeltaOptions {
     /// identity only — result indices are exact under the digest gate,
     /// which a divergent portable apply cannot promise.
     pub units: Vec<(usize, String)>,
+}
+
+impl DeltaOptions {
+    /// Strict identities, no claims, no units.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set [`Self::portable`].
+    #[must_use]
+    pub fn with_portable(mut self, portable: bool) -> Self {
+        self.portable = portable;
+        self
+    }
+
+    /// Set [`Self::claims`].
+    #[must_use]
+    pub fn with_claims(mut self, claims: Vec<(u64, Claim)>) -> Self {
+        self.claims = claims;
+        self
+    }
+
+    /// Set [`Self::units`].
+    #[must_use]
+    pub fn with_units(mut self, units: Vec<(usize, String)>) -> Self {
+        self.units = units;
+        self
+    }
 }
 
 fn delta_ns() -> Uuid {
@@ -117,9 +153,49 @@ fn targets(index: &HashMap<&str, usize>, e: &Value, key: &str) -> Vec<usize> {
 /// root appended in payload order. Emission-order-independent — the
 /// footing for [`state_digest`] and every delta index space.
 pub fn delta_canonical(compact: &Value) -> Result<Value, Error> {
+    Ok(Value::Array(
+        canonical_views(compact)?.into_iter().cloned().collect(),
+    ))
+}
+
+/// The payload's elements in delta-canonical order, borrowed. Digests,
+/// diffs and applies all walk these views, so canonicalizing a model
+/// costs a vector of pointers rather than a copy of it.
+pub(crate) fn canonical_views(compact: &Value) -> Result<Vec<&Value>, Error> {
     let arr = compact
         .as_array()
         .ok_or_else(|| Error::new("compact payload is a flat element array"))?;
+    Ok(canonical_order(arr)?.into_iter().map(|i| &arr[i]).collect())
+}
+
+/// [`delta_canonical`] for a payload we already own: the elements move
+/// into canonical order instead of being copied into it.
+fn canonical_owned(applied: Value) -> Result<Value, Error> {
+    let Value::Array(arr) = applied else {
+        return Err(Error::new("compact payload is a flat element array"));
+    };
+    let order = canonical_order(&arr)?;
+    let mut slots: Vec<Option<Value>> = arr.into_iter().map(Some).collect();
+    Ok(Value::Array(
+        order
+            .into_iter()
+            .map(|i| {
+                slots[i]
+                    .take()
+                    .expect("the canonical order lists each element once")
+            })
+            .collect(),
+    ))
+}
+
+/// Borrowed views over an array that is already in canonical order.
+fn views(arr: &[Value]) -> Vec<&Value> {
+    arr.iter().collect()
+}
+
+/// The delta-canonical order as a permutation of the payload's own
+/// positions — the shape [`delta_canonical`] materializes.
+fn canonical_order(arr: &[Value]) -> Result<Vec<usize>, Error> {
     let n = arr.len();
     let mut index: HashMap<&str, usize> = HashMap::with_capacity(n);
     for (i, e) in arr.iter().enumerate() {
@@ -161,9 +237,7 @@ pub fn delta_canonical(compact: &Value) -> Result<Value, Error> {
             order.push(i);
         }
     }
-    Ok(Value::Array(
-        order.into_iter().map(|i| arr[i].clone()).collect(),
-    ))
+    Ok(order)
 }
 
 /// Content digest of a model state: `uuid5` over the canonical compact
@@ -171,10 +245,10 @@ pub fn delta_canonical(compact: &Value) -> Result<Value, Error> {
 /// transport-independent; [`empty_base_digest`] is its fixed point for
 /// the empty model (the API's "first commit" base).
 pub fn state_digest(compact: &Value) -> Result<Uuid, Error> {
-    digest_of_canonical(&delta_canonical(compact)?)
+    digest_of_canonical(&canonical_views(compact)?)
 }
 
-fn digest_of_canonical(canon: &Value) -> Result<Uuid, Error> {
+fn digest_of_canonical(canon: &[&Value]) -> Result<Uuid, Error> {
     // The digest space canonicalizes with owners spelled — pinned
     // independently of wire-format elision, so digests recorded
     // before the owner-elision flag existed stay valid forever.
@@ -185,6 +259,10 @@ fn digest_of_canonical(canon: &Value) -> Result<Uuid, Error> {
 }
 
 /// The recognizable digest of the empty base.
+///
+/// # Panics
+/// Never in practice: the empty element array always encodes.
+#[must_use]
 pub fn empty_base_digest() -> Uuid {
     state_digest(&Value::Array(Vec::new())).expect("empty model encodes")
 }
@@ -207,14 +285,18 @@ pub fn empty_base_digest() -> Uuid {
 ///
 /// Not for same-session diffs: session identity survives moves, which
 /// path matching cannot see — diff those payloads as they are.
+///
+/// # Panics
+/// If an element of either payload has no string `@id`. Id derivation
+/// runs first and refuses such a payload, so a `Value` that reached
+/// this point already carries them.
 pub fn rebase_ids(base: &Value, target: &Value) -> Result<Value, Error> {
-    let flat = |v: &Value| -> Result<Vec<Value>, Error> {
+    fn array(v: &Value) -> Result<&Vec<Value>, Error> {
         v.as_array()
-            .cloned()
             .ok_or_else(|| Error::new("compact payload is a flat element array"))
-    };
-    let base_arr = flat(base)?;
-    let mut out = flat(target)?;
+    }
+    let base_arr = array(base)?;
+    let mut out = array(target)?.clone();
     let none = |_: &str| None;
     let base_paths = sysmlv2_model::ids::segment_paths(base, &none).map_err(Error::new)?;
     let target_paths = sysmlv2_model::ids::segment_paths(target, &none).map_err(Error::new)?;
@@ -267,7 +349,7 @@ pub fn rebase_ids(base: &Value, target: &Value) -> Result<Value, Error> {
             .collect()
     };
     let (base_roots, target_roots) = (roots(&base_paths), roots(&target_paths));
-    let base_keys = keyed(&base_arr, &base_roots);
+    let base_keys = keyed(base_arr, &base_roots);
     let target_keys = keyed(&out, &target_roots);
     let mut pair: HashMap<usize, usize> = HashMap::new();
     let mut base_used: HashSet<usize> = HashSet::new();
@@ -383,14 +465,14 @@ pub fn rebase_ids(base: &Value, target: &Value) -> Result<Value, Error> {
             .into_iter()
             .filter(|c| !pair_elem.contains_key(c))
             .collect();
-        let unb: Vec<usize> = children(&base_arr, &base_index, b)
+        let unb: Vec<usize> = children(base_arr, &base_index, b)
             .into_iter()
             .filter(|c| !base_paired.contains(c))
             .collect();
         let (mut i, mut j) = (0usize, 0usize);
         while i < unt.len() && j < unb.len() {
             let (tc, bc) = (unt[i], unb[j]);
-            if align_key(&out, &target_index, tc) == align_key(&base_arr, &base_index, bc) {
+            if align_key(&out, &target_index, tc) == align_key(base_arr, &base_index, bc) {
                 adopt(tc, bc, &out, &mut remap, &mut pair_elem, &mut base_paired);
                 queue.push((tc, bc));
                 i += 1;
@@ -528,7 +610,7 @@ fn plan_patch(base: &Value, target: &Value) -> Option<Vec<(u8, FieldOp)>> {
             (Some(_), None) => FieldOp::Unset,
             (None, None) => continue,
         };
-        ops.push((ord as u8, op));
+        ops.push((u8::try_from(ord).ok()?, op));
     }
     // Self-check: replaying the ops over the base must reproduce the
     // target exactly — this guards keys outside the field table and
@@ -641,15 +723,16 @@ fn read_patch(r: &mut Reader, t: &Tables, n: usize, base_elem: &Value) -> Result
     if n > r.remaining() / 2 {
         return Err(Error::new("patch longer than payload"));
     }
-    let mut prev: i32 = -1;
+    let mut prev: Option<u64> = None;
     for _ in 0..n {
         let ord = r.uint()?;
-        if ord as i32 <= prev {
+        if prev.is_some_and(|p| ord <= p) {
             return Err(Error::new(format!("{ty}: patch ordinals not ascending")));
         }
-        prev = ord as i32;
-        let field = fields
-            .get(ord as usize)
+        prev = Some(ord);
+        let field = usize::try_from(ord)
+            .ok()
+            .and_then(|ord| fields.get(ord))
             .ok_or_else(|| Error::new(format!("{ty}: field ordinal {ord} out of range")))?;
         if r.array()? != 2 {
             return Err(Error::new("patch op is array(2)"));
@@ -669,8 +752,8 @@ fn read_patch(r: &mut Reader, t: &Tables, n: usize, base_elem: &Value) -> Result
                 if r.array()? != 3 {
                     return Err(Error::new("splice op is array(3)"));
                 }
-                let at = r.uint()? as usize;
-                let del = r.uint()? as usize;
+                let at = r.index()?;
+                let del = r.index()?;
                 let len = r.array()?;
                 if len > r.remaining() {
                     return Err(Error::new("splice items longer than payload"));
@@ -712,12 +795,10 @@ fn delta_encode(
     opts: &DeltaOptions,
     elide: Option<Resolver>,
 ) -> Result<Vec<u8>, Error> {
-    let base_canon = delta_canonical(base)?;
-    let target_canon = delta_canonical(target)?;
-    let base_digest = digest_of_canonical(&base_canon)?;
-    let result_digest = digest_of_canonical(&target_canon)?;
-    let base_arr = base_canon.as_array().unwrap();
-    let target_arr = target_canon.as_array().unwrap();
+    let base_arr = canonical_views(base)?;
+    let target_arr = canonical_views(target)?;
+    let base_digest = digest_of_canonical(&base_arr)?;
+    let result_digest = digest_of_canonical(&target_arr)?;
 
     // Ownership backpointers on shipped element records elide
     // against derivation over the **canonical target** — the identical
@@ -729,7 +810,7 @@ fn delta_encode(
         .enumerate()
         .map(|(i, e)| (e["@id"].as_str().expect("canonicalized"), i))
         .collect();
-    let target_owners = crate::encode::derive_owners(target_arr);
+    let target_owners = crate::encode::derive_owners(target_arr.iter().copied());
     let derived_pair = |e: &Value| -> [Option<&str>; 2] {
         let ti = canon_pos[e["@id"].as_str().unwrap()];
         target_owners[ti].map(|s| s.map(|j| target_arr[j]["@id"].as_str().unwrap()))
@@ -777,7 +858,7 @@ fn delta_encode(
     let base_by_id: HashMap<&str, usize> =
         base_ids.iter().enumerate().map(|(i, &s)| (s, i)).collect();
     let mut target_ids: HashSet<&str> = HashSet::with_capacity(target_arr.len());
-    for e in target_arr {
+    for &e in &target_arr {
         if !target_ids.insert(e["@id"].as_str().expect("canonicalized")) {
             return Err(Error::new(format!("duplicate element @id `{}`", e["@id"])));
         }
@@ -785,9 +866,9 @@ fn delta_encode(
 
     // updates/deletes ascending by base position, creates in target order.
     let mut touched: Vec<(usize, Option<&Value>)> = Vec::new();
-    for e in target_arr {
+    for &e in &target_arr {
         if let Some(&i) = base_by_id.get(e["@id"].as_str().unwrap()) {
-            if base_arr[i] != *e {
+            if base_arr[i] != e {
                 touched.push((i, Some(e)));
             }
         }
@@ -805,17 +886,17 @@ fn delta_encode(
         .iter()
         .enumerate()
         .filter(|(_, e)| !base_by_id.contains_key(e["@id"].as_str().unwrap()))
+        .map(|(i, &e)| (i, e))
         .collect();
 
-    // Element records for external collection + writing.
-    let payload_value = Value::Array(
-        touched
-            .iter()
-            .filter_map(|&(_, v)| v.cloned())
-            .chain(creates.iter().map(|&(_, v)| v.clone()))
-            .collect(),
-    );
-    let payload_elems = elems_of(&payload_value, table_set(false))?;
+    // Element records for external collection + writing — views, so
+    // the records are read where they already are.
+    let payload: Vec<&Value> = touched
+        .iter()
+        .filter_map(|&(_, v)| v)
+        .chain(creates.iter().map(|&(_, v)| v))
+        .collect();
+    let payload_elems = elems_of(&payload, table_set(false))?;
     let created_ids: Vec<Uuid> = creates
         .iter()
         .map(|(_, e)| parse_uuid(e["@id"].as_str().unwrap()))
@@ -828,6 +909,7 @@ fn delta_encode(
     // the applier prove its recovered ids are exactly these.
     let elision: Option<Elision> = match elide {
         Some(external_name) => {
+            let target_canon = Value::Array(target_arr.iter().copied().cloned().collect());
             let derived =
                 sysmlv2_model::ids::derive_ids(&target_canon, external_name).map_err(Error::new)?;
             let exceptions = creates
@@ -897,7 +979,7 @@ fn delta_encode(
         let plan = if opts.portable {
             None
         } else {
-            plan_patch(&base_arr[i], target_elem)
+            plan_patch(base_arr[i], target_elem)
         };
         let mut chose_whole = true;
         let bytes = match plan {
@@ -930,7 +1012,7 @@ fn delta_encode(
         }
     }
 
-    let mut w = Writer::with_magic();
+    let mut w = Writer::with_magic_for(payload_elems.len());
     w.array(7 + usize::from(!units.is_empty()));
     let flags = FLAG_DELTA
         | crate::encode::FLAG_IMPLIED_OWNERS
@@ -1111,20 +1193,23 @@ fn apply(
     // (created table + identities) apply regardless of it.
     let (scheme, flags) = crate::decode::parse_header(r.uint()?)?;
     if flags & FLAG_DELTA == 0 {
-        return Err(Error::new("not a delta payload; decode with from_cbor"));
+        return Err(Error::of(
+            ErrorKind::WrongForm,
+            "not a delta payload; decode with from_cbor",
+        ));
     }
     let portable = flags & FLAG_DELTA_PORTABLE != 0;
     let elided = flags & crate::encode::FLAG_ELIDE_IDS != 0;
     let with_units = flags & crate::encode::FLAG_UNIT_PATHS != 0;
     let implied = flags & crate::encode::FLAG_IMPLIED_OWNERS != 0;
-    let known = FLAG_DELTA
-        | FLAG_DELTA_PORTABLE
-        | crate::encode::FLAG_ELIDE_IDS
-        | crate::encode::FLAG_UNIT_PATHS
-        | crate::encode::FLAG_IMPLIED_OWNERS;
-    if flags & !known != 0 {
-        return Err(Error::new(format!("unknown header flags {flags:#x}")));
-    }
+    gate_flags(
+        flags,
+        FLAG_DELTA
+            | FLAG_DELTA_PORTABLE
+            | crate::encode::FLAG_ELIDE_IDS
+            | crate::encode::FLAG_UNIT_PATHS
+            | crate::encode::FLAG_IMPLIED_OWNERS,
+    )?;
     let expect_arity = 6 + usize::from(implied) + usize::from(with_units);
     if arity != expect_arity {
         return Err(Error::new(format!(
@@ -1138,11 +1223,14 @@ fn apply(
         return Err(Error::new("id elision applies to strict deltas only"));
     }
     if elided && scheme != crate::ID_SCHEME_VERSION {
-        return Err(Error::new(format!(
-            "id-derivation scheme {scheme} unsupported (decoder carries {}); \
-             the delta's created ids cannot be recovered here",
-            crate::ID_SCHEME_VERSION
-        )));
+        return Err(Error::of(
+            ErrorKind::UnsupportedVersion,
+            format!(
+                "id-derivation scheme {scheme} unsupported (decoder carries {}); \
+                 the delta's created ids cannot be recovered here",
+                crate::ID_SCHEME_VERSION
+            ),
+        ));
     }
     if lenient && !portable {
         return Err(Error::new(
@@ -1152,7 +1240,8 @@ fn apply(
     }
     let resolver = if elided {
         Some(resolver.ok_or_else(|| {
-            Error::new(
+            Error::of(
+                ErrorKind::NeedsResolver,
                 "id-elided delta; apply with apply_delta_cbor_with and, for \
                  library-typed models, the library name resolver",
             )
@@ -1184,25 +1273,28 @@ fn apply(
         }
     }
 
-    let base_canon = delta_canonical(base)?;
-    let held_digest = digest_of_canonical(&base_canon)?;
+    let base_arr = canonical_views(base)?;
+    let held_digest = digest_of_canonical(&base_arr)?;
     let base_matched = held_digest == base_digest;
     if !base_matched && !lenient {
-        return Err(Error::new(
+        return Err(Error::of(
+            ErrorKind::BaseDigestMismatch,
             "held base does not match the delta's base digest — fetch the declared \
              base (see the payload's claims) or, for a portable delta, apply \
              leniently and review the report",
         ));
     }
-    let base_arr = base_canon.as_array().unwrap();
 
-    let declared_b = r.uint()? as usize;
+    let declared_b = r.index()?;
     if portable {
         if declared_b != 0 {
             return Err(Error::new("portable delta declares no base index space"));
         }
     } else if declared_b != base_arr.len() {
-        return Err(Error::new("base element count differs from the held base"));
+        return Err(Error::of(
+            ErrorKind::BaseDigestMismatch,
+            "base element count differs from the held base",
+        ));
     }
     let n_ext = r.array()?;
     let exts = read_uuid_table(&mut r, n_ext)?;
@@ -1215,28 +1307,18 @@ fn apply(
         if r.array()? != 3 {
             return Err(Error::new("elided created-id section is array(3)"));
         }
-        let n_created = r.uint()? as usize;
+        let n_created = r.index()?;
         if n_created > r.remaining() {
             return Err(Error::new("created count longer than payload"));
         }
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 18 => m,
-            Head::Map(_) => return Err(Error::new("exception map longer than payload")),
-            _ => return Err(Error::new("exception map expected")),
-        };
-        let mut prev: i64 = -1;
-        for _ in 0..m {
-            let k = r.uint()? as usize;
-            if k as i64 <= prev {
-                return Err(Error::new("exception indices not ascending"));
-            }
-            if k >= n_created {
-                return Err(Error::new("exception index out of range"));
-            }
-            prev = k as i64;
+        let entries = r.ascending_map("exception map", 18, |r| {
             let b: [u8; 16] = r.bstr(16)?.try_into().unwrap();
-            created_exceptions.insert(k, Uuid::from_bytes(b));
+            Ok(Uuid::from_bytes(b))
+        })?;
+        if entries.last().is_some_and(|&(k, _)| k >= n_created) {
+            return Err(Error::new("exception index out of range"));
         }
+        created_exceptions = entries.into_iter().collect();
         let d: [u8; 16] = r.bstr(16)?.try_into().unwrap();
         created_digest = Some(Uuid::from_bytes(d));
         (0..n_created).map(crate::decode::placeholder).collect()
@@ -1250,17 +1332,12 @@ fn apply(
         .iter()
         .map(|e| e["@id"].as_str().unwrap().to_owned())
         .collect();
-    let combined: Vec<String> = if portable {
-        created.clone()
-    } else {
-        base_ids
-            .iter()
-            .cloned()
-            .chain(created.iter().cloned())
-            .collect()
-    };
+    // Strict identities index the base then the created ids; portable
+    // ones carry base references as externals, so the base table is
+    // not part of that space.
     let tables = Tables {
-        ids: &combined,
+        ids: if portable { &[] } else { &base_ids },
+        created: &created,
         exts: &exts,
     };
     let field_tables = table_set(false);
@@ -1310,11 +1387,11 @@ fn apply(
         let identity = match r.head()? {
             Head::Null => Ident::Create,
             Head::Uint(i) if !portable => {
-                let i = i as usize;
-                if i >= base_arr.len() {
-                    return Err(Error::new(format!("change target {i} out of range")));
-                }
-                Ident::Base(i)
+                let at = usize::try_from(i)
+                    .ok()
+                    .filter(|&at| at < base_arr.len())
+                    .ok_or_else(|| Error::new(format!("change target {i} out of range")))?;
+                Ident::Base(at)
             }
             Head::Bstr(16) if portable => {
                 let u = Uuid::from_bytes(r.take(16)?.try_into().unwrap());
@@ -1352,7 +1429,7 @@ fn apply(
                 let Ident::Base(i) = identity else {
                     return Err(Error::new("patch record targets a base element"));
                 };
-                let element = read_patch(&mut r, &tables, m, &base_arr[i])?;
+                let element = read_patch(&mut r, &tables, m, base_arr[i])?;
                 replaced.insert(i, element);
             }
             Head::Array(3) => {
@@ -1420,31 +1497,19 @@ fn apply(
     // bits, only meaningful on records that shipped whole elements.
     let mut owner_bits_by_id: HashMap<String, u64> = HashMap::new();
     if implied {
-        let mut bits_by_ordinal: HashMap<usize, u64> = HashMap::new();
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 2 => m,
-            Head::Map(_) => return Err(Error::new("owner-exception map longer than payload")),
-            _ => return Err(Error::new("owner-exception map expected")),
-        };
-        let mut prev: i64 = -1;
-        for _ in 0..m {
-            let k = r.uint()? as usize;
-            if k as i64 <= prev {
-                return Err(Error::new("owner-exception indices not ascending"));
-            }
-            if k >= record_elem_ids.len() {
+        let entries = r.ascending_map("owner-exception map", 2, |r| match r.uint()? {
+            bits @ 1..=3 => Ok(bits),
+            _ => Err(Error::new("owner-exception bits out of range")),
+        })?;
+        for &(k, _) in &entries {
+            if record_elem_ids.get(k).is_none() {
                 return Err(Error::new("owner-exception index out of range"));
-            }
-            prev = k as i64;
-            let bits = r.uint()?;
-            if bits == 0 || bits > 3 {
-                return Err(Error::new("owner-exception bits out of range"));
             }
             if record_elem_ids[k].is_none() {
                 return Err(Error::new("owner-exception record did not ship an element"));
             }
-            bits_by_ordinal.insert(k, bits);
         }
+        let bits_by_ordinal: HashMap<usize, u64> = entries.into_iter().collect();
         // Later records win an id (portable replaces): iterate in
         // record order so the surviving record's bits apply.
         for (k, id) in record_elem_ids.iter().enumerate() {
@@ -1458,26 +1523,9 @@ fn apply(
     // validated against the result length once it is assembled.
     let mut units: Vec<(usize, String)> = Vec::new();
     if with_units {
-        let m = match r.head()? {
-            Head::Map(m) if m <= r.remaining() / 2 => m,
-            Head::Map(_) => return Err(Error::new("unit-path map longer than payload")),
-            _ => return Err(Error::new("unit-path map expected")),
-        };
-        let mut prev: i64 = -1;
-        for _ in 0..m {
-            let i = r.uint()? as usize;
-            if i as i64 <= prev {
-                return Err(Error::new("unit root indices not ascending"));
-            }
-            prev = i as i64;
-            let path = match r.head()? {
-                Head::Tstr(n) => r.tstr_body(n)?.to_owned(),
-                _ => return Err(Error::new("unit path is a text string")),
-            };
-            if path.is_empty() {
-                return Err(Error::new("empty unit path"));
-            }
-            units.push((i, path));
+        units = read_units(&mut r)?;
+        if units.iter().any(|(_, path)| path.is_empty()) {
+            return Err(Error::new("empty unit path"));
         }
     }
 
@@ -1486,7 +1534,7 @@ fn apply(
         if deleted.contains(&i) {
             continue;
         }
-        result.push(replaced.remove(&i).unwrap_or_else(|| e.clone()));
+        result.push(replaced.remove(&i).unwrap_or_else(|| (*e).clone()));
     }
     result.extend(appended);
     if !r.done() {
@@ -1551,7 +1599,7 @@ fn apply(
                 .collect();
         }
     }
-    let mut value = delta_canonical(&applied)?;
+    let mut value = canonical_owned(applied)?;
     if implied {
         // Re-materialize elided backpointers on the shipped records:
         // derivation runs over the canonicalized applied state — the
@@ -1596,7 +1644,7 @@ fn apply(
         }
     }
     if base_matched {
-        let got = digest_of_canonical(&value)?;
+        let got = digest_of_canonical(&views(value.as_array().unwrap()))?;
         if got != result_digest {
             return Err(Error::new(
                 "applied state does not match the delta's result digest — the \

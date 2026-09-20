@@ -1,0 +1,6327 @@
+{
+  "negative/extensions/x01-initial-state-marker.sysml": {
+    "diagnostics": [
+      {
+        "end": 193,
+        "message": "expected `;` or `{`, found `start`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 188
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/extensions/x02-choice-pseudostate.sysml": {
+    "diagnostics": [
+      {
+        "end": 214,
+        "message": "expected `;` or `{`, found `evaluate`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 206
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/extensions/x03-junction-pseudostate.sysml": {
+    "diagnostics": [
+      {
+        "end": 222,
+        "message": "expected `;` or `{`, found `route`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 217
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/extensions/x04-orthogonal-region.sysml": {
+    "diagnostics": [
+      {
+        "end": 200,
+        "message": "expected `;` or `{`, found `r1`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 198
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/extensions/x05-defer-member.sysml": {
+    "diagnostics": [
+      {
+        "end": 209,
+        "message": "expected `;` or `{`, found `Ping`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 205
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/extensions/x06-history-member.sysml": {
+    "diagnostics": [
+      {
+        "end": 217,
+        "message": "expected `;` or `{`, found `resume`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 211
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/extensions/x07-transition-to.sysml": {
+    "diagnostics": [
+      {
+        "end": 212,
+        "message": "expected `then`, found `to`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 210
+      },
+      {
+        "end": 212,
+        "message": "expected a name, found `to`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 210
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/extensions/x08-require-outside-requirement-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 356,
+        "message": "a `require` constraint member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 329
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g01-unclosed-package-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 123,
+        "message": "expected `}` closing package body, found `end of input`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 123
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g02-import-without-visibility.sysml": {
+    "diagnostics": [
+      {
+        "end": 204,
+        "message": "an import must declare an explicit visibility (`public`, `private`, or `protected`)",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 192
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g03-alias-without-for.sysml": {
+    "diagnostics": [
+      {
+        "end": 144,
+        "message": "expected `for`, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 143
+      },
+      {
+        "end": 144,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 143
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g04-specialization-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 171,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 170
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g05-typing-without-type.sysml": {
+    "diagnostics": [
+      {
+        "end": 144,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 143
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g06-definition-with-multiplicity.sysml": {
+    "diagnostics": [
+      {
+        "end": 188,
+        "message": "expected `;` or `{`, found `[`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 187
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g07-entry-outside-state-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 231,
+        "message": "an `entry` action member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 223
+      },
+      {
+        "end": 230,
+        "message": "unresolved reference `a`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 229
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g08-do-outside-state-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 219,
+        "message": "a `do` action member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 214
+      },
+      {
+        "end": 218,
+        "message": "unresolved reference `a`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 217
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g09-value-without-expression.sysml": {
+    "diagnostics": [
+      {
+        "end": 151,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 151
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g10-operator-without-operand.sysml": {
+    "diagnostics": [
+      {
+        "end": 170,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 170
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g11-assignment-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 178,
+        "message": "expected `:=` in assignment, found `}`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 177
+      },
+      {
+        "end": 178,
+        "message": "expected an expression, found `}`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g12-unterminated-block-comment.sysml": {
+    "diagnostics": [
+      {
+        "end": 158,
+        "message": "unterminated comment (missing `*/`)",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 140
+      },
+      {
+        "end": 158,
+        "message": "expected `}` closing package body, found `end of input`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 158
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g13-entry-then-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 179,
+        "message": "expected a name, found `then`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 175
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g14-connect-without-to.sysml": {
+    "diagnostics": [
+      {
+        "end": 200,
+        "message": "expected `to`, found `b`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 199
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g15-keyword-as-name.sysml": {
+    "diagnostics": [
+      {
+        "end": 144,
+        "message": "expected `;` or `{`, found `part`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 140
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g16-expose-without-name.sysml": {
+    "diagnostics": [
+      {
+        "end": 222,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 221
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g17-render-without-usage.sysml": {
+    "diagnostics": [
+      {
+        "end": 189,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 188
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g18-require-without-constraint.sysml": {
+    "diagnostics": [
+      {
+        "end": 221,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 220
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g19-frame-without-concern.sysml": {
+    "diagnostics": [
+      {
+        "end": 193,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 192
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g20-include-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 215,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 214
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g21-filter-without-expression.sysml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "missing `;` after filter expression",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 182
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g22-dependency-without-to.sysml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "expected `to`, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 181
+      },
+      {
+        "end": 182,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 181
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g23-rep-without-language.sysml": {
+    "diagnostics": [
+      {
+        "end": 188,
+        "message": "expected `language`, found `/* self.x > 0 */`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 172
+      },
+      {
+        "end": 188,
+        "message": "expected a language string, found `/* self.x > 0 */`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 172
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g24-alias-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 160,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 159
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g25-library-without-package.sysml": {
+    "diagnostics": [
+      {
+        "end": 127,
+        "message": "expected `package`, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 126
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g26-multiplicity-open-range.sysml": {
+    "diagnostics": [
+      {
+        "end": 175,
+        "message": "expected a multiplicity bound (literal or feature name), found `]`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 174
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g27-bind-without-right-end.sysml": {
+    "diagnostics": [
+      {
+        "end": 234,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 233
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g28-succession-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 234,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 233
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g29-flow-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 234,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 233
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g30-message-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 230,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 229
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g31-allocate-without-to.sysml": {
+    "diagnostics": [
+      {
+        "end": 248,
+        "message": "expected `to`, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 247
+      },
+      {
+        "end": 248,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 247
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g32-if-without-condition.sysml": {
+    "diagnostics": [
+      {
+        "end": 159,
+        "message": "expected `{`, found `}`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 158
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g33-while-without-condition.sysml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "expected `{`, found `}`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 181
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g34-for-without-in.sysml": {
+    "diagnostics": [
+      {
+        "end": 158,
+        "message": "expected `in`, found `{`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 157
+      },
+      {
+        "end": 166,
+        "message": "expected `{`, found `}`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 165
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g35-accept-without-payload.sysml": {
+    "diagnostics": [
+      {
+        "end": 194,
+        "message": "a payload requires a type, specialization, or value",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 193
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g36-direction-without-feature.sysml": {
+    "diagnostics": [
+      {
+        "end": 177,
+        "message": "expected a definition or usage after prefix, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 176
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g37-redefines-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 249,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 248
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g38-references-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 193,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 192
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g39-redefinition-symbol-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 230,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 229
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g40-modulo-without-operand.sysml": {
+    "diagnostics": [
+      {
+        "end": 173,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 173
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g41-exponent-without-operand.sysml": {
+    "diagnostics": [
+      {
+        "end": 177,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g42-implies-without-operand.sysml": {
+    "diagnostics": [
+      {
+        "end": 169,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 169
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g43-null-coalescing-without-operand.sysml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 182
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g44-conditional-without-else.sysml": {
+    "diagnostics": [
+      {
+        "end": 177,
+        "message": "expected `else`, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 176
+      },
+      {
+        "end": 177,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g45-classification-test-without-type.sysml": {
+    "diagnostics": [
+      {
+        "end": 191,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 190
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g46-cast-without-type.sysml": {
+    "diagnostics": [
+      {
+        "end": 140,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 139
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g47-prefix-metadata-without-name.sysml": {
+    "diagnostics": [
+      {
+        "end": 166,
+        "message": "expected a name, found `part`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 162
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g48-decision-without-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 172,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 172
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g49-assign-without-value.sysml": {
+    "diagnostics": [
+      {
+        "end": 220,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 220
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g50-conjugated-port-typing-without-name.sysml": {
+    "diagnostics": [
+      {
+        "end": 208,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 207
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g51-real-without-fraction.sysml": {
+    "diagnostics": [
+      {
+        "end": 168,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 168
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g52-unterminated-string.sysml": {
+    "diagnostics": [
+      {
+        "end": 146,
+        "message": "unterminated string literal",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 138
+      },
+      {
+        "end": 146,
+        "message": "expected `}` closing package body, found `end of input`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 146
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g53-range-without-upper-bound.sysml": {
+    "diagnostics": [
+      {
+        "end": 169,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 169
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g54-argument-list-trailing-comma.sysml": {
+    "diagnostics": [
+      {
+        "end": 220,
+        "message": "expected an expression, found `)`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 219
+      },
+      {
+        "end": 220,
+        "message": "expected `;` or `{`, found `)`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 219
+      },
+      {
+        "end": 220,
+        "message": "unsupported or unexpected construct at `)`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 219
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g55-feature-chain-trailing-dot.sysml": {
+    "diagnostics": [
+      {
+        "end": 218,
+        "message": "missing `;` at end of declaration",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 218
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g56-qualified-name-trailing-separator.sysml": {
+    "diagnostics": [
+      {
+        "end": 174,
+        "message": "expected `;` or `{`, found `::`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 172
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g57-unterminated-unrestricted-name.sysml": {
+    "diagnostics": [
+      {
+        "end": 163,
+        "message": "unterminated unrestricted name",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 157
+      },
+      {
+        "end": 163,
+        "message": "expected `}` closing package body, found `end of input`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 163
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g58-satisfy-without-reference.sysml": {
+    "diagnostics": [
+      {
+        "end": 227,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 226
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g59-crosses-without-target.sysml": {
+    "diagnostics": [
+      {
+        "end": 203,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 202
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g60-alias-keyword-as-name.sysml": {
+    "diagnostics": [
+      {
+        "end": 202,
+        "message": "expected `for`, found `part`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 198
+      },
+      {
+        "end": 202,
+        "message": "expected a name, found `part`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 198
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g61-actor-outside-requirement-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 313,
+        "message": "an `actor` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 289
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g62-subject-outside-requirement-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 320,
+        "message": "validateSubjectMembershipOwningType: a `subject` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 300
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g63-objective-outside-case-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 299,
+        "message": "validateObjectiveMembershipOwningType: an `objective` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 280
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g64-stakeholder-outside-requirement-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 333,
+        "message": "a `stakeholder` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 306
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g65-entry-action-outside-state-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 268,
+        "message": "an `entry` action member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 250
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g66-render-outside-view-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 312,
+        "message": "a `render` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 285
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g67-expose-outside-view-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 259,
+        "message": "an `expose` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 244
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g68-definition-in-enumeration-body.sysml": {
+    "diagnostics": [
+      {
+        "end": 233,
+        "message": "a `attribute` definition is not allowed in an enumeration definition body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 212
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g69-calc-body-second-result-expression.sysml": {
+    "diagnostics": [
+      {
+        "end": 333,
+        "message": "expected `;` or `{`, found `+`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 332
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/g70-name-before-usage-keyword.sysml": {
+    "diagnostics": [
+      {
+        "end": 286,
+        "message": "expected `;` or `{`, found `attribute`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 277
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k01-specializes-without-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 178,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k02-sysml-keyword-in-kerml.kerml": {
+    "diagnostics": [
+      {
+        "end": 158,
+        "message": "expected `;` or `{`, found `def`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 155
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k03-feature-typing-without-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 167,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 166
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k04-dangling-visibility.kerml": {
+    "diagnostics": [
+      {
+        "end": 153,
+        "message": "unsupported or unexpected construct at `}`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 152
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k05-unclosed-body.kerml": {
+    "diagnostics": [
+      {
+        "end": 111,
+        "message": "expected `}` closing body, found `end of input`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 111
+      },
+      {
+        "end": 111,
+        "message": "expected `}` closing package body, found `end of input`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 111
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k06-disjoining-without-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 151,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 150
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k07-conjugation-without-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 160,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 159
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k08-return-without-feature.kerml": {
+    "diagnostics": [
+      {
+        "end": 139,
+        "message": "unsupported or unexpected construct at `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 138
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k09-inverting-without-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 157,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 156
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k10-featuring-without-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 141,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 140
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k11-namespace-prefix-metadata-without-name.kerml": {
+    "diagnostics": [
+      {
+        "end": 133,
+        "message": "expected a name, found `namespace`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 124
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k12-multiplicity-subset-without-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 161,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 160
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k13-step-without-declaration.kerml": {
+    "diagnostics": [
+      {
+        "end": 133,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 132
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k14-flow-without-payload-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 138,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 137
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k15-conjugation-without-original.kerml": {
+    "diagnostics": [
+      {
+        "end": 147,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 146
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k16-redefinition-without-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 162,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 161
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k17-unions-without-target.kerml": {
+    "diagnostics": [
+      {
+        "end": 156,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 155
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k18-connector-end-without-reference.kerml": {
+    "diagnostics": [
+      {
+        "end": 223,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 222
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k19-metadata-typing-without-name.kerml": {
+    "diagnostics": [
+      {
+        "end": 154,
+        "message": "expected a name, found `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 153
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k20-function-body-second-result-expression.kerml": {
+    "diagnostics": [
+      {
+        "end": 330,
+        "message": "expected `;` or `{`, found `+`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 329
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/grammar/k21-name-before-feature-keyword.kerml": {
+    "diagnostics": [
+      {
+        "end": 265,
+        "message": "expected `;` or `{`, found `feature`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 258
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn01-fork-two-incoming.sysml": {
+    "diagnostics": [
+      {
+        "end": 295,
+        "message": "Control node has too many incoming successions [validateForkNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 294
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn02-join-two-outgoing.sysml": {
+    "diagnostics": [
+      {
+        "end": 296,
+        "message": "Control node has too many outgoing successions [validateJoinNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 295
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn03-merge-two-outgoing.sysml": {
+    "diagnostics": [
+      {
+        "end": 300,
+        "message": "Control node has too many outgoing successions [validateMergeNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 299
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn04-decide-two-incoming.sysml": {
+    "diagnostics": [
+      {
+        "end": 276,
+        "message": "unresolved reference `ScalarValues::Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 255
+      },
+      {
+        "end": 330,
+        "message": "unresolved reference `Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 323
+      },
+      {
+        "end": 384,
+        "message": "Control node has too many incoming successions [validateDecisionNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 383
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn05-control-node-outside-action.sysml": {
+    "diagnostics": [
+      {
+        "end": 215,
+        "message": "A control node must be owned by an action [validateControlNodeOwningType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 214
+      },
+      {
+        "end": 283,
+        "message": "A control node must be owned by an action [validateControlNodeOwningType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 282
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn06-fork-incoming-target-multiplicity.sysml": {
+    "diagnostics": [
+      {
+        "end": 393,
+        "message": "Succession end must have multiplicity 1..1 [validateControlNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 360
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn07-join-outgoing-source-multiplicity.sysml": {
+    "diagnostics": [
+      {
+        "end": 443,
+        "message": "Succession end must have multiplicity 1..1 [validateControlNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 410
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn08-merge-incoming-source-multiplicity.sysml": {
+    "diagnostics": [
+      {
+        "end": 389,
+        "message": "Succession end must have multiplicity 0..1 [validateMergeNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 359
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/cn09-decide-outgoing-target-multiplicity.sysml": {
+    "diagnostics": [
+      {
+        "end": 422,
+        "message": "Succession end must have multiplicity 0..1 [validateDecisionNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 392
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k01-two-owned-multiplicities.kerml": {
+    "diagnostics": [
+      {
+        "end": 183,
+        "message": "Only one multiplicity is allowed [validateTypeOwnedMultiplicity]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 182
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k02-differences-one-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 202,
+        "message": "A type operation must have zero or at least two operands [validateOwnedDifferencingNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 201
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k03-intersects-one-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 200,
+        "message": "A type operation must have zero or at least two operands [validateOwnedIntersectingNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 199
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k04-unions-one-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 184,
+        "message": "A type operation must have zero or at least two operands [validateOwnedUnioningNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 183
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k05-differences-self.kerml": {
+    "diagnostics": [
+      {
+        "end": 200,
+        "message": "A type operation cannot name its own type as an operand [validateTypeDifferencingTypesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 199
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k06-intersects-self.kerml": {
+    "diagnostics": [
+      {
+        "end": 198,
+        "message": "A type operation cannot name its own type as an operand [validateTypeIntersectingTypesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 197
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k07-unions-self.kerml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "A type operation cannot name its own type as an operand [validateTypeUnioningTypesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 181
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k08-conjugated-type-specialized.kerml": {
+    "diagnostics": [
+      {
+        "end": 279,
+        "message": "A conjugated type cannot be the specific type of a specialization [validateSpecializationSpecificNotConjugated]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 278
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k09-two-reference-subsettings.kerml": {
+    "diagnostics": [
+      {
+        "end": 281,
+        "message": "At most one relationship of this kind is allowed [validateFeatureOwnedReferenceSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 280
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k10-portion-var-feature.kerml": {
+    "diagnostics": [
+      {
+        "end": 219,
+        "message": "unresolved reference `Occurrences::Occurrence`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 196
+      },
+      {
+        "end": 251,
+        "message": "A portion cannot be variable [validateFeaturePortionNotVariable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 250
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k11-initial-value-nonvariable.kerml": {
+    "diagnostics": [
+      {
+        "end": 214,
+        "message": "An initialized feature must be variable [validateFeatureValueIsInitial]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 213
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k12-chain-through-self.kerml": {
+    "diagnostics": [
+      {
+        "end": 248,
+        "message": "A feature cannot chain through itself [validateFeatureChainingFeaturesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 247
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k13-subsets-inaccessible-feature.kerml": {
+    "diagnostics": [
+      {
+        "end": 300,
+        "message": "A subsetted feature must be accessible in the subsetting feature's context [validateSubsettingFeaturingTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 296
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k14-variable-subsets-constant.kerml": {
+    "diagnostics": [
+      {
+        "end": 266,
+        "message": "unresolved reference `Occurrences::Occurrence`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 243
+      },
+      {
+        "end": 333,
+        "message": "A variable subset of a constant feature must be constant [validateSubsettingConstantConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 332
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k15-nonend-redefines-end.kerml": {
+    "diagnostics": [
+      {
+        "end": 352,
+        "message": "A feature redefining an end must itself be an end [validateRedefinitionEndConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 351
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k16-crosses-from-nonend.kerml": {
+    "diagnostics": [
+      {
+        "end": 282,
+        "message": "A crossing feature must be an end of a type with at least two ends [validateCrossSubsettingCrossingFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 281
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k17-crosses-not-through-opposite-end.kerml": {
+    "diagnostics": [
+      {
+        "end": 275,
+        "message": "A cross subsetting must chain through an opposite end to a feature [validateCrossSubsettingCrossedFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 274
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k18-cross-feature-type-differs.kerml": {
+    "diagnostics": [
+      {
+        "end": 298,
+        "message": "A cross feature must have the same types as its end feature [validateFeatureCrossFeatureType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 297
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k19-cross-feature-not-specializing.kerml": {
+    "diagnostics": [
+      {
+        "end": 440,
+        "message": "A cross feature must specialize the cross feature of the redefined end [validateFeatureCrossFeatureSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 438
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k20-datatype-specializes-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 217,
+        "message": "A data type cannot specialize a class or association [validateDataTypeSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 216
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k21-class-specializes-datatype.kerml": {
+    "diagnostics": [
+      {
+        "end": 211,
+        "message": "A class cannot specialize a data type or an unrelated association family [validateClassSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 210
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k22-struct-specializes-behavior.kerml": {
+    "diagnostics": [
+      {
+        "end": 224,
+        "message": "A structure cannot specialize a behavior [validateStructureSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 223
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k23-behavior-specializes-struct.kerml": {
+    "diagnostics": [
+      {
+        "end": 220,
+        "message": "A behavior cannot specialize a structure [validateBehaviorSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 219
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k24-binary-assoc-three-ends.kerml": {
+    "diagnostics": [
+      {
+        "end": 274,
+        "message": "unresolved reference `Links::BinaryLink`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 257
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/semantic/k25-assoc-one-end.kerml": {
+    "diagnostics": [
+      {
+        "end": 209,
+        "message": "An association must have at least two related types [validateAssociationRelatedTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 208
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k26-binary-connector-three-ends.kerml": {
+    "diagnostics": [
+      {
+        "end": 335,
+        "message": "unresolved reference `Links::BinaryLink`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 318
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/semantic/k27-connector-feature-outside-featuring-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 379,
+        "message": "A bound feature reference must be accessible in the binding's context [validateConnectorTypeFeaturing]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 375
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k28-expr-two-return-parameters.kerml": {
+    "diagnostics": [
+      {
+        "end": 235,
+        "message": "Only one return parameter is allowed [validateExpressionResultParameterMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 234
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k29-function-inherits-second-result-expression.kerml": {
+    "diagnostics": [
+      {
+        "end": 326,
+        "message": "Only one owned or inherited result expression is allowed [validateFunctionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 325
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k30-expr-inherits-second-result-expression.kerml": {
+    "diagnostics": [
+      {
+        "end": 321,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 320
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k31-invoke-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 257,
+        "message": "An invocation must invoke a behavior or behavioral feature [validateInvocationExpressionInstantiatedType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 254
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k32-too-many-arguments.kerml": {
+    "diagnostics": [
+      {
+        "end": 353,
+        "message": "invocation of `F` supplies 2 arguments for 1 parameter(s)",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 346
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k33-parameter-bound-twice.kerml": {
+    "diagnostics": [
+      {
+        "end": 351,
+        "message": "invocation of `F` binds parameter `x` more than once",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 350
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k34-constructor-feature-bound-twice.kerml": {
+    "diagnostics": [
+      {
+        "end": 360,
+        "message": "A constructor cannot bind a feature more than once [validateConstructorExpressionNoDuplicateFeatureRedefinition]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 341
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k35-metadata-annotates-wrong-kind.kerml": {
+    "diagnostics": [
+      {
+        "end": 292,
+        "message": "unresolved reference `annotatedElement`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 276
+      },
+      {
+        "end": 307,
+        "message": "unresolved reference `KerML::Class`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 295
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/semantic/k36-metadata-body-redefines-outside.kerml": {
+    "diagnostics": [
+      {
+        "end": 280,
+        "message": "A metadata body feature must redefine one feature of its metadata type [validateMetadataFeatureBody]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 274
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k37-multiplicity-bound-not-natural.kerml": {
+    "diagnostics": [
+      {
+        "end": 259,
+        "message": "A multiplicity bound must have a Natural result [validateMultiplicityRangeResultTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 258
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k38-flow-end-without-dot-notation.kerml": {
+    "diagnostics": [
+      {
+        "end": 293,
+        "message": "A flow end must identify a participant's payload feature using dot notation [validateFlowEndSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 276
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k39-feature-reference-to-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 266,
+        "message": "A feature reference expression must name a feature [validateFeatureReferenceExpressionReferentIsFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 265
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k40-metadata-typed-by-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 404,
+        "message": "metadata must be typed by a metadata definition or metaclass; `M` is a Class",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 403
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k41-chain-expression-to-nested-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 335,
+        "message": "A feature-chain expression must select a feature [validateFeatureChainExpressionFeatureConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 332
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k42-two-cross-subsettings.kerml": {
+    "diagnostics": [
+      {
+        "end": 300,
+        "message": "At most one relationship of this kind is allowed [validateFeatureOwnedCrossSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 299
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k43-expr-typed-by-function-states-second-result-expression.kerml": {
+    "diagnostics": [
+      {
+        "end": 356,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 355
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k44-expr-referencing-expr-states-second-result-expression.kerml": {
+    "diagnostics": [
+      {
+        "end": 373,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 372
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k45-conjugated-feature-without-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 293,
+        "message": "Conjugating a classifier does not provide a feature type [validateFeatureHasType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 292
+      },
+      {
+        "end": 322,
+        "message": "Conjugating a classifier does not provide a feature type [validateFeatureHasType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 321
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k46-conjugated-structure-not-an-object.kerml": {
+    "diagnostics": [
+      {
+        "end": 342,
+        "message": "A structure must directly or indirectly specialize Objects::Object [validateClassifierDefaultSupertype]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 341
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k47-feature-chain-through-alias-to-another-type.kerml": {
+    "diagnostics": [
+      {
+        "end": 467,
+        "message": "Each chain member must be a feature accessible through the preceding feature [validateFeatureChainingFeatureConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 465
+      },
+      {
+        "end": 502,
+        "message": "Each chain member must be a feature accessible through the preceding feature [validateFeatureChainingFeatureConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 500
+      },
+      {
+        "end": 533,
+        "message": "Each chain member must be a feature accessible through the preceding feature [validateFeatureChainingFeatureConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 531
+      },
+      {
+        "end": 561,
+        "message": "Each chain member must be a feature accessible through the preceding feature [validateFeatureChainingFeatureConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 560
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k48-annotating-element-annotates-itself.kerml": {
+    "diagnostics": [],
+    "status": "unknown without library"
+  },
+  "negative/semantic/k49-binding-connector-with-three-ends.kerml": {
+    "diagnostics": [
+      {
+        "end": 323,
+        "message": "A binding connector must have exactly two ends [validateBindingConnectorIsBinary]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 322
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k50-inline-cross-feature-also-crosses.kerml": {
+    "diagnostics": [
+      {
+        "end": 379,
+        "message": "An end cannot declare both an inline cross feature and a cross subsetting [feature-cross-feature-single]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 378
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k51-return-parameter-in-classifier.kerml": {
+    "diagnostics": [
+      {
+        "end": 311,
+        "message": "a `return` parameter member is not allowed in a type body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 290
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k52-two-conjugators.kerml": {
+    "diagnostics": [
+      {
+        "end": 224,
+        "message": "expected `;` or `{`, found `~`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 223
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k53-boolean-expression-subsets-datatype.kerml": {
+    "diagnostics": [
+      {
+        "end": 475,
+        "message": "Subsetting::subsettedFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 474
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k54-cross-feature-typed-narrower-than-end.kerml": {
+    "diagnostics": [
+      {
+        "end": 382,
+        "message": "An inline cross feature must have the same types as its end feature [validateFeatureCrossFeatureType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 381
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k55-subtype-specific-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 374,
+        "message": "Specialization::specific must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 344
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k56-subtype-general-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 321,
+        "message": "Specialization::general must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 297
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k57-subclassifier-subclassifier-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 356,
+        "message": "Subclassification::subclassifier must refer to a Classifier [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 335
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k58-subclassifier-superclassifier-is-feature.kerml": {
+    "diagnostics": [
+      {
+        "end": 426,
+        "message": "Subclassification::superclassifier must refer to a Classifier [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 381
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k59-typing-typed-feature-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 326,
+        "message": "FeatureTyping::typedFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 313
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k60-typing-typed-feature-is-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 327,
+        "message": "FeatureTyping::typedFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 307
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k61-typing-type-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 315,
+        "message": "FeatureTyping::type must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 287
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k62-subset-subsetting-feature-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 334,
+        "message": "Subsetting::subsettingFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 320
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k63-subset-subsetted-feature-is-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 345,
+        "message": "Subsetting::subsettedFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 311
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k64-redefinition-redefining-feature-is-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 356,
+        "message": "Redefinition::redefiningFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 332
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k65-redefinition-redefined-feature-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 380,
+        "message": "Redefinition::redefinedFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 335
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k66-conjugate-conjugated-type-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 319,
+        "message": "Conjugation::conjugatedType must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 303
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k67-conjugate-original-type-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 334,
+        "message": "Conjugation::originalType must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 297
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k68-inverse-feature-inverted-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 348,
+        "message": "FeatureInverting::featureInverted must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 333
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k69-inverse-inverting-feature-is-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 355,
+        "message": "FeatureInverting::invertingFeature must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 330
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k70-disjoint-type-disjoined-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 315,
+        "message": "Disjoining::typeDisjoined must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 297
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k71-disjoint-disjoining-type-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 329,
+        "message": "Disjoining::disjoiningType must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 300
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k72-featuring-feature-of-type-is-class.kerml": {
+    "diagnostics": [
+      {
+        "end": 315,
+        "message": "TypeFeaturing::featureOfType must refer to a Feature [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 298
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/k73-featuring-featuring-type-is-package.kerml": {
+    "diagnostics": [
+      {
+        "end": 312,
+        "message": "TypeFeaturing::featuringType must refer to a Type [relationship-endpoint-metaclass]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 295
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s01-action-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 179,
+        "message": "ActionUsage must be typed by Behavior; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s02-allocation-typed-by-connection-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 319,
+        "message": "AllocationUsage must be typed by AllocationDefinition; the declared type is a ConnectionDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 317
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s03-analysis-typed-by-case-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 213,
+        "message": "AnalysisCaseUsage must be typed by AnalysisCaseDefinition; the declared type is a CaseDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 211
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s04-assert-references-non-constraint.sysml": {
+    "diagnostics": [
+      {
+        "end": 255,
+        "message": "AssertConstraintUsage must reference a ConstraintUsage [validateAssertConstraintUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 246
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s05-assign-to-package-level-attribute.sysml": {
+    "diagnostics": [
+      {
+        "end": 218,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 197
+      },
+      {
+        "end": 251,
+        "message": "An assignment referent must be time varying [validateAssignmentActionUsageReferentIsTimeVarying]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 250
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s06-enum-attribute-two-types.sysml": {
+    "diagnostics": [
+      {
+        "end": 242,
+        "message": "AttributeUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 241
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s07-calc-typed-by-action-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 201,
+        "message": "CalculationUsage must be typed by Function; the declared type is a ActionDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 199
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s08-case-def-two-objectives.sysml": {
+    "diagnostics": [
+      {
+        "end": 253,
+        "message": "validateCaseDefinitionOnlyOneObjective: a case may own at most one objective",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 236
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s09-case-def-two-subjects.sysml": {
+    "diagnostics": [
+      {
+        "end": 236,
+        "message": "validateCaseDefinitionOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 221
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s10-case-def-subject-not-first.sysml": {
+    "diagnostics": [
+      {
+        "end": 257,
+        "message": "validateCaseDefinitionSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 243
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s11-case-two-objectives.sysml": {
+    "diagnostics": [
+      {
+        "end": 235,
+        "message": "validateCaseUsageOnlyOneObjective: a case may own at most one objective",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 218
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s12-case-two-subjects.sysml": {
+    "diagnostics": [
+      {
+        "end": 218,
+        "message": "validateCaseUsageOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 203
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s13-case-subject-not-first.sysml": {
+    "diagnostics": [
+      {
+        "end": 239,
+        "message": "validateCaseUsageSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 225
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s14-case-typed-by-action-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 173,
+        "message": "CaseUsage must be typed by CaseDefinition; the declared type is a ActionDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 171
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s15-connection-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 305,
+        "message": "ConnectionUsage must be typed by AssociationStructure; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 303
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s16-event-references-non-occurrence.sysml": {
+    "diagnostics": [
+      {
+        "end": 244,
+        "message": "EventOccurrenceUsage must reference a OccurrenceUsage [validateEventOccurrenceUsageReferent]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 236
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s17-exhibit-references-non-state.sysml": {
+    "diagnostics": [
+      {
+        "end": 231,
+        "message": "ExhibitStateUsage must reference a StateUsage [validateExhibitStateUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 221
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s18-flow-def-three-ends.sysml": {
+    "diagnostics": [
+      {
+        "end": 272,
+        "message": "validateFlowDefinitionFlowEnds: a flow definition may not have more than two flow ends",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 257
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s19-flow-typed-by-connection-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 404,
+        "message": "FlowUsage must be typed by Interaction; the declared type is a ConnectionDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 402
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s20-include-references-non-use-case.sysml": {
+    "diagnostics": [
+      {
+        "end": 257,
+        "message": "IncludeUseCaseUsage must reference a UseCaseUsage [validateIncludeUseCaseUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 247
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s21-interface-def-end-not-port.sysml": {
+    "diagnostics": [
+      {
+        "end": 228,
+        "message": "An interface end must be a port [validateInterfaceDefinitionEnd]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 227
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s22-interface-typed-by-connection-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 344,
+        "message": "InterfaceUsage must be typed by InterfaceDefinition; the declared type is a ConnectionDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 342
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s23-metadata-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 203,
+        "message": "metadata must be typed by a metadata definition or metaclass; `PD` is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 201
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s24-perform-references-non-action.sysml": {
+    "diagnostics": [
+      {
+        "end": 237,
+        "message": "PerformActionUsage must reference a ActionUsage [validatePerformActionUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 227
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s25-port-nested-composite-part.sysml": {
+    "diagnostics": [
+      {
+        "end": 274,
+        "message": "A non-port usage owned by a port must be referential [validatePortUsageNestedUsagesNotComposite]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 273
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s26-port-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 184,
+        "message": "PortUsage must be typed by PortDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 182
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s27-rendering-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 209,
+        "message": "RenderingUsage must be typed by RenderingDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 207
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s28-requirement-def-subject-not-first.sysml": {
+    "diagnostics": [
+      {
+        "end": 291,
+        "message": "validateRequirementDefinitionSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 277
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s29-requirement-two-subjects.sysml": {
+    "diagnostics": [
+      {
+        "end": 253,
+        "message": "validateRequirementUsageOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 238
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s30-requirement-subject-not-first.sysml": {
+    "diagnostics": [
+      {
+        "end": 274,
+        "message": "validateRequirementUsageSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 260
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s31-requirement-typed-by-constraint-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 221,
+        "message": "RequirementUsage must be typed by RequirementDefinition; the declared type is a ConstraintDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 220
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s32-satisfy-references-non-requirement.sysml": {
+    "diagnostics": [
+      {
+        "end": 244,
+        "message": "SatisfyRequirementUsage must reference a RequirementUsage [validateSatisfyRequirementUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 234
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s33-parallel-state-usage-with-succession.sysml": {
+    "diagnostics": [
+      {
+        "end": 196,
+        "message": "A parallel state cannot own successions or transitions [validateStateUsageParallelSubactions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 195
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s34-state-usage-two-entry-actions.sysml": {
+    "diagnostics": [
+      {
+        "end": 170,
+        "message": "A state may have at most one subaction of each kind [validateStateUsageSubactionKind]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 169
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s35-state-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 172,
+        "message": "StateUsage must be typed by StateDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 170
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s36-usage-typed-by-feature.sysml": {
+    "diagnostics": [
+      {
+        "end": 165,
+        "message": "unresolved reference `Base::things`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 153
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/semantic/s37-variation-usage-member-not-variant.sysml": {
+    "diagnostics": [
+      {
+        "end": 275,
+        "message": "A usage owned by a variation must be a variant [validateUsageVariationMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 274
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s38-use-case-typed-by-case-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 192,
+        "message": "UseCaseUsage must be typed by UseCaseDefinition; the declared type is a CaseDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 190
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s39-verification-typed-by-case-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 236,
+        "message": "VerificationCaseUsage must be typed by VerificationCaseDefinition; the declared type is a CaseDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 234
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s40-view-def-two-renderings.sysml": {
+    "diagnostics": [
+      {
+        "end": 221,
+        "message": "A view may have at most one rendering [validateViewDefinitionOnlyOnvViewRendering]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 220
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s41-view-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 184,
+        "message": "ViewUsage must be typed by ViewDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 182
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s42-viewpoint-typed-by-requirement-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 224,
+        "message": "ViewpointUsage must be typed by ViewpointDefinition; the declared type is a RequirementDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 222
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s43-assign-to-non-feature.sysml": {
+    "diagnostics": [
+      {
+        "end": 210,
+        "message": "A feature reference expression must name a feature [validateFeatureReferenceExpressionReferentIsFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 208
+      },
+      {
+        "end": 210,
+        "message": "An assignment must refer to a feature [validateAssignmentActionUsageReferent]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 208
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s44-transition-target-not-action.sysml": {
+    "diagnostics": [
+      {
+        "end": 292,
+        "message": "A transition's succession must target an action usage [validateTransitionUsageSuccession]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 265
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s45-snapshot-outside-occurrence.sysml": {
+    "diagnostics": [
+      {
+        "end": 241,
+        "message": "A snapshot or timeslice must be owned by an occurrence definition or usage [validateOccurrenceUsageIsPortion]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 240
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s46-feature-value-overriding.sysml": {
+    "diagnostics": [
+      {
+        "end": 270,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 249
+      },
+      {
+        "end": 318,
+        "message": "unresolved reference `Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 311
+      },
+      {
+        "end": 374,
+        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 373
+      },
+      {
+        "end": 431,
+        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 430
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s47-enumeration-specializes-enumeration.sysml": {
+    "diagnostics": [
+      {
+        "end": 374,
+        "message": "A variation cannot specialize another variation [validateDefinitionVariationSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 373
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s48-after-trigger-not-duration.sysml": {
+    "diagnostics": [
+      {
+        "end": 295,
+        "message": "A 'after' trigger argument must conform to ISQ::DurationValue [validateTriggerInvocationActionAfterArgument]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 294
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s49-at-trigger-not-time-instant.sysml": {
+    "diagnostics": [
+      {
+        "end": 221,
+        "message": "unresolved reference `ISQ`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 218
+      },
+      {
+        "end": 247,
+        "message": "unresolved reference `SI`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 245
+      },
+      {
+        "end": 309,
+        "message": "unresolved reference `DurationValue`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 296
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/semantic/s50-when-trigger-not-boolean.sysml": {
+    "diagnostics": [
+      {
+        "end": 220,
+        "message": "unresolved reference `ScalarValues`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 208
+      },
+      {
+        "end": 276,
+        "message": "unresolved reference `Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 269
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/semantic/s51-enum-value-body-typed-outside-enumeration.sysml": {
+    "diagnostics": [
+      {
+        "end": 351,
+        "message": "An expression body is not a value of the owning enumeration [validateEnumerationUsageType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 342
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s52-variant-port-composite.sysml": {
+    "diagnostics": [
+      {
+        "end": 319,
+        "message": "A port nested in a port must be referential [validatePortUsageIsReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 318
+      },
+      {
+        "end": 449,
+        "message": "A port nested in a port must be referential [validatePortUsageIsReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 448
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s80-constant-attribute-not-variable.sysml": {
+    "diagnostics": [
+      {
+        "end": 306,
+        "message": "Only a variable feature can be constant [validateFeatureConstantIsVariable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 305
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s81-guarded-succession-guard-not-boolean.sysml": {
+    "diagnostics": [
+      {
+        "end": 390,
+        "message": "A transition guard must have a Boolean result with multiplicity 1..1 [validateTransitionFeatureMembershipGuardExpression]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 386
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s82-constraint-specialization-states-second-result-expression.sysml": {
+    "diagnostics": [
+      {
+        "end": 319,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 301
+      },
+      {
+        "end": 358,
+        "message": "unresolved reference `Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 354
+      },
+      {
+        "end": 392,
+        "message": "Only one owned or inherited result expression is allowed [validateFunctionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 389
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s83-redefined-constraint-usage-states-second-result-expression.sysml": {
+    "diagnostics": [
+      {
+        "end": 340,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 322
+      },
+      {
+        "end": 397,
+        "message": "unresolved reference `Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 393
+      },
+      {
+        "end": 538,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 497
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s84-referencing-constraint-usage-states-second-result-expression.sysml": {
+    "diagnostics": [
+      {
+        "end": 344,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 326
+      },
+      {
+        "end": 368,
+        "message": "unresolved reference `Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 364
+      },
+      {
+        "end": 415,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 414
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s85-viewpoint-inherits-second-result-expression.sysml": {
+    "diagnostics": [
+      {
+        "end": 319,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 301
+      },
+      {
+        "end": 343,
+        "message": "unresolved reference `Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 339
+      },
+      {
+        "end": 430,
+        "message": "Only one owned or inherited result expression is allowed [validateFunctionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 429
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s86-end-with-direction.sysml": {
+    "diagnostics": [
+      {
+        "end": 213,
+        "message": "expected a definition or usage after prefix, found `in`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 211
+      },
+      {
+        "end": 265,
+        "message": "expected a definition or usage after prefix, found `out`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 262
+      },
+      {
+        "end": 312,
+        "message": "expected a definition or usage after prefix, found `inout`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 307
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s87-end-derived-or-abstract.sysml": {
+    "diagnostics": [
+      {
+        "end": 298,
+        "message": "expected a definition or usage after prefix, found `derived`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 291
+      },
+      {
+        "end": 355,
+        "message": "expected a definition or usage after prefix, found `abstract`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 347
+      },
+      {
+        "end": 413,
+        "message": "expected a definition or usage after prefix, found `variation`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 404
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s88-cross-feature-typed-narrower-than-end.sysml": {
+    "diagnostics": [
+      {
+        "end": 393,
+        "message": "An inline cross feature must have the same types as its end feature [validateFeatureCrossFeatureType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 392
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s89-case-def-inherits-two-objectives.sysml": {
+    "diagnostics": [
+      {
+        "end": 316,
+        "message": "At most one effective member with this parameter role is allowed [validateCaseDefinitionOnlyOneObjective]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 315
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s90-requirement-def-inherits-two-subjects.sysml": {
+    "diagnostics": [
+      {
+        "end": 321,
+        "message": "At most one effective member with this parameter role is allowed [validateRequirementDefinitionOnlyOneSubject]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 320
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s91-case-references-second-objective.sysml": {
+    "diagnostics": [
+      {
+        "end": 334,
+        "message": "At most one effective member with this parameter role is allowed [validateCaseUsageOnlyOneObjective]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 333
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s92-requirement-references-second-subject.sysml": {
+    "diagnostics": [
+      {
+        "end": 348,
+        "message": "At most one effective member with this parameter role is allowed [validateRequirementUsageOnlyOneSubject]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 347
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/s93-assert-through-owner-of-unnamed-assertion.sysml": {
+    "diagnostics": [
+      {
+        "end": 421,
+        "message": "AssertConstraintUsage must reference a ConstraintUsage [validateAssertConstraintUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 412
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/send-constructor-non-type.sysml": {
+    "diagnostics": [
+      {
+        "end": 401,
+        "message": "A constructor must instantiate a type [validateInstantiationExpressionInstantiatedType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 388
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/send-payload-non-behavior.sysml": {
+    "diagnostics": [
+      {
+        "end": 388,
+        "message": "An invocation must invoke a behavior or behavioral feature [validateInvocationExpressionInstantiatedType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 383
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/semantic/send-subaction-no-payload.sysml": {
+    "diagnostics": [
+      {
+        "end": 470,
+        "message": "A send used as a state subaction or transition effect must supply a payload [validateSendActionUsagePayloadArgument]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 449
+      },
+      {
+        "end": 523,
+        "message": "A send used as a state subaction or transition effect must supply a payload [validateSendActionUsagePayloadArgument]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 479
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p01-public-root-import.kerml": {
+    "diagnostics": [
+      {
+        "end": 177,
+        "message": "validateImportTopLevelVisibility: a top-level import must be private",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 148
+      },
+      {
+        "end": 176,
+        "message": "unresolved reference `Base::Anything`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 162
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p02-association-end-two-types.kerml": {
+    "diagnostics": [
+      {
+        "end": 291,
+        "message": "An association end must have exactly one non-redundant type [validateAssociationEndTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 290
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p03-variable-in-datatype.kerml": {
+    "diagnostics": [
+      {
+        "end": 251,
+        "message": "A variable feature must be owned by an occurrence type [validateFeatureIsVariable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 250
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p04-nonunique-subsets-unique.kerml": {
+    "diagnostics": [
+      {
+        "end": 280,
+        "message": "A subset of a unique feature must be unique [validateSubsettingUniquenessConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 279
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p05-single-chaining-feature.kerml": {
+    "diagnostics": [
+      {
+        "end": 286,
+        "message": "A feature chain must have at least two features [validateFeatureChainingFeatureNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 285
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p06-private-member-reference.kerml": {
+    "diagnostics": [
+      {
+        "end": 237,
+        "message": "unresolved reference `A::X` — `P06PrivateMemberReference::A::X` exists but is private",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 233
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/xpect/p07-extraneous-closing-brace.kerml": {
+    "diagnostics": [
+      {
+        "end": 194,
+        "message": "unsupported or unexpected construct at `}`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 193
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p08-variant-outside-variation.sysml": {
+    "diagnostics": [
+      {
+        "end": 277,
+        "message": "a `variant` member is only allowed in the body of a `variation` definition or usage",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 266
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p09-variation-member-not-variant.sysml": {
+    "diagnostics": [
+      {
+        "end": 286,
+        "message": "A usage owned by a variation must be a variant [validateDefinitionVariationMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 284
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p10-variation-specializes-variation.sysml": {
+    "diagnostics": [
+      {
+        "end": 317,
+        "message": "A variation cannot specialize another variation [validateDefinitionVariationSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 300
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p11-metadata-body-not-evaluable.sysml": {
+    "diagnostics": [
+      {
+        "end": 287,
+        "message": "A metadata body value must be model-level evaluable [validateMetadataFeatureBody]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 285
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p12-filter-integer-condition.sysml": {
+    "diagnostics": [],
+    "status": "unknown without library"
+  },
+  "negative/xpect/p13-state-two-entry-actions.sysml": {
+    "diagnostics": [
+      {
+        "end": 194,
+        "message": "A state may have at most one subaction of each kind [validateStateDefinitionSubactionKind]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 193
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p14-requirement-two-subjects.sysml": {
+    "diagnostics": [
+      {
+        "end": 264,
+        "message": "validateRequirementDefinitionOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 249
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p15-attribute-typed-by-part-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 215,
+        "message": "AttributeUsage must be typed by DataType; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 214
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p16-part-typed-by-attribute-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 238,
+        "message": "PartUsage must be typed by Class; the declared type is a AttributeDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 232
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p17-calc-two-return-parameters.sysml": {
+    "diagnostics": [
+      {
+        "end": 254,
+        "message": "Only one return parameter is allowed [validateFunctionResultParameterMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 253
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p18-enum-two-types.sysml": {
+    "diagnostics": [
+      {
+        "end": 247,
+        "message": "EnumerationUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 245
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p18-enum-value-typed-outside-enumeration.sysml": {
+    "diagnostics": [
+      {
+        "end": 319,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 301
+      },
+      {
+        "end": 343,
+        "message": "unresolved reference `Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 339
+      }
+    ],
+    "status": "accepted (adjudicated)"
+  },
+  "negative/xpect/p19-parallel-state-with-transition.sysml": {
+    "diagnostics": [
+      {
+        "end": 215,
+        "message": "A parallel state cannot own successions or transitions [validateStateDefinitionParallelSubactions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 214
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p20-connection-with-one-end.sysml": {
+    "diagnostics": [
+      {
+        "end": 296,
+        "message": "A concrete connector must relate at least two features [validateConnectorRelatedFeatures]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 270
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p21-filter-constructor-condition.sysml": {
+    "diagnostics": [
+      {
+        "end": 287,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 266
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/xpect/p22-filter-not-model-level-evaluable.sysml": {
+    "diagnostics": [
+      {
+        "end": 304,
+        "message": "unresolved reference `ScalarValues::Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 283
+      },
+      {
+        "end": 357,
+        "message": "unresolved reference `ScalarValues::Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 336
+      },
+      {
+        "end": 389,
+        "message": "unresolved reference `ScalarValues::Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 368
+      },
+      {
+        "end": 415,
+        "message": "An element filter must be model-level evaluable [validateElementFilterMembershipIsModelLevelEvaluable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 404
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p23-metadata-body-feature-not-redefining.sysml": {
+    "diagnostics": [
+      {
+        "end": 271,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 250
+      },
+      {
+        "end": 344,
+        "message": "A metadata body feature must redefine one feature of its metadata type [validateMetadataFeatureBody]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 341
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p24-metadata-abstract-type.sysml": {
+    "diagnostics": [
+      {
+        "end": 265,
+        "message": "unresolved reference `Metaobjects::Metaobject`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 242
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "negative/xpect/p25-two-individual-definitions.sysml": {
+    "diagnostics": [
+      {
+        "end": 309,
+        "message": "At most one individual definition may type an occurrence [validateOccurrenceUsageIndividualDefinition]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 300
+      },
+      {
+        "end": 309,
+        "message": "An individual usage must be typed by one individual definition [validateOccurrenceUsageIndividualUsage]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 300
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p26-port-def-nonreferential-usage.sysml": {
+    "diagnostics": [
+      {
+        "end": 272,
+        "message": "A non-port usage owned by a port must be referential [validatePortDefinitionOwnedUsagesNotComposite]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 270
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p27-interface-end-not-port.sysml": {
+    "diagnostics": [
+      {
+        "end": 336,
+        "message": "An interface end must be a port [validateInterfaceUsageEnd]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 318
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p28-package-level-feature-redefined.sysml": {
+    "diagnostics": [
+      {
+        "end": 274,
+        "message": "A package-level feature cannot redefine another package-level feature [validateRedefinitionFeaturingTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 269
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p29-verify-outside-objective.sysml": {
+    "diagnostics": [
+      {
+        "end": 317,
+        "message": "A requirement verification must be in the objective of a verification case [validateRequirementVerificationMembershipOwningType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 308
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p30-two-view-renderings.sysml": {
+    "diagnostics": [
+      {
+        "end": 202,
+        "message": "A view may have at most one rendering [validateViewUsageOnlyOneRendering]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 201
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p31-redefinition-incompatible-direction.sysml": {
+    "diagnostics": [
+      {
+        "end": 367,
+        "message": "A redefining feature must have a compatible direction [validateRedefinitionDirectionConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 362
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p32-redefinition-same-featuring-type.sysml": {
+    "diagnostics": [
+      {
+        "end": 425,
+        "message": "Redefining and redefined features cannot have the same owning type [validateRedefinitionFeaturingTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 421
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p33-individual-typed-by-plain-def.sysml": {
+    "diagnostics": [
+      {
+        "end": 239,
+        "message": "An individual usage must be typed by one individual definition [validateOccurrenceUsageIndividualUsage]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 234
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "negative/xpect/p34-accepter-source-not-state.sysml": {
+    "diagnostics": [
+      {
+        "end": 315,
+        "message": "A triggered transition must have a state usage as its source [validateTransitionUsageTriggerActions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 282
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateActionUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 136,
+        "message": "ActionUsage must be typed by Behavior; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 135
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateActorMembershipOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 213,
+        "message": "an `actor` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 201
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAllocationUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 190,
+        "message": "AllocationUsage must be typed by AllocationDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 189
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAnalysisCaseUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 188,
+        "message": "AnalysisCaseUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 186
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAnnotationAnnotatedElementOwnership.kerml": {
+    "diagnostics": [],
+    "status": "unknown without library"
+  },
+  "probes/validateAssertConstraintUsageReference.sysml": {
+    "diagnostics": [
+      {
+        "end": 155,
+        "message": "AssertConstraintUsage must reference a ConstraintUsage [validateAssertConstraintUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 146
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAssignmentActionUsageReferent.sysml": {
+    "diagnostics": [
+      {
+        "end": 150,
+        "message": "A feature reference expression must name a feature [validateFeatureReferenceExpressionReferentIsFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 149
+      },
+      {
+        "end": 150,
+        "message": "An assignment must refer to a feature [validateAssignmentActionUsageReferent]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 149
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAssignmentActionUsageReferentIsTimeVarying.sysml": {
+    "diagnostics": [
+      {
+        "end": 176,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 155
+      },
+      {
+        "end": 215,
+        "message": "An assignment referent must be time varying [validateAssignmentActionUsageReferentIsTimeVarying]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 212
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAssociationBinarySpecialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 192,
+        "message": "unresolved reference `Links::BinaryLink`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 175
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateAssociationEndTypes.kerml": {
+    "diagnostics": [
+      {
+        "end": 152,
+        "message": "An association end must have exactly one non-redundant type [validateAssociationEndTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 151
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAssociationRelatedTypes.kerml": {
+    "diagnostics": [
+      {
+        "end": 133,
+        "message": "An association must have at least two related types [validateAssociationRelatedTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 132
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAttributeUsageEnumerationType.sysml": {
+    "diagnostics": [
+      {
+        "end": 190,
+        "message": "EnumerationUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 189
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateAttributeUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 148,
+        "message": "AttributeUsage must be typed by DataType; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 147
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateBehaviorSpecialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 138,
+        "message": "A behavior cannot specialize a structure [validateBehaviorSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 137
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateBindingConnectorIsBinary.kerml": {
+    "diagnostics": [
+      {
+        "end": 192,
+        "message": "A binding connector must have exactly two ends [validateBindingConnectorIsBinary]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 191
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateBindingConnectorTypeConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 171,
+        "message": "unresolved reference `ScalarValues::String`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 151
+      },
+      {
+        "end": 206,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 185
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateBindingConnectorTypeConformance.result.kerml": {
+    "diagnostics": [
+      {
+        "end": 200,
+        "message": "Bound feature types (D) and (C) should conform [validateBindingConnectorTypeConformance]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 199
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateBindingConnectorTypeConformance.satisfy.sysml": {
+    "diagnostics": [
+      {
+        "end": 247,
+        "message": "Bound feature types (PD) and (ID) should conform [validateBindingConnectorTypeConformance]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 246
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateBindingConnectorTypeConformance.subject.sysml": {
+    "diagnostics": [
+      {
+        "end": 211,
+        "message": "Bound feature types (ID) and (PD) should conform [validateBindingConnectorTypeConformance]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 205
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCalculationUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 173,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 152
+      },
+      {
+        "end": 223,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 202
+      },
+      {
+        "end": 235,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 234
+      },
+      {
+        "end": 244,
+        "message": "CalculationUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 242
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCaseDefinitionOnlyOneObjective.sysml": {
+    "diagnostics": [
+      {
+        "end": 151,
+        "message": "validateCaseDefinitionOnlyOneObjective: a case may own at most one objective",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 138
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCaseDefinitionOnlyOneSubject.sysml": {
+    "diagnostics": [
+      {
+        "end": 161,
+        "message": "validateCaseDefinitionOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 147
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCaseDefinitionSubjectParameterPosition.sysml": {
+    "diagnostics": [
+      {
+        "end": 170,
+        "message": "validateCaseDefinitionSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 156
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCaseUsageOnlyOneObjective.sysml": {
+    "diagnostics": [
+      {
+        "end": 158,
+        "message": "validateCaseUsageOnlyOneObjective: a case may own at most one objective",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 145
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCaseUsageOnlyOneSubject.sysml": {
+    "diagnostics": [
+      {
+        "end": 168,
+        "message": "validateCaseUsageOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 154
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCaseUsageSubjectParameterPosition.sysml": {
+    "diagnostics": [
+      {
+        "end": 177,
+        "message": "validateCaseUsageSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 163
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCaseUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 149,
+        "message": "CaseUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 147
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateClassSpecialization.connection.sysml": {
+    "diagnostics": [
+      {
+        "end": 162,
+        "message": "A class cannot specialize a data type or an unrelated association family [validateClassSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 161
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateClassSpecialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 149,
+        "message": "A class cannot specialize a data type or an unrelated association family [validateClassSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 148
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateClassSpecialization.subsets.kerml": {
+    "diagnostics": [
+      {
+        "end": 189,
+        "message": "A class cannot specialize a data type or an unrelated association family [validateClassSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 188
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateClassSpecialization.sysml": {
+    "diagnostics": [
+      {
+        "end": 140,
+        "message": "A class cannot specialize a data type or an unrelated association family [validateClassSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 139
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateClassifierDefaultSupertype.kerml": {
+    "diagnostics": [
+      {
+        "end": 152,
+        "message": "A structure must directly or indirectly specialize Objects::Object [validateClassifierDefaultSupertype]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 151
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateConnectionUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 188,
+        "message": "ConnectionUsage must be typed by AssociationStructure; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 187
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateConnectorBinarySpecialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 216,
+        "message": "unresolved reference `Links::BinaryLink`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 199
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateConnectorRelatedFeatures.sysml": {
+    "diagnostics": [
+      {
+        "end": 184,
+        "message": "A concrete connector must relate at least two features [validateConnectorRelatedFeatures]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 158
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateConnectorTypeFeaturing.kerml": {
+    "diagnostics": [
+      {
+        "end": 202,
+        "message": "connector end references `x`, which is featured in `A` — no featuring context of the connector reaches it",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 198
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateConstructorExpressionNoDuplicateFeatureRedefinition.kerml": {
+    "diagnostics": [
+      {
+        "end": 234,
+        "message": "A constructor cannot bind a feature more than once [validateConstructorExpressionNoDuplicateFeatureRedefinition]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 215
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateControlNodeIncomingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 220,
+        "message": "Succession end must have multiplicity 1..1 [validateControlNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 187
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateControlNodeOutgoingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 254,
+        "message": "Succession end must have multiplicity 1..1 [validateControlNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 221
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateControlNodeOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 159,
+        "message": "A control node must be owned by an action [validateControlNodeOwningType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 158
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCrossSubsettingCrossedFeature.kerml": {
+    "diagnostics": [
+      {
+        "end": 230,
+        "message": "unresolved reference `a`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 229
+      },
+      {
+        "end": 233,
+        "message": "unresolved reference `ax`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 231
+      },
+      {
+        "end": 216,
+        "message": "A cross subsetting must chain through an opposite end to a feature [validateCrossSubsettingCrossedFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 215
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateCrossSubsettingCrossingFeature.kerml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "A crossing feature must be an end of a type with at least two ends [validateCrossSubsettingCrossingFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 181
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateDataTypeSpecialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 148,
+        "message": "A data type cannot specialize a class or association [validateDataTypeSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 147
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateDataTypeSpecialization.subsets.kerml": {
+    "diagnostics": [
+      {
+        "end": 191,
+        "message": "A data type cannot specialize a class or association [validateDataTypeSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 190
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateDataTypeSpecialization.sysml": {
+    "diagnostics": [
+      {
+        "end": 138,
+        "message": "A data type cannot specialize a class or association [validateDataTypeSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 137
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateDecisionNodeIncomingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 155,
+        "message": "unresolved reference `ScalarValues::Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 134
+      },
+      {
+        "end": 199,
+        "message": "unresolved reference `Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 192
+      },
+      {
+        "end": 229,
+        "message": "Control node has too many incoming successions [validateDecisionNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 228
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateDecisionNodeOutgoingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 237,
+        "message": "Succession end must have multiplicity 0..1 [validateDecisionNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 207
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateDefinitionVariationMembership.sysml": {
+    "diagnostics": [
+      {
+        "end": 146,
+        "message": "expected a definition or usage after prefix, found `variation`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 137
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateDefinitionVariationSpecialization.sysml": {
+    "diagnostics": [
+      {
+        "end": 152,
+        "message": "expected a definition or usage after prefix, found `variation`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 143
+      },
+      {
+        "end": 184,
+        "message": "expected a definition or usage after prefix, found `variation`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 175
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateElementFilterMembershipIsBoolean.kerml": {
+    "diagnostics": [
+      {
+        "end": 131,
+        "message": "An element filter must have a Boolean result [validateElementFilterMembershipIsBoolean]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 130
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateElementFilterMembershipIsModelLevelEvaluable.sysml": {
+    "diagnostics": [
+      {
+        "end": 169,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 148
+      },
+      {
+        "end": 201,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 180
+      },
+      {
+        "end": 241,
+        "message": "An element filter must be model-level evaluable [validateElementFilterMembershipIsModelLevelEvaluable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 230
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateEnumerationUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 176,
+        "message": "EnumerationUsage must be typed by EnumerationDefinition; the declared type is a AttributeDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 175
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateEventOccurrenceUsageReferent.sysml": {
+    "diagnostics": [
+      {
+        "end": 153,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 135
+      },
+      {
+        "end": 163,
+        "message": "EventOccurrenceUsage must reference a OccurrenceUsage [validateEventOccurrenceUsageReferent]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 155
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateExhibitStateUsageReference.sysml": {
+    "diagnostics": [
+      {
+        "end": 155,
+        "message": "ExhibitStateUsage must reference a StateUsage [validateExhibitStateUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 145
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateExposeOwningNamespace.sysml": {
+    "diagnostics": [
+      {
+        "end": 152,
+        "message": "an `expose` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 140
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateExpressionResultExpressionMembership.kerml": {
+    "diagnostics": [
+      {
+        "end": 193,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 192
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateExpressionResultExpressionMembership.sysml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 164
+      },
+      {
+        "end": 239,
+        "message": "unresolved reference `Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 235
+      },
+      {
+        "end": 380,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 339
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateExpressionResultExpressionMembership.typed.kerml": {
+    "diagnostics": [
+      {
+        "end": 217,
+        "message": "Only one owned or inherited result expression is allowed [validateExpressionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 216
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateExpressionResultParameterMembership.kerml": {
+    "diagnostics": [
+      {
+        "end": 166,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 145
+      },
+      {
+        "end": 201,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 180
+      },
+      {
+        "end": 130,
+        "message": "Only one return parameter is allowed [validateExpressionResultParameterMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 129
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureChainExpressionFeatureConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 223,
+        "message": "A feature-chain expression must select a feature [validateFeatureChainExpressionFeatureConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 220
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureChainingFeatureConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 212,
+        "message": "Each chain member must be a feature accessible through the preceding feature [validateFeatureChainingFeatureConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 211
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureChainingFeatureNotOne.kerml": {
+    "diagnostics": [
+      {
+        "end": 169,
+        "message": "A feature chain must have at least two features [validateFeatureChainingFeatureNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 168
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureChainingFeaturesNotSelf.kerml": {
+    "diagnostics": [
+      {
+        "end": 198,
+        "message": "A feature cannot chain through itself [validateFeatureChainingFeaturesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 197
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureConstantIsVariable.sysml": {
+    "diagnostics": [
+      {
+        "end": 144,
+        "message": "unresolved reference `ScalarValues`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 132
+      },
+      {
+        "end": 199,
+        "message": "unresolved reference `Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 192
+      },
+      {
+        "end": 189,
+        "message": "Only a variable feature can be constant [validateFeatureConstantIsVariable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 188
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureCrossFeatureSpecialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 319,
+        "message": "unresolved reference `y`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 318
+      },
+      {
+        "end": 321,
+        "message": "unresolved reference `b`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 320
+      },
+      {
+        "end": 304,
+        "message": "A cross subsetting must chain through an opposite end to a feature [validateCrossSubsettingCrossedFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 303
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureCrossFeatureType.kerml": {
+    "diagnostics": [
+      {
+        "end": 206,
+        "message": "A cross feature must have the same types as its end feature [validateFeatureCrossFeatureType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 205
+      },
+      {
+        "end": 230,
+        "message": "A cross feature must have the same types as its end feature [validateFeatureCrossFeatureType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 229
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureEndFeatureMultiplicity.kerml": {
+    "diagnostics": [
+      {
+        "end": 163,
+        "message": "An end feature should have multiplicity 1..1 [validateFeatureEndFeatureMultiplicity]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 162
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureEndNoDirection.sysml": {
+    "diagnostics": [
+      {
+        "end": 146,
+        "message": "expected a definition or usage after prefix, found `in`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 144
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureEndNotDerivedAbstractCompositeOrPortion.sysml": {
+    "diagnostics": [
+      {
+        "end": 204,
+        "message": "expected a definition or usage after prefix, found `derived`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 197
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureHasType.kerml": {
+    "diagnostics": [
+      {
+        "end": 123,
+        "message": "Conjugating a classifier does not provide a feature type [validateFeatureHasType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 122
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureIsVariable.kerml": {
+    "diagnostics": [
+      {
+        "end": 155,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 134
+      },
+      {
+        "end": 131,
+        "message": "A variable feature must be owned by an occurrence type [validateFeatureIsVariable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 130
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureOwnedCrossSubsetting.kerml": {
+    "diagnostics": [
+      {
+        "end": 189,
+        "message": "At most one relationship of this kind is allowed [validateFeatureOwnedCrossSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 188
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureOwnedReferenceSubsetting.kerml": {
+    "diagnostics": [
+      {
+        "end": 168,
+        "message": "At most one relationship of this kind is allowed [validateFeatureOwnedReferenceSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 167
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeaturePortionNotVariable.kerml": {
+    "diagnostics": [
+      {
+        "end": 137,
+        "message": "A portion cannot be variable [validateFeaturePortionNotVariable]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 136
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureReferenceExpressionReferentIsFeature.kerml": {
+    "diagnostics": [
+      {
+        "end": 163,
+        "message": "unresolved reference `ScalarValues::Boolean`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 142
+      },
+      {
+        "end": 167,
+        "message": "A feature reference expression must name a feature [validateFeatureReferenceExpressionReferentIsFeature]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 166
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureValueIsInitial.kerml": {
+    "diagnostics": [
+      {
+        "end": 143,
+        "message": "An initialized feature must be variable [validateFeatureValueIsInitial]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 142
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureValueOverriding.kerml": {
+    "diagnostics": [
+      {
+        "end": 146,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 125
+      },
+      {
+        "end": 189,
+        "message": "unresolved reference `Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 182
+      },
+      {
+        "end": 254,
+        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 253
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFeatureValueOverriding.sysml": {
+    "diagnostics": [
+      {
+        "end": 153,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 132
+      },
+      {
+        "end": 189,
+        "message": "unresolved reference `Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 182
+      },
+      {
+        "end": 234,
+        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 233
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFlowDefinitionConnectionEnds.sysml": {
+    "diagnostics": [
+      {
+        "end": 191,
+        "message": "validateFlowDefinitionFlowEnds: a flow definition may not have more than two flow ends",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 181
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFlowEndImplicitSubsetting.kerml": {
+    "diagnostics": [
+      {
+        "end": 201,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 180
+      },
+      {
+        "end": 257,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 236
+      },
+      {
+        "end": 271,
+        "message": "A nested flow end must identify an accessible feature using dot notation [validateFlowEndImplicitSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 270
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFlowEndImplicitSubsetting.sysml": {
+    "diagnostics": [
+      {
+        "end": 203,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 182
+      },
+      {
+        "end": 258,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 237
+      },
+      {
+        "end": 272,
+        "message": "A nested flow end must identify an accessible feature using dot notation [validateFlowEndImplicitSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 271
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFlowEndSubsetting.kerml": {
+    "diagnostics": [
+      {
+        "end": 160,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 139
+      },
+      {
+        "end": 212,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 191
+      },
+      {
+        "end": 281,
+        "message": "A nested flow end must identify an accessible feature using dot notation [validateFlowEndSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 258
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFlowUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 182,
+        "message": "A flow end must identify a participant's payload feature using dot notation [validateFlowEndSubsetting]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 181
+      },
+      {
+        "end": 186,
+        "message": "FlowUsage must be typed by Interaction; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 185
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateForkNodeIncomingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 152,
+        "message": "Control node has too many incoming successions [validateForkNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 151
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFunctionResultExpressionMembership.kerml": {
+    "diagnostics": [
+      {
+        "end": 196,
+        "message": "Only one owned or inherited result expression is allowed [validateFunctionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 194
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFunctionResultExpressionMembership.specialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 219,
+        "message": "Only one owned or inherited result expression is allowed [validateFunctionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 218
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFunctionResultExpressionMembership.sysml": {
+    "diagnostics": [
+      {
+        "end": 180,
+        "message": "unresolved reference `ScalarValues::Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 162
+      },
+      {
+        "end": 219,
+        "message": "unresolved reference `Real`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 215
+      },
+      {
+        "end": 253,
+        "message": "Only one owned or inherited result expression is allowed [validateFunctionResultExpressionMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 250
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateFunctionResultParameterMembership.kerml": {
+    "diagnostics": [
+      {
+        "end": 168,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 147
+      },
+      {
+        "end": 203,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 182
+      },
+      {
+        "end": 132,
+        "message": "Only one return parameter is allowed [validateFunctionResultParameterMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 131
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateImportTopLevelVisibility.kerml": {
+    "diagnostics": [
+      {
+        "end": 125,
+        "message": "validateImportTopLevelVisibility: a top-level import must be private",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 95
+      },
+      {
+        "end": 121,
+        "message": "unresolved reference `ScalarValues`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 109
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateIncludeUseCaseUsageReference.sysml": {
+    "diagnostics": [
+      {
+        "end": 156,
+        "message": "IncludeUseCaseUsage must reference a UseCaseUsage [validateIncludeUseCaseUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 146
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateInstantiationExpressionInstantiatedType.kerml": {
+    "diagnostics": [
+      {
+        "end": 158,
+        "message": "A constructor must instantiate a type [validateInstantiationExpressionInstantiatedType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 151
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateInterfaceDefinitionEnd.sysml": {
+    "diagnostics": [
+      {
+        "end": 156,
+        "message": "An interface end must be a port [validateInterfaceDefinitionEnd]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 155
+      },
+      {
+        "end": 172,
+        "message": "An interface end must be a port [validateInterfaceDefinitionEnd]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 171
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateInterfaceUsageEnd.sysml": {
+    "diagnostics": [
+      {
+        "end": 253,
+        "message": "An interface end must be a port [validateInterfaceUsageEnd]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 235
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateInterfaceUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 197,
+        "message": "InterfaceUsage must be typed by InterfaceDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 196
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateInvocationExpressionInstantiatedType.kerml": {
+    "diagnostics": [
+      {
+        "end": 161,
+        "message": "An invocation must invoke a behavior or behavioral feature [validateInvocationExpressionInstantiatedType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 158
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateInvocationExpressionNoDuplicateParameterRedefinition.kerml": {
+    "diagnostics": [
+      {
+        "end": 231,
+        "message": "invocation of `F` binds parameter `x` more than once",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 230
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateInvocationExpressionParameterRedefinition.kerml": {
+    "diagnostics": [
+      {
+        "end": 193,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 172
+      },
+      {
+        "end": 225,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 204
+      },
+      {
+        "end": 266,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 245
+      },
+      {
+        "end": 272,
+        "message": "unresolved reference `y`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 271
+      },
+      {
+        "end": 276,
+        "message": "invocation of `F` names unknown parameter `y`",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 275
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateJoinNodeOutgoingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 152,
+        "message": "Control node has too many outgoing successions [validateJoinNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 151
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateLibraryPackageNotStandard.kerml": {
+    "diagnostics": [
+      {
+        "end": 146,
+        "message": "A user library package must not be marked standard [validateLibraryPackageNotStandard]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 145
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateMergeNodeIncomingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 214,
+        "message": "Succession end must have multiplicity 0..1 [validateMergeNodeIncomingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 184
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateMergeNodeOutgoingSuccessions.sysml": {
+    "diagnostics": [
+      {
+        "end": 155,
+        "message": "Control node has too many outgoing successions [validateMergeNodeOutgoingSuccessions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 154
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateMetadataFeatureAnnotatedElement.kerml": {
+    "diagnostics": [
+      {
+        "end": 146,
+        "message": "unresolved reference `Metaobjects::Metaobject`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 123
+      },
+      {
+        "end": 183,
+        "message": "unresolved reference `annotatedElement`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 167
+      },
+      {
+        "end": 200,
+        "message": "unresolved reference `KerML::Feature`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 186
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateMetadataFeatureBody.kerml": {
+    "diagnostics": [
+      {
+        "end": 155,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 134
+      },
+      {
+        "end": 194,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 173
+      },
+      {
+        "end": 214,
+        "message": "A metadata body feature must redefine one feature of its metadata type [validateMetadataFeatureBody]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 213
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateMetadataFeatureMetadata.kerml": {
+    "diagnostics": [
+      {
+        "end": 154,
+        "message": "metadata must be typed by a metadata definition or metaclass; `NotAMetaclass` is a Class",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 141
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateMetadataFeatureMetadataNotAbstract.kerml": {
+    "diagnostics": [
+      {
+        "end": 149,
+        "message": "Metadata must have a concrete type [validateMetadataFeatureMetadataNotAbstract]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 146
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateMetadataUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 185,
+        "message": "metadata must be typed by a metadata definition or metaclass; `NotMetadata` is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 174
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateMultiplicityRangeResultTypes.kerml": {
+    "diagnostics": [
+      {
+        "end": 132,
+        "message": "multiplicity bound must be a Natural number (or `*` for the upper bound)",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 127
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateNamespaceDistinguishablity.kerml": {
+    "diagnostics": [
+      {
+        "end": 135,
+        "message": "the name `A` is already used by an earlier member of the same namespace whose metaclass is not distinguishable from this member",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 134
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateObjectiveMembershipOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 196,
+        "message": "validateObjectiveMembershipOwningType: an `objective` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 184
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOccurrenceUsageIndividualDefinition.sysml": {
+    "diagnostics": [
+      {
+        "end": 196,
+        "message": "At most one individual definition may type an occurrence [validateOccurrenceUsageIndividualDefinition]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 195
+      },
+      {
+        "end": 196,
+        "message": "An individual usage must be typed by one individual definition [validateOccurrenceUsageIndividualUsage]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 195
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOccurrenceUsageIndividualUsage.sysml": {
+    "diagnostics": [
+      {
+        "end": 167,
+        "message": "An individual usage must be typed by one individual definition [validateOccurrenceUsageIndividualUsage]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 166
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOccurrenceUsageIsPortion.sysml": {
+    "diagnostics": [
+      {
+        "end": 153,
+        "message": "A snapshot or timeslice must be owned by an occurrence definition or usage [validateOccurrenceUsageIsPortion]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 152
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOccurrenceUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 171,
+        "message": "OccurrenceUsage must be typed by Class; the declared type is a AttributeDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 170
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOperatorExpressionBracketOperator.kerml": {
+    "diagnostics": [
+      {
+        "end": 146,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 125
+      },
+      {
+        "end": 188,
+        "message": "Square brackets do not index a sequence; use #(index) [validateOperatorExpressionBracketOperator]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 187
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOperatorExpressionCastConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 185,
+        "message": "unresolved reference `ScalarValues::String`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 165
+      },
+      {
+        "end": 227,
+        "message": "unresolved reference `ScalarValues::Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 206
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateOperatorExpressionQuantity.sysml": {
+    "diagnostics": [
+      {
+        "end": 174,
+        "message": "A quantity unit must be a measurement reference [validateOperatorExpressionQuantity]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 173
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOwnedDifferencingNotOne.kerml": {
+    "diagnostics": [
+      {
+        "end": 127,
+        "message": "A type operation must have zero or at least two operands [validateOwnedDifferencingNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 126
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOwnedIntersectingNotOne.kerml": {
+    "diagnostics": [
+      {
+        "end": 127,
+        "message": "A type operation must have zero or at least two operands [validateOwnedIntersectingNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 126
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateOwnedUnioningNotOne.kerml": {
+    "diagnostics": [
+      {
+        "end": 119,
+        "message": "A type operation must have zero or at least two operands [validateOwnedUnioningNotOne]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 118
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validatePerformActionUsageReference.sysml": {
+    "diagnostics": [
+      {
+        "end": 150,
+        "message": "PerformActionUsage must reference a ActionUsage [validatePerformActionUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 140
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validatePortDefinitionOwnedUsagesNotComposite.sysml": {
+    "diagnostics": [
+      {
+        "end": 192,
+        "message": "A non-port usage owned by a port must be referential [validatePortDefinitionOwnedUsagesNotComposite]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 191
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validatePortUsageIsReference.sysml": {
+    "diagnostics": [
+      {
+        "end": 169,
+        "message": "A port nested in a port must be referential [validatePortUsageIsReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 168
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validatePortUsageNestedUsagesNotComposite.sysml": {
+    "diagnostics": [
+      {
+        "end": 209,
+        "message": "A non-port usage owned by a port must be referential [validatePortUsageNestedUsagesNotComposite]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 208
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validatePortUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 127,
+        "message": "PortUsage must be typed by PortDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 126
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRedefinitionDirectionConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 213,
+        "message": "A redefining feature must have a compatible direction [validateRedefinitionDirectionConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 212
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRedefinitionEndConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 221,
+        "message": "A feature redefining an end must itself be an end [validateRedefinitionEndConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 220
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRedefinitionFeaturingTypes.kerml": {
+    "diagnostics": [
+      {
+        "end": 156,
+        "message": "A package-level feature cannot redefine another package-level feature [validateRedefinitionFeaturingTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 155
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRedefinitionMultiplicityConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 229,
+        "message": "redefining multiplicity [0..2] is not within the redefined feature's [1..2]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 223
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRenderingUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 179,
+        "message": "RenderingUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRequirementConstraintMembershipOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 202,
+        "message": "a `require` constraint member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRequirementDefinitionOnlyOneSubject.sysml": {
+    "diagnostics": [
+      {
+        "end": 175,
+        "message": "validateRequirementDefinitionOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 161
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRequirementDefinitionSubjectParameterPosition.sysml": {
+    "diagnostics": [
+      {
+        "end": 184,
+        "message": "validateRequirementDefinitionSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 170
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRequirementUsageOnlyOneSubject.sysml": {
+    "diagnostics": [
+      {
+        "end": 189,
+        "message": "validateRequirementUsageOnlyOneSubject: a requirement or case may own at most one subject",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 175
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRequirementUsageSubjectParameterPosition.sysml": {
+    "diagnostics": [
+      {
+        "end": 198,
+        "message": "validateRequirementUsageSubjectParameterPosition: the subject parameter must be the first input",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 184
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRequirementUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 191,
+        "message": "RequirementUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 189
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateRequirementVerificationMembershipOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 228,
+        "message": "A requirement verification must be in the objective of a verification case [validateRequirementVerificationMembershipOwningType]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 227
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateReturnParameterMembershipOwningType.kerml": {
+    "diagnostics": [
+      {
+        "end": 187,
+        "message": "a `return` parameter member is not allowed in a type body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 166
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSatisfyRequirementUsageReference.sysml": {
+    "diagnostics": [
+      {
+        "end": 165,
+        "message": "SatisfyRequirementUsage must reference a RequirementUsage [validateSatisfyRequirementUsageReference]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 150
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSendActionUsagePayloadArgument.sysml": {
+    "diagnostics": [
+      {
+        "end": 218,
+        "message": "A send used as a state subaction or transition effect must supply a payload [validateSendActionUsagePayloadArgument]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 202
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSendActionUsageReceiver.sysml": {
+    "diagnostics": [
+      {
+        "end": 214,
+        "message": "Sending through a port should use 'via' [validateSendActionUsageReceiver]",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 213
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSpecializationSpecificNotConjugated.kerml": {
+    "diagnostics": [
+      {
+        "end": 195,
+        "message": "A conjugated type cannot be the specific type of a specialization [validateSpecializationSpecificNotConjugated]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 156
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSpecializationSpecificNotConjugated.subset.kerml": {
+    "diagnostics": [
+      {
+        "end": 224,
+        "message": "A conjugated type cannot be the specific type of a specialization [validateSpecializationSpecificNotConjugated]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 190
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStakeholderMembershipOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 220,
+        "message": "a `stakeholder` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 202
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStateDefinitionParallelSubactions.sysml": {
+    "diagnostics": [
+      {
+        "end": 151,
+        "message": "A parallel state cannot own successions or transitions [validateStateDefinitionParallelSubactions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 150
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStateDefinitionSubactionKind.sysml": {
+    "diagnostics": [
+      {
+        "end": 132,
+        "message": "A state may have at most one subaction of each kind [validateStateDefinitionSubactionKind]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 131
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStateSubactionMembershioOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 208,
+        "message": "an `entry` action member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 190
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStateUsageParallelSubactions.sysml": {
+    "diagnostics": [
+      {
+        "end": 156,
+        "message": "A parallel state cannot own successions or transitions [validateStateUsageParallelSubactions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 155
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStateUsageSubactionKind.sysml": {
+    "diagnostics": [
+      {
+        "end": 137,
+        "message": "A state may have at most one subaction of each kind [validateStateUsageSubactionKind]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 136
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStateUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 131,
+        "message": "StateUsage must be typed by StateDefinition; the declared type is a PartDefinition",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 130
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateStructureSpecialization.kerml": {
+    "diagnostics": [
+      {
+        "end": 138,
+        "message": "A structure cannot specialize a behavior [validateStructureSpecialization]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 137
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSubjectMembershipOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 222,
+        "message": "validateSubjectMembershipOwningType: a `subject` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 208
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSubsettingConstantConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 241,
+        "message": "unresolved reference `Occurrences::Occurrence`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 218
+      },
+      {
+        "end": 308,
+        "message": "A variable subset of a constant feature must be constant [validateSubsettingConstantConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 307
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSubsettingFeaturingTypes.kerml": {
+    "diagnostics": [
+      {
+        "end": 194,
+        "message": "A subsetted feature must be accessible in the subsetting feature's context [validateSubsettingFeaturingTypes]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 190
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSubsettingMultiplicityConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 237,
+        "message": "subsetting multiplicity upper bound 5 exceeds the subsetted feature's upper bound 2",
+        "severity": "Warning",
+        "stage": "semantics",
+        "start": 231
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateSubsettingUniquenessConformance.kerml": {
+    "diagnostics": [
+      {
+        "end": 260,
+        "message": "A subset of a unique feature must be unique [validateSubsettingUniquenessConformance]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 259
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTransitionFeatureMembershipGuardExpression.sysml": {
+    "diagnostics": [
+      {
+        "end": 188,
+        "message": "A transition guard must have a Boolean result with multiplicity 1..1 [validateTransitionFeatureMembershipGuardExpression]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 183
+      },
+      {
+        "end": 250,
+        "message": "A transition guard must have a Boolean result with multiplicity 1..1 [validateTransitionFeatureMembershipGuardExpression]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 249
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTransitionUsageSuccession.sysml": {
+    "diagnostics": [
+      {
+        "end": 241,
+        "message": "A transition's succession must target an action usage [validateTransitionUsageSuccession]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 214
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTransitionUsageTriggerActions.sysml": {
+    "diagnostics": [
+      {
+        "end": 232,
+        "message": "A triggered transition must have a state usage as its source [validateTransitionUsageTriggerActions]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 199
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTriggerInvocationActionAfterArgument.sysml": {
+    "diagnostics": [
+      {
+        "end": 305,
+        "message": "A 'after' trigger argument must conform to ISQ::DurationValue [validateTriggerInvocationActionAfterArgument]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 304
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTriggerInvocationActionAtArgument.sysml": {
+    "diagnostics": [
+      {
+        "end": 256,
+        "message": "unresolved reference `ISQ`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 253
+      },
+      {
+        "end": 306,
+        "message": "unresolved reference `DurationValue`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 293
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateTriggerInvocationActionWhenArgument.sysml": {
+    "diagnostics": [
+      {
+        "end": 241,
+        "message": "unresolved reference `ScalarValues`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 229
+      },
+      {
+        "end": 285,
+        "message": "unresolved reference `Integer`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 278
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateTypeAtMostOneConjugator.kerml": {
+    "diagnostics": [
+      {
+        "end": 159,
+        "message": "expected `;` or `{`, found `~`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 158
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTypeDifferencingTypesNotSelf.kerml": {
+    "diagnostics": [
+      {
+        "end": 133,
+        "message": "A type operation cannot name its own type as an operand [validateTypeDifferencingTypesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 132
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTypeIntersectingTypesNotSelf.kerml": {
+    "diagnostics": [
+      {
+        "end": 132,
+        "message": "A type operation cannot name its own type as an operand [validateTypeIntersectingTypesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 131
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTypeOwnedMultiplicity.kerml": {
+    "diagnostics": [
+      {
+        "end": 113,
+        "message": "Only one multiplicity is allowed [validateTypeOwnedMultiplicity]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 112
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateTypeUnioningTypesNotSelf.kerml": {
+    "diagnostics": [
+      {
+        "end": 124,
+        "message": "A type operation cannot name its own type as an operand [validateTypeUnioningTypesNotSelf]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 123
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 142,
+        "message": "unresolved reference `Base::things`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 130
+      }
+    ],
+    "status": "unknown without library"
+  },
+  "probes/validateUsageVariationMembership.sysml": {
+    "diagnostics": [
+      {
+        "end": 153,
+        "message": "expected a definition or usage after prefix, found `variation`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 144
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateUsageVariationSpecialization.sysml": {
+    "diagnostics": [
+      {
+        "end": 159,
+        "message": "expected a definition or usage after prefix, found `variation`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 150
+      },
+      {
+        "end": 191,
+        "message": "expected a definition or usage after prefix, found `variation`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 182
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateUseCaseUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 172,
+        "message": "UseCaseUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 170
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateVariationMembershipOwningNamespace.sysml": {
+    "diagnostics": [
+      {
+        "end": 162,
+        "message": "a `variant` member is only allowed in the body of a `variation` definition or usage",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 147
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateVerificationCaseUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 211,
+        "message": "VerificationCaseUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 209
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateViewDefinitionOnlyOnvViewRendering.sysml": {
+    "diagnostics": [
+      {
+        "end": 166,
+        "message": "A view may have at most one rendering [validateViewDefinitionOnlyOnvViewRendering]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 165
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateViewRenderingMembershipOwningType.sysml": {
+    "diagnostics": [
+      {
+        "end": 200,
+        "message": "a `render` member is not allowed in a definition or usage body",
+        "severity": "Error",
+        "stage": "structure",
+        "start": 185
+      },
+      {
+        "end": 199,
+        "message": "unresolved reference `asTable`",
+        "severity": "Warning",
+        "stage": "referential",
+        "start": 192
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateViewUsageOnlyOneRendering.sysml": {
+    "diagnostics": [
+      {
+        "end": 154,
+        "message": "A view may have at most one rendering [validateViewUsageOnlyOneRendering]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 153
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateViewUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 149,
+        "message": "ViewUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 147
+      }
+    ],
+    "status": "diagnostic baseline"
+  },
+  "probes/validateViewpointUsageType.sysml": {
+    "diagnostics": [
+      {
+        "end": 179,
+        "message": "ViewpointUsage must have exactly one non-redundant type; found 2",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 177
+      }
+    ],
+    "status": "diagnostic baseline"
+  }
+}

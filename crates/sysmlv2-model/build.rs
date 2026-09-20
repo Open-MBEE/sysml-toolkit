@@ -10,7 +10,7 @@
 //! cannot tell two working-tree states apart, and a resolution or
 //! evaluation change that leaves the pending-reference queue unchanged
 //! slips past the sequence fingerprint — observed as a cached library
-//! export silently serving pre-change evaluated values (2026-08-05).
+//! export silently serving pre-change evaluated values.
 
 use std::path::{Path, PathBuf};
 

@@ -1,6 +1,6 @@
 //! Full-form JSON → text sentinels: converting a model's *full* JSON back
 //! to text must print exactly what the compact-JSON path prints. Minimal
-//! repros for the two 2026-07-17 lift defects — view `filter` clauses
+//! repros for two lift defects — view `filter` clauses
 //! dropped, and positional invocation arguments re-rendered as named —
 //! plus the inverse guard that genuinely named arguments stay named.
 

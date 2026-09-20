@@ -115,6 +115,42 @@ fn collision_and_version_policies_are_loud() {
     assert!(StdlibResolver::from_value(&v).is_err());
 }
 
+/// A version axis wider than the field it names is refused outright.
+/// It used to be narrowed instead, so an artifact declaring tables
+/// version 65537 passed as version 1 and cleared the compatibility
+/// gate it should have failed.
+#[test]
+fn oversized_version_axes_never_narrow_into_a_supported_one() {
+    let artifact = |key: &str, value: u64| {
+        let mut v = serde_json::json!({
+            "format": "sysmlv2-stdlib-resolver", "formatVersion": 1,
+            "toolkit": "t", "tablesVersion": sysmlv2_cbor::tables::CBOR_TABLES_VERSION,
+            "schemeVersion": sysmlv2_cbor::ID_SCHEME_VERSION,
+            "libraryStateDigest": "d", "units": 1,
+            "forward": {}, "inverse": {},
+        });
+        v[key] = serde_json::json!(value);
+        v
+    };
+    assert!(StdlibResolver::from_value(&artifact("tablesVersion", 1)).is_ok());
+    for (key, value) in [
+        (
+            "tablesVersion",
+            u64::from(sysmlv2_cbor::tables::CBOR_TABLES_VERSION) + (1 << 16),
+        ),
+        (
+            "schemeVersion",
+            u64::from(sysmlv2_cbor::ID_SCHEME_VERSION) + (1 << 8),
+        ),
+    ] {
+        let err = StdlibResolver::from_value(&artifact(key, value))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| panic!("{key} = {value} loaded"));
+        assert!(err.contains(key) && err.contains("out of range"), "{err}");
+    }
+}
+
 #[test]
 fn generated_collisions_never_leak_into_the_inverse() {
     let Some(model) = library_model() else { return };

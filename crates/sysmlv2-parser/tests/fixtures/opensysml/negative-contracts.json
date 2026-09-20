@@ -1,0 +1,394 @@
+{
+  "contracts": [
+    {
+      "fixture": "negative/semantic/k17-crosses-not-through-opposite-end.kerml",
+      "rule": "validateCrossSubsettingCrossedFeature",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "crosses a",
+      "to": ""
+    },
+    {
+      "fixture": "negative/semantic/k19-cross-feature-not-specializing.kerml",
+      "rule": "validateFeatureCrossFeatureSpecialization",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "feature y : A;",
+      "to": "feature y : A subsets x;"
+    },
+    {
+      "fixture": "negative/semantic/k27-connector-feature-outside-featuring-type.kerml",
+      "rule": "validateConnectorTypeFeaturing",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "class B {",
+      "to": "class B specializes A {"
+    },
+    {
+      "fixture": "negative/semantic/k37-multiplicity-bound-not-natural.kerml",
+      "rule": "validateMultiplicityRangeResultTypes",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "feature n : C;",
+      "to": "feature n : ScalarValues::Natural;"
+    },
+    {
+      "fixture": "negative/semantic/k38-flow-end-without-dot-notation.kerml",
+      "rule": "validateFlowEndSubsetting",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "flow from x to y;",
+      "to": "flow from x.o to y.o;",
+      "extra_from": "class T;",
+      "extra_to": "class T { feature o : T; }"
+    },
+    {
+      "fixture": "negative/semantic/k50-inline-cross-feature-also-crosses.kerml",
+      "rule": "feature-cross-feature-single",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "end [1] feature x",
+      "to": "end feature x"
+    },
+    {
+      "fixture": "negative/semantic/k53-boolean-expression-subsets-datatype.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "datatype D;",
+      "to": "feature D;"
+    },
+    {
+      "fixture": "negative/semantic/k54-cross-feature-typed-narrower-than-end.kerml",
+      "rule": "validateFeatureCrossFeatureType",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "x1 : Sub1",
+      "to": "x1 : C1"
+    },
+    {
+      "fixture": "negative/semantic/k55-subtype-specific-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k56-subtype-general-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k57-subclassifier-subclassifier-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k58-subclassifier-superclassifier-is-feature.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "feature f;",
+      "to": "class f;"
+    },
+    {
+      "fixture": "negative/semantic/k59-typing-typed-feature-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "feature Q;"
+    },
+    {
+      "fixture": "negative/semantic/k60-typing-typed-feature-is-class.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "class C;",
+      "to": "feature C;"
+    },
+    {
+      "fixture": "negative/semantic/k61-typing-type-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k62-subset-subsetting-feature-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "feature Q;"
+    },
+    {
+      "fixture": "negative/semantic/k63-subset-subsetted-feature-is-class.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "class C;",
+      "to": "feature C;"
+    },
+    {
+      "fixture": "negative/semantic/k64-redefinition-redefining-feature-is-class.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "class C;",
+      "to": "feature C;"
+    },
+    {
+      "fixture": "negative/semantic/k65-redefinition-redefined-feature-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "feature Q;"
+    },
+    {
+      "fixture": "negative/semantic/k66-conjugate-conjugated-type-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k67-conjugate-original-type-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k68-inverse-feature-inverted-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "feature Q;"
+    },
+    {
+      "fixture": "negative/semantic/k69-inverse-inverting-feature-is-class.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "class C;",
+      "to": "feature C;"
+    },
+    {
+      "fixture": "negative/semantic/k70-disjoint-type-disjoined-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k71-disjoint-disjoining-type-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/k72-featuring-feature-of-type-is-class.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "class C;",
+      "to": "feature C;"
+    },
+    {
+      "fixture": "negative/semantic/k73-featuring-featuring-type-is-package.kerml",
+      "rule": "relationship-endpoint-metaclass",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "package Q;",
+      "to": "class Q;"
+    },
+    {
+      "fixture": "negative/semantic/s37-variation-usage-member-not-variant.sysml",
+      "rule": "validateUsageVariationMembership",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "part b : P;",
+      "to": "variant part b : P;"
+    },
+    {
+      "fixture": "negative/semantic/s47-enumeration-specializes-enumeration.sysml",
+      "rule": "validateDefinitionVariationSpecialization",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "enum def F :> E",
+      "to": "enum def F"
+    },
+    {
+      "fixture": "negative/semantic/s51-enum-value-body-typed-outside-enumeration.sysml",
+      "rule": "validateEnumerationUsageType",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "a = { 1 + 2 };",
+      "to": "a;"
+    },
+    {
+      "fixture": "negative/semantic/s88-cross-feature-typed-narrower-than-end.sysml",
+      "rule": "validateFeatureCrossFeatureType",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "x1 : Sub1",
+      "to": "x1 : A"
+    },
+    {
+      "fixture": "negative/semantic/s89-case-def-inherits-two-objectives.sysml",
+      "rule": "validateCaseDefinitionOnlyOneObjective",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": ":> A, B",
+      "to": ":> A"
+    },
+    {
+      "fixture": "negative/semantic/s90-requirement-def-inherits-two-subjects.sysml",
+      "rule": "validateRequirementDefinitionOnlyOneSubject",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": ":> A, B",
+      "to": ":> A"
+    },
+    {
+      "fixture": "negative/semantic/s91-case-references-second-objective.sysml",
+      "rule": "validateCaseUsageOnlyOneObjective",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "case c : A ::> b",
+      "to": "case c : A"
+    },
+    {
+      "fixture": "negative/semantic/s92-requirement-references-second-subject.sysml",
+      "rule": "validateRequirementUsageOnlyOneSubject",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "requirement c : A ::> b",
+      "to": "requirement c : A"
+    },
+    {
+      "fixture": "negative/semantic/send-constructor-non-type.sysml",
+      "rule": "validateInstantiationExpressionInstantiatedType",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "new Signals()",
+      "to": "new Signals::Sig()"
+    },
+    {
+      "fixture": "negative/semantic/send-payload-non-behavior.sysml",
+      "rule": "validateInvocationExpressionInstantiatedType",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "attribute def Sig;",
+      "to": "calc def Sig;"
+    },
+    {
+      "fixture": "negative/xpect/p09-variation-member-not-variant.sysml",
+      "rule": "validateDefinitionVariationMembership",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "attribute a2;",
+      "to": "variant attribute a2;"
+    },
+    {
+      "fixture": "negative/xpect/p10-variation-specializes-variation.sysml",
+      "rule": "validateDefinitionVariationSpecialization",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "AttributeChoices1 :> AttributeChoices",
+      "to": "AttributeChoices1"
+    },
+    {
+      "fixture": "negative/xpect/p11-metadata-body-not-evaluable.sysml",
+      "rule": "validateMetadataFeatureBody",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "~3",
+      "to": "3"
+    },
+    {
+      "fixture": "negative/xpect/p12-filter-integer-condition.sysml",
+      "rule": "validateElementFilterMembershipIsBoolean",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "filter 1 + 2 * 3;",
+      "to": "filter 1 + 2 * 3 > 0;"
+    },
+    {
+      "fixture": "negative/xpect/p18-enum-value-typed-outside-enumeration.sysml",
+      "rule": "validateEnumerationUsageType",
+      "severity": "Error",
+      "authority": "The pinned official training model Enumeration Definitions-2.sysml uses the identical enum-over-Real with named literal values (GradePoints). This pilot-negative expectation conflicts with the supported enumeration-restriction idiom.",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "a = 4.0;\n        b = 3;",
+      "to": "a;\n        b;",
+      "verdict": "accepted"
+    },
+    {
+      "fixture": "negative/xpect/p32-redefinition-same-featuring-type.sysml",
+      "rule": "validateRedefinitionFeaturingTypes",
+      "severity": "Error",
+      "authority": "pinned KerML/SysML reference property types or validator rule; see preserved fixture source citation",
+      "prerequisites": "resolved relationship endpoints and effective members; unresolved prerequisites remain unknown",
+      "from": "part smallEng : Engine redefines eng1;",
+      "to": "part smallEng : Engine;"
+    }
+  ]
+}

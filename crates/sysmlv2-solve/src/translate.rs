@@ -31,10 +31,11 @@
 //! in one operation — or on one variable — bail. Each variable still
 //! lives in a single unit; witnesses report it.
 
-use crate::term::{EnumSort, Op, Sort, Term, real_from_f64};
+use crate::term::{EnumSort, Op, Sort, Term};
 use std::collections::{HashMap, HashSet, VecDeque};
 use sysmlv2_model::eval::Value;
 use sysmlv2_model::json::{ConstraintInfo, ElementRef, ResolvedModel, ScopeRef};
+use sysmlv2_model::rational::Rational;
 use sysmlv2_syntax::ast::*;
 
 /// The construct (with context) that put an expression outside the
@@ -55,6 +56,10 @@ pub(crate) struct VarInfo {
     pub sort: Sort,
     /// Inferred measurement unit (display spelling), for witness output.
     pub unit: Option<String>,
+    /// An auxiliary introduced by the translation itself (it names one
+    /// step of a sequence fold and is defined by a side equality) — part
+    /// of the variable space, never reported to callers.
+    pub aux: bool,
 }
 
 /// A measurement-unit tag: canonical *dimensional* key, the scale to
@@ -64,7 +69,7 @@ pub(crate) struct VarInfo {
 #[derive(Clone, Debug)]
 struct UTag {
     key: String,
-    scale: f64,
+    scale: Rational,
     display: String,
 }
 
@@ -93,7 +98,8 @@ pub(crate) struct Translation {
     pub root: Term,
     pub vars: Vec<VarInfo>,
     pub enums: Vec<EnumSort>,
-    /// Extra assertions (declared-type range constraints, e.g. `Natural`).
+    /// Extra assertions: declared-type range constraints (e.g. `Natural`)
+    /// and the defining equalities of auxiliary variables.
     pub side: Vec<Term>,
     /// Features that carry a defining expression the translator could not
     /// encode and therefore treated as free — SAT results are then only
@@ -164,7 +170,8 @@ pub(crate) enum JointRoot {
 /// system the propagation backend works on. A constraint outside the
 /// fragment is skipped (recorded) without poisoning the rest; variables
 /// and side assertions it half-registered stay — they are
-/// true-by-declaration facts, so keeping them only widens nothing.
+/// true-by-declaration facts or definitions of auxiliaries, so keeping
+/// them narrows nothing.
 ///
 /// An over-approximated feature (a definition outside the fragment, treated
 /// as free) is not tracked here the way [`Translation::approx`] tracks it
@@ -179,14 +186,50 @@ pub(crate) struct JointTranslation {
     pub side: Vec<Term>,
 }
 
+/// The model's enumeration literals, indexed for translation. Deriving
+/// them walks every scope's name table, so they are derived **once** per
+/// resolved model and shared by every constraint's translation rather
+/// than rebuilt per constraint. The element and scope tables a resolved
+/// model is built from do not change afterwards, so one derivation
+/// serves the whole run.
+pub(crate) struct EnumTables {
+    /// Enum literal → its EnumerationDefinition.
+    lit_to_enum: HashMap<ElementRef, ElementRef>,
+    /// EnumerationDefinition → its literals in declaration order.
+    enum_lits: HashMap<ElementRef, Vec<ElementRef>>,
+    /// Literal → position within its definition.
+    lit_pos: HashMap<ElementRef, usize>,
+}
+
+impl EnumTables {
+    pub(crate) fn build(r: &ResolvedModel) -> EnumTables {
+        let mut lit_to_enum = HashMap::new();
+        let mut enum_lits = HashMap::new();
+        let mut lit_pos = HashMap::new();
+        for (def, lits) in r.enum_types() {
+            for (i, &lit) in lits.iter().enumerate() {
+                lit_to_enum.insert(lit, def);
+                lit_pos.insert(lit, i);
+            }
+            enum_lits.insert(def, lits);
+        }
+        EnumTables {
+            lit_to_enum,
+            enum_lits,
+            lit_pos,
+        }
+    }
+}
+
 /// Translate `cs` jointly. `Err` means finalization itself failed (a
 /// sort or unit conflict *between* constraints) — the caller degrades to
 /// no propagation, not to a partial one.
 pub(crate) fn translate_all(
     r: &mut ResolvedModel,
+    tables: &EnumTables,
     cs: &[&ConstraintInfo],
 ) -> Result<JointTranslation, Unsupported> {
-    let mut tr = Translator::new(r);
+    let mut tr = Translator::new(r, tables);
     let mut roots = Vec::with_capacity(cs.len());
     for c in cs {
         let translated = tr
@@ -270,9 +313,10 @@ fn seq_intrinsic_arity_ok(name: &str, n: usize) -> bool {
 
 pub(crate) fn translate(
     r: &mut ResolvedModel,
+    tables: &EnumTables,
     c: &ConstraintInfo,
 ) -> Result<Translation, Unsupported> {
-    let mut tr = Translator::new(r);
+    let mut tr = Translator::new(r, tables);
     let root = tr.expr(c.scope, &c.expr)?.term;
     tr.demand(&root, Demand::Bool)?;
     let (vars, enums, side, approx) = tr.finish()?;
@@ -298,6 +342,11 @@ struct Translator<'m> {
     var_keys: HashMap<(ElementRef, Option<ScopeRef>), usize>,
     displays: Vec<String>,
     states: Vec<SortState>,
+    /// Whether each variable is a translation-made auxiliary
+    /// (index-aligned with `displays`).
+    aux: Vec<bool>,
+    /// Auxiliary variable → index in `side` of its defining equality.
+    aux_defs: HashMap<usize, usize>,
     side: Vec<Term>,
     /// Equalities between two still-unknown variables, unified at finish.
     pending_eq: Vec<(usize, usize)>,
@@ -320,34 +369,22 @@ struct Translator<'m> {
     /// Unit linkage between two still-untagged variables, unified at
     /// finish (piggybacks the sort mechanism).
     pending_unit_eq: Vec<(usize, usize)>,
-    /// Enum literal → its EnumerationDefinition (whole model, precomputed).
-    lit_to_enum: HashMap<ElementRef, ElementRef>,
-    /// EnumerationDefinition → its literals in declaration order.
-    enum_lits: HashMap<ElementRef, Vec<ElementRef>>,
-    /// Literal → position within its definition.
-    enum_lit_pos: HashMap<ElementRef, usize>,
+    /// The model's enumeration literal index, derived once per run.
+    tables: &'m EnumTables,
     /// Enum definitions actually used, in first-use order.
     enum_defs: Vec<ElementRef>,
     enum_index: HashMap<ElementRef, usize>,
 }
 
 impl<'m> Translator<'m> {
-    fn new(r: &'m mut ResolvedModel) -> Translator<'m> {
-        let mut lit_to_enum = HashMap::new();
-        let mut enum_lits = HashMap::new();
-        let mut enum_lit_pos = HashMap::new();
-        for (def, lits) in r.enum_types() {
-            for (i, &lit) in lits.iter().enumerate() {
-                lit_to_enum.insert(lit, def);
-                enum_lit_pos.insert(lit, i);
-            }
-            enum_lits.insert(def, lits);
-        }
+    fn new(r: &'m mut ResolvedModel, tables: &'m EnumTables) -> Translator<'m> {
         Translator {
             r,
             var_keys: HashMap::new(),
             displays: Vec::new(),
             states: Vec::new(),
+            aux: Vec::new(),
+            aux_defs: HashMap::new(),
             side: Vec::new(),
             pending_eq: Vec::new(),
             inlining: HashSet::new(),
@@ -357,9 +394,7 @@ impl<'m> Translator<'m> {
             approx: Vec::new(),
             var_units: Vec::new(),
             pending_unit_eq: Vec::new(),
-            lit_to_enum,
-            enum_lits,
-            enum_lit_pos,
+            tables,
             enum_defs: Vec::new(),
             enum_index: HashMap::new(),
         }
@@ -374,32 +409,34 @@ impl<'m> Translator<'m> {
         match self.r.evaluate_in(scope, e) {
             Ok(Value::Boolean(b)) => Ok(Some(UT::plain(Term::BoolLit(b)))),
             Ok(Value::Integer(i)) => Ok(Some(UT::plain(Term::IntLit(i)))),
-            Ok(Value::Rational(f)) => match real_from_f64(f) {
-                Some(s) => Ok(Some(UT::plain(Term::RealLit(s)))),
-                None => bail("a non-finite or out-of-range numeric value"),
+            Ok(Value::Rational(r)) => Ok(Some(UT::plain(Term::RealLit(r)))),
+            Ok(Value::Real(f)) => match Rational::from_f64(f) {
+                Some(r) => Ok(Some(UT::plain(Term::RealLit(r)))),
+                None => bail("a non-finite numeric value"),
             },
             Ok(Value::Quantity(n, u)) => {
                 let unit = Some(UTag {
                     key: u.dims_key(),
-                    scale: u.scale(),
+                    scale: u.scale().clone(),
                     display: u.display().to_string(),
                 });
                 let term = match *n {
                     Value::Integer(i) => Term::IntLit(i),
-                    Value::Rational(f) => match real_from_f64(f) {
-                        Some(s) => Term::RealLit(s),
-                        None => return bail("a non-finite or out-of-range numeric value"),
+                    Value::Rational(r) => Term::RealLit(r),
+                    Value::Real(f) => match Rational::from_f64(f) {
+                        Some(r) => Term::RealLit(r),
+                        None => return bail("a non-finite numeric value"),
                     },
                     _ => return bail("a non-numeric quantity magnitude"),
                 };
                 Ok(Some(UT { term, unit }))
             }
             Ok(Value::String(s)) => Ok(Some(UT::plain(Term::StrLit(s)))),
-            Ok(Value::Element(el)) if self.lit_to_enum.contains_key(&el) => {
+            Ok(Value::Element(el)) if self.tables.lit_to_enum.contains_key(&el) => {
                 Ok(Some(UT::plain(self.enum_term(el)?)))
             }
             Ok(Value::Element(_))
-            | Ok(Value::Unbound(_))
+            | Ok(Value::Unbound(_) | Value::UnboundMember(_))
             | Ok(Value::Indeterminate)
             | Ok(Value::Instance { .. })
             | Ok(Value::Sequence(_))
@@ -471,15 +508,12 @@ impl<'m> Translator<'m> {
                     .unit_of_in(scope, arg)
                     .map_err(|e| Unsupported(format!("a quantity-unit bracket: {e}")))?;
                 if unit.dims_key().is_empty() {
-                    return if unit.scale() == 1.0 {
+                    return if unit.scale().is_one() {
                         Ok(UT::plain(t.term))
                     } else {
-                        let Some(s) = real_from_f64(unit.scale()) else {
-                            return bail("a non-finite unit scale");
-                        };
                         Ok(UT::plain(Term::App(
                             Op::Mul,
-                            vec![t.term, Term::RealLit(s)],
+                            vec![t.term, Term::RealLit(unit.scale().clone())],
                         )))
                     };
                 }
@@ -487,7 +521,7 @@ impl<'m> Translator<'m> {
                     term: t.term,
                     unit: Some(UTag {
                         key: unit.dims_key(),
-                        scale: unit.scale(),
+                        scale: unit.scale().clone(),
                         display: unit.display().to_string(),
                     }),
                 })
@@ -592,7 +626,7 @@ impl<'m> Translator<'m> {
                     (Some(u), 1) => Some(u.clone()),
                     (Some(u), k) => Some(UTag {
                         key: format!("({}^{k})", u.key),
-                        scale: u.scale.powi(k as i32),
+                        scale: u.scale.pow_or_approx(k as i32),
                         display: format!("{}**{k}", u.display),
                     }),
                 };
@@ -921,29 +955,63 @@ impl<'m> Translator<'m> {
     }
 
     /// `max`/`min`: pairwise `ite(a ⋛ b, a, b)` with the comparison's
-    /// unit unification at each step.
+    /// unit unification at each step. Each step's value is named by an
+    /// auxiliary variable defined through a side equality, so the next
+    /// step references a variable rather than a copy of the whole prefix
+    /// (the operand appears in both the condition and a branch): the
+    /// fold stays linear in the item count for both backends.
     fn fold_extremum(&mut self, items: Vec<UT>, cmp: Op, display: &str) -> Result<UT, Unsupported> {
         let mut it = items.into_iter();
         let Some(mut acc) = it.next() else {
             return bail(format!("`{display}` of an empty sequence"));
         };
         self.demand(&acc.term, Demand::Numeric)?;
-        for mut x in it {
+        for (k, mut x) in it.enumerate() {
             self.demand(&x.term, Demand::Numeric)?;
             let unit = self.unify_units(&mut acc, &mut x)?;
+            let linked: Vec<usize> = [&acc.term, &x.term]
+                .into_iter()
+                .filter_map(|t| match t {
+                    Term::Var(j) => Some(*j),
+                    _ => None,
+                })
+                .collect();
+            let step = Term::App(
+                Op::Ite,
+                vec![
+                    Term::App(cmp, vec![acc.term.clone(), x.term.clone()]),
+                    acc.term,
+                    x.term,
+                ],
+            );
+            let i = self.aux_var(format!("{display}#{}", k + 1), unit.clone(), &linked);
+            self.aux_defs.insert(i, self.side.len());
+            self.side.push(Term::App(Op::Eq, vec![Term::Var(i), step]));
             acc = UT {
-                term: Term::App(
-                    Op::Ite,
-                    vec![
-                        Term::App(cmp, vec![acc.term.clone(), x.term.clone()]),
-                        acc.term,
-                        x.term,
-                    ],
-                ),
+                term: Term::Var(i),
                 unit,
             };
         }
         Ok(acc)
+    }
+
+    /// A fresh auxiliary numeric variable standing for a value the
+    /// translation names (`display` only seeds its symbol). It carries
+    /// the value's unit tag and is unit-linked to the `linked`
+    /// variables (the operands of its definition), so a tag arriving
+    /// later on either side reaches the other at finalization exactly as
+    /// it would through a direct comparison. The caller records the
+    /// defining equality.
+    fn aux_var(&mut self, display: String, unit: Option<UTag>, linked: &[usize]) -> usize {
+        let i = self.displays.len();
+        self.displays.push(display);
+        self.states.push(SortState::Numeric);
+        self.var_units.push(unit);
+        self.aux.push(true);
+        for &j in linked {
+            self.pending_unit_eq.push((i, j));
+        }
+        i
     }
 
     // -- finite quantifier expansion -----------------------------------------
@@ -1121,6 +1189,7 @@ impl<'m> Translator<'m> {
         self.displays.push(display);
         self.states.push(state);
         self.var_units.push(None);
+        self.aux.push(false);
         if let Some(lo) = lower {
             self.side
                 .push(Term::App(Op::Ge, vec![Term::Var(i), Term::IntLit(lo)]));
@@ -1142,7 +1211,7 @@ impl<'m> Translator<'m> {
         ctx: Option<ScopeRef>,
         display: String,
     ) -> Result<UT, Unsupported> {
-        if self.lit_to_enum.contains_key(&elem) || self.r.is_enum_value(elem) {
+        if self.tables.lit_to_enum.contains_key(&elem) || self.r.is_enum_value(elem) {
             return self.feature_term(elem, ctx, display);
         }
         if let Some((own_scope, vexpr)) = self.r.value_expr(elem) {
@@ -1150,7 +1219,10 @@ impl<'m> Translator<'m> {
             let closed = self.r.evaluate_in(scope, &vexpr).is_ok_and(|v| {
                 !matches!(
                     v,
-                    Value::Element(_) | Value::Unbound(_) | Value::Indeterminate
+                    Value::Element(_)
+                        | Value::Unbound(_)
+                        | Value::UnboundMember(_)
+                        | Value::Indeterminate
                 )
             });
             if closed && self.inlining.insert(elem) {
@@ -1269,12 +1341,30 @@ impl<'m> Translator<'m> {
             .r
             .evaluate_in(scope, target)
             .map_err(|e| Unsupported(format!("chain target: {e}")))?;
+        if matches!(tval, Value::Indeterminate | Value::UnboundMember(_)) {
+            // A nested unknown member has no concrete featuring context.
+            // Do not identify distinct receiver paths by their shared
+            // declaration, or inline defaults from that declaration.
+            return bail("a chain through an unknown receiver member");
+        }
+        let unbound = matches!(&tval, Value::Unbound(t) if self.r.is_reference_feature(*t));
         let (Value::Element(t) | Value::Unbound(t)) = tval else {
             return bail("a chain whose target is not a model element");
         };
         let Some((hit, sub)) = self.r.member_of(t, qn) else {
             return bail(format!("unresolved reference `{}`", display_expr(whole)));
         };
+        if unbound {
+            // Closed results were already handled by `fold`, which uses
+            // the evaluator's receiver-aware default rules. An unknown
+            // fixed formula may depend on sibling defaults too; inlining
+            // it without that context would invent a definitive value.
+            let display = display_expr(whole);
+            if self.r.has_own_fixed_value(hit) && !self.approx.contains(&display) {
+                self.approx.push(display.clone());
+            }
+            return self.var(hit, sub, display);
+        }
         self.feature_term(hit, sub, display_expr(whole))
     }
 
@@ -1289,7 +1379,7 @@ impl<'m> Translator<'m> {
         ctx: Option<ScopeRef>,
         display: String,
     ) -> Result<UT, Unsupported> {
-        if self.lit_to_enum.contains_key(&elem) {
+        if self.tables.lit_to_enum.contains_key(&elem) {
             return self.enum_term(elem).map(UT::plain);
         }
         if self.r.is_enum_value(elem) {
@@ -1330,6 +1420,7 @@ impl<'m> Translator<'m> {
         self.displays.push(display);
         self.states.push(state);
         self.var_units.push(None);
+        self.aux.push(false);
         if let Some(lo) = lower {
             self.side
                 .push(Term::App(Op::Ge, vec![Term::Var(i), Term::IntLit(lo)]));
@@ -1365,12 +1456,24 @@ impl<'m> Translator<'m> {
                 match &self.var_units[i] {
                     None => {
                         self.var_units[i] = Some(u.clone());
-                        Ok(())
+                        // An auxiliary's tag reaches the value it names,
+                        // exactly as the tag would have reached that value
+                        // spelled in place.
+                        let Some(&k) = self.aux_defs.get(&i) else {
+                            return Ok(());
+                        };
+                        let mut def = std::mem::replace(&mut self.side[k], Term::BoolLit(true));
+                        let out = match &mut def {
+                            Term::App(Op::Eq, args) => self.demand_unit(&mut args[1], u),
+                            _ => Ok(()),
+                        };
+                        self.side[k] = def;
+                        out
                     }
                     Some(v) if v == u => Ok(()),
                     Some(v) if v.key == u.key => {
-                        let Some(ratio) = real_from_f64(v.scale / u.scale) else {
-                            return bail("a non-finite unit-conversion ratio");
+                        let Some(ratio) = v.scale.div(&u.scale) else {
+                            return bail("a zero unit scale");
                         };
                         *t = Term::App(Op::Mul, vec![Term::Var(i), Term::RealLit(ratio)]);
                         Ok(())
@@ -1410,8 +1513,8 @@ impl<'m> Translator<'m> {
             // right term into the left's unit (mirroring the
             // evaluator's measurement-reference conversion).
             (Some(u), Some(v)) if u.key == v.key => {
-                let Some(ratio) = real_from_f64(v.scale / u.scale) else {
-                    return bail("a non-finite unit-conversion ratio");
+                let Some(ratio) = v.scale.div(&u.scale) else {
+                    return bail("a zero unit scale");
                 };
                 b.term = Term::App(
                     Op::Mul,
@@ -1470,7 +1573,8 @@ impl<'m> Translator<'m> {
             if steps > 64 {
                 break;
             }
-            if self.r.element_type(t) == "EnumerationDefinition" && self.enum_lits.contains_key(&t)
+            if self.r.element_type(t) == "EnumerationDefinition"
+                && self.tables.enum_lits.contains_key(&t)
             {
                 let idx = self.intern_enum(t)?;
                 return Ok((SortState::Fixed(Sort::Enum(idx)), None));
@@ -1497,16 +1601,16 @@ impl<'m> Translator<'m> {
     }
 
     fn enum_term(&mut self, lit: ElementRef) -> Result<Term, Unsupported> {
-        let def = self.lit_to_enum[&lit];
+        let def = self.tables.lit_to_enum[&lit];
         let idx = self.intern_enum(def)?;
-        Ok(Term::EnumLit(idx, self.enum_lit_pos[&lit]))
+        Ok(Term::EnumLit(idx, self.tables.lit_pos[&lit]))
     }
 
     fn intern_enum(&mut self, def: ElementRef) -> Result<usize, Unsupported> {
         if let Some(&i) = self.enum_index.get(&def) {
             return Ok(i);
         }
-        if self.enum_lits[&def].is_empty() {
+        if self.tables.enum_lits[&def].is_empty() {
             return bail("an enumeration without literals");
         }
         let i = self.enum_defs.len();
@@ -1687,12 +1791,13 @@ impl<'m> Translator<'m> {
                 sym: format!("v{i}_{}", sanitize(display)),
                 sort,
                 unit: self.var_units[i].as_ref().map(|u| u.display.clone()),
+                aux: self.aux[i],
             });
         }
         let mut enums = Vec::with_capacity(self.enum_defs.len());
         for (k, &def) in self.enum_defs.iter().enumerate() {
             let def_name = self.r.element_name(def).unwrap_or("enum").to_string();
-            let lits = &self.enum_lits[&def];
+            let lits = &self.tables.enum_lits[&def];
             let mut ctors = Vec::with_capacity(lits.len());
             let mut displays = Vec::with_capacity(lits.len());
             for (j, &lit) in lits.iter().enumerate() {
@@ -1734,7 +1839,7 @@ fn compose_mul(a: &Option<UTag>, b: &Option<UTag>) -> Option<UTag> {
             let (x, y) = if u.key <= v.key { (u, v) } else { (v, u) };
             Some(UTag {
                 key: format!("({}*{})", x.key, y.key),
-                scale: u.scale * v.scale,
+                scale: u.scale.mul(&v.scale),
                 display: format!("{}*{}", u.display, v.display),
             })
         }
@@ -1750,12 +1855,12 @@ fn compose_div(a: &Option<UTag>, b: &Option<UTag>) -> Option<UTag> {
         (Some(u), Some(v)) if u == v => None,
         (x, Some(v)) => {
             let (nk, nd, ns) = match x {
-                Some(u) => (u.key.clone(), u.display.clone(), u.scale),
-                None => ("1".to_string(), "1".to_string(), 1.0),
+                Some(u) => (u.key.clone(), u.display.clone(), u.scale.clone()),
+                None => ("1".to_string(), "1".to_string(), Rational::one()),
             };
             Some(UTag {
                 key: format!("({nk}/{})", v.key),
-                scale: ns / v.scale,
+                scale: ns.div(&v.scale).unwrap_or_else(Rational::one),
                 display: format!("{nd}/{}", v.display),
             })
         }

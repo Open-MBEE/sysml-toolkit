@@ -13,37 +13,17 @@ Every `.sysml` file here is a library the toolkit carries **ambiently**: `sysmlv
 
 Never edit the generated files: regenerate them.
 
-## Reproducing the libraries
+## Using and validating the libraries
 
-The generator is the separate `websysml` repository (not yet published). It expects this toolkit checked out as a sibling directory named `sysmlv2` (or `SYSMLV2_ROOT` pointing at it) and writes into this directory.
+The generated sources and provenance sidecars are included in this repository. No generator is needed to use them. Dataset revisions and per-element origins are recorded in the file headers and sidecars; do not edit generated sources by hand. The generation tool is not distributed with this repository.
 
-Prerequisites: Node 22.3 or newer, the Rust toolchain with the `wasm32-unknown-unknown` target, and `wasm-pack` (the wasm crate's `npm/` folder installs one).
+With the standard-library submodule initialized, validate the checked-in sources locally:
 
-```bash
-# 1. In this repository: the kernel the generator validates through —
-#    the nodejs wasm build and the standard-library bundle (once, and
-#    after toolkit changes).
-node crates/sysmlv2-wasm/npm/build.mjs
-
-# 2. In the websysml checkout: the generator's pinned inputs (corpus
-#    packages, compiler, parser), then regenerate every library and
-#    sidecar into this directory. The generator refuses to write
-#    anything that is not strict-check-clean against the standard
-#    library or not formatter-idempotent.
-npm ci
-npm run generate
-
-# 3. Verify, as CI does: outputs current, tests green (in websysml) …
-node src/cli.mjs generate --check
-npm test
-
-# … and the CLI gates (in this repository).
+```sh
 SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/Web.sysml local-packages/Template.sysml local-packages/Svelte.sysml local-packages/WebApp.sysml local-packages/SvelteKit.sysml
 cargo run --release -p sysmlv2-cli -- fmt --check local-packages/Web.sysml local-packages/Template.sysml local-packages/Svelte.sysml local-packages/WebApp.sysml local-packages/SvelteKit.sysml
 ```
 
-`SYSMLV2_AMBIENT=off` keeps the toolkit's built-in copies out of a check, so a regenerated file can be validated as a candidate (and so `sysmlv2` can run against a bare standard library when wanted). The generator's own tests do the same through a core-only kernel bundle.
+Both commands pass clean. Two earlier candidate-validation failures are closed — the `Base::Anything` attribute typings, and an operation repeating a name inherited through a mixin, which the generator now leaves to the inherited declaration and records in the sidecar's omission ledger. Do not suppress a check or patch generated files by hand: correct the generator, then regenerate sources and provenance together. Library-mode loading suppresses library diagnostics, so ordinary consumers never see a candidate-validation failure.
 
-To take a newer corpus or compiler, bump the exact version in the generator's `package.json`, run `npm install` there, regenerate, and review the diff: the goldens in the generator's `test/` directory and the sidecars make every change visible. The library headers name the dataset revisions they were generated from.
-
-The generator's README documents the pipeline, scope, options, and the document/template import commands.
+`SYSMLV2_AMBIENT=off` keeps the toolkit’s built-in copies out of a check, so these files are validated as candidates. It also allows analysis against a bare standard library.

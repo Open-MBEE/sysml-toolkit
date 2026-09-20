@@ -14,10 +14,11 @@
 //! equal `unbound`/`undecided` results prove nothing; this projection
 //! is the comparison made authoritative.
 //!
-//! The engine lives on [`Projector`], which borrows any resolved model
-//! plus its sources — the commit pipeline projects the *prospective*
-//! state (rebuilt but not yet swapped in) exactly like the session's
-//! own; [`Session::effective_member_projection`] is the public wrapper.
+//! The engine lives on the crate-internal projector, which borrows any
+//! resolved model plus its sources — the commit pipeline projects the
+//! *prospective* state (rebuilt but not yet swapped in) exactly like
+//! the session's own; [`Session::effective_member_projection`] is the
+//! public wrapper.
 
 use std::collections::{HashMap, HashSet};
 
@@ -118,7 +119,7 @@ impl Projector<'_> {
         for base in layers {
             for m in self.resolved.owned_members(base) {
                 let metaclass = self.resolved.element_type(m);
-                let name = self.resolved.element_effective_name(m);
+                let name = self.resolved.element_lookup_name(m);
                 if name
                     .as_ref()
                     .is_some_and(|n| !seen.insert((n.clone(), metaclass)))

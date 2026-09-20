@@ -1,0 +1,6 @@
+# The toolchain every gate runs under. CI reads the channel from this
+# file, so a formatting or lint change in a newer release cannot flip a
+# gate without a deliberate bump here.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

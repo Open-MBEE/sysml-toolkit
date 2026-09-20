@@ -40,15 +40,30 @@
 //!               "source", "target" }]
 //! }
 //! ```
+//!
+//! Summary emission ([`VizOptions::summary`], tree view): a container
+//! (a package, or an owner card with drawn members) outside the open
+//! set is one node whose subtree is hidden, carrying
+//! `"summary": { "open": false, "members", "containers", "leaves",
+//! "notes", "hidden", "truncated", "edgesIn", "edgesOut" }` — `notes`
+//! counts the notes on hidden elements below it and `hidden` the hidden
+//! drawable elements below it (the cards the full picture would add); an open container carries the
+//! same object with `"open": true` and `truncated` = direct members
+//! beyond the leaf budget (hidden and counted like a closed one's).
+//! Every reference edge with an endpoint that stands in for a hidden
+//! element is a bundle `{ "kind", "source", "target", "count" }` with no
+//! identity; edges between drawn nodes keep their shape. Notes beyond
+//! the per-cluster budget fold into `"noteCount"` on their target (a
+//! container's own overflow, distinct from `summary.notes` below it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value as Json, json};
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
 
 use crate::behavior::{ACTIONS, CONTROL_NODES, FLOWS, STATES, node_label, transition_edge_label};
 use crate::interconnect::{BLOCK_USAGES, CONNECTORS, KERML_BLOCKS};
-use crate::{Kind, View, VizOptions, classify, roots_of, stereotype, usage_label};
+use crate::{Kind, SummaryOptions, View, VizOptions, classify, roots_of, stereotype, usage_label};
 
 /// Why [`graph`] drew nothing.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -86,6 +101,12 @@ pub fn graph(
     }
     match opts.view {
         View::Tree => {
+            let notes = if opts.show_notes || opts.summary.is_some() {
+                r.annotation_notes()
+            } else {
+                Vec::new()
+            };
+            let summary = opts.summary.as_ref().map(|s| SummaryState::new(&notes, s));
             let mut g = GraphEmitter {
                 r,
                 opts,
@@ -94,12 +115,23 @@ pub fn graph(
                 edges: Vec::new(),
                 drawn: HashMap::new(),
                 rendered: Vec::new(),
+                summary,
             };
             for e in tops {
                 g.render(e, None);
             }
             g.reference_edges();
-            emit_note_nodes(g.r, opts, &g.drawn, &mut g.nodes, &mut g.edges);
+            let note_budget = g.summary.as_ref().map(|s| s.note_budget);
+            emit_note_nodes(
+                g.r,
+                opts,
+                notes,
+                &g.drawn,
+                &mut g.nodes,
+                &mut g.edges,
+                note_budget,
+            );
+            g.finish_summary();
             Ok(json!({ "view": opts.view.as_str(), "nodes": g.nodes, "edges": g.edges }))
         }
         View::Interconnection => {
@@ -118,7 +150,12 @@ pub fn graph(
                 g.render(e, None);
             }
             g.connector_edges();
-            emit_note_nodes(g.r, opts, &g.drawn, &mut g.nodes, &mut g.edges);
+            let notes = if opts.show_notes {
+                g.r.annotation_notes()
+            } else {
+                Vec::new()
+            };
+            emit_note_nodes(g.r, opts, notes, &g.drawn, &mut g.nodes, &mut g.edges, None);
             Ok(json!({ "view": opts.view.as_str(), "nodes": g.nodes, "edges": g.edges }))
         }
         View::State | View::Action => {
@@ -149,24 +186,51 @@ pub fn graph(
 fn emit_note_nodes(
     r: &mut ResolvedModel,
     opts: &VizOptions,
+    notes: Vec<(ElementRef, ElementRef, Option<String>, String)>,
     drawn: &HashMap<ElementRef, String>,
     nodes: &mut Vec<Json>,
     edges: &mut Vec<Json>,
+    note_budget: Option<usize>,
 ) {
     if !opts.show_notes {
         return;
     }
-    for (note, target, name, body) in r.annotation_notes() {
+    // Node id → FIRST position with that id (overlapping roots emit an
+    // element twice; the note keeps following the first, as the linear
+    // search did), for the parent lookup and the folded-count patch
+    // under a budget.
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if let Some(id) = n["id"].as_str() {
+            index.entry(id.to_string()).or_insert(i);
+        }
+    }
+    let mut per_cluster: HashMap<String, usize> = HashMap::new();
+    for (note, target, name, body) in notes {
         let Some(target_id) = drawn.get(&target) else {
             continue;
         };
         // The note joins its target's cluster (package box) so layout
         // keeps them together; the target itself may be a cluster.
-        let parent = nodes
-            .iter()
-            .find(|n| n["id"].as_str() == Some(target_id))
-            .and_then(|n| n["parent"].as_str())
+        let parent = index
+            .get(target_id)
+            .and_then(|&i| nodes[i]["parent"].as_str())
             .map(str::to_string);
+        if let Some(budget) = note_budget {
+            // Notes beyond the per-cluster budget fold into a count on
+            // their target instead of a card each.
+            let slot = per_cluster
+                .entry(parent.clone().unwrap_or_default())
+                .or_insert(0);
+            if *slot >= budget {
+                if let Some(&i) = index.get(target_id) {
+                    let count = nodes[i]["noteCount"].as_u64().unwrap_or(0) + 1;
+                    nodes[i]["noteCount"] = json!(count);
+                }
+                continue;
+            }
+            *slot += 1;
+        }
         let id = r.element_id(note).to_string();
         let mut obj = serde_json::Map::new();
         obj.insert("id".into(), json!(id));
@@ -213,9 +277,285 @@ struct GraphEmitter<'a> {
     drawn: HashMap<ElementRef, String>,
     /// Node-rendered elements (usage-likeness), for the second pass.
     rendered: Vec<(ElementRef, bool)>,
+    /// Summary-mode bookkeeping (large scopes); `None` is the full emission.
+    summary: Option<SummaryState>,
+}
+
+/// Counts a container node carries in summary mode.
+#[derive(Clone, Debug, Default)]
+struct SummaryCounts {
+    open: bool,
+    members: usize,
+    containers: usize,
+    leaves: usize,
+    notes: usize,
+    /// Drawable elements hidden below the container, at every depth.
+    hidden: usize,
+    truncated: usize,
+    edges_in: usize,
+    edges_out: usize,
+}
+
+/// Summary-mode state of the tree emitter (see [`SummaryOptions`]).
+struct SummaryState {
+    open: HashSet<ElementRef>,
+    /// Open containers whose members all draw, whatever the leaf budget.
+    unbounded: HashSet<ElementRef>,
+    note_budget: usize,
+    leaf_budget: usize,
+    /// Notes per annotated element, for the counts under closed containers.
+    notes_by_target: HashMap<ElementRef, usize>,
+    /// Hidden element → id of the emitted container standing in for it.
+    hidden: HashMap<ElementRef, String>,
+    /// Hidden elements in walk order with their usage-likeness, for the
+    /// reference pass that aggregates their edges onto the container.
+    hidden_order: Vec<(ElementRef, bool)>,
+    /// Container node id → its counts, patched onto the node at the end.
+    counts: HashMap<String, SummaryCounts>,
+    /// Reference edges with a hidden end: (source node, target node,
+    /// kind), bundled with a count by [`GraphEmitter::finish_summary`].
+    bundle: Vec<(String, String, String)>,
+}
+
+impl SummaryState {
+    fn new(
+        notes: &[(ElementRef, ElementRef, Option<String>, String)],
+        opts: &SummaryOptions,
+    ) -> SummaryState {
+        let mut notes_by_target: HashMap<ElementRef, usize> = HashMap::new();
+        for (_, target, _, _) in notes {
+            *notes_by_target.entry(*target).or_insert(0) += 1;
+        }
+        SummaryState {
+            open: opts.open.iter().copied().collect(),
+            unbounded: opts.unbounded.iter().copied().collect(),
+            note_budget: opts.note_budget,
+            leaf_budget: opts.leaf_budget,
+            notes_by_target,
+            hidden: HashMap::new(),
+            hidden_order: Vec::new(),
+            counts: HashMap::new(),
+            bundle: Vec::new(),
+        }
+    }
 }
 
 impl GraphEmitter<'_> {
+    /// Members of `e` that would draw as nodes: everything but metadata
+    /// and skipped kinds; on a non-package, compartment lines are rows,
+    /// not members.
+    fn drawable_children(&mut self, e: ElementRef, is_package: bool) -> Vec<ElementRef> {
+        // Enumerations draw their literals as rows and nothing else.
+        if matches!(
+            self.r.element_type(e),
+            "EnumerationDefinition" | "EnumerationUsage"
+        ) {
+            return Vec::new();
+        }
+        let metas = self.r.metadata_of(e);
+        let mut out = Vec::new();
+        for m in self.r.owned_members(e) {
+            if metas.contains(&m) {
+                continue;
+            }
+            match classify(self.r, self.opts.show_metadata, m) {
+                Kind::Skip => {}
+                Kind::Line if !is_package => {}
+                _ => out.push(m),
+            }
+        }
+        out
+    }
+
+    /// Hide `e` and its drawable subtree under the container `cid`:
+    /// every hidden element maps to the container for the reference
+    /// pass, and the notes below it join the container's count. Returns
+    /// how many drawable members `e` has (nonzero: a container).
+    fn hide_subtree(&mut self, e: ElementRef, cid: &str, counts: &mut SummaryCounts) -> usize {
+        let kind = classify(self.r, self.opts.show_metadata, e);
+        let is_usage = matches!(kind, Kind::UsageNode | Kind::Line);
+        let is_package = matches!(kind, Kind::Package);
+        let notes = self
+            .summary
+            .as_ref()
+            .and_then(|s| s.notes_by_target.get(&e).copied())
+            .unwrap_or(0);
+        counts.notes += notes;
+        counts.hidden += 1;
+        if let Some(s) = self.summary.as_mut() {
+            // Overlapping roots reach an element twice; its references
+            // bundle once.
+            if s.hidden.insert(e, cid.to_string()).is_none() {
+                s.hidden_order.push((e, is_usage));
+            }
+        }
+        let children = self.drawable_children(e, is_package);
+        let n = children.len();
+        for c in children {
+            self.hide_subtree(c, cid, counts);
+        }
+        n
+    }
+
+    /// Summary mode: emit the members of container `id` (element `e`)
+    /// — closed: every member hidden and counted; open: members drawn
+    /// up to the leaf budget, the rest hidden and counted as truncated.
+    /// Returns false when not in summary mode (the caller draws as
+    /// usual).
+    fn summary_members(&mut self, e: ElementRef, id: &str, is_package: bool) -> bool {
+        let Some(open) = self.summary.as_ref().map(|s| s.open.contains(&e)) else {
+            return false;
+        };
+        let children = self.drawable_children(e, is_package);
+        // An empty package is a leaf, not an openable box.
+        if !children.is_empty() {
+            self.summary_children(e, id, open, children, Some(id));
+        }
+        true
+    }
+
+    /// Summary mode: draw or hide the drawable `children` of the
+    /// container `id` and record its counts. Open: members draw (as
+    /// `parent`'s children) up to the leaf budget, the rest hide as
+    /// `truncated`; closed: everything hides. A drawn member is a
+    /// container when it recorded counts of its own; a hidden one when
+    /// it had drawable members. Returns the members that drew.
+    fn summary_children(
+        &mut self,
+        e: ElementRef,
+        id: &str,
+        open: bool,
+        children: Vec<ElementRef>,
+        parent: Option<&str>,
+    ) -> Vec<ElementRef> {
+        // An unbounded container (the per-container override) draws
+        // every member; the rest share the leaf budget.
+        let leaf_budget = self.summary.as_ref().map_or(usize::MAX, |s| {
+            if s.unbounded.contains(&e) {
+                usize::MAX
+            } else {
+                s.leaf_budget
+            }
+        });
+        let mut counts = SummaryCounts {
+            open,
+            ..SummaryCounts::default()
+        };
+        let mut emitted = 0usize;
+        let mut drawn = Vec::new();
+        for c in children {
+            counts.members += 1;
+            if open && emitted < leaf_budget {
+                self.render(c, parent);
+                emitted += 1;
+                drawn.push(c);
+                let container = self.drawn.get(&c).is_some_and(|cid| {
+                    self.summary
+                        .as_ref()
+                        .is_some_and(|s| s.counts.contains_key(cid))
+                });
+                if container {
+                    counts.containers += 1;
+                } else {
+                    counts.leaves += 1;
+                }
+            } else {
+                if open {
+                    counts.truncated += 1;
+                }
+                if self.hide_subtree(c, id, &mut counts) > 0 {
+                    counts.containers += 1;
+                } else {
+                    counts.leaves += 1;
+                }
+            }
+        }
+        if let Some(s) = self.summary.as_mut() {
+            s.counts.insert(id.to_string(), counts);
+        }
+        drawn
+    }
+
+    /// The emitted node an element resolves to: its own node when drawn
+    /// (`false`), else (summary mode) the container standing in for it
+    /// (`true` — an edge to it is a bundle, not a relationship).
+    fn visible_id(&self, e: ElementRef) -> Option<(String, bool)> {
+        if let Some(id) = self.drawn.get(&e) {
+            return Some((id.clone(), false));
+        }
+        self.summary
+            .as_ref()
+            .and_then(|s| s.hidden.get(&e).map(|id| (id.clone(), true)))
+    }
+
+    /// A reference edge: as itself between drawn nodes, or — when either
+    /// end stands in for hidden elements — counted into the bundle
+    /// between the two container nodes (summary mode only).
+    fn emit_ref(&mut self, remapped: bool, src: &str, tgt: &str, kind: &str, edge: Json) {
+        if remapped {
+            if let Some(s) = self.summary.as_mut() {
+                s.bundle
+                    .push((src.to_string(), tgt.to_string(), kind.to_string()));
+            }
+        } else {
+            self.edges.push(edge);
+        }
+    }
+
+    /// Summary mode, after every edge is in: edges touching a container
+    /// node collapse to one per (source, target, kind) with a `count`
+    /// (identity dropped — a bundle is not one relationship), self-loops
+    /// on a container vanish, the counts land on the container nodes.
+    fn finish_summary(&mut self) {
+        let Some(s) = self.summary.as_mut() else {
+            return;
+        };
+        let mut aggregated: Vec<((String, String, String), usize)> = Vec::new();
+        let mut slot: HashMap<(String, String, String), usize> = HashMap::new();
+        for key in s.bundle.drain(..) {
+            // Both ends inside one container: interior, not a bundle.
+            if key.0 == key.1 {
+                continue;
+            }
+            match slot.get(&key) {
+                Some(&i) => aggregated[i].1 += 1,
+                None => {
+                    slot.insert(key.clone(), aggregated.len());
+                    aggregated.push((key, 1));
+                }
+            }
+        }
+        for ((src, tgt, kind), count) in aggregated {
+            if let Some(c) = s.counts.get_mut(&src) {
+                c.edges_out += count;
+            }
+            if let Some(c) = s.counts.get_mut(&tgt) {
+                c.edges_in += count;
+            }
+            self.edges
+                .push(json!({ "kind": kind, "source": src, "target": tgt, "count": count }));
+        }
+        for n in self.nodes.iter_mut() {
+            let Some(id) = n["id"].as_str() else {
+                continue;
+            };
+            let Some(c) = s.counts.get(id) else {
+                continue;
+            };
+            n["summary"] = json!({
+                "open": c.open,
+                "members": c.members,
+                "containers": c.containers,
+                "leaves": c.leaves,
+                "notes": c.notes,
+                "hidden": c.hidden,
+                "truncated": c.truncated,
+                "edgesIn": c.edges_in,
+                "edgesOut": c.edges_out,
+            });
+        }
+    }
+
     fn id_of(&self, e: ElementRef) -> String {
         self.r.element_id(e).to_string()
     }
@@ -378,6 +718,9 @@ impl GraphEmitter<'_> {
         self.nodes.push(Json::Object(obj));
         self.drawn.insert(e, id.clone());
         self.rendered.push((e, false));
+        if self.summary_members(e, &id, true) {
+            return;
+        }
         let metas = self.r.metadata_of(e);
         for m in self.r.owned_members(e) {
             if !metas.contains(&m) {
@@ -455,46 +798,89 @@ impl GraphEmitter<'_> {
         self.drawn.insert(e, id.clone());
         self.rendered.push((e, is_usage));
 
+        // Summary mode: an owner card is a container — closed, its
+        // members hide under it with counts; open, they draw as sibling
+        // cards up to the budget. Ownership edges to drawn members are
+        // emitted below for the open case.
+        if !children.is_empty() && self.summary.is_some() {
+            let open = self.summary.as_ref().is_some_and(|s| s.open.contains(&e));
+            let drawn_children = self.summary_children(e, &id, open, children, parent);
+            for child in drawn_children {
+                self.ownership_edge(&id, child);
+            }
+            return;
+        }
+
         for child in children {
             self.render(child, parent);
-            if let Some(child_id) = self.drawn.get(&child).cloned() {
-                let kind = match classify(self.r, self.opts.show_metadata, child) {
-                    Kind::UsageNode | Kind::Line => "composition",
-                    _ => "membership",
-                };
-                let mut obj = serde_json::Map::new();
-                obj.insert("kind".into(), json!(kind));
-                obj.insert("source".into(), json!(id));
-                obj.insert("target".into(), json!(child_id));
-                // The notation splits composite (filled diamond) from
-                // non-composite (hollow diamond) feature membership —
-                // the graph twin of the PlantUML `*--` vs `o--` pick.
-                if kind == "composition" && self.r.is_composite(child) == Some(false) {
-                    obj.insert("composite".into(), json!(false));
-                }
-                self.edges.push(Json::Object(obj));
+            self.ownership_edge(&id, child);
+        }
+    }
+
+    /// The composition / membership edge from an owner card to a drawn
+    /// member (nothing when the member did not draw).
+    fn ownership_edge(&mut self, id: &str, child: ElementRef) {
+        if let Some(child_id) = self.drawn.get(&child).cloned() {
+            let kind = match classify(self.r, self.opts.show_metadata, child) {
+                Kind::UsageNode | Kind::Line => "composition",
+                _ => "membership",
+            };
+            let mut obj = serde_json::Map::new();
+            obj.insert("kind".into(), json!(kind));
+            obj.insert("source".into(), json!(id));
+            obj.insert("target".into(), json!(child_id));
+            // The notation splits composite (filled diamond) from
+            // non-composite (hollow diamond) feature membership —
+            // the graph twin of the PlantUML `*--` vs `o--` pick.
+            if kind == "composition" && self.r.is_composite(child) == Some(false) {
+                obj.insert("composite".into(), json!(false));
             }
+            self.edges.push(Json::Object(obj));
         }
     }
 
     /// Second pass: typing / specialization / import edges between
     /// drawn nodes (plus on-demand library nodes under `show_lib`),
     /// «keyword» reference edges for the shorthand usages, and
-    /// dependency edges.
+    /// dependency edges. In summary mode the hidden elements take the
+    /// same pass with their container as the source, and
+    /// [`Self::finish_summary`] bundles what touches a container.
     fn reference_edges(&mut self) {
         // Collection is over, so the pass takes the list rather than
         // copying it to keep the emitter free to mutate.
         for (e, is_usage) in std::mem::take(&mut self.rendered) {
             let id = self.drawn[&e].clone();
+            self.reference_edges_of(e, is_usage, &id, false);
+        }
+        let hidden: Vec<(ElementRef, bool, String)> = self
+            .summary
+            .as_ref()
+            .map(|s| {
+                s.hidden_order
+                    .iter()
+                    .map(|&(e, u)| (e, u, s.hidden[&e].clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (e, is_usage, cid) in hidden {
+            self.reference_edges_of(e, is_usage, &cid, true);
+        }
+        self.dependency_edges();
+    }
+
+    /// One element's reference edges from node `id` (`hidden`: the
+    /// element stands behind a container, so every edge is a bundle).
+    fn reference_edges_of(&mut self, e: ElementRef, is_usage: bool, id: &str, hidden: bool) {
+        {
             let typings = if is_usage {
                 self.r.typings(e)
             } else {
                 Vec::new()
             };
             for target in &typings {
-                if let Some(tid) = self.target_id(*target) {
-                    self.edges
-                        .push(json!({ "kind": "typing", "source": id, "target": tid }));
+                if let Some((tid, remapped)) = self.target_id(*target) {
+                    let edge = json!({ "kind": "typing", "source": id, "target": tid });
+                    self.emit_ref(hidden || remapped, id, &tid, "typing", edge);
                 }
             }
             // Kept under the umbrella kind "specialization" (consumer
@@ -507,12 +893,13 @@ impl GraphEmitter<'_> {
                 // portion-relationship, not a plain subsetting arrow.
                 if rel == "Subsetting" {
                     if let Some(p) = self.r.portion_kind(e).map(str::to_string) {
-                        if let Some(tid) = self.target_id(target) {
-                            self.edges.push(json!({
+                        if let Some((tid, remapped)) = self.target_id(target) {
+                            let edge = json!({
                                 "kind": "portion", "portionKind": p,
                                 "directed": true,
                                 "source": id, "target": tid,
-                            }));
+                            });
+                            self.emit_ref(hidden || remapped, id, &tid, "portion", edge);
                         }
                         continue;
                     }
@@ -524,16 +911,17 @@ impl GraphEmitter<'_> {
                     "FeatureTyping" => "typing",
                     _ => continue,
                 };
-                if let Some(tid) = self.target_id(target) {
-                    self.edges.push(json!({
+                if let Some((tid, remapped)) = self.target_id(target) {
+                    let edge = json!({
                         "kind": "specialization", "rel": rel,
                         "source": id, "target": tid,
-                    }));
+                    });
+                    self.emit_ref(hidden || remapped, id, &tid, "specialization", edge);
                 }
             }
             if self.opts.show_imported {
                 for (target, is_ns, recursive, visibility) in self.r.import_details(e) {
-                    if let Some(tid) = self.drawn.get(&target).cloned() {
+                    if let Some((tid, remapped)) = self.visible_id(target) {
                         let import_kind = if recursive {
                             "recursive"
                         } else if is_ns {
@@ -551,7 +939,7 @@ impl GraphEmitter<'_> {
                         }
                         obj.insert("source".into(), json!(id));
                         obj.insert("target".into(), json!(tid));
-                        self.edges.push(Json::Object(obj));
+                        self.emit_ref(hidden || remapped, id, &tid, "import", Json::Object(obj));
                     }
                 }
             }
@@ -565,7 +953,8 @@ impl GraphEmitter<'_> {
                 .map(|(_, k)| *k)
             {
                 for chain in self.r.referenced_features(e) {
-                    let Some(tid) = chain.iter().rev().find_map(|l| self.drawn.get(l).cloned())
+                    let Some((tid, remapped)) =
+                        chain.iter().rev().find_map(|l| self.visible_id(*l))
                     else {
                         continue;
                     };
@@ -575,11 +964,10 @@ impl GraphEmitter<'_> {
                     obj.insert("directed".into(), json!(true));
                     obj.insert("source".into(), json!(id));
                     obj.insert("target".into(), json!(tid));
-                    self.edges.push(Json::Object(obj));
+                    self.emit_ref(hidden || remapped, id, &tid, kind, Json::Object(obj));
                 }
             }
         }
-        self.dependency_edges();
     }
 
     /// Dependency elements between drawn nodes: one directed edge per
@@ -596,17 +984,17 @@ impl GraphEmitter<'_> {
                 base.insert("label".into(), json!(n));
             }
             for c in &clients {
-                let Some(cid) = self.drawn.get(c).cloned() else {
+                let Some((cid, rc)) = self.visible_id(*c) else {
                     continue;
                 };
                 for s in &suppliers {
-                    let Some(sid) = self.drawn.get(s).cloned() else {
+                    let Some((sid, rs)) = self.visible_id(*s) else {
                         continue;
                     };
                     let mut obj = base.clone();
                     obj.insert("source".into(), json!(cid));
                     obj.insert("target".into(), json!(sid));
-                    self.edges.push(Json::Object(obj));
+                    self.emit_ref(rc || rs, &cid, &sid, "dependency", Json::Object(obj));
                 }
             }
         }
@@ -614,9 +1002,9 @@ impl GraphEmitter<'_> {
 
     /// The node an edge target draws to: its node when rendered; under
     /// `show_lib`, an on-demand marked node for a library element.
-    fn target_id(&mut self, target: ElementRef) -> Option<String> {
-        if let Some(id) = self.drawn.get(&target) {
-            return Some(id.clone());
+    fn target_id(&mut self, target: ElementRef) -> Option<(String, bool)> {
+        if let Some(hit) = self.visible_id(target) {
+            return Some(hit);
         }
         if !self.opts.show_lib || !self.r.is_library_element(target) {
             return None;
@@ -638,7 +1026,7 @@ impl GraphEmitter<'_> {
         obj.insert("rows".into(), json!([]));
         self.nodes.push(Json::Object(obj));
         self.drawn.insert(target, id.clone());
-        Some(id)
+        Some((id, false))
     }
 }
 

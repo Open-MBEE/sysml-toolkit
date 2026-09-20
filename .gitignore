@@ -1,6 +1,5 @@
 target/
 target-wasm/
 target-msrv/
-/CLAUDE.local.md
 node_modules/
 .DS_Store

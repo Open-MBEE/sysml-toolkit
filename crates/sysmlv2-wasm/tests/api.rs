@@ -2312,3 +2312,97 @@ fn verify_positions_bindings_in_their_own_unit() {
     assert_eq!(report["summary"]["satisfied"], 1);
     assert_eq!(report["summary"]["violated"], 1);
 }
+
+const SUMMARY_MODEL: &str = "package P { package Q { part def A; part def B :> A; part q : A; } part def D { part d1 : Q::A; } part def L; }";
+
+#[test]
+fn to_graph_summary_resolves_selectors_and_reports_the_rest() {
+    let mut s = Session::from_sources(&sources(&[("p.sysml", SUMMARY_MODEL)])).unwrap();
+    let full: serde_json::Value = serde_json::from_str(&s.to_graph(None).unwrap()).unwrap();
+    assert!(
+        full.get("summary").is_none(),
+        "no reply field without a request"
+    );
+    let d_id = full["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["qname"] == "P::D")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let req = format!(
+        r#"{{"summary":{{"open":["P",{{"elementId":"{d_id}"}},"Nope::Missing",{{"elementId":"00000000-0000-0000-0000-000000000000"}}],"noteBudget":10,"leafBudget":50}}}}"#
+    );
+    let g: serde_json::Value = serde_json::from_str(&s.to_graph(Some(req)).unwrap()).unwrap();
+    let resolved = g["summary"]["resolved"].as_array().unwrap();
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(resolved[0]["qualifiedName"], "P");
+    assert_eq!(resolved[1]["id"], d_id);
+    assert_eq!(g["summary"]["unresolved"].as_array().unwrap().len(), 2);
+    assert_eq!(g["summary"]["unresolved"][0], "Nope::Missing");
+    let nodes = g["nodes"].as_array().unwrap();
+    assert!(
+        nodes.iter().any(|n| n["qname"] == "P::D::d1"),
+        "the opened owner card draws its member"
+    );
+    let q = nodes.iter().find(|n| n["qname"] == "P::Q").unwrap();
+    assert_eq!(q["summary"]["open"], false);
+    assert!(nodes.iter().all(|n| n["qname"] != "P::Q::A"));
+    // Unknown fields inside the summary object are rejected like any option.
+    assert!(
+        s.to_graph(Some(r#"{"summary":{"open":[],"bogus":1}}"#.into()))
+            .unwrap_err()
+            .contains("bad options")
+    );
+    assert!(
+        s.to_graph(Some(
+            r#"{"view":"interconnection","summary":{"open":[]}}"#.into()
+        ))
+        .unwrap_err()
+        .contains("tree-only")
+    );
+    // An empty roots list means the whole model, as without a summary:
+    // the root package draws closed, and the reply field rides along.
+    let whole: serde_json::Value = serde_json::from_str(
+        &s.to_graph(Some(r#"{"roots":[],"summary":{"open":[]}}"#.into()))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(whole["nodes"].as_array().unwrap().len(), 1);
+    assert!(whole.get("summary").is_some());
+    // The PlantUML path ignores the field.
+    assert!(
+        s.to_plantuml(Some(r#"{"summary":{"open":["P"]}}"#.into()))
+            .unwrap()
+            .starts_with("@startuml")
+    );
+}
+
+#[test]
+fn reveal_path_walks_owners_root_first() {
+    let mut s = Session::from_sources(&sources(&[("p.sysml", SUMMARY_MODEL)])).unwrap();
+    let by_name: serde_json::Value =
+        serde_json::from_str(&s.reveal_path("P::Q::A").unwrap()).unwrap();
+    let names: Vec<&str> = by_name
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["qualifiedName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["P", "P::Q"]);
+    let as_json: serde_json::Value =
+        serde_json::from_str(&s.reveal_path(r#""P::Q::A""#).unwrap()).unwrap();
+    assert_eq!(as_json, by_name);
+    let q_id = by_name[1]["id"].as_str().unwrap();
+    let by_id: serde_json::Value = serde_json::from_str(
+        &s.reveal_path(&format!(r#"{{"elementId":"{q_id}"}}"#))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(by_id.as_array().unwrap().len(), 1, "Q's only owner is P");
+    let root: serde_json::Value = serde_json::from_str(&s.reveal_path("P").unwrap()).unwrap();
+    assert_eq!(root.as_array().unwrap().len(), 0);
+    assert!(s.reveal_path("Nope").is_err());
+}

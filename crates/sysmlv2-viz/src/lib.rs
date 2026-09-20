@@ -300,6 +300,29 @@ pub struct VizOptions {
     /// package/root filter behind the diagram panel's package selector.
     /// Ignored when a single `root` is passed (that scoping wins).
     pub roots: Option<Vec<ElementRef>>,
+    /// Summary emission for large scopes (graph emitter, tree view):
+    /// containers outside `open` emit as one node with counts, cross-
+    /// container references aggregate, notes beyond a budget fold into
+    /// counts. `None` is the full emission.
+    pub summary: Option<SummaryOptions>,
+}
+
+/// Summary emission controls (see [`VizOptions::summary`]).
+#[derive(Clone, Debug, Default)]
+pub struct SummaryOptions {
+    /// Containers whose direct members are emitted; every other container
+    /// is one summary node. An entry under a closed ancestor is inert
+    /// (the ancestor hides it); the scope roots must be listed to open.
+    pub open: Vec<ElementRef>,
+    /// Notes drawn as nodes per cluster; the rest become `noteCount` on
+    /// their target.
+    pub note_budget: usize,
+    /// Direct members emitted per open container; the rest are counted as
+    /// `truncated` and hidden under it.
+    pub leaf_budget: usize,
+    /// Open containers drawn whole: every direct member emits regardless
+    /// of `leaf_budget` (a per-container override).
+    pub unbounded: Vec<ElementRef>,
 }
 
 impl Default for VizOptions {
@@ -317,6 +340,7 @@ impl Default for VizOptions {
             std_color: false,
             link_template: None,
             roots: None,
+            summary: None,
         }
     }
 }
@@ -324,6 +348,12 @@ impl Default for VizOptions {
 /// One setter per option, each consuming and returning the options so
 /// they chain from [`VizOptions::default`].
 impl VizOptions {
+    /// Configure summary emission for the structured tree graph.
+    pub fn with_summary(mut self, summary: Option<SummaryOptions>) -> VizOptions {
+        self.summary = summary;
+        self
+    }
+
     /// Layout direction.
     pub fn with_direction(mut self, direction: Direction) -> VizOptions {
         self.direction = direction;

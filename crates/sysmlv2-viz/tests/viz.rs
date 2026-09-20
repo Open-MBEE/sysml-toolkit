@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use sysmlv2_model::json::ResolvedModel;
+use sysmlv2_model::json::{ElementRef, ResolvedModel};
 use sysmlv2_model::model::Model;
 use sysmlv2_viz::{Direction, LineStyle, View, VizOptions, plantuml};
 
@@ -1625,4 +1625,523 @@ fn graph_action_view_params_are_border_chips() {
     assert_eq!(param("shots")["direction"], "in");
     assert_eq!(param("frames")["direction"], "out");
     assert_eq!(param("shots")["parent"], capture["id"]);
+}
+
+// ---------------------------------------------------------------------------
+// Summary emission (large scopes)
+// ---------------------------------------------------------------------------
+
+const SUMMARY_MODEL: &str = "package P {
+    doc /* on P */
+    package Q {
+        part def A;
+        part def B :> A;
+        part q : A;
+        comment about A /* c2 */
+    }
+    part def D { part d1 : Q::A; part d2 : Q::B; }
+    part def L;
+    comment about L /* c1 */
+}
+";
+
+fn summary_graph(
+    r: &mut ResolvedModel,
+    open: &[&str],
+    note_budget: usize,
+    leaf_budget: usize,
+) -> serde_json::Value {
+    let open = open
+        .iter()
+        .map(|q| r.resolve_qualified(q).expect(q))
+        .collect();
+    let opts = VizOptions::default().with_summary(Some(sysmlv2_viz::SummaryOptions {
+        open,
+        note_budget,
+        leaf_budget,
+        unbounded: Vec::new(),
+    }));
+    sysmlv2_viz::graph(r, None, &opts).unwrap()
+}
+
+fn node<'a>(g: &'a serde_json::Value, qname: &str) -> &'a serde_json::Value {
+    g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["qname"] == qname)
+        .unwrap_or_else(|| panic!("node {qname}"))
+}
+
+#[test]
+fn summary_closed_root_is_one_node_with_counts() {
+    let mut r = resolved(SUMMARY_MODEL);
+    let g = summary_graph(&mut r, &[], 200, 500);
+    let ids: Vec<&str> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["qname"].as_str())
+        .collect();
+    // P plus its own doc note (P is drawn, so its note draws too); nothing below.
+    assert_eq!(
+        ids.iter()
+            .filter(|q| !q.contains("doc") && !q.contains("comment"))
+            .collect::<Vec<_>>(),
+        vec![&"P"]
+    );
+    let s = &node(&g, "P")["summary"];
+    assert_eq!(s["open"], false);
+    assert_eq!(s["members"], 3, "Q, D, L");
+    assert_eq!(s["containers"], 2, "Q and the owner card D");
+    assert_eq!(s["leaves"], 1);
+    assert_eq!(s["notes"], 2, "c1 on L and c2 on A hide under P");
+    assert_eq!(s["hidden"], 8, "Q, A, B, q, D, d1, d2, L");
+    assert_eq!(s["truncated"], 0);
+    // Every reference stays inside P: no aggregated edge.
+    assert!(
+        g["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] == "note")
+    );
+}
+
+#[test]
+fn summary_open_root_draws_members_and_aggregates_cross_container_edges() {
+    let mut r = resolved(SUMMARY_MODEL);
+    let g = summary_graph(&mut r, &["P"], 200, 500);
+    assert_eq!(node(&g, "P")["summary"]["open"], true);
+    let q = &node(&g, "P::Q")["summary"];
+    assert_eq!(q["open"], false);
+    assert_eq!(q["members"], 3, "A, B, q");
+    assert_eq!(q["containers"], 0);
+    assert_eq!(q["notes"], 1);
+    let d = &node(&g, "P::D")["summary"];
+    assert_eq!(d["members"], 2, "d1, d2 hide under the closed owner card");
+    assert_eq!(d["hidden"], 2);
+    assert_eq!(q["hidden"], 3);
+    assert!(
+        node(&g, "P::L").get("summary").is_none(),
+        "a leaf carries no summary"
+    );
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["qname"] != "P::D::d1")
+    );
+    // d1 : A and d2 : B become one typing bundle D → Q with a count and no identity.
+    let bundle: Vec<&serde_json::Value> = g["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "typing")
+        .collect();
+    assert_eq!(bundle.len(), 1);
+    assert_eq!(bundle[0]["source"], node(&g, "P::D")["id"]);
+    assert_eq!(bundle[0]["target"], node(&g, "P::Q")["id"]);
+    assert_eq!(bundle[0]["count"], 2);
+    assert!(bundle[0].get("id").is_none());
+    assert_eq!(d["edgesOut"], 2);
+    assert_eq!(q["edgesIn"], 2);
+}
+
+#[test]
+fn summary_leaf_budget_truncates_and_counts() {
+    let mut r = resolved(SUMMARY_MODEL);
+    let g = summary_graph(&mut r, &["P"], 200, 1);
+    let p = &node(&g, "P")["summary"];
+    assert_eq!(p["members"], 3);
+    assert_eq!(p["truncated"], 2, "D and L beyond the budget of one");
+    assert_eq!(p["notes"], 1, "c1 on the hidden L");
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["qname"] != "P::D" && n["qname"] != "P::L")
+    );
+    // The hidden D's typings now leave P for Q.
+    let bundle: Vec<&serde_json::Value> = g["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "typing")
+        .collect();
+    assert_eq!(bundle.len(), 1);
+    assert_eq!(bundle[0]["source"], node(&g, "P")["id"]);
+    assert_eq!(bundle[0]["count"], 2);
+}
+
+#[test]
+fn summary_unbounded_container_draws_every_member() {
+    let mut r = resolved(SUMMARY_MODEL);
+    let q = r.resolve_qualified("P::Q").expect("P::Q");
+    let open = ["P", "P::Q"]
+        .iter()
+        .map(|name| r.resolve_qualified(name).expect(name))
+        .collect();
+    let opts = VizOptions::default().with_summary(Some(sysmlv2_viz::SummaryOptions {
+        open,
+        note_budget: 200,
+        leaf_budget: 1,
+        unbounded: vec![q],
+    }));
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    // Q is unbounded: all three members draw, nothing truncated.
+    let qs = &node(&g, "P::Q")["summary"];
+    assert_eq!(qs["members"], 3);
+    assert_eq!(
+        qs["truncated"], 0,
+        "an unbounded container draws every member"
+    );
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["qname"] == "P::Q::B")
+    );
+    // P keeps the shared budget: Q drew, D and L are truncated.
+    let ps = &node(&g, "P")["summary"];
+    assert_eq!(ps["truncated"], 2, "the override is per container");
+}
+
+#[test]
+fn summary_note_budget_folds_notes_into_counts() {
+    let mut r = resolved(SUMMARY_MODEL);
+    let g = summary_graph(&mut r, &["P"], 0, 500);
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["kind"] != "note")
+    );
+    assert_eq!(
+        node(&g, "P")["noteCount"],
+        1,
+        "the doc on P folds into a count"
+    );
+    assert!(
+        g["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] != "note")
+    );
+}
+
+#[test]
+fn full_emission_carries_no_summary_fields() {
+    let mut r = resolved(SUMMARY_MODEL);
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n.get("summary").is_none() && n.get("noteCount").is_none())
+    );
+    assert!(
+        g["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("count").is_none())
+    );
+    assert_eq!(
+        g["nodes"].as_array().unwrap().len(),
+        12,
+        "P, Q, A, B, q, D, d1, d2, L + 3 notes"
+    );
+}
+
+/// The full emission with the summary-only keys removed, for the
+/// invariant that opening every container with unbounded budgets is
+/// the full picture.
+fn strip_summary(mut g: serde_json::Value) -> serde_json::Value {
+    for n in g["nodes"].as_array_mut().unwrap() {
+        n.as_object_mut().unwrap().remove("summary");
+    }
+    g
+}
+
+#[test]
+fn summary_with_everything_open_is_the_full_emission() {
+    let src = "package P {
+        private import ScalarValues::*;
+        doc /* on P */
+        package Q { part def A; part def B :> A; part q : A; comment about A /* c2 */ }
+        part def D :> Q::A { part d1 : Q::A; part d2 : Q::B; attribute mass : Real; }
+        part def L;
+        part x : D;
+        dependency Dep from D to L;
+        enum def E { a; b; }
+        package Empty;
+        comment about L /* c1 */
+    }";
+    let mut r = resolved(src);
+    let full = sysmlv2_viz::graph(
+        &mut r,
+        None,
+        &VizOptions::default().with_show_imported(true),
+    )
+    .unwrap();
+    let open: Vec<ElementRef> = ["P", "P::Q", "P::D", "P::Empty", "P::E"]
+        .iter()
+        .map(|q| r.resolve_qualified(q).unwrap())
+        .collect();
+    let opts = VizOptions::default()
+        .with_show_imported(true)
+        .with_summary(Some(sysmlv2_viz::SummaryOptions {
+            open,
+            note_budget: usize::MAX,
+            leaf_budget: usize::MAX,
+            unbounded: Vec::new(),
+        }));
+    let all_open = strip_summary(sysmlv2_viz::graph(&mut r, None, &opts).unwrap());
+    assert_eq!(all_open.to_string(), full.to_string());
+}
+
+#[test]
+fn summary_open_owner_card_keeps_member_identity_and_bundles_only_hidden_ends() {
+    let src = "package P {
+        package Q { part def A; part def B :> A; }
+        part def Base;
+        part def D :> Base { part d1 : Q::A; part d2 : Q::B; }
+        part x : D;
+        dependency Dep from D to Base;
+    }";
+    let mut r = resolved(src);
+    let open: Vec<ElementRef> = ["P", "P::D"]
+        .iter()
+        .map(|q| r.resolve_qualified(q).unwrap())
+        .collect();
+    let opts = VizOptions::default().with_summary(Some(sysmlv2_viz::SummaryOptions {
+        open,
+        note_budget: 200,
+        leaf_budget: 500,
+        unbounded: Vec::new(),
+    }));
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    // The open owner card's members draw beside it, wired by composition edges without counts.
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["qname"] == "P::D::d1")
+    );
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|e| e["kind"] == "composition" && e.get("count").is_none())
+            .count(),
+        2
+    );
+    // Edges between drawn nodes keep their shape: the specialization's `rel`, the dependency's identity, x's typing.
+    let spec = edges
+        .iter()
+        .find(|e| e["kind"] == "specialization")
+        .unwrap();
+    assert_eq!(spec["rel"], "subclassification");
+    assert!(spec.get("count").is_none());
+    let dep = edges.iter().find(|e| e["kind"] == "dependency").unwrap();
+    assert!(dep.get("id").is_some() && dep.get("count").is_none());
+    let x_typing = edges
+        .iter()
+        .filter(|e| e["kind"] == "typing" && e.get("count").is_none())
+        .count();
+    assert_eq!(x_typing, 1, "x : D between two drawn nodes");
+    // d1 : Q::A and d2 : Q::B each reach the closed Q: two separate bundles (one per drawn source).
+    let bundles: Vec<&serde_json::Value> = edges
+        .iter()
+        .filter(|e| e["kind"] == "typing" && e.get("count").is_some())
+        .collect();
+    assert_eq!(bundles.len(), 2);
+    assert!(
+        bundles
+            .iter()
+            .all(|b| b["count"] == 1 && b["target"] == node(&g, "P::Q")["id"])
+    );
+    assert_eq!(node(&g, "P::Q")["summary"]["edgesIn"], 2);
+    assert_eq!(node(&g, "P::D")["summary"]["open"], true);
+}
+
+#[test]
+fn summary_bundles_imports_dependencies_and_library_typings_from_hidden_elements() {
+    let src = "package P {
+        package Lib { part def T; }
+        package C {
+            private import Lib::*;
+            part def U { part u : T; }
+            part def V;
+            dependency Need from V to Lib::T;
+        }
+        part def W;
+        dependency Uses from W to Lib::T;
+    }";
+    let mut r = resolved(src);
+    let open: Vec<ElementRef> = ["P"]
+        .iter()
+        .map(|q| r.resolve_qualified(q).unwrap())
+        .collect();
+    let opts = VizOptions::default()
+        .with_show_imported(true)
+        .with_summary(Some(sysmlv2_viz::SummaryOptions {
+            open,
+            note_budget: 200,
+            leaf_budget: 500,
+            unbounded: Vec::new(),
+        }));
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    let c = node(&g, "P::C")["id"].clone();
+    let lib = node(&g, "P::Lib")["id"].clone();
+    let bundle = |kind: &str| {
+        edges
+            .iter()
+            .find(|e| e["kind"] == kind && e["source"] == c && e["target"] == lib)
+            .cloned()
+    };
+    // C itself is drawn and so is Lib: its import is an edge between drawn nodes and keeps its shape.
+    let imp = edges
+        .iter()
+        .find(|e| e["kind"] == "import" && e["source"] == c && e["target"] == lib)
+        .unwrap();
+    assert!(imp.get("count").is_none() && imp["importKind"] == "namespace");
+    assert_eq!(
+        bundle("typing").unwrap()["count"],
+        1,
+        "u : T inside the hidden U"
+    );
+    let dep_bundle = bundle("dependency").unwrap();
+    assert_eq!(dep_bundle["count"], 1);
+    assert!(
+        dep_bundle.get("id").is_none(),
+        "a hidden dependency loses its identity"
+    );
+    // The drawn W's dependency to the closed Lib is a bundle too (its target stands in for T).
+    let w = node(&g, "P::W")["id"].clone();
+    let w_dep = edges
+        .iter()
+        .find(|e| e["kind"] == "dependency" && e["source"] == w)
+        .unwrap();
+    assert_eq!(w_dep["target"], lib);
+    assert_eq!(w_dep["count"], 1);
+    assert_eq!(
+        node(&g, "P::C")["summary"]["edgesOut"],
+        2,
+        "the typing and the dependency from hidden elements"
+    );
+}
+
+#[test]
+fn summary_truncated_container_counts_and_interior_edges_vanish() {
+    let src = "package P {
+        part def Z;
+        package Q { part def A; part q : A; comment about A /* c2 */ }
+    }";
+    let mut r = resolved(src);
+    let open: Vec<ElementRef> = ["P"]
+        .iter()
+        .map(|q| r.resolve_qualified(q).unwrap())
+        .collect();
+    let opts = VizOptions::default().with_summary(Some(sysmlv2_viz::SummaryOptions {
+        open,
+        note_budget: 200,
+        leaf_budget: 1,
+        unbounded: Vec::new(),
+    }));
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let p = &node(&g, "P")["summary"];
+    assert_eq!(p["truncated"], 1);
+    assert_eq!(
+        p["containers"], 1,
+        "the truncated Q is still counted as a container"
+    );
+    assert_eq!(p["leaves"], 1);
+    assert_eq!(p["notes"], 1, "Q's note rolls into P");
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["qname"] != "P::Q")
+    );
+    assert!(
+        g["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] == "note" || e.get("count").is_none()),
+        "q : A is interior to P: no bundle"
+    );
+}
+
+#[test]
+fn summary_enumerations_and_empty_packages_are_leaves() {
+    let src = "package P { enum def E { a; b; } enum e : E { part p : P::T; } part def T; package Empty; }";
+    let mut r = resolved(src);
+    let open: Vec<ElementRef> = ["P"]
+        .iter()
+        .map(|q| r.resolve_qualified(q).unwrap())
+        .collect();
+    let opts = VizOptions::default().with_summary(Some(sysmlv2_viz::SummaryOptions {
+        open,
+        note_budget: 200,
+        leaf_budget: 500,
+        unbounded: Vec::new(),
+    }));
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let p = &node(&g, "P")["summary"];
+    assert_eq!(p["containers"], 0);
+    assert_eq!(p["leaves"], p["members"]);
+    assert!(
+        node(&g, "P::Empty").get("summary").is_none(),
+        "an empty package is not an openable box"
+    );
+    assert!(node(&g, "P::E").get("summary").is_none());
+    assert!(
+        g["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("count").is_none())
+    );
+}
+
+/// The probe fixture behind the byte-identity goldens: every node kind
+/// the tree emitter draws, values, notes, imports, inherited rows, a
+/// library type, a dependency, an enumeration and an empty package.
+const IDENTITY_FIXTURE: &str = "package P { private import ScalarValues::*; doc /* on P */ package Q { part def A; part def B :> A; part q : A; comment about A /* c2 */ } part def D :> Q::A { part d1 : Q::A; part d2 : Q::B; attribute mass : Real = 3; } part def L; part x : D; dependency Dep from D to L; enum def E { a; b; } package Empty; comment about L /* c1 */ }";
+
+/// The full emission is byte-identical to the emitter before summary
+/// mode existed (goldens captured from it), with every option that
+/// touches the emission on, and with overlapping roots.
+#[test]
+fn full_emission_matches_pre_summary_goldens() {
+    let mut r = resolved_named("a.sysml", IDENTITY_FIXTURE);
+    let opts = VizOptions::default()
+        .with_show_imported(true)
+        .with_show_inherited(true)
+        .with_show_lib(true);
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap().to_string();
+    assert_eq!(g, include_str!("golden/graph-full-options.json").trim_end());
+    let roots: Vec<ElementRef> = ["P", "P::Q"]
+        .iter()
+        .map(|q| r.resolve_qualified(q).unwrap())
+        .collect();
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default().with_roots(Some(roots)))
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        g,
+        include_str!("golden/graph-overlapping-roots.json").trim_end()
+    );
 }

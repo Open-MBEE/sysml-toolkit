@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
@@ -197,6 +197,11 @@ struct PlantumlOpts {
     element: Option<String>,
     #[serde(default)]
     roots: Option<Vec<String>>,
+    /// Summary emission for large scopes (`toGraph`, tree view; ignored
+    /// by `toPlantuml`): containers outside `open` emit as one node
+    /// with counts. See `SummaryIn`.
+    #[serde(default)]
+    summary: Option<SummaryIn>,
     #[serde(default = "default_view")]
     view: String,
     #[serde(default)]
@@ -217,6 +222,54 @@ struct PlantumlOpts {
     #[serde(default)]
     std_color: bool,
     link_template: Option<String>,
+}
+
+/// `{open: [selector…], noteBudget, leafBudget, unbounded: [selector…]}`:
+/// which containers emit their members, how many notes draw as cards
+/// per cluster, how many members draw per open container, and which
+/// open containers draw every member regardless (a selector that does
+/// not resolve is ignored).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SummaryIn {
+    #[serde(default)]
+    open: Vec<Selector>,
+    #[serde(default)]
+    unbounded: Vec<Selector>,
+    #[serde(default = "default_note_budget")]
+    note_budget: usize,
+    #[serde(default = "default_leaf_budget")]
+    leaf_budget: usize,
+}
+
+fn default_note_budget() -> usize {
+    200
+}
+
+fn default_leaf_budget() -> usize {
+    500
+}
+
+/// An element selector: a `::`-qualified name, or `{elementId}` for
+/// elements without a resolvable name.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum Selector {
+    Name(String),
+    Id {
+        #[serde(rename = "elementId")]
+        element_id: String,
+    },
+}
+
+fn resolve_selector(
+    r: &mut sysmlv2_model::json::ResolvedModel,
+    sel: &Selector,
+) -> Option<ElementRef> {
+    match sel {
+        Selector::Name(name) => r.resolve_qualified(name),
+        Selector::Id { element_id } => r.element_by_id(element_id),
+    }
 }
 
 fn default_view() -> String {
@@ -385,7 +438,14 @@ impl Session {
     fn diagram_request(
         &mut self,
         opts_json: Option<&str>,
-    ) -> Result<(sysmlv2_viz::VizOptions, Option<ElementRef>), String> {
+    ) -> Result<
+        (
+            sysmlv2_viz::VizOptions,
+            Option<ElementRef>,
+            Option<SummaryIn>,
+        ),
+        String,
+    > {
         let opts: PlantumlOpts =
             serde_json::from_str(opts_json.filter(|s| !s.is_empty()).unwrap_or("{}"))
                 .map_err(|e| format!("bad options: {e}"))?;
@@ -425,7 +485,7 @@ impl Session {
             .with_std_color(opts.std_color)
             .with_link_template(opts.link_template)
             .with_roots(roots);
-        Ok((viz, root))
+        Ok((viz, root, opts.summary))
     }
 
     fn value_to_json(&mut self, v: &EvalValue) -> serde_json::Value {
@@ -1411,7 +1471,7 @@ impl Session {
     #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = toPlantuml)]
     pub fn to_plantuml(&mut self, opts_json: Option<String>) -> Result<String, String> {
-        let (viz, root) = self.diagram_request(opts_json.as_deref())?;
+        let (viz, root, _) = self.diagram_request(opts_json.as_deref())?;
         if viz.roots.as_ref().is_some_and(|r| r.is_empty()) {
             return Ok("@startuml\n' the view exposes nothing\n@enduml\n".to_string());
         }
@@ -1426,7 +1486,7 @@ impl Session {
     #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = toGraph)]
     pub fn to_graph(&mut self, opts_json: Option<String>) -> Result<String, String> {
-        let (viz, root) = self.diagram_request(opts_json.as_deref())?;
+        let (mut viz, root, summary_opts) = self.diagram_request(opts_json.as_deref())?;
         let view = view_name(viz.view);
         if !matches!(
             viz.view,
@@ -1437,12 +1497,81 @@ impl Session {
         ) {
             return Err(format!("no structured-graph emitter for view: {view}"));
         }
-        if viz.roots.as_ref().is_some_and(|r| r.is_empty()) {
-            return Ok(json!({ "view": view, "nodes": [], "edges": [] }).to_string());
+        if summary_opts.is_some() && viz.view != sysmlv2_viz::View::Tree {
+            return Err("summary emission is tree-only".to_string());
         }
-        sysmlv2_viz::graph(self.inner.resolved(), root, &viz)
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
+        if viz.roots.as_ref().is_some_and(|r| r.is_empty()) {
+            let mut g = json!({ "view": view, "nodes": [], "edges": [] });
+            if summary_opts.is_some() {
+                g["summary"] = json!({ "resolved": [], "unresolved": [] });
+            }
+            return Ok(g.to_string());
+        }
+        // Summary mode: resolve the open set, remembering what did not
+        // resolve so the client can prune a persisted set.
+        let mut summary = None;
+        let mut resolved_open = Vec::new();
+        let mut unresolved_open = Vec::new();
+        if let Some(sm) = &summary_opts {
+            let mut open = Vec::new();
+            for sel in &sm.open {
+                match resolve_selector(self.inner.resolved(), sel) {
+                    Some(e) => {
+                        let r = self.inner.resolved();
+                        resolved_open.push(json!({
+                            "id": r.element_id(e).to_string(),
+                            "qualifiedName": r.element_qualified_name(e),
+                        }));
+                        open.push(e);
+                    }
+                    None => unresolved_open
+                        .push(serde_json::to_value(sel).unwrap_or(serde_json::Value::Null)),
+                }
+            }
+            let unbounded = sm
+                .unbounded
+                .iter()
+                .filter_map(|sel| resolve_selector(self.inner.resolved(), sel))
+                .collect();
+            summary = Some(sysmlv2_viz::SummaryOptions {
+                open,
+                note_budget: sm.note_budget,
+                leaf_budget: sm.leaf_budget,
+                unbounded,
+            });
+        }
+        viz.summary = summary;
+        let mut g =
+            sysmlv2_viz::graph(self.inner.resolved(), root, &viz).map_err(|e| e.to_string())?;
+        if summary_opts.is_some() {
+            g["summary"] = json!({ "resolved": resolved_open, "unresolved": unresolved_open });
+        }
+        Ok(g.to_string())
+    }
+
+    /// The containers from the scope root down to an element (root
+    /// first, the element's owner last), for opening a summary picture
+    /// onto it: JSON `[{id, qualifiedName}]`. The selector is a
+    /// qualified name or `{elementId}`; errors when it does not resolve.
+    #[wasm_bindgen(js_name = revealPath)]
+    pub fn reveal_path(&mut self, selector_json: &str) -> Result<String, String> {
+        // A bare name is as good as its JSON string form.
+        let sel: Selector = serde_json::from_str(selector_json)
+            .unwrap_or_else(|_| Selector::Name(selector_json.to_string()));
+        let r = self.inner.resolved();
+        let e = resolve_selector(r, &sel)
+            .ok_or_else(|| format!("element not found: {selector_json}"))?;
+        let mut path = Vec::new();
+        let mut cur = r.owner(e);
+        while let Some(o) = cur {
+            if r.element_type(o) == "Namespace" {
+                break;
+            }
+            path.push(json!({ "id": r.element_id(o).to_string(), "qualifiedName": r.element_qualified_name(o) }));
+            cur = r.owner(o);
+        }
+        path.reverse();
+        Ok(serde_json::Value::Array(path).to_string())
     }
 
     /// Apply an edit batch (JSON array of `EditOpIn` operations) via

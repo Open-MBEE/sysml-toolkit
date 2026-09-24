@@ -1,11 +1,4 @@
-# Apollo 11 SysML v2 validation workflow
-#
-# Validates and evaluates the complete model with the matching SysML v2
-# standard library, then publishes the results as a workflow artifact.
-# SysML v2 kernel: https://github.com/Open-MBEE/sysml-toolkit
-# Pinned release: https://github.com/Open-MBEE/sysml-toolkit/releases/tag/v0.9.1
-
-name: SysML v2 Validation
+name: Validate Apollo 11 SysML v2 Model
 
 on:
   push:
@@ -16,23 +9,19 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate and evaluate SysML model
+  validate-apollo:
     runs-on: ubuntu-latest
 
     env:
       SYSML_TOOLKIT_VERSION: v0.9.1
       SYSML_RELEASE_VERSION: "2026-08"
+      APOLLO_REPO: https://github.com/airbus/apollo-11-sysml-v2.git
+      APOLLO_REF: main
 
     steps:
-      # ------------------------------------------------------------
-      # Checkout Apollo 11 repository
-      # ------------------------------------------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v5
 
       # ------------------------------------------------------------
-      # Install pre-built sysml-toolkit release binary
+      # Install released sysml-toolkit binary
       # ------------------------------------------------------------
       - name: Install sysml-toolkit
         shell: bash
@@ -44,9 +33,6 @@ jobs:
           RELEASE_API="https://api.github.com/repos/Open-MBEE/sysml-toolkit/releases/tags/${SYSML_TOOLKIT_VERSION}"
           RELEASE_JSON="${RUNNER_TEMP}/sysml-toolkit-release.json"
 
-          echo "Reading release metadata from:"
-          echo "${RELEASE_API}"
-
           curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -54,8 +40,6 @@ jobs:
             "${RELEASE_API}" \
             -o "${RELEASE_JSON}"
 
-          # Select the Linux x86-64 binary/archive from the official
-          # v0.9.1 release assets.
           mapfile -t ASSET_INFO < <(
             python3 - "${RELEASE_JSON}" <<'PY'
           import json
@@ -79,15 +63,9 @@ jobs:
               ):
                   continue
 
-              # Ignore checksums/signatures.
               if any(
-                  suffix in lower
-                  for suffix in (
-                      "sha256",
-                      "checksum",
-                      ".sig",
-                      ".asc",
-                  )
+                  x in lower
+                  for x in ("sha256", "checksum", ".sig", ".asc")
               ):
                   continue
 
@@ -101,8 +79,6 @@ jobs:
               ):
                   score += 50
 
-              # Prefer a portable static build if both GNU and musl
-              # artifacts exist.
               if "musl" in lower:
                   score += 10
 
@@ -116,16 +92,12 @@ jobs:
 
           if not candidates:
               print(
-                  "No Linux x86-64 release asset found.",
+                  "No Linux x86-64 sysml-toolkit asset found",
                   file=sys.stderr,
               )
-              print("Available assets:", file=sys.stderr)
 
               for asset in release.get("assets", []):
-                  print(
-                      f"  {asset['name']}",
-                      file=sys.stderr,
-                  )
+                  print(asset["name"], file=sys.stderr)
 
               sys.exit(1)
 
@@ -141,9 +113,7 @@ jobs:
           ASSET_NAME="${ASSET_INFO[0]}"
           ASSET_URL="${ASSET_INFO[1]}"
 
-          echo "Selected release asset:"
-          echo "  ${ASSET_NAME}"
-          echo "  ${ASSET_URL}"
+          echo "Downloading ${ASSET_NAME}"
 
           ASSET_PATH="${RUNNER_TEMP}/${ASSET_NAME}"
           EXTRACT_DIR="${RUNNER_TEMP}/sysml-toolkit"
@@ -153,7 +123,6 @@ jobs:
 
           curl -fL \
             --retry 3 \
-            --retry-delay 2 \
             -o "${ASSET_PATH}" \
             "${ASSET_URL}"
 
@@ -162,24 +131,18 @@ jobs:
               tar -xzf "${ASSET_PATH}" \
                 -C "${EXTRACT_DIR}"
               ;;
-
             *.tar.xz)
               tar -xJf "${ASSET_PATH}" \
                 -C "${EXTRACT_DIR}"
               ;;
-
             *.zip)
               unzip -q "${ASSET_PATH}" \
                 -d "${EXTRACT_DIR}"
               ;;
-
             *)
-              # Handle the case where the release asset is the
-              # executable itself rather than an archive.
               cp "${ASSET_PATH}" \
                 "${EXTRACT_DIR}/sysmlv2"
-              chmod +x \
-                "${EXTRACT_DIR}/sysmlv2"
+              chmod +x "${EXTRACT_DIR}/sysmlv2"
               ;;
           esac
 
@@ -192,10 +155,9 @@ jobs:
           )"
 
           if [[ -z "${SYSMLV2_BIN}" ]]; then
-            echo "::error::sysmlv2 executable not found in release asset."
-            echo "Extracted files:"
-            find "${EXTRACT_DIR}" -maxdepth 3 -type f -print
-            exit 1
+              echo "::error::sysmlv2 executable not found"
+              find "${EXTRACT_DIR}" -type f -print
+              exit 1
           fi
 
           install \
@@ -206,37 +168,72 @@ jobs:
           echo "${BIN_DIR}" >> "${GITHUB_PATH}"
 
       - name: Show sysml-toolkit version
-        run: |
-          sysmlv2 --version
+        run: sysmlv2 --version
+
 
       # ------------------------------------------------------------
-      # Download the matching SysML v2 standard library
+      # Clone Apollo -- NOT into GITHUB_WORKSPACE
       # ------------------------------------------------------------
-      - name: Checkout SysML v2 standard library
+      - name: Clone Apollo 11 model
         shell: bash
         run: |
           set -euo pipefail
+
+          APOLLO_DIR="${RUNNER_TEMP}/apollo-11-sysml-v2"
+
+          git clone \
+            --depth 1 \
+            --branch "${APOLLO_REF}" \
+            "${APOLLO_REPO}" \
+            "${APOLLO_DIR}"
+
+          APOLLO_SHA="$(
+            git -C "${APOLLO_DIR}" rev-parse HEAD
+          )"
+
+          echo "APOLLO_DIR=${APOLLO_DIR}" \
+            >> "${GITHUB_ENV}"
+
+          echo "APOLLO_SHA=${APOLLO_SHA}" \
+            >> "${GITHUB_ENV}"
+
+          echo "Apollo source:"
+          echo "  ${APOLLO_REPO}"
+          echo "  ref: ${APOLLO_REF}"
+          echo "  commit: ${APOLLO_SHA}"
+
+
+      # ------------------------------------------------------------
+      # Get OMG SysML v2 library
+      # ------------------------------------------------------------
+      - name: Clone SysML v2 standard library
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LIB_REPO="${RUNNER_TEMP}/SysML-v2-Release"
 
           git clone \
             --depth 1 \
             --branch "${SYSML_RELEASE_VERSION}" \
             https://github.com/Systems-Modeling/SysML-v2-Release.git \
-            "${RUNNER_TEMP}/SysML-v2-Release"
+            "${LIB_REPO}"
 
-          SYSML_LIB_DIR="${RUNNER_TEMP}/SysML-v2-Release/sysml.library"
+          SYSML_LIB_DIR="${LIB_REPO}/sysml.library"
 
           if [[ ! -d "${SYSML_LIB_DIR}" ]]; then
-            echo "::error::SysML standard library not found."
+            echo "::error::sysml.library not found"
             exit 1
           fi
 
           echo "SYSML_LIB_DIR=${SYSML_LIB_DIR}" \
             >> "${GITHUB_ENV}"
 
+
       # ------------------------------------------------------------
-      # Find all .sysml files
+      # Discover ONLY files underneath APOLLO_DIR
       # ------------------------------------------------------------
-      - name: Discover SysML files
+      - name: Discover Apollo SysML files
         id: files
         shell: bash
         run: |
@@ -244,43 +241,55 @@ jobs:
 
           mkdir -p reports
 
-          # NUL-separated list so filenames containing spaces are safe.
-          find "${GITHUB_WORKSPACE}" \
+          find "${APOLLO_DIR}" \
             -type f \
             -name '*.sysml' \
             -print0 \
             | sort -z \
-            > "${RUNNER_TEMP}/sysml-files.bin"
+            > "${RUNNER_TEMP}/apollo-sysml-files.bin"
 
           mapfile -d '' -t FILES \
-            < "${RUNNER_TEMP}/sysml-files.bin"
+            < "${RUNNER_TEMP}/apollo-sysml-files.bin"
 
           if [[ "${#FILES[@]}" -eq 0 ]]; then
-            echo "::error::No .sysml files found."
+            echo "::error::No Apollo .sysml files found"
             exit 1
           fi
 
-          printf '%s\n' "${FILES[@]#${GITHUB_WORKSPACE}/}" \
-            > reports/model-files.txt
+          echo "Found ${#FILES[@]} Apollo SysML files"
 
-          echo "Found ${#FILES[@]} SysML files:"
-          printf '  %s\n' \
-            "${FILES[@]#${GITHUB_WORKSPACE}/}"
+          # Important sanity check:
+          # absolutely every input must be inside APOLLO_DIR.
+          for file in "${FILES[@]}"; do
+            case "${file}" in
+              "${APOLLO_DIR}"/*)
+                ;;
+              *)
+                echo "::error::Unexpected model input: ${file}"
+                exit 1
+                ;;
+            esac
+          done
+
+          printf '%s\n' \
+            "${FILES[@]#${APOLLO_DIR}/}" \
+            | tee reports/model-files.txt
 
           echo "count=${#FILES[@]}" \
             >> "${GITHUB_OUTPUT}"
 
+
       # ------------------------------------------------------------
-      # Validate all files together as ONE model
+      # Validate Apollo as one multi-file model
       # ------------------------------------------------------------
-      - name: Validate model
+      - name: Validate Apollo model
         id: validation
         shell: bash
         run: |
           set -uo pipefail
 
           mapfile -d '' -t FILES \
-            < "${RUNNER_TEMP}/sysml-files.bin"
+            < "${RUNNER_TEMP}/apollo-sysml-files.bin"
 
           set +e
 
@@ -299,21 +308,20 @@ jobs:
           echo "status=${STATUS}" \
             >> "${GITHUB_OUTPUT}"
 
-          # Do not fail here. We want evaluation and report generation
-          # to run even when validation finds errors.
           exit 0
 
+
       # ------------------------------------------------------------
-      # Evaluate all computable model values
+      # Evaluate Apollo as one multi-file model
       # ------------------------------------------------------------
-      - name: Evaluate model
+      - name: Evaluate Apollo model
         id: evaluation
         shell: bash
         run: |
           set -uo pipefail
 
           mapfile -d '' -t FILES \
-            < "${RUNNER_TEMP}/sysml-files.bin"
+            < "${RUNNER_TEMP}/apollo-sysml-files.bin"
 
           set +e
 
@@ -334,306 +342,109 @@ jobs:
 
           exit 0
 
+
       # ------------------------------------------------------------
-      # Build GitHub Actions report
+      # GitHub Job Summary
       # ------------------------------------------------------------
       - name: Generate report
         if: always()
+        shell: bash
         env:
           FILE_COUNT: ${{ steps.files.outputs.count }}
           VALIDATION_STATUS: ${{ steps.validation.outputs.status }}
           EVALUATION_STATUS: ${{ steps.evaluation.outputs.status }}
-        shell: bash
         run: |
-          python3 <<'PY'
-          import json
-          import os
-          from pathlib import Path
+          {
+            echo "# Apollo 11 SysML v2 Validation"
+            echo
+            echo "| Item | Result |"
+            echo "|---|---|"
+            echo "| Apollo repository | \`${APOLLO_REPO}\` |"
+            echo "| Apollo ref | \`${APOLLO_REF}\` |"
+            echo "| Apollo commit | \`${APOLLO_SHA}\` |"
+            echo "| SysML files | ${FILE_COUNT} |"
+            echo "| sysml-toolkit | \`${SYSML_TOOLKIT_VERSION}\` |"
+            echo "| SysML library | \`${SYSML_RELEASE_VERSION}\` |"
 
-          reports = Path("reports")
+            if [[ "${VALIDATION_STATUS}" == "0" ]]; then
+              echo "| Validation | ✅ Passed |"
+            else
+              echo "| Validation | ❌ Failed (${VALIDATION_STATUS}) |"
+            fi
 
-          def read(name):
-              path = reports / name
-              if not path.exists():
-                  return ""
-              return path.read_text(
-                  encoding="utf-8",
-                  errors="replace",
-              )
+            if [[ "${EVALUATION_STATUS}" == "0" ]]; then
+              echo "| Evaluation | ✅ Passed |"
+            else
+              echo "| Evaluation | ❌ Failed (${EVALUATION_STATUS}) |"
+            fi
 
-          def preview(text, max_lines=200):
-              lines = text.splitlines()
+            echo
+            echo "## Model files"
+            echo
+            echo '```text'
+            cat reports/model-files.txt
+            echo '```'
 
-              if len(lines) <= max_lines:
-                  return text
+            echo
+            echo "## Validation"
+            echo
+            echo '```json'
+            head -n 300 reports/validation.json
+            echo '```'
 
-              return (
-                  "\n".join(lines[:max_lines])
-                  + f"\n\n... truncated; "
-                    f"{len(lines) - max_lines} additional lines "
-                    f"are available in the workflow artifact."
-              )
+            if [[ -s reports/validation.stderr ]]; then
+              echo
+              echo "### Validation stderr"
+              echo
+              echo '```text'
+              head -n 300 reports/validation.stderr
+              echo '```'
+            fi
 
-          def markdown_cell(value, limit=240):
-              text = " ".join(str(value or "").split())
-              text = text.replace("|", "\\|")
+            echo
+            echo "## Evaluation"
+            echo
+            echo '```text'
+            head -n 300 reports/evaluation.txt
+            echo '```'
 
-              if len(text) > limit:
-                  text = text[: limit - 1].rstrip() + "…"
+            if [[ -s reports/evaluation.stderr ]]; then
+              echo
+              echo "### Evaluation stderr"
+              echo
+              echo '```text'
+              head -n 300 reports/evaluation.stderr
+              echo '```'
+            fi
 
-              return text or "-"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-          def relative_path(value):
-              text = str(value or "")
-              workspace = os.environ.get("GITHUB_WORKSPACE", "")
 
-              if workspace:
-                  workspace = workspace.rstrip("/")
-
-                  if text == workspace:
-                      return "."
-
-                  prefix = f"{workspace}/"
-
-                  if text.startswith(prefix):
-                      return text[len(prefix):]
-
-              return text
-
-          def format_validation(validation):
-              try:
-                  document = json.loads(validation)
-              except json.JSONDecodeError:
-                  return (
-                      "**Unable to parse validation JSON.** The raw output "
-                      "is included below.\n\n"
-                      "```json\n"
-                      f"{preview(validation)}\n"
-                      "```"
-                  )
-
-              if not isinstance(document, dict):
-                  return (
-                      "**Unexpected validation JSON shape.** The raw output "
-                      "is included below.\n\n"
-                      "```json\n"
-                      f"{preview(validation)}\n"
-                      "```"
-                  )
-
-              findings = document.get("findings", [])
-              summary = document.get("summary", {})
-
-              if not isinstance(findings, list):
-                  findings = []
-
-              if not isinstance(summary, dict):
-                  summary = {}
-
-              summary_table = [
-                  "| Errors | Warnings | Infos | Hints |",
-                  "|---:|---:|---:|---:|",
-                  "| "
-                  f"{markdown_cell(summary.get('errors', 0))} | "
-                  f"{markdown_cell(summary.get('warnings', 0))} | "
-                  f"{markdown_cell(summary.get('infos', 0))} | "
-                  f"{markdown_cell(summary.get('hints', 0))} |",
-              ]
-
-              finding_table = [
-                  "| Severity | Stage | File | Location | Rule / Element | Message |",
-                  "|---|---|---|---:|---|---|",
-              ]
-
-              for finding in findings:
-                  if not isinstance(finding, dict):
-                      continue
-
-                  line = finding.get("line", "-")
-                  column = finding.get("col", "-")
-                  location = f"{line}:{column}"
-                  rule = finding.get("rule") or "-"
-                  element = finding.get("element") or "-"
-
-                  finding_table.append(
-                      "| "
-                      f"{markdown_cell(finding.get('severity', 'unknown')).upper()} | "
-                      f"{markdown_cell(finding.get('stage', '-'))} | "
-                      f"`{markdown_cell(relative_path(finding.get('unitName', '-')))}` | "
-                      f"{markdown_cell(location)} | "
-                      f"{markdown_cell(rule)} / {markdown_cell(element)} | "
-                      f"{markdown_cell(finding.get('message', '-'))} |"
-                  )
-
-              if len(finding_table) == 2:
-                  finding_table.append(
-                      "| - | - | - | - | - | No validation findings. |"
-                  )
-
-              return (
-                  "### Summary\n\n"
-                  + "\n".join(summary_table)
-                  + "\n\n### Findings\n\n"
-                  + "\n".join(finding_table)
-              )
-
-          validation_status = os.environ.get(
-              "VALIDATION_STATUS",
-              "unknown",
-          )
-
-          evaluation_status = os.environ.get(
-              "EVALUATION_STATUS",
-              "unknown",
-          )
-
-          validation_ok = validation_status == "0"
-          evaluation_ok = evaluation_status == "0"
-
-          validation_label = (
-              "✅ Passed"
-              if validation_ok
-              else "❌ Failed"
-          )
-
-          evaluation_label = (
-              "✅ Passed"
-              if evaluation_ok
-              else "❌ Failed"
-          )
-
-          overall = (
-              "✅ Passed"
-              if validation_ok and evaluation_ok
-              else "❌ Failed"
-          )
-
-          validation = read("validation.json")
-          validation_report = format_validation(validation)
-          validation_stderr = read(
-              "validation.stderr"
-          )
-          evaluation = read("evaluation.txt")
-          evaluation_stderr = read(
-              "evaluation.stderr"
-          )
-
-          report = f"""# SysML v2 Model Validation Report
-
-          ## Summary
-
-          | Check | Result |
-          |---|---|
-          | Model files | {os.environ.get("FILE_COUNT", "unknown")} |
-          | sysml-toolkit | {os.environ.get("SYSML_TOOLKIT_VERSION", "")} |
-          | SysML standard library | {os.environ.get("SYSML_RELEASE_VERSION", "")} |
-          | Validation | {validation_label} |
-          | Evaluation | {evaluation_label} |
-          | Overall | **{overall}** |
-
-          **Commit:** `{os.environ.get("GITHUB_SHA", "")}`
-
-          ## Validation
-
-          Exit code: `{validation_status}`
-
-          {validation_report}
-
-          """
-
-          if validation_stderr.strip():
-              report += f"""
-          ### Validation diagnostics
-
-          ```text
-          {preview(validation_stderr)}
-          ```
-          """
-
-          report += f"""
-          ## Evaluation
-
-          Exit code: `{evaluation_status}`
-
-          ```text
-          {preview(evaluation)}
-          ```
-          """
-
-          if evaluation_stderr.strip():
-              report += f"""
-          ### Evaluation diagnostics
-
-          ```text
-          {preview(evaluation_stderr)}
-          ```
-          """
-
-          report += """
-          ## Files
-
-          The complete outputs are available in the
-          `sysml-validation-report` workflow artifact:
-
-          - `validation.json`
-          - `validation.stderr`
-          - `evaluation.txt`
-          - `evaluation.stderr`
-          - `model-files.txt`
-          """
-
-          # Remove indentation introduced by the Python source.
-          import textwrap
-          report = textwrap.dedent(report)
-
-          (reports / "report.md").write_text(
-              report,
-              encoding="utf-8",
-          )
-
-          summary = os.environ.get(
-              "GITHUB_STEP_SUMMARY"
-          )
-
-          if summary:
-              with open(
-                  summary,
-                  "a",
-                  encoding="utf-8",
-              ) as f:
-                  f.write(report)
-          PY
-
-      # ------------------------------------------------------------
-      # Upload full results
-      # ------------------------------------------------------------
-      - name: Upload SysML validation report
+      - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: sysml-validation-report
+          name: apollo-sysml-validation
           path: reports/
           retention-days: 30
 
+
       # ------------------------------------------------------------
-      # Final CI gate
+      # Final gate
       # ------------------------------------------------------------
-      - name: Enforce model validation
+      - name: Enforce results
         if: always()
         shell: bash
         run: |
-          VALIDATION="${{ steps.validation.outputs.status }}"
-          EVALUATION="${{ steps.evaluation.outputs.status }}"
-
           FAILED=0
 
-          if [[ "${VALIDATION}" != "0" ]]; then
-            echo "::error::SysML model validation failed."
+          if [[ "${{ steps.validation.outputs.status }}" != "0" ]]; then
+            echo "::error::Apollo SysML validation failed"
             FAILED=1
           fi
 
-          if [[ "${EVALUATION}" != "0" ]]; then
-            echo "::error::SysML model evaluation failed."
+          if [[ "${{ steps.evaluation.outputs.status }}" != "0" ]]; then
+            echo "::error::Apollo SysML evaluation failed"
             FAILED=1
           fi
 

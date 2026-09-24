@@ -346,7 +346,7 @@ jobs:
       # ------------------------------------------------------------
       # GitHub Job Summary
       # ------------------------------------------------------------
-      - name: Generate report
+      - name: Generate GitHub report
         if: always()
         shell: bash
         env:
@@ -354,71 +354,366 @@ jobs:
           VALIDATION_STATUS: ${{ steps.validation.outputs.status }}
           EVALUATION_STATUS: ${{ steps.evaluation.outputs.status }}
         run: |
-          {
-            echo "# Apollo 11 SysML v2 Validation"
-            echo
-            echo "| Item | Result |"
-            echo "|---|---|"
-            echo "| Apollo repository | \`${APOLLO_REPO}\` |"
-            echo "| Apollo ref | \`${APOLLO_REF}\` |"
-            echo "| Apollo commit | \`${APOLLO_SHA}\` |"
-            echo "| SysML files | ${FILE_COUNT} |"
-            echo "| sysml-toolkit | \`${SYSML_TOOLKIT_VERSION}\` |"
-            echo "| SysML library | \`${SYSML_RELEASE_VERSION}\` |"
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
 
-            if [[ "${VALIDATION_STATUS}" == "0" ]]; then
-              echo "| Validation | ✅ Passed |"
-            else
-              echo "| Validation | ❌ Failed (${VALIDATION_STATUS}) |"
-            fi
+          reports = Path("reports")
 
-            if [[ "${EVALUATION_STATUS}" == "0" ]]; then
-              echo "| Evaluation | ✅ Passed |"
-            else
-              echo "| Evaluation | ❌ Failed (${EVALUATION_STATUS}) |"
-            fi
+          validation_file = reports / "validation.json"
+          evaluation_file = reports / "evaluation.txt"
+          report_file = reports / "report.md"
 
-            echo
-            echo "## Model files"
-            echo
-            echo '```text'
-            cat reports/model-files.txt
-            echo '```'
+          def esc(value):
+              """Escape text for a GitHub Markdown table."""
+              if value is None:
+                  return ""
+              return (
+                  str(value)
+                  .replace("|", "\\|")
+                  .replace("\r", " ")
+                  .replace("\n", "<br>")
+              )
 
-            echo
-            echo "## Validation"
-            echo
-            echo '```json'
-            head -n 300 reports/validation.json
-            echo '```'
+          # ----------------------------------------------------------
+          # Validation
+          # ----------------------------------------------------------
 
-            if [[ -s reports/validation.stderr ]]; then
-              echo
-              echo "### Validation stderr"
-              echo
-              echo '```text'
-              head -n 300 reports/validation.stderr
-              echo '```'
-            fi
+          findings = []
 
-            echo
-            echo "## Evaluation"
-            echo
-            echo '```text'
-            head -n 300 reports/evaluation.txt
-            echo '```'
+          if validation_file.exists():
+              raw = validation_file.read_text(
+                  encoding="utf-8",
+                  errors="replace",
+              ).strip()
 
-            if [[ -s reports/evaluation.stderr ]]; then
-              echo
-              echo "### Evaluation stderr"
-              echo
-              echo '```text'
-              head -n 300 reports/evaluation.stderr
-              echo '```'
-            fi
+              if raw:
+                  try:
+                      data = json.loads(raw)
 
-          } >> "${GITHUB_STEP_SUMMARY}"
+                      # Support either:
+                      #   [...]
+                      # or:
+                      #   {"findings": [...]}
+                      if isinstance(data, list):
+                          findings = data
 
+                      elif isinstance(data, dict):
+                          findings = (
+                              data.get("findings")
+                              or data.get("diagnostics")
+                              or data.get("results")
+                              or []
+                          )
+
+                  except json.JSONDecodeError:
+                      findings = []
+
+          validation_rows = []
+
+          for finding in findings:
+
+              severity = (
+                  finding.get("severity")
+                  or finding.get("level")
+                  or ""
+              )
+
+              stage = (
+                  finding.get("stage")
+                  or finding.get("phase")
+                  or ""
+              )
+
+              filename = (
+                  finding.get("unit")
+                  or finding.get("unitName")
+                  or finding.get("file")
+                  or finding.get("source")
+                  or ""
+              )
+
+              line = (
+                  finding.get("line")
+                  or ""
+              )
+
+              col = (
+                  finding.get("col")
+                  or finding.get("column")
+                  or ""
+              )
+
+              location = ""
+
+              if line:
+                  location = str(line)
+
+                  if col:
+                      location += f":{col}"
+
+              message = (
+                  finding.get("message")
+                  or finding.get("description")
+                  or ""
+              )
+
+              severity_lower = str(severity).lower()
+
+              if severity_lower == "error":
+                  severity_display = "❌ Error"
+
+              elif severity_lower in ("warning", "warn"):
+                  severity_display = "⚠️ Warning"
+
+              elif severity_lower == "info":
+                  severity_display = "ℹ️ Info"
+
+              elif severity_lower == "hint":
+                  severity_display = "💡 Hint"
+
+              else:
+                  severity_display = severity
+
+              validation_rows.append(
+                  (
+                      severity_display,
+                      stage,
+                      filename,
+                      location,
+                      message,
+                  )
+              )
+
+          # ----------------------------------------------------------
+          # Evaluation
+          # ----------------------------------------------------------
+
+          evaluation_rows = []
+
+          if evaluation_file.exists():
+
+              evaluation_text = evaluation_file.read_text(
+                  encoding="utf-8",
+                  errors="replace",
+              )
+
+              for line in evaluation_text.splitlines():
+
+                  line = line.strip()
+
+                  if not line:
+                      continue
+
+                  # Typical eval output is expected to look like:
+                  #
+                  # Package::Object::feature = value
+                  #
+                  # Split only on the first "=" so expressions/values
+                  # containing "=" are preserved.
+                  match = re.match(
+                      r"^(.*?)\s*=\s*(.*)$",
+                      line,
+                  )
+
+                  if match:
+                      feature = match.group(1).strip()
+                      value = match.group(2).strip()
+
+                      evaluation_rows.append(
+                          (
+                              feature,
+                              value,
+                          )
+                      )
+
+                  else:
+                      # Keep non-standard output visible rather than
+                      # silently losing it.
+                      evaluation_rows.append(
+                          (
+                              line,
+                              "",
+                          )
+                      )
+
+          # ----------------------------------------------------------
+          # Summary
+          # ----------------------------------------------------------
+
+          validation_status = os.environ.get(
+              "VALIDATION_STATUS",
+              "unknown",
+          )
+
+          evaluation_status = os.environ.get(
+              "EVALUATION_STATUS",
+              "unknown",
+          )
+
+          validation_label = (
+              "✅ Passed"
+              if validation_status == "0"
+              else "❌ Failed"
+          )
+
+          evaluation_label = (
+              "✅ Passed"
+              if evaluation_status == "0"
+              else "❌ Failed"
+          )
+
+          report = []
+
+          report.append(
+              "# Apollo 11 SysML v2 Validation Report"
+          )
+
+          report.append("")
+
+          report.append(
+              f"**Apollo commit:** `{os.environ.get('APOLLO_SHA', '')}`  "
+          )
+
+          report.append(
+              f"**sysml-toolkit:** `{os.environ.get('SYSML_TOOLKIT_VERSION', '')}`  "
+          )
+
+          report.append(
+              f"**SysML library:** `{os.environ.get('SYSML_RELEASE_VERSION', '')}`"
+          )
+
+          report.append("")
+
+          report.append("| Check | Result |")
+          report.append("|---|---|")
+          report.append(
+              f"| SysML files | {os.environ.get('FILE_COUNT', '')} |"
+          )
+          report.append(
+              f"| Validation | {validation_label} |"
+          )
+          report.append(
+              f"| Evaluation | {evaluation_label} |"
+          )
+
+          # ----------------------------------------------------------
+          # Validation table
+          # ----------------------------------------------------------
+
+          report.append("")
+          report.append("## Validation Results")
+          report.append("")
+
+          if validation_rows:
+
+              report.append(
+                  "| Severity | Stage | File | Location | Message |"
+              )
+
+              report.append(
+                  "|---|---|---|---:|---|"
+              )
+
+              for (
+                  severity,
+                  stage,
+                  filename,
+                  location,
+                  message,
+              ) in validation_rows:
+
+                  report.append(
+                      f"| {esc(severity)} "
+                      f"| {esc(stage)} "
+                      f"| `{esc(filename)}` "
+                      f"| {esc(location)} "
+                      f"| {esc(message)} |"
+                  )
+
+          else:
+
+              if validation_status == "0":
+                  report.append(
+                      "✅ No validation findings."
+                  )
+              else:
+                  report.append(
+                      "❌ Validation failed, but no structured "
+                      "findings were returned."
+                  )
+
+          # ----------------------------------------------------------
+          # Evaluation table
+          # ----------------------------------------------------------
+
+          report.append("")
+          report.append("## Evaluation Results")
+          report.append("")
+
+          if evaluation_rows:
+
+              report.append(
+                  "| Feature / Expression | Value |"
+              )
+
+              report.append(
+                  "|---|---|"
+              )
+
+              for feature, value in evaluation_rows:
+
+                  report.append(
+                      f"| `{esc(feature)}` "
+                      f"| `{esc(value)}` |"
+                  )
+
+          else:
+
+              if evaluation_status == "0":
+                  report.append(
+                      "No evaluated values were returned."
+                  )
+              else:
+                  report.append(
+                      "❌ Evaluation failed before producing values."
+                  )
+
+          report.append("")
+
+          report.append(
+              f"**Validation findings:** {len(validation_rows)}  "
+          )
+
+          report.append(
+              f"**Evaluated values:** {len(evaluation_rows)}"
+          )
+
+          report_text = "\n".join(report) + "\n"
+
+          report_file.write_text(
+              report_text,
+              encoding="utf-8",
+          )
+
+          summary_file = os.environ.get(
+              "GITHUB_STEP_SUMMARY"
+          )
+
+          if summary_file:
+
+              with open(
+                  summary_file,
+                  "a",
+                  encoding="utf-8",
+              ) as f:
+                  f.write(report_text)
+
+          print(report_text)
+
+          PY
 
       - name: Upload report
         if: always()

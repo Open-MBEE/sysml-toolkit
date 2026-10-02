@@ -1,6 +1,6 @@
 // Hazard: C-style logical operators — KerML spells them `&`/`and` and
-// `|`/`or`; `&&`/`||` are not tokens of the expression grammar (the
-// GfSE HVAC model uses them).
+// `|`/`or`; `&&`/`||` are not tokens of the expression grammar (some
+// community models use them).
 package P {
     part def R {
         attribute a : Positive;

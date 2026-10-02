@@ -27,6 +27,21 @@ fn offset(v: &serde_json::Value) -> usize {
 const FLASHLIGHT: &str = "package Flashlight {\n    part def Body;\n    part def Battery {\n        attribute voltage = 3;\n    }\n    part flashlight {\n        part body : Body;\n        part battery : Battery;\n    }\n}\n";
 
 #[test]
+fn checked_properties_and_strict_export() {
+    let mut s =
+        Session::from_sources(&sources(&[("m.sysml", "package P { interface def I; }")])).unwrap();
+    let i = s.resolve("P::I").unwrap();
+    assert_eq!(s.property(&i, "isSufficient").unwrap(), "true");
+    assert!(s.to_full_json_strict().is_err());
+    let mut s = Session::from_sources(&sources(&[("m.sysml", "package P;")])).unwrap();
+    assert!(
+        s.to_full_json_strict()
+            .unwrap()
+            .contains("\"isImpliedIncluded\":false")
+    );
+}
+
+#[test]
 fn session_navigation_and_query() {
     let mut s = Session::from_sources(&sources(&[("flashlight.sysml", FLASHLIGHT)])).unwrap();
     let pkg = s.resolve("Flashlight").expect("package resolves");
@@ -557,7 +572,7 @@ fn edit_batch_moves_members() {
     let body_at = post.find("part body : Body;").unwrap();
     assert!(battery_at < body_at, "not reordered:\n{post}");
     // Named members chain past their membership's ordinal (IDS.md,
-    // id scheme 1): reordering named siblings moves no ids, so
+    // id scheme 2): reordering named siblings moves no ids, so
     // the report's id map is empty and host selections survive as-is.
     assert!(
         report["idMap"].as_array().is_some_and(|m| m.is_empty()),
@@ -750,7 +765,7 @@ fn verify_reports_verdicts_and_narrowed_ranges() {
     // the "why") — the solverless `verify --ranges` pipeline.
     let src = "package P {\n\
                \x20   attribute def Real;\n\
-               \x20   attribute wingSpan : Real;\n\
+               \x20   attribute wingSpan : Real[1];\n\
                \x20   attribute margin : Real = 1;\n\
                \x20   assert constraint span { wingSpan >= 10 }\n\
                \x20   assert constraint bad { 1 > 2 }\n\
@@ -1252,271 +1267,10 @@ fn canonical_name_spells_like_the_printer() {
     assert_eq!(s.name(&e).unwrap().as_deref(), Some("part"));
 }
 
-/// The generated Web platform library, as committed.
-const WEB_LIBRARY: &str = include_str!("../../../local-packages/Web.sysml");
-const TEMPLATE_LIBRARY: &str = include_str!("../../../local-packages/Template.sysml");
-const SVELTE_LIBRARY: &str = include_str!("../../../local-packages/Svelte.sysml");
-
-/// An imported document stores structural
-/// ownership only; the DOM navigation API is constructed from it on
-/// query. Order is membership order, `children` is element-only, `Attr`
-/// parts feed `attributes` and never the tree, and the parent/sibling
-/// views come from the owner's membership.
+/// The ambient library loads with any directory library (interim
+/// mechanism) — no file needs naming, and it stays library content.
 #[test]
-fn dom_navigation_is_constructed_from_ownership() {
-    let abox = r#"package View {
-    private import Web::HTML::Elements::*;
-
-    part <n1> shell : Div {
-        :>> id = "shell";
-
-        part <n1_data_qn> : Web::DOM::Attr {
-            :>> localName = "data-qn";
-            :>> value = "q";
-        }
-
-        part <n2> : Web::DOM::Text {
-            :>> data = "lead";
-        }
-
-        part <n3> : Main {
-            part <n4> : Section;
-        }
-
-        part <n5> : Web::DOM::Comment {
-            :>> data = "c";
-        }
-
-        part <n6> : Span;
-    }
-}
-"#;
-    let src = sources(&[("Web.sysml", WEB_LIBRARY), ("view.sysml", abox)]);
-    let mut s = Session::from_sources(&src).unwrap();
-    let names = |json: String| -> Vec<String> {
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let one = |x: &serde_json::Value| match x {
-            serde_json::Value::String(s) => s.clone(),
-            _ => x["qualifiedName"]
-                .as_str()
-                .map(|q| q.rsplit("::").next().unwrap().to_string())
-                .unwrap_or_else(|| x.to_string()),
-        };
-        match v.as_array() {
-            Some(items) => items.iter().map(one).collect(),
-            None => vec![one(&v)],
-        }
-    };
-    let q = |s: &mut Session, e: &str| names(s.query(e).unwrap());
-    assert_eq!(
-        q(&mut s, "View::shell.childNodes"),
-        ["n2", "n3", "n5", "n6"]
-    );
-    assert_eq!(q(&mut s, "View::shell.children"), ["n3", "n6"]);
-    assert_eq!(q(&mut s, "View::shell.firstChild"), ["n2"]);
-    assert_eq!(q(&mut s, "View::shell.lastChild"), ["n6"]);
-    assert_eq!(q(&mut s, "View::shell.firstElementChild"), ["n3"]);
-    assert_eq!(q(&mut s, "View::shell.lastElementChild"), ["n6"]);
-    assert_eq!(q(&mut s, "View::shell.childElementCount"), ["2"]);
-    assert_eq!(q(&mut s, "View::shell.attributes"), ["n1_data_qn"]);
-    assert_eq!(q(&mut s, "View::shell::n3.parentNode"), ["shell"]);
-    assert_eq!(q(&mut s, "View::shell::n3.parentElement"), ["shell"]);
-    assert_eq!(q(&mut s, "View::shell::n3.previousSibling"), ["n2"]);
-    assert_eq!(q(&mut s, "View::shell::n3.nextSibling"), ["n5"]);
-    assert_eq!(
-        q(&mut s, "View::shell::n3.previousElementSibling"),
-        [] as [String; 0]
-    );
-    assert_eq!(q(&mut s, "View::shell::n3.nextElementSibling"), ["n6"]);
-    assert_eq!(q(&mut s, "View::shell::n3.children"), ["n4"]);
-    assert_eq!(
-        q(&mut s, "View::shell::n3::n4.childNodes"),
-        [] as [String; 0]
-    );
-    assert_eq!(
-        q(&mut s, "View::shell::n3::n4.parentNode.parentNode"),
-        ["shell"]
-    );
-    // A package-level node has no DOM parent; an Attr is never a child.
-    assert_eq!(q(&mut s, "View::shell.parentNode"), [] as [String; 0]);
-    assert_eq!(
-        q(&mut s, "View::shell::n1_data_qn.parentNode"),
-        [] as [String; 0]
-    );
-    // Nested chains compose with the constructed views.
-    assert_eq!(
-        q(&mut s, "View::shell.children.localName"),
-        ["main", "span"]
-    );
-    assert_eq!(q(&mut s, "View::shell.firstChild.data"), ["lead"]);
-}
-
-/// Template nodes: block slots and a component's `props` are transparent
-/// to the constructed views, a template
-/// element's redefined `attributes` view is constructed like the DOM
-/// one, and a node's parent is the block owning the slot it sits in.
-#[test]
-fn dom_navigation_projects_through_template_slots() {
-    let abox = r#"package View {
-    private import Svelte::*;
-    private import Web::HTML::Elements::*;
-
-    part <r> root : Root {
-        part <r_env> :>> environment : Environment {
-            :>> implementation = "svelte";
-        }
-
-        part <e1> : EachBlock {
-            attribute :>> expression : TypeScript = "items";
-
-            part <e1_body> :>> body {
-                part <h> heading : RegularElement, H3 {
-                    :>> id = "heading";
-
-                    part <h_t> : ExpressionTag {
-                        attribute :>> expression : TypeScript = "name";
-                    }
-                }
-
-                part <s> : RegularElement, Section {
-                    part <s_id> : Attribute {
-                        :>> localName = "id";
-
-                        part <s_id_e> : ExpressionTag {
-                            attribute :>> expression : TypeScript = "item.id";
-                        }
-                    }
-
-                    part <s_p> : RegularElement, P;
-                }
-            }
-
-            part <e1_fb> :>> fallback {
-                part <fb_p> : RegularElement, P;
-            }
-        }
-
-        part <c> : Component {
-            :>> name = "Card";
-
-            part <c_props> :>> props {
-                part <c_title> : Attribute {
-                    :>> localName = "title";
-                    :>> value = "T";
-                }
-            }
-
-            part <c_p> : RegularElement, P;
-        }
-    }
-}
-"#;
-    let src = sources(&[
-        ("Web.sysml", WEB_LIBRARY),
-        ("Template.sysml", TEMPLATE_LIBRARY),
-        ("Svelte.sysml", SVELTE_LIBRARY),
-        ("view.sysml", abox),
-    ]);
-    let mut s = Session::from_sources(&src).unwrap();
-    let names = |json: String| -> Vec<String> {
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let one = |x: &serde_json::Value| match x {
-            serde_json::Value::String(s) => s.clone(),
-            _ => x["qualifiedName"]
-                .as_str()
-                .map(|q| q.rsplit("::").next().unwrap().to_string())
-                .unwrap_or_else(|| x.to_string()),
-        };
-        match v.as_array() {
-            Some(items) => items.iter().map(one).collect(),
-            None => vec![one(&v)],
-        }
-    };
-    let q = |s: &mut Session, e: &str| names(s.query(e).unwrap());
-    // Root: the environment is not a node; the block and component are.
-    assert_eq!(q(&mut s, "View::root.childNodes"), ["e1", "c"]);
-    // Block traversal flattens body then fallback; the named slots
-    // themselves answer with their owned nodes.
-    assert_eq!(
-        q(&mut s, "View::root.e1.childNodes"),
-        ["heading", "s", "fb_p"]
-    );
-    assert_eq!(q(&mut s, "View::root.e1.firstChild"), ["heading"]);
-    assert_eq!(q(&mut s, "View::root.e1.lastChild"), ["fb_p"]);
-    assert_eq!(q(&mut s, "View::root.e1.body"), ["heading", "s"]);
-    assert_eq!(q(&mut s, "View::root.e1.fallback"), ["fb_p"]);
-    // A slot is a fragment: the element-only views live there.
-    assert_eq!(
-        q(&mut s, "View::root.e1.e1_body.children"),
-        ["heading", "s"]
-    );
-    assert_eq!(q(&mut s, "View::root.e1.e1_body.childElementCount"), ["2"]);
-    assert_eq!(
-        q(&mut s, "View::root.e1.e1_body.firstElementChild"),
-        ["heading"]
-    );
-    // Parent and siblings see through the slot.
-    assert_eq!(q(&mut s, "View::root.e1.e1_body.s.parentNode"), ["e1"]);
-    assert_eq!(
-        q(&mut s, "View::root.e1.e1_body.s.previousSibling"),
-        ["heading"]
-    );
-    assert_eq!(q(&mut s, "View::root.e1.e1_body.s.nextSibling"), ["fb_p"]);
-    assert_eq!(
-        q(&mut s, "View::root.e1.e1_body.heading.previousSibling"),
-        [] as [String; 0]
-    );
-    // A template element's attributes view: reified attribute-likes only, never children.
-    assert_eq!(q(&mut s, "View::root.e1.e1_body.s.attributes"), ["s_id"]);
-    assert_eq!(q(&mut s, "View::root.e1.e1_body.s.childNodes"), ["s_p"]);
-    assert_eq!(
-        q(&mut s, "View::root.e1.e1_body.s.attributes.localName"),
-        ["id"]
-    );
-    // The gates: ordered traversal, `H3.localName`, the static
-    // reflected id, and the dynamic id as an unevaluated typed source.
-    assert_eq!(q(&mut s, "View::root.e1.e1_body.heading.localName"), ["h3"]);
-    assert_eq!(q(&mut s, "View::root.e1.e1_body.heading.id"), ["heading"]);
-    assert_eq!(
-        q(
-            &mut s,
-            "View::root.e1.e1_body.s.attributes.s_id_e.expression"
-        ),
-        ["item.id"]
-    );
-    let expr = s
-        .resolve("View::root::e1::e1_body::s::s_id::s_id_e")
-        .unwrap();
-    let members = s.members(&expr).unwrap();
-    let mut typed = None;
-    for m in members {
-        let typings = s.typings(&m).unwrap();
-        let mut is_ts = false;
-        for t in &typings {
-            if s.qualified_name(t).unwrap().as_deref() == Some("Svelte::TypeScript") {
-                is_ts = true;
-            }
-        }
-        if is_ts {
-            typed = Some(m);
-        }
-    }
-    let tag_expr = typed.expect("the expression attribute is typed Svelte::TypeScript");
-    assert_eq!(s.evaluate(&tag_expr).unwrap(), "\"item.id\"");
-    // A component's props slot answers with its attribute-likes, its content is the tree.
-    assert_eq!(q(&mut s, "View::root.c.props"), ["c_title"]);
-    assert_eq!(q(&mut s, "View::root.c.props.localName"), ["title"]);
-    assert_eq!(q(&mut s, "View::root.c.childNodes"), ["c_p"]);
-    assert_eq!(
-        q(&mut s, "View::root.c.c_props.c_title.parentNode"),
-        [] as [String; 0]
-    );
-}
-
-/// The ambient libraries load with any directory library (interim
-/// mechanism) — no file needs naming.
-#[test]
-fn ambient_libraries_load_with_a_directory_library() {
+fn ambient_library_loads_with_a_directory_library() {
     let dir = std::env::temp_dir().join(format!("sysmlv2-ambient-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -1524,176 +1278,24 @@ fn ambient_libraries_load_with_a_directory_library() {
         "library package Tiny { part def T; }\n",
     )
     .unwrap();
-    let user = "package M {\n    private import Web::HTML::Elements::*;\n    part d : Div;\n    part t : Template::Text;\n    part k : Svelte::KeyBlock;\n    part y : Tiny::T;\n}\n";
+    let user =
+        "package M {\n    metadata tag : TransformMeta::Generated;\n    part y : Tiny::T;\n}\n";
     let mut session =
         sysmlv2_transform::Session::from_sources(vec![("m.sysml".into(), user.into())])
             .unwrap()
             .with_library(&dir)
             .unwrap();
     let r = session.resolved();
-    for qn in [
-        "Web::DOM::Node",
-        "Web::HTML::Elements::Div",
-        "Template::Root",
-        "Svelte::RegularElement",
-        "TransformMeta::Generated",
-        "Tiny::T",
-    ] {
-        assert!(r.resolve_qualified(qn).is_some(), "{qn} resolves ambiently");
-    }
-    let d = r.resolve_qualified("M::d").unwrap();
-    let node = r.resolve_qualified("Web::DOM::Node").unwrap();
-    assert!(r.is_library_element(node));
-    assert!(!r.is_library_element(d));
+    let generated = r
+        .resolve_qualified("TransformMeta::Generated")
+        .expect("TransformMeta resolves ambiently");
+    assert!(r.is_library_element(generated));
+    let tag = r.resolve_qualified("M::tag").unwrap();
+    assert_eq!(r.typings(tag), [generated]);
+    assert!(r.resolve_qualified("Tiny::T").is_some());
+    let y = r.resolve_qualified("M::y").unwrap();
+    assert!(!r.is_library_element(y));
     std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Semantic mode: a view usage's exposed slice renders
-/// through the rendering definition's template; the model is untouched.
-#[test]
-fn render_view_evaluates_a_template_over_the_exposed_slice() {
-    let component = r#"package Listing {
-    private import Svelte::*;
-    private import Web::HTML::Elements::*;
-
-    rendering def ListingRendering {
-        part <r> root : Root {
-            part <r_env> :>> environment : Environment {
-                :>> implementation = "svelte";
-                part <r_inputs> :>> inputs {
-                    part <r_in1> : InputBinding {
-                        :>> name = "things";
-                    }
-                }
-            }
-
-            part <e1> : EachBlock {
-                attribute :>> expression : JavaScript = "things";
-                attribute :>> kerml : KerML = "things";
-                attribute :>> context : JavaScript = "t";
-                attribute :>> kermlContext : KerML = "t = 'item'";
-
-                part <e1_body> :>> body {
-                    part <li> : RegularElement, Li {
-                        :>> className = "thing";
-
-                        part <li_t> : ExpressionTag {
-                            attribute :>> expression : JavaScript = "t.name";
-                            attribute :>> kerml : KerML = "declaredName(t)";
-                        }
-                    }
-                }
-
-                part <e1_fb> :>> fallback {
-                    part <p> : RegularElement, P {
-                        part <p_t> : Text {
-                            :>> data = "nothing";
-                        }
-                    }
-                }
-            }
-
-            part <input> : RegularElement, Input {
-                :>> id = "false";
-                :>> title = "true";
-                :>> draggable = false;
-                :>> disabled = false;
-                :>> checked = true;
-            }
-        }
-    }
-
-    view def ListingView {
-        rendering 'rendering' : ListingRendering;
-        render 'rendering';
-    }
-}
-"#;
-    let model = "package Meta {\n    metadata def Hidden;\n}\npackage M {\n    part def A;\n    part def B;\n    part def C;\n}\n";
-    // A resolvable filter nothing satisfies exposes an empty slice.
-    let site = "package S {\n    private import Listing::*;\n    view every : ListingView {\n        expose M::*;\n    }\n    view none : ListingView {\n        expose M::*;\n        filter @Meta::Hidden;\n    }\n}\n";
-    let src = sources(&[
-        ("Web.sysml", WEB_LIBRARY),
-        ("Template.sysml", TEMPLATE_LIBRARY),
-        ("Svelte.sysml", SVELTE_LIBRARY),
-        ("listing.sysml", component),
-        ("m.sysml", model),
-        ("s.sysml", site),
-    ]);
-    let mut s = Session::from_sources(&src).unwrap();
-    let before = s.to_compact_json();
-    let html = s.render_view("S::every", Some("html".into())).unwrap();
-    assert_eq!(
-        html,
-        "<li class=\"thing\">A</li><li class=\"thing\">B</li><li class=\"thing\">C</li><input id=\"false\" title=\"true\" draggable=\"false\" checked>"
-    );
-    let json: serde_json::Value =
-        serde_json::from_str(&s.render_view("S::every", None).unwrap()).unwrap();
-    assert_eq!(json.as_array().unwrap().len(), 4);
-    assert_eq!(json[0]["properties"]["className"], "thing");
-    assert_eq!(json[0]["children"][0]["data"], "A");
-    assert_eq!(
-        s.render_view("S::none", Some("html".into())).unwrap(),
-        "<p>nothing</p><input id=\"false\" title=\"true\" draggable=\"false\" checked>"
-    );
-    assert_eq!(
-        s.to_compact_json(),
-        before,
-        "rendering writes nothing into the model"
-    );
-    assert!(s.render_view("S::missing", None).is_err());
-}
-
-/// A rendering written in plain DOM parts — `Web::HTML::Elements` types,
-/// anonymous, no template `Root` — renders like a template: the
-/// rendering definition is the root and its element parts are elements.
-#[test]
-fn render_view_accepts_plain_dom_parts_without_a_template_root() {
-    let view = r#"package BrowserViews {
-    private import Web::DOM::*;
-    private import Web::HTML::Elements::*;
-
-    rendering def SummaryRendering {
-        part : Article {
-            part : H2 {
-                part : Text {
-                    :>> data = "Overview";
-                }
-            }
-
-            part : P {
-                :>> className = "lead";
-                part : Text {
-                    :>> data = "A rendered view.";
-                }
-            }
-        }
-    }
-
-    view def SummaryView {
-        rendering 'rendering' : SummaryRendering;
-        render 'rendering';
-    }
-
-    view summary : SummaryView {
-        expose M::*;
-    }
-}
-"#;
-    let model = "package M {\n    part def A;\n}\n";
-    let src = sources(&[
-        ("Web.sysml", WEB_LIBRARY),
-        ("Template.sysml", TEMPLATE_LIBRARY),
-        ("Svelte.sysml", SVELTE_LIBRARY),
-        ("views.sysml", view),
-        ("m.sysml", model),
-    ]);
-    let mut s = Session::from_sources(&src).unwrap();
-    assert_eq!(
-        s.render_view("BrowserViews::summary", Some("html".into()))
-            .unwrap(),
-        "<article><h2>Overview</h2><p class=\"lead\">A rendered view.</p></article>"
-    );
 }
 
 #[test]
@@ -1769,8 +1371,8 @@ fn id_lookup_preserves_library_read_only_and_handle_generation() {
 }
 
 /// A stand-in for the standard `Views` library package, loaded as a
-/// library so that `asElementTable` is a library element — referenced
-/// by spelling, never by id, exactly as the shipped library is.
+/// library so that `asElementTable` is a library element, exactly as the
+/// shipped library is.
 const VIEWS_LIBRARY: &str = "standard library package Views {\n    rendering def Rendering;\n    rendering def TabularRendering :> Rendering;\n    rendering asElementTable : TabularRendering;\n}\n";
 
 /// A matrix-view fixture over [`VIEWS_LIBRARY`]: the generated support
@@ -1835,7 +1437,7 @@ fn view_info_reports_exposure_rendering_and_metadata() {
     assert!(columns["views"].as_array().unwrap().is_empty());
     let masses: serde_json::Value =
         serde_json::from_str(&s.view_info("S::masses").unwrap()).unwrap();
-    // The standard rendering is a library element: found by its spelling.
+    // The standard rendering is a library element.
     assert_eq!(masses["rendering"], "asElementTable");
     // The reported name is the model's canonical spelling, whatever the
     // caller quoted.
@@ -1854,6 +1456,34 @@ fn view_info_reports_exposure_rendering_and_metadata() {
     );
     assert!(s.view_info("S::notAView").is_err());
     assert!(s.view_info("S::missing").is_err());
+    assert_eq!(s.to_compact_json(), before, "reading a view writes nothing");
+}
+
+/// A view usage without a `render` member of its own reports the
+/// rendering it inherits: from the definition that types it, or through
+/// a view usage it specializes. The inherited rendering resolves where
+/// its definition declares it, here through an import only that
+/// definition's package has. A view's own `render` member takes
+/// precedence over an inherited one.
+#[test]
+fn view_info_reports_an_inherited_rendering() {
+    let mut s = Session::from_sources(&sources(&[(
+        "views.sysml",
+        "package M {\n    part a;\n    part b;\n}\npackage Defs {\n    private import Views::*;\n    view def Listing { render asElementTable; }\n}\npackage S {\n    rendering asOutline : Views::Rendering;\n    view def TV { render Views::asElementTable; }\n    view v : TV { expose M::*; }\n    view listed : Defs::Listing { expose M::*; }\n    view outlined : TV {\n        expose M::*;\n        render asOutline;\n    }\n    view narrowed :> v;\n}\n",
+    )]))
+    .unwrap();
+    s.load_library_sources(&sources(&[("Views.sysml", VIEWS_LIBRARY)]), None)
+        .unwrap();
+    let before = s.to_compact_json();
+    let info = |s: &mut Session, view: &str| -> serde_json::Value {
+        serde_json::from_str(&s.view_info(view).unwrap()).unwrap()
+    };
+    let v = info(&mut s, "S::v");
+    assert_eq!(v["rendering"], "asElementTable");
+    assert_eq!(exposed_names(&v), ["M::a", "M::b"]);
+    assert_eq!(info(&mut s, "S::listed")["rendering"], "asElementTable");
+    assert_eq!(info(&mut s, "S::outlined")["rendering"], "asOutline");
+    assert_eq!(info(&mut s, "S::narrowed")["rendering"], "asElementTable");
     assert_eq!(s.to_compact_json(), before, "reading a view writes nothing");
 }
 

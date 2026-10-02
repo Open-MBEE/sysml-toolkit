@@ -371,13 +371,17 @@ fn decode(
     }
     // The derivation-scheme axis gates only payloads that actually
     // derive ids; explicit-id payloads decode regardless of it.
-    if elided && scheme != crate::ID_SCHEME_VERSION {
+    if elided
+        && !matches!(
+            scheme,
+            crate::ID_SCHEME_VERSION | crate::CANONICAL_GRAPH_VERSION
+        )
+    {
         return Err(Error::of(
             ErrorKind::UnsupportedVersion,
             format!(
-                "id-derivation scheme {scheme} unsupported (decoder carries {}); \
-                 the payload's ids cannot be recovered here",
-                crate::ID_SCHEME_VERSION
+                "id-derivation scheme {scheme} unsupported (decoder carries 2 and 3); \
+                 the payload's ids cannot be recovered here"
             ),
         ));
     }
@@ -543,6 +547,13 @@ fn decode(
             .collect();
         patch_placeholders(&mut value, &map);
     }
+    if scheme == crate::CANONICAL_GRAPH_VERSION && !full {
+        sysmlv2_model::migration::validate_graph_format(
+            &value,
+            sysmlv2_model::model::GraphFormat::CanonicalV3,
+        )
+        .map_err(Error::new)?;
+    }
     Ok((value, units))
 }
 
@@ -605,4 +616,52 @@ pub fn from_cbor_with_units(
 /// (see [`from_cbor_with_units`]).
 pub fn from_compact_cbor_units(bytes: &[u8]) -> Result<(Value, Vec<(u64, String)>), Error> {
     decode(bytes, Some(false), None)
+}
+
+/// Read the lowering/identity contract from the header without decoding the body.
+/// This is metadata only; decoding still validates the payload. The original
+/// explicit-ID scheme 1 uses the legacy graph shape. For compatibility,
+/// unrecognized explicit-ID schemes also select legacy; unknown elided schemes
+/// are refused because their identities cannot be recovered.
+pub fn graph_format(bytes: &[u8]) -> Result<sysmlv2_model::model::GraphFormat, Error> {
+    let mut r = Reader::new(crate::strip_magic(bytes)?);
+    r.array()?;
+    let (scheme, flags) = parse_header(r.uint()?)?;
+    match scheme {
+        1 | 2 => Ok(sysmlv2_model::model::GraphFormat::LegacyV2),
+        3 => Ok(sysmlv2_model::model::GraphFormat::CanonicalV3),
+        _ if flags & FLAG_ELIDE_IDS == 0 => Ok(sysmlv2_model::model::GraphFormat::LegacyV2),
+        _ => Err(Error::of(
+            ErrorKind::UnsupportedVersion,
+            "unknown authored graph format",
+        )),
+    }
+}
+
+/// Reject a payload whose header names a different lowering/identity contract.
+/// The caller must still decode or apply it to validate its contents.
+pub fn assert_graph_format(
+    bytes: &[u8],
+    expected: sysmlv2_model::model::GraphFormat,
+) -> Result<(), Error> {
+    if graph_format(bytes)? != expected {
+        return Err(Error::new(
+            "payload graph format differs from session; migrate or open a matching session",
+        ));
+    }
+    Ok(())
+}
+
+/// Decoded compact graph, source-unit paths, and authored graph-format contract.
+pub type DecodedCompactGraph = (Value, Vec<(u64, String)>, sysmlv2_model::model::GraphFormat);
+
+/// Decode a compact snapshot while retaining its graph-format choice for loading.
+/// Explicit-ID legacy compatibility follows [`graph_format`].
+pub fn from_cbor_with_format(
+    bytes: &[u8],
+    external_name: &dyn Fn(&str) -> Option<String>,
+) -> Result<DecodedCompactGraph, Error> {
+    let format = graph_format(bytes)?;
+    let (value, units) = decode(bytes, Some(false), Some(&external_name))?;
+    Ok((value, units, format))
 }

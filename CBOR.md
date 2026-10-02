@@ -35,6 +35,35 @@ Which payload kind it is lives in the body's own header flags, never in the name
 
   The type is unregistered vendor-tree for now; register it (and the application tag) before any public service exposes them.
 
+## Selecting a graph contract
+
+Existing codec functions continue to stamp scheme 2. For canonical compact
+snapshots use `to_compact_cbor_with_format`,
+`to_compact_cbor_explicit_with_format`, or
+`to_compact_cbor_elided_with_format`; use `to_full_cbor_with_format` for full
+emit views. Full encoding carries the caller's declared format and does not
+certify semantic conformance.
+
+`from_cbor_with_format` returns a compact document, unit paths, and its format.
+`graph_format` reads header metadata without walking the payload; it is not a
+payload validator. `assert_graph_format` checks a receiver's selected contract.
+Legacy explicit-ID stamps retain historical compatibility; unknown elided stamps
+are refused. A resolver artifact must pass `assert_compatible_with_format` before
+use with the selected contract.
+
+Deltas select the contract with `DeltaOptions::with_graph_format`; base and target
+must already use that contract. Deltas are not an identity migration. Retain the
+header's format alongside the returned JSON when using the generic apply APIs.
+Sessions select the header automatically when encoding and reject incoming
+snapshots or deltas whose header format differs from their library context.
+Explicitly format-aware sessions also enforce conditional and constructor JSON shapes at their
+boundaries. Historical legacy constructors and scheme-2 snapshot loading retain
+their foreign-graph recovery/warning policy. Opening a compact
+snapshot with `Session::from_compact_cbor` restores its recorded format. Scheme 2
+does not serialize the stricter JSON-boundary policy selected by an explicit
+LegacyV2 constructor; reopening it uses historical legacy recovery. JSON-only
+consumers must pass the format explicitly when rebuilding a session.
+
 ## Layout
 
 ```
@@ -77,7 +106,7 @@ Where the bytes go, relative to compact JSON:
 
 - **layout (u8)** — the array shapes, presence encoding, reference index spaces, and delta framing. Refused unconditionally on mismatch.
 - **tables (u16)** — the generated metamodel tables (type codes, field ordinals, kinds, defaults; currently from the 20250201 normative release). Refused on any decode, since every element record reads through them — but independently of layout, so a tables-only regeneration is diagnosable as exactly that.
-- **scheme (u8)** — the id-derivation scheme (`IDS.md`; wire scheme 1 is that document's graph-derived derivation). Consulted **only** where derivation is in play (id-elided payloads, snapshot or delta): explicit-id payloads decode regardless of it. Digest failures on matched-scheme payloads therefore come pre-diagnosed: not a scheme skew, so library skew or corruption.
+- **scheme (u8)** — the lowering/identity contract (`IDS.md`): 2 is the default legacy graph; 3 is opt-in canonical lowering. Both use graph-derived identities. Elided snapshots and deltas accept these supported schemes; scheme 3 compact snapshots and applied deltas also validate their authored conditional and constructor shapes. Generic explicit-ID decoders retain historical scheme compatibility, but format-aware sessions require their selected contract. Digest failures on matched schemes indicate a different library context or corruption.
 
 **Flags.** `elideIds` (1), `fullForm` (2), `delta` (4), `deltaPortable` (8), `unitPaths` (16), `impliedOwners` (32), and `explicitIds` (64): a compact snapshot whose ids are not all the graph derivation of `IDS.md` — a session that loaded a document from another producer, or under other unit names, keeps the ids it was given and marks the payload so a receiver never re-derives them; such a session refuses id elision. Informational for decoders, which always read the id table; `describe` reports it as `explicitIds`.
 

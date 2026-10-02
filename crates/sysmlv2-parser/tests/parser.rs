@@ -1641,6 +1641,61 @@ fn qualified_name_member_only_in_metadata_bodies() {
 }
 
 #[test]
+fn terminated_result_expression_stays_the_result() {
+    // `x * 2;` ending a calc body: one error, spanning the `;` alone,
+    // and the expression is still the body's result member.
+    let src = "package P { calc def F { in x; x * 2; } }";
+    let Parse { unit, diagnostics } = parse_source(src);
+    let semi = src.find("2;").unwrap() + 1;
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        (
+            diagnostics[0].span.start as usize,
+            diagnostics[0].span.end as usize
+        ),
+        (semi, semi + 1)
+    );
+    assert_eq!(
+        diagnostics[0].message,
+        sysmlv2_parser::parser::RESULT_EXPRESSION_TERMINATOR
+    );
+    let MemberKind::Package(p) = &unit.members[0].kind else {
+        panic!()
+    };
+    let MemberKind::Definition(d) = &p.body.as_ref().unwrap()[0].kind else {
+        panic!()
+    };
+    let body = d.body.as_ref().unwrap();
+    assert_eq!(body.len(), 2, "{body:#?}");
+    let MemberKind::Result(e) = &body[1].kind else {
+        panic!("{body:#?}")
+    };
+    assert!(matches!(e.kind, ExprKind::Binary { .. }), "{e:#?}");
+    assert_eq!(
+        &src[body[1].span.start as usize..body[1].span.end as usize],
+        "x * 2"
+    );
+
+    // A body that takes no result parses as it always has: the member
+    // parse's error at the operator, and no result member.
+    let src = "package P { part def V { attribute m; m > 0; } }";
+    let Parse { unit, diagnostics } = parse_source(src);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].message, "expected `;` or `{`, found `>`");
+    let MemberKind::Package(p) = &unit.members[0].kind else {
+        panic!()
+    };
+    let MemberKind::Definition(d) = &p.body.as_ref().unwrap()[0].kind else {
+        panic!()
+    };
+    let body = d.body.as_ref().unwrap();
+    assert!(
+        !body.iter().any(|m| matches!(m.kind, MemberKind::Result(_))),
+        "{body:#?}"
+    );
+}
+
+#[test]
 fn extended_definition_and_usage() {
     let body = package_body(
         "package P {
@@ -1810,6 +1865,93 @@ fn missing_semicolon_before_brace_defers_to_result_expression() {
         panic!()
     };
     assert_eq!(d.body.as_ref().unwrap().len(), 1, "repaired member kept");
+}
+
+/// Parse `src`, which must report exactly one error per `;` at the byte
+/// offsets `semis`, in order, each spanning its `;`: the errors'
+/// messages, and the package body.
+fn errors_at_semis(src: &str, semis: &[usize]) -> (Vec<String>, Vec<Member>) {
+    let Parse { unit, diagnostics } = parse_source(src);
+    let spans: Vec<_> = diagnostics
+        .iter()
+        .map(|d| (d.span.start as usize, d.span.end as usize))
+        .collect();
+    let expected: Vec<_> = semis.iter().map(|&at| (at, at + 1)).collect();
+    assert_eq!(spans, expected, "{src:?}: {diagnostics:#?}");
+    let MemberKind::Package(p) = unit.members.into_iter().next().unwrap().kind else {
+        panic!("{src:?}")
+    };
+    let messages = diagnostics.into_iter().map(|d| d.message).collect();
+    (messages, p.body.expect("package body"))
+}
+
+#[test]
+fn a_missing_value_is_reported_at_its_terminator() {
+    const MISSING: &str = "expected an expression, found `;`";
+    const STRAY: &str = "unsupported or unexpected construct at `;`";
+
+    // `=`, `:=`, and `default` take an expression. A `;` in its place is
+    // the declaration's terminator with the expression missing — not the
+    // bare-`;` body a calculation body lends SysML's expression body. One
+    // error, at the `;`; the declaration stays in the tree without a
+    // value, and the member after it parses clean, on the same line or
+    // the next.
+    for value in ["=", ":=", "default", "default =", "default :="] {
+        for gap in [" ", "\n    "] {
+            let src = format!("package P {{{gap}attribute x {value} ;{gap}part def Y;\n}}");
+            let semi = src.find(" ;").unwrap() + 1;
+            let (messages, body) = errors_at_semis(&src, &[semi]);
+            assert_eq!(messages, [MISSING], "{src:?}");
+            let [x, y] = body.as_slice() else {
+                panic!("{src:?}: {body:#?}")
+            };
+            let MemberKind::Usage(x) = &x.kind else {
+                panic!("{src:?}: {x:#?}")
+            };
+            assert_eq!(x.declaration.id.name.as_ref().unwrap().value, "x");
+            assert!(x.value.is_none(), "{src:?}: {x:#?}");
+            assert!(matches!(y.kind, MemberKind::Definition(_)), "{src:?}");
+        }
+    }
+
+    // A doubled terminator: the first `;` ends the declaration, the
+    // second is a stray `;` of its own.
+    let src = "package P { attribute x = ;; part def Y; }";
+    let semi = src.find(";;").unwrap();
+    let (messages, body) = errors_at_semis(src, &[semi, semi + 1]);
+    assert_eq!(messages, [MISSING, STRAY]);
+    assert_eq!(body.len(), 2, "{body:#?}");
+
+    // Nor is a `;` an operand, a collect or select body, or the body of
+    // an arrow invocation: each is reported at the `;`, which still ends
+    // the declaration.
+    for src in [
+        "package P { attribute x = 1 + ; part def Y; }",
+        "package P { attribute x = xs.; part def Y; }",
+        "package P { attribute x = xs.?; part def Y; }",
+        "package P { attribute x = xs->F ; part def Y; }",
+    ] {
+        let semi = src.find(';').unwrap();
+        let (_, body) = errors_at_semis(src, &[semi]);
+        assert_eq!(body.len(), 2, "{src:?}: {body:#?}");
+    }
+
+    // A lone `;` ending a calculation body is a stray terminator, not the
+    // body's result expression.
+    let src = "package P { calc def F { in x; ; } }";
+    let semi = src.rfind(';').unwrap();
+    let (messages, body) = errors_at_semis(src, &[semi]);
+    assert_eq!(messages, [STRAY]);
+    let MemberKind::Definition(f) = &body[0].kind else {
+        panic!("{body:#?}")
+    };
+    let members = f.body.as_ref().unwrap();
+    assert!(
+        !members
+            .iter()
+            .any(|m| matches!(m.kind, MemberKind::Result(_))),
+        "{members:#?}"
+    );
 }
 
 #[test]

@@ -10,11 +10,12 @@
 //! lambda bodies.
 //!
 //! KerML values are sequences; here scalars are singleton values and
-//! `null`/`()` is the empty [`Value::Sequence`]. Intrinsics are matched by
-//! the *last segment* of the invoked name (the Kernel Function Library
-//! names are treated as reserved), so models evaluated without the library
-//! loaded still compute. User-defined calculations — any resolvable element
-//! whose body carries a trailing result expression — invoke with
+//! `null`/`()` is the empty [`Value::Sequence`]. Resolved intrinsics are
+//! identified by their standard-library identity, including through aliases.
+//! Unresolved bare intrinsic names remain available without a library;
+//! declared functions and locally bound callees always take precedence.
+//! User-defined calculations — any resolvable element whose body carries a
+//! trailing result expression — invoke with
 //! positional and named arguments (parameters bind like lambda
 //! parameters; recursion is allowed to a fixed depth). Quantity brackets
 //! (`10 [mm]`) evaluate to [`Value::Quantity`]: units normalize to
@@ -49,7 +50,13 @@
 //! Documented v1 gaps (all reported as [`EvalError::Unsupported`]):
 //! extents (`all T`).
 
-use crate::json::{Builder, ElementRef, ResolvedModel, Tri};
+mod report;
+pub use report::{EvaluationDependency, EvaluationReport, InheritedDefaultFailure};
+
+use crate::json::{
+    Builder, CallableBody, CallableResult, ElementRef, ResolvedModel, RuntimeFrame,
+    RuntimeFrameProof, ScopeRef, Tri,
+};
 
 /// Owner-context library collections per member metaclass — the
 /// systems library's counterpart rows of SysML 8.4.2 Table 32 (the
@@ -68,8 +75,10 @@ fn implied_collection_extras(metaclass: &str) -> &'static [&'static str] {
 }
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::OnceLock;
 use sysmlv2_syntax::Span;
 use sysmlv2_syntax::ast::*;
+use uuid::Uuid;
 
 pub use crate::rational::Rational;
 
@@ -811,6 +820,14 @@ impl fmt::Display for EvalError {
 }
 
 type Result_ = Result<Value, EvalError>;
+type Cardinality = (i128, Option<i128>);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CardinalityDomain {
+    Type,
+    Multiplicity,
+}
+type CardinalityKey = (usize, Option<usize>, CardinalityDomain);
+type CardinalityMemo = HashMap<CardinalityKey, Option<Cardinality>>;
 
 /// A control function's per-item computation: a `{ … }` lambda body, or
 /// a referenced function (`->reduce '+'`, `->minimize someCalc`).
@@ -825,7 +842,16 @@ pub(crate) fn evaluate_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Resul
     Evaluator {
         b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -851,7 +877,16 @@ pub(crate) fn evaluate_expr_with(
     Evaluator {
         b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides,
         unbound_receiver: None,
         lib_frames: 0,
@@ -872,7 +907,16 @@ pub(crate) fn unit_of_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Result
     Evaluator {
         b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -895,7 +939,16 @@ pub(crate) fn evaluate_query_in(b: &mut Builder, scope: usize, e: &Expr) -> Resu
     Evaluator {
         b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -907,10 +960,9 @@ pub(crate) fn evaluate_query_in(b: &mut Builder, scope: usize, e: &Expr) -> Resu
     .expr(scope, e)
 }
 
-/// [`evaluate_query_in`] with an initial environment: `env` binds names
-/// the expression may reference (a template's loop variables and
-/// inputs), innermost last — the rendering backend's entry point.
-pub(crate) fn evaluate_query_with_env(
+/// Query with external names for environment-shadowing regressions.
+#[cfg(test)]
+fn evaluate_query_with_env(
     b: &mut Builder,
     scope: usize,
     e: &Expr,
@@ -918,8 +970,25 @@ pub(crate) fn evaluate_query_with_env(
 ) -> Result_ {
     Evaluator {
         b,
-        env,
+        env: env
+            .into_iter()
+            .map(|(name, value)| EnvironmentBinding {
+                name,
+                value,
+                parameter: None,
+                frame: None,
+            })
+            .collect(),
+        lexical_scope: Some(scope),
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -931,12 +1000,185 @@ pub(crate) fn evaluate_query_with_env(
     .expr(scope, e)
 }
 
+/// Exact effective multiplicity, shared with symbolic translation.
+pub(crate) fn effective_cardinality(
+    model: &mut ResolvedModel,
+    e: ElementRef,
+) -> Option<Cardinality> {
+    Evaluator {
+        b: &mut model.b,
+        env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
+        in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
+        overrides: HashMap::new(),
+        unbound_receiver: None,
+        lib_frames: 0,
+        call_depth: 0,
+        steps: 0,
+        allocated: 0,
+        query: false,
+    }
+    .unbound_cardinality(e.0)
+}
+
+/// See [`ResolvedModel::implicit_open_multiplicity`]: the branch of
+/// [`Evaluator::cardinality_in`] that answers the open default, with no
+/// bound, subsetting or positional target to consult first.
+pub(crate) fn implicit_open_multiplicity(model: &mut ResolvedModel, e: ElementRef) -> bool {
+    let b = &mut model.b;
+    if !b.structural_usage(e.0)
+        || b.default_cardinality(e.0) != (0, None)
+        || b.local_multiplicity(e.0) != Some(None)
+        || b.declared_multiplicity_of(e.0).is_some()
+    {
+        return false;
+    }
+    let mut steps = 0;
+    matches!(b.cardinality_subset_targets(e.0, &mut steps), Some(targets) if targets.is_empty())
+        && matches!(b.cardinality_positional_targets(e.0, &mut steps), Some(targets) if targets.is_empty())
+}
+
+/// Current graph expressions admitted by the shared checked providers.
+#[derive(Default)]
+pub(crate) struct CheckedMultiplicityExpressions {
+    pub(crate) operators: HashMap<usize, (BinaryOp, Vec<usize>)>,
+    pub(crate) references: HashMap<usize, (usize, usize, usize)>,
+    pub(crate) universal_relationships: HashSet<usize>,
+}
+
+/// Read a structurally certified range through the same numeric/receiver evaluator.
+pub(crate) fn checked_multiplicity_domain(
+    b: &mut Builder,
+    e: usize,
+    context: Option<usize>,
+    operators: &CheckedMultiplicityExpressions,
+    steps: &mut usize,
+) -> Option<Cardinality> {
+    let mut evaluator = checked_multiplicity_evaluator(b, *steps);
+    let result = evaluator.multiplicity_domain(e, context, &mut HashMap::new(), Some(operators));
+    *steps = evaluator.steps;
+    result
+}
+
+/// Select a contextual referent with the same complete identity-based receiver
+/// evidence used by numeric execution. This does not evaluate stored source ASTs.
+pub(crate) fn checked_multiplicity_reference_target(
+    b: &mut Builder,
+    original: usize,
+    context: Option<usize>,
+    steps: &mut usize,
+) -> Option<usize> {
+    let mut evaluator = checked_multiplicity_evaluator(b, *steps);
+    let result = evaluator
+        .cardinality_reference_target(original, context)
+        .map(|(target, _)| target);
+    *steps = evaluator.steps;
+    result
+}
+
+fn checked_multiplicity_evaluator(b: &mut Builder, steps: usize) -> Evaluator<'_> {
+    Evaluator {
+        b,
+        env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
+        in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
+        overrides: HashMap::new(),
+        unbound_receiver: None,
+        lib_frames: 0,
+        call_depth: 0,
+        steps,
+        allocated: 0,
+        query: false,
+    }
+}
+
+/// Distinguishes declaration-level validity from valuation in a specializing
+/// receiver. A body range's lexical scope need not be its featuring receiver.
+#[derive(Clone, Copy)]
+pub(crate) enum MultiplicityBoundContext {
+    Lexical,
+    Receiver(Option<usize>),
+}
+
+/// A declaration bound evaluated in a specified specializing receiver, retaining
+/// exact numeric values. Validation shares the query budget across domain edges
+/// and expressions; it must not substitute Feature cardinality for a range value.
+pub(crate) fn evaluate_multiplicity_bound(
+    b: &mut Builder,
+    source: usize,
+    scope: usize,
+    context: MultiplicityBoundContext,
+    expr: &Expr,
+    steps: &mut usize,
+) -> Option<Value> {
+    *steps = steps.saturating_add(1);
+    if *steps > MAX_STEPS {
+        return None;
+    }
+    let origin = b.set_identity_origin(source);
+    let mut evaluator = Evaluator {
+        b,
+        env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
+        in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
+        overrides: HashMap::new(),
+        unbound_receiver: None,
+        lib_frames: 0,
+        call_depth: 0,
+        steps: *steps,
+        allocated: 0,
+        query: false,
+    };
+    let value = match context {
+        MultiplicityBoundContext::Lexical => evaluator.expr(scope, expr).ok(),
+        MultiplicityBoundContext::Receiver(receiver) => {
+            evaluator.cardinality_bound(scope, receiver, expr)
+        }
+    };
+    *steps = evaluator.steps;
+    evaluator.b.identity_origin_unit = origin;
+    value
+}
+
 /// Evaluate the feature-value expression of `e`.
 pub(crate) fn evaluate_feature(model: &mut ResolvedModel, e: ElementRef) -> Result_ {
     Evaluator {
         b: &mut model.b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -946,6 +1188,50 @@ pub(crate) fn evaluate_feature(model: &mut ResolvedModel, e: ElementRef) -> Resu
         query: false,
     }
     .feature_value(e.0)
+}
+
+fn evaluate_report_with(
+    b: &mut Builder,
+    evaluate: impl FnOnce(&mut Evaluator<'_>) -> Result_,
+) -> EvaluationReport {
+    let mut evaluator = Evaluator {
+        b,
+        env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: Some(Box::default()),
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
+        in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
+        overrides: HashMap::new(),
+        unbound_receiver: None,
+        lib_frames: 0,
+        call_depth: 0,
+        steps: 0,
+        allocated: 0,
+        query: false,
+    };
+    let result = evaluate(&mut evaluator);
+    evaluator
+        .report
+        .take()
+        .expect("report collector")
+        .finish(result)
+}
+
+pub(crate) fn evaluate_feature_report(
+    model: &mut ResolvedModel,
+    e: ElementRef,
+) -> EvaluationReport {
+    evaluate_report_with(&mut model.b, |evaluator| evaluator.feature_value(e.0))
+}
+
+pub(crate) fn evaluate_expr_report(b: &mut Builder, scope: usize, expr: &Expr) -> EvaluationReport {
+    evaluate_report_with(b, |evaluator| evaluator.expr(scope, expr))
 }
 
 /// Evaluate the feature chain `root.m1.m2…` off an already-resolved
@@ -960,7 +1246,16 @@ pub(crate) fn evaluate_chain_of(
     let mut ev = Evaluator {
         b: &mut model.b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -974,6 +1269,71 @@ pub(crate) fn evaluate_chain_of(
         v = ev.chain_into(v, m)?;
     }
     Ok(v)
+}
+
+/// Charge recursive value traversal before cloning or comparing chain values.
+/// This also bounds the depth of externally constructed receivers.
+fn charge_chain_value(value: &Value, steps: &mut usize, depth: usize) -> Result<(), EvalError> {
+    *steps = steps.saturating_add(1);
+    if *steps > MAX_STEPS || depth > MAX_CALL_DEPTH {
+        return Err(EvalError::Budget("chain exceeds traversal budget".into()));
+    }
+    match value {
+        Value::Sequence(items) => {
+            for value in items {
+                charge_chain_value(value, steps, depth + 1)?;
+            }
+        }
+        Value::Instance { fields, .. } => {
+            for (_, value) in fields {
+                charge_chain_value(value, steps, depth + 1)?;
+            }
+        }
+        Value::Quantity(value, _) => charge_chain_value(value, steps, depth + 1)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A chain over a value whose source reference has already been evaluated.
+/// Validate externally supplied structure before recursive chain traversal.
+pub(crate) fn evaluate_value_chain(
+    model: &mut ResolvedModel,
+    target: Value,
+    members: &[&QualifiedName],
+) -> Result_ {
+    if members.iter().any(|m| m.segments.is_empty()) {
+        return Err(EvalError::Unsupported("empty chain member name".into()));
+    }
+    if members.is_empty() {
+        return Ok(target);
+    }
+    let mut ev = Evaluator {
+        b: &mut model.b,
+        env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
+        in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
+        overrides: HashMap::new(),
+        unbound_receiver: None,
+        lib_frames: 0,
+        call_depth: 0,
+        steps: 0,
+        allocated: 0,
+        query: false,
+    };
+    let mut value = target;
+    for member in members {
+        value = ev.chain_into(value, member)?;
+    }
+    Ok(value)
 }
 
 /// Evaluate `member` as a chain step off `receiver` — the semantics of
@@ -990,7 +1350,16 @@ pub(crate) fn evaluate_member_of(
     let mut ev = Evaluator {
         b: &mut model.b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1004,6 +1373,7 @@ pub(crate) fn evaluate_member_of(
             v @ (Value::Element(_)
             | Value::Unbound(_)
             | Value::UnboundMember(_)
+            | Value::Indeterminate
             | Value::Sequence(_)
             | Value::Instance { .. }),
         ) => v,
@@ -1019,7 +1389,8 @@ pub(crate) fn evaluate_member_of(
 /// bound (`1..1000000000`, a calculation doubling a string on every
 /// recursion, nested collects over large ranges, a product folding into
 /// a million-digit integer) fails with [`EvalError::Budget`] instead of
-/// hanging or exhausting memory. Steps count expression nodes; the
+/// hanging or exhausting memory. Steps count expression nodes and recursive
+/// chain traversal/comparison work; the
 /// allocation budget counts the bytes of every sequence or string an
 /// operator materializes, so many individually admissible values cannot
 /// add up without bound; exact numbers are refused past
@@ -1040,10 +1411,41 @@ pub const MAX_ALLOCATION: usize = 256 << 20;
 /// not a deep model.
 pub const MAX_CALL_DEPTH: usize = 64;
 
+#[derive(Clone, Copy)]
+struct CardinalityContext {
+    scope: Option<usize>,
+    /// Once a dependency is rebased, broader local evaluation cannot bypass
+    /// identity selection by calling into a locally declared sibling.
+    rebased: bool,
+    /// Conservative sum of syntax depths on the active dependency path.
+    depth: usize,
+}
+
+enum CardinalityFormulaLimit {
+    Unsupported,
+    Depth,
+}
+
+#[derive(Clone)]
+struct EnvironmentBinding {
+    name: String,
+    parameter: Option<usize>,
+    frame: Option<usize>,
+    value: Value,
+}
+
 struct Evaluator<'m> {
     b: &'m mut Builder,
     /// Lambda- and calculation-parameter bindings, innermost last.
-    env: Vec<(String, Value)>,
+    env: Vec<EnvironmentBinding>,
+    /// Declaration scope for runtime parameter admission, independent of receivers.
+    lexical_scope: Option<usize>,
+    call_frames: Vec<RuntimeFrame>,
+    frame_proofs: RuntimeFrameProof,
+    report: Option<Box<report::Collector>>,
+    /// Cache admission records hidden failures even when diagnostics are disabled.
+    inherited_failure_epoch: usize,
+    value_scopes: crate::json::ValueScopeResolver,
     /// (feature, evaluation scope) pairs currently being evaluated
     /// (cycle guard — context-aware, see [`Self::feature_value_in`]).
     in_progress: HashSet<(usize, usize)>,
@@ -1052,6 +1454,12 @@ struct Evaluator<'m> {
     /// requirement's subject binds to the satisfying feature); empty
     /// everywhere else.
     overrides: HashMap<usize, Value>,
+    /// Bounds can themselves call size; guard both bound and heritage cycles.
+    cardinality_in_progress: HashSet<CardinalityKey>,
+    /// A bound formula keeps its lexical scope while references select values
+    /// by identity in this featuring context. None means ordinary evaluation.
+    cardinality_context: Option<CardinalityContext>,
+    cardinality_providers: crate::json::provider_completeness::ProviderCompleteness,
     /// Depth of library-owned calculation bodies on the call stack.
     /// Inside them, unbound features keep the closed [`Value::Element`]
     /// convention (library functions legitimately count and compare
@@ -1130,6 +1538,41 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Intersect visibility atomically: proof failure leaves every frame intact.
+    fn mask_frames(&mut self, lexical: usize, receiver: usize) -> Result<Vec<usize>, EvalError> {
+        let mut hidden = Vec::new();
+        for (index, &frame) in self.call_frames.iter().enumerate() {
+            if frame.visible
+                && !self
+                    .frame_proofs
+                    .permits_builder(
+                        self.b,
+                        frame,
+                        ScopeRef(lexical),
+                        ScopeRef(receiver),
+                        &mut self.steps,
+                    )
+                    .ok_or_else(|| {
+                        EvalError::Unsupported(
+                            "runtime frame visibility is incomplete or exceeds the budget".into(),
+                        )
+                    })?
+            {
+                hidden.push(index);
+            }
+        }
+        for &index in &hidden {
+            self.call_frames[index].visible = false;
+        }
+        Ok(hidden)
+    }
+
+    fn restore_frames(&mut self, hidden: Vec<usize>) {
+        for index in hidden {
+            self.call_frames[index].visible = true;
+        }
+    }
+
     fn feature_value_in(&mut self, e: usize, ctx: Option<usize>) -> Result_ {
         // Reading a local/output directly must not bypass the refusal at
         // invocation: its initializer need not be its value after execution.
@@ -1145,8 +1588,8 @@ impl Evaluator<'_> {
         if let Some(v) = self.overrides.get(&e) {
             return Ok(v.clone());
         }
-        let (scope, expr, inherited) = match self.b.values.get(&e).cloned() {
-            Some((s, x)) => (s, x, false),
+        let (scope, expr, inherited, origin) = match self.b.values.get(&e).cloned() {
+            Some((s, x)) => (s, x, false, e),
             // A redefining feature with no value of its own inherits a
             // `default` value expression from its redefinition target
             // (KerML FeatureValue isDefault: a default applies unless
@@ -1157,16 +1600,73 @@ impl Evaluator<'_> {
             // survives redefinition is spec-ambiguous, so those stay
             // unbound (the element itself) as before.
             None => match (self.inherited_default(e), self.b.owner_scope_of(e)) {
-                (Some(expr), Some(s)) => (s, expr, true),
+                (Some((origin, expr)), Some(s)) => (s, expr, true, origin),
                 _ => return Ok(self.placeholder(e)),
             },
         };
         if (inherited || self.b.default_values.contains(&e)) && self.receiver_member(e).is_some() {
             return Ok(Value::Indeterminate);
         }
-        let scope = ctx.unwrap_or(scope);
+        let scope = match self.value_scopes.select_builder(
+            self.b,
+            origin,
+            ctx.or(Some(scope)),
+            &mut self.steps,
+        ) {
+            crate::json::ValueScopeDecision::Lexical(scope)
+            | crate::json::ValueScopeDecision::Receiver(scope) => scope.0,
+            crate::json::ValueScopeDecision::Unsupported => {
+                return Err(EvalError::Unsupported(
+                    "value receiver identity is incomplete or ambiguous".into(),
+                ));
+            }
+        };
+        let dependency = EvaluationDependency {
+            requested: ElementRef(e),
+            origin: ElementRef(origin),
+            receiver: ScopeRef(scope),
+        };
+        if let Some(report) = &mut self.report {
+            report.push(dependency);
+        }
+        let result = self.stored_feature_value(dependency, &expr, inherited);
+        if let Some(report) = &mut self.report {
+            report.pop();
+        }
+        result
+    }
+
+    fn record_inherited_failure(
+        &mut self,
+        dependency: EvaluationDependency,
+        span: Span,
+        error: EvalError,
+    ) {
+        self.inherited_failure_epoch = self.inherited_failure_epoch.saturating_add(1);
+        if let Some(report) = &mut self.report {
+            report.record(
+                dependency,
+                self.b.unit_of_elem(dependency.origin.0),
+                span,
+                error,
+            );
+        }
+    }
+
+    fn stored_feature_value(
+        &mut self,
+        dependency: EvaluationDependency,
+        expr: &Expr,
+        inherited: bool,
+    ) -> Result_ {
+        let EvaluationDependency {
+            requested: ElementRef(e),
+            origin: ElementRef(origin),
+            receiver: ScopeRef(scope),
+        } = dependency;
         if !self.in_progress.insert((e, scope)) {
-            if inherited {
+            if inherited && self.report.is_none() {
+                self.inherited_failure_epoch = self.inherited_failure_epoch.saturating_add(1);
                 return Ok(self.placeholder(e));
             }
             let name = self.b.elements[e]
@@ -1175,19 +1675,41 @@ impl Evaluator<'_> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("<anonymous>")
                 .to_string();
-            return Err(EvalError::Cycle(name));
+            let error = EvalError::Cycle(name);
+            if inherited {
+                self.record_inherited_failure(dependency, expr.span, error);
+                return Ok(self.placeholder(e));
+            }
+            return Err(error);
         }
-        let out = self.expr(scope, &expr);
+        let declaration = self.b.values.get(&origin).map(|(s, _)| *s).unwrap_or(scope);
+        let hidden = match self.mask_frames(declaration, scope) {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                self.in_progress.remove(&(e, scope));
+                return Err(error);
+            }
+        };
+        let saved_origin = self.b.set_identity_origin(origin);
+        let lexical = self.lexical_scope;
+        self.lexical_scope = Some(declaration);
+        let out = self.expr(scope, expr);
+        self.lexical_scope = lexical;
+        self.b.identity_origin_unit = saved_origin;
+        self.restore_frames(hidden);
         self.in_progress.remove(&(e, scope));
         // The inherited-default path is best-effort: a default written for
         // the general feature may reference names its defining scope
         // imported that the redefining context cannot reach — degrade to
         // the unbound element (the pre-fallback answer) instead of
         // erroring, so downstream member access keeps working.
-        if inherited && out.is_err() {
-            return Ok(self.placeholder(e));
+        match out {
+            Err(error) if inherited => {
+                self.record_inherited_failure(dependency, expr.span, error);
+                Ok(self.placeholder(e))
+            }
+            result => result,
         }
-        out
     }
 
     /// The nearest `default` value expression on the redefinition-target
@@ -1195,7 +1717,7 @@ impl Evaluator<'_> {
     /// targets). A target carrying a *non-default* value ends the walk —
     /// whether such a binding survives redefinition is spec-ambiguous, so
     /// the caller keeps the feature unbound.
-    fn inherited_default(&mut self, e: usize) -> Option<Expr> {
+    fn inherited_default(&mut self, e: usize) -> Option<(usize, Expr)> {
         let mut seen = HashSet::new();
         let mut frontier = vec![e];
         while let Some(cur) = frontier.pop() {
@@ -1205,7 +1727,7 @@ impl Evaluator<'_> {
             for t in self.b.redefinition_target_elems(cur) {
                 if let Some((_, expr)) = self.b.values.get(&t) {
                     let expr = expr.clone();
-                    return self.b.default_values.contains(&t).then_some(expr);
+                    return self.b.default_values.contains(&t).then_some((t, expr));
                 }
                 frontier.push(t);
             }
@@ -1213,28 +1735,502 @@ impl Evaluator<'_> {
         None
     }
 
-    /// The knowable cardinality of an unbound feature, from its declared
-    /// multiplicity: `(lower, upper)` bounds, `[1..1]` when none is
-    /// written (the KerML default), `None` when the bounds cannot be
-    /// evaluated.
-    fn unbound_cardinality(&mut self, e: usize) -> Option<(f64, f64)> {
-        let Some((scope, m)) = self
-            .b
-            .multiplicities
+    /// Exact nonnegative bounds from local declarations and supported heritage.
+    /// An absent upper bound denotes infinity; an unknown result must never
+    /// be interpreted as a singleton. Inherited references retain their identity
+    /// unless a supported redefinition applies. Inherited ranges intersect.
+    fn unbound_cardinality(&mut self, e: usize) -> Option<(i128, Option<i128>)> {
+        self.cardinality_in(e, self.b.owner_scope_of(e), &mut HashMap::new())
+    }
+
+    fn cardinality_in(
+        &mut self,
+        e: usize,
+        context: Option<usize>,
+        memo: &mut CardinalityMemo,
+    ) -> Option<Cardinality> {
+        let key = (e, context, CardinalityDomain::Type);
+        if let Some(bounds) = memo.get(&key) {
+            return *bounds;
+        }
+        self.steps += 1;
+        if self.steps > MAX_STEPS {
+            return None;
+        }
+        if self.cardinality_in_progress.len() >= MAX_CALL_DEPTH
+            || !self.cardinality_in_progress.insert(key)
+        {
+            return None;
+        }
+        let result = (|| {
+            let local_multiplicity = self.b.local_multiplicity(e)?;
+            if let Some((scope, m)) = self.b.declared_multiplicity_of(e) {
+                let m = m.clone();
+                let bound = |value| match value {
+                    Value::Integer(n) if n >= 0 => Some(Some(n)),
+                    Value::Real(n) if n == f64::INFINITY => Some(None),
+                    _ => None,
+                };
+                let origin = self.b.set_identity_origin(e);
+                let result = (|| {
+                    let upper = bound(self.cardinality_bound(scope, context, &m.upper)?)?;
+                    let lower = match m.lower {
+                        Some(lower) => bound(self.cardinality_bound(scope, context, &lower)?)??,
+                        None => upper.unwrap_or(0),
+                    };
+                    upper.is_none_or(|hi| lower <= hi).then_some((lower, upper))
+                })();
+                self.b.identity_origin_unit = origin;
+                return result;
+            }
+            if let Some(m) = local_multiplicity {
+                return self.multiplicity_domain(m, context, memo, None);
+            }
+            let mut targets = self.b.cardinality_subset_targets(e, &mut self.steps)?;
+            let default = self.b.default_cardinality(e);
+            if targets.is_empty() && default == (1, Some(1)) {
+                return Some(default);
+            }
+            for target in self.b.cardinality_positional_targets(e, &mut self.steps)? {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+            if targets.is_empty() {
+                return Some(default);
+            }
+            let mut lower = 0;
+            let mut upper: Option<i128> = None;
+            for target in targets {
+                let (lo, hi) = self.cardinality_in(target, context, memo)?;
+                lower = lower.max(lo);
+                upper = match (upper, hi) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            upper.is_none_or(|hi| lower <= hi).then_some((lower, upper))
+        })();
+        self.cardinality_in_progress.remove(&key);
+        memo.insert(key, result);
+        result
+    }
+
+    /// A Multiplicity's numeric value domain is distinct from its own Feature
+    /// cardinality. Follow stored graph identities, including named constraints
+    /// whose subsettings have no textual specialization-index entry.
+    fn multiplicity_domain(
+        &mut self,
+        e: usize,
+        context: Option<usize>,
+        memo: &mut CardinalityMemo,
+        operators: Option<&CheckedMultiplicityExpressions>,
+    ) -> Option<Cardinality> {
+        let key = (e, context, CardinalityDomain::Multiplicity);
+        if let Some(bounds) = memo.get(&key) {
+            return *bounds;
+        }
+        self.steps += 1;
+        if self.steps > MAX_STEPS
+            || self.cardinality_in_progress.len() >= MAX_CALL_DEPTH
+            || !self.cardinality_in_progress.insert(key)
+        {
+            return None;
+        }
+        let result = (|| {
+            let ty = self.b.elements[e].ty;
+            if !crate::metaclass::conforms(ty, "Multiplicity") {
+                return None;
+            }
+            let mut bounds = None;
+            if ty == "MultiplicityRange" {
+                let members = self.b.owned_member_elems(e, false);
+                let count = members
+                    .iter()
+                    .take_while(|&&m| {
+                        crate::metaclass::conforms(self.b.elements[m].ty, "Expression")
+                    })
+                    .count();
+                if !(1..=2).contains(&count)
+                    || members[count..]
+                        .iter()
+                        .any(|&m| crate::metaclass::conforms(self.b.elements[m].ty, "Expression"))
+                {
+                    return None;
+                }
+                let upper =
+                    self.certified_multiplicity_bound(members[count - 1], context, operators)?;
+                let lower = if count == 2 {
+                    self.certified_multiplicity_bound(members[0], context, operators)??
+                } else {
+                    upper.unwrap_or(0)
+                };
+                if upper.is_some_and(|hi| lower > hi) {
+                    return None;
+                }
+                bounds = Some((lower, upper));
+            }
+            let relationships = self.b.elements[e].owned_relationships.clone();
+            for r in relationships {
+                if operators.is_some_and(|proof| proof.universal_relationships.contains(&r)) {
+                    continue;
+                }
+                let rel = &self.b.elements[r];
+                if !crate::metaclass::conforms(rel.ty, "Specialization") {
+                    continue;
+                }
+                let property = match rel.ty {
+                    "Subsetting" => "subsettedFeature",
+                    "Redefinition" => "redefinedFeature",
+                    _ => return None,
+                };
+                let id = rel.props.get(property)?.as_reference()?;
+                let target = self.b.element_index_of_uuid(id)?;
+                let (lo, hi) = self.multiplicity_domain(target, context, memo, operators)?;
+                bounds = Some(match bounds {
+                    None => (lo, hi),
+                    Some((lower, upper)) => (
+                        lower.max(lo),
+                        match (upper, hi) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        },
+                    ),
+                });
+            }
+            let (lower, upper) = bounds?;
+            upper.is_none_or(|hi| lower <= hi).then_some((lower, upper))
+        })();
+        self.cardinality_in_progress.remove(&key);
+        memo.insert(key, result);
+        result
+    }
+
+    /// Execute certified graph operands through the same exact arithmetic as
+    /// ordinary evaluation. Source syntax is never substituted for edited rows.
+    fn certified_multiplicity_bound(
+        &mut self,
+        e: usize,
+        context: Option<usize>,
+        operators: Option<&CheckedMultiplicityExpressions>,
+    ) -> Option<Option<i128>> {
+        let Some(operators) = operators else {
+            return self.multiplicity_bound(e, context);
+        };
+        match self.certified_multiplicity_value(e, context, operators, 0)? {
+            Value::Integer(n) if n >= 0 => Some(Some(n)),
+            Value::Real(n) if n == f64::INFINITY => Some(None),
+            _ => None,
+        }
+    }
+    fn certified_multiplicity_value(
+        &mut self,
+        e: usize,
+        context: Option<usize>,
+        operators: &CheckedMultiplicityExpressions,
+        depth: usize,
+    ) -> Option<Value> {
+        use crate::properties::Atom;
+        self.steps = self.steps.saturating_add(1);
+        if depth >= MAX_CALL_DEPTH || self.steps > MAX_STEPS {
+            return None;
+        }
+        match self.b.elements[e].ty {
+            "LiteralInfinity" => Some(Value::Real(f64::INFINITY)),
+            "LiteralInteger" => Some(Value::Integer(
+                match self.b.elements[e].props.get("value")? {
+                    Atom::Number(n) => i128::from(n.as_i64()?),
+                    Atom::String(s) => s.parse::<i128>().ok()?,
+                    _ => return None,
+                },
+            )),
+            "FeatureReferenceExpression" => {
+                let &(original, certified_target, value) = operators.references.get(&e)?;
+                let (selected, _) = self.cardinality_reference_target(original, context)?;
+                // The selected value graph was certified in this exact receiver.
+                if selected != certified_target {
+                    return None;
+                }
+                self.certified_multiplicity_value(value, context, operators, depth + 1)
+            }
+            "OperatorExpression" => {
+                let (operator, operands) = operators.operators.get(&e)?;
+                let first = self.certified_multiplicity_value(
+                    *operands.first()?,
+                    context,
+                    operators,
+                    depth + 1,
+                )?;
+                if operands.len() == 1 {
+                    return match operator {
+                        BinaryOp::Add => Some(first),
+                        BinaryOp::Sub => arith(BinaryOp::Sub, Value::Integer(0), first).ok(),
+                        _ => None,
+                    };
+                }
+                if operands.len() != 2 {
+                    return None;
+                }
+                let second =
+                    self.certified_multiplicity_value(operands[1], context, operators, depth + 1)?;
+                arith(*operator, first, second).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Read graph bounds without converting exact integers through floating
+    /// point or resolving a stored reference again by its display name.
+    fn multiplicity_bound(&mut self, e: usize, context: Option<usize>) -> Option<Option<i128>> {
+        use crate::properties::Atom;
+        match self.b.elements[e].ty {
+            "LiteralInfinity" => Some(None),
+            "LiteralInteger" => {
+                let n = match self.b.elements[e].props.get("value")? {
+                    Atom::Number(n) => i128::from(n.as_i64()?),
+                    Atom::String(s) => s.parse::<i128>().ok()?,
+                    _ => return None,
+                };
+                (n >= 0).then_some(Some(n))
+            }
+            "FeatureReferenceExpression" => match self.multiplicity_reference_value(e, context)? {
+                Value::Integer(n) if n >= 0 => Some(Some(n)),
+                Value::Real(n) if n == f64::INFINITY => Some(None),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn multiplicity_reference_value(&mut self, e: usize, context: Option<usize>) -> Option<Value> {
+        if self.call_depth > 0 {
+            return None;
+        }
+        let mut refs = self.b.elements[e]
+            .owned_relationships
             .iter()
-            .find(|(o, _, _)| *o == e)
-            .map(|(_, s, m)| (*s, m.clone()))
-        else {
-            return Some((1.0, 1.0));
+            .filter(|&&r| self.b.elements[r].ty == "Membership");
+        let r = *refs.next()?;
+        if refs.next().is_some() {
+            return None;
+        }
+        let id = self.b.elements[r]
+            .props
+            .get("memberElement")?
+            .as_reference()?;
+        let target = self.b.element_index_of_uuid(id)?;
+        let env = std::mem::take(&mut self.env);
+        let frames = std::mem::take(&mut self.call_frames);
+        let origin = self.b.set_identity_origin(e);
+        let value = self.cardinality_reference_value(target, context);
+        self.b.identity_origin_unit = origin;
+        self.env = env;
+        self.call_frames = frames;
+        value
+    }
+
+    /// FeatureReferenceExpression valuation follows referent identity and
+    /// redefinition, independently of the spelling used to reach that referent.
+    fn cardinality_reference_value(
+        &mut self,
+        original: usize,
+        context: Option<usize>,
+    ) -> Option<Value> {
+        let (target, rebased) = self.cardinality_reference_target(original, context)?;
+        self.cardinality_feature_value(target, context, rebased)
+    }
+
+    fn cardinality_reference_target(
+        &mut self,
+        original: usize,
+        context: Option<usize>,
+    ) -> Option<(usize, bool)> {
+        let owner = self.b.owner_elem(original);
+        if owner.is_none_or(|owner| !crate::metaclass::conforms(self.b.elements[owner].ty, "Type"))
+        {
+            // Root and package references keep their lexical identity, but the value
+            // expression still evaluates on the same target. A dependency may
+            // refer back to a member that the receiver redefines.
+            let (scope, _) = self.b.values.get(&original)?;
+            return Some((original, context.is_some_and(|s| s != *scope)));
+        }
+        let owner = owner?;
+        let receiver = context.and_then(|s| self.b.scope_owner(s))?;
+        if !crate::metaclass::conforms(self.b.elements[receiver].ty, "Type") {
+            return None;
+        }
+        let scope = *self.b.elem_scope.get(&receiver)?;
+        if !self
+            .cardinality_providers
+            .scope(self.b, scope, &mut self.steps)
+        {
+            return None;
+        }
+        let candidates = self
+            .b
+            .cardinality_feature_candidates(receiver, &mut self.steps)?;
+        let mut memo = HashMap::new();
+        let mut active = HashSet::new();
+        let mut selected = None;
+        for candidate in candidates {
+            if self.cardinality_redefines(candidate, original, &mut memo, &mut active)?
+                && selected
+                    .replace(candidate)
+                    .is_some_and(|previous| previous != candidate)
+            {
+                return None;
+            }
+        }
+        let target = selected?;
+        Some((target, receiver != owner || target != original))
+    }
+
+    fn cardinality_feature_value(
+        &mut self,
+        target: usize,
+        context: Option<usize>,
+        rebased: bool,
+    ) -> Option<Value> {
+        let (_, value) = self.b.values.get(&target)?;
+        if self.in_progress.len() >= MAX_CALL_DEPTH {
+            return None;
+        }
+        let rebased = rebased || self.cardinality_context.is_some_and(|c| c.rebased);
+        // Preserve the existing broader local evaluator. Once a formula or
+        // dependency has been rebased, calls/chains need separate contracts.
+        let previous = self.cardinality_context;
+        match Self::cardinality_scalar_expression_depth(value, 0) {
+            Ok(depth) => {
+                let depth = depth.checked_add(previous.map_or(0, |c| c.depth))?;
+                if depth > MAX_CALL_DEPTH {
+                    return None;
+                }
+                self.cardinality_context = Some(CardinalityContext {
+                    scope: context,
+                    rebased,
+                    depth,
+                });
+            }
+            Err(CardinalityFormulaLimit::Unsupported) if !rebased => {
+                self.cardinality_context = None;
+            }
+            Err(_) => return None,
+        }
+        let result = self.feature_value_in(target, None).ok();
+        self.cardinality_context = previous;
+        result
+    }
+
+    /// Admit bounded contextual formulas before entering the ordinary operator
+    /// evaluator. Broader local evaluation retains its existing behavior;
+    /// feature dependency depth is guarded separately above.
+    fn cardinality_scalar_expression_depth(
+        expr: &Expr,
+        depth: usize,
+    ) -> Result<usize, CardinalityFormulaLimit> {
+        if depth >= MAX_CALL_DEPTH {
+            return Err(CardinalityFormulaLimit::Depth);
+        }
+        let nested = |e| Self::cardinality_scalar_expression_depth(e, depth + 1);
+        match &expr.kind {
+            ExprKind::Literal(_) | ExprKind::Ref(_) => Ok(1),
+            ExprKind::Unary { operand, .. } => Ok(1 + nested(operand)?),
+            ExprKind::Binary { op, lhs, rhs } => {
+                if matches!(op, BinaryOp::Range | BinaryOp::NullCoalescing) {
+                    return Err(CardinalityFormulaLimit::Unsupported);
+                }
+                Ok(1 + nested(lhs)?.max(nested(rhs)?))
+            }
+            ExprKind::Conditional {
+                cond,
+                then_branch,
+                else_branch,
+            } => Ok(1 + nested(cond)?
+                .max(nested(then_branch)?)
+                .max(nested(else_branch)?)),
+            _ => Err(CardinalityFormulaLimit::Unsupported),
+        }
+    }
+
+    fn cardinality_redefines(
+        &mut self,
+        candidate: usize,
+        original: usize,
+        memo: &mut HashMap<usize, bool>,
+        active: &mut HashSet<usize>,
+    ) -> Option<bool> {
+        if let Some(&result) = memo.get(&candidate) {
+            return Some(result);
+        }
+        self.steps += 1;
+        if self.steps > MAX_STEPS || active.len() >= MAX_CALL_DEPTH || !active.insert(candidate) {
+            return None;
+        }
+        let result = (|| {
+            let mut found = candidate == original;
+            for target in self
+                .b
+                .cardinality_redefinition_targets(candidate, &mut self.steps)?
+            {
+                found |= self.cardinality_redefines(target, original, memo, active)?;
+            }
+            Some(found)
+        })();
+        active.remove(&candidate);
+        if let Some(found) = result {
+            memo.insert(candidate, found);
+        }
+        result
+    }
+
+    /// A bound belongs to its declaration, not the caller's lambda environment.
+    /// Select member valuations only through proven redefinition identities;
+    /// lexical features outside the featuring type keep their original value.
+    fn cardinality_bound(
+        &mut self,
+        scope: usize,
+        context: Option<usize>,
+        expr: &Expr,
+    ) -> Option<Value> {
+        // Bound formulas do not yet substitute active runtime arguments.
+        // Clearing that environment must not expose a declaration default
+        // as the supplied argument.
+        if self.call_depth > 0 && !matches!(expr.kind, ExprKind::Literal(_)) {
+            return None;
+        }
+        let env = std::mem::take(&mut self.env);
+        let frames = std::mem::take(&mut self.call_frames);
+        let result = (|| {
+            if let ExprKind::Ref(qn) = &expr.kind {
+                let original = self.b.resolve(scope, qn, 0)?;
+                return self.cardinality_reference_value(original, context);
+            }
+            // Arbitrary inherited expressions still need identity-aware
+            // dependency mapping. Literal bounds never depend on a receiver.
+            if matches!(expr.kind, ExprKind::Literal(_)) || context.is_none_or(|s| s == scope) {
+                self.expr(scope, expr).ok()
+            } else {
+                None
+            }
+        })();
+        self.env = env;
+        self.call_frames = frames;
+        result
+    }
+
+    fn value_cardinality(&mut self, value: &Value) -> Option<Cardinality> {
+        let (Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))) = value else {
+            return None;
         };
-        let as_num = |v: Value| v.as_f64();
-        let hi = as_num(self.expr(scope, &m.upper).ok()?)?;
-        let lo = match &m.lower {
-            Some(l) => as_num(self.expr(scope, l).ok()?)?,
-            None if hi.is_infinite() => 0.0,
-            None => hi,
-        };
-        Some((lo, hi))
+        let previous = self.unbound_receiver;
+        if matches!(value, Value::UnboundMember(_)) {
+            // A symbolic bound must not become concrete by reading a default
+            // on the type of an unknown receiver.
+            self.unbound_receiver = self.b.owner_elem(*e);
+        }
+        let result = self.unbound_cardinality(*e);
+        self.unbound_receiver = previous;
+        result
     }
 
     /// The single exit for a freshly materialized value: it charges a
@@ -1271,7 +2267,16 @@ impl Evaluator<'_> {
         match &e.kind {
             ExprKind::Literal(l) => self.literal(l),
             ExprKind::Null => Ok(Value::null()),
-            ExprKind::Ref(qn) => self.reference(scope, qn),
+            ExprKind::Ref(qn) => {
+                if let Some(context) = self.cardinality_context {
+                    let value = self.b.resolve(scope, qn, 0).and_then(|original| {
+                        self.cardinality_reference_value(original, context.scope)
+                    });
+                    Ok(value.unwrap_or(Value::Indeterminate))
+                } else {
+                    self.reference(scope, qn)
+                }
+            }
             ExprKind::Conditional {
                 cond,
                 then_branch,
@@ -1330,12 +2335,12 @@ impl Evaluator<'_> {
                 // sequence.
                 match &tval {
                     Value::Indeterminate => return Ok(Value::Indeterminate),
-                    Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e)) => {
-                        let bounds = self.unbound_cardinality(*e);
-                        let admitted = i >= 1
-                            && bounds.is_none_or(|(_, hi)| hi.is_infinite() || i as f64 <= hi);
+                    Value::Unbound(_) | Value::UnboundMember(_) => {
+                        let bounds = self.value_cardinality(&tval);
+                        let admitted =
+                            i >= 1 && bounds.is_none_or(|(_, hi)| hi.is_none_or(|hi| i <= hi));
                         if admitted {
-                            return if i == 1 && bounds.is_some_and(|(_, hi)| hi <= 1.0) {
+                            return if i == 1 && bounds == Some((1, Some(1))) {
                                 Ok(tval)
                             } else {
                                 Ok(Value::Indeterminate)
@@ -1344,6 +2349,14 @@ impl Evaluator<'_> {
                         return Err(EvalError::Type(format!("index {i} out of bounds")));
                     }
                     _ => {}
+                }
+                // A chain can yield a partial sequence whose unknown entry
+                // denotes an entire collection. Its flattened positions are
+                // unknown, so it cannot count as one slot before indexing.
+                // Keep the direct-placeholder bound checks above intact.
+                let tval = self.collection_value(tval);
+                if matches!(tval, Value::Indeterminate) {
+                    return Ok(tval);
                 }
                 let items = tval.items();
                 // KerML sequence indexing is 1-based.
@@ -1439,11 +2452,11 @@ impl Evaluator<'_> {
                     let name = a.name.as_ref().map(|n| n.to_display_string());
                     values.push((name, self.expr(scope, &a.value)?));
                 }
-                // Kernel Function Library names are reserved: intrinsics
-                // first (positional only), user-defined calculations after.
+                // Only recognized library targets (or unresolved convenience
+                // names) use the intrinsic implementation.
                 if values.iter().all(|(n, _)| n.is_none()) {
                     let positional: Vec<Value> = values.iter().map(|(_, v)| v.clone()).collect();
-                    match self.intrinsic(ty, &positional) {
+                    match self.intrinsic(scope, ty, &positional) {
                         Err(EvalError::Unsupported(_)) => {}
                         out => return out,
                     }
@@ -1452,11 +2465,15 @@ impl Evaluator<'_> {
             }
             ExprKind::Constructor { ty, args } => self.construct(scope, ty, args),
             ExprKind::Body { members } => self.body_result(scope, members),
-            ExprKind::BodyTerminator => self.body_result(scope, &[]),
             ExprKind::Sequence(items) => {
                 let mut out = Vec::new();
                 for i in items {
-                    out.extend(self.expr(scope, i)?.items());
+                    let value = self.expr(scope, i)?;
+                    let value = self.collection_value(value);
+                    if matches!(value, Value::Indeterminate) {
+                        return Ok(value);
+                    }
+                    out.extend(value.items());
                 }
                 self.charged(Value::Sequence(out))
             }
@@ -1518,13 +2535,103 @@ impl Evaluator<'_> {
         self.placeholder(anchor)
     }
 
-    fn reference(&mut self, scope: usize, qn: &QualifiedName) -> Result_ {
-        // Lambda parameters shadow model names.
-        if qn.segments.len() == 1 && !qn.is_global {
-            let name = &qn.segments[0].value;
-            if let Some((_, v)) = self.env.iter().rev().find(|(n, _)| n == name) {
-                return Ok(v.clone());
+    /// Runtime arguments are attached to declarations, not written spellings.
+    /// Name bindings are reserved for external query/standalone environments.
+    fn environment_value(
+        &mut self,
+        scope: usize,
+        qn: &QualifiedName,
+    ) -> Result<Option<Value>, EvalError> {
+        if self.env.is_empty() && self.call_frames.is_empty() {
+            return Ok(None);
+        }
+        let lexical = self.lexical_scope.unwrap_or(scope);
+        let reference = self.b.reference_identity(lexical, qn);
+        let external_name = (!reference.identity_bound && !qn.is_global && qn.segments.len() == 1)
+            .then(|| qn.segments[0].value.as_str());
+        for frame in (0..self.call_frames.len())
+            .rev()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            if frame.is_some_and(|i| !self.call_frames[i].visible) {
+                continue;
             }
+            if let Some(binding) = self.env.iter().rev().find(|binding| {
+                binding.frame == frame
+                    && match binding.parameter {
+                        Some(parameter) => reference.target == Some(ElementRef(parameter)),
+                        None => external_name == Some(binding.name.as_str()),
+                    }
+            }) {
+                let visible = match binding.parameter {
+                    Some(parameter) => self.b.runtime_parameter_visible_with_steps(
+                        parameter,
+                        lexical,
+                        &mut self.steps,
+                    ).ok_or_else(|| EvalError::Unsupported(
+                        "runtime parameter lexical scope is incomplete or exceeds the budget".into(),
+                    ))?,
+                    None => true,
+                };
+                if visible {
+                    return Ok(Some(binding.value.clone()));
+                }
+            }
+            if let (Some(frame), Some(target)) = (frame, reference.target) {
+                let Some(callee) = self.call_frames[frame].callee else {
+                    continue;
+                };
+                match self.b.runtime_parameter_selection_with_steps(
+                    callee.0,
+                    lexical,
+                    scope,
+                    target.0,
+                    &mut self.steps,
+                ) {
+                    crate::json::RuntimeParameterSelection::Selected(parameter) => {
+                        if let Some(binding) = self.env.iter().rev().find(|binding| {
+                            binding.frame == Some(frame) && binding.parameter == Some(parameter.0)
+                        }) {
+                            return Ok(Some(binding.value.clone()));
+                        }
+                        // Defaults can depend on later omitted inputs. Read the
+                        // selected declaration rather than its general's default.
+                        if parameter != target {
+                            return self
+                                .feature_value_in(
+                                    parameter.0,
+                                    Some(self.call_frames[frame].receiver_scope.0),
+                                )
+                                .map(Some);
+                        }
+                    }
+                    crate::json::RuntimeParameterSelection::NotApplicable => {}
+                    crate::json::RuntimeParameterSelection::Unsupported => {
+                        return Err(EvalError::Unsupported(
+                            "runtime parameter redefinition is incomplete or ambiguous".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        // A declined runtime binding must not reappear as the default of an
+        // unrelated parameter selected by receiver-name lookup.
+        if let Some(receiver_target) = self.b.resolve(scope, qn, 0) {
+            if reference.target != Some(ElementRef(receiver_target))
+                && self.b.is_parameter(receiver_target)
+            {
+                return Err(EvalError::Unsupported(
+                    "receiver lookup selects an unrelated parameter declaration".into(),
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    fn reference(&mut self, scope: usize, qn: &QualifiedName) -> Result_ {
+        if let Some(value) = self.environment_value(scope, qn)? {
+            return Ok(value);
         }
         let Some(mut elem) = self.b.resolve(scope, qn, 0) else {
             // KerML `that` lives on the implied root feature `things`,
@@ -1735,6 +2842,32 @@ impl Evaluator<'_> {
         self.chain_into(target, member)
     }
 
+    /// Materialize only a collection whose members are available. A
+    /// placeholder with multiplicity greater than one is not one member,
+    /// and flattening a tuple must not turn it into one. Closed model
+    /// elements (reflection results) still denote individual declarations.
+    fn collection_value(&mut self, value: Value) -> Value {
+        match value {
+            v @ (Value::Unbound(_) | Value::UnboundMember(_)) => match self.value_cardinality(&v) {
+                Some((0, Some(0))) => Value::null(),
+                Some((1, Some(1))) => v,
+                _ => Value::Indeterminate,
+            },
+            Value::Sequence(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    let item = self.collection_value(item);
+                    if matches!(item, Value::Indeterminate) {
+                        return item;
+                    }
+                    out.extend(item.items());
+                }
+                Value::Sequence(out)
+            }
+            v => v,
+        }
+    }
+
     /// One chain step over an evaluated target. Per KFL `'.'`, a
     /// multi-valued source maps the member access over its items and the
     /// result feature is *unique* (its `source`/`target` are declared
@@ -1747,6 +2880,11 @@ impl Evaluator<'_> {
     /// Uncertainty follows the evaluated receiver, including a receiver
     /// returned by an alias, conditional or calculation.
     fn chain_into(&mut self, target: Value, member: &QualifiedName) -> Result_ {
+        charge_chain_value(&target, &mut self.steps, 0)?;
+        if member.segments.is_empty() {
+            return Err(EvalError::Unsupported("empty chain member name".into()));
+        }
+        let target = self.collection_value(target);
         // An unknown target has nothing to resolve a member against, and
         // the step is as parametric as the target was: strictly
         // propagating (see [`Value::Indeterminate`]) rather than a type
@@ -1758,7 +2896,16 @@ impl Evaluator<'_> {
             let mut out: Vec<Value> = Vec::new();
             for item in items {
                 for v in self.chain_into(item, member)?.items() {
-                    if !out.iter().any(|x| value_eq(x, &v)) {
+                    let mut duplicate = false;
+                    for x in &out {
+                        charge_chain_value(x, &mut self.steps, 0)?;
+                        charge_chain_value(&v, &mut self.steps, 0)?;
+                        if value_eq(x, &v) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if !duplicate {
                         out.push(v);
                     }
                 }
@@ -1811,20 +2958,11 @@ impl Evaluator<'_> {
         // materialize as relationships. `p.performedActions` collects
         // p's perform usages, each standing for its referenced action.
         if !unbound && !self.b.values.contains_key(&hit) {
-            // A named slot answers with its owned parts before the general
-            // collection rule, which would otherwise collect the slot
-            // itself (it specializes the member it redefines).
-            if let Some(v) = self.slot_projection(elem, hit)? {
-                return Ok(v);
-            }
             if let Some(items) = self.collection_items(elem, hit)? {
                 return Ok(match items.len() {
                     1 => items.into_iter().next().unwrap(),
                     _ => Value::Sequence(items),
                 });
-            }
-            if let Some(v) = self.dom_projection(elem, hit)? {
-                return Ok(v);
             }
         }
         // Evaluate fixed formulas in the unknown receiver's context too:
@@ -1835,255 +2973,6 @@ impl Evaluator<'_> {
         let value = self.feature_value_in(hit, sub);
         self.unbound_receiver = previous;
         value
-    }
-
-    /// A named slot's value: when the receiver owns a part that only
-    /// redefines `hit` (`part <n> :>> body { … }`, `:>> props { … }`),
-    /// that member's value is the slot's owned parts in membership order
-    /// — ownership is the sufficient representation. `None` when the
-    /// receiver owns no such slot.
-    fn slot_projection(&mut self, receiver: usize, hit: usize) -> Result<Option<Value>, EvalError> {
-        let owned = self.b.owned_member_elems(receiver, true);
-        let mut slot = None;
-        for m in owned {
-            if self.b.elements[m].ty != "PartUsage" || !self.is_dom_slot(m) {
-                continue;
-            }
-            // Only the *redefined* member projects; the slot addressed by
-            // its own short name stays the slot (a fragment node).
-            if self.b.redefinition_target_elems(m).contains(&hit) {
-                slot = Some(m);
-                break;
-            }
-        }
-        let Some(slot) = slot else {
-            return Ok(None);
-        };
-        let mut items = Vec::new();
-        for m in self.b.owned_member_elems(slot, true) {
-            if self.b.elements[m].ty == "PartUsage" {
-                items.extend(self.feature_value_in(m, None)?.items());
-            }
-        }
-        Ok(Some(match items.len() {
-            1 => items.into_iter().next().unwrap(),
-            _ => Value::Sequence(items),
-        }))
-    }
-
-    /// The Web platform library's constructed navigation: an imported
-    /// document stores only structural
-    /// ownership, so a derived DOM member reached on a node usage —
-    /// `childNodes`, `children`, `firstChild`, `lastChild`, `parentNode`,
-    /// `parentElement`, the sibling views, `childElementCount`,
-    /// `attributes` — is projected from the receiver's owned parts in
-    /// membership order: tree nodes are the owned parts that do not
-    /// conform to `Attr`; attributes are the ones that do. Applies only
-    /// to members declared by `Web::DOM`, so user features of the same
-    /// names are untouched. `None` for any other member.
-    fn dom_projection(&mut self, receiver: usize, hit: usize) -> Result<Option<Value>, EvalError> {
-        const NAV: &[&str] = &[
-            "childNodes",
-            "children",
-            "firstChild",
-            "lastChild",
-            "parentNode",
-            "parentElement",
-            "previousSibling",
-            "nextSibling",
-            "firstElementChild",
-            "lastElementChild",
-            "previousElementSibling",
-            "nextElementSibling",
-            "childElementCount",
-            "attributes",
-        ];
-        // A redefining member (`:>> attributes : AttributeLike[0..*]`)
-        // carries its name through the redefinition, not a declaration.
-        let Some(name) = self.b.id_name(hit) else {
-            return Ok(None);
-        };
-        if !NAV.contains(&name.as_str()) {
-            return Ok(None);
-        }
-        let scope = self.b.elem_scope.get(&receiver).copied().unwrap_or(0);
-        let attr_def = self
-            .b
-            .resolve(scope, &crate::json::lib_qn("Web::DOM::Attr"), 0);
-        let element_def = self
-            .b
-            .resolve(scope, &crate::json::lib_qn("Web::DOM::Element"), 0);
-        let node_def = self
-            .b
-            .resolve(scope, &crate::json::lib_qn("Web::DOM::Node"), 0);
-        let (Some(attr_def), Some(element_def), Some(node_def)) = (attr_def, element_def, node_def)
-        else {
-            return Ok(None);
-        };
-        // The member is a DOM view when it (or a feature it redefines) is
-        // declared inside `Web::DOM`, or when its owning definition is a
-        // node kind (a template element's redefined `attributes`).
-        let owner_is_node = self
-            .b
-            .owner_elem(hit)
-            .is_some_and(|o| self.b.conforms_upward(o, node_def));
-        if !owner_is_node && !self.redefines_web_dom_member(hit) {
-            return Ok(None);
-        }
-        let is_part = |b: &Builder, e: usize| b.elements[e].ty == "PartUsage";
-        // The receiver's owned parts split into tree nodes and attributes.
-        // A slot — a part with no typing of its own that redefines a
-        // collection (`part <n> :>> body { … }`, `:>> props { … }`) — is
-        // transparent: its owned parts are projected in its place.
-        let (nodes, attrs) = self.dom_owned(receiver, attr_def, node_def);
-        let mut elements = Vec::new();
-        for &m in &nodes {
-            if self.b.conforms_upward(m, element_def) {
-                elements.push(m);
-            }
-        }
-        // The receiver among its owner's tree nodes, for the parent and
-        // sibling views (a package-level node has no DOM parent, and an
-        // attribute is never a child of the element owning it).
-        let parent = if self.b.conforms_upward(receiver, attr_def) {
-            None
-        } else {
-            // Through transparent slots up to the nearest typed node.
-            let mut cur = self.b.owner_elem(receiver);
-            while let Some(o) = cur {
-                if !is_part(self.b, o) {
-                    cur = None;
-                    break;
-                }
-                if !self.is_dom_slot(o) {
-                    break;
-                }
-                cur = self.b.owner_elem(o);
-            }
-            cur.filter(|&o| self.b.conforms_upward(o, node_def))
-        };
-        let siblings: Vec<usize> = match parent {
-            Some(p) => self.dom_owned(p, attr_def, node_def).0,
-            None => Vec::new(),
-        };
-        let at = siblings.iter().position(|&m| m == receiver);
-        let before = |v: &[usize], i: Option<usize>| i.and_then(|i| v[..i].last().copied());
-        let after = |v: &[usize], i: Option<usize>| i.and_then(|i| v.get(i + 1).copied());
-        let element_siblings: Vec<usize> = {
-            let mut out = Vec::new();
-            for &m in &siblings {
-                if self.b.conforms_upward(m, element_def) {
-                    out.push(m);
-                }
-            }
-            out
-        };
-        let at_el = element_siblings.iter().position(|&m| m == receiver);
-        let picked: Vec<usize> = match name.as_str() {
-            "childNodes" => nodes,
-            "children" => elements,
-            "firstChild" => nodes.first().copied().into_iter().collect(),
-            "lastChild" => nodes.last().copied().into_iter().collect(),
-            "firstElementChild" => elements.first().copied().into_iter().collect(),
-            "lastElementChild" => elements.last().copied().into_iter().collect(),
-            "parentNode" => parent.into_iter().collect(),
-            "parentElement" => parent
-                .filter(|&p| self.b.conforms_upward(p, element_def))
-                .into_iter()
-                .collect(),
-            "previousSibling" => before(&siblings, at).into_iter().collect(),
-            "nextSibling" => after(&siblings, at).into_iter().collect(),
-            "previousElementSibling" => before(&element_siblings, at_el).into_iter().collect(),
-            "nextElementSibling" => after(&element_siblings, at_el).into_iter().collect(),
-            "childElementCount" => return Ok(Some(Value::Integer(elements.len() as i128))),
-            "attributes" => attrs,
-            _ => return Ok(None),
-        };
-        let mut items = Vec::with_capacity(picked.len());
-        for m in picked {
-            items.extend(self.feature_value_in(m, None)?.items());
-        }
-        Ok(Some(match items.len() {
-            1 => items.into_iter().next().unwrap(),
-            _ => Value::Sequence(items),
-        }))
-    }
-
-    /// The receiver's owned tree nodes and attributes in membership
-    /// order, transparent slots flattened.
-    fn dom_owned(
-        &mut self,
-        receiver: usize,
-        attr_def: usize,
-        node_def: usize,
-    ) -> (Vec<usize>, Vec<usize>) {
-        let mut nodes = Vec::new();
-        let mut attrs = Vec::new();
-        let mut stack: Vec<Vec<usize>> = vec![self.b.owned_member_elems(receiver, true)];
-        // Depth-first in order: a slot's members replace the slot.
-        let mut queue: Vec<usize> = Vec::new();
-        while let Some(batch) = stack.pop() {
-            queue.extend(batch);
-        }
-        let mut i = 0;
-        while i < queue.len() {
-            let m = queue[i];
-            i += 1;
-            if self.b.elements[m].ty != "PartUsage" {
-                continue;
-            }
-            if self.is_dom_slot(m) {
-                let inner = self.b.owned_member_elems(m, true);
-                queue.splice(i..i, inner);
-                continue;
-            }
-            if self.b.conforms_upward(m, attr_def) {
-                attrs.push(m);
-            } else if self.b.conforms_upward(m, node_def) {
-                nodes.push(m);
-            }
-        }
-        (nodes, attrs)
-    }
-
-    /// A part usage that only redefines (no typing of its own): a named
-    /// slot of a template block or component.
-    fn is_dom_slot(&mut self, e: usize) -> bool {
-        let specs = self.b.explicit_specialization_elems(e);
-        !specs.is_empty() && specs.iter().all(|(kind, _)| *kind == "Redefinition")
-    }
-
-    /// Does `e`, or a feature it (transitively) redefines, live inside
-    /// `Web::DOM`?
-    fn redefines_web_dom_member(&mut self, e: usize) -> bool {
-        let mut seen = HashSet::new();
-        let mut stack = vec![e];
-        while let Some(x) = stack.pop() {
-            if !seen.insert(x) {
-                continue;
-            }
-            if self.declared_in_web_dom(x) {
-                return true;
-            }
-            stack.extend(self.b.redefinition_target_elems(x));
-        }
-        false
-    }
-
-    /// Is `e` a member declared inside package `Web::DOM` (by owner
-    /// chain: some owner named `DOM` whose owner is named `Web`)?
-    fn declared_in_web_dom(&self, e: usize) -> bool {
-        let mut cur = self.b.owner_elem(e);
-        while let Some(o) = cur {
-            let owner = self.b.owner_elem(o);
-            if self.b.effective_name(o).as_deref() == Some("DOM")
-                && owner.is_some_and(|w| self.b.effective_name(w).as_deref() == Some("Web"))
-            {
-                return true;
-            }
-            cur = owner;
-        }
-        false
     }
 
     /// The values of the receiver's owned features that specialize
@@ -2273,14 +3162,20 @@ impl Evaluator<'_> {
             return hit.value;
         }
         let imports = std::mem::take(&mut self.b.used_imports);
+        let failure_epoch = self.inherited_failure_epoch;
         let value = self.expanded_unit_uncached(scope, elem, name, depth);
-        self.b.semantic_memo.units.insert(
-            key,
-            crate::semantic_memo::Proven {
-                value: value.clone(),
-                imports: self.b.used_imports.iter().copied().collect(),
-            },
-        );
+        // A cached conversion must not hide a suppressed default failure from
+        // a later report. Apply the same admission in legacy/report modes so
+        // observing diagnostics does not change semantic budget consumption.
+        if failure_epoch != usize::MAX && failure_epoch == self.inherited_failure_epoch {
+            self.b.semantic_memo.units.insert(
+                key,
+                crate::semantic_memo::Proven {
+                    value: value.clone(),
+                    imports: self.b.used_imports.iter().copied().collect(),
+                },
+            );
+        }
         self.b.used_imports.extend(imports);
         value
     }
@@ -2503,7 +3398,16 @@ impl Evaluator<'_> {
             .b
             .resolve(scope, qn, 0)
             .ok_or_else(|| EvalError::Unresolved(qn.to_display_string()))?;
-        let items = self.expr(scope, operand)?.items();
+        let value = self.expr(scope, operand)?;
+        let value = if matches!(op, ClassificationOp::AtType) {
+            value
+        } else {
+            self.collection_value(value)
+        };
+        if matches!(value, Value::Indeterminate) {
+            return Ok(value);
+        }
+        let items = value.items();
         match op {
             ClassificationOp::As => {
                 // Three-valued: a decided non-member drops, an *undecided*
@@ -2618,19 +3522,16 @@ impl Evaluator<'_> {
     /// referenced element. Lambda parameters shadow model names, as in
     /// plain references.
     fn metadata_access(&mut self, scope: usize, target: &QualifiedName) -> Result_ {
-        if target.segments.len() == 1 && !target.is_global {
-            let name = &target.segments[0].value;
-            if let Some((_, v)) = self.env.iter().rev().find(|(n, _)| n == name) {
-                let (Value::Element(ElementRef(e))
-                | Value::Unbound(ElementRef(e))
-                | Value::UnboundMember(ElementRef(e))) = v.clone()
-                else {
-                    return Err(EvalError::Type(
-                        "`.metadata` applies to model elements".into(),
-                    ));
-                };
-                return self.metaobjects_of(e);
-            }
+        if let Some(value) = self.environment_value(scope, target)? {
+            let (Value::Element(ElementRef(e))
+            | Value::Unbound(ElementRef(e))
+            | Value::UnboundMember(ElementRef(e))) = value
+            else {
+                return Err(EvalError::Type(
+                    "`.metadata` applies to model elements".into(),
+                ));
+            };
+            return self.metaobjects_of(e);
         }
         let elem = self
             .b
@@ -2646,6 +3547,11 @@ impl Evaluator<'_> {
     /// metaclass carrying the element's scalar abstract-syntax
     /// properties as bound fields.
     fn metaobjects_of(&mut self, elem: usize) -> Result_ {
+        if self.b.metadata_associations_incomplete {
+            return Err(EvalError::Unsupported(
+                "metadata annotation associations are incomplete".into(),
+            ));
+        }
         let mut out: Vec<Value> = self
             .b
             .metadata_of
@@ -2840,42 +3746,26 @@ impl Evaluator<'_> {
     /// element itself, or a feature *typed* by one (a function-typed
     /// parameter — `in calculation : Interpolate` — invoked in a body)?
     fn callee_is_calculation(&mut self, elem: usize) -> bool {
-        let calcish = |ty: &str| {
-            ty.contains("Calculation")
-                || ty.contains("Constraint")
-                || ty.contains("Expression")
-                || ty == "Function"
-                || ty == "Predicate"
-        };
-        if calcish(self.b.elements[elem].ty) {
+        if crate::json::calculation_like(self.b.elements[elem].ty) {
             return true;
         }
         self.b
             .direct_typing_elems(elem)
             .into_iter()
-            .any(|t| calcish(self.b.elements[t].ty))
+            .any(|t| crate::json::calculation_like(self.b.elements[t].ty))
     }
 
-    /// Effective input parameters of a calculation element. Calculation
-    /// usages commonly declare no parameters of their own and inherit the
-    /// signature from their typed calculation definition (`getOutput:
-    /// GetOutput`), so bodiless-call validation must walk explicit supertypes
-    /// instead of treating the usage as a zero-argument function.
-    fn callee_params(&mut self, elem: usize) -> Vec<String> {
-        let mut stack = vec![elem];
-        let mut seen = HashSet::new();
-        while let Some(e) = stack.pop() {
-            if !seen.insert(e) {
-                continue;
-            }
-            if let Some(params) = self.b.in_params.get(&e) {
-                if !params.is_empty() {
-                    return params.clone();
-                }
-            }
-            stack.extend(self.b.explicit_supertype_elems(e));
+    /// The results an invocation of `elem` evaluates, with the callables
+    /// that declare them (see [`ResolvedModel::callable_body`]): one, or
+    /// every result equally near when different generals each declare one.
+    fn calc_bodies(&mut self, elem: usize) -> Option<Vec<(usize, CallableResult)>> {
+        match self.b.callable_body(elem)? {
+            CallableBody::Declared { owner, result } => Some(vec![(owner.0, result)]),
+            CallableBody::Ambiguous(owners) => owners
+                .into_iter()
+                .map(|owner| Some((owner.0, self.b.own_callable_result(owner.0)?)))
+                .collect(),
         }
-        Vec::new()
     }
 
     /// Invoke a user-defined calculation (any element whose body carries a
@@ -2893,27 +3783,18 @@ impl Evaluator<'_> {
         let (display, elem) = match ty {
             TargetRef::Name(qn) => {
                 let display = qn.to_display_string();
-                if qn.segments.len() == 1 && !qn.is_global {
-                    let name = &qn.segments[0].value;
-                    let bound = self
-                        .env
-                        .iter()
-                        .rev()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, v)| v.clone());
-                    if let Some(value) = bound {
-                        return match value {
-                            Value::Element(ElementRef(elem))
-                            | Value::Unbound(ElementRef(elem))
-                            | Value::UnboundMember(ElementRef(elem)) => {
-                                self.user_calc_elem(&display, elem, args)
-                            }
-                            Value::Indeterminate => Ok(Value::Indeterminate),
-                            other => Err(EvalError::Type(format!(
-                                "function `{display}` is bound to non-callable value {other}"
-                            ))),
-                        };
-                    }
+                if let Some(value) = self.environment_value(scope, qn)? {
+                    return match value {
+                        Value::Element(ElementRef(elem))
+                        | Value::Unbound(ElementRef(elem))
+                        | Value::UnboundMember(ElementRef(elem)) => {
+                            self.user_calc_elem(&display, elem, args)
+                        }
+                        Value::Indeterminate => Ok(Value::Indeterminate),
+                        other => Err(EvalError::Type(format!(
+                            "function `{display}` is bound to non-callable value {other}"
+                        ))),
+                    };
                 }
                 let Some(elem) = self.b.resolve(scope, qn, 0) else {
                     return Err(EvalError::Unsupported(format!("function `{display}`")));
@@ -2957,7 +3838,19 @@ impl Evaluator<'_> {
                 elem
             }
         };
-        let value = self.user_calc_body(display, elem, args);
+        let value = (|| {
+            let scope =
+                self.b.elem_scope.get(&elem).copied().ok_or_else(|| {
+                    EvalError::Unsupported("calculation scope is unavailable".into())
+                })?;
+            let hidden = self.mask_frames(scope, scope)?;
+            self.call_frames
+                .push(RuntimeFrame::calculation(ElementRef(elem), ScopeRef(scope)));
+            let value = self.user_calc_body(display, elem, args);
+            self.call_frames.pop();
+            self.restore_frames(hidden);
+            value
+        })();
         self.unbound_receiver = previous;
         value
     }
@@ -2973,12 +3866,8 @@ impl Evaluator<'_> {
                 "calculation body requires statement execution".into(),
             ));
         }
-        let has_body = self.b.result_exprs.iter().any(|(o, _, _)| *o == elem)
-            || self
-                .b
-                .return_params
-                .get(&elem)
-                .is_some_and(|ret| self.b.values.contains_key(ret));
+        let bodies = self.calc_bodies(elem);
+        let has_body = bodies.is_some();
         if !has_body && !self.callee_is_calculation(elem) {
             return Err(EvalError::Unsupported(format!(
                 "function `{display}` (no result expression)"
@@ -2986,30 +3875,32 @@ impl Evaluator<'_> {
         }
         // Validate and bind arguments before the abstract/bodiless fallback:
         // an unknown result does not make an invalid invocation well-formed.
-        let params = self.callee_params(elem);
-        // Parameters belong to this invocation. A missing argument/default
-        // must never capture a same-named parameter from the calling frame.
+        let params = self.b.calc_parameter_bindings(elem).ok_or_else(|| {
+            EvalError::Unsupported(
+                "calculation parameter identities are incomplete or ambiguous".into(),
+            )
+        })?;
+        // Mask this invocation's declaration identities, preserving distinct
+        // enclosing parameters even when their names happen to be equal.
         let caller_env = self.env.clone();
-        self.env.retain(|(name, _)| !params.contains(name));
+        self.env.retain(|binding| {
+            !params
+                .iter()
+                .any(|p| binding.parameter == Some(p.element.0))
+        });
         let mut positional = 0usize;
         let mut bound = HashSet::new();
-        for (name, v) in args {
-            match name {
-                Some(n) => {
-                    if !params.contains(&n) {
+        for (name, value) in args {
+            let parameter = match name {
+                Some(name) => match params.iter().find(|p| p.name == name) {
+                    Some(p) => p,
+                    None => {
                         self.env = caller_env;
                         return Err(EvalError::Unresolved(format!(
-                            "parameter `{n}` of `{display}`"
+                            "parameter `{name}` of `{display}`"
                         )));
                     }
-                    if !bound.insert(n.clone()) {
-                        self.env = caller_env;
-                        return Err(EvalError::Type(format!(
-                            "parameter `{n}` of `{display}` is bound more than once"
-                        )));
-                    }
-                    self.env.push((n, v));
-                }
+                },
                 None => {
                     let Some(p) = params.get(positional) else {
                         self.env = caller_env;
@@ -3017,89 +3908,71 @@ impl Evaluator<'_> {
                             "too many arguments to `{display}`"
                         )));
                     };
-                    if !bound.insert(p.clone()) {
-                        self.env = caller_env;
-                        return Err(EvalError::Type(format!(
-                            "parameter `{p}` of `{display}` is bound more than once"
-                        )));
-                    }
-                    self.env.push((p.clone(), v));
                     positional += 1;
+                    p
                 }
+            };
+            if !bound.insert(parameter.element.0) {
+                self.env = caller_env;
+                return Err(EvalError::Type(format!(
+                    "parameter `{}` of `{display}` is bound more than once",
+                    parameter.name
+                )));
             }
+            self.env.push(EnvironmentBinding {
+                name: parameter.name.clone(),
+                parameter: Some(parameter.element.0),
+                frame: self.call_frames.len().checked_sub(1),
+                value,
+            });
         }
         if has_body {
-            for name in &params {
-                if bound.contains(name) {
+            for parameter in &params {
+                if bound.contains(&parameter.element.0) {
                     continue;
                 }
-                let mut stack = vec![elem];
-                let mut seen = HashSet::new();
-                let mut parameter = None;
-                while let Some(owner) = stack.pop() {
-                    if !seen.insert(owner) {
+                if !self.b.values.contains_key(&parameter.element.0) {
+                    // No name reaches a parameter that has none of its own
+                    // and redefines none, so no body can read it.
+                    if parameter.name.is_empty() {
                         continue;
                     }
-                    if let Some((_, field)) = self
-                        .b
-                        .ctor_fields
-                        .get(&owner)
-                        .and_then(|fields| fields.iter().find(|(n, _)| n == name))
-                    {
-                        parameter = Some(*field);
-                        break;
-                    }
-                    stack.extend(self.b.explicit_supertype_elems(owner));
-                }
-                let Some(parameter) = parameter.filter(|p| self.b.values.contains_key(p)) else {
                     self.env = caller_env;
                     return Err(EvalError::Unresolved(format!(
-                        "unbound parameter `{name}` of `{display}`"
+                        "unbound parameter `{}` of `{display}`",
+                        parameter.name
                     )));
-                };
-                let value = match self.feature_value(parameter) {
+                }
+                let receiver = self.call_frames.last().map(|frame| frame.receiver_scope.0);
+                let value = match self.feature_value_in(parameter.element.0, receiver) {
                     Ok(value) => value,
                     Err(error) => {
                         self.env = caller_env;
                         return Err(error);
                     }
                 };
-                self.env.push((name.clone(), value));
+                self.env.push(EnvironmentBinding {
+                    name: parameter.name.clone(),
+                    parameter: Some(parameter.element.0),
+                    frame: self.call_frames.len().checked_sub(1),
+                    value,
+                });
             }
         }
-        // A calculation's result is its trailing result expression, or —
-        // the `return x = expr;` spelling — its return parameter's value.
-        enum CalcBody {
-            Result(usize, Expr),
-            Return(usize),
-        }
-        let result = self
-            .b
-            .result_exprs
-            .iter()
-            .find(|(o, _, _)| *o == elem)
-            .map(|(_, s, e)| (*s, e.clone()));
-        let body = match result {
-            Some((s, e)) => CalcBody::Result(s, e),
-            None => match self.b.return_params.get(&elem) {
-                Some(&ret) if self.b.values.contains_key(&ret) => CalcBody::Return(ret),
-                _ => {
-                    // A *calculation* with no body — abstract, a
-                    // declaration shell, or a function-typed parameter
-                    // whose actual is unknown — applied to arguments has
-                    // an unknown result: indeterminate, not unsupported.
-                    // Non-callable targets keep the error (degrading
-                    // those would mask a genuine model defect).
-                    if self.callee_is_calculation(elem) {
-                        self.env = caller_env;
-                        return Ok(Value::Indeterminate);
-                    }
-                    self.env = caller_env;
-                    return Err(EvalError::Unsupported(format!(
-                        "function `{display}` (no result expression)"
-                    )));
-                }
-            },
+        let Some(bodies) = bodies else {
+            // A *calculation* with no body — abstract, a declaration
+            // shell, or a function-typed parameter whose actual is
+            // unknown — applied to arguments has an unknown result:
+            // indeterminate, not unsupported. Non-callable targets keep
+            // the error (degrading those would mask a genuine model
+            // defect).
+            self.env = caller_env;
+            if self.callee_is_calculation(elem) {
+                return Ok(Value::Indeterminate);
+            }
+            return Err(EvalError::Unsupported(format!(
+                "function `{display}` (no result expression)"
+            )));
         };
         // Call depth is a budget, not a cycle: a recursion that does not
         // terminate reaches it, and so does a legitimately deep chain of
@@ -3111,22 +3984,84 @@ impl Evaluator<'_> {
             )));
         }
         self.call_depth += 1;
-        // A library-owned callee evaluates in a library frame: its body
-        // keeps the closed element convention for unbound features (see
-        // `placeholder` — library sequence semantics count on it).
-        let lib_callee = elem < self.b.lib_boundary;
-        if lib_callee {
-            self.lib_frames += 1;
-        }
-        let out = match body {
-            CalcBody::Result(cscope, result) => self.expr(cscope, &result),
-            CalcBody::Return(ret) => self.feature_value(ret),
-        };
-        if lib_callee {
-            self.lib_frames -= 1;
+        // Results inherited from generals equally near all bind the one
+        // result: it is their common value, and unknown where they differ.
+        let mut out = None;
+        for (owner, body) in bodies {
+            let next = self.calc_result(elem, owner, body);
+            out = Some(match out {
+                None => next,
+                Some(Ok(first)) => match next {
+                    Ok(value) if value == first => Ok(first),
+                    Ok(_) => Err(EvalError::Unsupported(
+                        "the inherited results disagree".into(),
+                    )),
+                    error => error,
+                },
+                Some(error) => error,
+            });
+            if matches!(out, Some(Err(_))) {
+                break;
+            }
         }
         self.call_depth -= 1;
         self.env = caller_env;
+        out.unwrap_or(Ok(Value::Indeterminate))
+    }
+
+    /// One result `owner` declares, for an invocation of `elem` whose
+    /// arguments are bound in the innermost call frame.
+    fn calc_result(&mut self, elem: usize, owner: usize, body: CallableResult) -> Result_ {
+        // A library-owned body evaluates in a library frame: it keeps the
+        // closed element convention for unbound features (see
+        // `placeholder` — library sequence semantics count on it).
+        let lib_body = owner < self.b.lib_boundary;
+        if lib_body {
+            self.lib_frames += 1;
+        }
+        let saved_origin = self.b.set_identity_origin(owner);
+        let lexical = self.lexical_scope;
+        // An inherited body evaluates in the callee's own context, where
+        // its arguments stand for the parameters they redefine.
+        let callee_scope = self.call_frames.last().map(|frame| frame.receiver_scope.0);
+        let out = match (body, callee_scope) {
+            (
+                CallableResult::Expression {
+                    scope: ScopeRef(cscope),
+                    expression,
+                },
+                Some(receiver),
+            ) if owner != elem => {
+                self.lexical_scope = Some(cscope);
+                match self.mask_frames(cscope, receiver) {
+                    Ok(hidden) => {
+                        let out = self.expr(receiver, &expression);
+                        self.restore_frames(hidden);
+                        out
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (CallableResult::Parameter(ret), Some(receiver)) if owner != elem => {
+                self.feature_value_in(ret.0, Some(receiver))
+            }
+            (
+                CallableResult::Expression {
+                    scope: ScopeRef(cscope),
+                    expression,
+                },
+                _,
+            ) => {
+                self.lexical_scope = Some(cscope);
+                self.expr(cscope, &expression)
+            }
+            (CallableResult::Parameter(ret), _) => self.feature_value(ret.0),
+        };
+        self.b.identity_origin_unit = saved_origin;
+        self.lexical_scope = lexical;
+        if lib_body {
+            self.lib_frames -= 1;
+        }
         out
     }
 
@@ -3321,7 +4256,9 @@ impl Evaluator<'_> {
                 let TargetRef::Name(qn) = ty else {
                     return Err(EvalError::Unsupported("chained function reference".into()));
                 };
-                let name = qn.segments.last().unwrap().value.clone();
+                let name = self.intrinsic_name(scope, ty).ok_or_else(|| {
+                    EvalError::Unsupported(format!("control function `{}`", qn.to_display_string()))
+                })?;
                 self.control(scope, &name, first, &Applier::Lambda(body))
             }
             ArrowArgs::List(list) => {
@@ -3332,7 +4269,7 @@ impl Evaluator<'_> {
                 }
                 if values.iter().all(|(n, _)| n.is_none()) {
                     let positional: Vec<Value> = values.iter().map(|(_, v)| v.clone()).collect();
-                    match self.intrinsic(ty, &positional) {
+                    match self.intrinsic(scope, ty, &positional) {
                         Err(EvalError::Unsupported(_)) => {}
                         out => return out,
                     }
@@ -3345,7 +4282,9 @@ impl Evaluator<'_> {
                 let TargetRef::Name(qn) = ty else {
                     return Err(EvalError::Unsupported("chained function reference".into()));
                 };
-                let name = qn.segments.last().unwrap().value.clone();
+                let name = self.intrinsic_name(scope, ty).ok_or_else(|| {
+                    EvalError::Unsupported(format!("control function `{}`", qn.to_display_string()))
+                })?;
                 self.control(scope, &name, first, &Applier::FnRef(fnqn))
             }
         }
@@ -3372,12 +4311,14 @@ impl Evaluator<'_> {
 
     /// Apply a *referenced* function to arguments: operator spellings
     /// (`'+'`, `'*'`, …) fold through the arithmetic core, KFL intrinsics
-    /// dispatch by reserved name (`min`, `max`), anything else invokes as
+    /// dispatch by library identity, anything else invokes as
     /// a user calculation — where a bodiless callee degrades to
     /// indeterminate like any other invocation.
     fn apply_fn_ref(&mut self, scope: usize, qn: &QualifiedName, args: Vec<Value>) -> Result_ {
-        if let [l, r] = args.as_slice() {
-            let op = match qn.segments.last().unwrap().value.as_str() {
+        let target = TargetRef::Name(qn.clone());
+        let intrinsic = self.intrinsic_name(scope, &target);
+        if let (Some(name), [l, r]) = (intrinsic.as_deref(), args.as_slice()) {
+            let op = match name {
                 "+" => Some(BinaryOp::Add),
                 "-" => Some(BinaryOp::Sub),
                 "*" => Some(BinaryOp::Mul),
@@ -3391,9 +4332,12 @@ impl Evaluator<'_> {
                 return arith(op, l.clone(), r.clone());
             }
         }
-        match self.intrinsic(&TargetRef::Name(qn.clone()), &args) {
-            Err(EvalError::Unsupported(_)) => {}
-            out => return out,
+        if let Some(name) = intrinsic {
+            match self.intrinsic_uncharged(&name, &args) {
+                Err(EvalError::Unsupported(_)) => {}
+                Ok(value) => return self.charged(value),
+                Err(error) => return Err(error),
+            }
         }
         let named: Vec<(Option<String>, Value)> = args.into_iter().map(|v| (None, v)).collect();
         self.user_calc(scope, &TargetRef::Name(qn.clone()), named)
@@ -3419,6 +4363,10 @@ impl Evaluator<'_> {
         target: Value,
         applier: &Applier<'_>,
     ) -> Result_ {
+        let target = self.collection_value(target);
+        if matches!(target, Value::Indeterminate) {
+            return Ok(target);
+        }
         let items = target.items();
         match name {
             "collect" | "select" | "reject" | "forAll" | "exists" => {
@@ -3432,7 +4380,13 @@ impl Evaluator<'_> {
                 for item in &items {
                     let v = self.apply(scope, applier, std::slice::from_ref(item))?;
                     match name {
-                        "collect" => out.extend(v.items()),
+                        "collect" => {
+                            let v = self.collection_value(v);
+                            if matches!(v, Value::Indeterminate) {
+                                return Ok(v);
+                            }
+                            out.extend(v.items());
+                        }
                         "select" | "reject" => match v {
                             Value::Boolean(keep) => {
                                 if keep == (name == "select") {
@@ -3499,10 +4453,12 @@ impl Evaluator<'_> {
             "minimize" | "maximize" => {
                 let mut mapped = Vec::with_capacity(items.len());
                 for item in &items {
-                    mapped.extend(
-                        self.apply(scope, applier, std::slice::from_ref(item))?
-                            .items(),
-                    );
+                    let value = self.apply(scope, applier, std::slice::from_ref(item))?;
+                    let value = self.collection_value(value);
+                    if matches!(value, Value::Indeterminate) {
+                        return Ok(value);
+                    }
+                    mapped.extend(value.items());
                 }
                 extremum(mapped, name == "maximize")
             }
@@ -3557,12 +4513,59 @@ impl Evaluator<'_> {
                 args.len()
             )));
         }
+        let lowered = self
+            .b
+            .identity_origin_unit
+            .and_then(|unit| self.b.lambda_parameter_bindings(unit, body));
+        if self.b.identity_origin_unit.is_some()
+            && lowered.is_none()
+            && !params.is_empty()
+            && !self.query
+        {
+            return Err(EvalError::Unsupported(
+                "lambda parameter identities are incomplete or ambiguous".into(),
+            ));
+        }
+        if lowered
+            .as_ref()
+            .is_some_and(|(_, declared)| declared.len() != args.len())
+        {
+            return Err(EvalError::Unsupported(
+                "lambda parameter identity count differs".into(),
+            ));
+        }
         let depth = self.env.len();
-        for (p, v) in params.iter().zip(args) {
-            self.env.push((p.clone(), v.clone()));
+        let lexical = self.lexical_scope;
+        // A lambda body continues the current syntax subtree. Preserve existing
+        // visibility, but give its inputs an independently maskable activation.
+        self.call_frames.push(RuntimeFrame::lambda(
+            lowered.as_ref().map(|(s, _)| *s),
+            ScopeRef(scope),
+        ));
+        if let Some((body_scope, declared)) = lowered {
+            self.lexical_scope = Some(body_scope.0);
+            for (p, v) in declared.into_iter().zip(args) {
+                self.env.push(EnvironmentBinding {
+                    name: p.name,
+                    parameter: Some(p.element.0),
+                    frame: self.call_frames.len().checked_sub(1),
+                    value: v.clone(),
+                });
+            }
+        } else {
+            for (name, value) in params.iter().zip(args) {
+                self.env.push(EnvironmentBinding {
+                    name: name.clone(),
+                    parameter: None,
+                    frame: self.call_frames.len().checked_sub(1),
+                    value: value.clone(),
+                });
+            }
         }
         let out = self.expr(scope, result);
         self.env.truncate(depth);
+        self.lexical_scope = lexical;
+        self.call_frames.pop();
         out
     }
 
@@ -3659,23 +4662,82 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Kernel Function Library intrinsics, matched by the invoked name's
-    /// last segment. An intrinsic that builds a sequence or a string
-    /// (`reverse`, `including`, `ToString`, `Substring`, …) returns it
-    /// through the allocation budget; an
-    /// [`EvalError::Unsupported`] answer is the "not an intrinsic"
-    /// sentinel invocation dispatch falls through on, and stays exactly
-    /// that.
-    fn intrinsic(&mut self, ty: &TargetRef, args: &[Value]) -> Result_ {
-        let value = self.intrinsic_uncharged(ty, args)?;
+    /// Resolve before choosing a built-in implementation. Looking at the
+    /// written suffix would hijack user functions, aliases and function-valued
+    /// parameters. Library identities are indexed once, independently of model
+    /// size; no library scan is performed for each call.
+    fn intrinsic_name(&mut self, scope: usize, ty: &TargetRef) -> Option<String> {
+        let resolved = match ty {
+            TargetRef::Name(qn) => {
+                let value = match self.environment_value(scope, qn) {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                if let Some(value) = value {
+                    return match value {
+                        Value::Element(ElementRef(e))
+                        | Value::Unbound(ElementRef(e))
+                        | Value::UnboundMember(ElementRef(e)) => self.library_intrinsic(e),
+                        _ => None,
+                    };
+                }
+                return self.b.intrinsic_function_name(scope, qn);
+            }
+            TargetRef::Chain(links) => {
+                let empty = QualifiedName {
+                    is_global: false,
+                    segments: Vec::new(),
+                    span: Span::default(),
+                };
+                self.b.resolve_chain_member(scope, Some(links), &empty)
+            }
+        };
+        resolved.and_then(|elem| self.library_intrinsic(elem))
+    }
+
+    fn library_intrinsic(&self, elem: usize) -> Option<String> {
+        if elem >= self.b.lib_boundary {
+            return None;
+        }
+        library_intrinsics()
+            .get(&self.b.elem_id(elem))
+            .map(|s| (*s).to_owned())
+    }
+
+    /// Intrinsics return materialized values through the allocation budget.
+    /// Unsupported remains the sentinel for falling through to a calculation.
+    fn intrinsic(&mut self, scope: usize, ty: &TargetRef, args: &[Value]) -> Result_ {
+        let name = self
+            .intrinsic_name(scope, ty)
+            .ok_or_else(|| EvalError::Unsupported("non-intrinsic function".into()))?;
+        let value = self.intrinsic_uncharged(&name, args)?;
         self.charged(value)
     }
 
-    fn intrinsic_uncharged(&mut self, ty: &TargetRef, args: &[Value]) -> Result_ {
-        let TargetRef::Name(qn) = ty else {
-            return Err(EvalError::Unsupported("chained function reference".into()));
+    fn intrinsic_uncharged(&mut self, name: &str, args: &[Value]) -> Result_ {
+        // Normalize collection operands before any intrinsic can wrap,
+        // count or consume a placeholder as a single runtime value.
+        // Direct cardinality queries retain their bound-based answers.
+        let collection_args = match name {
+            "sum" | "product" | "head" | "last" | "tail" | "reverse" | "includes" | "excludes" => 1,
+            "union" => 2,
+            "min" | "max" if args.len() == 1 => 1,
+            "size" | "isEmpty" | "notEmpty" if matches!(args, [Value::Sequence(_)]) => 1,
+            _ => 0,
         };
-        let name = qn.segments.last().unwrap().value.as_str();
+        let mut normalized;
+        let args = if collection_args > 0 && args.len() >= collection_args {
+            normalized = args.to_vec();
+            for value in &mut normalized[..collection_args] {
+                *value = self.collection_value(value.clone());
+                if matches!(value, Value::Indeterminate) {
+                    return Ok(Value::Indeterminate);
+                }
+            }
+            &normalized[..]
+        } else {
+            args
+        };
         let items = |v: &Value| v.clone().items();
         match (name, args) {
             // Reflection over the model structure (query mode only —
@@ -3700,8 +4762,7 @@ impl Evaluator<'_> {
                 ],
             ) if self.query => Ok(Value::Sequence(self.owned_members(*e, true))),
             // Element reflection (query mode): names, metaclass and
-            // documentation of a model element, as the rendering backend's
-            // translated template expressions ask for them.
+            // documentation of a model element.
             (
                 "declaredName" | "shortName" | "qualifiedName" | "metaclass" | "docs",
                 [
@@ -3739,11 +4800,11 @@ impl Evaluator<'_> {
             // multiplicity, never from the placeholder itself. An exact
             // multiplicity answers; a lower/upper bound still settles
             // emptiness; anything else is honestly undecided. Sequences
-            // *containing* placeholders keep their literal arity, and
-            // library frames never mint Unbound in the first place.
-            ("size", [Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))]) => {
-                match self.unbound_cardinality(*e) {
-                    Some((lo, hi)) if lo == hi && lo.is_finite() => Ok(Value::Integer(lo as i128)),
+            // containing placeholders are normalized above; library
+            // frames never mint Unbound in the first place.
+            ("size", [v @ (Value::Unbound(_) | Value::UnboundMember(_))]) => {
+                match self.value_cardinality(v) {
+                    Some((lo, Some(hi))) if lo == hi => Ok(Value::Integer(lo)),
                     // Indeterminate, not an error — the cardinality is
                     // simply unknown, and downstream arithmetic degrades
                     // with it (this answer is final either way: never
@@ -3752,17 +4813,17 @@ impl Evaluator<'_> {
                     _ => Ok(Value::Indeterminate),
                 }
             }
-            ("isEmpty", [Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))]) => {
-                match self.unbound_cardinality(*e) {
-                    Some((_, 0.0)) => Ok(Value::Boolean(true)),
-                    Some((lo, _)) if lo >= 1.0 => Ok(Value::Boolean(false)),
+            ("isEmpty", [v @ (Value::Unbound(_) | Value::UnboundMember(_))]) => {
+                match self.value_cardinality(v) {
+                    Some((_, Some(0))) => Ok(Value::Boolean(true)),
+                    Some((lo, _)) if lo >= 1 => Ok(Value::Boolean(false)),
                     _ => Ok(Value::Indeterminate),
                 }
             }
-            ("notEmpty", [Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))]) => {
-                match self.unbound_cardinality(*e) {
-                    Some((_, 0.0)) => Ok(Value::Boolean(false)),
-                    Some((lo, _)) if lo >= 1.0 => Ok(Value::Boolean(true)),
+            ("notEmpty", [v @ (Value::Unbound(_) | Value::UnboundMember(_))]) => {
+                match self.value_cardinality(v) {
+                    Some((_, Some(0))) => Ok(Value::Boolean(false)),
+                    Some((lo, _)) if lo >= 1 => Ok(Value::Boolean(true)),
                     _ => Ok(Value::Indeterminate),
                 }
             }
@@ -3921,12 +4982,192 @@ impl Evaluator<'_> {
                     Err(EvalError::Type("Substring bounds out of range".into()))
                 }
             }
-            _ => Err(EvalError::Unsupported(format!(
-                "function `{}`",
-                qn.to_display_string()
-            ))),
+            _ => Err(EvalError::Unsupported(format!("function `{name}`"))),
         }
     }
+}
+
+pub(crate) fn library_intrinsic_for_id(id: Uuid) -> Option<&'static str> {
+    library_intrinsics().get(&id).copied()
+}
+
+pub(crate) fn intrinsic_spelling(name: &str) -> bool {
+    matches!(
+        name,
+        "sum"
+            | "product"
+            | "size"
+            | "isEmpty"
+            | "notEmpty"
+            | "includes"
+            | "excludes"
+            | "head"
+            | "tail"
+            | "last"
+            | "reverse"
+            | "union"
+            | "min"
+            | "max"
+            | "abs"
+            | "sqrt"
+            | "ln"
+            | "exp"
+            | "log"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "rat"
+            | "numer"
+            | "denom"
+            | "re"
+            | "im"
+            | "isZero"
+            | "isUnit"
+            | "floor"
+            | "round"
+            | "ToString"
+            | "ToInteger"
+            | "ToReal"
+            | "Length"
+            | "Substring"
+            | "collect"
+            | "select"
+            | "selectOne"
+            | "reject"
+            | "reduce"
+            | "forAll"
+            | "exists"
+            | "minimize"
+            | "maximize"
+            | "ownedMember"
+            | "ownedFeature"
+            | "declaredName"
+            | "shortName"
+            | "qualifiedName"
+            | "metaclass"
+            | "docs"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "**"
+            | "^"
+    )
+}
+
+/// Supported standard-library functions, keyed by the normative KerML
+/// qualified-name identity. Names shared by other libraries (for example
+/// CollectionFunctions::size) deliberately keep their own calculation bodies.
+fn library_intrinsics() -> &'static HashMap<Uuid, &'static str> {
+    static IDS: OnceLock<HashMap<Uuid, &'static str>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        let groups: &[(&str, &[&str])] = &[
+            ("BaseFunctions", &["ToString"]),
+            ("BooleanFunctions", &["ToString"]),
+            ("StringFunctions", &["ToString", "Length", "Substring"]),
+            ("DataFunctions", &["min", "max"]),
+            ("ScalarFunctions", &["min", "max"]),
+            (
+                "NumericalFunctions",
+                &["sum", "product", "abs", "min", "max", "isZero", "isUnit"],
+            ),
+            (
+                "ComplexFunctions",
+                &[
+                    "sum", "product", "abs", "re", "im", "isZero", "isUnit", "ToString",
+                ],
+            ),
+            (
+                "RealFunctions",
+                &[
+                    "sum", "product", "abs", "min", "max", "re", "im", "sqrt", "floor", "round",
+                    "ToString", "ToReal",
+                ],
+            ),
+            (
+                "RationalFunctions",
+                &[
+                    "sum", "product", "abs", "min", "max", "rat", "numer", "denom", "floor",
+                    "round", "ToString",
+                ],
+            ),
+            (
+                "IntegerFunctions",
+                &[
+                    "sum",
+                    "product",
+                    "abs",
+                    "min",
+                    "max",
+                    "ToString",
+                    "ToInteger",
+                ],
+            ),
+            ("NaturalFunctions", &["min", "max", "ToString"]),
+            ("TrigFunctions", &["sin", "cos", "tan"]),
+            (
+                "SequenceFunctions",
+                &[
+                    "size", "isEmpty", "notEmpty", "includes", "excludes", "union", "head", "tail",
+                    "last",
+                ],
+            ),
+            (
+                "ControlFunctions",
+                &[
+                    "collect",
+                    "select",
+                    "selectOne",
+                    "reject",
+                    "reduce",
+                    "forAll",
+                    "exists",
+                    "minimize",
+                    "maximize",
+                ],
+            ),
+        ];
+        let mut ids = HashMap::new();
+        for &(package, names) in groups {
+            let namespace = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("https://www.omg.org/spec/KerML/{package}").as_bytes(),
+            );
+            for &name in names {
+                ids.insert(
+                    Uuid::new_v5(&namespace, format!("{package}::{name}").as_bytes()),
+                    name,
+                );
+            }
+        }
+        // Operator function references used by reduce follow the same identity
+        // rule as ordinary calls. Their escaped qualified names include quotes.
+        let operators: &[(&str, &[&str])] = &[
+            ("DataFunctions", &["+", "-", "*", "/", "**", "^", "%"]),
+            ("ScalarFunctions", &["+", "-", "*", "/", "**", "^", "%"]),
+            ("StringFunctions", &["+"]),
+            ("NumericalFunctions", &["+", "-", "*", "/", "**", "^", "%"]),
+            ("ComplexFunctions", &["+", "-", "*", "/", "**", "^"]),
+            ("RealFunctions", &["+", "-", "*", "/", "**", "^"]),
+            ("RationalFunctions", &["+", "-", "*", "/", "**", "^"]),
+            ("IntegerFunctions", &["+", "-", "*", "/", "**", "^", "%"]),
+            ("NaturalFunctions", &["+", "*", "/", "%"]),
+        ];
+        for &(package, names) in operators {
+            let namespace = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("https://www.omg.org/spec/KerML/{package}").as_bytes(),
+            );
+            for &name in names {
+                ids.insert(
+                    Uuid::new_v5(&namespace, format!("{package}::'{name}'").as_bytes()),
+                    name,
+                );
+            }
+        }
+        ids
+    })
 }
 
 /// Scale a scalar or vector quantity magnitude during same-dimension unit
@@ -4271,7 +5512,16 @@ pub(crate) fn prepare_unit(b: &mut Builder, elem: usize) {
     let mut evaluator = Evaluator {
         b,
         env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
         in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -4289,6 +5539,60 @@ pub(crate) fn prepare_unit(b: &mut Builder, elem: usize) {
 mod memo_tests {
     use super::*;
     #[test]
+    fn malformed_multiplicity_domains_do_not_fabricate_bounds() {
+        fn model() -> ResolvedModel {
+            let mut model = crate::model::Model::new();
+            model.add_source(
+                "ranges.kerml",
+                "package P {
+                feature f { multiplicity interval[2..5] { feature extra; } }
+                multiplicity four[4];
+                feature named { multiplicity m subsets four; }
+            }",
+            );
+            assert!(!model.has_errors());
+            ResolvedModel::build(&model)
+        }
+        for mutation in 0..6 {
+            let mut r = model();
+            let f = r.resolve_qualified("P::f").unwrap();
+            let m = r.resolve_qualified("P::f::interval").unwrap().0;
+            assert_eq!(r.effective_cardinality(f), Some((2, Some(5))));
+            let members = r.b.owned_member_elems(m, false);
+            match mutation {
+                // Bound expressions must be a contiguous prefix, at most two.
+                0 => r.b.elements[members[0]].ty = "Feature",
+                1 => r.b.elements[members[2]].ty = "LiteralInteger",
+                // Unsupported or unresolved added constraints cannot be ignored.
+                _ => {
+                    let named = r.resolve_qualified("P::named::m").unwrap().0;
+                    let rel = r.b.elements[named].owned_relationships[0];
+                    r.b.elements[m].owned_relationships.push(rel);
+                    if mutation == 2 {
+                        r.b.elements[rel].ty = "Subclassification";
+                    } else if mutation == 3 {
+                        r.b.elements[rel].props.insert(
+                            "subsettedFeature",
+                            serde_json::json!({
+                                "@id": "11111111-1111-4111-8111-111111111111"
+                            }),
+                        );
+                    }
+                    if mutation == 5 {
+                        let four = r.resolve_qualified("P::four").unwrap().0;
+                        let bound = r.b.owned_member_elems(four, false)[0];
+                        r.b.elements[bound]
+                            .props
+                            .insert("value", serde_json::json!(10));
+                    }
+                }
+            }
+            let expected = (mutation == 4).then_some((4, Some(4)));
+            assert_eq!(r.effective_cardinality(f), expected, "mutation {mutation}");
+        }
+    }
+
+    #[test]
     fn unit_memo_replays_imports_and_bypasses_bound_or_recursive_contexts() {
         let mut model = crate::model::Model::new();
         model.add_source("units.sysml", "package B { attribute m; attribute s; } package U { private import B::*; attribute <'m/s'> speed; }");
@@ -4298,7 +5602,16 @@ mod memo_tests {
         let mut ev = Evaluator {
             b: &mut r.b,
             env: Vec::new(),
+            lexical_scope: None,
+            value_scopes: Default::default(),
+            frame_proofs: Default::default(),
+            report: None,
+            inherited_failure_epoch: 0,
+            call_frames: Vec::new(),
             in_progress: HashSet::new(),
+            cardinality_in_progress: HashSet::new(),
+            cardinality_context: None,
+            cardinality_providers: Default::default(),
             overrides: HashMap::new(),
             unbound_receiver: None,
             lib_frames: 0,
@@ -4313,6 +5626,7 @@ mod memo_tests {
         assert_eq!(ev.b.semantic_memo.units.iter().count(), 0);
         let full = ev.expanded_unit(scope, elem, "m/s".into(), 0);
         assert_ne!(shallow, full);
+        assert_eq!(ev.b.semantic_memo.units.iter().count(), 1);
         let imports = ev.b.used_imports.clone();
         assert!(
             !imports.is_empty(),
@@ -4338,8 +5652,199 @@ mod memo_tests {
         ev.call_depth = 1;
         ev.expanded_unit(scope, elem, "m/s".into(), 0);
         ev.call_depth = 0;
-        ev.env.push(("x".into(), Value::Integer(1)));
+        ev.env.push(EnvironmentBinding {
+            name: "x".into(),
+            parameter: None,
+            frame: None,
+            value: Value::Integer(1),
+        });
         ev.expanded_unit(scope, elem, "m/s".into(), 0);
         assert_eq!(ev.b.semantic_memo.units.iter().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod parameter_environment_tests {
+    use super::*;
+    use crate::model::Model;
+
+    #[test]
+    fn frame_masks_are_atomic_and_restore_after_failed_declarations_and_calls() {
+        let mut model = Model::new();
+        model.add_source("caller.sysml", "calc def Base {in q default 1; q}");
+        model.add_source(
+            "other.sysml",
+            "calc def Other {1/0} package P {attribute bad=1/0;}",
+        );
+        let mut r = ResolvedModel::build(&model);
+        let base = r.resolve_qualified("Base").unwrap();
+        let other = r.resolve_qualified("Other").unwrap();
+        let bad = r.resolve_qualified("P::bad").unwrap();
+        let scope = r.element_scope(base).unwrap();
+        let mut ev = Evaluator {
+            b: &mut r.b,
+            env: Vec::new(),
+            lexical_scope: Some(scope.0),
+            value_scopes: Default::default(),
+            frame_proofs: Default::default(),
+            report: None,
+            inherited_failure_epoch: 0,
+            call_frames: vec![RuntimeFrame::lambda(None, scope); 2],
+            in_progress: HashSet::new(),
+            cardinality_in_progress: HashSet::new(),
+            cardinality_context: None,
+            cardinality_providers: Default::default(),
+            overrides: HashMap::new(),
+            unbound_receiver: None,
+            lib_frames: 0,
+            call_depth: 0,
+            steps: MAX_STEPS - 1,
+            allocated: 0,
+            query: false,
+        };
+        // The first frame is eligible for masking, but the second proof fails.
+        assert!(ev.mask_frames(scope.0, scope.0).is_err());
+        assert!(ev.call_frames.iter().all(|frame| frame.visible));
+        ev.steps = 0;
+        let outer = ev.mask_frames(scope.0, scope.0).unwrap();
+        assert_eq!(outer, vec![0, 1]);
+        let inner = ev.mask_frames(scope.0, scope.0).unwrap();
+        assert!(inner.is_empty());
+        ev.restore_frames(inner);
+        assert!(ev.call_frames.iter().all(|frame| !frame.visible));
+        ev.restore_frames(outer);
+        assert!(ev.call_frames.iter().all(|frame| frame.visible));
+        ev.call_frames = vec![RuntimeFrame::calculation(base, scope)];
+        ev.b.identity_origin_unit = Some(0);
+        ev.unbound_receiver = Some(base.0);
+        for _ in 0..2 {
+            assert!(ev.feature_value(bad.0).is_err());
+            assert!(ev.call_frames[0].visible);
+            assert!(ev.in_progress.is_empty());
+            assert_eq!(ev.lexical_scope, Some(scope.0));
+            assert_eq!(ev.b.identity_origin_unit, Some(0));
+            assert_eq!(ev.unbound_receiver, Some(base.0));
+            assert!(ev.user_calc_elem("Other", other.0, Vec::new()).is_err());
+            assert_eq!(ev.call_frames.len(), 1);
+            assert!(ev.call_frames[0].visible);
+            assert_eq!(ev.call_depth, 0);
+            assert_eq!(ev.lexical_scope, Some(scope.0));
+            assert_eq!(ev.b.identity_origin_unit, Some(0));
+            assert_eq!(ev.unbound_receiver, Some(base.0));
+        }
+    }
+
+    #[test]
+    fn external_query_names_yield_to_inner_parameter_identities() {
+        let mut model = Model::new();
+        model.add_source(
+            "parameters.sysml",
+            "calc def F { in x; x } attribute invocation=F(2); attribute plain=x;",
+        );
+        let mut r = ResolvedModel::build(&model);
+        for (name, expected) in [("invocation", 2), ("plain", 99), ("invocation", 2)] {
+            let owner = r.resolve_qualified(name).unwrap();
+            let (scope, expr) = r.value_expr(owner).unwrap();
+            assert_eq!(
+                evaluate_query_with_env(
+                    &mut r.b,
+                    scope.0,
+                    &expr,
+                    vec![("x".into(), Value::Integer(99))]
+                ),
+                Ok(Value::Integer(expected))
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod inherited_signature_tests {
+    use super::*;
+    use crate::model::Model;
+
+    const DECLARATIONS: &str = "
+        calc def Diff { in a; in b; return r = a - b; }
+        calc def D3 :> Diff { in x; }
+        calc def D2 :> Diff { in :>> b; }
+        calc def Child :> Diff;
+        calc typed : Diff;
+        calc def Quotient { in n; in d; n / d }
+        calc def Half :> Quotient { in x; }
+        calc def Offset { in a; in b default 1; a - b }
+        calc def O3 :> Offset { in x; }
+        calc def Scaled :> Diff { in x; return :>> r = x * b; }
+        calc def Product { in p; in q; p * q }
+        calc def Both :> Diff, Product;
+        calc def Apply { in fn : Diff; return r = fn(5, 1); }
+    ";
+
+    /// `attribute result = <expr>;` beside `DECLARATIONS`, evaluated.
+    fn eval(expr: &str) -> Result_ {
+        let mut model = Model::new();
+        model.add_source(
+            "inherited.sysml",
+            &format!("package T {{ {DECLARATIONS} attribute result = {expr}; }}"),
+        );
+        assert!(!model.has_errors(), "{expr}");
+        let mut r = ResolvedModel::build(&model);
+        let result = r.resolve_qualified("T::result").unwrap();
+        r.evaluate(result)
+    }
+
+    #[test]
+    fn a_specialization_binds_its_own_then_its_inherited_inputs() {
+        // `x` takes over `a` by position; `b` is still `Diff`'s.
+        assert_eq!(eval("D3(10, 3)"), Ok(Value::Integer(7)));
+        assert_eq!(eval("D3(b = 3, x = 10)"), Ok(Value::Integer(7)));
+        assert_eq!(eval("Half(8, 2)"), Ok(Value::Integer(4)));
+        // An inherited default fills an inherited input left out.
+        assert_eq!(eval("O3(10)"), Ok(Value::Integer(9)));
+        // An own result reads an inherited input too.
+        assert_eq!(eval("Scaled(4, 3)"), Ok(Value::Integer(12)));
+        // `a` is no input of `D3`: `x` redefines it.
+        assert!(matches!(
+            eval("D3(a = 10, b = 3)"),
+            Err(EvalError::Unresolved(_))
+        ));
+    }
+
+    #[test]
+    fn an_explicit_redefinition_binds_by_position_as_well() {
+        // `in :>> b` also takes over `Diff`'s first parameter, so `D2` has
+        // one input, `b`, that both of `Diff`'s stand for.
+        let mut model = Model::new();
+        model.add_source("inherited.sysml", DECLARATIONS);
+        let mut r = ResolvedModel::build(&model);
+        let d2 = r.resolve_qualified("D2").unwrap();
+        let bindings = r.calc_parameter_bindings(d2).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name, "b");
+        assert_eq!(r.owner(bindings[0].element), Some(d2));
+        assert_eq!(eval("D2(10)"), Ok(Value::Integer(0)));
+        assert_eq!(eval("D2(b = 4)"), Ok(Value::Integer(0)));
+        assert!(
+            matches!(eval("D2(10, 3)"), Err(EvalError::Type(m)) if m.contains("too many arguments"))
+        );
+    }
+
+    #[test]
+    fn an_invocation_evaluates_an_inherited_result() {
+        assert_eq!(eval("Child(10, 3)"), Ok(Value::Integer(7)));
+        assert_eq!(eval("typed(10, 3)"), Ok(Value::Integer(7)));
+        // A function-typed parameter stands for an unknown calculation,
+        // whatever its type computes.
+        let mut model = Model::new();
+        model.add_source("inherited.sysml", DECLARATIONS);
+        let mut r = ResolvedModel::build(&model);
+        let result = r.resolve_qualified("Apply::r").unwrap();
+        assert_eq!(r.evaluate(result), Ok(Value::Indeterminate));
+        assert_eq!(eval("Apply(Child)"), Ok(Value::Integer(4)));
+        // Results equally near bind the one result: their common value,
+        // unknown where they differ.
+        assert_eq!(eval("Both(5, 1, 2, 2)"), Ok(Value::Integer(4)));
+        assert!(
+            matches!(eval("Both(5, 1, 2, 3)"), Err(EvalError::Unsupported(m)) if m.contains("disagree"))
+        );
     }
 }

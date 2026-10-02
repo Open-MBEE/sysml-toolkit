@@ -18,20 +18,95 @@
 //! normative UUIDv5 library IDs).
 
 mod behavior;
+mod callable_bodies;
 mod cases;
 mod closures;
 mod derived;
 mod derived_compositions;
+mod direction_proof;
+mod exposure;
+mod feature_type_projection;
+mod literal_inheritance;
+mod membership_context;
+mod metadata_associations;
+mod model_level_evaluability;
+use membership_context::{ImportProjection, MembershipContext, MembershipProjection};
+mod dynamic_graph;
+mod dynamic_invocations;
+mod generated_defaults;
 mod implied;
-mod naming;
+mod import_memberships;
+mod local_featuring;
+mod membership_evidence;
+mod membership_projection;
+#[cfg(test)]
+mod named_argument_index_tests;
+pub(crate) mod naming;
+mod operations;
+mod owned_results;
+mod parameter_context;
+mod parameters;
+mod positional;
+mod positional_delta;
+pub(crate) mod provider_completeness;
+mod publication;
+mod recorded_lookup;
+mod redefinition_provenance;
+mod result_redefinition;
+mod runtime_frames;
 mod scope_table;
+mod semantic;
+mod semantic_batch;
+mod semantic_ownership;
+pub mod settled;
+mod structural_index;
+mod succession_endpoints;
+mod type_features;
+mod type_inputs;
+mod type_relations;
+pub use type_features::{TypeFeatureReport, TypeFeatures};
+pub use type_inputs::{FunctionResultReport, TypeInputIssue, TypeInputReport};
+mod invocation_bindings;
+pub use invocation_bindings::{
+    InvocationBinding, InvocationBindingIssue, InvocationBindingReport, InvocationBindings,
+};
+mod constructor_bindings;
+pub use constructor_bindings::{
+    ConstructorBinding, ConstructorBindingIssue, ConstructorBindingReport, ConstructorBindings,
+    ConstructorDefaultBinding, ConstructorDefaultReport, ConstructorResult,
+    ConstructorResultReport, ConstructorSelection, ConstructorSelectionReport,
+};
+mod cardinality;
+pub use cardinality::{CardinalityBounds, CardinalityIssue, CardinalityReport};
+mod end_constancy;
 mod typeops;
+pub use end_constancy::{EndConstancyIssue, EndConstancyReport};
+mod usage_variability;
+pub use usage_variability::{UsageVariabilityIssue, UsageVariabilityReport};
+pub(crate) mod value_context;
+pub(crate) use callable_bodies::calculation_like;
+pub use callable_bodies::{CallableBody, CallableResult};
 pub use closures::{CLOSURE_NAMES, ClosurePolicy};
 pub use derived::dangling_id;
 pub use derived::{
     CatalogEntry, Derived, DerivedValue, Derives, PropertyShape, Reference, computed_names,
     derives, derives_under, is_owned_property, metaclass_conforms, property_catalog,
 };
+pub(crate) use direction_proof::{DirectionFact, DirectionProof, authored_direction};
+pub use feature_type_projection::{FeatureTypeIssue, FeatureTypeReport};
+pub use model_level_evaluability::{
+    ModelLevelEvaluability, ModelLevelEvaluabilityReport, ModelLevelEvaluabilityUnknown,
+};
+pub use operations::{
+    OperationArgumentIssue, OperationError, OperationExecutionSignature, OperationResult,
+    operation_execution_signature,
+};
+pub use parameter_context::RuntimeParameterSelection;
+pub use parameters::{ParameterBinding, ReferenceIdentity};
+pub use runtime_frames::{RuntimeFrame, RuntimeFrameProof};
+pub use semantic::{ConditionalPropertyCapability, conditional_property_capability};
+pub use semantic::{PropertyError, PropertyIssue, SemanticExportError};
+pub use value_context::{ValueScopeDecision, ValueScopeResolver};
 
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -69,6 +144,58 @@ pub fn library_name_map(model: &crate::model::Model) -> HashMap<String, Vec<Stri
         .chain(b.lib_mem_qnames.iter())
         .map(|(id, segments)| (id.to_string(), segments.clone()))
         .collect()
+}
+
+/// Canonical library names and the referenced identities whose canonical name
+/// cannot be used from an external source. The full name table retains its
+/// identity-derivation contract; remove the second set only from the table fed
+/// to the textual lifter, so those references use its existing UUID fallback.
+/// No alternate name is invented and source-language visibility is unchanged.
+pub fn library_reference_names(
+    model: &crate::model::Model,
+    referenced: &HashSet<Uuid>,
+) -> (HashMap<String, Vec<String>>, HashSet<String>) {
+    let mut b = Builder::default();
+    b.build_model(model);
+    let names: HashMap<_, _> = b
+        .lib_qnames
+        .iter()
+        .chain(b.lib_mem_qnames.iter())
+        .map(|(id, segments)| (id.to_string(), segments.clone()))
+        .collect();
+    let mut fallback = HashSet::new();
+    for id in referenced {
+        let text = id.to_string();
+        let Some(segments) = names.get(&text) else {
+            continue;
+        };
+        let qn = QualifiedName {
+            is_global: true,
+            segments: segments
+                .iter()
+                .map(|value| Name {
+                    value: value.clone(),
+                    span: Span::default(),
+                })
+                .collect(),
+            span: Span::default(),
+        };
+        // Membership imports serialize the selected alias/owning Membership,
+        // while ordinary reference expressions serialize the selected member.
+        let usable = match b.resolve_result(0, &qn, 0, false) {
+            LookupResult::Found(element, _, membership) => {
+                b.elem_id(element) == *id
+                    || membership
+                        .or(b.elements[element].owning_relationship)
+                        .is_some_and(|m| b.elem_id(m) == *id)
+            }
+            LookupResult::Missing | LookupResult::Ambiguous => false,
+        };
+        if !usable {
+            fallback.insert(text);
+        }
+    }
+    (names, fallback)
 }
 
 /// [`library_name_map`] restricted to library *elements* (memberships and
@@ -111,7 +238,13 @@ pub fn model_to_compact_json_with_units(
         .filter(|&&(start, _)| start >= boundary)
         .map(|&(start, orig)| (start - boundary, model.unit_meta(orig).0.to_owned()))
         .collect();
-    (b.finish(boundary), units)
+    if model.graph_format() == crate::model::GraphFormat::CanonicalV3 {
+        let mut resolved = ResolvedModel::from_builder(b, model);
+        let compact = resolved.completed_compact_range(boundary, resolved.b.explicit_len());
+        (compact, units)
+    } else {
+        (b.finish(boundary), units)
+    }
 }
 
 /// The resolved standard library itself as a compact element array:
@@ -141,7 +274,12 @@ pub fn library_to_compact_json_with_units(
         .filter(|&&(start, _)| start < boundary)
         .map(|&(start, orig)| (start, model.unit_meta(orig).0.to_owned()))
         .collect();
-    (b.finish_range(0, boundary), units)
+    if model.graph_format() == crate::model::GraphFormat::CanonicalV3 {
+        let mut resolved = ResolvedModel::from_builder(b, model);
+        (resolved.completed_compact_range(0, boundary), units)
+    } else {
+        (b.finish_range(0, boundary), units)
+    }
 }
 
 /// The standard-library **resolver artifact**: everything a
@@ -485,16 +623,23 @@ pub(crate) struct BlockedSite {
 pub(crate) struct InheritedBindings {
     pub(crate) members: Vec<(usize, usize)>,
     pub(crate) alias_rels: Vec<usize>,
+    /// Contributing Membership identities in normative per-base order.
+    pub(crate) membership_order: Vec<usize>,
     /// A heritage or import chain reached [`MAX_RESOLUTION_DEPTH`], so
     /// members beyond it are missing from `members`.
     pub(crate) truncated: bool,
+    /// Known cyclic or unsupported semantic dependency. This is distinct
+    /// from an actual depth-budget cut and does not certify completeness.
+    pub(crate) incomplete: bool,
     /// `(dropped, shadowing)` pairs removed by the SysML implicit
     /// same-name usage redefinition (condition (c) of the removal pass):
     /// `dropped` is the inherited member a same-named usage-family member
     /// `shadowing` (owned by the enumerated scope, or inherited from a
     /// nearer base) hides without a spelled `:>>`. Lookup treats the pair
     /// as a redefinition; the namespace-distinguishability check reads it
-    /// as the collision the normative rule reports.
+    /// as the collision the normative rule reports. A parameter of a
+    /// behavior or step, a result or an end shadows nothing this way, in
+    /// lookup or here: it redefines by position.
     pub(crate) implicit_redefinitions: Vec<(usize, usize)>,
 }
 
@@ -532,10 +677,54 @@ type ImportVisit = (usize, u8, bool, Vec<(usize, usize)>);
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Builder {
+    pub(crate) graph_format: crate::model::GraphFormat,
+    // Reconstructed from Model input metadata on every build; payload units
+    // are user units and cannot be frozen into a prepared library prefix.
+    #[serde(skip)]
+    payload_source_units: HashSet<usize>,
     dialect: Dialect,
     pub(crate) semantic_memo: crate::semantic_memo::SemanticMemo,
     #[serde(skip)]
     pub(crate) semantic_ready: bool,
+    /// Sole publication authority; skipped by prepared serialization.
+    #[serde(skip)]
+    implied: Option<implied::ImpliedTable>,
+    #[serde(skip)]
+    publication: publication::Control,
+    #[serde(skip)]
+    dynamic_graph: Option<Arc<dynamic_graph::Snapshot>>,
+    #[serde(skip)]
+    static_planning: bool,
+    #[serde(skip)]
+    recorded_lookup_ready: bool,
+    #[serde(skip)]
+    recorded_lookup_graph: Option<recorded_lookup::Graph>,
+    #[serde(skip)]
+    recorded_lookup_prefix: Option<Arc<recorded_lookup::Graph>>,
+    /// Whether the structural shape can change under Membership selection.
+    /// Persist this proof across prepared snapshots; user append recomputes it.
+    recorded_lookup_candidate: bool,
+    /// The outcomes this build starts from (see [`settled`]), taken by
+    /// [`Self::resolve_pending`].
+    #[serde(skip)]
+    seed: Option<settled::Seed>,
+    /// Whether this build keeps the outcomes it settles on.
+    #[serde(skip)]
+    keep_settled: bool,
+    /// The outcomes this build settled on, when kept.
+    #[serde(skip)]
+    settled: Option<Arc<settled::SettledOutcomes>>,
+    /// Selection did not stabilize within the pass budget. Restore contextual
+    /// bootstrap outputs together and preserve qualification across snapshots.
+    recorded_lookup_incomplete: bool,
+    #[serde(skip)]
+    redefinition_lookup_owner: Option<usize>,
+    #[serde(skip)]
+    redefinition_lookup_base: Option<usize>,
+    #[serde(skip)]
+    recorded_lookup_suppressed: bool,
+    #[serde(skip)]
+    library_refs_to_users: bool,
     /// Immutable library facts; never retain facts about user additions.
     #[serde(skip)]
     pub(crate) library_facts: Option<std::sync::Arc<crate::check::facts::Facts>>,
@@ -547,6 +736,9 @@ pub(crate) struct Builder {
     /// Flat element list in ownership (depth-first) order.
     #[serde(with = "element_table")]
     pub(crate) elements: crate::layered::LayeredVec<Elem>,
+    /// Ownership-path hash states, kept only while a build lowers.
+    #[serde(skip)]
+    path_hashes: Option<PathHashes>,
     #[serde(with = "scope_table")]
     scopes: crate::layered::LayeredVec<Scope>,
     /// Element index → its body scope (for namespace-owning elements).
@@ -554,10 +746,16 @@ pub(crate) struct Builder {
     /// Per-scope cache of resolved namespace-import target scopes (with the
     /// recursive flag and the import's bracket-filter indices).
     #[serde(skip)]
-    import_cache: Vec<Option<Vec<ImportedScope>>>,
+    import_cache: Vec<Option<Arc<Vec<ImportedScope>>>>,
+    /// Per scope and access, the sub-scopes a recursive import walks: the
+    /// scopes its admitted named members open, sorted. Lookups through a
+    /// recursive import visit them for every name; the lists are the scope
+    /// tables', fixed for a pass.
+    #[serde(skip)]
+    recursive_subs: crate::layered::IdMap<(usize, u8), Arc<[usize]>>,
     /// Import relationships a lookup actually resolved a name through
     /// (admitted hits only) — the unused-import check's evidence.
-    pub(crate) used_imports: HashSet<usize>,
+    pub(crate) used_imports: crate::layered::IdSet<usize>,
     /// Import relationships the resolution in progress walked through,
     /// each with the access the walk ran under; cleared per user
     /// reference and recorded on its [`RefSite`].
@@ -582,11 +780,25 @@ pub(crate) struct Builder {
     /// Per-scope cache of resolved specialization-base scopes.
     #[serde(skip)]
     base_cache: Vec<Option<(Vec<usize>, usize)>>,
+    /// Rule-required positional edges, keyed by stable element indices.
+    #[serde(skip)]
+    positional_redefinitions: Option<positional::PositionalRedefinitions>,
+    /// Private recursion guard; never stands in for completed evidence.
+    #[serde(skip)]
+    positional_planning: bool,
+    /// Library/variation requirements reused by positional planning and
+    /// materialization. External name-table overrides bypass this cache.
+    #[serde(skip)]
+    supported_implied: Option<Arc<implied::SupportedImpliedSpecializations>>,
+    /// Caller-supplied library-name overrides used by positional planning
+    /// before the implied relationship view is materialized.
+    #[serde(skip)]
+    external_implied_names: HashMap<String, Uuid>,
     /// Per-(scope, include_implied) memo of the inherited-member
     /// enumeration ([`Self::inherited_bindings`]), cleared with the
     /// other lookup caches. Shared, so a hit costs a pointer copy.
     #[serde(skip)]
-    inherited_cache: HashMap<(usize, bool), Arc<InheritedBindings>>,
+    inherited_cache: crate::layered::IdMap<(usize, bool), Arc<InheritedBindings>>,
     /// The same memo keyed by heritage for scopes that own nothing (a
     /// bodiless usage or definition): their enumeration is a function of
     /// their base scopes alone, and a large model has thousands of such
@@ -597,11 +809,12 @@ pub(crate) struct Builder {
     /// ([`Self::lookup`]). `None` under the active stamp means the scope is
     /// currently being evaluated (a cyclic re-entry is a miss); `Some`
     /// memoizes the completed result so multiple import paths can apply
-    /// their own filters without re-walking the graph.
+    /// their own filters without re-walking the graph. The six slots separate
+    /// three visibility levels for compatibility and semantic-name queries.
     #[serde(skip)]
-    visit_stamp: Vec<[u64; 3]>,
+    visit_stamp: Vec<[u64; 6]>,
     #[serde(skip)]
-    visit_result: Vec<[Option<LookupResult>; 3]>,
+    visit_result: Vec<[Option<LookupResult>; 6]>,
     /// The active lookup query number (one per (start scope, name) chase).
     #[serde(skip)]
     query_stamp: u64,
@@ -614,7 +827,7 @@ pub(crate) struct Builder {
     /// Resolved target of each namespace import per scope, with the
     /// import walks its own resolution took (attributed to the import's
     /// reference site, not to whichever lookup first filled the cache).
-    import_targets: HashMap<(usize, String), (Option<usize>, ImportWalks)>,
+    import_targets: crate::layered::IdMap<(usize, String), (Option<usize>, ImportWalks)>,
     /// Library element IDs → qualified-name segments (collected while
     /// assigning normative IDs).
     lib_qnames: crate::layered::LayeredVec<(Uuid, Vec<String>)>,
@@ -633,20 +846,67 @@ pub(crate) struct Builder {
     /// Unresolved references to patch after all scopes exist. A property key
     /// of the form `base#n` appends to the array property `base`.
     pending: Vec<PendingRef>,
+    /// User references retained only for models containing UUID spellings.
+    /// Interchange loading replays them after restoring explicit identities.
+    #[serde(skip)]
+    id_binding_pending: Vec<PendingRef>,
+    /// Identity spellings, keyed by source unit and first-segment span.
+    /// Distinct lexical names that happen to spell the same UUID retain
+    /// their normal meaning, even in the same interchange document.
+    #[serde(skip)]
+    id_spelled_targets: HashMap<(usize, u32, u32), (Uuid, Uuid)>,
+    /// Source provenance of a lifted expression/name while its resolution
+    /// context may belong to another unit (inherited defaults, imports).
+    #[serde(skip)]
+    pub(crate) identity_origin_unit: Option<usize>,
+    /// Source units for aliases; the global scope may contain aliases
+    /// declared in several source units with identical target spans.
+    #[serde(skip)]
+    alias_origins: crate::layered::IdMap<(usize, usize), usize>,
     /// Library-cache replay: recorded outcomes for library-origin pending
     /// refs, consumed positionally by `resolve_pending` (see
     /// [`crate::libcache`]).
     #[serde(skip)]
     lib_hints: Option<std::vec::IntoIter<(Option<Uuid>, Vec<String>)>>,
+    /// Whether `lib_hints` hold the library's own fixed point (see
+    /// [`crate::libcache::LibraryCache`]) rather than a first pass's outcomes.
+    #[serde(skip)]
+    lib_hints_fixed_point: bool,
+    /// Whether the last resolution pass took every library-origin pending
+    /// ref from `lib_hints`, none resolved afresh.
+    #[serde(skip)]
+    lib_replayed_all: bool,
+    /// Replay only the recorded targets from `lib_hints` in the next pass:
+    /// a recorded miss is resolved afresh, which alone tells an ambiguous
+    /// name from a missing one.
+    #[serde(skip)]
+    lib_replay_targets_only: bool,
     /// Root names the user units of the model being built introduce, from
     /// declarations, inferred names and root imports; `None` when a root
     /// construct's contribution needs the resolver. Replay skips every
     /// recorded outcome whose root misses intersect this set.
     #[serde(skip)]
     replay_completions: Option<HashSet<String>>,
-    /// Root misses seen while resolving the current pending reference.
+    /// Root misses seen while resolving the current pending reference, or
+    /// while computing the innermost lookup-cache entry in progress.
     #[serde(skip)]
     current_misses: Vec<String>,
+    /// The misses of every resolution a lookup-cache fill in progress
+    /// interrupted, outermost first: each fill notes its own misses in
+    /// `current_misses` (see [`Self::begin_fill`]).
+    #[serde(skip)]
+    fill_frames: Vec<Vec<String>>,
+    /// Root misses behind each scope's `base_cache` entry.
+    #[serde(skip)]
+    base_misses: Vec<FillMisses>,
+    /// Root misses behind each scope's `import_cache` entry — the
+    /// resolution of every namespace import target of the scope, which
+    /// also yields its `import_targets` entries.
+    #[serde(skip)]
+    import_misses: Vec<FillMisses>,
+    /// Root misses behind the `semantic_metadata` memo.
+    #[serde(skip)]
+    semantic_metadata_misses: FillMisses,
     /// Sealed-snapshot replay: the cache whose final library element ids
     /// are consumed positionally at element creation — skipping
     /// ownership-path construction and UUIDv5 hashing for the whole
@@ -685,7 +945,9 @@ pub(crate) struct Builder {
     pub(crate) owned_cross_features: crate::layered::LayeredMap<usize, usize>,
     pub(crate) payload_flows: HashSet<usize>,
     pub(crate) contract_exprs: crate::layered::LayeredMap<usize, (usize, Expr)>,
-    /// Multiplicities for semantic checks: (owning element, scope, clause).
+    /// Authored ranges for semantic checks: (source element, lexical scope,
+    /// clause). Header rows name the constrained element; body/named domain
+    /// rows name the MultiplicityRange itself and do not specify its cardinality.
     pub(crate) multiplicities: crate::layered::LayeredVec<(usize, usize, Multiplicity)>,
     /// Connector-family end features with reference targets, for the
     /// featuring-accessibility check: (connector, end feature, target span).
@@ -729,6 +991,16 @@ pub(crate) struct Builder {
     /// here instead of re-resolving (`:>>` names self-hit and fall through
     /// to full import scans, ~0.2 ms each on import-heavy scopes).
     pub(crate) spec_resolved: crate::layered::LayeredVec<Option<usize>>,
+    /// Root misses behind each `spec_resolved` outcome, by the same index:
+    /// a resolution that reads another reference's recorded outcome
+    /// depends on the root names that reference missed.
+    #[serde(skip)]
+    spec_misses: MissTable,
+    /// Root misses behind the recorded single-valued outcome of each
+    /// relationship, by the relationship element — what the recorded
+    /// lookup graph built from those outcomes depends on.
+    #[serde(skip)]
+    ref_misses: MissTable,
     /// `spec_targets` index the next created pending ref reports into.
     pending_spec_idx: Option<usize>,
     /// Trailing result expressions for constraint verdicts and calculation
@@ -740,9 +1012,11 @@ pub(crate) struct Builder {
     /// the result of executing the body. This is derived from source on
     /// every build, including builds that replay a library cache.
     pub(crate) executable_calculations: HashSet<usize>,
-    /// Named `in`/`inout` parameters per owning element, in declaration
-    /// order — the binding targets for user-defined calculation invocation.
-    pub(crate) in_params: crate::layered::LayeredMap<usize, Vec<String>>,
+    /// Derived source-site parameter identities, rebuilt when elements are appended.
+    #[serde(skip)]
+    parameter_sites: Option<parameters::ParameterSites>,
+    #[serde(skip)]
+    parameter_signatures: Option<parameters::ParameterSignatures>,
     /// Every named usage member per owning element, in declaration order
     /// with its element index — the binding targets for `new T(…)`
     /// constructor evaluation (filtered to data usages at use).
@@ -766,13 +1040,36 @@ pub(crate) struct Builder {
     /// `referencedFeature` without a [`ResolvedModel`] at hand. Rebuilt
     /// when the element count moves (edit sessions append).
     #[serde(skip)]
-    id_index: Option<HashMap<Uuid, usize>>,
+    id_index: Option<Arc<crate::layered::IdMap<Uuid, usize>>>,
     /// Element count `id_index` was built for (the map itself is shorter
     /// than the element list when ids collide, which must not force a
     /// rebuild per lookup).
     #[serde(skip)]
     id_index_built_for: usize,
-    /// Lazily built owning element → first [`Self::multiplicities`] row,
+    /// Immutable stored topology only; semantic proof facts stay query-local.
+    #[serde(skip)]
+    stored_structure: Option<Arc<structural_index::StoredStructure>>,
+    /// The structural scan of the frozen library rows, made when the
+    /// library is frozen and shared by every build on it: a build scans only
+    /// its own rows again. Not serialized: a decoded library's freeze makes
+    /// its own.
+    #[serde(skip)]
+    pub(crate) prefix_structure: Option<Arc<structural_index::PrefixStructure>>,
+    /// The frozen rows by id, kept by the freeze for the identity
+    /// assignment of every build on them (see [`Self::assign_user_ids`]):
+    /// the kept lookup graph's own table where there is one, else made at
+    /// the freeze. Not serialized: a decoded library's freeze makes its own.
+    #[serde(skip)]
+    pub(crate) prefix_ids: Option<Arc<crate::layered::IdMap<Uuid, usize>>>,
+    /// The library name tables by id, the first entry of an id winning,
+    /// made by the first build on the frozen rows whose identity
+    /// assignment reads a library row's name from them, and shared by
+    /// every build on them (see [`IdentityTables::table_name`]). Not
+    /// serialized: a decoded library's freeze makes its own cell.
+    #[serde(skip)]
+    pub(crate) prefix_table_names: Arc<std::sync::OnceLock<Arc<HashMap<Uuid, String>>>>,
+    /// Lazily built constrained element → first header [`Self::multiplicities`]
+    /// row, excluding body/named domain rows,
     /// with the row count it was built from. The table is
     /// library-inclusive, so the scan it replaces was proportional to
     /// the library on every lookup.
@@ -788,6 +1085,10 @@ pub(crate) struct Builder {
     /// the model's content stops at [`Self::explicit_len`].
     #[serde(skip)]
     pub(crate) implied_from: Option<usize>,
+    /// Immutable ownership/source projection for materialized semantic nodes.
+    /// Source storage and prepared snapshots never serialize this view.
+    #[serde(skip)]
+    semantic_ownership: Option<Arc<semantic_ownership::SemanticOwnership>>,
     /// Set while building an enum definition's direct body members.
     in_enum_body: bool,
     /// Usage elements with an expected featuring type (owned by a Type via
@@ -820,19 +1121,32 @@ pub(crate) struct Builder {
     /// References whose lookup found multiple same-precedence targets.
     ambiguous: Vec<(usize, QualifiedName)>,
     /// Import filter conditions — `filter expr;` members and bracketed
-    /// `import P::*[expr]` filters: (scope the expression's names resolve
-    /// from, the syntax expression). Applied by [`Self::lookup`] to every
+    /// `import P::*[expr]` filters: (source relationship, scope the expression's names resolve from, the syntax expression). Applied by [`Self::lookup`] to every
     /// hit that arrives through an import (see [`Self::filter_verdict`]).
-    pub(crate) filter_exprs: crate::layered::LayeredVec<(usize, Expr)>,
+    pub(crate) filter_exprs: crate::layered::LayeredVec<(usize, usize, Expr)>,
     /// Per-filter re-entrancy guard: resolving a filter's own metaclass
     /// names may walk back through the filtered import; a re-entered
     /// filter answers *undecided* (member stays visible).
     #[serde(skip)]
     filters_active: Vec<bool>,
     /// Direct metadata annotations per annotated element: `#M` prefix
-    /// metadata and about-less body `@M;` / `metadata m : M;` members
-    /// (`@M about x;` annotates `x`, not its owner — not recorded).
+    /// metadata, about-less body members and validated explicit Annotation
+    /// targets. Explicit-about snapshots are refreshed between resolution passes.
     pub(crate) metadata_of: crate::layered::LayeredMap<usize, Vec<usize>>,
+    /// Captured lazily only for models containing explicit metadata about sites.
+    #[serde(default)]
+    metadata_intrinsic: Option<crate::layered::LayeredMap<usize, Vec<usize>>>,
+    /// Current explicit contributions; empty keys retain touched-target history
+    /// so prepared library contexts can be refreshed after association removal.
+    #[serde(default)]
+    pub(crate) metadata_about: std::collections::BTreeMap<usize, Vec<usize>>,
+    /// Semantic snapshot changes can invalidate query proofs without row edits.
+    #[serde(skip)]
+    metadata_association_generation: Option<std::sync::Arc<()>>,
+    #[serde(default)]
+    explicit_metadata_annotations: crate::layered::LayeredVec<usize>,
+    #[serde(default)]
+    pub(crate) metadata_associations_incomplete: bool,
     /// Port definition element → its implicit ConjugatedPortDefinition
     /// (`~P` typings resolve through the original and substitute this).
     conjugated_defs: crate::layered::LayeredMap<usize, usize>,
@@ -848,7 +1162,7 @@ pub(crate) struct Builder {
     /// permanently caching an empty `import_scopes` for the scope on the
     /// way down).
     #[serde(skip)]
-    member_import_active: std::collections::HashSet<(usize, usize)>,
+    member_import_active: crate::layered::IdSet<(usize, usize)>,
 }
 
 /// Three-valued verdict of a filter condition against one candidate
@@ -903,15 +1217,97 @@ fn access_mode(access: LookupAccess) -> AccessMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum LookupResult {
     Missing,
-    Found(usize, Option<usize>),
+    /// Element, member scope, and the named alias Membership (if any).
+    /// Retaining the last component lets membership imports preserve identity
+    /// while ordinary references continue to denote the member element.
+    Found(usize, Option<usize>, Option<usize>),
     Ambiguous,
 }
 
 impl LookupResult {
     fn option(self) -> Option<(usize, Option<usize>)> {
         match self {
-            Self::Found(elem, scope) => Some((elem, scope)),
+            Self::Found(elem, scope, _) => Some((elem, scope)),
             Self::Missing | Self::Ambiguous => None,
+        }
+    }
+}
+
+/// The root misses ([`Builder::note_root_miss`]) behind one entry of a
+/// lookup cache. The caches outlive the reference whose resolution fills
+/// them, so every read of an entry notes these names again: an outcome
+/// read through a cache depends on each root name the cached computation
+/// looked up and missed, whichever reference computed it.
+#[derive(Clone, Default)]
+enum FillMisses {
+    /// Not computed yet, or computed without missing a root name.
+    #[default]
+    None,
+    /// Being computed by the fill [`Builder::begin_fill`] numbered so. A
+    /// read from inside it sees the partial entry, which depends on what
+    /// the fill has missed so far.
+    Filling(usize),
+    /// Computed; its computation missed these root names.
+    Missed(Arc<[String]>),
+}
+
+/// Root misses by a dense index (a scope, an element, a specialization
+/// entry), grown on demand. Only builds that record library outcomes fill
+/// one, and sparsely: an absent index costs a bounds check, not a hash.
+#[derive(Clone, Default)]
+struct MissTable(Vec<Option<Arc<[String]>>>);
+
+impl MissTable {
+    fn get(&self, index: usize) -> Option<&Arc<[String]>> {
+        self.0.get(index)?.as_ref()
+    }
+
+    fn set(&mut self, index: usize, misses: &[String]) {
+        if misses.is_empty() {
+            if let Some(slot) = self.0.get_mut(index) {
+                *slot = None;
+            }
+            return;
+        }
+        if self.0.len() <= index {
+            self.0.resize(index + 1, None);
+        }
+        self.0[index] = Some(misses.into());
+    }
+
+    fn clear(&mut self) {
+        self.0 = Vec::new();
+    }
+}
+
+/// The lookup state one query sets for itself — see
+/// [`Builder::enter_fill_mode`].
+struct QueryMode {
+    probing: bool,
+    widen: Option<(usize, LookupAccess)>,
+    exclude: Option<usize>,
+    declared_only: bool,
+    header_owner: Option<usize>,
+    header_base: Option<usize>,
+    member_imports: crate::layered::IdSet<(usize, usize)>,
+    /// The filter flags, when some filter was being evaluated.
+    filters: Option<Vec<bool>>,
+    suppressed: bool,
+}
+
+/// The root miss that stands for the root namespace importing nothing.
+/// The recorded lookup graph takes a scope's implied roots as absent only
+/// while no root import could make them visible, so what it reads through
+/// such a scope depends on this as on the roots themselves, and any root
+/// import supplies it. A root member spelled this way through an
+/// unrestricted name costs a needless re-resolution, never a wrong one.
+pub(crate) const ROOT_IMPORTS: &str = "::*";
+
+/// Note `names` among the misses of the resolution in progress, once each.
+fn note_misses<'a>(noted: &mut Vec<String>, names: impl IntoIterator<Item = &'a String>) {
+    for name in names {
+        if !noted.contains(name) {
+            noted.push(name.clone());
         }
     }
 }
@@ -973,21 +1369,186 @@ struct PendingRef {
     spec_idx: Option<usize>,
 }
 
+/// The rows an identity assignment reads by id and by name (see
+/// [`Builder::assign_user_ids`]): its own rows, from `start`, in tables of
+/// its own; the frozen rows before them through the ids their freeze kept
+/// and their names on demand.
+struct IdentityTables {
+    start: usize,
+    /// Pre-reassignment id → index of the rows from `start`: the last row
+    /// carrying an id.
+    by_id: crate::layered::IdMap<Uuid, usize>,
+    /// The identity names of the rows from `start`.
+    names: Vec<Option<String>>,
+    /// The frozen rows by id, when `start` is their end.
+    frozen: Option<Arc<crate::layered::IdMap<Uuid, usize>>>,
+    /// The library name tables by id, the first entry of an id winning,
+    /// made when a row's identity name is first read from them: the cell
+    /// every build on the frozen rows shares while the tables are the
+    /// frozen rows' alone, else a table of this build's own.
+    table_names: Option<Arc<HashMap<Uuid, String>>>,
+}
+
+impl IdentityTables {
+    /// The row carrying `id`: the last of this build's rows to, else the
+    /// frozen row.
+    fn index_of(&self, id: &Uuid) -> Option<usize> {
+        self.by_id
+            .get(id)
+            .or_else(|| self.frozen.as_ref()?.get(id))
+            .copied()
+    }
+
+    /// Row `e`'s identity name: declared, else from the library name tables.
+    fn name(&mut self, b: &Builder, e: usize) -> Option<String> {
+        if e >= self.start {
+            return self.names[e - self.start].clone();
+        }
+        b.effective_name(e)
+            .or_else(|| self.table_name(b, b.elements[e].id))
+    }
+
+    fn table_name(&mut self, b: &Builder, id: Uuid) -> Option<String> {
+        let tables = self.table_names.get_or_insert_with(|| {
+            let frozen_only = self.frozen.is_some()
+                && b.lib_qnames.len() == b.lib_qnames.base_len()
+                && b.lib_qnames.base_untouched()
+                && b.lib_mem_qnames.len() == b.lib_mem_qnames.base_len()
+                && b.lib_mem_qnames.base_untouched();
+            if frozen_only {
+                let shared = &b.prefix_table_names;
+                if shared.get().is_none() {
+                    note_library_names_built();
+                }
+                Arc::clone(shared.get_or_init(|| Arc::new(b.library_table_names())))
+            } else {
+                note_library_names_built();
+                Arc::new(b.library_table_names())
+            }
+        });
+        tables.get(&id).cloned()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREFIX_IDS_SERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ID_INDEX_TABLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIBRARY_NAMES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// How many rows the id index tabled itself, over every build.
+#[cfg(test)]
+pub(crate) fn id_index_tabled() -> usize {
+    ID_INDEX_TABLED.with(|c| c.get())
+}
+#[cfg(test)]
+fn note_id_index_tabled(rows: usize) {
+    ID_INDEX_TABLED.with(|c| c.set(c.get() + rows));
+}
+#[cfg(not(test))]
+fn note_id_index_tabled(_rows: usize) {}
+/// How many times the library name tables were made by id.
+#[cfg(test)]
+pub(crate) fn library_names_built() -> usize {
+    LIBRARY_NAMES_BUILT.with(|c| c.get())
+}
+#[cfg(test)]
+fn note_library_names_built() {
+    LIBRARY_NAMES_BUILT.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+fn note_library_names_built() {}
+/// How many identity assignments read the frozen rows through a kept table.
+#[cfg(test)]
+pub(crate) fn prefix_ids_served() -> usize {
+    PREFIX_IDS_SERVED.with(|c| c.get())
+}
+#[cfg(test)]
+fn note_prefix_ids_served() {
+    PREFIX_IDS_SERVED.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+fn note_prefix_ids_served() {}
+
+/// The passes the redo loop takes against the graph of the previous
+/// pass's outcomes before concluding that they oscillate.
+const REDO_PASSES: usize = 4;
+
+/// What a pass records beside its outcomes, as lowering left it: restored
+/// before every pass, so that each pass records its own.
+struct SideState {
+    unresolved: Vec<(usize, QualifiedName)>,
+    ambiguous: Vec<(usize, QualifiedName)>,
+    blocked: Vec<BlockedSite>,
+    sites: Vec<RefSite>,
+    used: crate::layered::IdSet<usize>,
+}
+
+impl SideState {
+    fn capture(b: &Builder) -> Self {
+        Self {
+            unresolved: b.unresolved.clone(),
+            ambiguous: b.ambiguous.clone(),
+            blocked: b.blocked.clone(),
+            sites: b.ref_sites.clone(),
+            used: b.used_imports.clone(),
+        }
+    }
+
+    fn restore(&self, b: &mut Builder) {
+        b.unresolved = self.unresolved.clone();
+        b.ambiguous = self.ambiguous.clone();
+        b.blocked = self.blocked.clone();
+        b.ref_sites = self.sites.clone();
+        b.used_imports = self.used.clone();
+    }
+}
+
+/// A pass's outcomes: the pending references' values and the
+/// specialization outcomes.
+type PassOutcomes = (Vec<Option<crate::properties::Atom>>, Vec<Option<usize>>);
+
+/// A library's recorded fixed point, for a redo pass to replay again.
+type LibraryReplay = (Vec<(Option<Uuid>, Vec<String>)>, HashSet<String>);
+
+#[cfg(test)]
+thread_local! {
+    static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// How many resolution passes ran.
+#[cfg(test)]
+pub(crate) fn passes() -> usize {
+    PASSES.with(|c| c.get())
+}
+#[cfg(test)]
+fn note_pass() {
+    PASSES.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+fn note_pass() {}
+
 /// One pending reference paired with cache bookkeeping before resolution is
 /// reordered to put specialization outcomes first.
 struct PendingWork {
     source_order: usize,
     pending: PendingRef,
-    lib_hint: Option<Option<Uuid>>,
+    /// A replayed outcome and the root misses recorded with it.
+    lib_hint: Option<(Option<Uuid>, Vec<String>)>,
     record_pos: Option<usize>,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone)]
 pub(crate) struct Elem {
     pub(crate) ty: &'static str,
     id: Uuid,
-    /// Ownership path used to derive `id` and children's ids.
+    /// Ownership path used to derive `id` and children's ids: the whole
+    /// path, or under a `path_parent` only the segment this element adds
+    /// to that element's path (see [`whole_path`]).
     path: String,
+    /// The element whose ownership path this one's extends. Holding the
+    /// segment alone keeps a path's cost its own length rather than its
+    /// depth, which grows by one segment per ownership level.
+    path_parent: Option<usize>,
     pub(crate) props: crate::properties::Properties,
     pub(crate) owned_relationships: crate::flat::Row<usize>,
     pub(crate) children: crate::flat::Row<usize>,
@@ -1012,12 +1573,66 @@ impl<'de> serde::Deserialize<'de> for Elem {
                 .ok_or_else(|| serde::de::Error::custom("unknown metaclass"))?,
             id: w.id,
             path: w.path,
+            path_parent: None,
             props: w.props,
             owned_relationships: w.owned_relationships,
             children: w.children,
             owning_relationship: w.owning_relationship,
         })
     }
+}
+
+/// The whole ownership path of element `i`: the segments of its path
+/// parents and its own, joined by `/`. Each parent precedes its children
+/// in the table, so the walk ends.
+fn whole_path(elements: &crate::layered::LayeredVec<Elem>, i: usize) -> String {
+    let mut segments = vec![elements[i].path.as_str()];
+    let mut at = i;
+    while let Some(parent) = elements[at].path_parent {
+        segments.push(elements[parent].path.as_str());
+        at = parent;
+    }
+    segments.reverse();
+    segments.join("/")
+}
+
+/// The version-5 identity of the name `hash` has read after the identity
+/// namespace — what [`Uuid::new_v5`] computes in one pass.
+fn path_id(hash: &sha1_smol::Sha1) -> Uuid {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hash.digest().bytes()[..16]);
+    uuid::Builder::from_sha1_bytes(bytes).into_uuid()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PATH_BYTES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes the current thread has hashed deriving element identities from
+/// ownership paths.
+#[cfg(test)]
+pub(crate) fn path_bytes_hashed() -> usize {
+    PATH_BYTES_HASHED.with(|c| c.get())
+}
+
+/// Hash `bytes` into an identity's path state.
+fn hash_path(hash: &mut sha1_smol::Sha1, bytes: &[u8]) {
+    #[cfg(test)]
+    PATH_BYTES_HASHED.with(|c| c.set(c.get() + bytes.len()));
+    hash.update(bytes);
+}
+
+/// The hash states that ownership paths leave, kept while a build lowers
+/// sources: a child's identity then hashes its own segment onto its
+/// parent's state instead of its whole path again.
+#[derive(Clone, Default)]
+struct PathHashes {
+    /// The first element with a slot.
+    base: usize,
+    /// The state after the identity namespace and the element's whole
+    /// path, by element index from `base`.
+    states: Vec<Option<sha1_smol::Sha1>>,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1041,6 +1656,10 @@ struct Scope {
     /// one with that owner excluded, sibling inferred names in its parent
     /// cannot establish the target they themselves are derived from.
     redefinition_names: HashSet<String>,
+    /// Every name-spelled redefinition target of this scope's owner. Keep
+    /// qualification so positional slot reduction can distinguish same-named
+    /// inherited features without consulting a partially built target index.
+    redefinition_spellings: Vec<QualifiedName>,
     /// Namespace imports (`P::*` / `P::*::**`) visible in this scope, with
     /// the recursive flag and the indices (into [`Builder::filter_exprs`])
     /// of the import's own bracket filters (`import P::*[@Safety]`).
@@ -1053,7 +1672,7 @@ struct Scope {
     /// ElementFilterMembership).
     filters: Vec<usize>,
     /// `alias a for X` members.
-    aliases: Vec<(String, QualifiedName, bool)>,
+    aliases: Vec<(String, QualifiedName, usize)>,
     /// Implied end-feature names of a binary connector-family usage: its two
     /// ends implicitly redefine `source`/`target` (SysML 8.4.2, the ends of
     /// `Connections::BinaryConnection`), so those names resolve — in the
@@ -1068,12 +1687,12 @@ struct Scope {
     /// members of these resolve as inherited members.
     bases: Vec<QualifiedName>,
     /// *Implied* heritage (resolution only, never emitted to JSON): the SysML
-    /// Tables 31/32 library bases of the owner's kind, the binary
-    /// connector/interface library base, and the implicit parameter
-    /// redefinition's own-name base. Split from [`Self::bases`] so
+    /// Tables 31/32 library bases of the owner's kind and the binary
+    /// connector/interface library base (the scopes of what a parameter,
+    /// end or result redefines by position join them when the bases are
+    /// read, [`Builder::base_scopes_split`]). Split from [`Self::bases`] so
     /// inherited-member enumeration can distinguish explicit heritage
-    /// from implied ([`Builder::base_scopes_split`]); lookup treats both
-    /// alike.
+    /// from implied; lookup treats both alike.
     implied_bases: Vec<QualifiedName>,
     /// Specialization/typing targets written as feature chains — the
     /// chain's last link contributes inherited members exactly like a
@@ -1084,6 +1703,7 @@ struct Scope {
 
 impl Builder {
     fn build(&mut self, unit: &SourceUnit) {
+        self.keep_path_hashes();
         let root_scope = self.push_scope(None);
         let root = self.new_element("Namespace", None, "$root".to_string());
         for (i, member) in unit.members.iter().enumerate() {
@@ -1091,27 +1711,37 @@ impl Builder {
         }
         self.resolve_pending();
         self.assign_user_ids(0, &[root]);
+        self.path_hashes = None;
     }
 
     /// Build all units of a model into one graph (library units first) and
     /// return the element index where non-library output starts.
     pub(crate) fn build_model(&mut self, model: &crate::model::Model) -> usize {
+        self.graph_format = model.graph_format();
         if let Some(library) = &model.prepared {
-            if !top_level_shadowing(model) && !library.builder.user_completes_library(model) {
+            if library.graph_format() == self.graph_format
+                && !top_level_shadowing(model)
+                && !library.builder.user_completes_library(model)
+            {
                 return self.build_on_library(model, &library.builder);
             }
+            // A prepared library's own recording stands in for the prepared
+            // graph this build cannot reuse.
+            model.arm_prepared_recording();
         }
         match self.build_model_inner(model, false) {
             Ok(boundary) => boundary,
             // Sealed-snapshot validation failed (a lowering change at the
             // same crate version — possible during development). Rebuild
-            // cold; the model's slot flips to Record so the next save
-            // overwrites the stale cache file.
+            // cold, recording: the model's slot flips to Record, so the
+            // rebuild makes the cache the next save overwrites the stale
+            // file with, and a library prepared from this model keeps it.
             Err(()) => {
                 *self = Builder::default();
+                self.graph_format = model.graph_format();
                 model.rerecord_library_cache();
-                self.build_model_inner(model, true)
-                    .expect("cold build cannot fail snapshot validation")
+                self.build_model_inner(model, false)
+                    .expect("a build without a snapshot cannot fail snapshot validation")
             }
         }
     }
@@ -1136,6 +1766,7 @@ impl Builder {
                 let id = match &member.kind {
                     MemberKind::Import(import) | MemberKind::Expose(import) => {
                         names.extend(self.imported_root_names(model, import)?);
+                        names.insert(ROOT_IMPORTS.to_owned());
                         None
                     }
                     // A root filter also constrains the library's own root
@@ -1147,7 +1778,14 @@ impl Builder {
                     // binding from its redefinition/reference target.
                     MemberKind::Usage(u) => {
                         if u.declaration.id.name.is_none() {
-                            names.extend(effective_ref_name(&u.declaration));
+                            names.extend(effective_ref_name(
+                                &u.declaration,
+                                matches!(
+                                    u.kind,
+                                    UsageKind::Perform | UsageKind::Exhibit | UsageKind::Include
+                                ),
+                                u.prefix.is_variant,
+                            ));
                         }
                         Some(&u.declaration.id)
                     }
@@ -1213,12 +1851,18 @@ impl Builder {
                 user_member_names(
                     member_body(member).unwrap_or(&[]),
                     import.is_recursive,
+                    import.is_import_all,
                     &mut names,
                 )?;
             } else {
                 member_names(member, &mut names)?;
                 if import.is_recursive {
-                    user_member_names(member_body(member).unwrap_or(&[]), true, &mut names)?;
+                    user_member_names(
+                        member_body(member).unwrap_or(&[]),
+                        true,
+                        import.is_import_all,
+                        &mut names,
+                    )?;
                 }
             }
             return Some(names);
@@ -1336,6 +1980,7 @@ impl Builder {
 
     fn build_on_library(&mut self, model: &crate::model::Model, library: &Builder) -> usize {
         *self = library.clone();
+        self.keep_path_hashes();
         self.semantic_ready = false;
         let boundary = self.elements.len();
         // Query outcomes are local to this model. In particular a root miss
@@ -1355,10 +2000,46 @@ impl Builder {
             for (i, member) in unit.unit.members.iter().enumerate() {
                 self.build_member(member, root, 0, i);
             }
+            self.restore_payload_flags(model, orig, root);
         }
+        // The outcomes the previous build settled on, where this build's
+        // units resolve the references they did then (see `settled`).
+        self.seed = model
+            .take_settled()
+            .and_then(|settled| self.seed_from(&self.pending, &settled));
+        self.keep_settled = model.keeps_settled();
         self.resolve_pending();
+        if let Some(settled) = self.settled.take() {
+            model.deposit_settled(settled);
+        }
         self.assign_user_ids(boundary, &roots);
+        self.path_hashes = None;
         boundary
+    }
+
+    fn restore_payload_flags(&mut self, model: &crate::model::Model, unit: usize, start: usize) {
+        let Some(records) = model.payload_source_flags(unit) else {
+            return;
+        };
+        self.payload_source_units.insert(unit);
+        if records.is_empty() {
+            return;
+        }
+        for i in start..self.elements.len() {
+            let Some(record) = records
+                .get(&whole_path(&self.elements, i))
+                .filter(|record| record.metaclass == self.elements[i].ty)
+            else {
+                continue;
+            };
+            for &key in crate::model::PAYLOAD_USAGE_FLAGS {
+                if let Some(value) = record.flags.get(key) {
+                    self.elements[i]
+                        .props
+                        .insert_payload_flag(key, value.to_json());
+                }
+            }
+        }
     }
 
     pub(crate) fn prepare_facts(&mut self) -> crate::check::facts::Facts {
@@ -1369,36 +2050,101 @@ impl Builder {
     }
 
     pub(crate) fn reset_lookup_caches(&mut self) {
+        self.parameter_signatures = None;
         let n = self.scopes.len();
         self.import_cache = vec![None; n];
+        self.recursive_subs.clear();
         self.base_cache = vec![None; n];
-        self.visit_stamp = vec![[0; 3]; n];
-        self.visit_result = vec![[None; 3]; n];
+        self.import_misses = vec![FillMisses::None; n];
+        self.base_misses = vec![FillMisses::None; n];
+        self.semantic_metadata_misses = FillMisses::None;
+        self.fill_frames.clear();
+        self.visit_stamp = vec![[0; 6]; n];
+        self.visit_result = vec![[None; 6]; n];
         self.query_stamp = 0;
         self.import_targets.clear();
+        self.recorded_lookup_graph = None;
         self.semantic_metadata = None;
-        self.id_index = None;
+        // `id_index` stays: the ids it tables change only where identities
+        // are assigned, which discards it itself.
         self.spec_index = None;
         self.mult_index = None;
+        self.positional_redefinitions = None;
+        self.supported_implied = None;
         self.inherited_cache.clear();
         self.inherited_by_heritage.clear();
         self.filters_active = vec![false; self.filter_exprs.len()];
         self.member_import_active.clear();
     }
 
+    pub(crate) fn suppress_semantic_publication(&mut self) {
+        self.publication.suppress();
+    }
+
     pub(crate) fn freeze_library(&mut self) {
+        assert!(
+            self.implied.is_none() && self.implied_from.is_none(),
+            "prepared libraries contain source rows only"
+        );
+        self.publication.suppress();
+        if self.recorded_lookup_candidate
+            && !self.recorded_lookup_incomplete
+            && self.lib_boundary == self.elements.len()
+            && !self.library_refs_to_users
+        {
+            let mut graph = self
+                .recorded_lookup_graph
+                .take()
+                .unwrap_or_else(|| recorded_lookup::Graph::build(self));
+            graph.freeze();
+            self.recorded_lookup_prefix = Some(Arc::new(graph));
+        } else {
+            self.recorded_lookup_prefix = None;
+        }
         for i in 0..self.elements.len() {
-            if !self.elements[i].path.is_empty() && self.elements[i].path != "first" {
-                let first = self.elements[i].path.ends_with("first");
-                self.elements[i].path = if first { "first".into() } else { String::new() };
+            let row = &self.elements[i];
+            // A whole path under a parent holds a `/`, so it is neither empty
+            // nor `first`; it ends as its own segment does.
+            if row.path_parent.is_some() || (!row.path.is_empty() && row.path != "first") {
+                let first = row.path.ends_with("first");
+                let row = &mut self.elements[i];
+                row.path = if first { "first".into() } else { String::new() };
+                row.path_parent = None;
             }
         }
+        self.recorded_lookup_graph = None;
+        // Builds on a prepared library never record resolution outcomes, and
+        // each one starts from a copy of this builder.
+        self.spec_misses.clear();
+        self.ref_misses.clear();
+        self.base_misses = Vec::new();
+        self.import_misses = Vec::new();
         self.elements.freeze();
+        // the frozen rows' structural scan, shared by every build on them
+        self.prefix_structure = structural_index::StoredStructure::prefix_of(self);
+        // the frozen rows by id, shared with the kept lookup graph
+        self.prefix_ids = Some(
+            self.recorded_lookup_prefix
+                .as_ref()
+                .and_then(|graph| graph.frozen_ids())
+                .unwrap_or_else(|| {
+                    Arc::new(
+                        self.elements
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| (e.id, i))
+                            .collect(),
+                    )
+                }),
+        );
+        self.prefix_table_names = Arc::new(std::sync::OnceLock::new());
         self.scopes.freeze();
         self.semantic_memo.freeze();
         self.id_index = None;
         self.spec_index = None;
         self.mult_index = None;
+        self.positional_redefinitions = None;
+        self.supported_implied = None;
         self.inherited_cache.clear();
         self.inherited_by_heritage.clear();
         self.elem_scope.freeze();
@@ -1409,12 +2155,15 @@ impl Builder {
         self.transition_guards.freeze();
         self.decl_spans.freeze();
         self.member_spans.freeze();
-        self.in_params.freeze();
         self.ctor_fields.freeze();
         self.return_params.freeze();
         self.usage_featuring.freeze();
         self.prefix_meta_next.freeze();
         self.metadata_of.freeze();
+        if let Some(intrinsic) = &mut self.metadata_intrinsic {
+            intrinsic.freeze();
+        }
+        self.explicit_metadata_annotations.freeze();
         self.conjugated_defs.freeze();
         self.lib_qnames.freeze();
         self.lib_mem_qnames.freeze();
@@ -1460,10 +2209,38 @@ impl Builder {
                     && e.owning_relationship
                         .is_none_or(|r| self.elements[r].children.contains(&i))
             })
+            && self
+                .metadata_of
+                .iter()
+                .all(|(&target, sources)| target < n && sources.iter().all(|&source| source < n))
+            && self.metadata_intrinsic.as_ref().is_none_or(|map| {
+                map.iter().all(|(&target, sources)| {
+                    target < n && sources.iter().all(|&source| source < n)
+                })
+            })
+            && self
+                .metadata_about
+                .iter()
+                .all(|(&target, sources)| target < n && sources.iter().all(|&source| source < n))
+            && (self.metadata_about.is_empty() || self.metadata_intrinsic.is_some())
+            && self
+                .explicit_metadata_annotations
+                .iter()
+                .all(|&annotation| {
+                    annotation < n
+                        && crate::metaclass::conforms(self.elements[annotation].ty, "Annotation")
+                })
             && self.semantic_memo.valid(n, ns)
             && self.scopes.iter().enumerate().all(|(s, scope)| {
                 scope.parent.is_none_or(|p| p < s)
                     && scope.owner.is_none_or(|e| e < n)
+                    && scope.filters.iter().all(|&f| f < self.filter_exprs.len())
+                    && scope.imports.iter().all(|i| {
+                        i.relationship < n && i.filters.iter().all(|&f| f < self.filter_exprs.len())
+                    })
+                    && scope.member_imports.iter().all(|i| {
+                        i.relationship < n && i.filters.iter().all(|&f| f < self.filter_exprs.len())
+                    })
                     && scope
                         .names
                         .values()
@@ -1487,6 +2264,8 @@ impl Builder {
                 .multiplicities
                 .iter()
                 .all(|(e, s, _)| *e < n && *s < ns)
+            && self.filter_exprs.iter().all(|(e, s, _)| *e < n && *s < ns)
+            && self.filters_active.len() == self.filter_exprs.len()
     }
 
     fn build_model_inner(
@@ -1494,6 +2273,7 @@ impl Builder {
         model: &crate::model::Model,
         no_cache: bool,
     ) -> Result<usize, ()> {
+        self.keep_path_hashes();
         let root_scope = self.push_scope(None);
         let mut ordered: Vec<_> = model
             .units()
@@ -1523,7 +2303,9 @@ impl Builder {
         };
         let mut snapshot: Option<Arc<crate::libcache::LibraryCache>> = None;
         match slot {
-            crate::model::LibCacheSlot::Use(cache) if !top_level_shadowing(model) => {
+            crate::model::LibCacheSlot::Use(cache)
+                if cache.graph_format == self.graph_format && !top_level_shadowing(model) =>
+            {
                 self.lib_ids_in = Some((Arc::clone(&cache), 0));
                 snapshot = Some(cache);
             }
@@ -1555,6 +2337,7 @@ impl Builder {
             for (m, member) in mu.unit.members.iter().enumerate() {
                 self.build_member(member, root, root_scope, m);
             }
+            self.restore_payload_flags(model, *orig, root);
         }
         if boundary_units == ordered.len() {
             boundary = self.elements.len();
@@ -1585,6 +2368,7 @@ impl Builder {
                 .zip(cache.outcome_misses.iter().cloned())
                 .collect();
             self.lib_hints = Some(hints.into_iter());
+            self.lib_hints_fixed_point = cache.fixed_point;
             // Recorded outcomes are replayed only where the user units cannot
             // have changed them; an unlocatable root contribution disables
             // replay for this build.
@@ -1620,6 +2404,8 @@ impl Builder {
         if let Some(recorded) = self.lib_record.take() {
             let (outcomes, outcome_misses) = recorded.into_iter().unzip();
             model.deposit_recorded(crate::libcache::LibraryCache {
+                graph_format: self.graph_format,
+                fixed_point: boundary_units == ordered.len() && !self.recorded_lookup_incomplete,
                 outcomes,
                 outcome_misses,
                 fingerprint: lib_fingerprint,
@@ -1628,6 +2414,7 @@ impl Builder {
                 lib_mem_qnames: self.lib_mem_qnames.iter().cloned().collect(),
             });
         }
+        self.path_hashes = None;
         Ok(boundary)
     }
 
@@ -1726,6 +2513,7 @@ impl Builder {
                 }
             }
         }
+        self.id_index = None;
     }
 
     /// Extend `lib_qnames` with redefinition-named library members
@@ -1885,7 +2673,7 @@ impl Builder {
     }
 
     /// The declared half of the naming rule: an element's own declared
-    /// (short) name, with no derivation. `Self::graph_effective_name`
+    /// (short) name, with no derivation. `Self::graph_identity_name`
     /// carries the derived half; see it for the rule and its other
     /// implementations.
     pub(crate) fn effective_name(&self, e: usize) -> Option<String> {
@@ -1913,30 +2701,29 @@ impl Builder {
         }
     }
 
-    /// The graph-effective name of an unnamed element (KerML 8.2.3.5):
-    /// the first `Redefinition`/`ReferenceSubsetting` target's name in
-    /// `ownedRelationship` order, read from the *graph* — a resolved
-    /// `{"@id"}` target names through `names`, a hermetic `{"@ref"}`
-    /// placeholder carries the name itself (last qualification segment).
-    ///
-    /// One naming rule, four representations — an element is named by
-    /// its declaration (`Self::effective_name`), else by its *naming
-    /// feature*: the first feature it redefines, else the one it
-    /// references, else the last link of its chain, each followed
-    /// transitively. The implementations are this one (over the lowered
-    /// element graph), `lift::Lifter::effective_name` (over payload
-    /// JSON), `full::effective_name_of` (over the full form's element
-    /// maps, which also derives the positional implied names), and the
-    /// fixpoint inside `ids::walk` (over a compact payload, for id
-    /// segments). They agree by construction and by the differential test
-    /// in the round-trip gate; a change to one belongs in all of them.
-    fn graph_effective_name(
-        &self,
-        e: usize,
-        by_id: &HashMap<Uuid, usize>,
-        names: &[Option<String>],
-    ) -> Option<String> {
+    /// Versioned identity label used only by ID scheme 2. Its historical
+    /// generic ReferenceSubsetting fallback is retained for decoder parity;
+    /// it does not confer a semantic name. Keep this algorithm synchronized
+    /// with `ids::walk`, independently of the public naming projection.
+    fn graph_identity_name(&self, e: usize, tables: &mut IdentityTables) -> Option<String> {
+        let named_reference = naming::reference_names_feature(
+            self.elements[e].ty,
+            self.elements[e]
+                .owning_relationship
+                .map(|r| self.elements[r].ty),
+        )
+        .then(|| {
+            self.elements[e]
+                .owned_relationships
+                .iter()
+                .copied()
+                .find(|&r| self.elements[r].ty == "ReferenceSubsetting")
+        })
+        .flatten();
         for &r in &self.elements[e].owned_relationships {
+            if named_reference.is_some() && Some(r) != named_reference {
+                continue;
+            }
             let rel = &self.elements[r];
             let key = match rel.ty {
                 "Redefinition" => "redefinedFeature",
@@ -1947,14 +2734,36 @@ impl Builder {
             if let Some(s) = target.get("@ref").and_then(|v| v.as_str()) {
                 return Some(s.rsplit("::").next().unwrap_or(s).to_string());
             }
-            let t = *by_id.get(&target.as_reference()?)?;
-            return names[t].clone();
+            let mut t = tables.index_of(&target.as_reference()?)?;
+            if key == "referencedFeature"
+                && naming::reference_names_feature_target(
+                    self.elements[e].ty,
+                    self.elements[e]
+                        .owning_relationship
+                        .map(|r| self.elements[r].ty),
+                )
+            {
+                if let Some(last) = self.elements[t]
+                    .owned_relationships
+                    .iter()
+                    .rev()
+                    .find(|&&r| self.elements[r].ty == "FeatureChaining")
+                {
+                    t = tables.index_of(
+                        &self.elements[*last]
+                            .props
+                            .get("chainingFeature")?
+                            .as_reference()?,
+                    )?;
+                }
+            }
+            return tables.name(self, t);
         }
         None
     }
 
     /// Reassign user-element ids to the graph-derived scheme (IDS.md;
-    /// id scheme 1): `id(child) = uuid5(id(parent),
+    /// id scheme 2): `id(child) = uuid5(id(parent),
     /// segment)`, chained from each unit root (whose id stays assigned
     /// — the root names the source unit, which the interchange graph
     /// does not carry). Segments: a single-member membership with a
@@ -1970,43 +2779,71 @@ impl Builder {
         if boundary >= n || roots.is_empty() {
             return;
         }
-        // Relationship → owned elements, creation (= array) order.
-        let mut owned_by_rel: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (i, e) in self.elements.iter().enumerate() {
-            if let Some(r) = e.owning_relationship {
-                owned_by_rel[r].push(i);
-            }
+        // The rows read by id and by name: a build on frozen rows reads
+        // the frozen rows' ids through the table their freeze kept and
+        // their names on demand, and tables only its own rows; any other
+        // build tables every row.
+        let frozen = self
+            .prefix_ids
+            .clone()
+            .filter(|ids| ids.len() == boundary && self.elements.base_untouched());
+        let start = if frozen.is_some() { boundary } else { 0 };
+        if frozen.is_some() {
+            note_prefix_ids_served();
         }
+        let mut tables = IdentityTables {
+            start,
+            by_id: crate::layered::IdMap::with_capacity_and_hasher(n - start, Default::default()),
+            names: Vec::with_capacity(n - start),
+            frozen,
+            table_names: None,
+        };
         // Pre-reassignment id → index, for resolved reference targets.
-        let mut by_id: HashMap<Uuid, usize> = HashMap::with_capacity(n);
-        for (i, e) in self.elements.iter().enumerate() {
-            by_id.insert(e.id, i);
+        for (i, e) in self.elements.iter().enumerate().skip(start) {
+            tables.by_id.insert(e.id, i);
         }
         // Names: declared everywhere; library elements additionally
         // through the effective-name tables; unnamed user elements by
         // the graph-effective fixpoint (`:>>` chains may pass through
         // other effectively named members).
-        let mut names: Vec<Option<String>> = (0..n).map(|i| self.effective_name(i)).collect();
-        for (id, segs) in self.lib_qnames.iter().chain(self.lib_mem_qnames.iter()) {
-            if let Some(&i) = by_id.get(id) {
-                if names[i].is_none() {
-                    names[i] = segs.last().cloned();
-                }
+        for i in start..n {
+            let id = self.elements[i].id;
+            let mut name = self.effective_name(i);
+            // The tables name the last row carrying an id of theirs, and
+            // theirs are the frozen rows' ids.
+            if name.is_none()
+                && tables.by_id.get(&id) == Some(&i)
+                && tables
+                    .frozen
+                    .as_ref()
+                    .is_none_or(|frozen| frozen.contains_key(&id))
+            {
+                name = tables.table_name(self, id);
             }
+            tables.names.push(name);
         }
         loop {
             let mut changed = false;
             for e in boundary..n {
-                if names[e].is_some() || self.elements[e].ty.ends_with("Membership") {
+                if tables.names[e - start].is_some() || self.elements[e].ty.ends_with("Membership")
+                {
                     continue;
                 }
-                if let Some(name) = self.graph_effective_name(e, &by_id, &names) {
-                    names[e] = Some(name);
+                if let Some(name) = self.graph_identity_name(e, &mut tables) {
+                    tables.names[e - start] = Some(name);
                     changed = true;
                 }
             }
             if !changed {
                 break;
+            }
+        }
+        // Relationship → owned elements, creation (= array) order, for the
+        // relationships the walk reaches: those owned from `boundary`.
+        let mut owned_by_rel: Vec<Vec<usize>> = vec![Vec::new(); n - boundary];
+        for (i, e) in self.elements.iter().enumerate().skip(boundary) {
+            if let Some(r) = e.owning_relationship.filter(|&r| r >= boundary) {
+                owned_by_rel[r - boundary].push(i);
             }
         }
         // Top-down walk: parents carry their final ids before children
@@ -2018,8 +2855,31 @@ impl Builder {
             let rels = self.elements[owner].owned_relationships.clone();
             let mut used: HashSet<String> = HashSet::new();
             for (i, rel) in rels.into_iter().enumerate() {
-                let kids = owned_by_rel[rel].clone();
+                let kids = if rel >= boundary {
+                    owned_by_rel[rel - boundary].clone()
+                } else {
+                    // A frozen relationship claimed by a row of this build,
+                    // which no production writer makes: its owned rows, as
+                    // a table over every row lists them.
+                    (0..n)
+                        .filter(|&i| self.elements[i].owning_relationship == Some(rel))
+                        .collect()
+                };
                 let membership = self.elements[rel].ty.ends_with("Membership");
+                // The constructor result is a structural role, independent of
+                // effective names and argument ordinals. In particular it must
+                // not capture a legacy first argument's positional identity.
+                if self.elements[owner].ty == "ConstructorExpression"
+                    && self.elements[rel].ty == "ReturnParameterMembership"
+                    && kids.len() == 1
+                    && self.elements[kids[0]].ty == "Feature"
+                {
+                    let rel_id = Uuid::new_v5(&owner_id, b"result");
+                    self.reassign_id(rel, rel_id, &mut remap);
+                    self.reassign_id(kids[0], Uuid::new_v5(&rel_id, b"e0"), &mut remap);
+                    stack.extend([rel, kids[0]]);
+                    continue;
+                }
                 // A single-member membership whose member has an
                 // id-name chains **past the membership**:
                 // the member takes the owner-scope named segment, and
@@ -2029,8 +2889,8 @@ impl Builder {
                 // (duplicate member names, aliases) drop the pair
                 // back to the positional chain.
                 if membership && kids.len() == 1 {
-                    if let Some(name) = &names[kids[0]] {
-                        let named = format!("::{}", escape_name(name));
+                    if let Some(name) = tables.name(self, kids[0]) {
+                        let named = format!("::{}", escape_name(&name));
                         if used.insert(named.clone()) {
                             let kid = kids[0];
                             let kid_id = Uuid::new_v5(&owner_id, named.as_bytes());
@@ -2065,8 +2925,8 @@ impl Builder {
                 for (j, kid) in kids.into_iter().enumerate() {
                     let mut kseg = format!("e{j}");
                     if membership {
-                        if let Some(name) = &names[kid] {
-                            let named = format!("::{}", escape_name(name));
+                        if let Some(name) = tables.name(self, kid) {
+                            let named = format!("::{}", escape_name(&name));
                             if kid_used.insert(named.clone()) {
                                 kseg = named;
                             }
@@ -2080,14 +2940,54 @@ impl Builder {
         if remap.is_empty() {
             return;
         }
-        // Re-point every captured reference (library elements never
-        // reference user elements, so the sweep stays in user range).
-        for i in boundary..self.elements.len() {
+        self.id_index = None;
+        self.supported_implied = None;
+        // A library reference can resolve a root supplied by user units.
+        // Remap those captured endpoints as well as user-owned references.
+        fn needs_remap(atom: &crate::properties::Atom, remap: &HashMap<Uuid, Uuid>) -> bool {
+            use crate::properties::Atom;
+            match atom {
+                Atom::Reference(_) => atom
+                    .as_reference()
+                    .is_some_and(|id| remap.contains_key(&id)),
+                Atom::Array(values) => values.iter().any(|v| needs_remap(v, remap)),
+                Atom::Object(values) => values.values().any(|v| needs_remap(v, remap)),
+                _ => false,
+            }
+        }
+        let reference_start = if self.library_refs_to_users {
+            0
+        } else {
+            boundary
+        };
+        for i in reference_start..self.elements.len() {
+            if i < boundary
+                && !self.elements[i]
+                    .props
+                    .entries
+                    .iter()
+                    .any(|(_, v)| needs_remap(v, &remap))
+            {
+                continue;
+            }
             let e = &mut self.elements[i];
             for v in e.props.values_mut() {
                 v.remap(&remap);
             }
         }
+        if let Some(record) = self.lib_record.as_mut() {
+            for (target, _) in record {
+                if let Some(id) = target.as_mut() {
+                    if let Some(&new) = remap.get(id) {
+                        *id = new;
+                    }
+                }
+            }
+        }
+        // Final user identity assignment can expose UUID collisions that were
+        // absent in the provisional lowering graph. Revalidate associations
+        // before publishing immutable metadata navigation.
+        self.refresh_metadata_associations();
     }
 
     fn finish(self, boundary: usize) -> Value {
@@ -2095,7 +2995,7 @@ impl Builder {
         self.finish_range(boundary, end)
     }
 
-    fn finish_range(self, start: usize, end: usize) -> Value {
+    fn finish_range(&self, start: usize, end: usize) -> Value {
         // Materialize relationship arrays as {"@id"} references.
         let ids: Vec<Uuid> = self.elements.iter().map(|e| e.id).collect();
         let mut out = Vec::with_capacity(end - start);
@@ -2111,21 +3011,21 @@ impl Builder {
                 Value::Array(
                     elem.owned_relationships
                         .iter()
-                        .map(|&i| id_ref(ids[i]))
+                        .map(|&i| id_value(ids[i]))
                         .collect(),
                 ),
             );
             obj.insert(
                 "owningRelationship".into(),
                 elem.owning_relationship
-                    .map(|i| id_ref(ids[i]))
+                    .map(|i| id_value(ids[i]))
                     .unwrap_or(Value::Null),
             );
             obj.extend(elem.props.to_json());
             if !elem.children.is_empty() {
                 obj.insert(
                     "ownedRelatedElement".into(),
-                    Value::Array(elem.children.iter().map(|&i| id_ref(ids[i])).collect()),
+                    Value::Array(elem.children.iter().map(|&i| id_value(ids[i])).collect()),
                 );
             }
             out.push(Value::Object(obj));
@@ -2142,8 +3042,10 @@ impl Builder {
         });
         self.import_cache.push(None);
         self.base_cache.push(None);
-        self.visit_stamp.push([0; 3]);
-        self.visit_result.push([None; 3]);
+        self.import_misses.push(FillMisses::None);
+        self.base_misses.push(FillMisses::None);
+        self.visit_stamp.push([0; 6]);
+        self.visit_result.push([None; 6]);
         self.scopes.len() - 1
     }
 
@@ -2200,13 +3102,20 @@ impl Builder {
     }
 
     fn new_element(&mut self, ty: &'static str, owner_rel: Option<usize>, path: String) -> usize {
-        let id = self
-            .next_lib_id()
-            .unwrap_or_else(|| Uuid::new_v5(&ID_NAMESPACE, path.as_bytes()));
+        let id = match self.next_lib_id() {
+            Some(id) => id,
+            None => {
+                let mut hash = sha1_smol::Sha1::new();
+                hash_path(&mut hash, ID_NAMESPACE.as_bytes());
+                hash_path(&mut hash, path.as_bytes());
+                self.keep_path_hash(hash)
+            }
+        };
         self.elements.push(Elem {
             ty,
             id,
             path,
+            path_parent: None,
             props: crate::properties::Properties::new(),
             owned_relationships: Default::default(),
             children: Default::default(),
@@ -2232,20 +3141,66 @@ impl Builder {
         self.implied_from.unwrap_or(self.elements.len())
     }
 
+    /// Keep the ownership-path hash state of each element created from
+    /// here on, until the build ends.
+    fn keep_path_hashes(&mut self) {
+        self.path_hashes = Some(PathHashes {
+            base: self.elements.len(),
+            states: Vec::new(),
+        });
+    }
+
+    /// The identity of the element about to be created, whose whole path
+    /// `hash` has read after the identity namespace. Its state is kept for
+    /// the element's children while a build lowers.
+    fn keep_path_hash(&mut self, hash: sha1_smol::Sha1) -> Uuid {
+        let id = path_id(&hash);
+        let i = self.elements.len();
+        if let Some(kept) = &mut self.path_hashes {
+            if let Some(slot) = i.checked_sub(kept.base) {
+                if kept.states.len() <= slot {
+                    kept.states.resize(slot + 1, None);
+                }
+                kept.states[slot] = Some(hash);
+            }
+        }
+        id
+    }
+
+    /// The identity of the element about to be created with `segment`
+    /// appended to `parent`'s ownership path: the version-5 identity of the
+    /// whole path, hashing only `/` and the segment onto the parent's kept
+    /// state. Without a kept state the parent's whole path is hashed first.
+    fn child_path_id(&mut self, parent: usize, segment: &str) -> Uuid {
+        let kept = self
+            .path_hashes
+            .as_ref()
+            .and_then(|kept| kept.states.get(parent.checked_sub(kept.base)?)?.clone());
+        let mut hash = kept.unwrap_or_else(|| {
+            let mut hash = sha1_smol::Sha1::new();
+            hash_path(&mut hash, ID_NAMESPACE.as_bytes());
+            hash_path(&mut hash, whole_path(&self.elements, parent).as_bytes());
+            hash
+        });
+        hash_path(&mut hash, b"/");
+        hash_path(&mut hash, segment.as_bytes());
+        self.keep_path_hash(hash)
+    }
+
     fn new_relationship(&mut self, ty: &'static str, owner: usize, path_seg: &str) -> usize {
-        let (path, id) = match self.next_lib_id() {
+        let (path, path_parent, id) = match self.next_lib_id() {
             // Sealed snapshot: paths only feed id derivation, so skip both.
-            Some(id) => (String::new(), id),
+            Some(id) => (String::new(), None, id),
             None => {
-                let path = format!("{}/{}", self.elements[owner].path, path_seg);
-                let id = Uuid::new_v5(&ID_NAMESPACE, path.as_bytes());
-                (path, id)
+                let id = self.child_path_id(owner, path_seg);
+                (path_seg.to_owned(), Some(owner), id)
             }
         };
         self.elements.push(Elem {
             ty,
             id,
             path,
+            path_parent,
             props: crate::properties::Properties::new(),
             owned_relationships: Default::default(),
             children: Default::default(),
@@ -2263,19 +3218,19 @@ impl Builder {
 
     /// Create an element owned via `rel` (`ownedRelatedElement`).
     fn new_owned_element(&mut self, ty: &'static str, rel: usize, name_seg: &str) -> usize {
-        let (path, id) = match self.next_lib_id() {
+        let (path, path_parent, id) = match self.next_lib_id() {
             // Sealed snapshot: paths only feed id derivation, so skip both.
-            Some(id) => (String::new(), id),
+            Some(id) => (String::new(), None, id),
             None => {
-                let path = format!("{}/{}", self.elements[rel].path, name_seg);
-                let id = Uuid::new_v5(&ID_NAMESPACE, path.as_bytes());
-                (path, id)
+                let id = self.child_path_id(rel, name_seg);
+                (name_seg.to_owned(), Some(rel), id)
             }
         };
         self.elements.push(Elem {
             ty,
             id,
             path,
+            path_parent,
             props: crate::properties::Properties::new(),
             owned_relationships: Default::default(),
             children: Default::default(),
@@ -2286,7 +3241,7 @@ impl Builder {
         idx
     }
 
-    fn set(&mut self, elem: usize, key: &str, value: Value) {
+    fn set(&mut self, elem: usize, key: &str, value: impl Into<crate::properties::Atom>) {
         self.elements[elem].props.insert(key, value);
     }
 
@@ -2497,14 +3452,15 @@ impl Builder {
         self.set(e, "isVariation", json!(false));
         let ft = self.new_relationship("FeatureTyping", e, "typing");
         self.set(ft, "isImplied", json!(false));
+        // Record before creating the pending reference so its outcome is
+        // indexed just like an explicitly written metadata typing.
+        self.spec_targets
+            .push((e, "FeatureTyping", scope, m.clone()));
+        self.pending_spec_idx = Some(self.spec_targets.len() - 1);
         self.set_ref(ft, "type", scope, &TargetRef::Name(m.clone()));
         let e_id = self.elements[e].id;
         self.set(ft, "typedFeature", id_ref(e_id));
-        // Recorded like declared typings so the semantic checks (and
-        // explicit-supertype walks) see prefix metadata too.
-        self.spec_targets
-            .push((e, "FeatureTyping", scope, m.clone()));
-        self.metadata_of.entry(owner).or_default().push(e);
+        self.record_intrinsic_metadata(owner, e);
     }
 
     fn build_member(&mut self, member: &Member, owner: usize, scope: usize, index: usize) {
@@ -2614,7 +3570,7 @@ impl Builder {
                     scope,
                     visibility: member.visibility,
                 });
-                let fids = self.record_filters(&imp.filters, scope);
+                let fids = self.record_filters(&imp.filters, rel, scope);
                 let is_public =
                     member.visibility.is_none() || member.visibility == Some(Visibility::Public);
                 if imp.is_namespace {
@@ -2674,13 +3630,20 @@ impl Builder {
                     scope,
                     &TargetRef::Name(a.target.clone()),
                 );
-                if let Some(name) = &a.id.name {
-                    self.scopes[scope].aliases.push((
-                        name.value.clone(),
-                        a.target.clone(),
-                        member.visibility.is_none()
-                            || member.visibility == Some(Visibility::Public),
-                    ));
+                for name in a.id.name.iter().chain(a.id.short_name.iter()) {
+                    if self.scopes[scope]
+                        .aliases
+                        .last()
+                        .is_some_and(|entry| entry.2 == rel && entry.0 == name.value)
+                    {
+                        continue;
+                    }
+                    let index = self.scopes[scope].aliases.len();
+                    self.alias_origins
+                        .insert((scope, index), self.unit_of_elem(rel));
+                    self.scopes[scope]
+                        .aliases
+                        .push((name.value.clone(), a.target.clone(), rel));
                 }
             }
             MemberKind::Comment(c) => {
@@ -2743,7 +3706,7 @@ impl Builder {
                 self.build_expr(expr, rel, scope, "condition");
                 // A namespace's filter conditions apply to every membership
                 // it imports (resolution-side of ElementFilterMembership).
-                let fids = self.record_filters(std::slice::from_ref(expr), scope);
+                let fids = self.record_filters(std::slice::from_ref(expr), rel, scope);
                 self.scopes[scope].filters.extend(fids);
             }
             MemberKind::Definition(d) => self.build_definition(d, member, owner, scope, index),
@@ -2909,7 +3872,7 @@ impl Builder {
                 );
                 // An expose is an import for name resolution: exposed
                 // members are referencable within the view body.
-                let fids = self.record_filters(&imp.filters, scope);
+                let fids = self.record_filters(&imp.filters, rel, scope);
                 if imp.is_namespace {
                     self.scopes[scope].imports.push(NamespaceImport {
                         target: imp.target.clone(),
@@ -3009,6 +3972,7 @@ impl Builder {
                     self.set_ref(s, "subsettedFeature", scope, subsets);
                 }
                 if let Some(range) = &m.range {
+                    self.multiplicities.push((e, scope, range.clone()));
                     // A multiplicity declaration owns its bound expressions
                     // directly (it *is* the MultiplicityRange).
                     if let Some(lower) = &range.lower {
@@ -3120,6 +4084,11 @@ impl Builder {
                 self.build_member(m, e, body_scope, i);
             }
             self.in_enum_body = false;
+        }
+        // SysML binary definition rules count owned ends. Their library
+        // heritage must be available before resolving end redefinitions.
+        if let Some((base, true)) = self.binary_owned_base(e) {
+            self.scopes[body_scope].implied_bases.push(lib_qn(base));
         }
         // Every port definition owns its implicit conjugated definition
         // (pilot ConjugatedPortDefinitionMember, after the body): an
@@ -3287,17 +4256,6 @@ impl Builder {
             .as_ref()
             .map(|n| n.value.clone())
             .unwrap_or_else(|| format!("#{index}"));
-        if matches!(
-            u.prefix.direction,
-            Some(FeatureDirection::In | FeatureDirection::InOut)
-        ) {
-            if let Some(n) = &u.declaration.id.name {
-                self.in_params
-                    .entry(owner)
-                    .or_default()
-                    .push(n.value.clone());
-            }
-        }
         let e = self.build_usage_element(u, rel, scope, &seg, class_override);
         if let Some(n) = &u.declaration.id.name {
             self.ctor_fields
@@ -3310,7 +4268,7 @@ impl Builder {
         if u.kind == UsageKind::Metadata
             && matches!(&u.detail, UsageDetail::Metadata { about } if about.is_empty())
         {
-            self.metadata_of.entry(owner).or_default().push(e);
+            self.record_intrinsic_metadata(owner, e);
         }
         (rel, e)
     }
@@ -3339,6 +4297,7 @@ impl Builder {
         let owner_ty = self.pending_owner_ty.take();
         self.set_identification(e, &u.declaration.id);
         self.emit_prefix_metadata(e, &u.prefix.metadata, scope);
+        let body_scope = self.push_scope(Some(scope));
         if let Some(cross) = &u.prefix.end_cross {
             let om = self.new_relationship("OwningMembership", e, "crossFeature");
             self.set(om, "isImplied", json!(false));
@@ -3378,9 +4337,11 @@ impl Builder {
                 self.set(cf, "isVariable", json!(true));
             }
             self.set_identification(cf, &cross.decl.id);
-            self.emit_specializations(cf, &cross.decl, scope);
+            // The cross feature is an owned member of the end feature, so
+            // its references see that end's members and inherited types.
+            self.emit_specializations(cf, &cross.decl, body_scope);
             if let Some(mult) = &cross.decl.multiplicity {
-                self.emit_multiplicity(cf, mult, scope);
+                self.emit_multiplicity(cf, mult, body_scope);
             }
         }
         // A variation is implicitly abstract (pilot `UsageAdapter.postProcess`).
@@ -3458,7 +4419,6 @@ impl Builder {
             );
         }
 
-        let body_scope = self.push_scope(Some(scope));
         self.register(scope, &u.declaration.id.clone(), e, body_scope);
         // Unnamed features take an effective name from the first feature
         // they redefine (KerML 8.2.3.5) or reference (SysML variant/perform/
@@ -3466,7 +4426,11 @@ impl Builder {
         // `:>> mass = 5;` are findable by those names. Resolution-only —
         // declaredName stays null.
         if u.declaration.id.name.is_none() && u.declaration.id.short_name.is_none() {
-            if let Some(name) = effective_ref_name(&u.declaration) {
+            if let Some(name) = effective_ref_name(
+                &u.declaration,
+                naming::reference_names_feature_target(ty, Some(self.elements[rel].ty)),
+                self.elements[rel].ty == "VariantMembership",
+            ) {
                 self.effective_hint.insert(e, name.clone());
                 self.scopes[scope].effective_names.push(
                     name,
@@ -3502,13 +4466,15 @@ impl Builder {
             for t in targets {
                 match t {
                     TargetRef::Name(qn) => {
-                        if matches!(spec, FeatureSpecialization::Redefines(_))
-                            && !qn.is_global
-                            && qn.segments.len() == 1
-                        {
+                        if matches!(spec, FeatureSpecialization::Redefines(_)) {
                             self.scopes[body_scope]
-                                .redefinition_names
-                                .insert(qn.segments[0].value.clone());
+                                .redefinition_spellings
+                                .push(qn.clone());
+                            if !qn.is_global && qn.segments.len() == 1 {
+                                self.scopes[body_scope]
+                                    .redefinition_names
+                                    .insert(qn.segments[0].value.clone());
+                            }
                         }
                         self.scopes[body_scope].bases.push(qn.clone());
                     }
@@ -3537,21 +4503,19 @@ impl Builder {
                 self.scopes[body_scope].implied_bases.push(lib_qn(base));
             }
         }
-        // Implicit parameter redefinition (SysML 8.3): a named directed
-        // parameter redefines the same-named parameter of its owner's type.
-        // Its own name as a base resolves — with the owner excluded — to
-        // that inherited parameter, making its members visible
-        // (`focus.image.isWellFocused` with `out item image;`).
-        if u.prefix.direction.is_some() {
-            if let Some(name) = &u.declaration.id.name {
-                self.scopes[body_scope].implied_bases.push(QualifiedName {
-                    is_global: false,
-                    segments: vec![name.clone()],
-                    span: name.span,
-                });
-            }
+        // Every Step specializes the Kernel Semantic Library performance
+        // feature, including untyped KerML steps.
+        if crate::metaclass::conforms(ty, "Step") {
+            self.scopes[body_scope]
+                .implied_bases
+                .push(lib_qn("Performances::performances"));
         }
-
+        // Every Feature specializes Base::things, including ordinary KerML
+        // features whose syntax kind has no SysML-specific implied base.
+        // Its nested `that` feature must therefore participate in lookup.
+        self.scopes[body_scope]
+            .implied_bases
+            .push(lib_qn("Base::things"));
         self.emit_specializations(e, &u.declaration, scope);
 
         if let Some(mult) = &u.declaration.multiplicity {
@@ -3798,55 +4762,76 @@ impl Builder {
         }
         let end_elems = self.build_usage_detail(e, &detail, scope);
 
-        // A *binary* connector-family usage (exactly two ends): its body
-        // additionally bases on the library's binary variant (SysML 8.4.2
-        // Table 32 — BinaryConnection/BinaryInterface declare the end
-        // features `source`/`target`; the n-ary bases don't), and its own
-        // two ends implicitly redefine those ends, so `source`/`target` in
-        // the body resolve to the end features themselves. Each end gets a
-        // scope basing on its connected feature, so chain members
-        // (`flow … from source.x to target.y`) resolve through the ends.
-        // The base resolves from the end scope's parent — the owning scope,
-        // where the end target itself resolves.
+        // Connector-part end declarations own the same lookup bindings as
+        // ordinary end members. Their scopes inherit the connected feature,
+        // with target names resolved outside the connector's body to avoid
+        // capturing the end currently being declared.
         if matches!(
             u.kind,
             UsageKind::Connection
                 | UsageKind::Interface
                 | UsageKind::Allocation
                 | UsageKind::Connector
-        ) && end_elems.len() == 2
-        {
-            if self.dialect == Dialect::Sysml {
-                let binary = match u.kind {
-                    UsageKind::Connection => Some("Connections::binaryConnections"),
-                    UsageKind::Interface => Some("Interfaces::binaryInterfaces"),
-                    _ => None,
-                };
-                if let Some(base) = binary {
-                    self.scopes[body_scope].implied_bases.push(lib_qn(base));
+        ) {
+            if let UsageDetail::Connector { ends } = &detail {
+                let binary = end_elems.len() == 2;
+                if binary && self.dialect == Dialect::Sysml {
+                    let base = match u.kind {
+                        UsageKind::Connection => Some("Connections::binaryConnections"),
+                        UsageKind::Interface => Some("Interfaces::binaryInterfaces"),
+                        _ => None,
+                    };
+                    if let Some(base) = base {
+                        self.scopes[body_scope].implied_bases.push(lib_qn(base));
+                    }
                 }
-            }
-            let UsageDetail::Connector { ends } = &detail else {
-                unreachable!()
-            };
-            for ((name, &end_elem), end) in [("source", &end_elems[0]), ("target", &end_elems[1])]
-                .into_iter()
-                .zip(ends)
-            {
-                let end_scope = self.push_scope(Some(scope));
-                self.scopes[end_scope].owner = Some(end_elem);
-                if let Some(qn) = flat_target_qn(&end.target) {
-                    self.scopes[end_scope].bases.push(qn);
+                for (i, (&end_elem, end)) in end_elems.iter().zip(ends).enumerate() {
+                    let end_scope = self.push_scope(Some(scope));
+                    if let Some(qn) = flat_target_qn(&end.target) {
+                        self.scopes[end_scope].bases.push(qn);
+                    }
+                    self.register(
+                        body_scope,
+                        &Identification {
+                            name: end.name.clone(),
+                            short_name: None,
+                        },
+                        end_elem,
+                        end_scope,
+                    );
+                    // The binary positional aliases remain a fallback after
+                    // declared names, including a declared source or target.
+                    if binary {
+                        self.scopes[body_scope].implied_ends.push((
+                            ["source", "target"][i],
+                            end_elem,
+                            end_scope,
+                        ));
+                    }
                 }
-                self.elem_scope.insert(end_elem, end_scope);
-                self.scopes[body_scope]
-                    .implied_ends
-                    .push((name, end_elem, end_scope));
             }
         }
 
         for (i, m) in body_members.into_iter().enumerate() {
             self.build_member(m, e, body_scope, i);
+        }
+        // Flow's narrower library base applies only when it owns ends.
+        // Keep lookup heritage aligned with the materialized requirements.
+        if crate::metaclass::conforms(self.elements[e].ty, "Flow")
+            && self.owned_member_elems(e, true).into_iter().any(|feature| {
+                self.elements[feature]
+                    .props
+                    .get("isEnd")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            })
+        {
+            let base = if crate::metaclass::conforms(self.elements[e].ty, "FlowUsage") {
+                "Flows::flows"
+            } else {
+                "Transfers::flowTransfers"
+            };
+            self.scopes[body_scope].implied_bases.push(lib_qn(base));
         }
         e
     }
@@ -3930,7 +4915,11 @@ impl Builder {
             self.set(ru, "declaredName", json!(name.value));
         }
         if let Some(mult) = &end.multiplicity {
-            self.emit_multiplicity(ru, mult, scope);
+            // The bound expression is owned inside the connector and can
+            // reference members declared in its body. End target lookup
+            // keeps the outer scope so it cannot capture the end itself.
+            let bound_scope = self.elem_scope.get(&parent).copied().unwrap_or(scope);
+            self.emit_multiplicity(ru, mult, bound_scope);
         }
         // Empty targets occur for implicit source ends of successions.
         let is_empty = end.target.is_unspelled();
@@ -4147,6 +5136,7 @@ impl Builder {
             UsageDetail::Metadata { about } => {
                 for (i, target) in about.iter().enumerate() {
                     let ann = self.new_relationship("Annotation", e, &format!("about{i}"));
+                    self.explicit_metadata_annotations.push(ann);
                     self.set(ann, "isImplied", json!(false));
                     self.set_ref(
                         ann,
@@ -4453,14 +5443,24 @@ impl Builder {
             } => {
                 let e = self.operator_expr(rel, seg, "if");
                 self.operand(e, cond, scope, 0);
-                self.operand(e, then_branch, scope, 1);
-                self.operand(e, else_branch, scope, 2);
+                self.conditional_operand(e, then_branch, scope, 1);
+                self.conditional_operand(e, else_branch, scope, 2);
                 e
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let e = self.operator_expr(rel, seg, binary_op_str(*op));
                 self.operand(e, lhs, scope, 0);
-                self.operand(e, rhs, scope, 1);
+                if matches!(
+                    op,
+                    BinaryOp::NullCoalescing
+                        | BinaryOp::Implies
+                        | BinaryOp::CondOr
+                        | BinaryOp::CondAnd
+                ) {
+                    self.conditional_operand(e, rhs, scope, 1);
+                } else {
+                    self.operand(e, rhs, scope, 1);
+                }
                 e
             }
             ExprKind::Unary { op, operand } => {
@@ -4767,8 +5767,18 @@ impl Builder {
                 let m = self.new_relationship("Membership", e, "type");
                 self.set(m, "isImplied", json!(false));
                 self.set_ref(m, "memberElement", scope, ty);
+                let argument_owner = if self.graph_format == crate::model::GraphFormat::CanonicalV3
+                {
+                    let member = self.new_relationship("ReturnParameterMembership", e, "result");
+                    self.set(member, "isImplied", json!(false));
+                    let result = self.new_owned_element("Feature", member, "result");
+                    self.set(result, "direction", json!("out"));
+                    result
+                } else {
+                    e
+                };
                 for (i, a) in args.iter().enumerate() {
-                    self.argument(e, a, scope, i, ty);
+                    self.argument(argument_owner, a, scope, i, ty);
                 }
                 e
             }
@@ -4782,7 +5792,6 @@ impl Builder {
                 }
                 e
             }
-            ExprKind::BodyTerminator => self.new_owned_element("Expression", rel, seg),
             ExprKind::Sequence(items) => {
                 // Comma sequences are right-nested OperatorExpressions
                 // (operator ",").
@@ -4831,6 +5840,24 @@ impl Builder {
         self.param_wrapped_expr(m, operand, scope, true);
     }
 
+    fn conditional_operand(&mut self, parent: usize, expr: &Expr, scope: usize, i: usize) {
+        if self.graph_format == crate::model::GraphFormat::LegacyV2 {
+            self.operand(parent, expr, scope, i);
+            return;
+        }
+        let m = self.new_relationship("ParameterMembership", parent, &format!("operand{i}"));
+        self.set(m, "isImplied", json!(false));
+        self.set(m, "visibility", json!("private"));
+        let f = self.new_owned_element("Feature", m, "param");
+        self.set(f, "direction", json!("in"));
+        let fv = self.new_relationship("FeatureValue", f, "value");
+        self.set(fv, "isImplied", json!(false));
+        let reference = self.new_owned_element("FeatureReferenceExpression", fv, "expr");
+        let member = self.new_relationship("FeatureMembership", reference, "expression");
+        self.set(member, "isImplied", json!(false));
+        self.build_expr(expr, member, scope, "expr");
+    }
+
     /// A positional argument expression (same shape/segments as
     /// [`Self::argument`] without a name).
     fn arg_expr(&mut self, parent: usize, expr: &Expr, scope: usize, i: usize) {
@@ -4858,6 +5885,13 @@ impl Builder {
                 TargetRef::Chain(links) if !links.is_empty() => Some(links.clone()),
                 TargetRef::Chain(_) => None,
             };
+            // The stored relationship already identifies this specialization.
+            // Record its callee-context pending outcome in the same identity
+            // index as declaration-written redefinitions; never rediscover its
+            // bare parameter name in the lexical scope later.
+            let spec_idx = self.spec_targets.len();
+            self.spec_targets
+                .push((f, "Redefinition", scope, name.clone()));
             self.pending.push(PendingRef {
                 elem: rd,
                 key: "redefinedFeature".to_string(),
@@ -4865,7 +5899,7 @@ impl Builder {
                 qn: name.clone(),
                 exclude: None,
                 declared_only: false,
-                spec_idx: None,
+                spec_idx: Some(spec_idx),
                 chain,
             });
             let fv = self.new_relationship("FeatureValue", f, "value");
@@ -4879,10 +5913,235 @@ impl Builder {
     // ---- name resolution ----
 
     fn resolve_pending(&mut self) {
+        self.recorded_lookup_ready = false;
+        self.recorded_lookup_graph = None;
+        self.recorded_lookup_candidate = recorded_lookup::Graph::needed(self);
+        if !self.recorded_lookup_candidate && self.explicit_metadata_annotations.is_empty() {
+            self.seed = None;
+            self.resolve_pending_pass();
+            return;
+        }
+        let pending = self.pending.clone();
+        let side = SideState::capture(self);
+        // The bootstrap pass consumes the recorded library outcomes; keep a
+        // recorded fixed point for replaying the library again below.
+        let library_replay: Option<LibraryReplay> = self
+            .lib_hints
+            .as_ref()
+            .zip(self.replay_completions.as_ref())
+            .filter(|_| self.lib_hints_fixed_point)
+            .map(|(hints, completions)| (hints.as_slice().to_vec(), completions.clone()));
+        // Kept outcomes stand in for the bootstrap pass: the loop starts
+        // against the graph of theirs, confirms them in one pass when the
+        // units resolve as they did, and starts over cold when it does not
+        // settle (see `settled`). A build replaying a library recording
+        // resolves cold: the replay belongs to the bootstrap pass.
+        if let Some(seed) = self.seed.take().filter(|_| self.lib_hints.is_none()) {
+            let cold = recorded_lookup::Checkpoint::capture(self, &pending);
+            self.apply_seed(&pending, &seed);
+            self.refresh_metadata_associations();
+            self.recorded_lookup_ready = self.recorded_lookup_candidate;
+            let graph = recorded_lookup::Graph::build(self);
+            self.note_root_imports_absent(&graph);
+            let seeded = recorded_lookup::Checkpoint::capture(self, &pending);
+            let previous = self.pass_outcomes(&pending);
+            let passes = settled::seeded_passes();
+            if self.resolve_pending_redo(
+                &pending, &side, &seeded, graph, previous, None, false, passes,
+            ) {
+                return;
+            }
+            settled::note_seed_abandoned();
+            cold.restore(self);
+            self.pending = pending.clone();
+            self.recorded_lookup_ready = false;
+            self.recorded_lookup_graph = None;
+        }
+        self.resolve_pending_pass();
+        let library_replayed = self.lib_replayed_all;
+        let metadata_changed = self.refresh_metadata_associations();
+        if self.recorded_lookup_incomplete {
+            if !self.explicit_metadata_annotations.is_empty() {
+                self.discard_unstable_metadata_associations();
+            }
+            return;
+        }
+        self.recorded_lookup_ready = self.recorded_lookup_candidate;
+        let mut graph = recorded_lookup::Graph::build(self);
+        self.note_root_imports_absent(&graph);
+        if pending.is_empty() || (!graph.has_replay_context() && !metadata_changed) {
+            self.recorded_lookup_graph = Some(graph);
+            return;
+        }
+        // Each pass reads one complete snapshot. Never feed partially updated
+        // endpoints back into inherited selection in the same pass.
+        let bootstrap = recorded_lookup::Checkpoint::capture(self, &pending);
+        let previous = self.pass_outcomes(&pending);
+        if self.resolve_pending_redo(
+            &pending,
+            &side,
+            &bootstrap,
+            graph,
+            previous,
+            library_replay.as_ref(),
+            library_replayed,
+            REDO_PASSES,
+        ) {
+            return;
+        }
+        // Selection is non-monotone: circular references can oscillate.
+        // Restore all bootstrap outputs together, never the last partial pass.
+        bootstrap.restore(self);
+        if !self.explicit_metadata_annotations.is_empty() {
+            self.discard_unstable_metadata_associations();
+        }
+        self.recorded_lookup_ready = false;
+        self.recorded_lookup_graph = None;
+        self.recorded_lookup_incomplete = true;
+    }
+
+    /// A pass's outcomes for `pending`: the value of each reference and
+    /// the specialization outcomes.
+    fn pass_outcomes(&self, pending: &[PendingRef]) -> PassOutcomes {
+        let values = pending
+            .iter()
+            .map(|p| {
+                let key = p.key.split_once('#').map_or(p.key.as_str(), |(key, _)| key);
+                self.elements[p.elem].props.get(key).cloned()
+            })
+            .collect();
+        (values, self.spec_resolved.iter().copied().collect())
+    }
+
+    /// The redo passes, each against the lookup graph of the previous
+    /// pass's outcomes (`graph`, built from `previous`), from the state
+    /// `checkpoint` holds, until a pass changes no outcome: the graph it
+    /// read is settled and kept, and the outcomes recorded. `false` when
+    /// `passes` ran out, the builder holding the last pass's state.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_pending_redo(
+        &mut self,
+        pending: &[PendingRef],
+        side: &SideState,
+        checkpoint: &recorded_lookup::Checkpoint,
+        mut graph: recorded_lookup::Graph,
+        mut previous: PassOutcomes,
+        library_replay: Option<&LibraryReplay>,
+        library_replayed: bool,
+        passes: usize,
+    ) -> bool {
+        for _ in 0..passes {
+            let metadata = self.metadata_snapshot();
+            checkpoint.restore(self);
+            self.restore_metadata_snapshot(&metadata);
+            self.recorded_lookup_graph = Some(graph);
+            self.recorded_lookup_ready = self.recorded_lookup_candidate;
+            side.restore(self);
+            self.pending = pending.to_vec();
+            // A library the bootstrap took entirely from its recorded fixed
+            // point stays there while user units cannot change its outcomes:
+            // replay it again rather than re-resolve every library reference.
+            (self.lib_hints, self.replay_completions) = match library_replay {
+                Some((hints, completions))
+                    if library_replayed && self.library_outcomes_are_own() =>
+                {
+                    self.lib_replay_targets_only = true;
+                    (Some(hints.clone().into_iter()), Some(completions.clone()))
+                }
+                _ => (None, None),
+            };
+            for p in pending {
+                if let Some((key, _)) = p.key.split_once('#') {
+                    self.elements[p.elem].props.insert(key, json!([]));
+                }
+            }
+            self.resolve_pending_pass();
+            // A recorded-only selection can avoid lexical walks that proved
+            // implicit/structural roots absent during bootstrap. Retain those
+            // cache invalidation dependencies even when the final target hit.
+            if let (Some(before), Some(after)) = (&checkpoint.lib_record, &mut self.lib_record) {
+                for ((_, prior_misses), (_, misses)) in before.iter().zip(after) {
+                    for name in prior_misses {
+                        if !misses.contains(name) {
+                            misses.push(name.clone());
+                        }
+                    }
+                }
+            }
+            let current = self.pass_outcomes(pending);
+            // A pass that changed no outcome leaves the rows as the previous
+            // pass left them, so the associations it would recompute and the
+            // graph it would build are the ones it read: settle that graph
+            // instead of building it again.
+            if current == previous {
+                let mut graph = self
+                    .recorded_lookup_graph
+                    .take()
+                    .expect("a redo pass reads the graph the previous pass built");
+                graph.settle(self);
+                self.note_root_imports_absent(&graph);
+                self.recorded_lookup_graph = Some(graph);
+                self.record_settled(pending);
+                return true;
+            }
+            self.refresh_metadata_associations();
+            graph = recorded_lookup::Graph::build(self);
+            self.note_root_imports_absent(&graph);
+            previous = current;
+        }
+        false
+    }
+
+    /// A graph that takes implied roots as absent holds only while the root
+    /// namespace imports nothing: a root import completes that miss, so a
+    /// model adding one resolves jointly rather than on this library.
+    fn note_root_imports_absent(&mut self, graph: &recorded_lookup::Graph) {
+        if graph.takes_implied_roots_absent() && !self.root_misses.contains(ROOT_IMPORTS) {
+            self.root_misses.insert(ROOT_IMPORTS.to_owned());
+        }
+    }
+
+    /// Whether library resolution sees what it saw when its outcomes were
+    /// recorded, root names aside (the recorded misses cover those): the
+    /// library annotates nothing by association itself, no annotation
+    /// reaches the metadata of a library element, and no external name
+    /// stands in for an implied library root.
+    fn library_outcomes_are_own(&self) -> bool {
+        let boundary = self.lib_boundary;
+        self.external_implied_names.is_empty()
+            && self
+                .explicit_metadata_annotations
+                .iter()
+                .all(|&annotation| annotation >= boundary)
+            && self.metadata_about.keys().all(|&target| target >= boundary)
+    }
+
+    fn resolve_pending_pass(&mut self) {
+        note_pass();
         let pending = std::mem::take(&mut self.pending);
+        if self.id_spelled_targets.is_empty() {
+            self.id_binding_pending.clear();
+        }
+        if self.id_spelled_targets.is_empty()
+            && pending.iter().any(|p| {
+                p.elem >= self.lib_boundary
+                    && p.qn
+                        .segments
+                        .iter()
+                        .any(|s| s.value.len() >= 32 && Uuid::parse_str(&s.value).is_ok())
+            })
+        {
+            self.id_binding_pending = pending
+                .iter()
+                .filter(|p| p.elem >= self.lib_boundary)
+                .cloned()
+                .collect();
+        }
         let mut hints = self.lib_hints.take();
         let completions = self.replay_completions.take();
         let mut replay_active = hints.is_some() && completions.is_some();
+        let mut replayed_all = replay_active;
+        let targets_only = std::mem::take(&mut self.lib_replay_targets_only);
         let completions = completions.unwrap_or_default();
         let recording = self.lib_record.is_some();
         let mut lib_pos = 0usize;
@@ -4902,7 +6161,9 @@ impl Builder {
                         // now supply is resolved afresh; the entry is still
                         // consumed to keep the positional alignment.
                         Some((outcome, misses)) => {
-                            (!misses.iter().any(|m| completions.contains(m))).then_some(outcome)
+                            (!misses.iter().any(|m| completions.contains(m))
+                                && (outcome.is_some() || !targets_only))
+                                .then_some((outcome, misses))
                         }
                         None => {
                             replay_active = false;
@@ -4912,6 +6173,7 @@ impl Builder {
                 } else {
                     None
                 };
+                replayed_all &= !is_lib_ref || hint.is_some();
                 let record_pos = if is_lib_ref && recording {
                     let pos = lib_pos;
                     lib_pos += 1;
@@ -4955,7 +6217,7 @@ impl Builder {
             let is_lib_ref = self.lib_boundary > 0 && elem < self.lib_boundary;
             if is_lib_ref {
                 match lib_hint {
-                    Some(Some(id)) => {
+                    Some((Some(id), misses)) => {
                         let ids = lib_ids.get_or_insert_with(|| {
                             self.elements
                                 .iter()
@@ -4973,18 +6235,21 @@ impl Builder {
                             // resolution through inherited-merge shadowing
                             // would differ across cache states.
                             if let Some(si) = spec_idx {
-                                if self.spec_resolved.len() <= si {
-                                    self.spec_resolved.resize(si + 1, None);
-                                }
-                                self.spec_resolved[si] = Some(target);
+                                self.record_spec_outcome(si, Some(target), &misses);
                             }
+                            self.record_ref_misses(elem, &key, &misses);
                             self.set_pending_value(elem, &key, id_ref(id));
                             continue;
                         }
                         // Unknown target — cache/content skew; fall through
                         // to a full resolve of this entry.
+                        replayed_all = false;
                     }
-                    Some(None) => {
+                    Some((None, misses)) => {
+                        if let Some(si) = spec_idx {
+                            self.record_spec_outcome(si, None, &misses);
+                        }
+                        self.record_ref_misses(elem, &key, &misses);
                         self.unresolved.push((elem, qn.clone()));
                         let v = json!({ "@ref": qn.to_ref_string() });
                         self.set_pending_value(elem, &key, v);
@@ -4993,8 +6258,16 @@ impl Builder {
                     None => {}
                 }
             }
+            let saved_identity_origin = self.set_identity_origin(elem);
             let (saved, saved_mode) = (self.exclude, self.declared_only);
             self.query_imports.clear();
+            let saved_header = self.redefinition_lookup_owner;
+            let saved_base = self.redefinition_lookup_base.take();
+            self.recorded_lookup_suppressed = false;
+            self.redefinition_lookup_owner = (key == "redefinedFeature"
+                && crate::metaclass::conforms(self.elements[elem].ty, "Redefinition"))
+            .then(|| exclude.and_then(|feature| self.owner_elem(feature)))
+            .flatten();
             self.exclude = exclude;
             self.current_misses.clear();
             // Contextual chain-step resolution first (effective names are
@@ -5002,6 +6275,7 @@ impl Builder {
             // lexical mode as fallback.
             self.declared_only = false;
             let mut was_ambiguous = false;
+            let mut imported_membership = None;
             let mut resolved = if key == "importedNamespace" {
                 // A namespace import's own target takes the outcome the
                 // resolution machinery computed (entry self-excluded); a
@@ -5042,8 +6316,17 @@ impl Builder {
             let chained = chain.as_deref().is_some_and(|c| !c.is_empty());
             if resolved.is_none() && key != "importedNamespace" {
                 self.declared_only = declared_only;
-                let lexical = match self.resolve_result(scope, &qn, 0, false) {
-                    LookupResult::Found(found, _) => Some(found),
+                let import_all = key == "importedMembership"
+                    && self.elements[elem]
+                        .props
+                        .get("isImportAll")
+                        .and_then(|v| v.as_bool())
+                        == Some(true);
+                let lexical = match self.resolve_result(scope, &qn, 0, import_all) {
+                    LookupResult::Found(found, _, membership) => {
+                        imported_membership = membership;
+                        Some(found)
+                    }
                     LookupResult::Ambiguous => {
                         was_ambiguous = true;
                         None
@@ -5065,6 +6348,7 @@ impl Builder {
                     None
                 };
             }
+            let semantically_suppressed = self.recorded_lookup_suppressed;
             // Record the reference site while `resolved` is still the
             // element the name *denotes* (before the serialization
             // substitutions below). Library-internal sites are skipped:
@@ -5074,7 +6358,10 @@ impl Builder {
                 if let Some(target) = resolved {
                     let kind = key.split_once('#').map_or(key.as_str(), |(b, _)| b);
                     let unit = self.unit_of_elem(elem);
-                    let plain = chain.is_none() && !declared_only && key != "importedNamespace";
+                    let plain = chain.is_none()
+                        && !declared_only
+                        && key != "importedNamespace"
+                        && self.id_spelled_target(scope, &qn).is_none();
                     // Chain-root provenance: re-resolve the spine's first
                     // link under the spine's own rules (contextual mode,
                     // caller's exclusion) — `resolve_chain_member` resolved
@@ -5120,20 +6407,24 @@ impl Builder {
                 // its own site even when a later segment makes the whole
                 // reference unresolved or ambiguous.
                 let unit = self.unit_of_elem(elem);
+                // Prefixes name namespaces/types, not the Feature expected
+                // by the complete header. Preserve its selected base context.
+                let qualifier_scope = self.redefinition_lookup_base.unwrap_or(scope);
+                let header = self.redefinition_lookup_owner.take();
                 for k in 1..qn.segments.len() {
                     let prefix = QualifiedName {
                         is_global: qn.is_global,
                         segments: qn.segments[..k].to_vec(),
                         span: qn.span,
                     };
-                    if let Some(t) = self.resolve(scope, &prefix, 0) {
+                    if let Some(t) = self.resolve(qualifier_scope, &prefix, 0) {
                         self.ref_sites.push(RefSite {
                             unit,
                             span: qn.span,
                             name_span: qn.segments[k - 1].span,
                             target: ElementRef(t),
                             kind: "qualifier".to_string(),
-                            scope: ScopeRef(scope),
+                            scope: ScopeRef(qualifier_scope),
                             exclude: None,
                             plain: false,
                             owner: ElementRef(elem),
@@ -5142,17 +6433,24 @@ impl Builder {
                         });
                     }
                 }
+                self.redefinition_lookup_owner = header;
             }
             // `importedMembership` is Membership-typed (KerML 7.2.5.2): a
             // membership import references the resolved member's owning
-            // Membership, not the member element itself. (An import through
-            // an alias canonicalizes to the target's own membership.)
+            // Membership, retaining the named alias Membership when present.
             if key == "importedMembership" {
-                resolved = resolved.map(|t| self.elements[t].owning_relationship.unwrap_or(t));
+                resolved = resolved.map(|t| {
+                    imported_membership
+                        .or(self.elements[t].owning_relationship)
+                        .unwrap_or(t)
+                });
             }
             // A `~P` typing references P's implicit ConjugatedPortDefinition.
             if self.elements[elem].ty == "ConjugatedPortTyping" && key == "type" {
                 resolved = resolved.map(|t| self.conjugated_defs.get(&t).copied().unwrap_or(t));
+            }
+            if is_lib_ref && resolved.is_some_and(|target| target >= self.lib_boundary) {
+                self.library_refs_to_users = true;
             }
             let value = match resolved {
                 Some(target) => id_ref(self.elements[target].id),
@@ -5160,7 +6458,7 @@ impl Builder {
                     if was_ambiguous {
                         self.ambiguous.push((elem, qn.clone()));
                     } else {
-                        if !is_lib_ref {
+                        if !is_lib_ref && !semantically_suppressed {
                             if let Some(site) =
                                 self.blocked_site(scope, chain.as_deref(), &qn, elem)
                             {
@@ -5169,16 +6467,19 @@ impl Builder {
                         }
                         self.unresolved.push((elem, qn.clone()));
                     }
-                    json!({ "@ref": qn.to_ref_string() })
+                    crate::properties::Atom::from(json!({ "@ref": qn.to_ref_string() }))
                 }
             };
+            self.redefinition_lookup_owner = saved_header;
+            self.redefinition_lookup_base = saved_base;
             (self.exclude, self.declared_only) = (saved, saved_mode);
+            self.identity_origin_unit = saved_identity_origin;
+            let misses = std::mem::take(&mut self.current_misses);
             if let Some(si) = spec_idx {
-                if self.spec_resolved.len() <= si {
-                    self.spec_resolved.resize(si + 1, None);
-                }
-                self.spec_resolved[si] = resolved;
+                self.record_spec_outcome(si, resolved, &misses);
             }
+            self.record_ref_misses(elem, &key, &misses);
+            self.current_misses = misses;
             if let Some(pos) = record_pos {
                 self.lib_record.as_mut().unwrap()[pos] = (
                     resolved.map(|t| self.elements[t].id),
@@ -5187,6 +6488,7 @@ impl Builder {
             }
             self.set_pending_value(elem, &key, value);
         }
+        self.lib_replayed_all = replayed_all;
         self.ref_sites.sort_by_key(|site| {
             (
                 site.unit,
@@ -5198,9 +6500,46 @@ impl Builder {
         });
     }
 
+    /// Record a specialization reference's outcome with the root misses
+    /// behind it, for resolutions that read it later.
+    fn record_spec_outcome(&mut self, si: usize, target: Option<usize>, misses: &[String]) {
+        if self.spec_resolved.len() <= si {
+            self.spec_resolved.resize(si + 1, None);
+        }
+        self.spec_resolved[si] = target;
+        // Only a build that records its library outcomes reads the misses.
+        if self.lib_record.is_none() {
+            return;
+        }
+        self.spec_misses.set(si, misses);
+    }
+
+    /// Record the root misses behind a relationship's single-valued outcome.
+    fn record_ref_misses(&mut self, elem: usize, key: &str, misses: &[String]) {
+        if key.contains('#') || self.lib_record.is_none() {
+            return;
+        }
+        self.ref_misses.set(elem, misses);
+    }
+
+    /// A resolution read the recorded outcomes of these specialization
+    /// entries: it depends on the root names their references missed.
+    fn note_spec_misses(&mut self, entries: impl IntoIterator<Item = usize>) {
+        for i in entries {
+            if let Some(misses) = self.spec_misses.get(i) {
+                note_misses(&mut self.current_misses, misses.iter());
+            }
+        }
+    }
+
     /// Store a resolved (or `@ref`) value under a pending ref's key —
     /// `key#n` spellings append to the `key` array property.
-    fn set_pending_value(&mut self, elem: usize, key: &str, value: Value) {
+    fn set_pending_value(
+        &mut self,
+        elem: usize,
+        key: &str,
+        value: impl Into<crate::properties::Atom>,
+    ) {
         if let Some((base, _)) = key.split_once('#') {
             self.elements[elem].props.append(base, value);
         } else {
@@ -5212,16 +6551,56 @@ impl Builder {
     pub(crate) fn element_index_of_uuid(&mut self, id: Uuid) -> Option<usize> {
         let stale = self.id_index.is_none() || self.id_index_built_for != self.elements.len();
         if stale {
-            self.id_index_built_for = self.elements.len();
-            self.id_index = Some(
-                self.elements
-                    .iter()
-                    .enumerate()
-                    .map(|(i, el)| (el.id, i))
-                    .collect(),
-            );
+            let n = self.elements.len();
+            self.id_index_built_for = n;
+            // The frozen rows through the table their freeze kept, copied,
+            // and the rows after them tabled here; every row otherwise.
+            let (mut index, start) = match self.prefix_ids.as_deref() {
+                // (an identity override writes a frozen row's id: then every
+                // row is tabled)
+                Some(frozen)
+                    if frozen.len() == self.lib_boundary
+                        && self.lib_boundary <= n
+                        && self.elements.base_untouched() =>
+                {
+                    (frozen.clone(), self.lib_boundary)
+                }
+                _ => (
+                    crate::layered::IdMap::with_capacity_and_hasher(n, Default::default()),
+                    0,
+                ),
+            };
+            note_id_index_tabled(n - start);
+            for (i, el) in self.elements.iter().enumerate().skip(start) {
+                index.insert(el.id, i);
+            }
+            self.id_index = Some(Arc::new(index));
         }
         self.id_index.as_ref().unwrap().get(&id).copied()
+    }
+
+    /// The identity tables of a build on this builder's frozen rows, for a
+    /// test to read a library name through.
+    #[cfg(test)]
+    fn identity_tables_for_test(&self) -> IdentityTables {
+        IdentityTables {
+            start: self.lib_boundary,
+            by_id: crate::layered::IdMap::default(),
+            names: Vec::new(),
+            frozen: self.prefix_ids.clone(),
+            table_names: None,
+        }
+    }
+
+    /// The library name tables by id, the first entry of an id winning.
+    fn library_table_names(&self) -> HashMap<Uuid, String> {
+        let mut tables = HashMap::new();
+        for (id, segments) in self.lib_qnames.iter().chain(self.lib_mem_qnames.iter()) {
+            if let Some(last) = segments.last() {
+                tables.entry(*id).or_insert_with(|| last.clone());
+            }
+        }
+        tables
     }
 
     /// The multiplicity `e` declares of its own — the scope it was
@@ -5232,6 +6611,11 @@ impl Builder {
         if self.mult_index.as_ref().is_none_or(|(n, _)| *n != rows) {
             let mut map = HashMap::with_capacity(rows);
             for (i, (owner, _, _)) in self.multiplicities.iter().enumerate() {
+                // A named/body range's numeric domain is not a declaration of
+                // that Multiplicity Feature's own cardinality.
+                if crate::metaclass::conforms(self.elements[*owner].ty, "Multiplicity") {
+                    continue;
+                }
                 // First row wins, as the scan this replaces did.
                 map.entry(*owner).or_insert(i);
             }
@@ -5276,6 +6660,10 @@ impl Builder {
 
     /// Original unit index of the unit that built element `elem`.
     pub(crate) fn unit_of_elem(&self, elem: usize) -> usize {
+        let elem = self
+            .semantic_ownership
+            .as_ref()
+            .map_or(elem, |view| view.source_anchor(elem));
         match self.unit_starts.binary_search_by_key(&elem, |&(e, _)| e) {
             Ok(i) => self.unit_starts[i].1,
             Err(0) => 0,
@@ -5296,9 +6684,18 @@ impl Builder {
     fn check_aliases(&mut self) -> Vec<(usize, QualifiedName)> {
         let mut out = Vec::new();
         for s in 0..self.scopes.len() {
-            for (_, qn, _) in self.scopes[s].aliases.clone() {
-                if self.resolve(s, &qn, 0).is_none() {
-                    out.push((self.unit_of_scope(s), qn));
+            for (i, (_, qn, _)) in self.scopes[s].aliases.clone().into_iter().enumerate() {
+                let origin = self.identity_origin_unit;
+                let unit = self
+                    .alias_origins
+                    .get(&(s, i))
+                    .copied()
+                    .unwrap_or_else(|| self.unit_of_scope(s));
+                self.identity_origin_unit = Some(unit);
+                let missing = self.resolve(s, &qn, 0).is_none();
+                self.identity_origin_unit = origin;
+                if missing {
+                    out.push((unit, qn));
                 }
             }
         }
@@ -5330,8 +6727,8 @@ impl Builder {
         collisions.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, bindings) in collisions {
             let (library_elem, resolves_to_library) =
-                match self.binding_result(Some(&bindings), LookupAccess::All, None) {
-                    LookupResult::Found(elem, _) if elem < boundary => (elem, true),
+                match self.binding_result(Some(&bindings), LookupAccess::All, None, false) {
+                    LookupResult::Found(elem, _, _) if elem < boundary => (elem, true),
                     LookupResult::Found(..) => continue,
                     LookupResult::Ambiguous | LookupResult::Missing => {
                         let Some(first) = bindings.iter().find(|b| b.elem < boundary) else {
@@ -5369,7 +6766,10 @@ impl Builder {
         for s in 0..self.scopes.len() {
             let imports = self.scopes[s].imports.clone();
             for entry in imports {
-                if let Some(elem) = self.resolve(s, &entry.target, 0) {
+                let origin = self.set_identity_origin(entry.relationship);
+                let resolved = self.resolve(s, &entry.target, 0);
+                self.identity_origin_unit = origin;
+                if let Some(elem) = resolved {
                     if let Some(&target) = self.elem_scope.get(&elem) {
                         if self.imports_reach(target, s) {
                             out.push((self.unit_of_scope(s), entry.target));
@@ -5393,7 +6793,7 @@ impl Builder {
             if !seen.insert(s) {
                 continue;
             }
-            for imported in self.import_scopes(s) {
+            for imported in self.import_scopes(s).iter() {
                 stack.push(imported.scope);
             }
         }
@@ -5531,7 +6931,7 @@ impl Builder {
         let saved = self.exclude;
         self.exclude = None;
         let out = match self.resolve_rest_result(scope, elem, sub, &segments, 0, false) {
-            LookupResult::Found(found, _) => Some(found),
+            LookupResult::Found(found, _, _) => Some(found),
             LookupResult::Missing | LookupResult::Ambiguous => None,
         };
         self.exclude = saved;
@@ -5549,8 +6949,37 @@ impl Builder {
         depth: usize,
     ) -> Option<usize> {
         match self.resolve_result(scope, qn, depth, false) {
-            LookupResult::Found(elem, _) => Some(elem),
+            LookupResult::Found(elem, _, _) => Some(elem),
             LookupResult::Missing | LookupResult::Ambiguous => None,
+        }
+    }
+
+    pub(crate) fn intrinsic_function_name(
+        &mut self,
+        scope: usize,
+        qn: &QualifiedName,
+    ) -> Option<String> {
+        match self.resolve_result(scope, qn, 0, false) {
+            LookupResult::Found(elem, _, _) if elem < self.lib_boundary => {
+                crate::eval::library_intrinsic_for_id(self.elem_id(elem)).map(str::to_owned)
+            }
+            LookupResult::Missing
+                if !qn.is_global
+                    && qn.segments.len() == 1
+                    && crate::eval::intrinsic_spelling(&qn.segments[0].value) =>
+            {
+                // A visibility failure is not an absent convenience name.
+                // Probe with widened access without recording import usage.
+                let probing = self.probing;
+                self.probing = true;
+                let absent = matches!(
+                    self.resolve_result(scope, qn, 0, false),
+                    LookupResult::Missing
+                );
+                self.probing = probing;
+                absent.then(|| qn.segments[0].value.clone())
+            }
+            _ => None,
         }
     }
 
@@ -5566,8 +6995,12 @@ impl Builder {
         let stamp = self.next_stamp();
         while let Some(s) = current {
             match self.lookup_at(s, &first, 0, stamp, LookupAccess::All) {
-                LookupResult::Found(elem, sub_scope) => {
-                    return self.resolve_rest_unrestricted(elem, sub_scope, &qn.segments[1..], 0);
+                hit @ LookupResult::Found(elem, sub_scope, _) => {
+                    return if qn.segments.len() == 1 {
+                        hit
+                    } else {
+                        self.resolve_rest_unrestricted(elem, sub_scope, &qn.segments[1..], 0)
+                    };
                 }
                 LookupResult::Ambiguous => return LookupResult::Ambiguous,
                 LookupResult::Missing => {}
@@ -5585,18 +7018,51 @@ impl Builder {
         depth: usize,
     ) -> LookupResult {
         if rest.is_empty() {
-            return LookupResult::Found(elem, scope);
+            return LookupResult::Found(elem, scope, None);
         }
         let Some(scope) = scope else {
             return LookupResult::Missing;
         };
         let stamp = self.next_stamp();
         match self.lookup_at(scope, &rest[0].value, depth + 1, stamp, LookupAccess::All) {
-            LookupResult::Found(next, next_scope) => {
-                self.resolve_rest_unrestricted(next, next_scope, &rest[1..], depth + 1)
+            hit @ LookupResult::Found(next, next_scope, _) => {
+                if rest.len() == 1 {
+                    hit
+                } else {
+                    self.resolve_rest_unrestricted(next, next_scope, &rest[1..], depth + 1)
+                }
             }
             other => other,
         }
+    }
+
+    /// Switch source provenance for expression and runtime-parameter queries.
+    /// Return the previous origin for the caller to restore on every exit.
+    #[inline]
+    pub(crate) fn set_identity_origin(&mut self, element: usize) -> Option<usize> {
+        let previous = self.identity_origin_unit;
+        self.identity_origin_unit = Some(self.unit_of_elem(element));
+        previous
+    }
+
+    /// An identity carried through textual lifting is tied to its source
+    /// site, not to its spelling: a different site can legitimately use
+    /// that UUID as an ordinary declared name.
+    #[inline]
+    fn id_spelled_target(&self, _scope: usize, qn: &QualifiedName) -> Option<Uuid> {
+        self.id_spelled_name(qn.segments.first()?)
+    }
+
+    #[inline]
+    fn id_spelled_name(&self, first: &Name) -> Option<Uuid> {
+        if self.id_spelled_targets.is_empty() {
+            return None;
+        }
+        let (spelling, target) = self
+            .id_spelled_targets
+            .get(&(self.identity_origin_unit?, first.span.start, first.span.end))
+            .copied()?;
+        (Uuid::parse_str(&first.value).ok() == Some(spelling)).then_some(target)
     }
 
     /// Resolution with ambiguity retained. `allow_last_non_public` is used
@@ -5613,13 +7079,83 @@ impl Builder {
         if depth > MAX_RESOLUTION_DEPTH || qn.segments.is_empty() {
             return LookupResult::Missing;
         }
+        // Redefinition headers resolve from each direct general Type, in
+        // declaration order, without admitting the declaring Type's members.
+        // Starting contexts use frozen explicit endpoints even when lookup
+        // inside those contexts still needs the contextual resolver.
+        if self.recorded_lookup_ready
+            && !self.recorded_lookup_incomplete
+            && self.id_spelled_target(scope, qn).is_none()
+        {
+            if let Some(owner) = self.redefinition_lookup_owner {
+                if let Some(&owner_scope) = self.elem_scope.get(&owner) {
+                    if self.recorded_lookup_graph.is_none() {
+                        self.recorded_lookup_graph = Some(recorded_lookup::Graph::build(self));
+                    }
+                    let graph = self.recorded_lookup_graph.as_mut().unwrap();
+                    let complete = graph
+                        .direct_bases(owner_scope, &mut self.current_misses)
+                        .is_some();
+                    let bases = graph.header_bases(owner_scope, &mut self.current_misses);
+                    if let Some(bases) = bases {
+                        let saved = self.redefinition_lookup_owner.take();
+                        let mut result = LookupResult::Missing;
+                        for base in bases {
+                            let hit =
+                                self.resolve_result(base, qn, depth + 1, allow_last_non_public);
+                            match hit {
+                                LookupResult::Found(e, _, _)
+                                    if crate::metaclass::conforms(
+                                        self.elements[e].ty,
+                                        "Feature",
+                                    ) =>
+                                {
+                                    result = hit;
+                                    self.redefinition_lookup_base = Some(base);
+                                    break;
+                                }
+                                LookupResult::Ambiguous => result = LookupResult::Ambiguous,
+                                _ => {}
+                            }
+                        }
+                        self.redefinition_lookup_owner = saved;
+                        if complete || matches!(result, LookupResult::Found(..)) {
+                            return result;
+                        }
+                    }
+                }
+                // An unsupported header keeps the contextual fallback, but
+                // nested alias/base resolution must not restart this header.
+                let saved = self.redefinition_lookup_owner.take();
+                let result = self.resolve_result(scope, qn, depth, allow_last_non_public);
+                self.redefinition_lookup_owner = saved;
+                return result;
+            }
+        }
         let first = qn.segments[0].value.clone();
+        if let Some(id) = self.id_spelled_target(scope, qn) {
+            let Some(elem) = self.element_index_of_uuid(id) else {
+                return LookupResult::Missing;
+            };
+            let sub_scope = self.elem_scope.get(&elem).copied();
+            return self.resolve_rest_result(
+                scope,
+                elem,
+                sub_scope,
+                &qn.segments[1..],
+                depth,
+                allow_last_non_public,
+            );
+        }
         // `$::` roots resolution at the global namespace (scope 0).
         let mut current = Some(if qn.is_global { 0 } else { scope });
         let stamp = self.next_stamp();
         while let Some(s) = current {
             match self.lookup_at(s, &first, depth, stamp, LookupAccess::All) {
-                LookupResult::Found(elem, sub_scope) => {
+                hit @ LookupResult::Found(elem, sub_scope, _) => {
+                    if qn.segments.len() == 1 {
+                        return hit;
+                    }
                     return self.resolve_rest_result(
                         scope,
                         elem,
@@ -5669,16 +7205,31 @@ impl Builder {
         stamp: u64,
         access: LookupAccess,
     ) -> LookupResult {
+        self.lookup_at_with_names(s, name, depth, stamp, access, false)
+    }
+
+    /// Semantic import lookup excludes compatibility locators before merging
+    /// candidates. Separate memo slots preserve replay lookup within the same
+    /// query (for example while an alias resolves its target).
+    fn lookup_at_with_names(
+        &mut self,
+        s: usize,
+        name: &str,
+        depth: usize,
+        stamp: u64,
+        access: LookupAccess,
+        semantic_names: bool,
+    ) -> LookupResult {
         let hit = if depth > MAX_RESOLUTION_DEPTH {
             LookupResult::Missing
         } else {
-            let mode = access as usize;
+            let mode = access as usize + usize::from(semantic_names) * 3;
             if self.visit_stamp[s][mode] == stamp {
                 self.visit_result[s][mode].unwrap_or(LookupResult::Missing)
             } else {
                 self.visit_stamp[s][mode] = stamp;
                 self.visit_result[s][mode] = None;
-                let hit = self.lookup_body(s, name, depth, stamp, access);
+                let hit = self.lookup_body(s, name, depth, stamp, access, semantic_names);
                 self.visit_result[s][mode] = Some(hit);
                 hit
             }
@@ -5703,24 +7254,154 @@ impl Builder {
         }
     }
 
+    /// Set aside the lookup state of the query in progress before computing
+    /// a lookup-cache entry. The entry outlives the query, so it must not
+    /// depend on it: a probe's or a widened member's access, an excluded
+    /// element, a chain step's declared names only, a redefinition header,
+    /// a membership import or filter resolving its own target. Otherwise
+    /// whichever reference first reads the entry decides it for all later
+    /// ones — and a replayed build, which reads it from another reference,
+    /// would resolve differently from a cold one.
+    fn enter_fill_mode(&mut self) -> QueryMode {
+        let filters = self.filters_active.contains(&true).then(|| {
+            let idle = vec![false; self.filters_active.len()];
+            std::mem::replace(&mut self.filters_active, idle)
+        });
+        QueryMode {
+            probing: std::mem::replace(&mut self.probing, false),
+            widen: self.widen.take(),
+            exclude: self.exclude.take(),
+            declared_only: std::mem::replace(&mut self.declared_only, false),
+            header_owner: self.redefinition_lookup_owner.take(),
+            header_base: self.redefinition_lookup_base.take(),
+            member_imports: std::mem::take(&mut self.member_import_active),
+            filters,
+            suppressed: std::mem::replace(&mut self.recorded_lookup_suppressed, false),
+        }
+    }
+
+    /// Restore the query state [`Self::enter_fill_mode`] set aside.
+    fn leave_fill_mode(&mut self, query: QueryMode) {
+        self.probing = query.probing;
+        self.widen = query.widen;
+        self.exclude = query.exclude;
+        self.declared_only = query.declared_only;
+        self.redefinition_lookup_owner = query.header_owner;
+        self.redefinition_lookup_base = query.header_base;
+        self.member_import_active = query.member_imports;
+        if let Some(filters) = query.filters {
+            self.filters_active = filters;
+        }
+        self.recorded_lookup_suppressed = query.suppressed;
+    }
+
+    /// Start computing a lookup-cache entry: the misses noted from here to
+    /// [`Self::end_fill`] are the entry's own. The returned number marks
+    /// the entry as [`FillMisses::Filling`] meanwhile.
+    fn begin_fill(&mut self) -> usize {
+        let interrupted = std::mem::take(&mut self.current_misses);
+        self.fill_frames.push(interrupted);
+        self.fill_frames.len()
+    }
+
+    /// Finish the innermost fill: its misses are also the misses of the
+    /// resolution it interrupted, which read the entry it computed.
+    fn end_fill(&mut self) -> FillMisses {
+        let interrupted = self.fill_frames.pop().unwrap_or_default();
+        let noted = std::mem::replace(&mut self.current_misses, interrupted);
+        if noted.is_empty() {
+            return FillMisses::None;
+        }
+        note_misses(&mut self.current_misses, &noted);
+        FillMisses::Missed(noted.into())
+    }
+
+    fn set_base_misses(&mut self, s: usize, misses: FillMisses) {
+        if self.base_misses.len() <= s {
+            self.base_misses.resize(s + 1, FillMisses::None);
+        }
+        self.base_misses[s] = misses;
+    }
+
+    fn set_import_misses(&mut self, s: usize, misses: FillMisses) {
+        if self.import_misses.len() <= s {
+            self.import_misses.resize(s + 1, FillMisses::None);
+        }
+        self.import_misses[s] = misses;
+    }
+
+    /// A read of a lookup-cache entry notes the misses behind it: all of
+    /// them once computed, and those noted so far while a fill that the
+    /// reader runs inside computes it.
+    #[inline]
+    fn note_fill_misses(
+        noted: &mut Vec<String>,
+        frames: &[Vec<String>],
+        misses: Option<&FillMisses>,
+    ) {
+        match misses {
+            None | Some(FillMisses::None) => {}
+            Some(FillMisses::Missed(names)) => note_misses(noted, names.iter()),
+            // The fill's own misses sit in the frame of the first fill it
+            // started; while it has none running they are `noted` itself.
+            Some(&FillMisses::Filling(fill)) => {
+                if let Some(own) = frames.get(fill) {
+                    note_misses(noted, own);
+                }
+            }
+        }
+    }
+
     fn merge_lookup(&self, left: LookupResult, right: LookupResult) -> LookupResult {
         match (left, right) {
             (LookupResult::Ambiguous, _) | (_, LookupResult::Ambiguous) => LookupResult::Ambiguous,
             (LookupResult::Missing, hit) | (hit, LookupResult::Missing) => hit,
-            (LookupResult::Found(a, ascope), LookupResult::Found(b, bscope)) if a == b => {
-                LookupResult::Found(a, ascope.or(bscope))
+            (LookupResult::Found(a, ascope, am), LookupResult::Found(b, bscope, bm)) if a == b => {
+                // Two import paths to one Membership agree. Distinct
+                // aliases with this spelling remain indistinguishable even
+                // when they happen to denote the same member element.
+                let owning = self.elements[a].owning_relationship;
+                if am.or(owning) == bm.or(owning) {
+                    LookupResult::Found(a, ascope.or(bscope), am)
+                } else {
+                    LookupResult::Ambiguous
+                }
             }
-            (LookupResult::Found(a, ascope), LookupResult::Found(b, _))
+            (LookupResult::Found(a, ascope, am), LookupResult::Found(b, _, _))
                 if !metaclasses_overlap(self.elements[a].ty, self.elements[b].ty) =>
             {
                 // KerML Membership::isDistinguishableFrom: concrete sibling
                 // metaclasses with equal names do not make the namespace
                 // ambiguous. Context-sensitive selection is a later stage;
                 // retain the earlier candidate here for stable traversal.
-                LookupResult::Found(a, ascope)
+                LookupResult::Found(a, ascope, am)
             }
             (LookupResult::Found(..), LookupResult::Found(..)) => LookupResult::Ambiguous,
         }
+    }
+
+    /// The features `e` redefines as lookup reads them: the recorded
+    /// written ones, those the positional plan materialized once the model
+    /// is semantically ready, and — before that, while references are
+    /// still being resolved — those its position pairs it with, read off
+    /// its owner's heritage (`positional_redefinition_targets`), so that a
+    /// usage's `out fuelEconomy` shadows the definition's it redefines by
+    /// position whenever a chain reaches both.
+    fn shadowing_redefinition_targets(
+        &mut self,
+        e: usize,
+        read: &mut Vec<usize>,
+        memo: &mut parameters::SlotMemo,
+    ) -> Vec<usize> {
+        let mut targets = self.recorded_redefinition_targets(e, read);
+        if let Some(owner) = self.owner_elem(e) {
+            for target in self.positional_targets(e, owner, memo) {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
     }
 
     /// Distinct same-named hits inherited from different bases are not
@@ -5730,7 +7411,7 @@ impl Builder {
     /// overriding usage `part :>> c : N;` inherits `d` both through the
     /// redefinition target's type (the original) and through `N` (the
     /// override); the override wins.
-    fn drop_redefined_hits(&self, hits: &mut Vec<LookupResult>) {
+    fn drop_redefined_hits(&mut self, hits: &mut Vec<LookupResult>) {
         let mut found: Vec<usize> = hits
             .iter()
             .filter_map(|h| h.option().map(|(e, _)| e))
@@ -5740,9 +7421,16 @@ impl Builder {
         if found.len() < 2 {
             return;
         }
+        // Only a competing inherited lookup needs semantic redefinitions.
+        // Ordinary owned-name lookups must not initialize the entire graph.
+        self.ensure_positional_redefinitions();
+        // The specialization entries whose recorded outcomes decide the
+        // shadowing: this lookup depends on what their references missed.
+        let mut read = Vec::new();
+        let mut memo = parameters::SlotMemo::default();
         let mut shadowed: Vec<usize> = Vec::new();
         for &e in &found {
-            let mut stack = self.recorded_redefinition_targets(e);
+            let mut stack = self.shadowing_redefinition_targets(e, &mut read, &mut memo);
             let mut seen = HashSet::new();
             while let Some(t) = stack.pop() {
                 if !seen.insert(t) {
@@ -5751,7 +7439,7 @@ impl Builder {
                 if found.contains(&t) && !shadowed.contains(&t) {
                     shadowed.push(t);
                 }
-                stack.extend(self.recorded_redefinition_targets(t));
+                stack.extend(self.shadowing_redefinition_targets(t, &mut read, &mut memo));
             }
         }
         // Implicit redefinition by name (SysML): a usage owned by a type
@@ -5767,9 +7455,13 @@ impl Builder {
             .copied()
             .filter(|e| !shadowed.contains(e))
             .collect();
+        // Not a parameter of a behavior or step, a result or an end: those
+        // redefine by position (`redefines_by_position`), and a reused
+        // name at another position is a collision, which the enumeration
+        // keeps and the distinguishability check reports.
         if remaining.len() > 1 {
             for &x in &remaining {
-                if !self.elements[x].ty.ends_with("Usage") {
+                if !self.elements[x].ty.ends_with("Usage") || self.redefines_by_position(x) {
                     continue;
                 }
                 let Some(ox) = self.owner_elem(x) else {
@@ -5782,13 +7474,16 @@ impl Builder {
                     let Some(oy) = self.owner_elem(y) else {
                         continue;
                     };
-                    if ox != oy && self.recorded_conforms(ox, oy) && !self.recorded_conforms(oy, ox)
+                    if ox != oy
+                        && self.recorded_conforms(ox, oy, &mut read)
+                        && !self.recorded_conforms(oy, ox, &mut read)
                     {
                         shadowed.push(y);
                     }
                 }
             }
         }
+        self.note_spec_misses(read);
         if shadowed.is_empty() {
             return;
         }
@@ -5879,7 +7574,8 @@ impl Builder {
     /// specialization outcomes? Like [`Self::recorded_redefinition_targets`],
     /// a direct scan with no resolution and no index — this runs inside
     /// `lookup_body` (see that method's doc for why both are off-limits).
-    fn recorded_conforms(&self, sub: usize, sup: usize) -> bool {
+    /// The entries whose outcomes it read are added to `read`.
+    fn recorded_conforms(&self, sub: usize, sup: usize, read: &mut Vec<usize>) -> bool {
         if sub == sup {
             return true;
         }
@@ -5896,6 +7592,7 @@ impl Builder {
                         "FeatureTyping" | "Subclassification" | "Subsetting" | "Redefinition"
                     )
                 {
+                    read.push(i);
                     if let Some(t) = self.spec_resolved.get(i).copied().flatten() {
                         if t == sup {
                             return true;
@@ -5917,13 +7614,24 @@ impl Builder {
     /// nor build the permanent `spec_index` mid-lowering while
     /// `spec_targets` is still growing. The scan is linear but only runs
     /// on the rare multi-candidate merges.
-    fn recorded_redefinition_targets(&self, e: usize) -> Vec<usize> {
+    /// The entries whose outcomes it read are added to `read`.
+    fn recorded_redefinition_targets(&self, e: usize, read: &mut Vec<usize>) -> Vec<usize> {
         let mut out = Vec::new();
         for (i, (owner, kind, _, _)) in self.spec_targets.iter().enumerate() {
             if *owner == e && *kind == "Redefinition" {
+                read.push(i);
                 if let Some(t) = self.spec_resolved.get(i).copied().flatten() {
                     if t != e && !out.contains(&t) {
                         out.push(t);
+                    }
+                }
+            }
+        }
+        if self.semantic_ready {
+            if let Some(plan) = self.effective_positional_redefinitions() {
+                for &target in plan.targets.get(&e).into_iter().flatten() {
+                    if !out.contains(&target) {
+                        out.push(target);
                     }
                 }
             }
@@ -6034,10 +7742,13 @@ impl Builder {
         bindings: Option<&[Binding]>,
         access: LookupAccess,
         exclude: Option<usize>,
+        semantic_names: bool,
     ) -> LookupResult {
         let mut result = LookupResult::Missing;
         for binding in bindings.into_iter().flatten().copied() {
-            if Some(binding.elem) == exclude {
+            if Some(binding.elem) == exclude
+                || (semantic_names && self.reference_locator_has_no_semantic_name(binding.elem))
+            {
                 continue;
             }
             let widened =
@@ -6045,8 +7756,10 @@ impl Builder {
             if !access.admits(binding.visibility) && !widened {
                 continue;
             }
-            result =
-                self.merge_lookup(result, LookupResult::Found(binding.elem, binding.sub_scope));
+            result = self.merge_lookup(
+                result,
+                LookupResult::Found(binding.elem, binding.sub_scope, None),
+            );
         }
         result
     }
@@ -6058,13 +7771,15 @@ impl Builder {
         depth: usize,
         stamp: u64,
         access: LookupAccess,
+        semantic_names: bool,
     ) -> LookupResult {
         let access = if self.probing {
             LookupAccess::All
         } else {
             access
         };
-        let direct = self.binding_result(self.scopes[s].names.get(name), access, self.exclude);
+        let direct =
+            self.binding_result(self.scopes[s].names.get(name), access, self.exclude, false);
         if direct != LookupResult::Missing {
             return direct;
         }
@@ -6085,6 +7800,7 @@ impl Builder {
                 self.scopes[s].effective_names.get(name),
                 access,
                 self.exclude,
+                semantic_names,
             );
             if effective != LookupResult::Missing {
                 return effective;
@@ -6096,16 +7812,31 @@ impl Builder {
         let mut aliases = LookupResult::Missing;
         for i in 0..self.scopes[s].aliases.len() {
             if self.scopes[s].aliases[i].0 != name
-                || (access == LookupAccess::Public && !self.scopes[s].aliases[i].2)
+                || !self.import_admitted(self.scopes[s].aliases[i].2, access)
             {
                 continue;
             }
             let target = self.scopes[s].aliases[i].1.clone();
-            match self.resolve_result(s, &target, depth + 1, false) {
-                LookupResult::Found(elem, _) => {
+            let origin = self.identity_origin_unit;
+            if !self.id_spelled_targets.is_empty() {
+                self.identity_origin_unit = Some(
+                    self.alias_origins
+                        .get(&(s, i))
+                        .copied()
+                        .unwrap_or_else(|| self.unit_of_scope(s)),
+                );
+            }
+            let resolved = self.resolve_result(s, &target, depth + 1, false);
+            self.identity_origin_unit = origin;
+            match resolved {
+                LookupResult::Found(elem, _, _) => {
                     aliases = self.merge_lookup(
                         aliases,
-                        LookupResult::Found(elem, self.elem_scope.get(&elem).copied()),
+                        LookupResult::Found(
+                            elem,
+                            self.elem_scope.get(&elem).copied(),
+                            Some(self.scopes[s].aliases[i].2),
+                        ),
                     );
                 }
                 LookupResult::Ambiguous => aliases = LookupResult::Ambiguous,
@@ -6118,7 +7849,7 @@ impl Builder {
         let mut implied = LookupResult::Missing;
         for &(end_name, elem, sub) in &self.scopes[s].implied_ends {
             if end_name == name && Some(elem) != self.exclude {
-                implied = self.merge_lookup(implied, LookupResult::Found(elem, Some(sub)));
+                implied = self.merge_lookup(implied, LookupResult::Found(elem, Some(sub), None));
             }
         }
         if implied != LookupResult::Missing {
@@ -6138,18 +7869,22 @@ impl Builder {
                 continue;
             }
             let entry = self.scopes[s].member_imports[i].clone();
+            let origin = self.set_identity_origin(entry.relationship);
             let resolved = self.resolve_result(s, &entry.target, depth + 1, entry.is_import_all);
+            self.identity_origin_unit = origin;
             self.member_import_active.remove(&(s, i));
             match resolved {
-                LookupResult::Found(elem, _) => {
+                LookupResult::Found(elem, _, membership) => {
                     if self.filters_admit(s, &entry.filters, elem, depth) {
                         if !self.probing {
                             self.used_imports.insert(entry.relationship);
                             self.query_imports.push((entry.relationship, access));
                         }
                         let sub = self.elem_scope.get(&elem).copied();
-                        imported_members =
-                            self.merge_lookup(imported_members, LookupResult::Found(elem, sub));
+                        imported_members = self.merge_lookup(
+                            imported_members,
+                            LookupResult::Found(elem, sub, membership),
+                        );
                     }
                 }
                 LookupResult::Ambiguous => imported_members = LookupResult::Ambiguous,
@@ -6159,9 +7894,39 @@ impl Builder {
         if imported_members != LookupResult::Missing {
             return imported_members;
         }
+        if self.recorded_lookup_ready
+            && !self.recorded_lookup_incomplete
+            && !self.probing
+            && self.widen.is_none()
+            && !self.declared_only
+        {
+            if self.recorded_lookup_graph.is_none() {
+                self.recorded_lookup_graph = Some(recorded_lookup::Graph::build(self));
+            }
+            if let Some((hits, suppressed)) = self.recorded_lookup_graph.as_mut().unwrap().select(
+                s,
+                name,
+                access,
+                self.exclude,
+                false,
+                &mut self.current_misses,
+            ) {
+                self.recorded_lookup_suppressed |= suppressed;
+                return hits.into_iter().fold(LookupResult::Missing, |result, hit| {
+                    self.merge_lookup(result, hit)
+                });
+            }
+        }
         let mut hits: Vec<LookupResult> = Vec::new();
         for base in self.base_scopes(s) {
-            hits.push(self.lookup_at(base, name, depth + 1, stamp, access.inherited()));
+            hits.push(self.lookup_at_with_names(
+                base,
+                name,
+                depth + 1,
+                stamp,
+                access.inherited(),
+                semantic_names,
+            ));
         }
         self.drop_redefined_hits(&mut hits);
         let mut inherited = LookupResult::Missing;
@@ -6172,7 +7937,8 @@ impl Builder {
             return inherited;
         }
         let mut imported = LookupResult::Missing;
-        for entry in self.import_scopes(s) {
+        let imports = self.import_scopes(s);
+        for entry in imports.iter() {
             if access == LookupAccess::Public && !entry.is_public {
                 continue;
             }
@@ -6189,7 +7955,7 @@ impl Builder {
                     },
                 )
             } else {
-                self.lookup_at(
+                self.lookup_at_with_names(
                     entry.scope,
                     name,
                     depth + 1,
@@ -6199,16 +7965,18 @@ impl Builder {
                     } else {
                         LookupAccess::Public
                     },
+                    true,
                 )
             };
             match hit {
-                LookupResult::Found(elem, sub) => {
+                LookupResult::Found(elem, sub, membership) => {
                     if self.filters_admit(s, &entry.filters, elem, depth) {
                         if !self.probing {
                             self.used_imports.insert(entry.relationship);
                             self.query_imports.push((entry.relationship, access));
                         }
-                        imported = self.merge_lookup(imported, LookupResult::Found(elem, sub));
+                        imported =
+                            self.merge_lookup(imported, LookupResult::Found(elem, sub, membership));
                     }
                 }
                 LookupResult::Ambiguous => imported = LookupResult::Ambiguous,
@@ -6237,17 +8005,26 @@ impl Builder {
         } else {
             access
         };
-        let mut result = self.lookup_at(s, name, depth, stamp, access);
-        let mut subs: Vec<usize> = self.scopes[s]
-            .names
-            .values()
-            .flatten()
-            .filter(|binding| access.admits(binding.visibility))
-            .filter_map(|binding| binding.sub_scope)
-            .collect();
-        subs.sort_unstable();
-        subs.dedup();
-        for sub in subs {
+        let mut result = self.lookup_at_with_names(s, name, depth, stamp, access, true);
+        let key = (s, access as u8);
+        let subs = match self.recursive_subs.get(&key) {
+            Some(subs) => Arc::clone(subs),
+            None => {
+                let mut subs: Vec<usize> = self.scopes[s]
+                    .names
+                    .values()
+                    .flatten()
+                    .filter(|binding| access.admits(binding.visibility))
+                    .filter_map(|binding| binding.sub_scope)
+                    .collect();
+                subs.sort_unstable();
+                subs.dedup();
+                let subs: Arc<[usize]> = subs.into();
+                self.recursive_subs.insert(key, Arc::clone(&subs));
+                subs
+            }
+        };
+        for &sub in subs.iter() {
             let hit = self.lookup_recursive(sub, name, depth + 1, stamp, access);
             result = self.merge_lookup(result, hit);
         }
@@ -6263,23 +8040,29 @@ impl Builder {
     /// poison the cache with an empty set — making resolution outcomes
     /// depend on file order). Cycle safety comes from the placeholder seed
     /// below and the per-query visit stamps, not from inherited depth.
-    fn import_scopes(&mut self, s: usize) -> Vec<ImportedScope> {
+    fn import_scopes(&mut self, s: usize) -> Arc<Vec<ImportedScope>> {
         if let Some(cached) = &self.import_cache[s] {
-            return cached.clone();
+            Self::note_fill_misses(
+                &mut self.current_misses,
+                &self.fill_frames,
+                self.import_misses.get(s),
+            );
+            return Arc::clone(cached);
         }
         // The cache outlives any query: it must never hold what a
-        // visibility-blind probe or a widened member would resolve.
-        let (probing, widen) = (
-            std::mem::replace(&mut self.probing, false),
-            self.widen.take(),
-        );
+        // visibility-blind probe, a widened member or another query's mode
+        // would resolve.
+        let query = self.enter_fill_mode();
+        let fill = self.begin_fill();
+        self.set_import_misses(s, FillMisses::Filling(fill));
         let result = self.import_scopes_uncached(s);
-        self.probing = probing;
-        self.widen = widen;
+        let misses = self.end_fill();
+        self.set_import_misses(s, misses);
+        self.leave_fill_mode(query);
         result
     }
 
-    fn import_scopes_uncached(&mut self, s: usize) -> Vec<ImportedScope> {
+    fn import_scopes_uncached(&mut self, s: usize) -> Arc<Vec<ImportedScope>> {
         // Placeholder breaks cycles while computing. An import target may
         // itself be visible only through an earlier import of the same
         // scope (`import P::*; import P_Member::*;`), and resolving it
@@ -6289,7 +8072,7 @@ impl Builder {
         // owns a member also named `Domain` must not capture that member
         // through the import itself on the second pass — the
         // namespace-import analogue of `member_import_active`.
-        self.import_cache[s] = Some(Vec::new());
+        self.import_cache[s] = Some(Arc::new(Vec::new()));
         let imports = self.scopes[s].imports.clone();
         let mut outcomes: Vec<Option<(usize, ImportedScope)>> = vec![None; imports.len()];
         let mut walked: Vec<ImportWalks> = vec![Vec::new(); imports.len()];
@@ -6305,8 +8088,9 @@ impl Builder {
                 let entry = imports[i].clone();
                 let at = outcomes[..i].iter().filter(|o| o.is_some()).count();
                 let mine = outcomes[i].as_ref().map(|_| seeds.remove(at));
-                self.import_cache[s] = Some(std::mem::take(&mut seeds));
+                self.import_cache[s] = Some(Arc::new(std::mem::take(&mut seeds)));
                 let mark = self.query_imports.len();
+                let origin = self.set_identity_origin(entry.relationship);
                 let next = self.resolve(s, &entry.target, 0).and_then(|elem| {
                     self.elem_scope.get(&elem).map(|&sc| {
                         (
@@ -6322,10 +8106,14 @@ impl Builder {
                         )
                     })
                 });
+                self.identity_origin_unit = origin;
                 walked[i] = self.query_imports.drain(mark..).collect();
                 // Re-entry into this scope reads the seed; it never
                 // replaces it, so the vector comes back as it was left.
-                seeds = self.import_cache[s].take().unwrap_or_default();
+                seeds = self.import_cache[s]
+                    .take()
+                    .map(|seeds| Arc::try_unwrap(seeds).unwrap_or_else(|shared| (*shared).clone()))
+                    .unwrap_or_default();
                 if next != outcomes[i] {
                     if let Some((_, scope)) = &next {
                         seeds.insert(at, scope.clone());
@@ -6357,18 +8145,19 @@ impl Builder {
                 }
             }
         }
-        self.import_cache[s] = Some(result.clone());
+        let result = Arc::new(result);
+        self.import_cache[s] = Some(Arc::clone(&result));
         result
     }
 
     /// Record import filter expressions and return their indices into
     /// [`Self::filter_exprs`]. `scope` is where the expressions' names
     /// (metaclass references like `Safety`) resolve from.
-    fn record_filters(&mut self, filters: &[Expr], scope: usize) -> Vec<usize> {
+    fn record_filters(&mut self, filters: &[Expr], owner: usize, scope: usize) -> Vec<usize> {
         filters
             .iter()
             .map(|f| {
-                self.filter_exprs.push((scope, f.clone()));
+                self.filter_exprs.push((owner, scope, f.clone()));
                 self.filters_active.push(false);
                 self.filter_exprs.len() - 1
             })
@@ -6404,8 +8193,10 @@ impl Builder {
             return Tri::Unknown;
         }
         self.filters_active[fid] = true;
-        let (scope, expr) = self.filter_exprs[fid].clone();
+        let (owner, scope, expr) = self.filter_exprs[fid].clone();
+        let origin = self.set_identity_origin(owner);
         let out = self.filter_expr_verdict(&expr, scope, elem, depth);
+        self.identity_origin_unit = origin;
         self.filters_active[fid] = false;
         out
     }
@@ -6477,11 +8268,7 @@ impl Builder {
                 let TargetRef::Name(attr) = member else {
                     return Tri::Unknown;
                 };
-                if attr.segments.len() != 1 {
-                    return Tri::Unknown;
-                }
-                let attr = attr.segments[0].value.clone();
-                self.metadata_attr_verdict(scope, meta_qn, &attr, elem, depth)
+                self.metadata_attr_verdict(scope, meta_qn, attr, elem, depth)
             }
             _ => Tri::Unknown,
         }
@@ -6517,9 +8304,16 @@ impl Builder {
             }
         }
         if self.is_reflection_target(target) {
-            return self.metaclass_test(target, elem);
+            let result = self.metaclass_test(target, elem);
+            if result != Tri::False || !self.metadata_associations_incomplete {
+                return result;
+            }
         }
-        Tri::False
+        if self.metadata_associations_incomplete {
+            Tri::Unknown
+        } else {
+            Tri::False
+        }
     }
 
     /// Is `@target` a *reflection* test — one against the candidate's own
@@ -6614,40 +8408,87 @@ impl Builder {
         &mut self,
         scope: usize,
         meta_qn: &QualifiedName,
-        attr: &str,
+        attr: &QualifiedName,
         elem: usize,
         depth: usize,
     ) -> Tri {
+        // A missing incoming annotation can change the cardinality of this
+        // cast and its selected attribute values, even beside a known value.
+        if self.metadata_associations_incomplete {
+            return Tri::Unknown;
+        }
         let Some(target) = self.resolve(scope, meta_qn, depth + 1) else {
             return Tri::Unknown;
         };
-        let metas = self.metadata_of.get(&elem).cloned().unwrap_or_default();
-        for m in metas {
-            if !self.conforms_upward(m, target) {
-                continue;
+        // Interchange spells a chain member by its declaration identity. A
+        // qualified or identity-bound spelling must name the same member of
+        // the cast metadata type before its key can select an annotation value.
+        // Merely taking the final segment could capture an unrelated feature.
+        let key = if attr.is_global
+            || attr.segments.len() != 1
+            || self.id_spelled_target(scope, attr).is_some()
+        {
+            let LookupResult::Found(declaration, _, _) =
+                self.resolve_result(scope, attr, depth + 1, false)
+            else {
+                return Tri::Unknown;
+            };
+            if !crate::metaclass::conforms(self.elements[declaration].ty, "Feature") {
+                return Tri::Unknown;
             }
-            // The annotation's `attr` member — declared (`isMandatory =
-            // true;`) or redefining (`:>> isMandatory = true;`, findable
-            // by its effective name).
-            let Some(&ms) = self.elem_scope.get(&m) else {
+            let Some(key) = self.effective_name(declaration) else {
                 return Tri::Unknown;
             };
-            let f = self.scopes[ms]
-                .names
-                .get(attr)
-                .or_else(|| self.scopes[ms].effective_names.get(attr))
-                .and_then(|bindings| bindings.first())
-                .map(|binding| binding.elem);
-            let Some(f) = f else {
+            let member = Name {
+                value: key.clone(),
+                span: Span::default(),
+            };
+            let target_scope = self.elem_scope.get(&target).copied();
+            if !matches!(
+                self.resolve_rest_result(scope, target, target_scope, &[member], depth + 1, false),
+                LookupResult::Found(found, _, _) if found == declaration
+            ) {
                 return Tri::Unknown;
-            };
-            return match self.values.get(&f).map(|(_, e)| &e.kind) {
-                Some(ExprKind::Literal(Literal::Bool(true))) => Tri::True,
-                Some(ExprKind::Literal(Literal::Bool(false))) => Tri::False,
-                _ => Tri::Unknown,
-            };
+            }
+            key
+        } else {
+            attr.segments[0].value.clone()
+        };
+        let metas = self.metadata_of.get(&elem).cloned().unwrap_or_default();
+        let mut selected = None;
+        for metadata in metas {
+            if self.conforms_upward(metadata, target) && selected.replace(metadata).is_some() {
+                // This scalar filter evaluator cannot choose one member of a
+                // multi-valued metadata cast by declaration order.
+                return Tri::Unknown;
+            }
         }
-        Tri::False
+        let Some(m) = selected else {
+            return Tri::False;
+        };
+        // The annotation's `attr` member — declared (`isMandatory =
+        // true;`) or redefining (`:>> isMandatory = true;`, findable
+        // by its effective name).
+        let Some(&ms) = self.elem_scope.get(&m) else {
+            return Tri::Unknown;
+        };
+        let f = self.scopes[ms]
+            .names
+            .get(&key)
+            .or_else(|| self.scopes[ms].effective_names.get(&key))
+            .and_then(|bindings| match bindings {
+                [binding] => Some(binding),
+                _ => None,
+            })
+            .map(|binding| binding.elem);
+        let Some(f) = f else {
+            return Tri::Unknown;
+        };
+        match self.values.get(&f).map(|(_, e)| &e.kind) {
+            Some(ExprKind::Literal(Literal::Bool(true))) => Tri::True,
+            Some(ExprKind::Literal(Literal::Bool(false))) => Tri::False,
+            _ => Tri::Unknown,
+        }
     }
 
     /// The body scopes of the specialization bases of the element owning
@@ -6661,27 +8502,59 @@ impl Builder {
     /// returned `usize` is the count of leading entries resolved from
     /// *written* heritage (specializations, typings, chain bases); the
     /// remainder are implied (Tables 31/32 library bases, binary connector
-    /// bases, implicit parameter redefinition, semantic metadata).
+    /// bases, positional parameter, end and result redefinitions, semantic
+    /// metadata).
     pub(crate) fn base_scopes_split(&mut self, s: usize) -> (Vec<usize>, usize) {
         if let Some(cached) = &self.base_cache[s] {
-            return cached.clone();
+            Self::note_fill_misses(
+                &mut self.current_misses,
+                &self.fill_frames,
+                self.base_misses.get(s),
+            );
+            return self.with_dynamic_scope_bases(s, cached.clone());
         }
-        // As for `import_scopes`: cached bases never come from a probe,
-        // and the import walks that resolve the base names belong to the
-        // specialization's own reference sites, not to whichever lookup
-        // first fills the cache — a prepared library rebuilds its base
-        // caches under the user's lookups, and cold and warm builds must
-        // record identical sites.
-        let (probing, widen) = (
-            std::mem::replace(&mut self.probing, false),
-            self.widen.take(),
-        );
+        // As for `import_scopes`: cached bases never come from a probe or
+        // another query's mode, and the import walks that resolve the base
+        // names belong to the specialization's own reference sites, not to
+        // whichever lookup first fills the cache — a prepared library
+        // rebuilds its base caches under the user's lookups, and cold and
+        // warm builds must record identical sites.
+        let query = self.enter_fill_mode();
         let mark = self.query_imports.len();
+        let origin = self.identity_origin_unit;
+        if let Some(owner) = self.scopes[s].owner {
+            self.set_identity_origin(owner);
+        }
+        let fill = self.begin_fill();
+        self.set_base_misses(s, FillMisses::Filling(fill));
         let result = self.base_scopes_uncached(s);
+        let misses = self.end_fill();
+        self.set_base_misses(s, misses);
+        self.identity_origin_unit = origin;
         self.query_imports.truncate(mark);
-        self.probing = probing;
-        self.widen = widen;
-        result
+        self.leave_fill_mode(query);
+        self.with_dynamic_scope_bases(s, result)
+    }
+
+    fn with_dynamic_scope_bases(
+        &self,
+        scope: usize,
+        (mut bases, explicit): (Vec<usize>, usize),
+    ) -> (Vec<usize>, usize) {
+        // Keep cached construction bases static. The read-only accepted overlay
+        // adds real existing scopes without contaminating later static planning.
+        if let Some(owner) = self.scopes[scope].owner {
+            if let Some(plan) = self.effective_dynamic_plan() {
+                for target in plan.added_bases.get(&owner).into_iter().flatten() {
+                    if let Some(&target_scope) = self.elem_scope.get(target) {
+                        if target_scope != scope && !bases.contains(&target_scope) {
+                            bases.push(target_scope);
+                        }
+                    }
+                }
+            }
+        }
+        (bases, explicit)
     }
 
     fn base_scopes_uncached(&mut self, s: usize) -> (Vec<usize>, usize) {
@@ -6694,10 +8567,52 @@ impl Builder {
         // A base name must never resolve to the element being specialized
         // itself (its effective name may equal the base's name).
         let saved = self.exclude;
+        let saved_header = self.redefinition_lookup_owner.take();
+        let saved_header_base = self.redefinition_lookup_base.take();
         self.exclude = self.scopes[s].owner;
+        // A redefinition remains a base even when the declaring Type's
+        // filtered inherited view suppresses its target. Use the same header
+        // context as the stored relationship, not ordinary member lookup.
+        let redefinitions: Vec<_> = if let Some(owner) = self.scopes[s].owner.filter(|&owner| {
+            self.elements[owner]
+                .owned_relationships
+                .iter()
+                .any(|&r| self.elements[r].ty == "Redefinition")
+        }) {
+            if self.semantic_ready {
+                self.ensure_spec_index();
+                self.spec_index
+                    .as_ref()
+                    .unwrap()
+                    .get(&owner)
+                    .into_iter()
+                    .flatten()
+                    .filter(|&&i| self.spec_targets[i].1 == "Redefinition")
+                    .map(|&i| self.spec_targets[i].3.clone())
+                    .collect()
+            } else {
+                // Lowering can still append specialization declarations;
+                // never establish its permanent index from a partial prefix.
+                self.spec_targets
+                    .iter()
+                    .filter(|(source, kind, _, _)| *source == owner && *kind == "Redefinition")
+                    .map(|(_, _, _, qn)| qn.clone())
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        let header_owner = self.scopes[s]
+            .owner
+            .and_then(|owner| self.owner_elem(owner));
         // Fresh depth budget: the cache is permanent, so outcomes must not
         // depend on the first caller's recursion depth (see import_scopes).
         for qn in &bases {
+            self.redefinition_lookup_owner = redefinitions
+                .iter()
+                .any(|target| target == qn)
+                .then_some(header_owner)
+                .flatten();
             if let Some(elem) = self.resolve(from, qn, 0) {
                 if let Some(&sc) = self.elem_scope.get(&elem) {
                     if sc != s {
@@ -6706,6 +8621,8 @@ impl Builder {
                 }
             }
         }
+        self.redefinition_lookup_owner = None;
+        self.redefinition_lookup_base = None;
         // A chain-written base contributes the chain's *last* link: the
         // spine resolves like any reference (member steps in the previous
         // target's scope), and the landed feature's members are inherited.
@@ -6726,9 +8643,36 @@ impl Builder {
         let explicit = result.len();
         for qn in &implied_bases {
             if let Some(elem) = self.resolve(from, qn, 0) {
+                if let [package, member] = qn.segments.as_slice() {
+                    if let Some(role) = implied::binary_role_name(&package.value, &member.value) {
+                        if !self.binary_lookup_target(elem, role) {
+                            continue;
+                        }
+                    }
+                }
                 if let Some(&sc) = self.elem_scope.get(&elem) {
                     if sc != s && !result.contains(&sc) {
                         result.push(sc);
+                    }
+                }
+            }
+        }
+        // A parameter, end or result redefines its general's feature at the
+        // same position by implication (KerML
+        // `checkFeatureParameterRedefinition`, `checkFeatureEndRedefinition`,
+        // `checkFeatureResultRedefinition`), and a redefining feature inherits
+        // the members of what it redefines: `in q;` declared first under
+        // `action def Swapped :> A` reads the members of `A`'s first
+        // parameter, whatever that one is named. The pairing is read off the
+        // owning type's heritage here; the implied relationships materialize
+        // the same edges for the whole model later.
+        if let Some(feature) = self.scopes[s].owner {
+            if let Some(owner) = self.owner_elem(feature) {
+                for target in self.positional_redefinition_targets(feature, owner) {
+                    if let Some(&sc) = self.elem_scope.get(&target) {
+                        if sc != s && !result.contains(&sc) {
+                            result.push(sc);
+                        }
                     }
                 }
             }
@@ -6748,6 +8692,8 @@ impl Builder {
                 }
             }
         }
+        self.redefinition_lookup_owner = saved_header;
+        self.redefinition_lookup_base = saved_header_base;
         self.base_cache[s] = Some((result.clone(), explicit));
         (result, explicit)
     }
@@ -6756,10 +8702,9 @@ impl Builder {
     /// the resolver's own walk ([`Self::base_scopes_split`]) run for
     /// enumeration instead of name lookup. Returns
     /// `(member element, contributing scope)` pairs — the heritage scope
-    /// or import that made the member visible — in breadth-first heritage
-    /// order, members within a level in creation (document) order (the
-    /// lowest-numbered contributing scope wins a tie, so the pairs are
-    /// deterministic), plus the inherited **alias Membership**
+    /// or import that made the member visible — in direct-base order,
+    /// composing each base's public/protected contributions and already
+    /// filtered inheritance, plus the inherited **alias Membership**
     /// relationship indices from the heritage scopes and from every
     /// imported scope the walk visited, and whether a depth guard cut
     /// the walk short. Memoized per (scope, `include_implied`).
@@ -6783,22 +8728,24 @@ impl Builder {
     ///   retained (name lookup answers ambiguous; the memberships still
     ///   inherit);
     /// - `include_implied` extends the walk over the implied heritage
-    ///   (Tables 31/32 library bases, binary connector bases, implicit
-    ///   parameter redefinition, semantic metadata) at *every* level.
+    ///   (Tables 31/32 library bases, binary connector bases, positional
+    ///   parameter, end and result redefinitions, semantic metadata) at
+    ///   *every* level.
     ///
-    /// Deliberate deviations from the normative operation: member
-    /// *elements* are returned, not Membership relationships; the
-    /// `excluded` namespace/type parameters are not taken; alias
-    /// memberships are not enumerated (they denote members declared
-    /// elsewhere — resolve them through lookup). Nearer-level direct
-    /// redefinitions are pooled across heritage branches for the
-    /// intersection condition (the same cross-branch approximation
-    /// lookup's `drop_redefined_hits` makes).
+    /// Ordinary member identities and alias memberships are kept separately
+    /// internally, then projected to Membership handles by the public API.
+    /// Redefinition removal compares their distinct Membership identities;
+    /// aliases to Features participate as both candidates and blockers.
+    /// Acyclic inheritance is evaluated bottom-up without a depth cap;
+    /// cycles use a bounded partial walk and are reported as incomplete.
     pub(crate) fn inherited_bindings(
         &mut self,
         s: usize,
         include_implied: bool,
     ) -> Arc<InheritedBindings> {
+        if include_implied && self.semantic_ready {
+            self.ensure_positional_redefinitions();
+        }
         if let Some(hit) = self.inherited_cache.get(&(s, include_implied)) {
             return Arc::clone(hit);
         }
@@ -6817,7 +8764,10 @@ impl Builder {
                 && sc.imports.is_empty()
                 && sc.member_imports.is_empty()
                 && sc.aliases.is_empty()
-                && sc.implied_ends.is_empty())
+                && sc.implied_ends.is_empty()
+                && sc
+                    .owner
+                    .is_none_or(|e| self.owned_member_elems(e, false).is_empty()))
             .then(|| (self.base_scopes_split(s).0, include_implied))
         };
         let result = match heritage_key
@@ -6827,16 +8777,20 @@ impl Builder {
             Some(hit) => Arc::clone(hit),
             None => {
                 let result = Arc::new(self.inherited_bindings_uncached(s, include_implied));
-                if let Some(k) = heritage_key {
-                    self.inherited_by_heritage.insert(k, Arc::clone(&result));
+                if !result.truncated && !result.incomplete {
+                    if let Some(k) = heritage_key {
+                        self.inherited_by_heritage.insert(k, Arc::clone(&result));
+                    }
                 }
                 result
             }
         };
         self.used_imports = used_imports;
         self.query_imports = query_imports;
-        self.inherited_cache
-            .insert((s, include_implied), Arc::clone(&result));
+        if !result.truncated && !result.incomplete {
+            self.inherited_cache
+                .insert((s, include_implied), Arc::clone(&result));
+        }
         result
     }
 
@@ -6844,6 +8798,59 @@ impl Builder {
         &mut self,
         s: usize,
         include_implied: bool,
+    ) -> InheritedBindings {
+        // Build dependencies iteratively, then let each base contribute its
+        // already-filtered inherited memberships. Pooling raw ancestors loses
+        // removals made by intermediate types and changes positional ordering.
+        let mut state = HashMap::new();
+        let mut order = Vec::new();
+        let mut pending = vec![(s, false)];
+        while let Some((scope, exiting)) = pending.pop() {
+            if self.inherited_cache.contains_key(&(scope, include_implied)) {
+                continue;
+            }
+            if exiting {
+                state.insert(scope, 2);
+                order.push(scope);
+                continue;
+            }
+            match state.get(&scope) {
+                Some(2) => continue,
+                Some(1) => {
+                    let mut result = self.inherited_bindings_walk(s, include_implied, true);
+                    // Cycle exclusions depend on the requested root. Never
+                    // reuse a root-relative partial result as a base's closure.
+                    result.incomplete = true;
+                    return result;
+                }
+                _ => {}
+            }
+            state.insert(scope, 1);
+            pending.push((scope, true));
+            let (mut bases, explicit) = self.base_scopes_split(scope);
+            if !include_implied {
+                bases.truncate(explicit);
+            }
+            pending.extend(bases.into_iter().rev().map(|b| (b, false)));
+        }
+        let mut result = InheritedBindings::default();
+        for scope in order {
+            let value = self.inherited_bindings_walk(scope, include_implied, false);
+            if scope == s {
+                result = value;
+            } else {
+                self.inherited_cache
+                    .insert((scope, include_implied), Arc::new(value));
+            }
+        }
+        result
+    }
+
+    fn inherited_bindings_walk(
+        &mut self,
+        s: usize,
+        include_implied: bool,
+        recursive: bool,
     ) -> InheritedBindings {
         let heritage = |b: &mut Self, sc: usize| {
             let (all, explicit) = b.base_scopes_split(sc);
@@ -6854,24 +8861,49 @@ impl Builder {
             }
         };
         let mut visited: HashSet<usize> = HashSet::from([s]);
-        let mut level: Vec<usize> = heritage(self, s)
+        let mut pending: Vec<(usize, usize)> = heritage(self, s)
             .into_iter()
-            .filter(|&b| visited.insert(b))
+            .rev()
+            .map(|b| (b, 1))
             .collect();
-        // (element, contributing scope), breadth-first.
+        // (element, contributing scope), each direct base before the next.
         let mut collected: Vec<(usize, usize)> = Vec::new();
         let mut seen_elems: HashSet<usize> = HashSet::new();
         let mut alias_rels: Vec<usize> = Vec::new();
+        let mut membership_order = Vec::new();
         let mut truncated = false;
-        for _depth in 1..=MAX_RESOLUTION_DEPTH {
-            if level.is_empty() {
-                break;
+        let mut incomplete = false;
+        while let Some((base, depth)) = pending.pop() {
+            if visited.contains(&base) {
+                continue;
             }
-            // This level's visible bindings, deterministically ordered by
-            // element creation index, then contributing scope (HashMap
-            // iteration order must never reach the result).
+            if depth > MAX_RESOLUTION_DEPTH {
+                truncated = true;
+                continue;
+            }
+            visited.insert(base);
+            // Preserve direct-base order; order each base's own members by
+            // declaration, including members with no declared name.
             let mut found: Vec<(usize, usize)> = Vec::new();
-            for &b in &level {
+            {
+                let b = base;
+                let begin = found.len();
+                if let Some(owner) = self.scopes[b].owner {
+                    found.extend(
+                        self.owned_member_elems(owner, false)
+                            .into_iter()
+                            .filter(|&e| {
+                                self.elements[e].owning_relationship.is_none_or(|r| {
+                                    self.elements[r]
+                                        .props
+                                        .get("visibility")
+                                        .and_then(|v| v.as_str())
+                                        != Some("private")
+                                })
+                            })
+                            .map(|e| (e, b)),
+                    );
+                }
                 for map in [&self.scopes[b].names, &self.scopes[b].effective_names] {
                     for bindings in map.values() {
                         for binding in bindings {
@@ -6882,102 +8914,259 @@ impl Builder {
                         }
                     }
                 }
-                // Public imported memberships re-export through
-                // heritage (KerML nonPrivateMemberships); alias
-                // memberships inherit at inherited access.
-                let mut imported = InheritedBindings::default();
-                self.imported_bindings(b, include_implied, LookupAccess::Protected, &mut imported);
-                found.extend(imported.members);
-                alias_rels.extend(imported.alias_rels);
-                truncated |= imported.truncated;
-                self.scope_alias_rels(b, LookupAccess::Protected, &[], &mut alias_rels);
+                found[begin..].sort_by_key(|&(e, scope)| {
+                    let protected = self.elements[e].owning_relationship.is_some_and(|r| {
+                        self.elements[r]
+                            .props
+                            .get("visibility")
+                            .and_then(|v| v.as_str())
+                            == Some("protected")
+                    });
+                    (protected, e, scope)
+                });
+                // nonPrivateMemberships unions public owned/imported,
+                // protected owned/imported, then inherited memberships. An
+                // import's visibility controls admission, not its target's.
+                let owned = std::mem::take(&mut found);
+                for access in [LookupAccess::Public, LookupAccess::Protected] {
+                    let own: Vec<_> = owned
+                        .iter()
+                        .copied()
+                        .filter(|&(e, _)| {
+                            self.elements[e]
+                                .owning_relationship
+                                .is_none_or(|r| self.import_admitted(r, access))
+                        })
+                        .collect();
+                    let mut own_order: Vec<_> = own
+                        .iter()
+                        .filter_map(|&(e, _)| self.elements[e].owning_relationship)
+                        .collect();
+                    let mut aliases = Vec::new();
+                    self.scope_alias_rels(b, access, &[], &mut aliases);
+                    own_order.extend(aliases.iter().copied());
+                    own_order.sort_unstable();
+                    own_order.dedup();
+                    membership_order.extend(own_order);
+                    alias_rels.extend(aliases);
+                    found.extend(own);
+                    let mut imported = InheritedBindings::default();
+                    membership_order.extend(self.imported_bindings(
+                        b,
+                        include_implied,
+                        access,
+                        &mut imported,
+                    ));
+                    found.extend(imported.members);
+                    alias_rels.extend(imported.alias_rels);
+                    truncated |= imported.truncated;
+                    incomplete |= imported.incomplete;
+                }
+                if !recursive {
+                    if let Some(inherited) = self.inherited_cache.get(&(b, include_implied)) {
+                        membership_order.extend(inherited.membership_order.iter().copied());
+                        found.extend(inherited.members.iter().copied());
+                        alias_rels.extend(inherited.alias_rels.iter().copied());
+                        truncated |= inherited.truncated;
+                        incomplete |= inherited.incomplete;
+                    }
+                }
             }
-            found.sort_unstable();
             for (elem, scope) in found {
                 if seen_elems.insert(elem) {
                     collected.push((elem, scope));
                 }
             }
-            level = level
-                .clone()
-                .into_iter()
-                .flat_map(|b| heritage(self, b))
-                .filter(|&b| visited.insert(b))
-                .collect();
+            if recursive {
+                pending.extend(
+                    heritage(self, base)
+                        .into_iter()
+                        .rev()
+                        .map(|b| (b, depth + 1)),
+                );
+            }
         }
-        // Heritage still pending after the last level means the budget,
-        // not the model, ended the walk.
-        truncated |= !level.is_empty();
-        // Redefinition-driven removal (KerML removeRedefinedFeatures +
-        // the owned-features intersection condition + SysML implicit
-        // same-name usage redefinition). Owned members participate as
-        // depth 0.
-        let owned: Vec<usize> = {
-            let mut o: Vec<usize> = self.scopes[s]
-                .names
-                .values()
-                .chain(self.scopes[s].effective_names.values())
-                .flatten()
-                .map(|b| b.elem)
-                .collect();
-            o.sort_unstable();
-            o.dedup();
-            o
-        };
-        // (a) KerML removeRedefinedFeatures, first condition: a candidate
-        //     included in the redefined Features of *another inherited
-        //     candidate* (its member plus everything it transitively
-        //     redefines) is removed. Owned features do not seed this
-        //     condition — they act through condition (b) only.
-        let mut shadow: HashSet<usize> = HashSet::new();
-        let mut closures: HashMap<usize, HashSet<usize>> = HashMap::new();
-        for &(e, _) in &collected {
-            let mut cl = HashSet::new();
-            let mut stack = self.indexed_redefinition_targets(e);
-            while let Some(t) = stack.pop() {
-                if cl.insert(t) {
-                    stack.extend(self.indexed_redefinition_targets(t));
+        self.reduce_inherited_bindings(
+            self.scopes[s].owner,
+            include_implied,
+            InheritedBindings {
+                members: collected,
+                alias_rels,
+                membership_order,
+                truncated,
+                incomplete,
+                implicit_redefinitions: Vec::new(),
+            },
+            None,
+        )
+    }
+
+    /// Preserve compatibility bookkeeping around the shared identity reducer.
+    fn reduce_inherited_bindings(
+        &mut self,
+        owner: Option<usize>,
+        include_implied: bool,
+        mut candidates: InheritedBindings,
+        steps: Option<&mut usize>,
+    ) -> InheritedBindings {
+        let reduced = self.reduce_membership_projection(
+            owner,
+            include_implied,
+            MembershipProjection {
+                membership_order: std::mem::take(&mut candidates.membership_order),
+                truncated: candidates.truncated,
+                incomplete: candidates.incomplete,
+                implicit_redefinitions: Vec::new(),
+            },
+            steps,
+        );
+        let retained: HashSet<_> = reduced.membership_order.iter().copied().collect();
+        let mut seen_members = HashSet::new();
+        candidates.members.retain(|(member, _)| {
+            self.elements[*member]
+                .owning_relationship
+                .is_some_and(|membership| retained.contains(&membership))
+                && seen_members.insert(*member)
+        });
+        let mut seen_aliases = HashSet::new();
+        candidates
+            .alias_rels
+            .retain(|membership| retained.contains(membership) && seen_aliases.insert(*membership));
+        candidates.membership_order = reduced.membership_order;
+        candidates.truncated = reduced.truncated;
+        candidates.incomplete = reduced.incomplete;
+        candidates.implicit_redefinitions = reduced.implicit_redefinitions;
+        candidates
+    }
+
+    /// One redefinition reducer for global and context-sensitive candidates.
+    fn reduce_membership_projection(
+        &mut self,
+        owner: Option<usize>,
+        include_implied: bool,
+        candidates: MembershipProjection,
+        mut steps: Option<&mut usize>,
+    ) -> MembershipProjection {
+        let MembershipProjection {
+            mut membership_order,
+            truncated,
+            mut incomplete,
+            ..
+        } = candidates;
+        macro_rules! charge {
+            ($count:expr) => {
+                if let Some(steps) = steps.as_deref_mut() {
+                    *steps = steps.saturating_add($count);
+                    if *steps > crate::eval::MAX_STEPS {
+                        return MembershipProjection {
+                            truncated: true,
+                            incomplete: true,
+                            ..Default::default()
+                        };
+                    }
                 }
-            }
-            shadow.extend(cl.iter().copied());
-            closures.insert(e, cl);
+            };
         }
-        // (b) Intersection condition (KerML removeRedefinedFeatures,
-        //     second condition — owned features only): an inherited
-        //     member whose redefinition closure meets a feature
-        //     *directly* redefined by an **owned** feature is not
-        //     inherited (owned `z :>> A::x` removes the sibling
-        //     `y :>> x` arriving from farther up). Redefiners inherited
-        //     from unrelated branches never suppress one another.
-        let mut owned_direct: HashSet<usize> = HashSet::new();
+        charge!(membership_order.len());
+        if include_implied {
+            incomplete |= owner.is_some_and(|e| {
+                !self.dynamic_evidence_current(e)
+                    || self
+                        .effective_positional_redefinitions()
+                        .is_some_and(|plan| plan.incomplete.contains(&e))
+            });
+        }
+        // An empty inherited projection cannot be shadowed by an owned member.
+        // Keep the readiness side effect of the ordinary path when planning
+        // has not yet run; once ready, no owned-feature scan is necessary.
+        if membership_order.is_empty()
+            && (!include_implied
+                || !self.semantic_ready
+                || self.effective_positional_redefinitions().is_some())
+        {
+            return MembershipProjection {
+                membership_order,
+                truncated,
+                incomplete,
+                implicit_redefinitions: Vec::new(),
+            };
+        }
+        // Membership identity, not memberElement identity, distinguishes
+        // contributors. Resolve each unique relationship's target once; the
+        // same target may intentionally participate through distinct aliases.
+        let mut seen_memberships = HashSet::new();
+        membership_order.retain(|m| seen_memberships.insert(*m));
+        let resolved: Vec<_> = membership_order
+            .iter()
+            .map(|&membership| (membership, self.stored_membership_member(membership)))
+            .collect();
+        let mut seen_members = HashSet::new();
+        let collected: Vec<_> = resolved
+            .iter()
+            .filter_map(|&(membership, member)| {
+                let member = member?;
+                (self.elements[member].owning_relationship == Some(membership)
+                    && seen_members.insert(member))
+                .then_some(member)
+            })
+            .collect();
+        let mut feature_memberships: HashMap<usize, usize> = HashMap::new();
+        for &(_, member) in &resolved {
+            charge!(1);
+            if let Some(e) = member {
+                if crate::metaclass::conforms(self.elements[e].ty, "Feature") {
+                    *feature_memberships.entry(e).or_default() += 1;
+                }
+            } else {
+                incomplete = true;
+            }
+        }
+        // Only actual owned Features seed the direct-target intersection.
+        // An owned alias of a redefining Feature is not an ownedFeature.
+        let owned = owner
+            .map(|owner| self.owned_member_elems(owner, true))
+            .unwrap_or_default();
+        let mut owned_direct = HashSet::new();
         for &e in &owned {
-            owned_direct.extend(self.indexed_redefinition_targets(e));
+            charge!(1);
+            owned_direct.extend(self.semantic_redefinition_targets(e, include_implied));
         }
-        for &(e, _) in &collected {
-            if shadow.contains(&e) {
-                continue;
+        let mut shadow = HashSet::new();
+        // Reuse traversal storage; closures are consumed immediately rather
+        // than retained once per Feature. Every candidate remains a blocker
+        // even when another candidate or an owned Feature removes it.
+        let mut closure = HashSet::new();
+        let mut stack = Vec::new();
+        for (&e, &count) in &feature_memberships {
+            closure.clear();
+            stack.push(e);
+            let mut intersects_owned = false;
+            while let Some(t) = stack.pop() {
+                charge!(1);
+                if !closure.insert(t) {
+                    continue;
+                }
+                // Exclude only the candidate's own Membership, including in
+                // a cycle. Another Membership of the same Feature still counts.
+                if t != e || count > 1 {
+                    shadow.insert(t);
+                }
+                intersects_owned |= owned_direct.contains(&t);
+                stack.extend(self.semantic_redefinition_targets(t, include_implied));
             }
-            // The member itself counts among its redefined Features
-            // (OCL allRedefinedFeaturesOf includes the memberElement).
-            if owned_direct.contains(&e) {
-                shadow.insert(e);
-                continue;
-            }
-            let Some(cl) = closures.get(&e) else { continue };
-            if cl.iter().any(|t| owned_direct.contains(t)) {
+            if intersects_owned {
                 shadow.insert(e);
             }
         }
         // (c) SysML implicit same-name usage redefinition: a usage-family
         //     member whose owning type strictly conforms over another
         //     candidate's owner redefines the same-named candidate
-        //     without a spelled `:>>`.
+        //     without a spelled `:>>`. Not a parameter of a behavior or
+        //     step, a result or an end: those redefine by position
+        //     (`redefines_by_position`), and a reused name at another
+        //     position is a collision, not a redefinition.
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        for e in owned
-            .iter()
-            .copied()
-            .chain(collected.iter().map(|&(e, _)| e))
-        {
+        for e in owned.iter().copied().chain(collected.iter().copied()) {
             // Both spellings share the lookup name space: a short name can
             // shadow (or be shadowed by) a declared name, as in lookup.
             for key in ["declaredName", "declaredShortName"] {
@@ -6990,13 +9179,17 @@ impl Builder {
         let mut implicit_redefinitions: Vec<(usize, usize)> = Vec::new();
         for group in groups {
             for &x in &group {
-                if !self.elements[x].ty.ends_with("Usage") || shadow.contains(&x) {
+                if !self.elements[x].ty.ends_with("Usage")
+                    || shadow.contains(&x)
+                    || self.redefines_by_position(x)
+                {
                     continue;
                 }
                 let Some(ox) = self.owner_elem(x) else {
                     continue;
                 };
                 for &y in &group {
+                    charge!(1);
                     if x == y || shadow.contains(&y) {
                         continue;
                     }
@@ -7010,16 +9203,18 @@ impl Builder {
                 }
             }
         }
-        let members = collected
-            .into_iter()
-            .filter(|&(e, _)| !shadow.contains(&e))
-            .collect();
+        membership_order.clear();
+        membership_order.extend(resolved.into_iter().filter_map(|(membership, member)| {
+            member
+                .is_none_or(|member| !shadow.contains(&member))
+                .then_some(membership)
+        }));
         implicit_redefinitions.sort_unstable();
         implicit_redefinitions.dedup();
-        InheritedBindings {
-            members,
-            alias_rels,
+        MembershipProjection {
+            membership_order,
             truncated,
+            incomplete,
             implicit_redefinitions,
         }
     }
@@ -7031,53 +9226,186 @@ impl Builder {
     /// `nonPrivateMemberships`), `All` for the namespace's own
     /// `importedMembership` (every owned import, whatever its
     /// visibility). Member elements, alias Membership relationship
-    /// indices and the truncation flag land in `out`.
+    /// indices and the truncation flag land in `out`; the returned indices
+    /// retain Membership discovery order for the ordered import closure.
     fn imported_bindings(
         &mut self,
         b: usize,
         include_implied: bool,
         admitted: LookupAccess,
         out: &mut InheritedBindings,
-    ) {
-        let member_imports = self.scopes[b].member_imports.clone();
-        for entry in member_imports {
-            if !self.import_admitted(entry.relationship, admitted) {
+    ) -> Vec<usize> {
+        let mut context = MembershipContext::default();
+        self.imported_bindings_with_context(b, include_implied, admitted, out, &mut context)
+    }
+
+    fn imported_bindings_with_context(
+        &mut self,
+        b: usize,
+        include_implied: bool,
+        admitted: LookupAccess,
+        out: &mut InheritedBindings,
+        context: &mut MembershipContext,
+    ) -> Vec<usize> {
+        if include_implied && self.semantic_ready {
+            self.ensure_positional_redefinitions();
+        }
+        let mut order = Vec::new();
+        let mut seen = HashMap::new();
+        let mut excluded = vec![b];
+        self.collect_import_edges(
+            b,
+            admitted,
+            include_implied,
+            &[],
+            &mut excluded,
+            &mut seen,
+            out,
+            &mut order,
+            0,
+            admitted == LookupAccess::All,
+            context,
+        );
+        if admitted == LookupAccess::All {
+            // Namespace::importedMemberships is distinct from the raw
+            // visibility-specific operation used for re-export/inheritance.
+            if let Some(owner) = self.scopes[b].owner {
+                let (retained, incomplete) = self.distinguishable_import_memberships(owner, order);
+                order = retained;
+                out.incomplete |= incomplete;
+            }
+            // Package::importedMemberships filters the Namespace result.
+            let filters = self.scopes[b].filters.clone();
+            order.retain(|&rel| {
+                self.stored_membership_member(rel)
+                    .is_none_or(|member| self.import_filter_set_admits(&filters, member))
+            });
+            let retained: HashSet<_> = order.iter().copied().collect();
+            out.members.retain(|&(element, _)| {
+                self.elements[element]
+                    .owning_relationship
+                    .is_some_and(|rel| retained.contains(&rel))
+            });
+            out.alias_rels.retain(|rel| retained.contains(rel));
+        }
+        order
+    }
+
+    /// Import relationships in declaration order. A recursive membership
+    /// import contributes its Membership before its namespace traversal.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_import_edges(
+        &mut self,
+        sc: usize,
+        access: LookupAccess,
+        include_implied: bool,
+        chain: &[(usize, Vec<usize>)],
+        excluded: &mut Vec<usize>,
+        seen: &mut HashMap<ImportVisit, ImportProjection>,
+        out: &mut InheritedBindings,
+        order: &mut Vec<usize>,
+        depth: usize,
+        defer_package_filters: bool,
+        context: &mut MembershipContext,
+    ) -> Option<Vec<usize>> {
+        if !context.charge(1 + self.scopes[sc].member_imports.len() + self.scopes[sc].imports.len())
+        {
+            out.incomplete = true;
+            out.truncated = true;
+            return None;
+        }
+        let members = self.scopes[sc].member_imports.clone();
+        let namespaces = self.import_scopes(sc);
+        let resolved_imports: HashSet<_> =
+            namespaces.iter().map(|entry| entry.relationship).collect();
+        if self.scopes[sc].imports.iter().any(|entry| {
+            self.import_admitted(entry.relationship, access)
+                && !resolved_imports.contains(&entry.relationship)
+        }) {
+            out.incomplete = true;
+        }
+        let mut entries: Vec<_> = members
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.relationship, false, i))
+            .chain(
+                namespaces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (e.relationship, true, i)),
+            )
+            .collect();
+        entries.sort_unstable();
+        let mut blocked = Vec::new();
+        let mut complete = true;
+        for (rel, namespace, i) in entries {
+            if !self.import_admitted(rel, access) {
                 continue;
             }
-            if let Some(elem) = self.resolve(b, &entry.target, 0) {
-                if self.filters_admit(b, &entry.filters, elem, 0) {
-                    out.members.push((elem, b));
+            if namespace {
+                let entry = &namespaces[i];
+                let sub_access = if entry.is_import_all {
+                    LookupAccess::All
+                } else {
+                    LookupAccess::Public
+                };
+                let mut chain2 = chain.to_vec();
+                let mut filters = entry.filters.clone();
+                if !defer_package_filters {
+                    filters.extend_from_slice(&self.scopes[sc].filters);
+                }
+                chain2.push((sc, filters));
+                match self.collect_import_scope(
+                    excluded,
+                    entry.scope,
+                    sub_access,
+                    entry.recursive,
+                    include_implied,
+                    &chain2,
+                    seen,
+                    out,
+                    order,
+                    depth,
+                    context,
+                ) {
+                    Some(bounds) => blocked.extend(bounds),
+                    None => complete = false,
+                }
+            } else {
+                let entry = &members[i];
+                let origin = self.set_identity_origin(entry.relationship);
+                let resolved = self.resolve_result(sc, &entry.target, 0, entry.is_import_all);
+                self.identity_origin_unit = origin;
+                if let LookupResult::Found(elem, _, membership) = resolved {
+                    let local_filters = self.scopes[sc].filters.clone();
+                    if self.import_filter_set_admits(&entry.filters, elem)
+                        && (defer_package_filters
+                            || self.import_filter_set_admits(&local_filters, elem))
+                        && self.chain_admits(chain, elem)
+                    {
+                        if let Some(rel) = membership {
+                            out.alias_rels.push(rel);
+                        } else {
+                            out.members.push((elem, sc));
+                        }
+                        if let Some(rel) = membership.or(self.elements[elem].owning_relationship) {
+                            order.push(rel);
+                        } else {
+                            out.incomplete = true;
+                        }
+                    }
+                } else {
+                    out.incomplete = true;
                 }
             }
         }
-        let mut seen: HashSet<ImportVisit> = HashSet::new();
-        for entry in self.import_scopes(b) {
-            if !self.import_admitted(entry.relationship, admitted) {
-                continue;
-            }
-            let access = if entry.is_import_all {
-                LookupAccess::All
-            } else {
-                LookupAccess::Public
-            };
-            let chain = vec![(b, entry.filters.clone())];
-            self.collect_import_scope(
-                entry.scope,
-                access,
-                entry.recursive,
-                include_implied,
-                &chain,
-                &mut seen,
-                out,
-                0,
-            );
-        }
+        complete.then_some(blocked)
     }
 
     /// Enumerate what one namespace-import edge makes visible in scope
     /// `sc` — the faithful mirror of `lookup_at` + `lookup_recursive`
     /// over that scope:
-    /// - own (and effective-)named bindings admitted by `access`;
+    /// - owned memberships, including unnamed members, admitted by `access`;
     /// - alias memberships admitted by `access`;
     /// - the scope's own member imports and namespace re-exports, each
     ///   under **its own** policy (filters, `import all`, `::**`) — an
@@ -7086,129 +9414,144 @@ impl Builder {
     /// - the scope's heritage (`base_scopes`), at inherited access —
     ///   lookup resolves inherited members through an import, so
     ///   enumeration follows;
-    /// - for `::**` (`recursive`), descent into owned named members'
-    ///   scopes only — exactly `lookup_recursive`'s traversal.
+    /// - for `::**` (`recursive`), descent into owned members' scopes.
     #[allow(clippy::too_many_arguments)]
     fn collect_import_scope(
         &mut self,
+        excluded: &mut Vec<usize>,
         sc: usize,
         access: LookupAccess,
         recursive: bool,
         include_implied: bool,
         chain: &[(usize, Vec<usize>)],
-        seen: &mut HashSet<ImportVisit>,
+        seen: &mut HashMap<ImportVisit, ImportProjection>,
         out: &mut InheritedBindings,
+        order: &mut Vec<usize>,
         depth: usize,
-    ) {
+        context: &mut MembershipContext,
+    ) -> Option<Vec<usize>> {
+        // Namespace::importedMemberships seeds excluded with itself.
+        // This exclusion is independent of access, recursion and filters.
+        if !context.charge(1) {
+            out.incomplete = true;
+            out.truncated = true;
+            return None;
+        }
+        let is_excluded = excluded.contains(&sc);
+        if !context.namespace_test(sc, is_excluded) {
+            out.incomplete = true;
+            out.truncated = true;
+            return None;
+        }
+        if is_excluded {
+            return Some(vec![sc]);
+        }
         // The filter chain is part of the visit key: a scope first reached
         // through a filtered path must still be visited through an
         // unfiltered one, whatever the import order.
         let mut signature: Vec<(usize, usize)> = chain
             .iter()
-            .flat_map(|(scope, filters)| {
-                // The import's bracket filters plus the importing scope's own
-                // `filter` members, which `filters_admit` applies as well.
-                filters
-                    .iter()
-                    .chain(self.scopes[*scope].filters.iter())
-                    .map(move |&f| (*scope, f))
-            })
+            .flat_map(|(scope, filters)| filters.iter().map(move |&f| (*scope, f)))
             .collect();
         signature.sort_unstable();
         signature.dedup();
         let key: ImportVisit = (sc, access as u8, recursive, signature);
-        if seen.contains(&key) {
-            return;
+        // Redefinition removal is nonmonotonic in namespace exclusions.
+        // Reuse only when every consulted inclusion/exclusion decision agrees,
+        // rather than assuming that more exclusions can only remove results.
+        if let Some(visit) = seen.get(&key) {
+            if context.reuse_namespace(visit, excluded) {
+                return Some(visit.blocked.clone());
+            }
         }
         // A cut visit is not recorded, so a shorter path found later can
         // still complete it; only a genuinely new visit counts as a cut.
         if depth > MAX_RESOLUTION_DEPTH {
             out.truncated = true;
-            return;
+            return None;
         }
-        seen.insert(key);
-        let mut candidates: Vec<usize> = Vec::new();
-        for map in [&self.scopes[sc].names, &self.scopes[sc].effective_names] {
-            for bindings in map.values() {
-                for binding in bindings {
-                    if access.admits(binding.visibility) {
-                        candidates.push(binding.elem);
-                    }
-                }
-            }
+        context.begin_namespace(excluded);
+        excluded.push(sc);
+        let mut blocked = Vec::new();
+        let mut complete = true;
+        let own_cost = self.scopes[sc]
+            .owner
+            .map_or(0, |owner| self.elements[owner].owned_relationships.len());
+        if !context.charge(own_cost + self.scopes[sc].aliases.len()) {
+            excluded.pop();
+            context.finish_namespace(Vec::new());
+            out.incomplete = true;
+            out.truncated = true;
+            return None;
         }
+        // Visibility is a property of Memberships, including unnamed ones;
+        // lookup's name index alone cannot enumerate this collection.
+        let mut candidates: Vec<usize> = if let Some(owner) = self.scopes[sc].owner {
+            self.owned_member_elems(owner, false)
+                .into_iter()
+                .filter(|&elem| {
+                    self.elements[elem]
+                        .owning_relationship
+                        .is_some_and(|rel| self.import_admitted(rel, access))
+                })
+                .collect()
+        } else {
+            self.scopes[sc]
+                .names
+                .values()
+                .chain(self.scopes[sc].effective_names.values())
+                .flatten()
+                .filter(|b| access.admits(b.visibility))
+                .map(|b| b.elem)
+                .collect()
+        };
         candidates.sort_unstable();
         candidates.dedup();
+        let mut subs: Vec<usize> = if recursive {
+            candidates
+                .iter()
+                .filter_map(|e| self.elem_scope.get(e).copied())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut own_memberships = Vec::new();
         for elem in candidates {
             if self.chain_admits(chain, elem) {
                 out.members.push((elem, sc));
-            }
-        }
-        self.scope_alias_rels(sc, access, chain, &mut out.alias_rels);
-        let member_imports = self.scopes[sc].member_imports.clone();
-        for entry in member_imports {
-            if !self.import_admitted(entry.relationship, access) {
-                continue;
-            }
-            if let Some(elem) = self.resolve(sc, &entry.target, 0) {
-                if self.filters_admit(sc, &entry.filters, elem, 0) && self.chain_admits(chain, elem)
-                {
-                    out.members.push((elem, sc));
+                if let Some(rel) = self.elements[elem].owning_relationship {
+                    own_memberships.push(rel);
                 }
             }
         }
-        for sub in self.import_scopes(sc) {
-            if !self.import_admitted(sub.relationship, access) {
-                continue;
-            }
-            let sub_access = if sub.is_import_all {
-                LookupAccess::All
-            } else {
-                LookupAccess::Public
-            };
-            let mut chain2 = chain.to_vec();
-            chain2.push((sc, sub.filters.clone()));
-            self.collect_import_scope(
-                sub.scope,
-                sub_access,
-                sub.recursive,
-                include_implied,
-                &chain2,
-                seen,
-                out,
-                depth + 1,
-            );
-        }
-        let (bases, explicit) = self.base_scopes_split(sc);
-        let bases = if include_implied {
-            bases
-        } else {
-            bases[..explicit].to_vec()
-        };
-        for base in bases {
-            self.collect_import_scope(
-                base,
-                access.inherited(),
-                false,
-                include_implied,
-                chain,
-                seen,
-                out,
-                depth + 1,
-            );
+        let alias_start = out.alias_rels.len();
+        self.scope_alias_rels(sc, access, chain, &mut out.alias_rels);
+        own_memberships.extend_from_slice(&out.alias_rels[alias_start..]);
+        own_memberships.sort_unstable();
+        own_memberships.dedup();
+        order.extend(own_memberships);
+        match self.collect_import_edges(
+            sc,
+            access,
+            include_implied,
+            chain,
+            excluded,
+            seen,
+            out,
+            order,
+            depth + 1,
+            false,
+            context,
+        ) {
+            Some(bounds) => blocked.extend(bounds),
+            None => complete = false,
         }
         if recursive {
-            let mut subs: Vec<usize> = self.scopes[sc]
-                .names
-                .values()
-                .flatten()
-                .filter(|b| access.admits(b.visibility))
-                .filter_map(|b| b.sub_scope)
-                .collect();
             subs.sort_unstable();
             subs.dedup();
             for sub in subs {
-                self.collect_import_scope(
+                let result = self.collect_import_scope(
+                    excluded,
                     sub,
                     access,
                     true,
@@ -7216,17 +9559,84 @@ impl Builder {
                     chain,
                     seen,
                     out,
+                    order,
                     depth + 1,
+                    context,
                 );
+                match result {
+                    Some(bounds) => blocked.extend(bounds),
+                    None => complete = false,
+                }
             }
         }
+        if self.scopes[sc]
+            .owner
+            .is_some_and(|owner| crate::metaclass::conforms(self.elements[owner].ty, "Type"))
+        {
+            let family = context.new_type_family();
+            let inherited = self.contextual_inherited_bindings(
+                self.scopes[sc].owner.expect("checked Type owner"),
+                include_implied && !recursive,
+                excluded,
+                &[],
+                family,
+                context,
+                0,
+            );
+            out.truncated |= inherited.truncated;
+            out.incomplete |= inherited.incomplete;
+            complete &= !inherited.truncated;
+            for &membership in &inherited.membership_order {
+                if !context.charge(1) {
+                    out.incomplete = true;
+                    out.truncated = true;
+                    complete = false;
+                    break;
+                }
+                if !self.import_admitted(membership, access) {
+                    continue;
+                }
+                let Some(element) = self.stored_membership_member(membership) else {
+                    out.incomplete = true;
+                    continue;
+                };
+                if !self.chain_admits(chain, element) {
+                    continue;
+                }
+                if self.elements[element].owning_relationship == Some(membership) {
+                    out.members.push((element, sc));
+                } else {
+                    out.alias_rels.push(membership);
+                }
+                order.push(membership);
+            }
+        }
+        excluded.pop();
+        if !complete {
+            context.finish_namespace(Vec::new());
+            return None;
+        }
+        // This visit always excludes itself; only caller-supplied boundary
+        // exclusions affect whether its completed result is reusable.
+        blocked.retain(|&s| s != sc);
+        blocked.sort_unstable();
+        blocked.dedup();
+        let visit = context.finish_namespace(blocked.clone());
+        seen.insert(key, visit);
+        Some(blocked)
     }
 
     /// Every filter set along an import path admits `elem`.
     fn chain_admits(&mut self, chain: &[(usize, Vec<usize>)], elem: usize) -> bool {
         chain
             .iter()
-            .all(|(scope, filters)| self.filters_admit(*scope, filters, elem, 0))
+            .all(|(_, filters)| self.import_filter_set_admits(filters, elem))
+    }
+
+    fn import_filter_set_admits(&mut self, filters: &[usize], elem: usize) -> bool {
+        filters
+            .iter()
+            .all(|&filter| self.filter_verdict(filter, elem, 0) != Tri::False)
     }
 
     /// Alias Membership relationships of scope `sc` admitted by `access`
@@ -7363,9 +9773,16 @@ impl Builder {
     /// `declared_only` (the memo must not capture a mode-dependent miss).
     fn semantic_metadata_elem(&mut self) -> Option<usize> {
         if let Some(memo) = self.semantic_metadata {
+            Self::note_fill_misses(
+                &mut self.current_misses,
+                &self.fill_frames,
+                Some(&self.semantic_metadata_misses),
+            );
             return memo;
         }
+        self.begin_fill();
         let r = self.resolve(0, &lib_qn("Metaobjects::SemanticMetadata"), 0);
+        self.semantic_metadata_misses = self.end_fill();
         self.semantic_metadata = Some(r);
         r
     }
@@ -7398,8 +9815,14 @@ impl Builder {
             // must land on the *inherited* x, not the redefining part's
             // own registered name — a plain re-resolve self-loops there).
             let recorded = self.spec_resolved.get(i).copied().flatten();
+            self.note_spec_misses([i]);
             let t = match recorded {
                 Some(t) => Some(t),
+                // Redefinition resolution is identity-bound: its original
+                // exclusion/header/callee-chain context cannot be recreated
+                // by an ordinary lexical lookup. An unresolved outcome stays
+                // missing, including a named argument with a lexical namesake.
+                None if self.spec_targets[i].1 == "Redefinition" => None,
                 None => {
                     let (_, _, scope, qn) = self.spec_targets[i].clone();
                     self.resolve(scope, &qn, 0)
@@ -7512,7 +9935,14 @@ impl Builder {
         for i in indices {
             let (_, kind, scope, qn) = self.spec_targets[i].clone();
             if kind == "FeatureTyping" {
-                if let Some(t) = self.resolve(scope, &qn, 0) {
+                self.note_spec_misses([i]);
+                let target = self
+                    .spec_resolved
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .or_else(|| self.resolve(scope, &qn, 0));
+                if let Some(t) = target {
                     if !out.contains(&t) {
                         out.push(t);
                     }
@@ -7537,6 +9967,7 @@ impl Builder {
         let mut out = Vec::new();
         for i in indices {
             if self.spec_targets[i].1 == "Redefinition" {
+                self.note_spec_misses([i]);
                 if let Some(t) = self.spec_resolved.get(i).copied().flatten() {
                     if t != e && !out.contains(&t) {
                         out.push(t);
@@ -7547,6 +9978,97 @@ impl Builder {
         out
     }
 
+    /// Find the local multiplicity, declining an invalid second declaration.
+    /// Body constraints participate even if their ranges are not indexed.
+    pub(crate) fn local_multiplicity(&self, e: usize) -> Option<Option<usize>> {
+        let mut members = self.elements[e]
+            .owned_relationships
+            .iter()
+            .filter(|&&r| crate::metaclass::conforms(self.elements[r].ty, "Membership"))
+            .flat_map(|&r| self.elements[r].children.iter())
+            .filter(|&&child| crate::metaclass::conforms(self.elements[child].ty, "Multiplicity"))
+            .copied();
+        let first = members.next();
+        members.next().is_none().then_some(first)
+    }
+
+    /// Reuse the supported positional redefinition graph for parameters and
+    /// connector ends. Incomplete owner heritage cannot establish bounds.
+    pub(crate) fn cardinality_positional_targets(
+        &mut self,
+        e: usize,
+        steps: &mut usize,
+    ) -> Option<Vec<usize>> {
+        if !self.dynamic_evidence_current(e) {
+            return None;
+        }
+        if (self.is_parameter(e)
+            || self.elements[e]
+                .props
+                .get("isEnd")
+                .and_then(|v| v.as_bool())
+                == Some(true))
+            && self.effective_positional_redefinitions().is_none()
+            && !self.ensure_positional_redefinitions_with_budget(steps)
+        {
+            return None;
+        }
+        let targets = self.completed_positional_targets(e)?;
+        *steps = steps.saturating_add(targets.len());
+        (*steps <= crate::eval::MAX_STEPS).then(|| targets.to_vec())
+    }
+
+    /// Read only a completed positional snapshot. Bounded readers borrow the
+    /// targets and charge before traversal without entering legacy planning.
+    fn completed_positional_targets(&self, e: usize) -> Option<&[usize]> {
+        if !self.dynamic_evidence_current(e) {
+            return None;
+        }
+        if !self.is_parameter(e)
+            && self.elements[e]
+                .props
+                .get("isEnd")
+                .and_then(|v| v.as_bool())
+                != Some(true)
+        {
+            return Some(&[]);
+        }
+        let plan = self.effective_positional_redefinitions()?;
+        if self
+            .owner_elem(e)
+            .is_some_and(|owner| plan.incomplete.contains(&owner))
+        {
+            return None;
+        }
+        Some(plan.targets.get(&e).map_or(&[][..], Vec::as_slice))
+    }
+
+    /// SysML's implicit singleton declaration applies only to structural usages
+    /// owned by a definition or usage, without explicit owned subsettings.
+    /// Call only after ruling out explicit bounds and owned subsettings.
+    pub(crate) fn default_cardinality(&self, e: usize) -> (i128, Option<i128>) {
+        let conforms = crate::metaclass::conforms;
+        let featured = self.owner_elem(e).is_some_and(|owner| {
+            let ty = self.elements[owner].ty;
+            conforms(ty, "Definition") || conforms(ty, "Usage")
+        });
+        if self.structural_usage(e) && featured {
+            (1, Some(1))
+        } else {
+            (0, None)
+        }
+    }
+
+    /// An attribute, port or item usage (connections excluded): the usages
+    /// SysML declares singletons when a definition or usage owns them.
+    pub(crate) fn structural_usage(&self, e: usize) -> bool {
+        let conforms = crate::metaclass::conforms;
+        let ty = self.elements[e].ty;
+        conforms(ty, "AttributeUsage")
+            || conforms(ty, "PortUsage")
+            || (conforms(ty, "ItemUsage") && !conforms(ty, "ConnectionUsage"))
+    }
+
     pub(crate) fn resolve_rest(
         &mut self,
         elem: usize,
@@ -7555,7 +10077,7 @@ impl Builder {
         depth: usize,
     ) -> Option<usize> {
         match self.resolve_rest_result(scope.unwrap_or(0), elem, scope, rest, depth, false) {
-            LookupResult::Found(found, _) => Some(found),
+            LookupResult::Found(found, _, _) => Some(found),
             LookupResult::Missing | LookupResult::Ambiguous => None,
         }
     }
@@ -7615,7 +10137,24 @@ impl Builder {
         allow_last_non_public: bool,
     ) -> LookupResult {
         if rest.is_empty() {
-            return LookupResult::Found(elem, scope);
+            return LookupResult::Found(elem, scope, None);
+        }
+        if let Some(id) = self.id_spelled_name(&rest[0]) {
+            if depth > MAX_RESOLUTION_DEPTH {
+                return LookupResult::Missing;
+            }
+            let Some(next) = self.element_index_of_uuid(id) else {
+                return LookupResult::Missing;
+            };
+            let next_scope = self.elem_scope.get(&next).copied();
+            return self.resolve_rest_result(
+                origin,
+                next,
+                next_scope,
+                &rest[1..],
+                depth + 1,
+                allow_last_non_public,
+            );
         }
         let Some(scope) = scope else {
             return LookupResult::Missing;
@@ -7630,14 +10169,20 @@ impl Builder {
             };
         let stamp = self.next_stamp();
         match self.lookup_at(scope, &rest[0].value, depth + 1, stamp, access) {
-            LookupResult::Found(next, next_scope) => self.resolve_rest_result(
-                origin,
-                next,
-                next_scope,
-                &rest[1..],
-                depth + 1,
-                allow_last_non_public,
-            ),
+            hit @ LookupResult::Found(next, next_scope, _) => {
+                if rest.len() == 1 {
+                    hit
+                } else {
+                    self.resolve_rest_result(
+                        origin,
+                        next,
+                        next_scope,
+                        &rest[1..],
+                        depth + 1,
+                        allow_last_non_public,
+                    )
+                }
+            }
             other => other,
         }
     }
@@ -7650,7 +10195,13 @@ fn qn_span(qn: &QualifiedName) -> Span {
     }
 }
 
-fn id_ref(id: Uuid) -> Value {
+/// A reference property value: the element with identity `id`.
+fn id_ref(id: Uuid) -> crate::properties::Atom {
+    crate::properties::Atom::reference(id)
+}
+
+/// A reference in interchange form.
+fn id_value(id: Uuid) -> Value {
     json!({ "@id": id.to_string() })
 }
 
@@ -7980,26 +10531,61 @@ fn member_names(m: &Member, out: &mut HashSet<String>) -> Option<()> {
     );
     if let Some(u) = member_usage(m) {
         if u.declaration.id.name.is_none() {
-            out.extend(effective_ref_name(&u.declaration));
+            out.extend(effective_ref_name(
+                &u.declaration,
+                matches!(
+                    u.kind,
+                    UsageKind::Perform | UsageKind::Exhibit | UsageKind::Include
+                ),
+                u.prefix.is_variant,
+            ));
         }
     }
     Some(())
 }
 
-fn user_member_names(members: &[Member], recursive: bool, out: &mut HashSet<String>) -> Option<()> {
+/// The names the members of a user namespace contribute to an import of
+/// it. Unless the import is `all`, a private or protected import in the
+/// namespace re-exports nothing to it.
+fn user_member_names(
+    members: &[Member],
+    recursive: bool,
+    import_all: bool,
+    out: &mut HashSet<String>,
+) -> Option<()> {
     for m in members {
+        if !import_all
+            && matches!(m.kind, MemberKind::Import(_))
+            && matches!(
+                m.visibility,
+                Some(Visibility::Private | Visibility::Protected)
+            )
+        {
+            continue;
+        }
         member_names(m, out)?;
         if recursive {
             if let Some(body) = member_body(m) {
-                user_member_names(body, true, out)?;
+                user_member_names(body, true, import_all, out)?;
             }
         }
     }
     Some(())
 }
 
-fn effective_ref_name(d: &FeatureDeclaration) -> Option<String> {
+fn effective_ref_name(
+    d: &FeatureDeclaration,
+    reference_chain: bool,
+    variant: bool,
+) -> Option<String> {
+    let named_reference = (reference_chain || variant)
+        && d.specializations
+            .iter()
+            .any(|s| matches!(s, FeatureSpecialization::References(_)));
     for s in &d.specializations {
+        if named_reference && !matches!(s, FeatureSpecialization::References(_)) {
+            continue;
+        }
         let target = match s {
             FeatureSpecialization::References(t) => Some(t),
             FeatureSpecialization::Redefines(ts) => ts.first(),
@@ -8008,7 +10594,12 @@ fn effective_ref_name(d: &FeatureDeclaration) -> Option<String> {
         if let Some(t) = target {
             let qn = match t {
                 TargetRef::Name(qn) => qn,
-                TargetRef::Chain(links) => links.last()?,
+                TargetRef::Chain(links)
+                    if reference_chain && matches!(s, FeatureSpecialization::References(_)) =>
+                {
+                    links.last()?
+                }
+                TargetRef::Chain(_) => return None,
             };
             return qn.segments.last().map(|n| n.value.clone());
         }
@@ -8083,7 +10674,7 @@ pub(crate) fn implicit_def_bases(kind: DefKind) -> &'static [&'static str] {
         DefKind::Connection => &["Connections::Connection"],
         DefKind::Interface => &["Interfaces::Interface"],
         DefKind::Allocation => &["Allocations::Allocation"],
-        DefKind::Flow => &["Flows::Flow"],
+        DefKind::Flow => &["Flows::MessageAction"],
         DefKind::Action => &["Actions::Action"],
         DefKind::State => &["States::StateAction"],
         DefKind::Calc => &["Calculations::Calculation"],
@@ -8107,7 +10698,8 @@ pub(crate) fn implicit_def_bases(kind: DefKind) -> &'static [&'static str] {
         DefKind::Interaction => &["Transfers::Transfer"],
         DefKind::DataType => &["Base::DataValue"],
         DefKind::Type | DefKind::Classifier => &["Base::Anything"],
-        DefKind::Extended | DefKind::Metaclass => &[],
+        DefKind::Metaclass => &["Metaobjects::Metaobject"],
+        DefKind::Extended => &[],
     }
 }
 
@@ -8123,7 +10715,7 @@ pub(crate) fn implicit_usage_bases(kind: UsageKind) -> &'static [&'static str] {
         UsageKind::Connection => &["Connections::connections"],
         UsageKind::Interface => &["Interfaces::interfaces"],
         UsageKind::Allocation => &["Allocations::allocations"],
-        UsageKind::Flow | UsageKind::Message => &["Flows::flows"],
+        UsageKind::Flow | UsageKind::Message => &["Flows::messages"],
         UsageKind::SuccessionFlow => &["Flows::successionFlows"],
         UsageKind::Action | UsageKind::Perform => &["Actions::actions"],
         UsageKind::Accept => &["Actions::acceptActions"],
@@ -8520,6 +11112,8 @@ pub struct SatisfactionInfo {
 /// entry point for semantic queries and expression evaluation.
 pub struct ResolvedModel {
     pub(crate) b: Builder,
+    /// Last publication observed by the derived-reader cache group.
+    semantic_publication_seen: publication::Revision,
     /// Relationship index → owning element, built lazily by
     /// [`Self::element_qualified_name`] (empty until first use).
     rel_owner: Vec<Option<usize>>,
@@ -8552,11 +11146,13 @@ pub struct ResolvedModel {
     external_names: HashMap<Uuid, String>,
     /// The same table inverted: qualified name → id.
     external_by_name: HashMap<String, Uuid>,
+    /// Qualified names with conflicting external identity or provenance
+    /// evidence. The compatibility lookup index remains available, but these
+    /// names cannot prove a designated model-level function identity.
+    external_ambiguous_names: HashSet<String>,
     /// Each external id's root package (the first segment of its
     /// qualified name) — which library package a function belongs to.
     external_package: HashMap<Uuid, String>,
-    /// The implied relationships, once materialized (`json/implied.rs`).
-    implied: Option<implied::ImpliedTable>,
     /// How the inheritance-aware families answer (`json/closures.rs`).
     closure_policy: ClosurePolicy,
     /// Scope → whether its import walk was truncated, per implied flag
@@ -8592,6 +11188,58 @@ impl ResolvedModel {
         Self::from_builder(b, model)
     }
 
+    pub(crate) fn source_compact_json(&self) -> Value {
+        self.b
+            .finish_range(self.b.lib_boundary, self.b.explicit_len())
+    }
+
+    /// Payload units retain their supplied flags even though their syntax was
+    /// reconstructed by the loader. Prepared library prefixes are textual.
+    pub(crate) fn canonical_text_end(&self, e: ElementRef) -> bool {
+        self.b.graph_format == crate::model::GraphFormat::CanonicalV3
+            && e.0 < self.b.explicit_len()
+            && self.b.elements.get(e.0).is_some_and(|row| {
+                metaclass_conforms(row.ty, "Usage")
+                    && row.props.get("isEnd").and_then(|v| v.as_bool()) == Some(true)
+                    && !self
+                        .b
+                        .payload_source_units
+                        .contains(&self.b.unit_of_elem(e.0))
+            })
+    }
+
+    /// Compatibility compact emission completes only proven textual defaults.
+    /// Unknown evidence remains syntax data; checked reads and strict export
+    /// expose the qualification instead of certifying that retained value.
+    fn completed_compact_range(&mut self, start: usize, end: usize) -> Value {
+        let mut compact = self.b.finish_range(start, end);
+        for (offset, row) in compact
+            .as_array_mut()
+            .expect("element array")
+            .iter_mut()
+            .enumerate()
+        {
+            if let Some(report) =
+                self.canonical_end_constant_with_budget(ElementRef(start + offset), 0)
+            {
+                if let Ok(value) = report.value {
+                    row["isConstant"] = json!(value);
+                }
+            }
+        }
+        compact
+    }
+
+    pub(crate) fn payload_owned_flag_anchor(&self, e: ElementRef) -> Option<(usize, String)> {
+        let row = self.b.elements.get(e.0)?;
+        let unit = self.b.unit_of_elem(e.0);
+        (e.0 >= self.b.lib_boundary
+            && e.0 < self.b.explicit_len()
+            && self.b.payload_source_units.contains(&unit)
+            && (row.path_parent.is_some() || !row.path.is_empty()))
+        .then(|| (unit, whole_path(&self.b.elements, e.0)))
+    }
+
     pub(crate) fn from_builder(mut b: Builder, model: &crate::model::Model) -> Self {
         // A user relationship can specialize a library feature without adding
         // a root name. Such a graph cannot reuse derived library quantities.
@@ -8612,22 +11260,26 @@ impl ResolvedModel {
                     .and_then(|key| e.props.get(key))
                     .and_then(|v| v.as_reference())
                     .is_some_and(|id| facts.contains_id(&id))
-                    || e.props
-                        .get("annotatedElement")
-                        .and_then(|v| v.as_array())
-                        .is_some_and(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_reference())
-                                .any(|id| facts.contains_id(&id))
-                        })
+                    || e.props.get("annotatedElement").is_some_and(|v| {
+                        v.as_reference().is_some_and(|id| facts.contains_id(&id))
+                            || v.as_array().is_some_and(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_reference())
+                                    .any(|id| facts.contains_id(&id))
+                            })
+                    })
             });
             if changed {
                 b.semantic_memo = Default::default();
             }
         }
         b.semantic_ready = true;
+        b.publication.enable();
+        b.recorded_lookup_ready = b.recorded_lookup_candidate && !b.recorded_lookup_incomplete;
+        let semantic_publication_seen = b.publication.revision();
         ResolvedModel {
             b,
+            semantic_publication_seen,
             rel_owner: Vec::new(),
             rel_member: Vec::new(),
             by_id: HashMap::new(),
@@ -8642,8 +11294,8 @@ impl ResolvedModel {
             name_memo: Vec::new(),
             external_names: HashMap::new(),
             external_by_name: HashMap::new(),
+            external_ambiguous_names: HashSet::new(),
             external_package: HashMap::new(),
-            implied: None,
             closure_policy: ClosurePolicy::default(),
             import_truncated: HashMap::new(),
             derives_memo: HashMap::new(),
@@ -8664,36 +11316,125 @@ impl ResolvedModel {
     /// reset, and the implied relationships are re-synthesized only if
     /// none were materialized yet (materialized ones stay).
     pub fn set_library_names(&mut self, names: &HashMap<String, Vec<String>>) {
+        let dynamic_was_current = self
+            .b
+            .dynamic_graph
+            .as_ref()
+            .is_some_and(|s| s.current(&self.b));
         self.external_names.clear();
         self.external_by_name.clear();
+        self.external_ambiguous_names.clear();
         self.external_package.clear();
         if self
+            .b
             .implied
             .as_ref()
             .is_some_and(|t| t.from == self.b.elements.len())
         {
-            self.implied = None;
+            self.b.implied = None;
             self.b.implied_from = None;
+            self.b.semantic_ownership = None;
         }
+        let mut qualified_by_id: HashMap<Uuid, &Vec<String>> = HashMap::new();
         for (id, segments) in names {
             let Ok(id) = Uuid::parse_str(id) else {
                 continue;
             };
+            let qualified = segments.join("::");
+            // Alternate textual UUID representations can occur as separate
+            // input keys. Contradictory names for the same parsed identity
+            // must not make function admission depend on map iteration order.
+            if let Some(previous) = qualified_by_id.insert(id, segments) {
+                if previous != segments {
+                    self.external_ambiguous_names.insert(previous.join("::"));
+                    self.external_ambiguous_names.insert(qualified.clone());
+                }
+            }
+            if let Some(previous) = self.external_by_name.get(&qualified) {
+                if *previous != id {
+                    self.external_ambiguous_names.insert(qualified.clone());
+                }
+            }
             if let Some(last) = segments.last() {
                 self.external_names.insert(id, last.clone());
             }
             if let Some(first) = segments.first() {
                 self.external_package.insert(id, first.clone());
             }
-            self.external_by_name.insert(segments.join("::"), id);
+            self.external_by_name.insert(qualified, id);
         }
+        if self.b.implied.is_none() {
+            self.b.external_implied_names = self.external_by_name.clone();
+            self.b.recorded_lookup_graph = None;
+            self.b.recorded_lookup_prefix = None;
+            self.b.positional_redefinitions = None;
+            self.b.supported_implied = None;
+            self.b.inherited_cache.clear();
+            self.b.inherited_by_heritage.clear();
+            self.import_truncated.clear();
+        }
+        self.b
+            .library_names_changed(self.b.implied.is_some(), dynamic_was_current);
         self.name_memo.clear();
     }
 
     /// Resolve a `::`-separated qualified name (quoted segments allowed)
-    /// from the model's root namespace.
+    /// from the model's root namespace. This compatibility lookup also accepts
+    /// anonymous reference locators used by interchange replay; finding an
+    /// element does not imply it has a semantic `name` or `qualifiedName`.
+    /// Use [`Self::resolve_semantic_qualified`] to exclude those locators.
     pub fn resolve_qualified(&mut self, name: &str) -> Option<ElementRef> {
         self.resolve_segments(&split_qualified(name))
+    }
+
+    /// Resolve a root-qualified name without accepting compatibility locators
+    /// as semantic names. Alias Memberships remain named independently of
+    /// their target. This uses the same supported lookup rules as
+    /// [`Self::resolve_qualified`]; it is not a completeness certificate for
+    /// namespace resolution in unsupported inheritance/import contexts.
+    pub fn resolve_semantic_qualified(&mut self, name: &str) -> Option<ElementRef> {
+        let mut scope = Some(0);
+        let mut result = None;
+        // Check every qualifier as well: a named child of an anonymous
+        // reference must not become accessible through its parent's locator.
+        for (depth, name) in split_qualified(name).iter().enumerate() {
+            let stamp = self.b.next_stamp();
+            let LookupResult::Found(target, next_scope, membership) =
+                self.b
+                    .lookup_at_with_names(scope?, name, depth, stamp, LookupAccess::All, true)
+            else {
+                return None;
+            };
+            let target = ElementRef(target);
+            let alias = membership.is_some_and(|m| {
+                ["memberName", "memberShortName"].iter().any(|key| {
+                    self.b.elements[m].props.get(key).and_then(|v| v.as_str()) == Some(name)
+                })
+            });
+            if !alias
+                && self.element_effective_name(target).as_ref() != Some(name)
+                && self.element_short_name(target).as_ref() != Some(name)
+            {
+                return None;
+            }
+            result = Some(target);
+            scope = next_scope;
+        }
+        result
+    }
+
+    /// Resolve a named built-in function for expression translation using
+    /// the evaluator's admission rules. Resolved targets must have a known
+    /// standard-library identity. Bare missing names retain standalone intrinsic
+    /// support; ambiguous names and user declarations never select a built-in.
+    /// Callers with a local argument environment must check those bindings first.
+    /// The returned name identifies an implementation, not its supported arities.
+    pub fn intrinsic_function_name(
+        &mut self,
+        scope: ScopeRef,
+        name: &QualifiedName,
+    ) -> Option<String> {
+        self.b.intrinsic_function_name(scope.0, name)
     }
 
     /// Look up an interchange UUID independently of an element's name.
@@ -8722,7 +11463,7 @@ impl ResolvedModel {
         };
         // Scope 0 is the shared root namespace.
         match self.b.resolve_unrestricted(0, &qn) {
-            LookupResult::Found(elem, _) => Some(ElementRef(elem)),
+            LookupResult::Found(elem, _, _) => Some(ElementRef(elem)),
             LookupResult::Missing | LookupResult::Ambiguous => None,
         }
     }
@@ -8845,12 +11586,14 @@ impl ResolvedModel {
     /// 8.2.3.5): the declared name, else — for a Feature that declares
     /// neither a name nor a short name — the effective name of its
     /// naming feature: the feature it explicitly redefines,
-    /// else the positional name of the library feature its membership
+    /// else a positional redefinition target in the owner's heritage, else
+    /// the positional name of the library feature its membership
     /// kind implicitly redefines (a binary connector's ends `source` /
     /// `target`, a return parameter `result`, a subject `subj`, an
     /// invocation's positional argument the callee's parameter name, …),
-    /// else the feature it references, else the last link of its feature
-    /// chain. A naming feature that did not resolve names nothing, so an
+    /// else the feature selected by its SysML reference naming rule.
+    /// An anonymous feature chain does not inherit its last link's name.
+    /// A naming feature that did not resolve names nothing, so an
     /// unresolved `:>> mass` is unnamed here where
     /// [`Self::element_lookup_name`] still answers `mass`. Never falls
     /// back to the short name (`qualifiedName` does).
@@ -8876,6 +11619,65 @@ impl ResolvedModel {
         e: ElementRef,
     ) -> Result<crate::eval::Value, crate::eval::EvalError> {
         crate::eval::evaluate_feature(self, e)
+    }
+
+    /// Evaluate a feature value and retain failures hidden by inherited-default
+    /// fallback. The result matches [`Self::evaluate`]; reporting has separate
+    /// bounded storage. Use [`crate::eval::EvaluationReport::into_checked_result`]
+    /// to reject hidden failures or truncated diagnostics.
+    pub fn evaluate_report(&mut self, e: ElementRef) -> crate::eval::EvaluationReport {
+        crate::eval::evaluate_feature_report(self, e)
+    }
+
+    /// Integer cardinality bounds under the evaluator's supported rules.
+    /// Local explicit bounds and eligible implicit SysML singleton declarations
+    /// take precedence. The implicit `[1]` applies to attribute/item/port usages
+    /// owned by definitions/usages without explicit owned subsettings; connection
+    /// usages and their subtypes are excluded. Otherwise, bounds intersect across
+    /// explicit subsettings/redefinitions and supported positional parameter/end
+    /// redefinitions. With no applicable inherited bounds, the default is `[0..*]`.
+    ///
+    /// Exactness refers to integer representation, not complete normative
+    /// multiplicity semantics. Other specialization kinds and implied constraint
+    /// families are not implemented. Body ranges and named multiplicity subsets
+    /// support exact literals and stored feature references. Inherited reference
+    /// valuations select a unique effective feature by referent identity and
+    /// supported Redefinition edges, independent of reference spelling. Incomplete
+    /// or ambiguous selection and nonliteral bounds during calculation calls
+    /// remain unknown. Receiver provider proofs admit complete nonrecursive,
+    /// unfiltered namespace/member imports. Exact member imports do not require
+    /// unrelated imports in their declaring namespace to be complete. Missing
+    /// providers, recursive/filtered imports, chain bases, attached metadata and
+    /// cycles remain unknown. This is a receiver/inherited-provider proof, not
+    /// a certification of lexical lookup completeness or whole-model validity.
+    /// Reference resolution retains its existing identity contract. Selected
+    /// feature values support contextual scalar formulas, resolving each dependency
+    /// lexically before identity-based selection in the receiver. Contextual calls,
+    /// member navigation, cycles and exhausted budgets remain unknown. Broader
+    /// local formula evaluation is retained before rebasing. Package references
+    /// retain lexical identity while their scalar dependencies keep the receiver.
+    /// Unknown receiver defaults stay unknown.
+    /// Local bounds take precedence; this is not a conformance check against
+    /// every inherited restriction or an implementation of `Type::multiplicities`.
+    ///
+    /// Without local bounds establishing the result, unresolved/unsupported
+    /// owned subsettings and inheritance cycles return `None`. Also returns
+    /// `None` for multiple local multiplicities, invalid evaluated ranges or
+    /// unevaluable bounds; the inner `None` denotes an unbounded upper
+    /// limit. Counts outside
+    /// `i128` are unevaluable. This does not instantiate collection members.
+    pub fn effective_cardinality(&mut self, e: ElementRef) -> Option<(i128, Option<i128>)> {
+        crate::eval::effective_cardinality(self, e)
+    }
+
+    /// Whether `e` is a collection by the implicit default alone: an
+    /// attribute, item or port usage that a package or another non-type
+    /// namespace owns, with no multiplicity, subsetting or redefinition of
+    /// its own. Such a usage evaluates as `[0..*]`, and declaring `[1]`
+    /// makes it one value; a parameter, connector end, reference usage or
+    /// explicitly open multiplicity is never reported here.
+    pub fn implicit_open_multiplicity(&mut self, e: ElementRef) -> bool {
+        crate::eval::implicit_open_multiplicity(self, e)
     }
 
     /// Render an evaluated value for display with model context:
@@ -8950,6 +11752,53 @@ impl ResolvedModel {
         crate::eval::evaluate_expr_in(&mut self.b, scope.0, expr)
     }
 
+    /// As [`Self::evaluate_in`], retaining bounded diagnostic causes hidden by
+    /// inherited-default fallback. Source identity follows the same contract;
+    /// use [`Self::with_source`] for syntax from a particular declaration.
+    /// A clean report does not certify that a returned value is concrete.
+    pub fn evaluate_in_report(
+        &mut self,
+        scope: ScopeRef,
+        expr: &Expr,
+    ) -> crate::eval::EvaluationReport {
+        crate::eval::evaluate_expr_report(&mut self.b, scope.0, expr)
+    }
+
+    /// Run model queries using the source identity of an expression's declaration.
+    /// This selects source-site identity bindings only; lexical and receiver scopes
+    /// remain the explicit arguments of each query. `owner` must belong to this model.
+    /// Nested calls and unwinding restore the caller's source identity. The callback
+    /// should query the model rather than replace it or its source declarations.
+    pub fn with_source<T>(&mut self, owner: ElementRef, read: impl FnOnce(&mut Self) -> T) -> T {
+        struct Restore<'a> {
+            model: &'a mut ResolvedModel,
+            previous: Option<usize>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.model.b.identity_origin_unit = self.previous;
+            }
+        }
+        let previous = self.b.set_identity_origin(owner.0);
+        let guard = Restore {
+            model: self,
+            previous,
+        };
+        read(&mut *guard.model)
+    }
+
+    /// Evaluate a chain of member names on an already evaluated receiver value.
+    /// All member names are read under the current source context (see
+    /// [`Self::with_source`]); the receiver retains the identity it already has.
+    /// The links share one evaluation budget and use ordinary chain semantics.
+    pub fn evaluate_value_chain(
+        &mut self,
+        target: crate::eval::Value,
+        members: &[&QualifiedName],
+    ) -> Result<crate::eval::Value, crate::eval::EvalError> {
+        crate::eval::evaluate_value_chain(self, target, members)
+    }
+
     /// The measurement unit denoted by a bracket's unit expression
     /// (`[mm]`, `[km/h]`), with references resolving from `scope`. Unlike
     /// [`Self::evaluate_in`] on the whole bracket, this reads *only* the
@@ -8991,6 +11840,7 @@ impl ResolvedModel {
     /// implied relationship is owned through the side table, not its
     /// owner's row.
     fn ensure_rel_owner(&mut self) {
+        self.sync_semantic_publication();
         if self.rel_owner.len() != self.b.elements.len() {
             let mut map = vec![None; self.b.elements.len()];
             for (i, el) in self.b.elements.iter().enumerate() {
@@ -8998,9 +11848,9 @@ impl ResolvedModel {
                     map[r] = Some(i);
                 }
             }
-            if let Some(table) = &self.implied {
-                for (k, &owner) in table.owner_of.iter().enumerate() {
-                    map[table.from + k] = Some(owner);
+            if let Some(view) = &self.b.semantic_ownership {
+                for (relationship, owner) in view.relationship_owners() {
+                    map[relationship] = Some(owner);
                 }
             }
             self.rel_owner = map;
@@ -9009,6 +11859,7 @@ impl ResolvedModel {
 
     /// Build the membership → owned-member map on first use.
     fn ensure_rel_member(&mut self) {
+        self.sync_semantic_publication();
         if self.rel_member.len() != self.b.elements.len() {
             let mut map = vec![None; self.b.elements.len()];
             for (i, el) in self.b.elements.iter().enumerate() {
@@ -9465,6 +12316,77 @@ impl ResolvedModel {
             .collect()
     }
 
+    /// The already-materialized semantic ownership view. Mutable entry points
+    /// establish readiness; immutable source navigation deliberately stays raw.
+    pub(super) fn projected_owned_relationships(&self, e: ElementRef) -> Vec<ElementRef> {
+        match self.b.semantic_ownership.as_ref() {
+            Some(view) => view
+                .relationships(&self.b, e.0)
+                .map(|rows| rows.iter().map(ElementRef).collect())
+                .unwrap_or_default(),
+            None => self.owned_relationships(e),
+        }
+    }
+
+    /// Serialize a generated node with its real kind and reciprocal ownership.
+    /// Source rows are never emitted through this path.
+    pub(crate) fn generated_node_record(&self, e: ElementRef) -> Option<Map<String, Value>> {
+        let view = self.b.semantic_ownership.as_ref()?;
+        if !view.contains(e.0) {
+            return None;
+        }
+        let node = &self.b.elements[e.0];
+        let id = |index: usize| json!({"@id":self.b.elements[index].id.to_string()});
+        let mut record = self.element_properties(e);
+        if crate::metaclass::conforms(node.ty, "Feature") {
+            generated_defaults::fill_owned_defaults(node.ty, &node.props, &mut record);
+        }
+        record.insert("@type".into(), json!(node.ty));
+        record.insert("@id".into(), json!(node.id.to_string()));
+        record.insert("elementId".into(), json!(node.id.to_string()));
+        record.insert("isImpliedIncluded".into(), json!(true));
+        record.insert(
+            "ownedRelationship".into(),
+            Value::Array(view.relationships(&self.b, e.0)?.iter().map(id).collect()),
+        );
+        record.insert(
+            "owningRelationship".into(),
+            node.owning_relationship.map(id).unwrap_or(Value::Null),
+        );
+        if crate::metaclass::conforms(node.ty, "Relationship") {
+            record.insert(
+                "ownedRelatedElement".into(),
+                Value::Array(node.children.iter().copied().map(id).collect()),
+            );
+            record.insert(
+                "owningRelatedElement".into(),
+                view.generated_relationship_owner(e.0)
+                    .map(id)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        record.entry("aliasIds").or_insert_with(|| json!([]));
+        record.entry("declaredName").or_insert(Value::Null);
+        record.entry("declaredShortName").or_insert(Value::Null);
+        Some(record)
+    }
+
+    /// Generated direct descendants, in relationship then child order. The
+    /// full emitter follows this closure atomically from each source owner.
+    pub(crate) fn generated_node_children(&self, e: ElementRef) -> Vec<ElementRef> {
+        let Some(view) = self.b.semantic_ownership.as_ref() else {
+            return Vec::new();
+        };
+        let Some(rows) = view.relationships(&self.b, e.0) else {
+            return Vec::new();
+        };
+        rows.iter()
+            .chain(self.b.elements[e.0].children.iter().copied())
+            .filter(|&index| view.contains(index))
+            .map(ElementRef)
+            .collect()
+    }
+
     /// The elements owned by `e` through its owned memberships, in
     /// declaration order — KerML `Namespace::ownedMember`.
     pub fn owned_members(&self, e: ElementRef) -> Vec<ElementRef> {
@@ -9494,13 +12416,16 @@ impl ResolvedModel {
     /// chains included, filters applied). Removal is redefinition-driven,
     /// not name-driven, per KerML `removeRedefinedFeatures`: a member is
     /// dropped when another inherited candidate (transitively) redefines
-    /// it, when its own redefinition closure meets a feature **directly**
+    /// it (including a distinct Membership of the same Feature), when its
+    /// own redefinition closure meets a feature **directly**
     /// redefined by one of `e`'s owned features (the normative
     /// `ownedFeature.redefinition.redefinedFeature` set is one hop), or
     /// under SysML's implicit same-name usage redefinition; same-name
     /// members of *unrelated* branches are all retained (lookup answers
     /// ambiguous — the memberships still inherit). Handles come in
-    /// breadth-first heritage order, creation order within a level.
+    /// direct-base heritage order (each base's ancestors before the next
+    /// base), preserving
+    /// each base's public-before-protected membership order.
     ///
     /// Returns **Membership relationship handles**, per the normative
     /// operation: owning memberships for ordinary members, the imported
@@ -9519,48 +12444,60 @@ impl ResolvedModel {
     /// The normative `excluded` namespace/type parameters are not taken
     /// (they are the OCL recursion's cycle-guard plumbing; the guard here
     /// is internal — [`Self::inheritance_walk_truncated`] reports when it
-    /// cut the walk). `e` without a body scope answers empty.
+    /// cut the walk). Supported literal, null and metadata-access leaves without a body scope
+    /// read their library heritage by element identity. Other elements without a
+    /// body scope answer empty.
     pub fn inherited_memberships(
         &mut self,
         e: ElementRef,
         include_implied: bool,
     ) -> Vec<ElementRef> {
         let Some(&s) = self.b.elem_scope.get(&e.0) else {
-            return Vec::new();
+            return self
+                .b
+                .literal_inherited_memberships(e.0, include_implied)
+                .membership_order
+                .into_iter()
+                .map(ElementRef)
+                .collect();
         };
         let bindings = self.b.inherited_bindings(s, include_implied);
-        let mut out: Vec<ElementRef> = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
-        for &(elem, _) in &bindings.members {
-            if let Some(r) = self.b.elements[elem].owning_relationship {
-                if seen.insert(r) {
-                    out.push(ElementRef(r));
-                }
-            }
-        }
-        // Alias Memberships — direct heritage and imported alike; the
-        // aliased element is reachable through
-        // [`Self::membership_member`].
-        for &r in &bindings.alias_rels {
-            if seen.insert(r) {
-                out.push(ElementRef(r));
-            }
-        }
-        out
+        bindings
+            .membership_order
+            .iter()
+            .copied()
+            .map(ElementRef)
+            .collect()
     }
 
-    /// Whether the inheritance walk behind [`Self::inherited_memberships`]
-    /// / [`Self::inherited_features`] for `e` hit the resolver's depth
-    /// budget (a heritage or import chain deeper than 24 levels), so the
-    /// enumeration may be incomplete. Cycles never trip it — the walk
-    /// tracks visited scopes and a cyclic heritage enumerates completely;
-    /// only a genuinely deeper chain does. The flag lets an emitter
-    /// refuse to present a cut enumeration as the closure.
+    /// Whether the inheritance/import enumeration reached its depth budget.
+    /// Scoped acyclic inheritance itself has no depth cap; supported scope-less
+    /// expression heritage and contextual import operations have bounded traversal budgets.
+    /// This does not report unsupported semantic dependencies; see
+    /// [`Self::inheritance_incomplete`].
     pub fn inheritance_walk_truncated(&mut self, e: ElementRef, include_implied: bool) -> bool {
         let Some(&s) = self.b.elem_scope.get(&e.0) else {
-            return false;
+            return self
+                .b
+                .literal_inherited_memberships(e.0, include_implied)
+                .truncated;
         };
         self.b.inherited_bindings(s, include_implied).truncated
+    }
+
+    /// Whether this inheritance query has a known cyclic or unsupported
+    /// positional dependency, hit an import-walk depth budget, or restored
+    /// bootstrap lookup after selection exceeded its stabilization budget. `false`
+    /// does not certify complete specification conformance: the fidelity of
+    /// inheritance-dependent properties remains qualified. Compatibility
+    /// exports permit unsupported semantics but refuse actual depth cuts.
+    pub fn inheritance_incomplete(&mut self, e: ElementRef, include_implied: bool) -> bool {
+        let Some(&s) = self.b.elem_scope.get(&e.0) else {
+            let result = self.b.literal_inherited_memberships(e.0, include_implied);
+            return result.incomplete || result.truncated;
+        };
+        let result = self.b.inherited_bindings(s, include_implied);
+        result.incomplete || result.truncated || self.b.recorded_lookup_incomplete
     }
 
     /// [`Self::inherited_memberships`] projected to feature member
@@ -9574,7 +12511,19 @@ impl ResolvedModel {
     /// keeps the wider view.
     pub fn inherited_features(&mut self, e: ElementRef, include_implied: bool) -> Vec<ElementRef> {
         let Some(&s) = self.b.elem_scope.get(&e.0) else {
-            return Vec::new();
+            let inherited = self.b.literal_inherited_memberships(e.0, include_implied);
+            let mut seen = HashSet::new();
+            return inherited
+                .membership_order
+                .into_iter()
+                .filter_map(|membership| {
+                    let member = self.b.stored_membership_member(membership)?;
+                    (crate::metaclass::conforms(self.b.elements[member].ty, "Feature")
+                        && seen.insert(member))
+                    .then_some(member)
+                })
+                .map(ElementRef)
+                .collect();
         };
         let bindings = self.b.inherited_bindings(s, include_implied);
         bindings
@@ -9663,7 +12612,11 @@ impl ResolvedModel {
     /// Whether `e` belongs to a loaded library unit (resolution target
     /// only — never serialized, never a transformation target).
     pub fn is_library_element(&self, e: ElementRef) -> bool {
-        e.0 < self.b.lib_boundary
+        self.b
+            .semantic_ownership
+            .as_ref()
+            .map_or(e.0, |view| view.source_anchor(e.0))
+            < self.b.lib_boundary
     }
 
     /// `Type::isAbstract` as declared: the `abstract` keyword, or a
@@ -9678,8 +12631,10 @@ impl ResolvedModel {
     }
 
     /// Evaluated numeric bounds of `e`'s *explicitly declared*
-    /// multiplicity: `[l..u]` → `(l, u)`, `[u]` → `(u, u)` except `[*]`
-    /// → `(0, ∞)` — the same reading the multiplicity checks use.
+    /// header multiplicity: `[l..u]` → `(l, u)`, `[u]` → `(u, u)` except `[*]`
+    /// → `(0, ∞)`. This compatibility accessor returns approximate `f64`
+    /// values; semantic validation retains exact values. Body/named numeric
+    /// domains do not become a declaration of their own Feature cardinality.
     /// `None` when `e` declares no multiplicity of its own (inherited
     /// ones are not walked) or a bound does not evaluate to a number.
     pub fn declared_multiplicity(&mut self, e: ElementRef) -> Option<(f64, f64)> {
@@ -9695,13 +12650,18 @@ impl ResolvedModel {
             crate::eval::Value::Real(f) => Some(f),
             _ => None,
         };
-        let hi = as_num(crate::eval::evaluate_expr_in(&mut self.b, scope, &m.upper).ok()?)?;
-        let lo = match &m.lower {
-            Some(l) => as_num(crate::eval::evaluate_expr_in(&mut self.b, scope, l).ok()?)?,
-            None if hi.is_infinite() => 0.0,
-            None => hi,
-        };
-        Some((lo, hi))
+        let origin = self.b.set_identity_origin(e.0);
+        let result = (|| {
+            let hi = as_num(crate::eval::evaluate_expr_in(&mut self.b, scope, &m.upper).ok()?)?;
+            let lo = match &m.lower {
+                Some(l) => as_num(crate::eval::evaluate_expr_in(&mut self.b, scope, l).ok()?)?,
+                None if hi.is_infinite() => 0.0,
+                None => hi,
+            };
+            Some((lo, hi))
+        })();
+        self.b.identity_origin_unit = origin;
+        result
     }
 
     /// `e`'s explicit FeatureTyping targets (`: T`), resolved — a subset
@@ -9724,10 +12684,10 @@ impl ResolvedModel {
     }
 
     /// How many references failed to resolve (serialized as `@ref`
-    /// spellings). A transformation gate: an edit that was supposed to be
-    /// semantics-preserving must not change this.
+    /// spellings), including ambiguous references. A transformation gate: an
+    /// edit that was supposed to be semantics-preserving must not change this.
     pub fn unresolved_count(&self) -> usize {
-        self.b.unresolved.len()
+        self.b.unresolved.len() + self.b.ambiguous.len()
     }
 
     /// Unresolved user references that name a member visible only under
@@ -9749,7 +12709,8 @@ impl ResolvedModel {
             .collect()
     }
 
-    /// Every reference that failed to resolve: the element whose property
+    /// Every reference that failed to resolve, including ambiguous references:
+    /// the element whose property
     /// carries it, the spelling as written, and the unit it was written
     /// in. Relocation edits (which must not create unresolved references)
     /// diff this list pre/post to name exactly what they broke.
@@ -9757,6 +12718,7 @@ impl ResolvedModel {
         self.b
             .unresolved
             .iter()
+            .chain(self.b.ambiguous.iter())
             .map(|(elem, qn)| UnresolvedReference {
                 owner: ElementRef(*elem),
                 spelling: qn.to_ref_string(),
@@ -9798,6 +12760,20 @@ impl ResolvedModel {
         if map.is_empty() {
             return Vec::new();
         }
+        let dynamic_was_current =
+            self.b.dynamic_graph.as_ref().is_some_and(|s| {
+                s.current(&self.b) && s.outcome == dynamic_graph::Outcome::Accepted
+            });
+        let local_was_current = self
+            .b
+            .dynamic_graph
+            .as_ref()
+            .is_some_and(|s| s.local_current(&self.b));
+        let result_was_current = self
+            .b
+            .dynamic_graph
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.result_redefinition_current(&self.b));
         let mut applied: Vec<(Uuid, Uuid, &'static str)> = Vec::new();
         let mut remap: HashMap<Uuid, Uuid> = HashMap::new();
         let n = self.b.elements.len();
@@ -9814,13 +12790,84 @@ impl ResolvedModel {
         if applied.is_empty() {
             return applied;
         }
+        self.b.recorded_lookup_prefix = None;
         for i in 0..n {
             for atom in self.b.elements[i].props.values_mut() {
                 atom.remap(&remap);
             }
         }
+        for (_, target) in self.b.id_spelled_targets.values_mut() {
+            if let Some(&replacement) = remap.get(target) {
+                *target = replacement;
+            }
+        }
+        // Name tables are reference-bearing indexes too: a later implied
+        // materialization must never recreate an edge to a retired identity.
+        for names in [&mut self.b.lib_qnames, &mut self.b.lib_mem_qnames] {
+            for i in 0..names.len() {
+                if let Some(&id) = remap.get(&names[i].0) {
+                    names[i].0 = id;
+                }
+            }
+        }
+        for names in [
+            &mut self.external_by_name,
+            &mut self.b.external_implied_names,
+        ] {
+            for id in names.values_mut() {
+                if let Some(&replacement) = remap.get(id) {
+                    *id = replacement;
+                }
+            }
+        }
+        // ID replacement can collapse external bindings. Keep conflicting
+        // name provenance qualified even when the compatibility indexes merge.
+        let mut external_names_by_id: HashMap<Uuid, String> = HashMap::new();
+        for (name, &id) in &self.external_by_name {
+            if let Some(previous) = external_names_by_id.insert(id, name.clone()) {
+                if previous != *name {
+                    self.external_ambiguous_names.insert(previous);
+                    self.external_ambiguous_names.insert(name.clone());
+                }
+            }
+        }
+        for names in [&mut self.external_names, &mut self.external_package] {
+            *names = std::mem::take(names)
+                .into_iter()
+                .map(|(id, name)| (remap.get(&id).copied().unwrap_or(id), name))
+                .collect();
+        }
+        if self
+            .b
+            .implied
+            .as_ref()
+            .is_none_or(|t| t.from == self.b.elements.len())
+        {
+            self.b.implied = None;
+            self.b.implied_from = None;
+            self.b.semantic_ownership = None;
+            self.b.positional_redefinitions = None;
+            self.b.inherited_cache.clear();
+            self.b.inherited_by_heritage.clear();
+            self.import_truncated.clear();
+        }
         self.by_id_built_for = usize::MAX;
         self.b.id_index = None;
+        self.b.supported_implied = None;
+        let metadata_changed = self.b.refresh_metadata_associations();
+        if metadata_changed {
+            self.quantity_index = None;
+            self.name_memo.clear();
+            self.redefiner_index = None;
+            self.import_truncated.clear();
+        }
+        self.refresh_implied_specializations();
+        self.b.remap_dynamic_graph(
+            &remap,
+            dynamic_was_current && !metadata_changed,
+            local_was_current,
+            result_was_current && !metadata_changed,
+        );
         applied
     }
 
@@ -9830,22 +12877,308 @@ impl ResolvedModel {
     /// id as a quoted name) — to that id: a reference to an element of
     /// this model, or a dangling reference to an id outside it (a library
     /// element when no library is loaded), which the emitters carry as
-    /// spelled. Returns the ids bound. Binding sets the property; the
-    /// resolver's semantic tables (typing, specialization, reference
-    /// sites) do not learn the link.
+    /// spelled. Returns the ids bound. In-model references participate in
+    /// typing, specialization, inherited lookup, evaluation and reference
+    /// navigation. User references are resolved again after the identities
+    /// become available, including references depending on the newly bound
+    /// heritage or imports. Call after restoring explicit ids and before
+    /// derived/implied queries. Payload loaders should use
+    /// [`Self::bind_id_spelled_references_with`] to disambiguate lexical
+    /// names that happen to spell an identity.
+    ///
+    /// Generated owned-result handles must be reacquired after this call;
+    /// see [`Self::bind_id_spelled_references_with`] for the invalidation rule.
     pub fn bind_id_spelled_references(&mut self) -> HashSet<Uuid> {
+        self.bind_id_spelled_references_with(&mut HashMap::new())
+    }
+
+    /// Bind identity spellings with the original payload's reference hints.
+    ///
+    /// This call invalidates handles for newly generated owned-result nodes;
+    /// reacquire those nodes through their source expression afterward. Source
+    /// and pre-existing generic implied relationship handles remain valid.
+    /// Invalidated Rust handles are not generation-checked: do not reuse them.
+    /// This also repairs spellings that accidentally resolved as a lexical
+    /// UUID-looking name. The hints are pruned to actual identity spellings
+    /// and should be retained across rebuilds of the lifted text. Call this
+    /// after restoring explicit ids and before derived/implied queries.
+    ///
+    /// Unresolved UUID-shaped spellings without a preserved payload holder
+    /// retain the compatibility interpretation as identity references. The
+    /// lift cannot always distinguish an authored UUID-shaped `@ref` from
+    /// an unnamed-target fallback when it regenerates relationship identity.
+    pub fn bind_id_spelled_references_with(
+        &mut self,
+        hints: &mut crate::loader::IdReferenceBindings,
+    ) -> HashSet<Uuid> {
+        self.bind_id_spelled_references_impl(hints, false)
+    }
+
+    /// Bind only payload-proven reference sites. Unlike the compatibility
+    /// binder, unrelated authored UUID-shaped names keep lexical meaning.
+    /// The same generated-handle invalidation rules apply as for
+    /// [`Self::bind_id_spelled_references_with`].
+    pub fn bind_payload_id_references(
+        &mut self,
+        hints: &mut crate::loader::IdReferenceBindings,
+    ) -> HashSet<Uuid> {
+        self.bind_id_spelled_references_impl(hints, true)
+    }
+
+    /// Source positions of references currently bound by identity. Transform
+    /// callers may map these through their exact text splices and then call
+    /// [`Self::rekey_id_reference_bindings`] on a rebuilt model. This preserves
+    /// site evidence when an enclosing declaration changes identity.
+    pub fn bound_id_reference_sites(&self) -> Vec<(usize, Span, Uuid)> {
+        self.b
+            .id_spelled_targets
+            .iter()
+            .map(|(&(unit, start, end), &(_, id))| (unit, Span { start, end }, id))
+            .collect()
+    }
+
+    /// Recover holder/property keys only at explicitly carried source sites
+    /// whose rebuilt single-segment spelling still equals the given UUID.
+    /// A changed reference spelling is deliberately not carried forward.
+    pub fn rekey_id_reference_bindings(
+        &self,
+        sites: &[(usize, Span, Uuid)],
+    ) -> crate::loader::IdReferenceBindings {
+        let sites: HashMap<_, _> = sites
+            .iter()
+            .map(|(u, s, id)| ((*u, s.start, s.end), *id))
+            .collect();
+        self.b
+            .id_binding_pending
+            .iter()
+            .filter_map(|p| {
+                let [name] = p.qn.segments.as_slice() else {
+                    return None;
+                };
+                if p.qn.is_global {
+                    return None;
+                }
+                let id =
+                    *sites.get(&(self.b.unit_of_elem(p.elem), name.span.start, name.span.end))?;
+                (Uuid::parse_str(&name.value).ok() == Some(id))
+                    .then(|| ((self.b.elem_id(p.elem), p.key.clone()), id))
+            })
+            .collect()
+    }
+
+    /// Current serialized endpoint values for retained payload spelling hints.
+    /// Keep this separate from the spelling map: an imported member's spelling
+    /// denotes a Membership-valued serialized endpoint after resolution.
+    pub fn payload_id_reference_values(
+        &mut self,
+        hints: &crate::loader::IdReferenceBindings,
+    ) -> crate::loader::IdReferenceBindings {
+        hints
+            .keys()
+            .filter_map(|(owner, key)| {
+                let element = self.b.element_index_of_uuid(*owner)?;
+                let (base, index) = key
+                    .split_once('#')
+                    .map_or((key.as_str(), None), |(b, i)| (b, i.parse::<usize>().ok()));
+                let mut value = self.b.elements[element].props.get(base)?;
+                if let Some(index) = index {
+                    let crate::properties::Atom::Array(items) = value else {
+                        return None;
+                    };
+                    value = items.get(index)?;
+                }
+                let target = value
+                    .get("@id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())?;
+                Some(((*owner, key.clone()), target))
+            })
+            .collect()
+    }
+
+    fn bind_id_spelled_references_impl(
+        &mut self,
+        hints: &mut crate::loader::IdReferenceBindings,
+        strict: bool,
+    ) -> HashSet<Uuid> {
+        if self.b.id_binding_pending.is_empty() && !self.b.id_spelled_targets.is_empty() {
+            return HashSet::new();
+        }
+        self.discard_owned_result_tail();
         let mut bound: HashSet<Uuid> = HashSet::new();
         let n = self.b.elements.len();
-        for i in self.b.lib_boundary..n {
-            for atom in self.b.elements[i].props.values_mut() {
-                bind_atom(atom, &mut bound);
+        if !strict {
+            for i in self.b.lib_boundary..n {
+                let row = &mut self.b.elements[i];
+                for (key, atom) in row.props.entries.make_mut() {
+                    if !crate::model::is_payload_usage_flag(row.ty, key.name()) {
+                        bind_atom(atom, &mut bound);
+                    }
+                }
             }
         }
+        let mut hinted_sites = HashSet::new();
+        let pending_ids: HashMap<_, _> = self
+            .b
+            .id_binding_pending
+            .iter()
+            .filter_map(|p| {
+                let [name] = p.qn.segments.as_slice() else {
+                    return None;
+                };
+                let id = Uuid::parse_str(&name.value).ok()?;
+                Some(((self.b.elements[p.elem].id, p.key.clone()), (p, id)))
+            })
+            .collect();
+        hints.retain(|key, target| {
+            let matching = pending_ids
+                .get(key)
+                .filter(|(_, id)| id == target)
+                .map(|(p, _)| *p);
+            if let Some(p) = matching {
+                hinted_sites.insert((p.elem, p.qn.span.start, p.qn.span.end));
+                bound.insert(*target);
+                true
+            } else {
+                false
+            }
+        });
+        let strict_slots: Vec<_> = if strict {
+            self.b
+                .id_binding_pending
+                .iter()
+                .filter_map(|p| {
+                    let id = hints.get(&(self.b.elem_id(p.elem), p.key.clone()))?;
+                    Some((p.elem, p.key.clone(), *id))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !bound.is_empty() {
-            let spellings: HashSet<String> = bound.iter().map(|u| u.to_string()).collect();
-            self.b.unresolved.retain(|(_, qn)| {
-                !(qn.segments.len() == 1 && spellings.contains(&qn.segments[0].value))
-            });
+            if self
+                .b
+                .implied
+                .as_ref()
+                .is_some_and(|t| t.from == self.b.elements.len())
+            {
+                self.b.implied = None;
+                self.b.implied_from = None;
+                self.b.semantic_ownership = None;
+            }
+            let unresolved: HashSet<_> = self
+                .b
+                .unresolved
+                .iter()
+                .map(|(owner, qn)| (*owner, qn.span.start, qn.span.end))
+                .collect();
+            let mut bound_sites = HashSet::new();
+            for pending in &self.b.id_binding_pending {
+                let site = (pending.elem, pending.qn.span.start, pending.qn.span.end);
+                if hinted_sites.contains(&site) || (!strict && unresolved.contains(&site)) {
+                    if let [name] = pending.qn.segments.as_slice() {
+                        if let Ok(id) = Uuid::parse_str(&name.value) {
+                            if bound.contains(&id) {
+                                bound_sites.insert(site);
+                                self.b.id_spelled_targets.insert(
+                                    (
+                                        self.b.unit_of_elem(pending.elem),
+                                        name.span.start,
+                                        name.span.end,
+                                    ),
+                                    (id, id),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            self.b.recorded_lookup_prefix = None;
+            self.b.reset_lookup_caches();
+            self.b.semantic_memo = Default::default();
+            self.quantity_index = None;
+            self.name_memo.clear();
+            self.redefiner_index = None;
+            self.import_truncated.clear();
+            let pending = std::mem::take(&mut self.b.id_binding_pending);
+            if !pending.is_empty() {
+                // Array-valued references append during resolution; replay
+                // replaces their values instead of duplicating them.
+                for p in &pending {
+                    if let Some((base, _)) = p.key.split_once('#') {
+                        self.b.elements[p.elem].props.insert(base, json!([]));
+                    }
+                    if let Some(si) = p.spec_idx {
+                        self.b.spec_resolved[si] = None;
+                    }
+                }
+                self.b.unresolved.retain(|(e, _)| *e < self.b.lib_boundary);
+                self.b.ambiguous.retain(|(e, _)| *e < self.b.lib_boundary);
+                self.b.blocked.clear();
+                self.b.ref_sites.clear();
+                self.b.used_imports.clear();
+                self.b.pending = pending;
+                self.b.semantic_ready = false;
+                self.b.resolve_pending();
+                self.b.semantic_ready = true;
+                self.b.positional_redefinitions = None;
+                self.b.supported_implied = None;
+                self.b.inherited_cache.clear();
+                self.b.inherited_by_heritage.clear();
+                // External targets stay references by identity even though
+                // no in-model element can supply a semantic outcome.
+                if strict {
+                    // External targets stay identity references only at the
+                    // exact retained payload-proven slots. Resolved imports
+                    // retain their Membership-valued resolution outcome.
+                    for (elem, key, target) in &strict_slots {
+                        let (base, index) = key
+                            .split_once('#')
+                            .map_or((key.as_str(), None), |(base, i)| {
+                                (base, i.parse::<usize>().ok())
+                            });
+                        let entries = self.b.elements[*elem].props.entries.make_mut();
+                        let Some((_, atom)) = entries.iter_mut().find(|(k, _)| k.name() == base)
+                        else {
+                            continue;
+                        };
+                        let atom = if let Some(index) = index {
+                            let crate::properties::Atom::Array(items) = atom else {
+                                continue;
+                            };
+                            let Some(atom) = items.get_mut(index) else {
+                                continue;
+                            };
+                            atom
+                        } else {
+                            atom
+                        };
+                        if atom
+                            .get("@ref")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Uuid::parse_str(s.trim_matches('\'')).ok())
+                            == Some(*target)
+                        {
+                            bind_atom(atom, &mut bound);
+                        }
+                    }
+                } else {
+                    for i in self.b.lib_boundary..n {
+                        let row = &mut self.b.elements[i];
+                        for (key, atom) in row.props.entries.make_mut() {
+                            if !crate::model::is_payload_usage_flag(row.ty, key.name()) {
+                                bind_atom(atom, &mut bound);
+                            }
+                        }
+                    }
+                }
+            }
+            self.b
+                .unresolved
+                .retain(|(owner, qn)| !bound_sites.contains(&(*owner, qn.span.start, qn.span.end)));
+            self.b.refresh_metadata_associations();
+            // Refresh known adjacency only; binding still precedes semantic queries.
+            self.refresh_implied_specializations();
         }
         bound
     }
@@ -10302,123 +13635,87 @@ impl ResolvedModel {
         out
     }
 
-    /// The elements a view usage exposes: every member visible through
-    /// the view's `expose` imports (recursively for `::**` forms), each
-    /// admitted by the view's `filter` conditions — the same
-    /// three-valued filter machinery that governs import visibility, so
-    /// only a provably-false condition hides a member. Order follows
-    /// discovery (per import, declaration order).
-    pub fn view_exposed_elements(&mut self, view: ElementRef) -> Vec<ElementRef> {
-        let Some(&scope) = self.b.elem_scope.get(&view.0) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        // `emitted` keeps the order-preserving `out` free of duplicates
-        // without a linear scan per candidate (a `::**` exposure over a
-        // large model visits every element).
-        let mut emitted = std::collections::HashSet::new();
-        let mut seen = std::collections::HashSet::new();
-        // Membership exposes (`expose P::name;`, and the target itself of
-        // `expose P::**`) contribute their resolved element directly.
-        for entry in self.b.scopes[scope].member_imports.clone() {
-            if let Some(elem) = self.b.resolve(scope, &entry.target, 0) {
-                if self.b.filters_admit(scope, &entry.filters, elem, 0) && emitted.insert(elem) {
-                    out.push(ElementRef(elem));
-                }
-            }
-        }
-        for entry in self.b.import_scopes(scope) {
-            self.collect_exposed(
-                scope,
-                entry.scope,
-                entry.recursive,
-                &entry.filters,
-                &mut seen,
-                &mut emitted,
-                &mut out,
-            );
-        }
-        out
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn collect_exposed(
-        &mut self,
-        view_scope: usize,
-        sc: usize,
-        recursive: bool,
-        fids: &[usize],
-        seen: &mut std::collections::HashSet<usize>,
-        emitted: &mut std::collections::HashSet<usize>,
-        out: &mut Vec<ElementRef>,
-    ) {
-        // The seen-set breaks scope cycles (each scope enumerates once).
-        if !seen.insert(sc) {
-            return;
-        }
-        let Some(owner) = self.b.scopes[sc].owner else {
-            return;
-        };
-        for m in self.b.owned_member_elems(owner, false) {
-            if !self.b.filters_admit(view_scope, fids, m, 0) {
-                continue;
-            }
-            if emitted.insert(m) {
-                out.push(ElementRef(m));
-            }
-            if recursive {
-                if let Some(&msc) = self.b.elem_scope.get(&m) {
-                    self.collect_exposed(view_scope, msc, true, fids, seen, emitted, out);
-                }
-            }
-        }
-    }
-
-    /// The declared name of the rendering a view usage requests
-    /// (`render asInterconnectionDiagram;` → `asInterconnectionDiagram`),
-    /// read from the view's ViewRenderingMembership member's reference.
+    /// The declared name of the rendering a view requests
+    /// (`render asInterconnectionDiagram;` → `asInterconnectionDiagram`):
+    /// the referenced rendering of the first ViewRenderingMembership among
+    /// the view's feature memberships, inherited ones included, as the
+    /// specification derives `viewRendering`. The view's own `render`
+    /// member comes first. A view without one takes the rendering it
+    /// inherits through its typings and specializations (`view v : T;`
+    /// over `view def T { render asElementTable; }` → `asElementTable`);
+    /// of several, the first in heritage order wins — the first-declared
+    /// typing or specialization, and a supertype's own `render` ahead of
+    /// the ones it inherits in turn. A `render` member that references a
+    /// rendering names it (through a feature chain, its last feature); one
+    /// that declares a rendering in place (`render rendering outline;`) is
+    /// that rendering. `None` when the view has no rendering, or when the
+    /// one selected does not resolve to a rendering usage.
     pub fn view_rendering(&mut self, view: ElementRef) -> Option<String> {
         self.ensure_by_id();
-        let m = self
-            .members_under(view.0, "ViewRenderingMembership")
-            .into_iter()
-            .next()?;
-        let target = match self.rel_prop_target(m, "ReferenceSubsetting", "referencedFeature") {
-            Some(t) => t,
-            // A library rendering (`render asElementTable;`, the standard
-            // `Views` package) is never serialized, so the reference holds
-            // its spelling as written: resolve that from the view's scope.
-            None => {
-                let rel = *self.b.elements[m]
-                    .owned_relationships
-                    .iter()
-                    .find(|&&r| self.b.elements[r].ty == "ReferenceSubsetting")?;
-                let spelling = self.b.elements[rel]
-                    .props
-                    .get("referencedFeature")?
-                    .get("@ref")?
-                    .as_str()?
-                    .to_string();
-                let scope = *self.b.elem_scope.get(&view.0)?;
-                let qn = QualifiedName {
-                    is_global: false,
-                    segments: split_qualified(&spelling)
-                        .into_iter()
-                        .map(|value| Name {
-                            value,
-                            span: sysmlv2_syntax::span::Span::default(),
-                        })
-                        .collect(),
-                    span: sysmlv2_syntax::span::Span::default(),
-                };
-                self.b.resolve(scope, &qn, 0)?
-            }
+        let membership = self.view_rendering_membership(view)?;
+        let rendering = match self.d_referenced_member(membership, "RenderingUsage")? {
+            Reference::Element(rendering) => rendering,
+            Reference::Unresolved(_) => self.spelled_rendering(membership)?,
+            Reference::External(_) => return None,
         };
-        self.b.elements[target]
+        self.b.elements[rendering.0]
             .props
             .get("declaredName")
             .and_then(|v| v.as_str())
             .map(str::to_string)
+    }
+
+    /// The ViewRenderingMembership [`Self::view_rendering`] reads: the
+    /// view's own, else the first it inherits. The inheritance walk keeps
+    /// a supertype's rendering beside the rendering of a more specific
+    /// type that replaces it, so the order decides: the walk lists each
+    /// type's own memberships ahead of those it inherits.
+    fn view_rendering_membership(&mut self, view: ElementRef) -> Option<ElementRef> {
+        let own = self
+            .owned_relationships_of_kind(view, "ViewRenderingMembership")
+            .into_iter()
+            .next();
+        if own.is_some() {
+            return own;
+        }
+        self.inherited_memberships(view, true)
+            .into_iter()
+            .find(|&m| self.is_kind(m, "ViewRenderingMembership"))
+    }
+
+    /// The rendering a `render` member names by a reference that did not
+    /// resolve when the model was built, which holds its spelling as
+    /// written: resolved from the namespace the member was declared in —
+    /// the view's own body, or the body of the definition or view it
+    /// inherits the member from. A chained reference is not re-resolved.
+    fn spelled_rendering(&mut self, membership: ElementRef) -> Option<ElementRef> {
+        let member = self.membership_member(membership)?;
+        let subsetting = self
+            .owned_relationships_of_kind(member, "ReferenceSubsetting")
+            .into_iter()
+            .next()?;
+        let spelling = self.b.elements[subsetting.0]
+            .props
+            .get("referencedFeature")?
+            .get("@ref")?
+            .as_str()?
+            .to_string();
+        let owner = self.owner(membership)?;
+        let scope = ScopeRef(*self.b.elem_scope.get(&owner.0)?);
+        let qn = QualifiedName {
+            is_global: false,
+            segments: split_qualified(&spelling)
+                .into_iter()
+                .map(|value| Name {
+                    value,
+                    span: sysmlv2_syntax::span::Span::default(),
+                })
+                .collect(),
+            span: sysmlv2_syntax::span::Span::default(),
+        };
+        let rendering = self.resolve_in_excluding(scope, &qn, Some(member))?;
+        self.is_kind(rendering, "RenderingUsage")
+            .then_some(rendering)
     }
 
     /// Resolve a qualified name with references resolving from `scope` —
@@ -10516,6 +13813,7 @@ impl ResolvedModel {
     /// when they declare none of their own. Library features are not
     /// indexed. Built lazily once per resolved model.
     pub fn redefiners(&mut self, e: ElementRef) -> Vec<ElementRef> {
+        self.sync_semantic_publication();
         if self.redefiner_index.is_none() {
             let mut index: HashMap<usize, Vec<usize>> = HashMap::new();
             let users: Vec<usize> = (self.b.lib_boundary..self.b.elements.len()).collect();
@@ -10558,11 +13856,6 @@ impl ResolvedModel {
             .values
             .get(ret)
             .map(|(s, expr)| (ScopeRef(*s), expr.clone()))
-    }
-
-    /// Declared `in`/`inout` parameter names, in declaration order.
-    pub fn calc_params(&self, e: ElementRef) -> Vec<String> {
-        self.b.in_params.get(&e.0).cloned().unwrap_or_default()
     }
 
     /// The declared `return` parameter, when the calculation has one.
@@ -10919,8 +14212,9 @@ impl ResolvedModel {
         out
     }
 
-    /// The metadata annotating `e` — prefix metadata (`#M` / `@M`)
-    /// recorded at lowering — in declaration order.
+    /// Known metadata annotating `e`, including prefix/about-less metadata and
+    /// identity-validated explicit `about` annotations, in declaration order.
+    /// Unresolved or malformed annotation associations are omitted.
     pub fn metadata_of(&self, e: ElementRef) -> Vec<ElementRef> {
         self.b
             .metadata_of
@@ -11037,6 +14331,7 @@ impl ResolvedModel {
     }
 
     fn ensure_by_id(&mut self) {
+        self.sync_semantic_publication();
         if self.by_id_built_for != self.b.elements.len() {
             self.by_id_built_for = self.b.elements.len();
             self.by_id = self
@@ -11353,11 +14648,11 @@ mod split_qualified_tests {
 
     #[test]
     fn decodes_control_escapes_like_escape_name_spells_them() {
-        let raw = "APS M3 to APS-TMT Interface Point\nAlignment Error Analysis";
+        let raw = "Optics Bench to Sensor-Hub Interface Point\nAlignment Error Analysis";
         let spelled = format!("P::{}", sysmlv2_syntax::ast::escape_name(raw));
         assert_eq!(
             spelled,
-            "P::'APS M3 to APS-TMT Interface Point\\nAlignment Error Analysis'"
+            "P::'Optics Bench to Sensor-Hub Interface Point\\nAlignment Error Analysis'"
         );
         assert_eq!(
             split_qualified(&spelled),
@@ -11386,7 +14681,7 @@ mod split_qualified_tests {
         let mut model = crate::model::Model::new();
         let unit = model.add_source(
             "t.sysml".to_string(),
-            "package P { part def 'APS M3 to APS-TMT Interface Point\\nAlignment Error Analysis'; }",
+            "package P { part def 'Optics Bench to Sensor-Hub Interface Point\\nAlignment Error Analysis'; }",
         );
         assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
         let mut r = super::ResolvedModel::build(&model);
@@ -11395,7 +14690,7 @@ mod split_qualified_tests {
         let spelled = r.element_qualified_name(def).unwrap();
         assert_eq!(
             spelled,
-            "P::'APS M3 to APS-TMT Interface Point\\nAlignment Error Analysis'"
+            "P::'Optics Bench to Sensor-Hub Interface Point\\nAlignment Error Analysis'"
         );
         assert_eq!(r.resolve_qualified(&spelled), Some(def));
     }
@@ -11413,6 +14708,12 @@ mod split_qualified_tests {
 #[cfg(test)]
 mod unused_imports_tests;
 
+#[cfg(test)]
+mod replay_dependencies_tests;
+
+#[cfg(test)]
+mod identity_tables_tests;
+
 /// Persist element headers and their variable-length lists as separate tables.
 /// A decoded library shares each table's contiguous backing storage.
 mod element_table {
@@ -11427,7 +14728,7 @@ mod element_table {
     struct HeaderRef<'a> {
         ty: &'a str,
         id: Uuid,
-        path: &'a str,
+        path: std::borrow::Cow<'a, str>,
         present: u64,
         flags: u64,
         owner: Option<usize>,
@@ -11463,10 +14764,15 @@ mod element_table {
         struct Headers<'a>(&'a LayeredVec<Elem>);
         impl Serialize for Headers<'_> {
             fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                s.collect_seq(self.0.iter().map(|e| HeaderRef {
+                s.collect_seq(self.0.iter().enumerate().map(|(i, e)| HeaderRef {
                     ty: e.ty,
                     id: e.id,
-                    path: &e.path,
+                    // The table holds whole paths, which decode as such.
+                    path: if e.path_parent.is_some() {
+                        whole_path(self.0, i).into()
+                    } else {
+                        e.path.as_str().into()
+                    },
                     present: e.props.present,
                     flags: e.props.flags,
                     owner: e.owning_relationship,
@@ -11519,6 +14825,7 @@ mod element_table {
                 ty: h.ty.0,
                 id: h.id,
                 path: h.path,
+                path_parent: None,
                 props: Properties {
                     present: h.present,
                     flags: h.flags,
@@ -11569,5 +14876,479 @@ mod element_table_tests {
             crate::cache_codec::decode::<Table>(&crate::cache_codec::encode(&bad).unwrap())
                 .is_err()
         );
+    }
+
+    /// The table carries whole ownership paths, however the builder holds
+    /// them, and decodes to the same paths and identities.
+    #[test]
+    fn whole_paths_survive_the_table() {
+        let mut model = crate::model::Model::new();
+        model.add_library_source(
+            "l.sysml",
+            "package L { part p { attribute x = 1 + 2 * 3; } }",
+        );
+        let mut b = Builder::default();
+        b.build_model(&model);
+        assert!(b.elements.iter().any(|e| e.path_parent.is_some()));
+        let decoded: Table = crate::cache_codec::decode(
+            &crate::cache_codec::encode(&Table(b.elements.clone())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.0.len(), b.elements.len());
+        for i in 0..b.elements.len() {
+            assert_eq!(whole_path(&decoded.0, i), whole_path(&b.elements, i));
+            assert_eq!(decoded.0[i].id, b.elements[i].id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_path_tests {
+    use super::*;
+
+    /// An identity derived from an ownership path is the version-5
+    /// identity of the whole path, whether the parent's hash state was
+    /// kept or the parent's path is read afresh — including for children
+    /// of elements created before the states were kept or after they
+    /// were dropped.
+    #[test]
+    fn identities_hash_the_whole_ownership_path() {
+        for keep in [true, false] {
+            let mut b = Builder::default();
+            let mut paths = Vec::new();
+            let root = b.new_element("Namespace", None, "$root/u.sysml".into());
+            paths.push("$root/u.sysml".to_string());
+            if keep {
+                b.keep_path_hashes();
+            }
+            let mut parent = root;
+            for level in 0..40 {
+                let segment = format!("m{level}");
+                let rel = b.new_relationship("OwningMembership", parent, &segment);
+                paths.push(format!("{}/{segment}", paths[parent]));
+                // Segments may be empty or hold separators of their own.
+                let segment = ["", "x/y", "e", "first"][level % 4];
+                let element = b.new_owned_element("PartUsage", rel, segment);
+                paths.push(format!("{}/{segment}", paths[rel]));
+                parent = element;
+            }
+            b.path_hashes = None;
+            for owner in [root, parent, parent / 2] {
+                b.new_relationship("Membership", owner, "late");
+                paths.push(format!("{}/late", paths[owner]));
+            }
+            assert_eq!(paths.len(), b.elements.len());
+            for (i, path) in paths.iter().enumerate() {
+                assert_eq!(&whole_path(&b.elements, i), path);
+                assert_eq!(
+                    b.elements[i].id,
+                    Uuid::new_v5(&ID_NAMESPACE, path.as_bytes()),
+                    "{path}"
+                );
+            }
+        }
+    }
+
+    /// Lowering stores and hashes a bounded number of path bytes per
+    /// element, however deep the ownership nests. Measured in bytes rather
+    /// than in wall-clock time: the counts are the work and the memory the
+    /// paths take, and do not depend on the machine.
+    ///
+    /// The longest operator chain the parser admits nests its first operand
+    /// over four thousand ownership levels deep. Holding and hashing each
+    /// element's whole path took about 233 MB of each over its seventeen
+    /// thousand elements, against about 100 KB with segments.
+    #[test]
+    fn path_cost_is_linear_in_the_ownership_depth() {
+        // Lowering the chain recurses once per operator, so the probe runs
+        // on a thread with room for it; the count is kept per thread, so
+        // the build runs there too.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let terms = sysmlv2_syntax::parser::MAX_EXPR_OPERATORS as usize;
+                let chain = (0..terms)
+                    .map(|i| format!("a{i} > 0"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                let mut model = crate::model::Model::new();
+                model.add_source(
+                    "chain.sysml",
+                    &format!("package P {{ part x {{ attribute v = {chain}; }} }}"),
+                );
+                assert!(!model.has_errors());
+                let before = path_bytes_hashed();
+                let r = ResolvedModel::build(&model);
+                let hashed = path_bytes_hashed() - before;
+                let elements = r.b.elements.len();
+                let stored: usize = r.b.elements.iter().map(|e| e.path.len()).sum();
+                assert!(
+                    stored <= 16 * elements,
+                    "{stored} path bytes held for {elements} elements"
+                );
+                assert!(
+                    hashed <= 32 * elements,
+                    "{hashed} path bytes hashed for {elements} elements"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod filter_origin_tests {
+    use super::*;
+    use crate::model::Model;
+
+    #[test]
+    fn prepared_filters_reject_invalid_source_scope_and_filter_indexes() {
+        let mut model = Model::new();
+        model.add_library_source("lib.sysml","package Items { part def X; } package P { filter true; import Items::*[true]; import Items::X[true]; }");
+        assert!(!model.has_errors());
+        let r = ResolvedModel::build(&model);
+        assert!(r.b.valid_library(1));
+        for field in [0, 1] {
+            let mut b = r.b.clone();
+            if field == 0 {
+                b.filter_exprs[0].0 = b.elements.len();
+            } else {
+                b.filter_exprs[0].1 = b.scopes.len();
+            }
+            assert!(!b.valid_library(1));
+        }
+        for kind in [0, 1, 2] {
+            let mut b = r.b.clone();
+            let fid = b.filter_exprs.len();
+            let scope = b.scopes.iter().position(|s| !s.filters.is_empty()).unwrap();
+            match kind {
+                0 => b.scopes[scope].filters.push(fid),
+                1 => b.scopes[scope].imports[0].filters.push(fid),
+                _ => b.scopes[scope].member_imports[0].filters.push(fid),
+            }
+            assert!(!b.valid_library(1));
+        }
+        let mut b = r.b.clone();
+        b.filters_active.clear();
+        assert!(!b.valid_library(1));
+    }
+
+    #[test]
+    fn filter_execution_restores_source_and_reentrancy_state() {
+        let id = "88888888-8888-4888-8888-888888888888";
+        let mut model = Model::new();
+        model.add_source("first.sysml", "package First;");
+        model.add_source("filter.sysml",&format!("package P {{ metadata def Actual; metadata def '{id}'; package Items {{ #Actual part def X; }} package View {{ filter @'{id}'; filter false and @missing; filter true or @missing; filter @missing; public import Items::*; }} }}"));
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let actual = r.resolve_qualified("P::Actual").unwrap();
+        let ordinary = r.resolve_qualified(&format!("P::'{id}'")).unwrap();
+        let sites = r.references_to(ordinary);
+        assert_eq!(sites.len(), 1);
+        let id = id.parse().unwrap();
+        r.override_ids(&HashMap::from([(r.element_id(actual), id)]));
+        let mut hints =
+            HashMap::from([((r.element_id(sites[0].owner), sites[0].kind.clone()), id)]);
+        assert!(r.bind_id_spelled_references_with(&mut hints).contains(&id));
+        let x = r.resolve_qualified("P::Items::X").unwrap();
+        let view = r.resolve_qualified("P::View").unwrap();
+        let scope = *r.b.elem_scope.get(&view.0).unwrap();
+        let filters = r.b.scopes[scope].filters.clone();
+        assert_eq!(filters.len(), 4);
+        for origin in [None, Some(0)] {
+            r.b.identity_origin_unit = origin;
+            for (&fid, expected) in
+                filters
+                    .iter()
+                    .zip([Tri::True, Tri::False, Tri::True, Tri::Unknown])
+            {
+                assert_eq!(r.b.filter_verdict(fid, x.0, 0), expected);
+                assert!(!r.b.filters_active[fid]);
+                assert_eq!(r.b.identity_origin_unit, origin);
+                r.b.filters_active[fid] = true;
+                assert_eq!(r.b.filter_verdict(fid, x.0, 0), Tri::Unknown);
+                assert!(r.b.filters_active[fid]);
+                assert_eq!(r.b.identity_origin_unit, origin);
+                r.b.filters_active[fid] = false;
+                assert_eq!(
+                    r.b.filter_verdict(fid, x.0, MAX_RESOLUTION_DEPTH + 1),
+                    Tri::Unknown
+                );
+                assert_eq!(r.b.identity_origin_unit, origin);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_query_tests {
+    use super::*;
+    use crate::{
+        eval::{EvalError, Value},
+        model::Model,
+    };
+
+    #[test]
+    fn source_callbacks_restore_after_nesting_errors_and_panics() {
+        let mut m = Model::new();
+        m.add_source("a.sysml", "package A;");
+        m.add_source("b.sysml", "package B;");
+        let mut r = ResolvedModel::build(&m);
+        let a = r.resolve_qualified("A").unwrap();
+        let b = r.resolve_qualified("B").unwrap();
+        for prior in [None, Some(0), Some(1)] {
+            r.b.identity_origin_unit = prior;
+            let result: Result<(), ()> = r.with_source(a, |r| {
+                assert_eq!(r.b.identity_origin_unit, Some(0));
+                r.with_source(b, |r| assert_eq!(r.b.identity_origin_unit, Some(1)));
+                assert_eq!(r.b.identity_origin_unit, Some(0));
+                Err(())
+            });
+            assert!(result.is_err());
+            assert_eq!(r.b.identity_origin_unit, prior);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    r.with_source(a, |r| r.with_source(b, |_| panic!("test unwind")))
+                }))
+                .is_err()
+            );
+            assert_eq!(r.b.identity_origin_unit, prior);
+        }
+    }
+
+    #[test]
+    fn value_chain_preserves_uncertainty_and_bounds_recursive_work() {
+        let mut m = Model::new();
+        m.add_source("model.sysml", "package P { part def T; }");
+        let mut r = ResolvedModel::build(&m);
+        let ty = r.resolve_qualified("P::T").unwrap();
+        let name = QualifiedName {
+            is_global: false,
+            segments: vec![Name {
+                value: "x".into(),
+                span: Default::default(),
+            }],
+            span: Default::default(),
+        };
+        let instance = |v| Value::Instance {
+            ty,
+            ty_name: "T".into(),
+            fields: vec![("x".into(), v)],
+        };
+        assert_eq!(
+            r.evaluate_value_chain(Value::Indeterminate, &[&name, &name]),
+            Ok(Value::Indeterminate)
+        );
+        assert_eq!(
+            r.evaluate_value_chain(instance(instance(Value::Integer(7))), &[&name, &name]),
+            Ok(Value::Integer(7))
+        );
+        let repeated = Value::Sequence(vec![
+            instance(Value::Integer(7)),
+            instance(Value::Integer(7)),
+        ]);
+        assert_eq!(
+            r.evaluate_value_chain(repeated, &[&name]),
+            Ok(Value::Integer(7))
+        );
+        let mut empty = name.clone();
+        empty.segments.clear();
+        assert!(matches!(
+            r.evaluate_value_chain(instance(Value::Integer(7)), &[&empty]),
+            Err(EvalError::Unsupported(_))
+        ));
+        let many = Value::Sequence((0..4000).map(|i| instance(Value::Integer(i))).collect());
+        assert!(matches!(
+            r.evaluate_value_chain(many, &[&name]),
+            Err(EvalError::Budget(_))
+        ));
+        let mut deep = Value::Integer(1);
+        for _ in 0..=crate::eval::MAX_CALL_DEPTH {
+            deep = Value::Quantity(Box::new(deep), crate::eval::Unit::from_dims(Vec::new()));
+        }
+        assert!(matches!(
+            r.evaluate_value_chain(instance(deep.clone()), &[&name]),
+            Err(EvalError::Budget(_))
+        ));
+        // An empty path performs no recursive work, even on a deep receiver.
+        assert_eq!(r.evaluate_value_chain(deep.clone(), &[]), Ok(deep));
+        assert_eq!(
+            r.evaluate_value_chain(instance(Value::Integer(8)), &[&name]),
+            Ok(Value::Integer(8))
+        );
+    }
+}
+
+#[cfg(test)]
+mod positional_member_tests {
+    use super::*;
+    use crate::model::Model;
+
+    fn resolved(name: &str, source: &str) -> ResolvedModel {
+        let mut model = Model::new();
+        model.add_source(name, source);
+        assert!(!model.has_errors(), "{source}");
+        ResolvedModel::build(&model)
+    }
+
+    /// A parameter takes members from what its position pairs it with, and
+    /// from nothing else that shares its name: not an element of an
+    /// enclosing namespace, not the parameter its owner inherits under the
+    /// same name at another position.
+    #[test]
+    fn a_parameter_inherits_no_namesake() {
+        for (name, source, parameter, namesake) in [
+            (
+                "functions.kerml",
+                "package P { datatype R;
+                     function rect { in re : R[1]; in im : R[1]; return : R[1]; }
+                     function re { in x : R[1]; return : R[1]; } }",
+                "P::rect::re",
+                "P::re::x",
+            ),
+            (
+                "parts.sysml",
+                "package P { part engine { attribute rpm; } calc def power { in engine; } }",
+                "P::power::engine",
+                "P::engine::rpm",
+            ),
+            (
+                "swapped.sysml",
+                "package P { part def P2 { attribute m2; }
+                     action def A { in p; in q : P2; }
+                     action def Swapped :> A { in q; in p; } }",
+                "P::Swapped::q",
+                "P::P2::m2",
+            ),
+        ] {
+            let mut r = resolved(name, source);
+            let parameter_ref = r.resolve_qualified(parameter).unwrap();
+            let namesake_ref = r.resolve_qualified(namesake).unwrap();
+            assert!(
+                !r.effective_features(parameter_ref, true)
+                    .contains(&namesake_ref),
+                "{parameter}"
+            );
+            let member = namesake.rsplit("::").next().unwrap();
+            assert_eq!(
+                r.resolve_qualified(&format!("{parameter}::{member}")),
+                None,
+                "{parameter}"
+            );
+        }
+    }
+
+    /// A parameter, a result and an end inherit the members of what their
+    /// position pairs them with — through a general that declares its own,
+    /// and through one that only inherits them.
+    #[test]
+    fn a_feature_inherits_the_members_of_what_it_redefines_by_position() {
+        let mut r = resolved(
+            "positions.sysml",
+            "package P {
+                 part def P1 { attribute m1; }
+                 part def P2 { attribute m2; }
+                 action def A { in p : P1; in q : P2; }
+                 action def Swapped :> A { in q; in p; }
+                 action def Renamed :> A { in x; in y; }
+                 action swappedUse : A { in q; in p; }
+                 action def Explicit :> A { in y :>> q; in x; }
+                 calc def C1 { in i; return r : P1; }
+                 calc def C2 :> C1 { return s; }
+                 calc def C3 :> C2;
+                 calc def C4 :> C3 { return t; }
+                 connection def Conn { end e1 : P1; end e2 : P2; }
+                 connection def Conn2 :> Conn { end f1; end f2; }
+                 connection def Conn3 :> Conn2;
+                 connection def Conn4 :> Conn3 { end g1; end g2; }
+                 requirement def R { subject sub : P1; }
+                 requirement def R2 :> R { subject t; in x; }
+             }",
+        );
+        let m1 = r.resolve_qualified("P::P1::m1").unwrap();
+        let m2 = r.resolve_qualified("P::P2::m2").unwrap();
+        for (feature, expected) in [
+            ("P::Swapped::q", m1),
+            ("P::Swapped::p", m2),
+            ("P::Renamed::x", m1),
+            ("P::Renamed::y", m2),
+            ("P::swappedUse::q", m1),
+            ("P::swappedUse::p", m2),
+            ("P::Explicit::x", m2),
+            ("P::Explicit::y", m1),
+            ("P::C2::s", m1),
+            ("P::C4::t", m1),
+            ("P::Conn2::f1", m1),
+            ("P::Conn2::f2", m2),
+            ("P::Conn4::g1", m1),
+            ("P::Conn4::g2", m2),
+            ("P::R2::t", m1),
+        ] {
+            let feature_ref = r.resolve_qualified(feature).unwrap();
+            let member = r.element_qualified_name(expected).unwrap();
+            let member = member.rsplit("::").next().unwrap();
+            assert_eq!(
+                r.resolve_qualified(&format!("{feature}::{member}")),
+                Some(expected),
+                "{feature}::{member}"
+            );
+            assert!(
+                r.effective_features(feature_ref, true).contains(&expected),
+                "{feature}"
+            );
+            assert!(
+                !r.effective_features(feature_ref, false).contains(&expected),
+                "{feature} inherits through an implied relationship"
+            );
+        }
+        assert_eq!(r.resolve_qualified("P::Swapped::q::m2"), None);
+        // A written redefinition keeps its members among the written
+        // heritage; the position adds the general's at the same index.
+        let y = r.resolve_qualified("P::Explicit::y").unwrap();
+        assert!(r.effective_features(y, false).contains(&m2));
+    }
+
+    /// A parameter reusing an inherited name at another position shadows
+    /// nothing, in lookup as in the inherited view: `Q::b` redefines `A::a`
+    /// by position, so `A::b` is still inherited beside it, and a name that
+    /// finds both is ambiguous.
+    #[test]
+    fn a_reused_parameter_name_shadows_nothing_in_lookup() {
+        let mut r = resolved(
+            "shadow.sysml",
+            "package P {
+                 action def A { in a; in b; }
+                 action def Q :> A { in b; }
+                 action def C :> Q, A;
+             }",
+        );
+        let q_b = r.resolve_qualified("P::Q::b").unwrap();
+        let a_b = r.resolve_qualified("P::A::b").unwrap();
+        let c = r.resolve_qualified("P::C").unwrap();
+        assert_eq!(r.resolve_qualified("P::C::b"), None);
+        // Ambiguous, not missing: both `b`s are found from `C`'s body.
+        let body = *r.b.elem_scope.get(&c.0).unwrap();
+        let b = QualifiedName {
+            is_global: false,
+            segments: vec![Name {
+                value: "b".to_string(),
+                span: Span::default(),
+            }],
+            span: Span::default(),
+        };
+        assert!(matches!(
+            r.b.resolve_result(body, &b, 0, false),
+            LookupResult::Ambiguous
+        ));
+        let features = r.effective_features(c, true);
+        assert!(features.contains(&q_b) && features.contains(&a_b));
+        let names: Vec<String> = r
+            .callable_parameters(c)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["b", "b"]);
     }
 }

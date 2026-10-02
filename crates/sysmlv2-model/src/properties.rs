@@ -42,9 +42,11 @@ impl<'de> Deserialize<'de> for Key {
     }
 }
 fn key(name: &str) -> Key {
-    static KEYS: OnceLock<HashMap<&'static str, Arc<str>>> = OnceLock::new();
+    type Keys =
+        HashMap<&'static str, Arc<str>, std::hash::BuildHasherDefault<crate::layered::IdHasher>>;
+    static KEYS: OnceLock<Keys> = OnceLock::new();
     let keys = KEYS.get_or_init(|| {
-        let mut keys = HashMap::new();
+        let mut keys = Keys::default();
         for (_, props) in crate::schema_props::METACLASS_PROPS {
             for &(name, _) in *props {
                 keys.entry(name).or_insert_with(|| Arc::from(name));
@@ -111,13 +113,68 @@ impl PartialEq for Atom {
         }
     }
 }
+impl From<Value> for Atom {
+    fn from(v: Value) -> Self {
+        Self::from_json(v)
+    }
+}
+/// The spellings of the enumeration-valued properties (visibility,
+/// direction, the usage kinds) and the operators the builder writes most:
+/// one shared string each, instead of a copy per element.
+fn interned_string(s: &str) -> Option<Arc<str>> {
+    const WORDS: &[&str] = &[
+        "public",
+        "private",
+        "protected",
+        "in",
+        "out",
+        "inout",
+        "requirement",
+        "assumption",
+        "objective",
+        "subject",
+        "actor",
+        "stakeholder",
+        ".",
+        "==",
+        "===",
+        "+",
+        "-",
+        "*",
+        "/",
+        "and",
+        "or",
+        "not",
+        "istype",
+        "hastype",
+        "@",
+        "@@",
+        "as",
+        "meta",
+        "if",
+        "[",
+        "#",
+        "..",
+    ];
+    static INTERNED: OnceLock<Vec<Arc<str>>> = OnceLock::new();
+    let i = WORDS.iter().position(|w| *w == s)?;
+    let interned = INTERNED.get_or_init(|| WORDS.iter().map(|w| Arc::from(*w)).collect());
+    Some(Arc::clone(&interned[i]))
+}
 impl Atom {
+    /// A reference to the element with identity `id`.
+    pub(crate) fn reference(id: Uuid) -> Self {
+        Self::Reference(Reference {
+            id,
+            spelling: OnceLock::new(),
+        })
+    }
     pub fn from_json(v: Value) -> Self {
         match v {
             Value::Null => Self::Null,
             Value::Bool(v) => Self::Bool(v),
             Value::Number(v) => Self::Number(v),
-            Value::String(v) => Self::String(v.into()),
+            Value::String(v) => Self::String(interned_string(&v).unwrap_or_else(|| v.into())),
             Value::Array(v) => Self::Array(v.into_iter().map(Self::from_json).collect()),
             Value::Object(v) => {
                 // A lone `@id` is an element reference. Its spelling is not
@@ -252,9 +309,10 @@ impl Properties {
             .ok()
             .map(|i| &self.entries[i].1)
     }
-    pub fn insert(&mut self, k: &str, v: Value) {
+    pub fn insert(&mut self, k: &str, v: impl Into<Atom>) {
+        let v = v.into();
         if let Some(bit) = flag(k) {
-            if let Value::Bool(b) = v {
+            if let Atom::Bool(b) = v {
                 self.present |= bit;
                 if b {
                     self.flags |= bit;
@@ -269,13 +327,40 @@ impl Properties {
             self.present &= !bit;
             self.flags &= !bit;
         }
-        let value = (key(k), Atom::from_json(v));
+        let value = (key(k), v);
         match self.entries.binary_search_by(|(key, _)| key.name().cmp(k)) {
             Ok(i) => self.entries.make_mut()[i] = value,
             Err(i) => self.entries.make_mut().insert(i, value),
         }
     }
-    pub fn append(&mut self, k: &str, value: Value) {
+    /// Preserve malformed scalar input as literal data. A reference-shaped
+    /// object in a Boolean property is not a semantic reference to remap.
+    pub(crate) fn insert_payload_flag(&mut self, k: &str, value: Value) {
+        fn literal(value: Value) -> Atom {
+            match value {
+                Value::Object(v) => {
+                    Atom::Object(v.into_iter().map(|(k, v)| (key(&k), literal(v))).collect())
+                }
+                Value::Array(v) => Atom::Array(v.into_iter().map(literal).collect()),
+                v => Atom::from_json(v),
+            }
+        }
+        if value.is_boolean() {
+            self.insert(k, value);
+            return;
+        }
+        if let Some(bit) = flag(k) {
+            self.present &= !bit;
+            self.flags &= !bit;
+        }
+        let value = (key(k), literal(value));
+        match self.entries.binary_search_by(|(key, _)| key.name().cmp(k)) {
+            Ok(i) => self.entries.make_mut()[i] = value,
+            Err(i) => self.entries.make_mut().insert(i, value),
+        }
+    }
+
+    pub fn append(&mut self, k: &str, value: impl Into<Atom>) {
         let i = match self.entries.binary_search_by(|(key, _)| key.name().cmp(k)) {
             Ok(i) => i,
             Err(i) => {
@@ -286,7 +371,7 @@ impl Properties {
             }
         };
         if let Atom::Array(a) = &mut self.entries.make_mut()[i].1 {
-            a.push(Atom::from_json(value));
+            a.push(value.into());
         }
     }
     pub fn references(&self) -> impl Iterator<Item = (Key, Uuid)> + '_ {

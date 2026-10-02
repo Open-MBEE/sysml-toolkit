@@ -209,6 +209,7 @@ rule_ids! {
     UsageKindMismatch = "usage-kind-mismatch",
     PortMemberReferential = "port-member-referential",
     InheritedNameShadow = "inherited-name-shadow",
+    RedefinitionOutsideInheritance = "redefinition-outside-inheritance",
     UnqualifiedEnumLiteral = "unqualified-enum-literal",
     UnitSpelling = "unit-spelling",
     DimensionalConsistency = "dimensional-consistency",
@@ -488,6 +489,17 @@ pub const RULES: &[Rule] = &[
                       one. Info by default: the semantic check already reports the \
                       collision as a warning, this finding carries the fix",
         default: Severity::Info,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::RedefinitionOutsideInheritance,
+        description: "an unqualified redefinition that resolves through an enclosing namespace \
+                      rather than a member of its selected explicit general; qualify an \
+                      intentional external target. No automatic fix",
+        default: Severity::Warn,
         scopes: &[],
         styles: &[],
         families: &[],
@@ -1425,6 +1437,9 @@ pub fn lint_units(
     }
     if config.cfg(RuleId::InheritedNameShadow).enabled() {
         inherited_name_shadow(resolved, config, sources, &mut out);
+    }
+    if config.cfg(RuleId::RedefinitionOutsideInheritance).enabled() {
+        redefinition_outside_inheritance(resolved, config, &mut out);
     }
     if config.cfg(RuleId::UnqualifiedEnumLiteral).enabled() {
         unqualified_enum_literal(resolved, config, &mut out);
@@ -5442,5 +5457,73 @@ fn report_unclaimed_markers(
             guard_anchor(resolved, *member),
             edit_target(resolved, *member),
         );
+    }
+}
+
+/// Flag a bare redefinition that escaped its general's member namespace.
+fn redefinition_outside_inheritance(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    out: &mut Vec<Finding>,
+) {
+    for (site, name) in resolved.redefinitions_outside_inheritance() {
+        let Some(feature) = site.exclude else {
+            continue;
+        };
+        let severity = config
+            .cfg(RuleId::RedefinitionOutsideInheritance)
+            .severity(resolved.element_type(feature));
+        if severity == Severity::Off {
+            continue;
+        }
+        let Some(owner) = resolved.owner(feature) else {
+            continue;
+        };
+        let target = resolved
+            .element_qualified_name(site.target)
+            .unwrap_or_else(|| format!("@{}", resolved.element_id(site.target)));
+        let owner_name = resolved
+            .element_qualified_name(owner)
+            .unwrap_or_else(|| format!("@{}", resolved.element_id(owner)));
+        let mut message = format!(
+            "Unqualified redefinition resolves to `{target}` through an enclosing namespace, rather than a member of the selected general of `{owner_name}`; qualify the target if intentional"
+        );
+        // A shallow, unique structural alternative is useful context, never
+        // an automatic repair. Its value might itself be non-overridable.
+        let mut alternatives = Vec::new();
+        for child in resolved.effective_features(owner, true) {
+            if child == feature
+                || !sysmlv2_model::check::metaclass_conforms(
+                    resolved.element_type(child),
+                    "PartUsage",
+                )
+            {
+                continue;
+            }
+            let Some(child_name) = resolved.element_effective_name(child) else {
+                continue;
+            };
+            if let Some(target) = resolved.owned_member(child, &name) {
+                if target != site.target {
+                    alternatives.push(format!(
+                        "{}.{}",
+                        sysmlv2_syntax::ast::escape_name(&child_name),
+                        sysmlv2_syntax::ast::escape_name(&name)
+                    ));
+                }
+            }
+        }
+        alternatives.sort();
+        alternatives.dedup();
+        if let [path] = alternatives.as_slice() {
+            message.push_str(&format!(
+                ". A nested feature `{path}` also exists; check the intended target"
+            ));
+        }
+        let mut f = finding(RuleId::RedefinitionOutsideInheritance, severity, message);
+        f.unit = Some(site.unit);
+        f.span = Some(site.span);
+        f.element = edit_target(resolved, feature);
+        out.push(f);
     }
 }

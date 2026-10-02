@@ -41,7 +41,9 @@ use uuid::Uuid;
 // changes; bump the MAGIC digit only for serialized-layout changes.
 // v6: outcomes may carry the root names their resolution missed, so a
 // replay can re-resolve exactly the entries a model's root additions reach.
-const MAGIC: &[u8; 8] = b"SYSML6LC";
+// v7: include the authored graph format so resolution recordings cannot cross it.
+// v8: whether the outcomes are the library's own fixed point.
+const MAGIC: &[u8; 8] = b"SYSML8LC";
 
 /// Toolkit build identity stamped into every serialized cache: the crate
 /// version plus a fingerprint of the semantics-bearing crate sources
@@ -67,6 +69,12 @@ const _: () = assert!(
 /// unresolved long tail is re-reported identically without re-searching).
 #[derive(Clone)]
 pub struct LibraryCache {
+    pub(crate) graph_format: crate::model::GraphFormat,
+    /// Whether the outcomes are the library's own fixed point: recorded
+    /// from the library alone, by a resolution whose passes agreed. An
+    /// oscillating library keeps its first pass's outcomes instead, which a
+    /// replay may not treat as final.
+    pub(crate) fixed_point: bool,
     pub(crate) outcomes: Vec<Option<Uuid>>,
     /// Per outcome, the root-namespace names its resolution looked up and
     /// missed. A model that introduces one of them resolves that entry
@@ -134,6 +142,13 @@ impl LibraryCache {
         write_atomically(path, &self.to_bytes())
     }
 
+    /// The graph format the outcomes were recorded for; a build of another
+    /// format cannot replay them.
+    #[must_use]
+    pub fn graph_format(&self) -> crate::model::GraphFormat {
+        self.graph_format
+    }
+
     /// The serialized form `save` writes — for hosts that carry the
     /// sealed snapshot without a filesystem (WASM: fetch the bytes,
     /// [`Self::from_bytes`] them). Versioned, fingerprinted, and
@@ -144,6 +159,8 @@ impl LibraryCache {
         buf.extend_from_slice(MAGIC);
         buf.push(TOOLKIT_BUILD.len() as u8);
         buf.extend_from_slice(TOOLKIT_BUILD.as_bytes());
+        buf.push(self.graph_format.version());
+        buf.push(u8::from(self.fixed_point));
         buf.extend_from_slice(&self.fingerprint.to_le_bytes());
         buf.extend_from_slice(&(self.outcomes.len() as u64).to_le_bytes());
         for (i, o) in self.outcomes.iter().enumerate() {
@@ -217,7 +234,18 @@ impl LibraryCache {
         if rest.len() < vlen || &rest[..vlen] != TOOLKIT_BUILD.as_bytes() {
             return None;
         }
-        let rest = &rest[vlen..];
+        let (format, rest) = rest[vlen..].split_first()?;
+        let graph_format = match format {
+            2 => crate::model::GraphFormat::LegacyV2,
+            3 => crate::model::GraphFormat::CanonicalV3,
+            _ => return None,
+        };
+        let (fixed_point, rest) = rest.split_first()?;
+        let fixed_point = match fixed_point {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
         if rest.len() < 16 {
             return None;
         }
@@ -323,6 +351,8 @@ impl LibraryCache {
             return None;
         }
         Some(LibraryCache {
+            graph_format,
+            fixed_point,
             outcomes,
             outcome_misses,
             fingerprint,
@@ -355,6 +385,22 @@ pub fn hash_library_dir(dir: &Path) -> io::Result<u64> {
         h.update(&std::fs::read(&path)?);
     }
     Ok(h.finish())
+}
+
+/// Content key of in-memory library units, `(name, text)` in load order:
+/// what a prepared snapshot of a source bundle is keyed by, so a bundle
+/// whose units changed (or were reordered) misses. Mixes the released
+/// version like [`hash_library_dir`].
+pub fn hash_units<'a>(units: impl IntoIterator<Item = (&'a str, &'a str)>) -> u64 {
+    let mut h = Fnv::new();
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    for (name, text) in units {
+        h.update(name.as_bytes());
+        h.update(&[0]);
+        h.update(text.as_bytes());
+        h.update(&[0]);
+    }
+    h.finish()
 }
 
 /// Default cache file path for a library keyed by `key`:

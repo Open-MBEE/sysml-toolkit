@@ -1,5 +1,5 @@
 //! Shared libraries preserve the source-library API's graph and edit behavior.
-use sysmlv2_wasm::{PreparedLibrary, Session};
+use sysmlv2_wasm::{LspServer, PreparedLibrary, Session};
 
 fn sources(units: &[(&str, &str)]) -> String {
     serde_json::to_string(
@@ -128,6 +128,38 @@ fn prepared_sources_reject_stale_corrupt_and_truncated_recordings() {
     );
 }
 
+/// A prepared library keeps the snapshot it was prepared with, or the
+/// recording it made while preparing, and a workspace that must resolve
+/// the library together with its own units answers as a session on the
+/// sources does: one that supplies a root name the library looked up and
+/// missed replays the recording's outcomes, one with a root filter takes
+/// its element identities and resolves the library's references again,
+/// and one with a root declaration named like the library's resolves the
+/// library afresh.
+#[test]
+fn joint_builds_on_a_prepared_library_answer_like_its_sources() {
+    let lib = [(
+        "lib.sysml",
+        "package L { part def A; part def B :> A { attribute x : Measured; } }",
+    )];
+    let mut model = sysmlv2_model::model::Model::new();
+    for (name, text) in lib {
+        model.add_library_source(name, text);
+    }
+    model.record_library_cache();
+    let _ = sysmlv2_model::json::ResolvedModel::build(&model);
+    let snapshot = model.take_recorded_library_cache().unwrap().to_bytes();
+    for user in [
+        "package L { part def Z; } package U { part b : L::B; }",
+        "attribute def Measured; package U { part b : L::B; attribute y :> b.x; }",
+        "filter true; package U { part b : L::B; }",
+    ] {
+        for snapshot in [None, Some(snapshot.clone())] {
+            parity(&lib, &[("user.sysml", user)], snapshot);
+        }
+    }
+}
+
 #[test]
 fn sessions_retain_shared_library_and_isolate_edits() {
     let text = "package L { part def A; attribute value = 3; }";
@@ -175,4 +207,96 @@ fn prepared_library_supports_interchange_and_attachment() {
     attached.load_prepared_library(&prepared).unwrap();
     assert!(attached.metaclass(&stale).is_err());
     assert_eq!(attached.to_compact_json(), original.to_compact_json());
+}
+
+/// A language server over a prepared library answers as one over the same
+/// sources and snapshot, and outlives the prepared library's handle.
+#[test]
+fn language_server_on_a_prepared_library_answers_like_its_sources() {
+    let unit = (
+        "MiniLib.sysml",
+        "package MiniLib {\n    part def Widget;\n    part def Gadget :> Widget;\n}\n",
+    );
+    let library = sources(&[unit]);
+    let conversation = |mut lsp: LspServer| {
+        let mut out = Vec::new();
+        for message in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-8"]}}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///w/m.sysml","languageId":"sysml","version":1,"text":"package P {\n    private import MiniLib::*;\n    part g : Gadget;\n    part def X;\n}\n"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///w/m.sysml"},"position":{"line":3,"character":4}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///w/m.sysml"},"position":{"line":2,"character":14}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///w/m.sysml"},"position":{"line":2,"character":14}}}"#,
+        ] {
+            out.push(lsp.handle(message).unwrap());
+        }
+        out
+    };
+    let mut model = sysmlv2_model::model::Model::new();
+    model.add_library_source(unit.0, unit.1);
+    model.record_library_cache();
+    let _ = sysmlv2_model::json::ResolvedModel::build(&model);
+    let snapshot = model.take_recorded_library_cache().unwrap().to_bytes();
+    for snapshot in [None, Some(snapshot)] {
+        let expected = conversation(LspServer::with_library(&library, snapshot.clone()).unwrap());
+        let prepared = PreparedLibrary::new(&library, snapshot).unwrap();
+        let lsp = LspServer::with_prepared_library(&prepared);
+        drop(prepared);
+        assert_eq!(conversation(lsp), expected);
+        assert!(
+            expected[4][0].contains("MiniLib.sysml"),
+            "{:?}",
+            expected[4]
+        );
+    }
+}
+
+/// A handle decoded from a prepared snapshot of the bundle equals one prepared
+/// from the bundle's source; a snapshot of other units, or garbage, is refused.
+#[test]
+fn snapshot_handles_match_source_handles_and_refuse_other_units() {
+    let lib = [(
+        "lib.sysml",
+        "package L { part def A; part def B :> A; attribute def M; }",
+    )];
+    let users = [("user.sysml", "package U { part a : L::A; part b : L::B; }")];
+    let library = sources(&lib);
+    let users = sources(&users);
+    let units: Vec<(String, String)> = lib
+        .iter()
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect();
+    let (snapshot, recording) =
+        match sysmlv2_transform::Library::prepared_sources(units.clone(), None).unwrap() {
+            sysmlv2_transform::Library::Prepared(prepared) => {
+                let key = sysmlv2_model::libcache::hash_units(
+                    units.iter().map(|(n, t)| (n.as_str(), t.as_str())),
+                );
+                (prepared.to_bytes(key).unwrap(), prepared.recording_bytes())
+            }
+            _ => unreachable!(),
+        };
+    let decoded = PreparedLibrary::from_snapshot(snapshot.clone(), &library, recording).unwrap();
+    let prepared = PreparedLibrary::new(&library, None).unwrap();
+    let mut a = Session::from_sources_with_prepared_library(&users, &decoded).unwrap();
+    let mut b = Session::from_sources_with_prepared_library(&users, &prepared).unwrap();
+    assert_eq!(a.to_compact_json(), b.to_compact_json());
+    assert_eq!(a.check(), b.check());
+    assert_eq!(a.units(), b.units());
+    let other = sources(&[("lib.sysml", "package L { part def A; }")]);
+    assert!(
+        PreparedLibrary::from_snapshot(snapshot.clone(), &other, None).is_err(),
+        "other units"
+    );
+    assert!(
+        PreparedLibrary::from_snapshot(snapshot[..snapshot.len() / 2].to_vec(), &library, None)
+            .is_err(),
+        "truncated"
+    );
+    let mut corrupt = snapshot;
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    assert!(
+        PreparedLibrary::from_snapshot(corrupt, &library, None).is_err(),
+        "corrupt"
+    );
 }

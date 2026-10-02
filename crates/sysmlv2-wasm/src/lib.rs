@@ -547,6 +547,62 @@ impl PreparedLibrary {
                 .map_err(|e| e.to_string())?,
         })
     }
+
+    /// Decode a prepared snapshot (the package's `sysml-library.prepared.gz`,
+    /// decompressed) of exactly `sources_json`, the bundle it was generated
+    /// from: no resolve at boot, no syntax trees in memory. A snapshot made by
+    /// another build or from other units is refused with an error, and the
+    /// caller prepares from source with `new` instead. `recording` is the
+    /// sealed resolution snapshot, kept encoded for the builds that must
+    /// resolve the library together with user units.
+    /// [`Self::from_snapshot`] reading the snapshot where it lies: `view` stays
+    /// in the host's memory and is copied into this module one window at a
+    /// time, so the module's memory never holds the whole snapshot (which it
+    /// would keep as its high-water mark). Same refusals as `fromSnapshot`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = fromSnapshotStream)]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_snapshot_stream(
+        view: js_sys::Uint8Array,
+        sources_json: &str,
+        recording: Option<Vec<u8>>,
+    ) -> Result<PreparedLibrary, String> {
+        let len = usize::try_from(view.length()).map_err(|e| e.to_string())?;
+        let mut at: u32 = 0;
+        let fill = |buf: &mut [u8]| {
+            let n = u32::try_from(buf.len())
+                .unwrap_or(u32::MAX)
+                .min(view.length() - at);
+            if n == 0 {
+                return 0;
+            }
+            view.subarray(at, at + n).copy_to(&mut buf[..n as usize]);
+            at += n;
+            n as usize
+        };
+        Ok(Self {
+            inner: Library::prepared_snapshot_chunks(
+                parse_sources(sources_json)?,
+                len,
+                fill,
+                recording,
+            )
+            .map_err(|e| e.to_string())?,
+        })
+    }
+
+    #[wasm_bindgen(js_name = fromSnapshot)]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_snapshot(
+        snapshot: Vec<u8>,
+        sources_json: &str,
+        recording: Option<Vec<u8>>,
+    ) -> Result<PreparedLibrary, String> {
+        Ok(Self {
+            inner: Library::prepared_snapshot(parse_sources(sources_json)?, &snapshot, recording)
+                .map_err(|e| e.to_string())?,
+        })
+    }
 }
 
 #[wasm_bindgen]
@@ -616,6 +672,72 @@ impl Session {
             .map_err(|e| e.to_string())?;
         self.gen += 1;
         Ok(())
+    }
+}
+
+/// The outcomes a session's build settled on, held apart from the
+/// session for the next build of mostly the same units to start from
+/// (see [`Session::from_sources_settled`]). The handle keeps only the
+/// outcomes — each reference's fingerprint and the identity of its
+/// target — so the session that produced it may be freed before the
+/// next build; free the handle once a build has taken it, or keep the
+/// latest one across edits.
+#[wasm_bindgen]
+pub struct SettledOutcomes {
+    inner: std::sync::Arc<sysmlv2_transform::SettledOutcomes>,
+}
+
+#[wasm_bindgen]
+impl SettledOutcomes {
+    /// How many units' outcomes the handle keeps.
+    #[must_use]
+    #[wasm_bindgen(js_name = unitCount)]
+    pub fn unit_count(&self) -> usize {
+        self.inner.unit_count()
+    }
+}
+
+#[wasm_bindgen]
+impl Session {
+    /// The outcomes this session's build settled on, for a session over
+    /// mostly the same units to start from ([`Self::from_sources_settled`]):
+    /// `undefined` unless the session was built on a prepared library and
+    /// its resolution ran more than one pass and settled — a build that
+    /// resolved in one pass, one that resolved the library together with
+    /// its units, or one that did not settle keeps none. A session rebuilt
+    /// by an edit or a library load keeps the outcomes of its latest build.
+    #[must_use]
+    #[wasm_bindgen(js_name = settledOutcomes)]
+    pub fn settled_outcomes(&self) -> Option<SettledOutcomes> {
+        self.inner
+            .settled_outcomes()
+            .map(|inner| SettledOutcomes { inner })
+    }
+
+    /// [`Self::from_sources_with_prepared_library`] with resolution started
+    /// from `settled`, the outcomes a previous session settled on
+    /// ([`Self::settled_outcomes`]): a reference lowered where and as it
+    /// was takes its outcome, so a unit that resolves as it did is
+    /// confirmed in one pass, while an edited reference, and every
+    /// reference after an inserted or removed element, starts unresolved
+    /// and is carried through as many passes as it takes. What a host that
+    /// rebuilds its session after every edit starts the next build from;
+    /// the session answers as one built without.
+    #[wasm_bindgen(js_name = fromSourcesSettled)]
+    pub fn from_sources_settled(
+        sources_json: &str,
+        library: &PreparedLibrary,
+        settled: &SettledOutcomes,
+    ) -> Result<Session, String> {
+        Ok(Session {
+            inner: TSession::from_sources_settled(
+                parse_sources(sources_json)?,
+                Some(library.inner.clone()),
+                Some(settled.inner.clone()),
+            )
+            .map_err(|e| e.to_string())?,
+            gen: 0,
+        })
     }
 
     /// Open a session over in-memory sources: JSON `[{name, text}]`.
@@ -797,33 +919,12 @@ impl Session {
         Ok(self.value_to_json(&value).to_string())
     }
 
-    /// Render the template a `view` usage presents over its exposed model
-    /// slice (semantic mode): `qualified_name` names the view
-    /// usage; the result is the rendered node tree as JSON, or HTML when
-    /// `format` is `"html"`. Evaluation writes nothing into the model.
-    // The export boundary converts an optional string only when owned.
-    #[allow(clippy::needless_pass_by_value)]
-    #[wasm_bindgen(js_name = renderView)]
-    pub fn render_view(
-        &mut self,
-        qualified_name: &str,
-        format: Option<String>,
-    ) -> Result<String, String> {
-        let view = self
-            .inner
-            .resolved()
-            .resolve_qualified(qualified_name)
-            .ok_or_else(|| format!("element not found: {qualified_name}"))?;
-        let nodes = self.inner.resolved().render_view(view)?;
-        Ok(match format.as_deref() {
-            Some("html") => sysmlv2_model::render::to_html(&nodes),
-            _ => serde_json::Value::Array(nodes.iter().map(|n| n.to_json()).collect()).to_string(),
-        })
-    }
-
     /// Describe a `view` usage for tabular consumers: the rendering it
-    /// requests (`render …;` → the rendering usage's declared name),
-    /// the elements it exposes (its `expose` imports with the view's
+    /// requests (`render …;` → the rendering usage's declared name; a
+    /// view with no `render` member of its own reports the one it
+    /// inherits from its definition or a view it specializes, the first
+    /// in heritage order when there are several), the elements it
+    /// exposes (its `expose` imports with the view's
     /// `filter` conditions applied — the same exposure the CLI's
     /// view-directed diagrams use), the view usages it owns (a matrix's
     /// `columns` sub-view), and its prefix metadata with every owned
@@ -980,6 +1081,25 @@ impl Session {
             _ => return Err("unsupported derived value shape from a newer toolkit".into()),
         };
         Ok(json.to_string())
+    }
+
+    /// Checked owned/derived property by specification name, encoded as JSON.
+    pub fn property(&mut self, e: &Element, name: &str) -> Result<String, String> {
+        self.guard(e)?;
+        self.inner
+            .resolved()
+            .property(e.e, name)
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Strict full JSON; no recovery elements or unavailable-value placeholders.
+    #[wasm_bindgen(js_name = toFullJsonStrict)]
+    pub fn to_full_json_strict(&mut self) -> Result<String, String> {
+        self.inner
+            .to_full_json_strict()
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
     }
 
     /// The element handles of the derived property `name` of `e`: the
@@ -1225,6 +1345,19 @@ impl Session {
         self.guard(e)?;
         self.guard(ancestor)?;
         Ok(self.inner.resolved().conforms(e.e, ancestor.e))
+    }
+
+    /// Reachability including supported implied library and variation bases.
+    /// A negative result does not establish complete non-conformance.
+    #[wasm_bindgen(js_name = conformsWithImplied)]
+    pub fn conforms_with_implied(
+        &mut self,
+        e: &Element,
+        ancestor: &Element,
+    ) -> Result<bool, String> {
+        self.guard(e)?;
+        self.guard(ancestor)?;
+        Ok(self.inner.resolved().conforms_with_implied(e.e, ancestor.e))
     }
 
     /// The shortest spelling of `target` that resolves to it from
@@ -2691,6 +2824,22 @@ impl LspServer {
                 lib_snapshot,
             ),
         })
+    }
+
+    /// A server whose navigation and completions see a prepared library.
+    /// The library was resolved when it was prepared, so a session resolves
+    /// the workspace's units against it rather than the library's sources;
+    /// a workspace that may change what the library's own names resolve to
+    /// (for example a root name the library looked up and missed, or a root
+    /// declaration named like one of the library's) has the library resolved
+    /// again with it. The server keeps its own reference; the handle may be
+    /// freed afterwards.
+    #[must_use]
+    #[wasm_bindgen(js_name = withPreparedLibrary)]
+    pub fn with_prepared_library(library: &PreparedLibrary) -> LspServer {
+        LspServer {
+            inner: sysmlv2_lsp::PushServer::with_library(library.inner.clone()),
+        }
     }
 
     /// Seed (or replace) the navigation workspace: every model unit the

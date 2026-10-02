@@ -185,7 +185,10 @@ fn corpus_model() -> Model {
         .expect("library loads");
     for f in testkit::user_files() {
         let src = std::fs::read_to_string(&f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     assert!(!model.has_errors(), "corpus parses clean");
     model

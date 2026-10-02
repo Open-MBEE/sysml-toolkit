@@ -6,15 +6,58 @@
 //! `derived.rs`.
 
 use super::derived::Reference;
-use super::{ElementRef, ResolvedModel};
+use super::type_relations::{RelationFact, TypeRelations};
+use super::{ElementRef, LookupResult, ResolvedModel, split_qualified};
 use std::collections::HashSet;
+use sysmlv2_syntax::{
+    ast::{Name, QualifiedName},
+    span::Span,
+};
 
-/// The library packages whose functions the KerML concrete syntax names
-/// as model-level evaluable (clause 7.4.10). The clause lists a subset of
-/// each package's functions; every function of the three packages counts
-/// here, an over-approximation recorded in the API reference.
-const EVALUABLE_FUNCTION_PACKAGES: &[&str] =
-    &["BaseFunctions", "DataFunctions", "ControlFunctions"];
+/// KerML 1.0, §§8.2.5.8.1–8.2.5.8.2, Tables 5 and 7. These are
+/// designated function identities, not all functions in their packages.
+fn evaluable_function_name(package: &str, name: &str) -> bool {
+    match package {
+        "BaseFunctions" => matches!(
+            name,
+            "istype"
+                | "hastype"
+                | "@"
+                | "@@"
+                | "as"
+                | "meta"
+                | "=="
+                | "!="
+                | "==="
+                | "!=="
+                | "#"
+                | ","
+        ),
+        "DataFunctions" => matches!(
+            name,
+            "xor"
+                | "not"
+                | "|"
+                | "&"
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "^"
+                | ".."
+        ),
+        "ControlFunctions" => matches!(
+            name,
+            "??" | "if" | "or" | "and" | "implies" | "." | "collect" | "select"
+        ),
+        _ => false,
+    }
+}
 
 impl ResolvedModel {
     // ---- type operations ----
@@ -108,13 +151,26 @@ impl ResolvedModel {
     /// `closure(featuringType)` over a set of features and types: every
     /// type featuring them directly or through the owning types of those
     /// types' own features — the owning-type chain, in discovery order.
-    fn featuring_closure(&mut self, roots: &[ElementRef]) -> Vec<ElementRef> {
+    fn featuring_closure(
+        &mut self,
+        roots: &[ElementRef],
+        mut relations: Option<&mut TypeRelations>,
+        steps: &mut usize,
+    ) -> Option<Vec<ElementRef>> {
         let mut out: Vec<ElementRef> = Vec::new();
+        let mut output_seen = HashSet::new();
         let mut frontier: Vec<ElementRef> = roots.to_vec();
         let mut seen: HashSet<usize> = roots.iter().map(|r| r.0).collect();
         while let Some(x) = frontier.pop() {
             let next: Vec<ElementRef> = if self.is_kind(x, "Feature") {
-                self.d_featuring_types(x)
+                match relations.as_deref_mut() {
+                    Some(proof) => proof
+                        .featuring_types(&mut self.b, x.0, steps)?
+                        .into_iter()
+                        .map(ElementRef)
+                        .collect(),
+                    None => self.d_featuring_types(x),
+                }
             } else {
                 // A Type that is not a Feature is featured by nothing.
                 Vec::new()
@@ -126,22 +182,18 @@ impl ResolvedModel {
                 if seen.insert(t.0) {
                     frontier.push(t);
                 }
-                if !out.contains(&t) {
+                if output_seen.insert(t) {
                     out.push(t);
                 }
             }
         }
-        out
+        Some(out)
     }
 
-    /// Whether `t` specializes `general`, through the explicit
-    /// specializations of the model (`t` itself counts). Three clauses of
-    /// the normative `supertypes`/`specializes` are omitted, inert in
-    /// this lowering's featuring types: a Feature's `featureTarget` as a
-    /// supertype (a chain feature is never a featuring type here), a
-    /// conjugated type's `conjugator.originalType`, and
-    /// `Feature::isCompatibleWith`'s shared-redefinition clause.
-    pub(super) fn specializes(&mut self, t: ElementRef, general: ElementRef) -> bool {
+    // Retained compatibility provider for domains whose snapshot/derived
+    // featuring is not yet audited. Domain selection happens before the
+    // stronger provider runs; a failed proof never falls back here.
+    fn compatibility_specializes(&mut self, t: ElementRef, general: ElementRef) -> bool {
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack = vec![t];
         while let Some(x) = stack.pop() {
@@ -161,18 +213,17 @@ impl ResolvedModel {
         false
     }
 
-    /// `Feature::isFeaturedWithin(type)` for a non-null type: every
-    /// featuring type of `f` is one `t` specializes; or `f` is variable and
-    /// `t` specializes its owning type; or `f` is a chain whose first link
-    /// is variable and `t` specializes that link's owning type.
-    fn is_featured_within(&mut self, f: ElementRef, t: ElementRef) -> bool {
+    fn compatibility_is_featured_within(&mut self, f: ElementRef, t: ElementRef) -> bool {
         let featuring = self.d_featuring_types(f);
-        if featuring.iter().all(|&ft| self.specializes(t, ft)) {
+        if featuring
+            .iter()
+            .all(|&ft| self.compatibility_specializes(t, ft))
+        {
             return true;
         }
         if self.prop_bool(f.0, "isVariable") {
             if let Some(o) = self.d_owning_type(f) {
-                if self.specializes(t, o) {
+                if self.compatibility_specializes(t, o) {
                     return true;
                 }
             }
@@ -180,7 +231,7 @@ impl ResolvedModel {
         if let Some(Reference::Element(first)) = self.d_chaining_features(f).into_iter().next() {
             if self.prop_bool(first.0, "isVariable") {
                 if let Some(o) = self.d_owning_type(first) {
-                    if self.specializes(t, o) {
+                    if self.compatibility_specializes(t, o) {
                         return true;
                     }
                 }
@@ -189,11 +240,65 @@ impl ResolvedModel {
         false
     }
 
+    /// `Feature::isFeaturedWithin(type)` for a non-null type: every
+    /// featuring type of `f` is one `t` specializes; or `f` is variable and
+    /// `t` specializes its owning type; or `f` is a chain whose first link
+    /// is variable and `t` specializes that link's owning type.
+    fn is_featured_within(
+        &mut self,
+        f: ElementRef,
+        t: ElementRef,
+        relations: Option<&mut TypeRelations>,
+        steps: &mut usize,
+    ) -> Option<bool> {
+        let relations = match relations {
+            Some(proof) => proof,
+            None => return Some(self.compatibility_is_featured_within(f, t)),
+        };
+        let featuring = relations.featuring_types(&mut self.b, f.0, steps)?;
+        let compatibility = RelationFact::all(
+            featuring
+                .into_iter()
+                .map(|ft| relations.compatible(&mut self.b, t.0, ft, steps)),
+        );
+        if compatibility == RelationFact::Yes {
+            return Some(true);
+        }
+        let mut unknown = compatibility == RelationFact::Unknown;
+        let mut alternatives = Vec::new();
+        if self.prop_bool(f.0, "isVariable") {
+            match relations.owning_type(&mut self.b, f.0, steps) {
+                Some(Some(owner)) => alternatives.push(ElementRef(owner)),
+                Some(None) => {}
+                None => unknown = true,
+            }
+        }
+        if let Some(Reference::Element(first)) = self.d_chaining_features(f).into_iter().next() {
+            if self.prop_bool(first.0, "isVariable") {
+                match relations.owning_type(&mut self.b, first.0, steps) {
+                    Some(Some(owner)) => alternatives.push(ElementRef(owner)),
+                    Some(None) => {}
+                    None => unknown = true,
+                }
+            }
+        }
+        for owner in alternatives {
+            match relations.specializes(&mut self.b, t.0, owner.0, steps) {
+                RelationFact::Yes => return Some(true),
+                RelationFact::No => {}
+                RelationFact::Unknown => unknown = true,
+            }
+        }
+        if unknown { None } else { Some(false) }
+    }
+
     /// `Connector::defaultFeaturingType`: of the types featuring the related
     /// features directly or indirectly, those every related feature is
     /// featured within; of those, the innermost — one no other of them is
     /// featured within — first. Null when a related feature is outside the
-    /// model (its featuring is not visible) or there are none.
+    /// model (its featuring is not visible), owned evidence is incomplete,
+    /// a proof budget is exhausted, or there are no candidates. The strict
+    /// reader retains its Approximate refusal; null is not an absence proof.
     pub(super) fn d_default_featuring_type(&mut self, e: ElementRef) -> Option<ElementRef> {
         let related: Vec<ElementRef> = self
             .d_related_features(e)
@@ -203,14 +308,23 @@ impl ResolvedModel {
         if related.is_empty() {
             return None;
         }
-        let candidates = self.featuring_closure(&related);
+        let mut proof = TypeRelations::default();
+        let mut steps = 0;
+        let roots: Vec<_> = related.iter().map(|e| e.0).collect();
+        let audited = proof.audited_featuring_domain(&mut self.b, &roots, &mut steps)?;
+        let mut relations = audited.then_some(proof);
+        let candidates = self.featuring_closure(&related, relations.as_mut(), &mut steps)?;
         let mut common: Vec<ElementRef> = Vec::new();
         for t in candidates {
             let mut all = true;
             for &f in &related {
-                if !self.is_featured_within(f, t) {
-                    all = false;
-                    break;
+                match self.is_featured_within(f, t, relations.as_mut(), &mut steps) {
+                    Some(true) => {}
+                    Some(false) => {
+                        all = false;
+                        break;
+                    }
+                    None => return None,
                 }
             }
             if all {
@@ -222,7 +336,11 @@ impl ResolvedModel {
         for &t1 in &common {
             let mut outer = false;
             for &t2 in &common {
-                if t2 != t1 && self.featuring_closure(&[t2]).contains(&t1) {
+                if t2 != t1
+                    && self
+                        .featuring_closure(&[t2], relations.as_mut(), &mut steps)?
+                        .contains(&t1)
+                {
                     outer = true;
                     break;
                 }
@@ -360,7 +478,7 @@ impl ResolvedModel {
             }
         };
         if let Some(Reference::Element(anything_self)) = anything_self {
-            if self.specializes(referent, anything_self) {
+            if self.compatibility_specializes(referent, anything_self) {
                 return true;
             }
         }
@@ -392,26 +510,136 @@ impl ResolvedModel {
         }
     }
 
-    /// `Function::isModelLevelEvaluable` for the function an invocation
-    /// instantiates: a function of the Kernel Functions Library's
-    /// `BaseFunctions`, `DataFunctions` or `ControlFunctions` — an element
-    /// of a loaded library, or an external id the library name table names
-    /// in one of them.
+    /// Only the designated Kernel Functions Library identities are
+    /// model-level evaluable. A spelling selects a candidate; the library
+    /// binding must resolve back to the same element or external identity.
     pub(super) fn function_is_model_level_evaluable(&mut self, f: &Reference) -> bool {
-        match f {
-            Reference::Element(f) => {
-                self.is_library_element(*f)
-                    && self.element_qualified_name(*f).is_some_and(|qn| {
-                        qn.split("::")
-                            .next()
-                            .is_some_and(|p| EVALUABLE_FUNCTION_PACKAGES.contains(&p))
-                    })
+        let (package, name) = match f {
+            Reference::Element(e) => {
+                if !self.is_library_element(*e) || !self.is_kind(*e, "Function") {
+                    return false;
+                }
+                let Some(qn) = self.element_qualified_name(*e) else {
+                    return false;
+                };
+                let segments = split_qualified(&qn);
+                let [package, name] = segments.as_slice() else {
+                    return false;
+                };
+                (package.clone(), name.clone())
             }
-            Reference::External(id) => self
-                .external_package
-                .get(id)
-                .is_some_and(|p| EVALUABLE_FUNCTION_PACKAGES.contains(&p.as_str())),
-            Reference::Unresolved(_) => false,
+            Reference::External(id) => {
+                let (Some(package), Some(name)) =
+                    (self.external_package.get(id), self.external_names.get(id))
+                else {
+                    return false;
+                };
+                (package.clone(), name.clone())
+            }
+            Reference::Unresolved(_) => return false,
+        };
+        if !evaluable_function_name(&package, &name) {
+            return false;
+        }
+        self.designated_function_binding(&package, &name).as_ref() == Some(f)
+    }
+
+    /// Resolve one designated function without allowing an ambiguous loaded
+    /// name to fall back to an external name-table identity. General name
+    /// lookup retains its compatibility behavior; this is an admission proof.
+    fn designated_function_binding(&mut self, package: &str, name: &str) -> Option<Reference> {
+        match self.b.designated_function_lookup(package, name) {
+            LookupResult::Found(index, _, _) => {
+                let e = ElementRef(index);
+                (self.is_library_element(e) && self.is_kind(e, "Function"))
+                    .then_some(Reference::Element(e))
+            }
+            LookupResult::Ambiguous => None,
+            LookupResult::Missing => {
+                let name = format!("{package}::{name}");
+                if self.external_ambiguous_names.contains(&name) {
+                    return None;
+                }
+                let id = *self.external_by_name.get(&name)?;
+                self.ensure_by_id();
+                // An external table cannot relabel an in-model element. The
+                // loaded-identity branch must establish its actual binding.
+                (!self.by_id.contains_key(&id)).then_some(Reference::External(id))
+            }
+        }
+    }
+}
+
+impl super::Builder {
+    pub(super) fn designated_function_lookup(&mut self, package: &str, name: &str) -> LookupResult {
+        let qn = QualifiedName {
+            is_global: false,
+            segments: [package, name]
+                .into_iter()
+                .map(|value| Name {
+                    value: value.to_string(),
+                    span: Span::default(),
+                })
+                .collect(),
+            span: Span::default(),
+        };
+        self.resolve_unrestricted(0, &qn)
+    }
+}
+
+#[cfg(test)]
+mod evaluable_function_tests {
+    use super::*;
+    use crate::model::Model;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn all_designated_external_identities_and_exclusions() {
+        // Independently transcribed normative Table 5 / Table 7 identities.
+        let rows = [
+            (
+                "BaseFunctions",
+                "istype hastype @ @@ as meta == != === !== # ,",
+                true,
+            ),
+            (
+                "DataFunctions",
+                "xor not | & < > <= >= + - * / % ^ ..",
+                true,
+            ),
+            (
+                "ControlFunctions",
+                "?? if or and implies . collect select",
+                true,
+            ),
+            ("BaseFunctions", "all [ custom", false),
+            ("DataFunctions", "~ custom", false),
+            ("ControlFunctions", "custom", false),
+        ];
+        let mut names = HashMap::new();
+        let mut expected = Vec::new();
+        for (package, functions, eligible) in rows {
+            for name in functions.split_whitespace() {
+                let id = Uuid::from_u128(expected.len() as u128 + 1);
+                names.insert(id.to_string(), vec![package.to_string(), name.to_string()]);
+                expected.push((id, eligible));
+            }
+        }
+        assert_eq!(
+            expected.iter().filter(|(_, eligible)| *eligible).count(),
+            35
+        );
+        let mut r = ResolvedModel::build(&Model::new());
+        r.set_library_names(&names);
+        for _ in 0..2 {
+            for &(id, eligible) in &expected {
+                assert_eq!(
+                    r.function_is_model_level_evaluable(&Reference::External(id)),
+                    eligible,
+                    "{id}"
+                );
+            }
         }
     }
 }

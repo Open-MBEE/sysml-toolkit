@@ -113,7 +113,22 @@ impl LibraryUnits {
 // 8: the integrity trailer is the same fixed hash the resolution cache
 // uses, so a snapshot outlives a change of the standard library's
 // hasher.
-const MAGIC: &[u8] = b"SYSML-PREPARED-8\n";
+// 9: aliases retain their Membership relationship and lookup outcomes carry
+// the selected alias Membership through re-exports.
+// 10: preserve nonconvergent recorded-lookup qualification.
+// 12: calculations no longer keep their declared input names apart.
+// 13: scopes carry the spellings of every redefinition their owner writes.
+// 14: retain those complete QualifiedNames, including qualification and source spans.
+const MAGIC: &[u8] = b"SYSML-PREPARED-14\n";
+
+/// The records a snapshot carries, in order.
+#[derive(Deserialize)]
+struct Wire {
+    units: Arc<LibraryUnits>,
+    builder: Builder,
+    facts: Arc<crate::check::facts::Facts>,
+    root_names: std::collections::HashSet<String>,
+}
 /// A resolved library with source text and static-analysis facts. Loaded syntax
 /// trees are reconstructed on demand. Models share immutable element and scope
 /// prefixes; user additions and resolver caches remain private.
@@ -123,6 +138,15 @@ pub struct PreparedLibrary {
     pub(crate) builder: Builder,
     facts: Arc<crate::check::facts::Facts>,
     pub(crate) root_names: std::collections::HashSet<String>,
+    /// The resolution recording the library was prepared with, replayed by
+    /// builds that must resolve the library together with user units. Kept
+    /// in memory only; a decoded snapshot has none.
+    #[serde(skip)]
+    pub(crate) recording: Option<Arc<crate::libcache::LibraryCache>>,
+    /// The encoded recording a decoded handle keeps for joint builds, which
+    /// decode it on first need; installing arms the model's lazy slot with it.
+    #[serde(skip)]
+    pub(crate) lazy_recording: Option<Arc<[u8]>>,
 }
 impl PreparedLibrary {
     /// Original unit names and text in library order, without loading syntax trees.
@@ -141,6 +165,11 @@ impl PreparedLibrary {
             .map(|s| (s.name.as_str(), s.source.as_ref()))
     }
 
+    /// Authored graph contract captured by this prepared library.
+    pub fn graph_format(&self) -> crate::model::GraphFormat {
+        self.builder.graph_format
+    }
+
     /// Prepare a library-only model. User units are refused.
     pub fn build(model: &Model) -> io::Result<Self> {
         if (0..model.unit_count()).any(|i| !model.is_library_unit(i)) {
@@ -152,6 +181,9 @@ impl PreparedLibrary {
         let mut builder = Builder::default();
         builder.build_model(model);
         let mut resolved = crate::json::ResolvedModel::from_builder(builder, model);
+        // Keep logical semantic readiness for warming, but never freeze a
+        // published semantic suffix into the source-only prepared prefix.
+        resolved.b.suppress_semantic_publication();
         resolved.prepare_quantity_memo();
         let mut builder = resolved.b;
         let mut facts = builder.prepare_facts();
@@ -166,7 +198,29 @@ impl PreparedLibrary {
             builder,
             facts,
             root_names: crate::json::top_level_names(model.units().iter()),
+            recording: model.library_recording(),
+            lazy_recording: None,
         })
+    }
+
+    /// The resolution recording a source-prepared handle keeps, encoded
+    /// ([`crate::libcache::LibraryCache::to_bytes`]); `None` for a decoded handle.
+    #[must_use]
+    pub fn recording_bytes(&self) -> Option<Vec<u8>> {
+        self.recording
+            .as_ref()
+            .map(|recording| recording.to_bytes())
+    }
+
+    /// Keep an encoded resolution recording ([`crate::libcache::LibraryCache::to_bytes`])
+    /// for the builds that cannot reuse the prepared graph; a handle that
+    /// already holds a decoded recording ignores it. Nothing is decoded here.
+    #[must_use]
+    pub fn with_lazy_recording(mut self, bytes: Vec<u8>) -> Self {
+        if self.recording.is_none() {
+            self.lazy_recording = Some(Arc::from(bytes));
+        }
+        self
     }
     /// Attach this library to an empty model, without parsing or graph lowering.
     pub fn install(self: Arc<Self>, model: &mut Model) -> io::Result<()> {
@@ -190,19 +244,61 @@ impl PreparedLibrary {
         if saved_key != key || checksum(payload) != sum {
             return None;
         }
-        #[derive(Deserialize)]
-        struct Wire {
-            units: Arc<LibraryUnits>,
-            builder: Builder,
-            facts: Arc<crate::check::facts::Facts>,
-            root_names: std::collections::HashSet<String>,
+        Self::from_wire(crate::cache_codec::decode(payload).ok()?)
+    }
+
+    /// [`Self::from_bytes`] over a snapshot the caller feeds in chunks: `fill`
+    /// copies the next bytes of the `len`-byte snapshot into the buffer it
+    /// is given and answers how many (0 once exhausted). Only a window of the
+    /// snapshot is ever held here, so a host that already holds the bytes
+    /// elsewhere (a browser's heap) pays no second copy of them. The
+    /// checksum is verified once the payload has been consumed whole, so a
+    /// corrupt snapshot costs a decode before it is refused; a stale or
+    /// truncated one is refused the same as from `from_bytes`.
+    pub fn from_chunks<F: FnMut(&mut [u8]) -> usize>(
+        len: usize,
+        fill: F,
+        key: u64,
+    ) -> Option<Self> {
+        if len as u64 > MAX_BYTES {
+            return None;
         }
-        let wire: Wire = crate::cache_codec::decode(payload).ok()?;
+        let build = crate::libcache::TOOLKIT_BUILD.as_bytes();
+        let mut src = crate::cache_codec::Chunked::new(len, 64 * 1024, fill);
+        {
+            use crate::cache_codec::Source;
+            if src.take(MAGIC.len()).ok()? != MAGIC
+                || src.take(build.len()).ok()? != build
+                || src.take(1).ok()? != b"\n"
+            {
+                return None;
+            }
+            let saved_key = u64::from_le_bytes(src.take(8).ok()?.try_into().ok()?);
+            if saved_key != key {
+                return None;
+            }
+        }
+        let sum = {
+            use crate::cache_codec::Source;
+            u64::from_le_bytes(src.take(8).ok()?.try_into().ok()?)
+        };
+        src.reset_checksum();
+        let wire: Wire = crate::cache_codec::decode_from(&mut src).ok()?;
+        if src.checksum() != sum {
+            return None;
+        }
+        Self::from_wire(wire)
+    }
+
+    /// The decoded records into a handle, validated and frozen.
+    fn from_wire(wire: Wire) -> Option<Self> {
         let mut result = Self {
             units: wire.units,
             builder: wire.builder,
             facts: wire.facts,
             root_names: wire.root_names,
+            recording: None,
+            lazy_recording: None,
         };
         result.builder.reset_lookup_caches();
         if result.units.sources.iter().any(|u| !u.is_library)
@@ -293,9 +389,10 @@ pub fn load_library_with_cache(model: &mut Model, dir: &Path) -> io::Result<Libr
 /// [`load_library_with_cache`] with an explicit content key and resolution
 /// cache path. The complete snapshot lives beside that path under the
 /// `prepared` extension. A prepared model also keeps the resolution recording
-/// reachable, unread, for builds that must resolve jointly after all: those
-/// replay it instead of resolving the whole library cold. A snapshot miss
-/// records that recording while preparing.
+/// reachable for builds that must resolve jointly after all: those replay it
+/// instead of resolving the whole library cold. A snapshot miss records that
+/// recording while preparing, and the handle then keeps it in memory; a
+/// decoded handle leaves it on disk, unread until such a build.
 pub(crate) fn load_library_with_cache_at(
     model: &mut Model,
     dir: &Path,
@@ -306,7 +403,16 @@ pub(crate) fn load_library_with_cache_at(
         collections::HashMap,
         sync::{Mutex, OnceLock, Weak},
     };
-    static SHARED: OnceLock<Mutex<HashMap<u64, Weak<PreparedLibrary>>>> = OnceLock::new();
+    type SharedLibraries = Mutex<HashMap<(u64, u8), Weak<PreparedLibrary>>>;
+    static SHARED: OnceLock<SharedLibraries> = OnceLock::new();
+    let cache = cache.map(|(key, path)| {
+        let path = if model.graph_format() == crate::model::GraphFormat::CanonicalV3 {
+            path.with_extension("v3.cache")
+        } else {
+            path
+        };
+        (key, path)
+    });
     let mut warnings = Vec::new();
     if model.unit_count() == 0 {
         if let Some((key, path)) = cache {
@@ -314,15 +420,24 @@ pub(crate) fn load_library_with_cache_at(
             let cached = {
                 let mut entries = shared.lock().unwrap_or_else(|e| e.into_inner());
                 entries.retain(|_, value| value.strong_count() > 0);
-                entries.get(&key).and_then(Weak::upgrade)
+                entries
+                    .get(&(key, model.graph_format().version()))
+                    .and_then(Weak::upgrade)
             };
             if let Some(library) = cached {
+                // A handle prepared from source in this process keeps its
+                // recording in memory, so the cache file is left unread.
+                let recorded = library.recording.is_some();
                 library.install(model)?;
-                model.set_lazy_library_cache(path);
+                if !recorded {
+                    model.set_lazy_library_cache(path);
+                }
                 return Ok(LibraryLoad::default());
             }
             let snapshot = path.with_extension("prepared");
-            let library = if let Some(library) = PreparedLibrary::load(&snapshot, key) {
+            let library = if let Some(library) = PreparedLibrary::load(&snapshot, key)
+                .filter(|library| library.graph_format() == model.graph_format())
+            {
                 let library = Arc::new(library);
                 library.clone().install(model)?;
                 library
@@ -341,11 +456,13 @@ pub(crate) fn load_library_with_cache_at(
                 }
                 library
             };
-            model.set_lazy_library_cache(path);
-            shared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, Arc::downgrade(&library));
+            if library.recording.is_none() {
+                model.set_lazy_library_cache(path);
+            }
+            shared.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                (key, model.graph_format().version()),
+                Arc::downgrade(&library),
+            );
             return Ok(LibraryLoad {
                 recording_path: None,
                 warnings,
@@ -371,6 +488,191 @@ pub(crate) fn load_library_with_cache_at(
 mod tests {
     use super::*;
     use crate::json::ResolvedModel;
+    /// A library prepared while recording, or with a snapshot the preparing
+    /// build rejects as stale, keeps a recording; a build that must resolve
+    /// the library together with user units arms it, validates it and
+    /// replays it, and equals a cold build in both graphs. A decoded handle
+    /// has none, a lazy cache slot the loader set is left alone, and a model
+    /// that gains a library unit after installing builds without the handle.
+    #[test]
+    fn joint_builds_replay_the_recording_the_library_was_prepared_with() {
+        let library = "package L { part def A; part def B :> A; }";
+        // `Parts` is a root name the library looked up and missed.
+        let user = "package Parts; package U { part a : L::A; part b : L::B; }";
+        let graphs = |model: &Model| {
+            (
+                crate::json::model_to_compact_json(model),
+                crate::json::library_to_compact_json(model),
+            )
+        };
+        let mut cold = Model::new();
+        cold.add_library_source("lib.sysml", library);
+        cold.add_source("user.sysml", user);
+        let cold = graphs(&cold);
+        // A snapshot of another library decodes but fails the build's
+        // validation, so the preparing build records in its place.
+        let mut other = Model::new();
+        other.add_library_source("lib.sysml", "package L { part def A; }");
+        other.record_library_cache();
+        let _ = ResolvedModel::build(&other);
+        let stale = other.take_recorded_library_cache().unwrap();
+        let mut prepared = None;
+        for (label, snapshot) in [
+            ("recording while preparing", None),
+            ("rejecting a stale snapshot", Some(stale)),
+        ] {
+            let mut base = Model::new();
+            base.add_library_source("lib.sysml", library);
+            match snapshot {
+                Some(cache) => base.set_library_cache(cache),
+                None => base.record_library_cache(),
+            }
+            let library = base.prepare_library().unwrap();
+            assert!(library.recording.is_some(), "{label}: preparing recorded");
+            let mut warm = Model::new();
+            Arc::clone(&library).install(&mut warm).unwrap();
+            assert_eq!(
+                warm.lib_cache_kind(),
+                "off",
+                "{label}: installing arms nothing"
+            );
+            warm.add_source("user.sysml", user);
+            let r = ResolvedModel::build(&warm);
+            assert!(r.b.library_facts.is_none(), "{label}: resolved jointly");
+            assert_eq!(
+                warm.lib_cache_kind(),
+                "use",
+                "{label}: the joint build armed the recording and it validated"
+            );
+            assert_eq!(
+                graphs(&warm),
+                cold,
+                "{label}: both graphs equal a cold build's"
+            );
+            prepared = Some(library);
+        }
+        let prepared = prepared.unwrap();
+        // A decoded prepared snapshot carries no recording; its joint builds
+        // resolve the library cold.
+        let decoded =
+            Arc::new(PreparedLibrary::from_bytes(&prepared.to_bytes(9).unwrap(), 9).unwrap());
+        assert!(decoded.recording.is_none());
+        let mut fresh = Model::new();
+        decoded.install(&mut fresh).unwrap();
+        fresh.add_source("user.sysml", user);
+        assert!(ResolvedModel::build(&fresh).b.library_facts.is_none());
+        assert_eq!(fresh.lib_cache_kind(), "off", "nothing to arm");
+        assert_eq!(graphs(&fresh), cold);
+        // The same snapshot fed in chunks decodes to the same library; a
+        // window narrower than any item still works, and the refusals match.
+        {
+            let bytes = prepared.to_bytes(9).unwrap();
+            fn feed(bytes: &[u8], step: usize) -> impl FnMut(&mut [u8]) -> usize + '_ {
+                let mut at = 0;
+                move |buf: &mut [u8]| {
+                    let n = buf.len().min(step).min(bytes.len() - at);
+                    buf[..n].copy_from_slice(&bytes[at..at + n]);
+                    at += n;
+                    n
+                }
+            }
+            for step in [1, 1000, usize::MAX] {
+                let chunked = Arc::new(
+                    PreparedLibrary::from_chunks(bytes.len(), feed(&bytes, step), 9).unwrap(),
+                );
+                let mut m = Model::new();
+                chunked.install(&mut m).unwrap();
+                m.add_source("user.sysml", user);
+                assert_eq!(graphs(&m), cold, "step {step}");
+            }
+            assert!(
+                PreparedLibrary::from_chunks(bytes.len(), feed(&bytes, 1000), 8).is_none(),
+                "other key"
+            );
+            assert!(
+                PreparedLibrary::from_chunks(
+                    bytes.len() - 1,
+                    feed(&bytes[..bytes.len() - 1], 1000),
+                    9
+                )
+                .is_none(),
+                "truncated"
+            );
+            let mut corrupt = bytes.clone();
+            let last = corrupt.len() - 1;
+            corrupt[last] ^= 0xff;
+            assert!(
+                PreparedLibrary::from_chunks(corrupt.len(), feed(&corrupt, 1000), 9).is_none(),
+                "corrupt"
+            );
+        }
+        // A decoded handle holding the encoded recording arms the lazy slot
+        // on install; the joint build decodes and replays it, and a prepared
+        // build never touches it.
+        let recording_bytes = prepared.recording.as_ref().unwrap().to_bytes();
+        let held = Arc::new(
+            PreparedLibrary::from_bytes(&prepared.to_bytes(9).unwrap(), 9)
+                .unwrap()
+                .with_lazy_recording(recording_bytes),
+        );
+        assert!(held.recording.is_none() && held.lazy_recording.is_some());
+        let mut plain = Model::new();
+        held.clone().install(&mut plain).unwrap();
+        assert_eq!(
+            plain.lib_cache_kind(),
+            "lazy",
+            "installing arms the held recording"
+        );
+        plain.add_source("user.sysml", "package U { part a : L::A; }");
+        assert!(
+            ResolvedModel::build(&plain).b.library_facts.is_some(),
+            "prepared build"
+        );
+        assert_eq!(
+            plain.lib_cache_kind(),
+            "lazy",
+            "a prepared build leaves it encoded"
+        );
+        let mut joint = Model::new();
+        held.install(&mut joint).unwrap();
+        joint.add_source("user.sysml", user);
+        assert!(
+            ResolvedModel::build(&joint).b.library_facts.is_none(),
+            "resolved jointly"
+        );
+        assert_eq!(
+            joint.lib_cache_kind(),
+            "use",
+            "the joint build decoded and replayed it"
+        );
+        assert_eq!(graphs(&joint), cold);
+        // A lazy cache slot the directory loader set stays in place.
+        let mut lazy = Model::new();
+        Arc::clone(&prepared).install(&mut lazy).unwrap();
+        lazy.set_lazy_library_cache(std::path::PathBuf::from("/nonexistent/stdlib.libcache"));
+        lazy.add_source("user.sysml", user);
+        assert!(ResolvedModel::build(&lazy).b.library_facts.is_none());
+        assert_eq!(
+            lazy.lib_cache_kind(),
+            "off",
+            "the lazy slot, not the recording, was consulted"
+        );
+        assert_eq!(graphs(&lazy), cold);
+        // A library unit added after installing drops the prepared library
+        // and with it the recording: no sealed-id lowering to throw away.
+        let more = "package More { part def C; }";
+        let mut grown = Model::new();
+        prepared.install(&mut grown).unwrap();
+        grown.add_library_source("more.sysml", more);
+        grown.add_source("user.sysml", user);
+        assert!(ResolvedModel::build(&grown).b.library_facts.is_none());
+        assert_eq!(grown.lib_cache_kind(), "off");
+        let mut both = Model::new();
+        both.add_library_source("lib.sysml", library);
+        both.add_library_source("more.sysml", more);
+        both.add_source("user.sysml", user);
+        assert_eq!(graphs(&grown), graphs(&both));
+    }
     #[test]
     fn disk_syntax_is_lazy_exact_and_shared_without_changing_unit_indices() {
         let sources = [
@@ -551,6 +853,9 @@ mod tests {
             "package U { part b : L::B; } private import U::*; part x : b;",
             "package Q { part def Y; part def Parts; } private import Q::Y; package U { part a : L::A; }",
             "package Q { part def Y { part def Parts; } } private import Q::*; package U { part a : L::A; }",
+            // Imports the imported namespace does not re-export.
+            "package Q { private import L::*; part def Y; } private import Q::*; package U { part a : L::A; }",
+            "package Q { protected import L::*; } private import Q::**; package U { part a : L::A; }",
         ] {
             same_graphs(&complete, ("user.sysml", source), true);
         }
@@ -558,6 +863,7 @@ mod tests {
             // A user namespace re-exporting through its own import, an
             // alias target, and a recursive import reaching a probed name.
             "package Q { public import L::*; } private import Q::*; package U { part a : A; }",
+            "package Q { private import L::*; } private import all Q::*; package U { part a : A; }",
             "alias Q for L; private import Q::*; package U { part a : A; }",
             "package Q { part def Y { part def Parts; } } private import Q::**; package U { part a : L::A; }",
             "package Q { part def Parts; } private import Q::*; package U { part a : L::A; }",
@@ -644,6 +950,42 @@ mod tests {
     }
 
     #[test]
+    fn directory_cache_separates_graph_formats_in_memory_and_on_disk() {
+        use crate::model::GraphFormat;
+        let root =
+            std::env::temp_dir().join(format!("sysml-graph-format-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("library");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("L.kerml"),
+            "standard library package L { feature x = if true ? 1 else 2; }",
+        )
+        .unwrap();
+        let path = root.join("stdlib.libcache");
+        // Keep both models alive to exercise the process-wide shared cache.
+        let mut legacy = Model::new();
+        load_library_with_cache_at(&mut legacy, &dir, Some((91, path.clone()))).unwrap();
+        let mut canonical = Model::with_graph_format(GraphFormat::CanonicalV3);
+        load_library_with_cache_at(&mut canonical, &dir, Some((91, path.clone()))).unwrap();
+        let expected = crate::json::library_to_compact_json(&canonical);
+        assert_ne!(crate::json::library_to_compact_json(&legacy), expected);
+        for format in [GraphFormat::LegacyV2, GraphFormat::CanonicalV3] {
+            let mut shared = Model::with_graph_format(format);
+            load_library_with_cache_at(&mut shared, &dir, Some((91, path.clone()))).unwrap();
+            assert_eq!(shared.graph_format(), format);
+        }
+        drop(legacy);
+        drop(canonical);
+        let mut disk = Model::with_graph_format(GraphFormat::CanonicalV3);
+        load_library_with_cache_at(&mut disk, &dir, Some((91, path.clone()))).unwrap();
+        assert_eq!(disk.loaded_library_unit_count(), 0);
+        assert_eq!(crate::json::library_to_compact_json(&disk), expected);
+        assert!(path.with_extension("prepared").exists());
+        assert!(path.with_extension("v3.prepared").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn fallback_builds_replay_the_recorded_resolution_cache() {
         let root =
             std::env::temp_dir().join(format!("sysml-prepared-replay-{}", uuid::Uuid::new_v4()));
@@ -666,7 +1008,19 @@ mod tests {
             "a snapshot miss records the resolution cache"
         );
         assert!(recording.with_extension("prepared").exists());
-        assert_eq!(cold.lib_cache_kind(), "lazy");
+        // The handle prepared here keeps the recording in memory, so this
+        // process leaves the file unread: a joint build arms the handle's.
+        assert_eq!(cold.lib_cache_kind(), "off");
+        cold.add_source(
+            "user.sysml",
+            "private import Other::*; package U { part a : L::A; }",
+        );
+        assert!(ResolvedModel::build(&cold).b.library_facts.is_none());
+        assert_eq!(
+            cold.lib_cache_kind(),
+            "use",
+            "the fallback replays the recording the handle keeps"
+        );
         drop(cold);
         let mut warm = Model::new();
         load_library_with_cache_at(&mut warm, &dir, cache()).unwrap();

@@ -73,6 +73,9 @@ pub enum Claim {
 #[derive(Default)]
 #[non_exhaustive]
 pub struct DeltaOptions {
+    /// Lowering/identity contract for both base and target. Canonical graphs
+    /// are validated before encoding and after application.
+    pub graph_format: sysmlv2_model::model::GraphFormat,
     /// Id-keyed identities and external base references — larger, but
     /// applicable best-effort to a divergent base.
     pub portable: bool,
@@ -96,6 +99,13 @@ impl DeltaOptions {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the lowering/identity contract for this delta.
+    #[must_use]
+    pub fn with_graph_format(mut self, format: sysmlv2_model::model::GraphFormat) -> Self {
+        self.graph_format = format;
+        self
     }
 
     /// Set [`Self::portable`].
@@ -795,6 +805,12 @@ fn delta_encode(
     opts: &DeltaOptions,
     elide: Option<Resolver>,
 ) -> Result<Vec<u8>, Error> {
+    if opts.graph_format == sysmlv2_model::model::GraphFormat::CanonicalV3 {
+        sysmlv2_model::migration::validate_graph_format(base, opts.graph_format)
+            .map_err(Error::new)?;
+        sysmlv2_model::migration::validate_graph_format(target, opts.graph_format)
+            .map_err(Error::new)?;
+    }
     let base_arr = canonical_views(base)?;
     let target_arr = canonical_views(target)?;
     let base_digest = digest_of_canonical(&base_arr)?;
@@ -1031,7 +1047,10 @@ fn delta_encode(
         } else {
             crate::encode::FLAG_UNIT_PATHS
         };
-    w.uint(crate::encode::header_word(flags));
+    w.uint(crate::encode::header_word_with_scheme(
+        flags,
+        opts.graph_format.version(),
+    ));
     w.array(3);
     w.bstr(base_digest.as_bytes());
     w.bstr(result_digest.as_bytes());
@@ -1222,13 +1241,17 @@ fn apply(
     if elided && portable {
         return Err(Error::new("id elision applies to strict deltas only"));
     }
-    if elided && scheme != crate::ID_SCHEME_VERSION {
+    if elided
+        && !matches!(
+            scheme,
+            crate::ID_SCHEME_VERSION | crate::CANONICAL_GRAPH_VERSION
+        )
+    {
         return Err(Error::of(
             ErrorKind::UnsupportedVersion,
             format!(
-                "id-derivation scheme {scheme} unsupported (decoder carries {}); \
-                 the delta's created ids cannot be recovered here",
-                crate::ID_SCHEME_VERSION
+                "id-derivation scheme {scheme} unsupported (decoder carries 2 and 3); \
+                 the delta's created ids cannot be recovered here"
             ),
         ));
     }
@@ -1658,6 +1681,18 @@ fn apply(
         .is_some_and(|&(i, _)| i >= value.as_array().unwrap().len())
     {
         return Err(Error::new("unit root index out of range"));
+    }
+    if scheme == crate::CANONICAL_GRAPH_VERSION {
+        sysmlv2_model::migration::validate_graph_format(
+            base,
+            sysmlv2_model::model::GraphFormat::CanonicalV3,
+        )
+        .map_err(Error::new)?;
+        sysmlv2_model::migration::validate_graph_format(
+            &value,
+            sysmlv2_model::model::GraphFormat::CanonicalV3,
+        )
+        .map_err(Error::new)?;
     }
     report.units = units;
     Ok((value, report))

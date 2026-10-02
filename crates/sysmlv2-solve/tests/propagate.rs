@@ -89,10 +89,10 @@ fn unknown_receiver_formulas_and_aliases_do_not_decide_propagation() {
         let p = prop(&format!(
             "package P {{
                 attribute def Boolean;
-                part def Child {{ attribute enabled : Boolean default = false; }}
+                part def Child {{ attribute enabled[1] : Boolean default = false; }}
                 part def Device {{
-                    attribute enabled : Boolean default = false;
-                    attribute computed : Boolean = enabled;
+                    attribute enabled[1] : Boolean default = false;
+                    attribute computed[1] : Boolean = enabled;
                     part child : Child;
                 }}
                 requirement def R {{
@@ -117,7 +117,7 @@ fn nested_unknown_receivers_do_not_share_solver_variables() {
     let p = prop(
         "package P {
             attribute def Real;
-            part def Child { attribute value : Real default = 0; }
+            part def Child { attribute value[1] : Real default = 0; }
             part def Parent { part child : Child; }
             requirement def R {
                 subject leftUnit : Parent;
@@ -142,7 +142,7 @@ fn lower_bound_narrows_to_half_line() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute wingSpan : Real;
+            attribute wingSpan[1] : Real;
             assert constraint c { wingSpan >= 10 }
         }",
     );
@@ -153,6 +153,24 @@ fn lower_bound_narrows_to_half_line() {
     assert_eq!(sole_outcome(&p), PropagateOutcome::Satisfied);
 }
 
+/// An invocation of a calculation that declares no result propagates
+/// through the nearest result its heritage declares.
+#[test]
+fn ranges_narrow_through_an_inherited_result() {
+    let p = prop(
+        "package P {
+            attribute def Real;
+            calc def Diff { in a; in b; return r = a - b; }
+            calc def D3 :> Diff { in x; }
+            attribute wingSpan[1] : Real;
+            assert constraint c { D3(wingSpan, 3) >= 7 }
+        }",
+    );
+    let r = range_of(&p, "wingSpan");
+    assert_eq!(r.range, "[10, +∞]");
+    assert!(r.narrowed);
+}
+
 #[test]
 fn lower_bound_tightens_twice() {
     // A half-line's finite side keeps moving under a second, stronger
@@ -161,7 +179,7 @@ fn lower_bound_tightens_twice() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute x : Real;
+            attribute x[1] : Real;
             assert constraint open { x > 0 }
             assert constraint strong { x >= 1000 }
             assert constraint weak { x >= 500 }
@@ -178,7 +196,7 @@ fn two_constraints_narrow_jointly() {
     let p = prop(
         "package Tank {
             attribute def Real;
-            attribute level : Real;
+            attribute level[1] : Real;
             assert constraint lo { level >= 5 }
             assert constraint hi { level <= 8 }
         }",
@@ -199,8 +217,8 @@ fn product_backsolves_the_other_factor() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute x : Real;
-            attribute y : Real;
+            attribute x[1] : Real;
+            attribute y[1] : Real;
             assert constraint fix { x == 2 }
             assert constraint prod { x * y == 6 }
         }",
@@ -225,7 +243,7 @@ fn contradiction_is_unsatisfiable() {
     let p = prop(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x > 5 & x < 4 }
         }",
     );
@@ -238,7 +256,7 @@ fn joint_contradiction_across_constraints_is_unsatisfiable() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute t : Real;
+            attribute t[1] : Real;
             assert constraint lo { t >= 9 }
             assert constraint hi { t <= 3 }
         }",
@@ -260,8 +278,8 @@ fn division_by_a_zero_straddling_divisor_stays_wide() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute x : Real;
-            attribute y : Real;
+            attribute x[1] : Real;
+            attribute y[1] : Real;
             assert constraint yb1 { y >= -1 }
             assert constraint yb2 { y <= 1 }
             assert constraint q { x == 6 / y }
@@ -292,8 +310,8 @@ fn remainder_by_a_possibly_zero_divisor_stays_undecided() {
     let p = prop(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
-            attribute y : Integer;
+            attribute x[1] : Integer;
+            attribute y[1] : Integer;
             assert constraint yb1 { y >= 0 }
             assert constraint yb2 { y <= 5 }
             assert constraint m { x % y == 100 }
@@ -313,8 +331,8 @@ fn division_by_an_exactly_zero_divisor_constrains_nothing() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute x : Real;
-            attribute y : Real;
+            attribute x[1] : Real;
+            attribute y[1] : Real;
             assert constraint yz { y == 0 }
             assert constraint q { x == 6 / y }
             assert constraint xb { x >= 5 }
@@ -333,8 +351,8 @@ fn backward_division_keeps_zero_in_the_divisor() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute x : Real;
-            attribute y : Real;
+            attribute x[1] : Real;
+            attribute y[1] : Real;
             assert constraint xf { x == 4 }
             assert constraint q { x / y == 2 }
         }",
@@ -363,9 +381,9 @@ fn ranges_narrow_through_a_sum_fold() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute x : Real;
-            attribute a : Real;
-            attribute b : Real;
+            attribute x[1] : Real;
+            attribute a[1] : Real;
+            attribute b[1] : Real;
             attribute ps : Real[0..*] = (a, b);
             assert constraint xs { x == sum(ps) }
             assert constraint af { a == 2 }
@@ -394,9 +412,9 @@ fn max_fold_pins_the_result() {
     let p = prop(
         "package P {
             attribute def Integer;
-            attribute hi : Integer;
-            attribute a : Integer;
-            attribute b : Integer;
+            attribute hi[1] : Integer;
+            attribute a[1] : Integer;
+            attribute b[1] : Integer;
             assert constraint m { hi == max((a, b)) }
             assert constraint af { a == 2 }
             assert constraint bf { b == 7 }
@@ -429,8 +447,8 @@ fn max_over_forty_items_stays_linear() {
     let p = prop(&format!(
         "package P {{
             attribute def Integer;
-            attribute x : Integer;
-            attribute y : Integer;
+            attribute x[1] : Integer;
+            attribute y[1] : Integer;
             assert constraint m {{ x == max(({}, y)) }}
             assert constraint yf {{ y == 45 }}
         }}",
@@ -458,7 +476,7 @@ fn separate_units_each_see_their_own_enumerations() {
             "a.sysml",
             "package A {
                 enum def Phase { init; run; halt; }
-                attribute p : Phase;
+                attribute p[1] : Phase;
                 assert constraint ap { p == Phase::halt }
             }",
         ),
@@ -466,7 +484,7 @@ fn separate_units_each_see_their_own_enumerations() {
             "b.sysml",
             "package B {
                 enum def Colour { red; green; blue; }
-                attribute c : Colour;
+                attribute c[1] : Colour;
                 assert constraint bc { c != Colour::red }
             }",
         ),
@@ -496,7 +514,7 @@ fn ranges_narrow_through_a_skolemized_forall() {
         "package P {
             attribute def Real;
             part def W {
-                attribute r : Real;
+                attribute r[1] : Real;
             }
             part ws : W[2];
             assert constraint c { ws->forAll {in w; w.r >= 3 & w.r <= 5} }
@@ -515,7 +533,7 @@ fn inequality_removes_one_enum_literal() {
     let p = prop(
         "package P {
             enum def Phase { halt; mid; init; }
-            attribute c : Phase;
+            attribute c[1] : Phase;
             assert constraint c1 { c != Phase::mid }
         }",
     );
@@ -533,7 +551,7 @@ fn enum_literals_past_position_128_stay_distinct() {
     let p = prop(&format!(
         "package P {{
             enum def Wide {{ {lits} }}
-            attribute c : Wide;
+            attribute c[1] : Wide;
             assert constraint pin {{ c == Wide::l130 }}
             assert constraint apart {{ c != Wide::l2 }}
         }}"
@@ -554,9 +572,9 @@ fn conjunction_degrades_per_conjunct() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute u; attribute v;
-            attribute margin : Real;
-            attribute mix : Real;
+            attribute u[1]; attribute v[1];
+            attribute margin[1] : Real;
+            attribute mix[1] : Real;
             assert constraint c { margin >= 2100 and mix + 1 ['u'] > 1 ['v'] }
         }",
     );
@@ -571,6 +589,68 @@ fn conjunction_degrades_per_conjunct() {
     }
 }
 
+/// A package-owned attribute written without a multiplicity is a
+/// collection of any size by the implicit default; the bail reason names
+/// the feature and the one-line fix.
+#[test]
+fn implicit_collection_names_the_multiplicity_fix() {
+    let p = prop(
+        "package P {
+            attribute def Real;
+            attribute airframeKg : Real;
+            assert constraint c { airframeKg >= 0.8 }
+        }",
+    );
+    match sole_outcome(&p) {
+        PropagateOutcome::Unsupported(m) => assert_eq!(
+            m,
+            "`airframeKg` declares no multiplicity, so it is a collection of any size; declare `[1]` for one value"
+        ),
+        o => panic!("expected the bail reason, got {o:?}"),
+    }
+}
+
+/// An explicitly open multiplicity is a choice, not an omission: the
+/// reason stays the cardinality itself, with no `[1]` advice.
+#[test]
+fn explicit_open_multiplicity_reports_the_cardinality() {
+    let p = prop(
+        "package P {
+            attribute def Real;
+            attribute masses : Real[0..*];
+            assert constraint c { masses >= 0.8 }
+        }",
+    );
+    match sole_outcome(&p) {
+        PropagateOutcome::Unsupported(m) => {
+            assert_eq!(m, "non-scalar or unknown cardinality of `masses`")
+        }
+        o => panic!("expected the bail reason, got {o:?}"),
+    }
+}
+
+/// A chain through a package-owned part names the part, since `[1]`
+/// belongs on the receiver, not on the member the chain reads.
+#[test]
+fn chain_through_implicit_collection_names_the_receiver() {
+    let p = prop(
+        "package P {
+            attribute def Real;
+            part avionics {
+                attribute massKg : Real = 0.28;
+            }
+            assert constraint c { avionics.massKg <= 0.3 }
+        }",
+    );
+    match sole_outcome(&p) {
+        PropagateOutcome::Unsupported(m) => assert_eq!(
+            m,
+            "a chain through `avionics`, which declares no multiplicity and so is a collection of any size; declare `[1]` on it for one value"
+        ),
+        o => panic!("expected the bail reason, got {o:?}"),
+    }
+}
+
 #[test]
 fn partial_conjunction_still_refutes() {
     // Translated conjuncts that contradict each other (an empty joint
@@ -579,9 +659,9 @@ fn partial_conjunction_still_refutes() {
     let p = prop(
         "package P {
             attribute def Real;
-            attribute u; attribute v;
-            attribute margin : Real;
-            attribute mix : Real;
+            attribute u[1]; attribute v[1];
+            attribute margin[1] : Real;
+            attribute mix[1] : Real;
             assert constraint c {
                 margin >= 5 and margin <= 4 and mix + 1 ['u'] > 1 ['v']
             }
@@ -604,7 +684,10 @@ fn corpus_no_false_violations() {
         .unwrap();
     for f in sysmlv2_testkit::user_files() {
         let src = std::fs::read_to_string(&f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     let p = propagate_constraints(&model, &PropagateConfig::default());
     for c in &p.constraints {
@@ -630,8 +713,8 @@ fn decimal_bounds_stay_exact() {
     let p = prop(
         "package Mass {
             attribute def Real;
-            attribute airframeKg : Real;
-            attribute batteryKg : Real;
+            attribute airframeKg[1] : Real;
+            attribute batteryKg[1] : Real;
             assert constraint airframeRange { airframeKg >= 0.8 and airframeKg <= 1.1 }
             assert constraint batteryRange { batteryKg >= 0.2 and batteryKg <= 0.3 }
         }",
@@ -649,11 +732,294 @@ fn non_terminating_bounds_print_as_fractions_and_hint_as_decimals() {
     let p = prop(
         "package Ratio {
             attribute def Real;
-            attribute share : Real;
+            attribute share[1] : Real;
             assert constraint c { share >= 1 / 3 and share <= 2 / 3 }
         }",
     );
     let r = range_of(&p, "share");
     assert_eq!(r.range, "[1/3, 2/3]");
     assert_eq!(r.range_approx, "[≈0.3333333333333333, ≈0.6666666666666666]");
+}
+
+#[test]
+fn named_user_calculations_are_not_symbolic_intrinsics() {
+    for call in ["sum(a)", "P::sum(a)"] {
+        let p = prop(&format!(
+            "package P {{
+            attribute def Integer;
+            attribute x[1] : Integer;
+            attribute a[1] : Integer;
+            calc def sum {{ in v; return r = v + 99; }}
+            assert constraint value {{ x == {call} }}
+            assert constraint input {{ a == 1 }}
+        }}"
+        ));
+        assert_eq!(range_of(&p, "x").range, "[100, 100]", "{call}");
+    }
+}
+
+#[test]
+fn unknown_qualified_intrinsic_names_do_not_constrain_values() {
+    let p = prop(
+        "package P {
+        attribute def Integer;
+        attribute x[1] : Integer;
+        attribute a[1] : Integer;
+        assert constraint value { x == Missing::sum(a) }
+    }",
+    );
+    assert!(matches!(sole_outcome(&p), PropagateOutcome::Unsupported(_)));
+}
+
+#[test]
+fn symbolic_lambda_bindings_do_not_call_outer_calculations() {
+    let p = prop(
+        "package P {
+        attribute def Integer;
+        attribute a[1] : Integer;
+        attribute b[1] : Integer;
+        calc def sum { in x; return r = x + 99; }
+        assert constraint value { (a, b)->forAll { in sum; sum(a) == 100 } }
+    }",
+    );
+    assert!(matches!(sole_outcome(&p), PropagateOutcome::Unsupported(_)));
+}
+
+#[test]
+fn unbound_collection_rollups_cannot_be_proved_from_one_default() {
+    for expression in [
+        "sum(rack.motors.mass)",
+        "sum((rack.motors,).mass)",
+        "sum((rack.motors as Motor).mass)",
+        "sum(rack.motors->collect { in m; m.mass })",
+    ] {
+        let p = prop(&format!(
+            "package P {{
+            attribute def Real;
+            part def Motor {{ attribute mass[1] : Real = 0.55; }}
+            part def Rack {{ part motors : Motor[4]; }}
+            part def Middle :> Rack {{ part :>> motors; }}
+            part rack : Middle {{ part :>> motors; }}
+            attribute total[1] : Real = {expression};
+            assert constraint direct {{ {expression} < 1 }}
+            assert constraint indirect {{ total < 1 }}
+        }}"
+        ));
+        for c in &p.constraints {
+            assert!(
+                matches!(c.verdict, ConstraintVerdict::Undecided(_)),
+                "{expression}: {c:?}"
+            );
+            assert!(
+                matches!(
+                    c.propagate,
+                    Some(PropagateOutcome::Undecided | PropagateOutcome::Unsupported(_))
+                ),
+                "{expression}: {c:?}"
+            );
+        }
+        assert_eq!(p.constraints.len(), 2);
+    }
+}
+
+#[test]
+fn inherited_collection_quantifiers_expand_exact_counts_only() {
+    let p = prop(
+        "package P {
+        attribute def Real;
+        part def Item { attribute value[1] : Real; }
+        part def Base { part items : Item[2]; }
+        part def Middle :> Base { part :>> items; }
+        part def Final :> Middle {
+            part :>> items : Item;
+            assert constraint c { items->forAll { in x; x.value >= 3 & x.value <= 5 } }
+        }
+    }",
+    );
+    for feature in ["items#1.value", "items#2.value"] {
+        assert_eq!(range_of(&p, feature).range, "[3, 5]");
+    }
+    for bound in ["0..1", "0..*", "count", "9007199254740993"] {
+        let p = prop(&format!(
+            "package P {{
+            attribute def Real;
+            attribute count[1];
+            part def Item {{ attribute value[1] : Real; }}
+            part items : Item[{bound}];
+            assert constraint c {{ items->forAll {{ in x; x.value > 0 }} }}
+        }}"
+        ));
+        assert!(
+            matches!(sole_outcome(&p), PropagateOutcome::Unsupported(_)),
+            "{bound}: {p:?}"
+        );
+        assert!(p.ranges.is_empty(), "{bound}: {p:?}");
+    }
+}
+
+#[test]
+fn collection_wrappers_do_not_become_scalar_solver_variables() {
+    for collection in [
+        "xs",
+        "if choose ? xs else xs",
+        "ReturnItems()",
+        "if choose ? copied else copied",
+    ] {
+        let p = prop(&format!(
+            "package P {{
+            attribute def Integer; attribute def Boolean;
+            attribute xs : Integer[4]; attribute choose[1] : Boolean;
+            attribute copied[1] : Integer = xs;
+            calc def ReturnItems {{ return result : Integer[4] = xs; }}
+            assert constraint c {{ size({collection}) == 1 }}
+        }}"
+        ));
+        if matches!(collection, "xs" | "ReturnItems()") {
+            assert!(matches!(
+                p.constraints[0].verdict,
+                ConstraintVerdict::Violated
+            ));
+        } else {
+            assert!(
+                matches!(
+                    sole_outcome(&p),
+                    PropagateOutcome::Undecided | PropagateOutcome::Unsupported(_)
+                ),
+                "{collection}: {p:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn approximate_collection_arguments_cannot_prove_parameter_arity() {
+    let p = prop(
+        "package P {
+        attribute def Integer; attribute def Boolean;
+        attribute xs : Integer[4]; attribute choose[1] : Boolean;
+        attribute copied[1] : Integer = xs;
+        calc def Count { in things; return n = size(things); }
+        assert constraint c { Count(if choose ? copied else copied) == 1 }
+    }",
+    );
+    assert!(
+        matches!(
+            sole_outcome(&p),
+            PropagateOutcome::Undecided | PropagateOutcome::Unsupported(_)
+        ),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn quantified_items_do_not_scalarize_nested_collections() {
+    for expression in [
+        "size(x.motors.mass) == 1",
+        "size(x.values) == 1",
+        "sum(x.motors.mass) < 1",
+    ] {
+        let p = prop(&format!(
+            "package P {{
+            attribute def Integer; attribute def Real;
+            part def Motor {{ attribute mass[1] : Real = 0.55; }}
+            part def Item {{ part motors : Motor[4]; attribute values : Integer[4]; }}
+            part items : Item[2];
+            assert constraint c {{ items->forAll {{ in x; {expression} }} }}
+        }}"
+        ));
+        assert!(
+            matches!(
+                sole_outcome(&p),
+                PropagateOutcome::Undecided | PropagateOutcome::Unsupported(_)
+            ),
+            "{expression}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn quantified_scalar_instances_do_not_inherit_root_collection_arity() {
+    let p = prop(
+        "package P {
+        attribute def Integer;
+        attribute values : Integer[2];
+        assert constraint c { values->forAll { in x; x >= 3 & x <= 5 } }
+    }",
+    );
+    for feature in ["values#1", "values#2"] {
+        assert_eq!(range_of(&p, feature).range, "[3, 5]");
+    }
+}
+
+#[path = "common/collection_identity.rs"]
+mod collection_identity;
+
+#[test]
+fn contextual_member_formulas_do_not_capture_quantifier_bindings() {
+    for source in collection_identity::contextual_formulas() {
+        let p = prop(&source);
+        assert!(
+            matches!(sole_outcome(&p), PropagateOutcome::Unsupported(_)),
+            "{source}: {p:?}"
+        );
+    }
+    for size in [1, 2] {
+        let p = prop(&collection_identity::closed_member_formula(size));
+        assert_eq!(sole_outcome(&p), PropagateOutcome::Satisfied, "{p:?}");
+    }
+}
+
+#[test]
+fn quantified_members_preserve_reference_identity() {
+    for source in collection_identity::contradictions() {
+        let p = prop(&source);
+        assert_eq!(
+            sole_outcome(&p),
+            PropagateOutcome::Unsatisfiable,
+            "{source}: {p:?}"
+        );
+    }
+    for size in [1, 2] {
+        let source = collection_identity::distinct_receivers(size);
+        let p = prop(&source);
+        assert_eq!(
+            sole_outcome(&p),
+            PropagateOutcome::Satisfied,
+            "{source}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn scalar_admission_respects_defaults_and_subsetting() {
+    for (source, scalar) in collection_identity::scalar_admission() {
+        let p = prop(&source);
+        if scalar {
+            assert_eq!(
+                sole_outcome(&p),
+                PropagateOutcome::Unsatisfiable,
+                "{source}: {p:?}"
+            );
+        } else {
+            assert!(
+                matches!(sole_outcome(&p), PropagateOutcome::Unsupported(_)),
+                "{source}: {p:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scalar_admission_respects_body_and_named_multiplicity() {
+    for (model, scalar) in collection_identity::body_scalar_admission() {
+        let p = propagate_constraints(&model, &PropagateConfig::default());
+        if scalar {
+            assert_eq!(sole_outcome(&p), PropagateOutcome::Unsatisfiable, "{p:?}");
+        } else {
+            assert!(
+                matches!(sole_outcome(&p), PropagateOutcome::Unsupported(_)),
+                "{p:?}"
+            );
+        }
+    }
 }

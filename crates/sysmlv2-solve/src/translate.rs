@@ -34,16 +34,60 @@
 use crate::term::{EnumSort, Op, Sort, Term};
 use std::collections::{HashMap, HashSet, VecDeque};
 use sysmlv2_model::eval::Value;
-use sysmlv2_model::json::{ConstraintInfo, ElementRef, ResolvedModel, ScopeRef};
+use sysmlv2_model::json::{
+    CallableBody, CallableResult, ConstraintInfo, ElementRef, ResolvedModel, RuntimeFrame,
+    RuntimeFrameProof, ScopeRef,
+};
 use sysmlv2_model::rational::Rational;
 use sysmlv2_syntax::ast::*;
 
 /// The construct (with context) that put an expression outside the
 /// solvable fragment.
-pub(crate) struct Unsupported(pub String);
+pub(crate) struct Unsupported(pub String, pub bool);
+
+impl Unsupported {
+    fn ordinary(message: String) -> Self {
+        Self(message, false)
+    }
+
+    /// Runtime dependencies cannot be replaced by declaration variables, even
+    /// after unwinding through outer value expressions.
+    fn runtime(mut self) -> Self {
+        self.1 = true;
+        self
+    }
+}
 
 fn bail<T>(msg: impl Into<String>) -> Result<T, Unsupported> {
-    Err(Unsupported(msg.into()))
+    Err(Unsupported::ordinary(msg.into()))
+}
+
+/// The reason a feature cannot stand for one value. A usage that is a
+/// collection only by the implicit default (a package-owned attribute
+/// written without a multiplicity) names the one-line fix; any other
+/// unknown or non-scalar cardinality is reported as such.
+fn not_one_value(r: &mut ResolvedModel, elem: ElementRef, display: &str) -> Unsupported {
+    if r.implicit_open_multiplicity(elem) {
+        Unsupported::ordinary(format!(
+            "`{display}` declares no multiplicity, so it is a collection of any size; declare `[1]` for one value"
+        ))
+    } else {
+        Unsupported::ordinary(format!("non-scalar or unknown cardinality of `{display}`"))
+    }
+}
+
+/// [`not_one_value`] for a chain's intermediate feature.
+fn not_one_receiver(r: &mut ResolvedModel, elem: ElementRef, display: &str) -> Unsupported {
+    let name = r.render_value(&Value::Unbound(elem));
+    if r.implicit_open_multiplicity(elem) {
+        Unsupported::ordinary(format!(
+            "a chain through `{name}`, which declares no multiplicity and so is a collection of any size; declare `[1]` on it for one value"
+        ))
+    } else if display.is_empty() {
+        Unsupported::ordinary("a chain through an unbound collection".to_string())
+    } else {
+        Unsupported::ordinary(format!("a chain through an unbound collection `{display}`"))
+    }
 }
 
 /// One free SMT constant.
@@ -119,6 +163,14 @@ enum SortState {
 enum Binding {
     /// An ordinary scalar term (calculation arguments, sequence items).
     Scalar(Term, Option<UTag>),
+    /// A singleton retains its model identity and receiver expression, so
+    /// lambda member access follows the same rules as ordinary navigation.
+    Singleton {
+        feature: ElementRef,
+        scope: ScopeRef,
+        target: Box<Expr>,
+        source: Option<ElementRef>,
+    },
     /// The k-th anonymous member of a skolemized bounded collection:
     /// a bare reference mints one variable per instance
     /// (`path`, sorted like the collection feature); chains resolve
@@ -127,7 +179,17 @@ enum Binding {
         feature: ElementRef,
         ty: Option<ElementRef>,
         path: String,
+        key: InstanceKey,
     },
+}
+
+/// Semantic identity of one expanded member and its navigation path.
+/// Source spellings are presentation only: aliases must share variables.
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct InstanceKey {
+    root: ElementRef,
+    ordinal: usize,
+    members: Vec<(ElementRef, Option<ScopeRef>)>,
 }
 
 /// Cap on skolem instances per collection — quantifier expansion is
@@ -173,17 +235,18 @@ pub(crate) enum JointRoot {
 /// true-by-declaration facts or definitions of auxiliaries, so keeping
 /// them narrows nothing.
 ///
-/// An over-approximated feature (a definition outside the fragment, treated
-/// as free) is not tracked here the way [`Translation::approx`] tracks it
-/// for the SMT path: propagation's definitive verdicts (satisfied /
-/// violated / unsatisfiable) all stay sound under a *wider* reachable set,
-/// so the extra freedom never invalidates them.
+/// An over-approximated feature has an unsupported definition and is treated
+/// as free. Refutation remains sound in this wider domain, but satisfaction
+/// after asserting the roots can depend on impossible approximate values.
+/// Callers must retain this distinction when reporting a positive outcome.
 pub(crate) struct JointTranslation {
     /// Index-aligned with the input constraints.
     pub roots: Vec<JointRoot>,
     pub vars: Vec<VarInfo>,
     pub enums: Vec<EnumSort>,
     pub side: Vec<Term>,
+    /// Unsupported feature definitions retained as free variables.
+    pub approx: Vec<String>,
 }
 
 /// The model's enumeration literals, indexed for translation. Deriving
@@ -232,6 +295,8 @@ pub(crate) fn translate_all(
     let mut tr = Translator::new(r, tables);
     let mut roots = Vec::with_capacity(cs.len());
     for c in cs {
+        tr.source = Some(c.element);
+        tr.lexical_scope = Some(c.scope);
         let translated = tr
             .expr(c.scope, &c.expr)
             .and_then(|ut| tr.demand(&ut.term, Demand::Bool).map(|()| ut));
@@ -241,7 +306,7 @@ pub(crate) fn translate_all(
             } else {
                 ut.term
             })),
-            Err(Unsupported(m)) => {
+            Err(Unsupported(m, _)) => {
                 // A conjunction degrades per conjunct: the ones inside
                 // the fragment still contribute (one spoiled term no
                 // longer silences its siblings' narrowing). Half-
@@ -268,13 +333,13 @@ pub(crate) fn translate_all(
             }
         }
     }
-    // `approx` is intentionally dropped — see [`JointTranslation`].
-    let (vars, enums, side, _approx) = tr.finish()?;
+    let (vars, enums, side, approx) = tr.finish()?;
     Ok(JointTranslation {
         roots,
         vars,
         enums,
         side,
+        approx,
     })
 }
 
@@ -317,6 +382,8 @@ pub(crate) fn translate(
     c: &ConstraintInfo,
 ) -> Result<Translation, Unsupported> {
     let mut tr = Translator::new(r, tables);
+    tr.source = Some(c.element);
+    tr.lexical_scope = Some(c.scope);
     let root = tr.expr(c.scope, &c.expr)?.term;
     tr.demand(&root, Demand::Bool)?;
     let (vars, enums, side, approx) = tr.finish()?;
@@ -334,8 +401,21 @@ pub(crate) fn translate(
     })
 }
 
+#[derive(Clone)]
+struct ParameterValue {
+    parameter: ElementRef,
+    frame: Option<usize>,
+    binding: Binding,
+}
+
 struct Translator<'m> {
     r: &'m mut ResolvedModel,
+    source: Option<ElementRef>,
+    lexical_scope: Option<ScopeRef>,
+    frames: Vec<RuntimeFrame>,
+    frame_proofs: RuntimeFrameProof,
+    proof_steps: usize,
+    value_scopes: sysmlv2_model::json::ValueScopeResolver,
     /// Free variables keyed by (element, featuring context) — the same
     /// inherited feature reached through two different usages is two
     /// distinct unknowns.
@@ -355,14 +435,12 @@ struct Translator<'m> {
     /// Calculations whose bodies are being inlined (recursion bails —
     /// unbounded unrolling has no finite translation).
     inlining_calcs: HashSet<ElementRef>,
-    /// Calculation/lambda-parameter bindings, innermost last — dynamic
-    /// extent with one level of shadowing, exactly like the evaluator's
-    /// lambda/parameter environment.
-    env: Vec<(String, Binding)>,
+    /// Runtime arguments keyed by parameter declaration, innermost last.
+    env: Vec<ParameterValue>,
     /// Per-instance variables of skolemized bounded collections,
-    /// keyed by their display path (`ws#2.radius`) — the same collection
-    /// quantified twice shares its instances.
-    skolem_vars: HashMap<String, usize>,
+    /// keyed by resolved root, ordinal and member path. Aliases and repeated
+    /// quantifiers over the same collection share their instances.
+    skolem_vars: HashMap<InstanceKey, usize>,
     approx: Vec<String>,
     /// Inferred unit tag per variable (index-aligned with `displays`).
     var_units: Vec<Option<UTag>>,
@@ -380,6 +458,12 @@ impl<'m> Translator<'m> {
     fn new(r: &'m mut ResolvedModel, tables: &'m EnumTables) -> Translator<'m> {
         Translator {
             r,
+            source: None,
+            lexical_scope: None,
+            frames: Vec::new(),
+            frame_proofs: RuntimeFrameProof::default(),
+            proof_steps: 0,
+            value_scopes: Default::default(),
             var_keys: HashMap::new(),
             displays: Vec::new(),
             states: Vec::new(),
@@ -400,13 +484,96 @@ impl<'m> Translator<'m> {
         }
     }
 
+    fn read<T>(&mut self, read: impl FnOnce(&mut ResolvedModel) -> T) -> T {
+        match self.source {
+            Some(source) => self.r.with_source(source, read),
+            None => read(self.r),
+        }
+    }
+
+    fn in_source<T>(
+        &mut self,
+        source: ElementRef,
+        lexical_scope: ScopeRef,
+        read: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = self.source.replace(source);
+        let previous_lexical = self.lexical_scope.replace(lexical_scope);
+        let result = read(self);
+        self.source = previous;
+        self.lexical_scope = previous_lexical;
+        result
+    }
+
+    /// Prepare every proof before mutating visibility. An exhausted or
+    /// incomplete proof must not leave a partially masked caller environment.
+    fn mask_frames(
+        &mut self,
+        lexical: ScopeRef,
+        receiver: ScopeRef,
+    ) -> Result<Vec<usize>, Unsupported> {
+        let mut hidden = Vec::new();
+        for (index, frame) in self.frames.iter().copied().enumerate() {
+            if !frame.visible {
+                continue;
+            }
+            match self
+                .frame_proofs
+                .permits(self.r, frame, lexical, receiver, &mut self.proof_steps)
+            {
+                Some(true) => {}
+                Some(false) => hidden.push(index),
+                None => {
+                    return Err(Unsupported::ordinary(
+                        "runtime frame visibility is incomplete or exceeds the budget".into(),
+                    )
+                    .runtime());
+                }
+            }
+        }
+        for &index in &hidden {
+            self.frames[index].visible = false;
+        }
+        Ok(hidden)
+    }
+
+    fn restore_frames(&mut self, hidden: Vec<usize>) {
+        for index in hidden {
+            self.frames[index].visible = true;
+        }
+    }
+
+    /// A nested declaration can hide an existing activation, but can never
+    /// reactivate one hidden by an enclosing declaration boundary.
+    fn in_declaration<T>(
+        &mut self,
+        source: ElementRef,
+        lexical: ScopeRef,
+        receiver: ScopeRef,
+        read: impl FnOnce(&mut Self) -> Result<T, Unsupported>,
+    ) -> Result<T, Unsupported> {
+        let hidden = self.mask_frames(lexical, receiver)?;
+        let result = self.in_source(source, lexical, read);
+        self.restore_frames(hidden);
+        result
+    }
+
     // -- constant folding ---------------------------------------------------
 
     /// Try the evaluator first: anything it computes to a scalar is a
     /// literal term (quantities carry their unit tag). `Ok(None)` = not a
     /// constant (translate structurally).
     fn fold(&mut self, scope: ScopeRef, e: &Expr) -> Result<Option<UT>, Unsupported> {
-        match self.r.evaluate_in(scope, e) {
+        // The evaluator cannot see symbolic argument/lambda bindings.
+        // Folding a declaration instead can invent a default or arity.
+        // Literals are independent; everything else translates through
+        // the environment, including transitive aliases and calculations.
+        if (!self.env.is_empty() || !self.frames.is_empty())
+            && !matches!(e.kind, ExprKind::Literal(_))
+        {
+            return Ok(None);
+        }
+        match self.read(|r| r.evaluate_in(scope, e)) {
             Ok(Value::Boolean(b)) => Ok(Some(UT::plain(Term::BoolLit(b)))),
             Ok(Value::Integer(i)) => Ok(Some(UT::plain(Term::IntLit(i)))),
             Ok(Value::Rational(r)) => Ok(Some(UT::plain(Term::RealLit(r)))),
@@ -504,9 +671,8 @@ impl<'m> Translator<'m> {
                 }
                 self.demand(&t.term, Demand::Numeric)?;
                 let unit = self
-                    .r
-                    .unit_of_in(scope, arg)
-                    .map_err(|e| Unsupported(format!("a quantity-unit bracket: {e}")))?;
+                    .read(|r| r.unit_of_in(scope, arg))
+                    .map_err(|e| Unsupported::ordinary(format!("a quantity-unit bracket: {e}")))?;
                 if unit.dims_key().is_empty() {
                     return if unit.scale().is_one() {
                         Ok(UT::plain(t.term))
@@ -532,9 +698,7 @@ impl<'m> Translator<'m> {
                 bail("collect/select over unbound features")
             }
             ExprKind::Constructor { .. } => bail("`new` constructors"),
-            ExprKind::Body { .. } | ExprKind::BodyTerminator => {
-                bail("expression bodies over unbound features")
-            }
+            ExprKind::Body { .. } => bail("expression bodies over unbound features"),
             ExprKind::Classification { .. } => bail("classification operators"),
             ExprKind::Extent { .. } => bail("`all` extents"),
             ExprKind::MetadataAccess { .. } => bail("`.metadata` access"),
@@ -652,7 +816,7 @@ impl<'m> Translator<'m> {
             // else translates the left side, which then denotes a
             // *present* scalar (free variables model existing values —
             // the fragment-wide treatment of multiplicities) and wins.
-            NullCoalescing => match self.r.evaluate_in(scope, lhs) {
+            NullCoalescing => match self.read(|r| r.evaluate_in(scope, lhs)) {
                 Ok(Value::Sequence(s)) if s.is_empty() => self.expr(scope, rhs),
                 _ => self.expr(scope, lhs),
             },
@@ -665,6 +829,17 @@ impl<'m> Translator<'m> {
         self.unify(&l.term, &r.term)?;
         self.unify_units(&mut l, &mut r)?;
         Ok(UT::plain(Term::App(Op::Eq, vec![l.term, r.term])))
+    }
+
+    /// Share the evaluator's identity admission rule. Bare unresolved names
+    /// retain standalone-expression compatibility; bound names never select a
+    /// built-in merely because of their spelling.
+    fn intrinsic_name(&mut self, scope: ScopeRef, qn: &QualifiedName) -> Option<String> {
+        match self.env_binding(scope, qn) {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return None,
+        }
+        self.read(|r| r.intrinsic_function_name(scope, qn))
     }
 
     /// Translate *through* a user-calculation body: arguments translate
@@ -681,78 +856,132 @@ impl<'m> Translator<'m> {
         ty: &TargetRef,
         args: &[Arg],
     ) -> Result<UT, Unsupported> {
+        self.invocation_inner(scope, ty, args)
+            .map_err(Unsupported::runtime)
+    }
+
+    fn invocation_inner(
+        &mut self,
+        scope: ScopeRef,
+        ty: &TargetRef,
+        args: &[Arg],
+    ) -> Result<UT, Unsupported> {
         let TargetRef::Name(qn) = ty else {
             return bail("chained function references");
         };
         let display = qn.to_display_string();
-        // Kernel Function Library sequence intrinsics: KFL names
-        // are *reserved* — dispatched on the invoked name's last segment
-        // with positional arguments, before resolution and before any
-        // user body, exactly like the evaluator. A shape the table does
-        // not admit (named arguments, wrong arity) falls through to the
-        // ordinary calculation path.
-        let simple = qn
-            .segments
-            .last()
-            .map(|s| s.value.clone())
-            .unwrap_or_default();
+        if self.env_binding(scope, qn)?.is_some() {
+            return bail("symbolic function-valued arguments");
+        }
+        // Use the same resolved function identity as concrete evaluation.
         if args.iter().all(|a| a.name.is_none()) {
-            let exprs: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
-            if seq_intrinsic_arity_ok(&simple, exprs.len()) {
-                return self.seq_intrinsic(scope, &simple, &exprs, &display);
+            if let Some(simple) = self.intrinsic_name(scope, qn) {
+                let exprs: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
+                if seq_intrinsic_arity_ok(&simple, exprs.len()) {
+                    return self.seq_intrinsic(scope, &simple, &exprs, &display);
+                }
             }
         }
-        let Some(callee) = self.r.resolve_in(scope, qn) else {
+        let Some(callee) = self.read(|r| r.resolve_in(scope, qn)) else {
             return bail(format!("unresolved function `{display}`"));
         };
-        let Some((body_scope, body)) = self.r.calc_body(callee) else {
+        // The result the callee declares, else the nearest one its written
+        // heritage declares, read in the callee's own context.
+        let (owner, body_scope, body) = match self.r.callable_body(callee) {
+            Some(CallableBody::Declared {
+                owner,
+                result: CallableResult::Expression { scope, expression },
+            }) => (owner, scope, expression),
+            Some(CallableBody::Declared {
+                owner,
+                result: CallableResult::Parameter(ret),
+            }) => match self.r.value_expr(ret) {
+                Some((scope, expression)) => (owner, scope, expression),
+                None => return bail("function invocation over unbound features"),
+            },
+            Some(CallableBody::Ambiguous(_)) => {
+                return bail(format!("`{display}` inherits more than one result"));
+            }
             // Abstract library functions and bodiless declarations.
-            return bail("function invocation over unbound features");
+            None => return bail("function invocation over unbound features"),
         };
-        let params = self.r.calc_params(callee);
+        let receiver = if owner == callee {
+            body_scope
+        } else {
+            match self.r.element_scope(callee) {
+                Some(scope) => scope,
+                None => return bail(format!("`{display}` has no scope of its own")),
+            }
+        };
+        let params = self.r.calc_parameter_bindings(callee).ok_or_else(|| {
+            Unsupported::ordinary(
+                "calculation parameter identities are incomplete or ambiguous".into(),
+            )
+        })?;
         // Arguments translate in the caller's scope *before* any
         // parameter binding is visible (applicative order).
-        let mut bindings: Vec<(String, Binding)> = Vec::with_capacity(args.len());
+        let mut bindings: Vec<(ElementRef, Binding)> = Vec::with_capacity(args.len());
         let mut pos = 0usize;
         for a in args {
             let t = self.expr(scope, &a.value)?;
-            let name = match &a.name {
-                Some(n) => n
-                    .segments
-                    .last()
-                    .map(|s| s.value.clone())
-                    .unwrap_or_default(),
+            let parameter = match &a.name {
+                Some(n) => params.iter().find(|p| p.name == n.to_display_string()),
                 None => {
-                    let p = params.get(pos).cloned().unwrap_or_default();
+                    let p = params.get(pos);
                     pos += 1;
                     p
                 }
-            };
-            bindings.push((name, Binding::Scalar(t.term, t.unit)));
+            }
+            .ok_or_else(|| Unsupported::ordinary(format!("invalid argument to `{display}`")))?;
+            if bindings.iter().any(|(p, _)| *p == parameter.element) {
+                return bail(format!(
+                    "duplicate argument `{}` to `{display}`",
+                    parameter.name
+                ));
+            }
+            bindings.push((parameter.element, Binding::Scalar(t.term, t.unit)));
         }
-        // Every unbound parameter must have its own (default) value —
-        // otherwise two call sites would share one free variable, which
-        // could prove a spurious UNSAT.
         for p in &params {
-            if bindings.iter().any(|(n, _)| n == p) {
+            // No name reaches a parameter that has none of its own and
+            // redefines none, so no body reads it.
+            if p.name.is_empty() || bindings.iter().any(|(id, _)| *id == p.element) {
                 continue;
             }
-            let has_default = self
-                .r
-                .owned_member(callee, p)
-                .and_then(|m| self.r.value_expr(m))
-                .is_some();
-            if !has_default {
-                return bail(format!("invocation of `{display}` leaves `{p}` unbound"));
+            if self.r.value_expr(p.element).is_none() {
+                return bail(format!(
+                    "invocation of `{display}` leaves `{}` unbound",
+                    p.name
+                ));
             }
         }
-        if !self.inlining_calcs.insert(callee) {
+        if self.inlining_calcs.contains(&callee) {
             return bail(format!("recursive calculation `{display}`"));
         }
-        let depth = self.env.len();
-        self.env.extend(bindings);
-        let out = self.expr(body_scope, &body);
-        self.env.truncate(depth);
+        let hidden = self.mask_frames(receiver, receiver)?;
+        self.inlining_calcs.insert(callee);
+        let caller_env = self.env.clone();
+        self.env
+            .retain(|value| !params.iter().any(|p| p.element == value.parameter));
+        let frame = self.frames.len();
+        self.frames
+            .push(RuntimeFrame::calculation(callee, receiver));
+        self.env.extend(
+            bindings
+                .into_iter()
+                .map(|(parameter, binding)| ParameterValue {
+                    parameter,
+                    binding,
+                    frame: Some(frame),
+                }),
+        );
+        let out = if owner == callee {
+            self.in_source(callee, body_scope, |tr| tr.expr(body_scope, &body))
+        } else {
+            self.in_declaration(owner, body_scope, receiver, |tr| tr.expr(receiver, &body))
+        };
+        self.env = caller_env;
+        self.frames.pop();
+        self.restore_frames(hidden);
         self.inlining_calcs.remove(&callee);
         out
     }
@@ -764,13 +993,27 @@ impl<'m> Translator<'m> {
     /// are flat), `null` is empty, and a reference to a feature with a
     /// value expression recurses into it (cycle-guarded, like
     /// [`Self::feature_term`]). A valueless reference contributes one
-    /// scalar exactly when it is declared scalar — no explicit
-    /// multiplicity (the source default) or an explicit `[1]`, the
-    /// fragment-wide one-existing-value treatment; any other declared
-    /// multiplicity has no static arity here (bounded expansion is the
-    /// quantifier path). Anything else contributes one scalar via the ordinary
+    /// scalar exactly when its effective multiplicity is `[1]`; `[0]`
+    /// contributes none. Other multiplicities decline (bounded expansion
+    /// is the quantifier path). Anything else contributes one scalar via the ordinary
     /// expression path.
     fn seq_terms(
+        &mut self,
+        scope: ScopeRef,
+        e: &Expr,
+        out: &mut Vec<UT>,
+    ) -> Result<(), Unsupported> {
+        self.seq_terms_inner(scope, e, out)?;
+        // Scalar over-approximation does not preserve sequence arity.
+        // Include cached approximations and lambda parameter bindings;
+        // dependency-precise admission can recover precision separately.
+        if !self.approx.is_empty() {
+            return bail("sequence arity depends on approximate scalar translation");
+        }
+        Ok(())
+    }
+
+    fn seq_terms_inner(
         &mut self,
         scope: ScopeRef,
         e: &Expr,
@@ -786,30 +1029,38 @@ impl<'m> Translator<'m> {
             ExprKind::Null => Ok(()),
             ExprKind::Ref(qn) => {
                 // Parameter bindings shadow model names, as one item.
-                if let Some(b) = self.env_binding(qn) {
+                if let Some(b) = self.env_binding(scope, qn)? {
                     out.push(self.binding_term(b)?);
                     return Ok(());
                 }
                 let display = qn.to_display_string();
-                let Some(elem) = self.r.resolve_in(scope, qn) else {
+                let Some(elem) = self.read(|r| r.resolve_in(scope, qn)) else {
                     return bail(format!("unresolved reference `{display}`"));
                 };
                 let Some((own_scope, vexpr)) = self.r.value_expr(elem) else {
-                    return match self.r.declared_multiplicity(elem) {
-                        None | Some((1.0, 1.0)) => {
+                    return match self.r.effective_cardinality(elem) {
+                        Some((0, Some(0))) => Ok(()),
+                        Some((1, Some(1))) => {
                             out.push(self.feature_term(elem, None, display)?);
                             Ok(())
                         }
-                        Some((lo, hi)) => bail(format!(
-                            "a collection `{display}` (multiplicity [{lo}..{hi}]) \
-                             with no bound value: arity unknown"
+                        _ => bail(format!(
+                            "a collection `{display}` with no bound values: scalar arity unknown"
                         )),
                     };
                 };
+                let receiver = if !qn.is_global && qn.segments.len() == 1 {
+                    scope
+                } else {
+                    own_scope
+                };
+                let receiver = self.value_scope(elem, Some(receiver))?;
                 if !self.inlining.insert(elem) {
                     return bail(format!("cyclic value of `{display}`"));
                 }
-                let r = self.seq_terms(own_scope, &vexpr, out);
+                let r = self.in_declaration(elem, own_scope, receiver, |tr| {
+                    tr.seq_terms(receiver, &vexpr, out)
+                });
                 self.inlining.remove(&elem);
                 r
             }
@@ -874,13 +1125,13 @@ impl<'m> Translator<'m> {
                 items
                     .into_iter()
                     .next()
-                    .ok_or_else(|| Unsupported("`head` of an empty sequence".into()))
+                    .ok_or_else(|| Unsupported::ordinary("`head` of an empty sequence".into()))
             }
             "last" => {
                 let mut items = self.seq_arg(scope, args, display)?;
                 items
                     .pop()
-                    .ok_or_else(|| Unsupported("`last` of an empty sequence".into()))
+                    .ok_or_else(|| Unsupported::ordinary("`last` of an empty sequence".into()))
             }
             // One sequence, or the two-scalar spelling — either way a
             // fold over the flattened elements.
@@ -1030,11 +1281,9 @@ impl<'m> Translator<'m> {
         let TargetRef::Name(qn) = ty else {
             return bail("chained function references");
         };
-        let simple = qn
-            .segments
-            .last()
-            .map(|s| s.value.clone())
-            .unwrap_or_default();
+        let Some(simple) = self.intrinsic_name(scope, qn) else {
+            return bail("non-intrinsic arrow over unbound features");
+        };
         let display = qn.to_display_string();
         match args {
             ArrowArgs::Body(body) if simple == "forAll" || simple == "exists" => {
@@ -1088,15 +1337,32 @@ impl<'m> Translator<'m> {
         let Some(result) = result else {
             return bail("a lambda body without a result");
         };
+        let Some(source) = self.source else {
+            return bail("lambda source is unavailable");
+        };
+        let Some((body_scope, parameters)) = self.r.lambda_parameter_bindings(source, body) else {
+            return bail("lambda parameter identities are incomplete or ambiguous");
+        };
+        if parameters.len() != 1 || param.as_ref() != Some(&parameters[0].name) {
+            return bail("a quantifier lambda requires one input parameter");
+        }
         let bindings = self.collection_bindings(scope, target)?;
         let mut acc: Option<Term> = None;
         for b in bindings {
             let depth = self.env.len();
-            if let Some(p) = &param {
-                self.env.push((p.clone(), b));
-            }
+            let frame = self.frames.len();
+            self.frames
+                .push(RuntimeFrame::lambda(Some(body_scope), scope));
+            self.env.push(ParameterValue {
+                parameter: parameters[0].element,
+                binding: b,
+                frame: Some(frame),
+            });
+            let lexical = self.lexical_scope.replace(body_scope);
             let t = self.expr(scope, result);
+            self.lexical_scope = lexical;
             self.env.truncate(depth);
+            self.frames.pop();
             let t = t?;
             self.demand(&t.term, Demand::Bool)?;
             acc = Some(match acc {
@@ -1108,10 +1374,10 @@ impl<'m> Translator<'m> {
     }
 
     /// The members a quantifier ranges over. An *unbound* feature with an
-    /// exact declared multiplicity `[n]` (≤ the skolem cap; own
-    /// declaration, or borrowed one hop from a redefinition target)
-    /// skolemizes into `n` anonymous instances — sound for `forAll` /
-    /// `exists` because quantified bodies are aliasing-insensitive.
+    /// exact supported cardinality `[n]` (≤ the skolem cap, including
+    /// transitive redefinitions) expands into `n` members. A singleton
+    /// preserves ordinary feature identity and navigation; larger collections
+    /// share anonymous members across reference spellings and quantifiers.
     /// Everything else lowers through [`Self::seq_terms`] as scalars.
     fn collection_bindings(
         &mut self,
@@ -1119,35 +1385,43 @@ impl<'m> Translator<'m> {
         target: &Expr,
     ) -> Result<Vec<Binding>, Unsupported> {
         if let ExprKind::Ref(qn) = &target.kind {
-            if self.env_binding(qn).is_none() {
-                if let Some(elem) = self.r.resolve_in(scope, qn) {
+            if self.env_binding(scope, qn)?.is_none() {
+                if let Some(elem) = self.read(|r| r.resolve_in(scope, qn)) {
                     if self.r.value_expr(elem).is_none() {
-                        if let Some((lo, hi)) = self.multiplicity_with_hop(elem) {
-                            let display = qn.to_display_string();
-                            if lo == hi && lo >= 0.0 && lo.fract() == 0.0 {
-                                let n = lo as usize;
-                                if n > SKOLEM_CAP {
-                                    return bail(format!(
-                                        "a collection `{display}` with multiplicity \
-                                         [{n}] over the expansion cap ({SKOLEM_CAP})"
-                                    ));
-                                }
-                                let ty = self.r.typings(elem).into_iter().next();
-                                return Ok((1..=n)
-                                    .map(|k| Binding::Instance {
-                                        feature: elem,
-                                        ty,
-                                        path: format!("{display}#{k}"),
-                                    })
-                                    .collect());
-                            }
-                            if hi != 1.0 {
-                                return bail(format!(
-                                    "a collection `{display}` (multiplicity \
-                                     [{lo}..{hi}]) without static arity"
-                                ));
-                            }
+                        let display = qn.to_display_string();
+                        let Some((lo, Some(hi))) = self.r.effective_cardinality(elem) else {
+                            return bail(format!("a collection `{display}` without static arity"));
+                        };
+                        if lo != hi {
+                            return bail(format!("a collection `{display}` without static arity"));
                         }
+                        if lo > SKOLEM_CAP as i128 {
+                            return bail(format!(
+                                "a collection `{display}` with multiplicity [{lo}] \
+                                 over the expansion cap ({SKOLEM_CAP})"
+                            ));
+                        }
+                        if lo == 1 {
+                            return Ok(vec![Binding::Singleton {
+                                feature: elem,
+                                scope,
+                                target: Box::new(target.clone()),
+                                source: self.source,
+                            }]);
+                        }
+                        let ty = self.r.typings(elem).into_iter().next();
+                        return Ok((1..=lo)
+                            .map(|k| Binding::Instance {
+                                feature: elem,
+                                ty,
+                                path: format!("{display}#{k}"),
+                                key: InstanceKey {
+                                    root: elem,
+                                    ordinal: k as usize,
+                                    members: Vec::new(),
+                                },
+                            })
+                            .collect());
                     }
                 }
             }
@@ -1160,32 +1434,19 @@ impl<'m> Translator<'m> {
             .collect())
     }
 
-    /// The element's evaluated exact multiplicity bounds: its own
-    /// explicit declaration, else (one hop) a redefinition target's —
-    /// the same borrow the semantic checks use for undeclared
-    /// characteristics of redefining features.
-    fn multiplicity_with_hop(&mut self, elem: ElementRef) -> Option<(f64, f64)> {
-        if let Some(b) = self.r.declared_multiplicity(elem) {
-            return Some(b);
-        }
-        for t in self.r.redefinition_targets(elem) {
-            if let Some(b) = self.r.declared_multiplicity(t) {
-                return Some(b);
-            }
-        }
-        None
-    }
-
-    /// A per-instance variable of a skolemized collection, keyed by its
-    /// display path so the same collection quantified twice shares its
-    /// instances. Sorted like `sort_from`'s declaration.
-    fn skolem_var(&mut self, sort_from: ElementRef, display: String) -> Result<UT, Unsupported> {
-        if let Some(&i) = self.skolem_vars.get(&display) {
+    /// A per-instance variable, sorted like `sort_from`'s declaration.
+    fn skolem_var(
+        &mut self,
+        sort_from: ElementRef,
+        display: String,
+        key: InstanceKey,
+    ) -> Result<UT, Unsupported> {
+        if let Some(&i) = self.skolem_vars.get(&key) {
             return Ok(UT::plain(Term::Var(i)));
         }
         let (state, lower) = self.declared_sort(sort_from)?;
         let i = self.displays.len();
-        self.skolem_vars.insert(display.clone(), i);
+        self.skolem_vars.insert(key, i);
         self.displays.push(display);
         self.states.push(state);
         self.var_units.push(None);
@@ -1200,53 +1461,64 @@ impl<'m> Translator<'m> {
     /// A leaf reached through a skolem instance. Instance-independent
     /// leaves (enum literals) translate normally. A *closed* value
     /// expression — one the evaluator settles with no unbound references
-    /// — inlines shared (it is the same constant for every instance); an
-    /// *open* one must not (shared inlining would equate the instances'
-    /// sibling features, a spurious-UNSAT risk), so it falls to a
-    /// per-instance free variable recorded as an over-approximation,
-    /// exactly [`Self::feature_term`]'s out-of-fragment fallback.
+    /// — is shared (it is the same constant for every instance); an
+    /// *open* one must decline because its sibling references need the
+    /// instance's identity and cannot use their declaration variables.
     fn skolem_leaf(
         &mut self,
         elem: ElementRef,
         ctx: Option<ScopeRef>,
         display: String,
+        key: InstanceKey,
     ) -> Result<UT, Unsupported> {
         if self.tables.lit_to_enum.contains_key(&elem) || self.r.is_enum_value(elem) {
             return self.feature_term(elem, ctx, display);
         }
-        if let Some((own_scope, vexpr)) = self.r.value_expr(elem) {
-            let scope = ctx.unwrap_or(own_scope);
-            let closed = self.r.evaluate_in(scope, &vexpr).is_ok_and(|v| {
-                !matches!(
-                    v,
-                    Value::Element(_)
-                        | Value::Unbound(_)
-                        | Value::UnboundMember(_)
-                        | Value::Indeterminate
-                )
-            });
-            if closed && self.inlining.insert(elem) {
-                let out = self.expr(scope, &vexpr);
-                self.inlining.remove(&elem);
-                if let Ok(t) = out {
-                    return Ok(t);
-                }
-            }
-            if !self.approx.contains(&display) {
-                self.approx.push(display.clone());
-            }
+        if self.r.effective_cardinality(elem) != Some((1, Some(1))) {
+            return Err(not_one_value(self.r, elem, &display));
         }
-        self.skolem_var(elem, display)
+        if let Some((own_scope, vexpr)) = self.r.value_expr(elem) {
+            let receiver = self.value_scope(elem, ctx)?;
+            return self.in_declaration(elem, own_scope, receiver, |tr| {
+                tr.closed_member_term(receiver, &vexpr, &display)
+            });
+        }
+        self.skolem_var(elem, display, key)
+    }
+
+    /// A declaration formula does not capture its caller's lambda names.
+    /// Without contextual symbolic substitution, only an evaluator-proven
+    /// scalar is safe. Active calculation arguments are invisible to that
+    /// evaluator, so their nonliteral formulas must remain unsupported.
+    fn closed_member_term(
+        &mut self,
+        scope: ScopeRef,
+        expression: &Expr,
+        display: &str,
+    ) -> Result<UT, Unsupported> {
+        if !self.inlining_calcs.is_empty() && !matches!(expression.kind, ExprKind::Literal(_)) {
+            return bail(format!(
+                "a contextual member formula during a calculation `{display}`"
+            ));
+        }
+        let environment = std::mem::take(&mut self.env);
+        let frames = std::mem::take(&mut self.frames);
+        let folded = self.fold(scope, expression);
+        self.frames = frames;
+        self.env = environment;
+        folded?.ok_or_else(|| {
+            Unsupported::ordinary(format!("an open contextual member formula `{display}`"))
+        })
     }
 
     /// A chain whose spine roots at a skolem-instance lambda parameter:
     /// members resolve statically from the instance's type, minting the
     /// per-instance leaf. `Ok(None)` = not such a chain (the ordinary
     /// path applies).
-    fn instance_chain(&mut self, whole: &Expr) -> Result<Option<UT>, Unsupported> {
+    fn instance_chain(&mut self, scope: ScopeRef, whole: &Expr) -> Result<Option<UT>, Unsupported> {
         let mut links: Vec<&QualifiedName> = Vec::new();
         let mut cur = whole;
-        let (ty, path) = loop {
+        let binding = loop {
             match &cur.kind {
                 ExprKind::ChainStep { target, member } => {
                     let TargetRef::Name(qn) = member else {
@@ -1255,14 +1527,39 @@ impl<'m> Translator<'m> {
                     links.push(qn);
                     cur = target;
                 }
-                ExprKind::Ref(qn) => match self.env_binding(qn) {
-                    Some(Binding::Instance { ty, path, .. }) => break (ty, path),
+                ExprKind::Ref(qn) => match self.env_binding(scope, qn)? {
+                    Some(b @ (Binding::Instance { .. } | Binding::Singleton { .. })) => break b,
                     _ => return Ok(None),
                 },
                 _ => return Ok(None),
             }
         };
         links.reverse();
+        let (ty, path, mut key) = match binding {
+            Binding::Singleton {
+                scope,
+                target,
+                source,
+                ..
+            } => {
+                // Retained receiver syntax and lambda links can come from
+                // different files. Evaluate each fragment in its own source.
+                let target = match source {
+                    Some(source) => self
+                        .r
+                        .with_source(source, |r| r.evaluate_in(scope, &target)),
+                    None => self.r.evaluate_in(scope, &target),
+                }
+                .map_err(|e| Unsupported::ordinary(format!("chain target: {e}")))?;
+                let (last, prefix) = links.split_last().expect("a chain has a member");
+                let target = self
+                    .read(|r| r.evaluate_value_chain(target, prefix))
+                    .map_err(|e| Unsupported::ordinary(format!("chain target: {e}")))?;
+                return self.ordinary_chain_value(whole, target, last).map(Some);
+            }
+            Binding::Instance { ty, path, key, .. } => (ty, path, key),
+            Binding::Scalar(..) => unreachable!("only model bindings are admitted"),
+        };
         let Some(ty) = ty else {
             return bail(format!("an untyped skolemized collection `{path}`"));
         };
@@ -1272,11 +1569,15 @@ impl<'m> Translator<'m> {
         };
         let mut cur_elem = ty;
         for (i, qn) in links.iter().enumerate() {
-            let Some((hit, s)) = self.r.member_of(cur_elem, qn) else {
+            let Some((hit, s)) = self.read(|r| r.member_of(cur_elem, qn)) else {
                 return bail(format!("unresolved reference `{display}`"));
             };
+            key.members.push((hit, s));
             if i + 1 == links.len() {
-                return self.skolem_leaf(hit, s, display).map(Some);
+                return self.skolem_leaf(hit, s, display, key).map(Some);
+            }
+            if self.r.effective_cardinality(hit) != Some((1, Some(1))) {
+                return Err(not_one_receiver(self.r, hit, &display));
             }
             cur_elem = hit;
         }
@@ -1285,17 +1586,99 @@ impl<'m> Translator<'m> {
 
     // -- references and free variables ---------------------------------------
 
-    /// The environment binding of a single-segment name, if any.
-    fn env_binding(&self, qn: &QualifiedName) -> Option<Binding> {
-        if qn.segments.len() != 1 || qn.is_global {
-            return None;
+    /// Runtime arguments follow the declaration resolved in the lexical scope.
+    fn env_binding(
+        &mut self,
+        scope: ScopeRef,
+        qn: &QualifiedName,
+    ) -> Result<Option<Binding>, Unsupported> {
+        self.env_binding_inner(scope, qn)
+            .map_err(Unsupported::runtime)
+    }
+
+    fn env_binding_inner(
+        &mut self,
+        scope: ScopeRef,
+        qn: &QualifiedName,
+    ) -> Result<Option<Binding>, Unsupported> {
+        if self.env.is_empty() && self.frames.is_empty() {
+            return Ok(None);
         }
-        let name = &qn.segments[0].value;
-        self.env
-            .iter()
+        let lexical_scope = self.lexical_scope.unwrap_or(scope);
+        let target = self
+            .read(|r| r.reference_identity(lexical_scope, qn))
+            .target;
+        for frame in (0..self.frames.len())
             .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, b)| b.clone())
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            if frame.is_some_and(|frame| !self.frames[frame].visible) {
+                continue;
+            }
+            if let Some(value) = self
+                .env
+                .iter()
+                .rev()
+                .find(|value| value.frame == frame && Some(value.parameter) == target)
+            {
+                let visible =
+                    self.r
+                        .runtime_parameter_visible_with_steps(
+                            value.parameter,
+                            lexical_scope,
+                            &mut self.proof_steps,
+                        )
+                        .ok_or_else(|| {
+                            Unsupported::ordinary(
+                    "runtime parameter lexical scope is incomplete or exceeds the budget".into(),
+                )
+                        })?;
+                if visible {
+                    return Ok(Some(value.binding.clone()));
+                }
+            }
+            if let (Some(frame), Some(target)) = (frame, target) {
+                let Some(callee) = self.frames[frame].callee else {
+                    continue;
+                };
+                match self.r.runtime_parameter_selection_with_steps(
+                    callee,
+                    lexical_scope,
+                    scope,
+                    target,
+                    &mut self.proof_steps,
+                ) {
+                    sysmlv2_model::json::RuntimeParameterSelection::Selected(parameter) => {
+                        if let Some(value) = self.env.iter().rev().find(|value| {
+                            value.frame == Some(frame) && value.parameter == parameter
+                        }) {
+                            return Ok(Some(value.binding.clone()));
+                        }
+                        if parameter != target {
+                            let receiver = self.frames[frame].receiver_scope;
+                            let value = self.feature_term_in(
+                                parameter,
+                                None,
+                                Some(receiver),
+                                qn.to_display_string(),
+                            )?;
+                            return Ok(Some(Binding::Scalar(value.term, value.unit)));
+                        }
+                    }
+                    sysmlv2_model::json::RuntimeParameterSelection::NotApplicable => {}
+                    sysmlv2_model::json::RuntimeParameterSelection::Unsupported => {
+                        return bail("runtime parameter redefinition is incomplete or ambiguous");
+                    }
+                }
+            }
+        }
+        if let Some(receiver_target) = self.read(|r| r.resolve_in(scope, qn)) {
+            if Some(receiver_target) != target && self.r.is_parameter(receiver_target) {
+                return bail("receiver lookup selects an unrelated parameter declaration");
+            }
+        }
+        Ok(None)
     }
 
     /// A binding used as a value: scalars pass through; a skolem
@@ -1305,21 +1688,29 @@ impl<'m> Translator<'m> {
     fn binding_term(&mut self, b: Binding) -> Result<UT, Unsupported> {
         match b {
             Binding::Scalar(t, u) => Ok(UT { term: t, unit: u }),
-            Binding::Instance { feature, path, .. } => self.skolem_leaf(feature, None, path),
+            Binding::Singleton {
+                feature, target, ..
+            } => self.feature_term(feature, None, display_expr(&target)),
+            // This binding already denotes one expanded member. Its
+            // root declaration's multiplicity describes the collection,
+            // not this scalar instance; nested members use skolem_leaf.
+            Binding::Instance {
+                feature, path, key, ..
+            } => self.skolem_var(feature, path, key),
         }
     }
 
     fn ref_term(&mut self, scope: ScopeRef, qn: &QualifiedName) -> Result<UT, Unsupported> {
-        // Calculation/lambda parameters shadow model names (dynamic
-        // extent, like the evaluator's environment).
-        if let Some(b) = self.env_binding(qn) {
+        // Parameter declarations retain their active runtime arguments.
+        if let Some(b) = self.env_binding(scope, qn)? {
             return self.binding_term(b);
         }
         let display = qn.to_display_string();
-        let Some(elem) = self.r.resolve_in(scope, qn) else {
+        let Some(elem) = self.read(|r| r.resolve_in(scope, qn)) else {
             return bail(format!("unresolved reference `{display}`"));
         };
-        self.feature_term(elem, None, display)
+        let receiver = (!qn.is_global && qn.segments.len() == 1).then_some(scope);
+        self.feature_term_in(elem, None, receiver, display)
     }
 
     fn chain(
@@ -1329,29 +1720,52 @@ impl<'m> Translator<'m> {
         target: &Expr,
         member: &TargetRef,
     ) -> Result<UT, Unsupported> {
+        // A spine rooted at a skolem-instance lambda parameter resolves
+        // statically — the evaluator below cannot see the binding.
+        if let Some(out) = self.instance_chain(scope, whole)? {
+            return Ok(out);
+        }
+        self.ordinary_chain(scope, whole, target, member)
+    }
+
+    fn ordinary_chain(
+        &mut self,
+        scope: ScopeRef,
+        whole: &Expr,
+        target: &Expr,
+        member: &TargetRef,
+    ) -> Result<UT, Unsupported> {
         let TargetRef::Name(qn) = member else {
             return bail("chained chain members");
         };
-        // A spine rooted at a skolem-instance lambda parameter resolves
-        // statically — the evaluator below cannot see the binding.
-        if let Some(out) = self.instance_chain(whole)? {
-            return Ok(out);
-        }
         let tval = self
-            .r
-            .evaluate_in(scope, target)
-            .map_err(|e| Unsupported(format!("chain target: {e}")))?;
+            .read(|r| r.evaluate_in(scope, target))
+            .map_err(|e| Unsupported::ordinary(format!("chain target: {e}")))?;
+        self.ordinary_chain_value(whole, tval, qn)
+    }
+
+    fn ordinary_chain_value(
+        &mut self,
+        whole: &Expr,
+        tval: Value,
+        qn: &QualifiedName,
+    ) -> Result<UT, Unsupported> {
         if matches!(tval, Value::Indeterminate | Value::UnboundMember(_)) {
             // A nested unknown member has no concrete featuring context.
             // Do not identify distinct receiver paths by their shared
             // declaration, or inline defaults from that declaration.
             return bail("a chain through an unknown receiver member");
         }
+        if let Value::Unbound(t) = &tval {
+            if self.r.effective_cardinality(*t) != Some((1, Some(1))) {
+                return Err(not_one_receiver(self.r, *t, ""));
+            }
+        }
         let unbound = matches!(&tval, Value::Unbound(t) if self.r.is_reference_feature(*t));
         let (Value::Element(t) | Value::Unbound(t)) = tval else {
             return bail("a chain whose target is not a model element");
         };
-        let Some((hit, sub)) = self.r.member_of(t, qn) else {
+        let Some((hit, sub)) = self.read(|r| r.member_of(t, qn)) else {
             return bail(format!("unresolved reference `{}`", display_expr(whole)));
         };
         if unbound {
@@ -1364,6 +1778,12 @@ impl<'m> Translator<'m> {
                 self.approx.push(display.clone());
             }
             return self.var(hit, sub, display);
+        }
+        if let Some((own_scope, expression)) = self.r.value_expr(hit) {
+            let receiver = self.value_scope(hit, sub)?;
+            return self.in_declaration(hit, own_scope, receiver, |tr| {
+                tr.closed_member_term(receiver, &expression, &display_expr(whole))
+            });
         }
         self.feature_term(hit, sub, display_expr(whole))
     }
@@ -1379,6 +1799,36 @@ impl<'m> Translator<'m> {
         ctx: Option<ScopeRef>,
         display: String,
     ) -> Result<UT, Unsupported> {
+        self.feature_term_in(elem, ctx, ctx, display)
+    }
+
+    fn value_scope(
+        &mut self,
+        element: ElementRef,
+        receiver: Option<ScopeRef>,
+    ) -> Result<ScopeRef, Unsupported> {
+        match self
+            .value_scopes
+            .select(self.r, element, receiver, &mut self.proof_steps)
+        {
+            sysmlv2_model::json::ValueScopeDecision::Lexical(scope)
+            | sysmlv2_model::json::ValueScopeDecision::Receiver(scope) => Ok(scope),
+            sysmlv2_model::json::ValueScopeDecision::Unsupported => Err(Unsupported::ordinary(
+                "value receiver identity is incomplete or ambiguous".into(),
+            )
+            .runtime()),
+        }
+    }
+
+    /// An expression receiver can differ from the context identifying a free
+    /// variable: a simple inherited reference evaluates in the caller's scope.
+    fn feature_term_in(
+        &mut self,
+        elem: ElementRef,
+        ctx: Option<ScopeRef>,
+        receiver: Option<ScopeRef>,
+        display: String,
+    ) -> Result<UT, Unsupported> {
         if self.tables.lit_to_enum.contains_key(&elem) {
             return self.enum_term(elem).map(UT::plain);
         }
@@ -1386,13 +1836,21 @@ impl<'m> Translator<'m> {
             return bail(format!("variant value `{display}`"));
         }
         if let Some((own_scope, vexpr)) = self.r.value_expr(elem) {
+            let receiver = self.value_scope(elem, receiver)?;
             if !self.inlining.insert(elem) {
                 return bail(format!("cyclic value of `{display}`"));
             }
-            let out = self.expr(ctx.unwrap_or(own_scope), &vexpr);
+            let out =
+                self.in_declaration(elem, own_scope, receiver, |tr| tr.expr(receiver, &vexpr));
             self.inlining.remove(&elem);
             match out {
                 Ok(t) => return Ok(t),
+                // A call-local formula can depend on runtime arguments. Turning
+                // a refused dependency into a declaration variable loses that
+                // identity contract and can manufacture a satisfied constraint.
+                Err(error) if error.1 || !self.inlining_calcs.is_empty() => {
+                    return Err(error.runtime());
+                }
                 Err(_) => {
                     // The definition is outside the fragment: treat the
                     // feature as free but remember the over-approximation.
@@ -1411,6 +1869,18 @@ impl<'m> Translator<'m> {
         ctx: Option<ScopeRef>,
         display: String,
     ) -> Result<UT, Unsupported> {
+        // Scalar translation must not turn a collection hidden behind a
+        // conditional, calculation or unsupported formula into one value.
+        if self.r.effective_cardinality(elem) != Some((1, Some(1))) {
+            return Err(not_one_value(self.r, elem, &display));
+        }
+        // An own member's qualified reference and receiver navigation denote
+        // the same value. Inherited members retain their distinct usage context.
+        let ctx = ctx.or_else(|| {
+            self.r
+                .owner(elem)
+                .and_then(|owner| self.r.element_scope(owner))
+        });
         if let Some(&i) = self.var_keys.get(&(elem, ctx)) {
             return Ok(UT::plain(Term::Var(i)));
         }
@@ -1672,7 +2142,7 @@ impl<'m> Translator<'m> {
 
     fn demand_var(&mut self, i: usize, d: Demand) -> Result<(), Unsupported> {
         let conflict = || {
-            Unsupported(format!(
+            Unsupported::ordinary(format!(
                 "conflicting type requirements on `{}`",
                 self.displays[i]
             ))
@@ -1888,4 +2358,340 @@ fn sanitize(s: &str) -> String {
         .collect();
     out.truncate(24);
     out
+}
+
+#[cfg(test)]
+mod source_fragment_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use sysmlv2_model::model::Model;
+
+    fn receiver_retry_model() -> ResolvedModel {
+        let mut model = Model::new();
+        let unit = model.add_source(
+            "receiver-retry.kerml",
+            "class Base { feature v[1] = 4; }
+             class Broken specializes Base, missing {
+                 alias chosen for Base::v;
+                 feature probe = chosen;
+             }
+             class Good specializes Base {
+                 alias chosen for Base::v;
+                 feature probe = chosen;
+             }",
+        );
+        assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+        ResolvedModel::build(&model)
+    }
+
+    #[test]
+    fn failed_scalar_receiver_proof_does_not_poison_a_later_valid_translation() {
+        let mut resolved = receiver_retry_model();
+        let value = resolved.resolve_qualified("Base::v").unwrap();
+        let broken = resolved.resolve_qualified("Broken").unwrap();
+        let good = resolved.resolve_qualified("Good").unwrap();
+        let broken_scope = resolved.element_scope(broken).unwrap();
+        let good_scope = resolved.element_scope(good).unwrap();
+        let tables = EnumTables::build(&resolved);
+        let mut translator = Translator::new(&mut resolved, &tables);
+        let error = match translator.feature_term_in(
+            value,
+            Some(broken_scope),
+            Some(broken_scope),
+            "v".into(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("incomplete receiver proof must be refused"),
+        };
+        assert!(error.1, "proof rejection must not permit approximation");
+        let translated = translator
+            .feature_term_in(value, Some(good_scope), Some(good_scope), "v".into())
+            .unwrap_or_else(|error| panic!("{}", error.0));
+        assert!(matches!(translated.term, Term::IntLit(4)));
+        assert!(translator.approx.is_empty());
+        assert!(translator.displays.is_empty());
+        assert!(translator.inlining.is_empty());
+        assert_eq!(translator.source, None);
+        assert_eq!(translator.lexical_scope, None);
+    }
+
+    #[test]
+    fn failed_sequence_receiver_proof_does_not_poison_a_later_valid_translation() {
+        let mut resolved = receiver_retry_model();
+        let value = resolved.resolve_qualified("Base::v").unwrap();
+        let broken = resolved.resolve_qualified("Broken::probe").unwrap();
+        let good = resolved.resolve_qualified("Good::probe").unwrap();
+        let (broken_scope, broken_expression) = resolved.value_expr(broken).unwrap();
+        let (good_scope, good_expression) = resolved.value_expr(good).unwrap();
+        for (scope, expression) in [
+            (broken_scope, &broken_expression),
+            (good_scope, &good_expression),
+        ] {
+            let ExprKind::Ref(name) = &expression.kind else {
+                panic!("expected the alias reference");
+            };
+            assert_eq!(resolved.resolve_in(scope, name), Some(value));
+        }
+        let tables = EnumTables::build(&resolved);
+        let mut translator = Translator::new(&mut resolved, &tables);
+        let mut terms = Vec::new();
+        let error = translator
+            .seq_terms(broken_scope, &broken_expression, &mut terms)
+            .expect_err("incomplete receiver proof must be refused");
+        assert!(error.1, "proof rejection must not permit approximation");
+        assert!(terms.is_empty());
+        translator
+            .seq_terms(good_scope, &good_expression, &mut terms)
+            .unwrap_or_else(|error| panic!("{}", error.0));
+        assert_eq!(terms.len(), 1);
+        assert!(matches!(terms[0].term, Term::IntLit(4)));
+        assert!(translator.approx.is_empty());
+        assert!(translator.displays.is_empty());
+        assert!(translator.inlining.is_empty());
+        assert_eq!(translator.source, None);
+        assert_eq!(translator.lexical_scope, None);
+    }
+
+    #[test]
+    fn singleton_chain_keeps_receiver_and_two_links_in_their_original_sources() {
+        const TARGET: &str = "77777777-7777-4777-8777-777777777777";
+        const LINK: &str = "88888888-8888-4888-8888-888888888888";
+        let mut model = Model::new();
+        for package in ["A", "B"] {
+            model.add_source(
+                format!("{package}.sysml"),
+                &format!(
+                    "package {package} {{
+                        part def Def {{
+                            part '{LINK}'[1] {{ attribute leaf = 11; }}
+                            part poison[1] {{ attribute leaf = 99; }}
+                        }}
+                        part Actual[1] : Def;
+                        part '{TARGET}'[1] {{
+                            part '{LINK}'[1] {{ attribute leaf = 22; }}
+                        }}
+                        attribute capture = '{TARGET}';
+                        part p[1] : Def;
+                        attribute links = p.'{LINK}'.leaf;
+                    }}"
+                ),
+            );
+        }
+        assert!(!model.has_errors());
+        let mut resolved = ResolvedModel::build(&model);
+        let actual = resolved.resolve_qualified("A::Actual").unwrap();
+        let poison = resolved.resolve_qualified("A::Def::poison").unwrap();
+        let ordinary_target = resolved
+            .resolve_qualified(&format!("A::'{TARGET}'"))
+            .unwrap();
+        let ordinary_link = resolved
+            .resolve_qualified(&format!("A::Def::'{LINK}'"))
+            .unwrap();
+        let target_sites = resolved.references_to(ordinary_target);
+        let link_sites = resolved.references_to(ordinary_link);
+        assert_eq!(target_sites.len(), 1);
+        assert!(!link_sites.is_empty());
+        let mut hints = HashMap::new();
+        for (sites, identity) in [(&target_sites, TARGET), (&link_sites, LINK)] {
+            for site in sites {
+                hints.insert(
+                    (resolved.element_id(site.owner), site.kind.clone()),
+                    identity.parse().unwrap(),
+                );
+            }
+        }
+        resolved.override_ids(&HashMap::from([
+            (resolved.element_id(actual), TARGET.parse().unwrap()),
+            (resolved.element_id(poison), LINK.parse().unwrap()),
+        ]));
+        let bound = resolved.bind_id_spelled_references_with(&mut hints);
+        assert!(bound.contains(&TARGET.parse().unwrap()));
+        assert!(bound.contains(&LINK.parse().unwrap()));
+
+        let capture = resolved.resolve_qualified("A::capture").unwrap();
+        let a_links = resolved.resolve_qualified("A::links").unwrap();
+        let b_links = resolved.resolve_qualified("B::links").unwrap();
+        let (scope, target) = resolved.value_expr(capture).unwrap();
+        let (_, a_expression) = resolved.value_expr(a_links).unwrap();
+        let (_, expression) = resolved.value_expr(b_links).unwrap();
+        // Equal spans in the two files ensure the wrong origin finds a real
+        // binding, rather than merely failing to resolve a name.
+        assert_eq!(a_expression.span, expression.span);
+        let ExprKind::ChainStep {
+            target: prefix,
+            member: TargetRef::Name(last),
+        } = &expression.kind
+        else {
+            panic!("expected the final chain link");
+        };
+        let ExprKind::ChainStep {
+            member: TargetRef::Name(first),
+            ..
+        } = &prefix.kind
+        else {
+            panic!("expected the intermediate chain link");
+        };
+        let receiver = resolved
+            .with_source(capture, |r| r.evaluate_in(scope, &target))
+            .unwrap();
+        let correct = resolved
+            .with_source(b_links, |r| {
+                r.evaluate_value_chain(receiver.clone(), &[first, last])
+            })
+            .unwrap();
+        assert_eq!(correct, Value::Integer(11));
+        let wrong_links = resolved
+            .with_source(a_links, |r| {
+                r.evaluate_value_chain(receiver, &[first, last])
+            })
+            .unwrap();
+        assert_eq!(wrong_links, Value::Integer(99));
+        let wrong_receiver = resolved
+            .with_source(b_links, |r| r.evaluate_in(scope, &target))
+            .unwrap();
+        let wrong_target = resolved
+            .with_source(b_links, |r| {
+                r.evaluate_value_chain(wrong_receiver, &[first, last])
+            })
+            .unwrap();
+        assert_eq!(wrong_target, Value::Integer(22));
+
+        let parameter = resolved.resolve_qualified("B::p").unwrap();
+        let tables = EnumTables::build(&resolved);
+        let mut translator = Translator::new(&mut resolved, &tables);
+        translator.source = Some(b_links);
+        translator.lexical_scope = translator.r.value_expr(b_links).map(|(s, _)| s);
+        translator.env.push(ParameterValue {
+            parameter,
+            frame: None,
+            binding: Binding::Singleton {
+                feature: actual,
+                scope,
+                target: Box::new(target),
+                source: Some(capture),
+            },
+        });
+        let translated = translator
+            .instance_chain(scope, &expression)
+            .unwrap_or_else(|error| panic!("{}", error.0))
+            .unwrap();
+        assert!(matches!(translated.term, Term::IntLit(11)));
+        assert_eq!(translator.source, Some(b_links));
+    }
+}
+
+#[cfg(test)]
+mod runtime_frame_tests {
+    use super::*;
+    use sysmlv2_model::model::Model;
+
+    fn model() -> ResolvedModel {
+        let mut model = Model::new();
+        model.add_source(
+            "frames.sysml",
+            "calc def Base {in p default 1; attribute value=p;}
+             calc def Other {Base::value}
+             attribute literal=1; attribute listValue=(1,2);",
+        );
+        assert!(!model.has_errors());
+        ResolvedModel::build(&model)
+    }
+
+    #[test]
+    fn nested_declarations_never_reactivate_frames_and_errors_restore_masks() {
+        let mut resolved = model();
+        let base = resolved.resolve_qualified("Base").unwrap();
+        let base_scope = resolved.element_scope(base).unwrap();
+        let other = resolved.resolve_qualified("Other").unwrap();
+        let other_scope = resolved.element_scope(other).unwrap();
+        let tables = EnumTables::build(&resolved);
+        let mut tr = Translator::new(&mut resolved, &tables);
+        tr.source = Some(base);
+        tr.lexical_scope = Some(base_scope);
+        tr.frames = vec![
+            RuntimeFrame::calculation(base, base_scope),
+            RuntimeFrame::lambda(Some(base_scope), base_scope),
+            RuntimeFrame {
+                visible: false,
+                ..RuntimeFrame::calculation(base, base_scope)
+            },
+        ];
+        let result: Result<(), Unsupported> =
+            tr.in_declaration(other, other_scope, other_scope, |tr| {
+                assert!(tr.frames.iter().all(|frame| !frame.visible));
+                tr.in_declaration(base, base_scope, base_scope, |tr| {
+                    assert!(tr.frames.iter().all(|frame| !frame.visible));
+                    bail("test nested declaration failure")
+                })
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            tr.frames
+                .iter()
+                .map(|frame| frame.visible)
+                .collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        assert_eq!(tr.source, Some(base));
+        assert_eq!(tr.lexical_scope, Some(base_scope));
+    }
+
+    #[test]
+    fn a_partially_proved_mask_is_not_applied_on_budget_failure() {
+        let mut resolved = model();
+        let other = resolved.resolve_qualified("Other").unwrap();
+        let scope = resolved.element_scope(other).unwrap();
+        let tables = EnumTables::build(&resolved);
+        let mut tr = Translator::new(&mut resolved, &tables);
+        tr.frames = vec![RuntimeFrame::lambda(None, scope); 2];
+        tr.proof_steps = sysmlv2_model::eval::MAX_STEPS - 1;
+        assert!(tr.mask_frames(scope, scope).is_err());
+        assert!(tr.frames.iter().all(|frame| frame.visible));
+        tr.proof_steps = 0;
+        let hidden = tr
+            .mask_frames(scope, scope)
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert!(tr.frames.iter().all(|frame| !frame.visible));
+        tr.restore_frames(hidden);
+        assert!(tr.frames.iter().all(|frame| frame.visible));
+    }
+
+    #[test]
+    fn closed_member_folding_restores_bindings_and_frame_masks() {
+        let mut resolved = model();
+        let base = resolved.resolve_qualified("Base").unwrap();
+        let parameter = resolved.resolve_qualified("Base::p").unwrap();
+        let scope = resolved.element_scope(base).unwrap();
+        let literal = resolved.resolve_qualified("literal").unwrap();
+        let sequence = resolved.resolve_qualified("listValue").unwrap();
+        let (literal_scope, literal) = resolved.value_expr(literal).unwrap();
+        let (sequence_scope, sequence) = resolved.value_expr(sequence).unwrap();
+        let tables = EnumTables::build(&resolved);
+        let mut tr = Translator::new(&mut resolved, &tables);
+        tr.frames.push(RuntimeFrame {
+            visible: false,
+            ..RuntimeFrame::lambda(Some(scope), scope)
+        });
+        tr.env.push(ParameterValue {
+            parameter,
+            frame: Some(0),
+            binding: Binding::Scalar(Term::IntLit(7), None),
+        });
+        assert!(
+            tr.closed_member_term(literal_scope, &literal, "literal")
+                .is_ok()
+        );
+        assert!(
+            tr.closed_member_term(sequence_scope, &sequence, "sequence")
+                .is_err()
+        );
+        assert_eq!(tr.frames.len(), 1);
+        assert!(!tr.frames[0].visible);
+        assert_eq!(tr.env.len(), 1);
+        assert_eq!(tr.env[0].frame, Some(0));
+        assert!(matches!(
+            tr.env[0].binding,
+            Binding::Scalar(Term::IntLit(7), None)
+        ));
+    }
 }

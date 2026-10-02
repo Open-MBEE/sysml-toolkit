@@ -166,8 +166,8 @@ fn verify_ranges_narrows_and_attributes_verdicts() {
         "package Demo {\n\
          \x20   attribute def Real;\n\
          \x20   attribute def Integer;\n\
-         \x20   attribute wingSpan : Real;\n\
-         \x20   attribute count : Integer;\n\
+         \x20   attribute wingSpan : Real[1];\n\
+         \x20   attribute count : Integer[1];\n\
          \x20   assert constraint span_lo { wingSpan >= 10 }\n\
          \x20   assert constraint span_hi { wingSpan <= 200 }\n\
          \x20   assert constraint bad { count > 5 & count < 4 }\n\
@@ -214,7 +214,59 @@ fn check_reports_rustc_style_diagnostics() {
     assert!(!out.status.success());
     let err = stderr(&out);
     assert!(err.contains("error:"), "{err}");
-    assert!(err.contains("bad.sysml:1:"), "location missing: {err}");
+    assert!(err.contains("bad.sysml:1:22\n"), "location missing: {err}");
+    // The finding's line, and a caret under its span.
+    let excerpt = format!(
+        "   | package Q {{ part x : ; }}\n   | {}^\n",
+        " ".repeat(21)
+    );
+    assert!(err.contains(&excerpt), "{err}");
+}
+
+/// The text report shows at most 160 characters of a finding's line, so
+/// on a model written as one long line it costs the same per finding
+/// whatever the line's length. Echoing the whole line made the report
+/// grow with findings times line length: 960 findings on a 12 KB line
+/// wrote 12 MB.
+#[test]
+fn check_report_per_finding_does_not_grow_with_the_line() {
+    const FINDINGS: usize = 100;
+    let dir =
+        std::env::temp_dir().join(format!("sysmlv2-cli-test-long-line-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    // `FINDINGS` parts of unresolved types on one line, each followed by a
+    // note of `pad` characters.
+    let report = |name: &str, pad: usize| {
+        let note = format!("//* {} */", "x".repeat(pad));
+        let parts: String = (0..FINDINGS)
+            .map(|i| format!("part p{i} : Missing{i}; {note} "))
+            .collect();
+        let path = dir.join(name);
+        fs::write(&path, format!("package P {{ {parts}}}\n")).unwrap();
+        stderr(&sysmlv2(&["check", path.to_str().unwrap()]))
+    };
+    let short = report("s.sysml", 200);
+    let long = report("l.sysml", 20_000);
+    for text in [&short, &long] {
+        assert_eq!(
+            text.matches("warning: unresolved reference").count(),
+            FINDINGS,
+            "{text}"
+        );
+        // The gutter, at most 160 characters of the line and a `…` at
+        // each cut; the caret line is no longer.
+        for line in text.lines().filter(|line| line.starts_with("   | ")) {
+            assert!(line.chars().count() <= 5 + 160 + 2, "{line}");
+        }
+    }
+    // A line a hundred times longer adds only the digits of the columns.
+    assert!(
+        long.len() <= short.len() + 3 * FINDINGS,
+        "{} > {}",
+        long.len(),
+        short.len()
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -852,7 +904,7 @@ fn query_finds_parts_by_usage_type() {
                 part rear : Wheel;
                 part engine : Engine;
             }
-            part car : Vehicle;
+            part car : Vehicle[1];
         }",
     )
     .unwrap();
@@ -903,7 +955,7 @@ fn query_reads_multiple_files_and_stdin() {
     let defs = dir.join("defs.sysml");
     let uses = dir.join("uses.sysml");
     fs::write(&defs, "package Defs { part def Wheel; }").unwrap();
-    fs::write(&uses, "package Uses { import Defs::*; part w : Wheel; }").unwrap();
+    fs::write(&uses, "package Uses { import Defs::*; part w : Wheel[1]; }").unwrap();
 
     // Cross-file query: both files form one model.
     let out = sysmlv2(&[
@@ -1074,6 +1126,61 @@ fn viz_element_scopes_and_unknown_element_fails() {
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("element not found"), "{err}");
+}
+
+/// `viz --element` on a view usage draws in the style of the view's
+/// rendering: its own `render` member's, else the one its definition
+/// declares. `--view` overrides either.
+#[test]
+fn viz_element_view_takes_an_inherited_rendering() {
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-viz-rendering-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("m.sysml");
+    fs::write(
+        &model,
+        "package P {
+            port def Jack;
+            part def Amp { port line : Jack; }
+            part def Speaker { port feed : Jack; }
+            part rig {
+                part amp : Amp;
+                part main : Speaker;
+                connect amp.line to main.feed;
+            }
+            view def Wiring { render Views::asInterconnectionDiagram; }
+            view wiring : Wiring { expose rig; }
+            view outline : Wiring {
+                expose rig;
+                render Views::asTreeDiagram;
+            }
+        }",
+    )
+    .unwrap();
+    let (model, lib) = (model.to_str().unwrap(), lib.to_str().unwrap());
+    let viz = |args: &[&str]| {
+        let out = sysmlv2(&[&["viz", model, "--lib", lib], args].concat());
+        assert!(out.status.success(), "{}", stderr(&out));
+        stdout(&out)
+    };
+    // The rendering the definition declares: parts as blocks, with ports.
+    let wiring = viz(&["--element", "P::wiring"]);
+    assert!(wiring.contains("rectangle \"rig\""), "{wiring}");
+    assert!(wiring.contains("port \"line : Jack\""), "{wiring}");
+    // The view's own rendering wins over the inherited one.
+    let outline = viz(&["--element", "P::outline"]);
+    assert!(outline.contains("class \"rig\""), "{outline}");
+    assert!(!outline.contains("port \""), "{outline}");
+    // An explicit --view overrides an inherited rendering.
+    let tree = viz(&["--element", "P::wiring", "--view", "tree"]);
+    assert!(tree.contains("class \"rig\""), "{tree}");
 }
 
 #[test]

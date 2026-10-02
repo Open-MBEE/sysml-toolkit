@@ -71,7 +71,8 @@ pub struct InheritedNameCollision {
     /// a checker rule a spelled redefinition is subject to: both are
     /// features and `hidden` is no variant; an end is redefined by an end
     /// (`validateRedefinitionEndConformance`); spelled directions agree or
-    /// `hidden`'s is `inout` (`validateRedefinitionDirectionConformance`);
+    /// the inherited direction is `inout` and this feature is directed.
+    /// Conjugation is included; incomplete direction evidence omits the repair;
     /// `element` binds no value over a bound (non-default) value of
     /// `hidden` or its redefinition chain (`validateFeatureValueOverriding`);
     /// each user type `hidden` declares admits some type `element`
@@ -118,15 +119,11 @@ fn overlapping(b: &Builder, x: usize, y: usize) -> bool {
 }
 
 /// Whether `e` reuses an inherited name through a redefinition the
-/// specification implies rather than one the modeller spells — the
-/// normative implicit redefinitions the resolver's specialization index
-/// does not record as `Redefinition` relationships:
-/// - a parameter of a behavior or step redefines the general's parameter
-///   at the same position (KerML `checkFeatureParameterRedefinition`), a
-///   result parameter the general's result (`checkFeatureResultRedefinition`);
-/// - an end feature redefines the general's end at the same position
-///   (`checkFeatureEndRedefinition`), so `end source : P;` in an interface
-///   definition legally reuses `BinaryInterface`'s end names;
+/// specification implies rather than one the modeller spells:
+/// - a parameter, result or end redefines the general's by position
+///   (`Builder::redefines_by_position`) — which inherited member that is
+///   depends on the position, not the name: [`implicitly_redefines_member`]
+///   tells whether a given one is it;
 /// - a case objective (SysML `checkRequirementUsageObjectiveRedefinition`),
 ///   a state's entry/do/exit action (`checkActionUsageStateActionRedefinition`),
 ///   a view rendering (`checkRenderingUsageRedefinition`) and a result
@@ -135,20 +132,14 @@ fn overlapping(b: &Builder, x: usize, y: usize) -> bool {
 ///   metadata definition's feature by the grammar (`MetadataBodyUsage`),
 ///   which the lowering spells as a same-named usage.
 fn implicitly_redefines(b: &Builder, e: usize) -> bool {
+    if b.redefines_by_position(e) {
+        return true;
+    }
     let elem = &b.elements[e];
-    let owner_ty = b.owner_elem(e).map(|o| b.elements[o].ty);
-    let in_behavior = owner_ty.is_some_and(|t| conforms(t, "Behavior") || conforms(t, "Step"));
-    if in_behavior && elem.props.get("direction").is_some_and(|d| d.is_string()) {
-        return true;
-    }
-    if elem.props.get("isEnd").and_then(|v| v.as_bool()) == Some(true) {
-        return true;
-    }
     if elem.owning_relationship.is_some_and(|r| {
         matches!(
             b.elements[r].ty,
-            "ReturnParameterMembership"
-                | "ObjectiveMembership"
+            "ObjectiveMembership"
                 | "StateSubactionMembership"
                 | "ViewRenderingMembership"
                 | "ResultExpressionMembership"
@@ -156,7 +147,36 @@ fn implicitly_redefines(b: &Builder, e: usize) -> bool {
     }) {
         return true;
     }
-    owner_ty.is_some_and(|t| conforms(t, "MetadataFeature"))
+    b.owner_elem(e)
+        .is_some_and(|o| conforms(b.elements[o].ty, "MetadataFeature"))
+}
+
+/// Whether `e`, an owned member of `owner`, redefines the inherited member
+/// `hidden` by implication. A parameter, result or end redefines what its position
+/// pairs it with, directly or through what that redefines: `in b;` as the
+/// only parameter under `Partial :> Diff { in a; in b; }` redefines `a`,
+/// and its reuse of the name `b` is the collision the rule reports. The
+/// other implied kinds ([`implicitly_redefines`]) carry their role's one
+/// inherited member.
+fn implicitly_redefines_member(b: &mut Builder, owner: usize, e: usize, hidden: usize) -> bool {
+    if !b.redefines_by_position(e) {
+        return implicitly_redefines(b, e);
+    }
+    let mut closure: HashSet<usize> = HashSet::new();
+    let mut stack = b.indexed_redefinition_targets(e);
+    stack.extend(b.positional_redefinition_targets(e, owner));
+    while let Some(t) = stack.pop() {
+        if t == hidden {
+            return true;
+        }
+        if closure.insert(t) {
+            stack.extend(b.indexed_redefinition_targets(t));
+            if let Some(o) = b.owner_elem(t) {
+                stack.extend(b.positional_redefinition_targets(t, o));
+            }
+        }
+    }
+    false
 }
 
 /// Whether `reuser` spells a redefinition or subsetting of `hidden` —
@@ -297,6 +317,8 @@ fn redefinition_target(
     element: usize,
     hidden: usize,
     simple: bool,
+    facts: &super::facts::Facts,
+    directions: &mut super::directions::RedefinitionDirections,
 ) -> Option<String> {
     let b = &r.b;
     if !conforms(b.elements[element].ty, "Feature") || !conforms(b.elements[hidden].ty, "Feature") {
@@ -313,13 +335,10 @@ fn redefinition_target(
     if flag(hidden, "isEnd") && !flag(element, "isEnd") {
         return None;
     }
-    let (from, to) = (
-        prop_str(b, element, "direction"),
-        prop_str(b, hidden, "direction"),
-    );
-    if from.is_some() && to.is_some() && from != to && to != Some("inout") {
+    if directions.conformance(&mut r.b, facts, element, hidden) != Some(true) {
         return None;
     }
+    let b = &r.b;
     if b.values.contains_key(&element) {
         let mut chain = redefinition_closure(&mut r.b, hidden);
         chain.insert(hidden);
@@ -383,6 +402,8 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
 /// inherits twice, each in name order.
 pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
     let mut out = Vec::new();
+    let mut direction_facts = None;
+    let mut directions = super::directions::RedefinitionDirections::default();
     let lib_boundary = r.b.lib_boundary;
     for e in lib_boundary..r.b.explicit_len() {
         let unit = r.b.unit_of_elem(e);
@@ -520,7 +541,9 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
 
         let mut by_owned: BTreeMap<(String, usize), (Vec<usize>, bool)> = BTreeMap::new();
         for (m, o, key, simple) in hidden {
-            if !implicitly_redefines(&r.b, o) && !explicitly_specializes(&mut r.b, o, m) {
+            if !implicitly_redefines_member(&mut r.b, e, o, m)
+                && !explicitly_specializes(&mut r.b, o, m)
+            {
                 let entry = by_owned.entry((key, o)).or_insert((Vec::new(), simple));
                 entry.0.push(m);
                 entry.1 &= simple;
@@ -554,9 +577,13 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
                             _ => false,
                         }
                 });
-            let redefinition_target = one_chain
-                .then(|| redefinition_target(r, o, near, simple && ms.len() == 1))
-                .flatten();
+            let redefinition_target = if one_chain {
+                let facts =
+                    direction_facts.get_or_insert_with(|| super::facts::Facts::new(&mut r.b));
+                redefinition_target(r, o, near, simple && ms.len() == 1, facts, &mut directions)
+            } else {
+                None
+            };
             let hint = if !conforms(r.b.elements[o].ty, "Feature") {
                 "rename it"
             } else if redefinition_target.is_some() {

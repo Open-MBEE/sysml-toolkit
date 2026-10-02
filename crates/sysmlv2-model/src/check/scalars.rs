@@ -56,7 +56,10 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         if kinds.is_empty() || kinds.len() != tys.len() {
             continue;
         }
-        let Ok(v) = crate::eval::evaluate_expr_in(&mut r.b, scope, &expr) else {
+        let origin = r.b.set_identity_origin(owner);
+        let value = crate::eval::evaluate_expr_in(&mut r.b, scope, &expr);
+        r.b.identity_origin_unit = origin;
+        let Ok(v) = value else {
             continue; // undecided, not wrong
         };
         let Some(value_kind) = value_scalar_kind(&v) else {
@@ -206,4 +209,32 @@ fn declared_scalar_kind(b: &mut crate::json::Builder, ty: usize) -> Option<Scala
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn scalar_checks_restore_active_source_identity_on_every_outcome() {
+        let mut model = Model::new();
+        model.add_source("first.kerml", "package A;");
+        model.add_source("second.kerml", "package B { datatype Integer; feature n = 2; feature bound : Integer = '88888888-8888-4888-8888-888888888888'; feature invalid : Integer = true; feature unknown : Integer = missing; feature unbound; feature unconstrained = 3; feature empty : Integer = (); }");
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let n = r.resolve_qualified("B::n").unwrap();
+        let id = "88888888-8888-4888-8888-888888888888".parse().unwrap();
+        r.override_ids(&HashMap::from([(r.element_id(n), id)]));
+        assert!(r.bind_id_spelled_references().contains(&id));
+        let prior = r.b.set_identity_origin(n.0);
+        assert_eq!(r.b.identity_origin_unit, Some(1));
+        r.b.identity_origin_unit = prior;
+        for origin in [None, Some(0)] {
+            r.b.identity_origin_unit = origin;
+            let findings = validate(&mut r, &model);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(r.b.identity_origin_unit, origin);
+        }
+    }
 }

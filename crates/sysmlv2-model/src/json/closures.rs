@@ -1,4 +1,4 @@
-//! The closures and the inheritance-aware switch (plan §33h): the four
+//! The closures and the inheritance-aware switch: the four
 //! closure names — `inheritedMembership`, `inheritedFeature`,
 //! `importedMembership`, `featuringType` — over the resolver's own
 //! inheritance and import walks, and the *closure policy* under which the
@@ -14,10 +14,13 @@
 //! — the payload grows with the closures materialized per element, which
 //! is why the passthrough level exists (INTEROP.md).
 //!
-//! The walk stops at a fixed heritage depth ([`super::MAX_RESOLUTION_DEPTH`])
-//! and reports it ([`ResolvedModel::closure_truncated`]) rather than
-//! presenting a cut enumeration as the closure; the emitter refuses to
-//! write one.
+//! Scoped acyclic inheritance is evaluated iteratively without a depth cap.
+//! Supported scope-less expression heritage and contextual import inheritance use bounded
+//! query walks. Import walks and cyclic inheritance fallback retain a depth budget
+//! ([`super::MAX_RESOLUTION_DEPTH`]); [`ResolvedModel::closure_truncated`]
+//! reports an actual cut, and closure emission refuses that partial result.
+//! Known unsupported dependencies are separately reported by
+//! [`ResolvedModel::inheritance_incomplete`].
 
 use super::{ElementRef, InheritedBindings, LookupAccess, ResolvedModel};
 use crate::metaclass::conforms;
@@ -80,6 +83,7 @@ impl ResolvedModel {
     /// incomplete. A closure the emitter is asked to write for such an
     /// element is refused, not truncated.
     pub fn closure_truncated(&mut self, e: ElementRef) -> bool {
+        self.sync_semantic_publication();
         let include_implied = self.include_implied();
         if self.inheritance_walk_truncated(e, include_implied) {
             return true;
@@ -126,35 +130,28 @@ impl ResolvedModel {
     /// excludes) — each imported member's owning membership, and the
     /// imported alias memberships, admitted by the imports' filter
     /// conditions, in discovery order (per import, declaration order).
-    /// Two deviations from the normative operation: a `import Q::alias;`
-    /// contributes the aliased element's owning membership rather than
-    /// the alias Membership itself, and a mutual public-import cycle
-    /// lists a namespace's own memberships under its imports (the
-    /// operation's `excluded->including(self)` seed), which `membership`
-    /// deduplicates.
+    /// Named imports retain the selected alias Membership. Namespace
+    /// traversal excludes ancestor namespaces to break import cycles.
+    /// Membership identity is deduplicated before name/metaclass collisions
+    /// against peers and owned memberships are removed. Package filters follow
+    /// that pruning. Visibility-specific re-exports are a separate operation.
+    /// Signatures requiring unavailable external or specialized inferred naming
+    /// remain conservatively present; this is not a complete conformance claim.
     pub fn imported_memberships(&mut self, e: ElementRef) -> Vec<ElementRef> {
         let Some(&s) = self.b.elem_scope.get(&e.0) else {
             return Vec::new();
         };
         let include_implied = self.include_implied();
         let mut bindings = InheritedBindings::default();
-        self.b
+        let order = self
+            .b
             .imported_bindings(s, include_implied, LookupAccess::All, &mut bindings);
-        let mut out: Vec<ElementRef> = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
-        for &(elem, _) in &bindings.members {
-            if let Some(r) = self.b.elements[elem].owning_relationship {
-                if seen.insert(r) {
-                    out.push(ElementRef(r));
-                }
-            }
-        }
-        for &r in &bindings.alias_rels {
-            if seen.insert(r) {
-                out.push(ElementRef(r));
-            }
-        }
-        out
+        let mut seen = HashSet::new();
+        order
+            .into_iter()
+            .filter(|&r| seen.insert(r))
+            .map(ElementRef)
+            .collect()
     }
 
     // ---- the inheritance-aware bases ----

@@ -108,6 +108,10 @@ fn protected_members_are_visible_to_specializers_but_private_members_are_not() {
                 feature redefines inherited;
                 feature redefines secret;
             }
+            class Ordinary specializes Base {
+                feature protectedReference references inherited;
+                feature privateReference references secret;
+            }
             feature outsideProtected : Base::inherited;
             feature outsidePrivate : Base::secret;
         }",
@@ -123,12 +127,26 @@ fn protected_members_are_visible_to_specializers_but_private_members_are_not() {
     assert_eq!(
         unresolved,
         ["Base::inherited", "Base::secret", "secret"],
-        "a specializer inherits protected, never private; external qualified access sees neither"
+        "ordinary inheritance exposes protected, not private; external qualified access sees neither"
     );
     let mut resolved = sysmlv2_parser::json::ResolvedModel::build(&model);
+    let secret = resolved.resolve_qualified("P::Base::secret").unwrap();
+    let inherited = resolved.resolve_qualified("P::Base::inherited").unwrap();
+    // Redefinition headers resolve with the general as their local namespace,
+    // so they can address its private owned member without inheriting it.
+    let targets: Vec<_> = resolved
+        .reference_sites()
+        .iter()
+        .filter(|site| site.kind == "redefinedFeature")
+        .map(|site| site.target)
+        .collect();
+    assert_eq!(targets, [inherited, secret]);
+    let ordinary = resolved.resolve_qualified("P::Ordinary").unwrap();
     assert!(
-        resolved.resolve_qualified("P::Base::secret").is_some(),
-        "absolute tooling paths can still address private model elements"
+        resolved
+            .inherited_memberships(ordinary, false)
+            .into_iter()
+            .all(|membership| resolved.membership_member(membership) != Some(secret))
     );
 }
 
@@ -682,8 +700,8 @@ fn recursive_membership_import_visible_from_outside() {
 /// instead of the package's. The serialized `importedNamespace` must stay
 /// the package, while a plain *reference* to the imported name prefers the
 /// imported member (imported memberships shadow outer namespaces).
-/// Found via GfSE/SysML-v2-Models (`package Domain`
-/// owning `part def Domain`, EveOnlineMiningFrigate).
+/// Found in a community model (`package Domain`
+/// owning `part def Domain`).
 #[cfg(feature = "json")]
 #[test]
 fn namespace_import_does_not_capture_its_own_target() {
@@ -735,9 +753,9 @@ fn namespace_import_does_not_capture_its_own_target() {
 
 /// The first segment of a qualified reference commits to the nearest
 /// binding without backtracking: with `import Domain::*;` making the inner
-/// `part def Domain` visible, `Domain::PilotPod` resolves `Domain` to the
-/// part def and fails on `PilotPod` — even though the root package `Domain`
-/// has that member (KerML resolution commits per segment; the GfSE Eve
+/// `part def Domain` visible, `Domain::Cabin` resolves `Domain` to the
+/// part def and fails on `Cabin` — even though the root package `Domain`
+/// has that member (KerML resolution commits per segment; a community
 /// corpus exercises exactly this shape).
 #[cfg(feature = "json")]
 #[test]
@@ -747,11 +765,11 @@ fn imported_member_shadows_package_for_qualified_refs() {
         "shadow.sysml",
         "package Domain {
             part def Domain;
-            part def PilotPod;
+            part def Cabin;
         }
         package User {
             private import Domain::*;
-            part p : Domain::PilotPod;
+            part p : Domain::Cabin;
         }",
     );
     assert!(!model.has_errors());
@@ -759,7 +777,7 @@ fn imported_member_shadows_package_for_qualified_refs() {
     let (_, unresolved) = count_refs(&elements);
     assert_eq!(
         unresolved, 1,
-        "Domain::PilotPod stays unresolved — the imported part def shadows the package"
+        "Domain::Cabin stays unresolved — the imported part def shadows the package"
     );
 }
 
@@ -769,7 +787,7 @@ fn imported_member_shadows_package_for_qualified_refs() {
 /// intermediate scopes' import caches at that exhausted depth, permanently
 /// poisoning them with empty import sets — so whether a *shallow* reference
 /// through the same scopes resolved depended on pending-resolution order
-/// (on the GfSE Eve corpus, on CLI file order). The deep probe stays
+/// (on that community corpus, on CLI file order). The deep probe stays
 /// unresolved; the shallow one must resolve regardless of coming second.
 #[cfg(feature = "json")]
 #[test]
@@ -970,6 +988,87 @@ fn view_exposure_honors_filters() {
     );
 }
 
+/// A view's rendering is its own `render` member's — a declared
+/// rendering as well as a referenced one, through a feature chain too —
+/// else the one it inherits through a typing or a specialization, at any
+/// depth; of several inherited renderings the first in heritage order
+/// wins, and a definition's own rendering precedes the one it inherits in
+/// turn. The answer matches the specification's `viewRendering`
+/// derivation, which the derived-property API computes under the closure
+/// policy.
+#[test]
+fn view_rendering_follows_inheritance() {
+    use sysmlv2_parser::json::{ClosurePolicy, Derived, DerivedValue, Reference, ResolvedModel};
+    let mut model = Model::new();
+    model.add_source(
+        "vr.sysml",
+        "package VR {
+            rendering def Layout;
+            rendering asTable : Layout;
+            rendering asTree : Layout;
+            rendering asGrid : Layout;
+            part layouts { rendering asNested : Layout; }
+            view def TableView { render asTable; }
+            view def TreeView { render asTree; }
+            view def GridView :> TreeView { render asGrid; }
+            view def LeftTable :> TableView;
+            view def RightTable :> TableView;
+            view def Unrendered;
+            view def NestedView { render layouts.asNested; }
+            view inherits : TableView;
+            view exposing : TableView { expose VR::*; }
+            view overrides : TableView { render asTree; }
+            view declares : TableView { render rendering outline : Layout; }
+            view refined :> inherits;
+            view deepest : GridView;
+            view tableFirst : TableView, TreeView;
+            view treeFirst : TreeView, TableView;
+            view diamond : LeftTable, RightTable;
+            view unrendered : Unrendered;
+            view chained { render layouts.asNested; }
+            view nested : NestedView;
+            view bare;
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let expected = [
+        ("VR::inherits", Some("asTable")),
+        ("VR::exposing", Some("asTable")),
+        ("VR::overrides", Some("asTree")),
+        ("VR::declares", Some("outline")),
+        ("VR::refined", Some("asTable")),
+        ("VR::deepest", Some("asGrid")),
+        ("VR::tableFirst", Some("asTable")),
+        ("VR::treeFirst", Some("asTree")),
+        ("VR::diamond", Some("asTable")),
+        ("VR::unrendered", None),
+        ("VR::chained", Some("asNested")),
+        ("VR::nested", Some("asNested")),
+        ("VR::bare", None),
+        ("VR::GridView", Some("asGrid")),
+        ("VR::LeftTable", Some("asTable")),
+    ];
+    for (view, rendering) in expected {
+        let v = r.resolve_qualified(view).expect(view);
+        assert_eq!(r.view_rendering(v).as_deref(), rendering, "{view}");
+    }
+    r.set_closure_policy(ClosurePolicy::Closure {
+        include_implied: true,
+    });
+    for (view, rendering) in expected {
+        let v = r.resolve_qualified(view).expect(view);
+        let derived = match r.derived(v, "viewRendering") {
+            Derived::Value(DerivedValue::Reference(Reference::Element(e))) => {
+                r.element_name(e).map(str::to_string)
+            }
+            Derived::Value(DerivedValue::Null) => None,
+            other => panic!("{view}: {other:?}"),
+        };
+        assert_eq!(derived.as_deref(), rendering, "{view} (derived)");
+    }
+}
+
 #[cfg(feature = "json")]
 #[test]
 fn anonymous_redefinition_fanout_targets_the_inherited_feature() {
@@ -1071,32 +1170,36 @@ fn redefinition_fanout_preserves_inherited_overrides_and_named_members() {
         }
         assert!(check::validate_model(&model).is_empty());
     }
-    // Declared local targets remain visible: the fix is not an
-    // inherited-only lookup, nor a blanket removal of local members.
+    // A redefinition starts in each direct general Type; the declaring
+    // Type's local feature is not a target when no general Type exists.
     let mut model = Model::new();
     model.add_source(
         "local.kerml",
         "class C { feature x; feature y redefines x; }",
     );
-    let mut r = ResolvedModel::build(&model);
-    let x = r.resolve_qualified("C::x").unwrap();
     let rows = emit(&model);
     let edge = rows.iter().find(|e| e["@type"] == "Redefinition").unwrap();
-    assert_eq!(edge["redefinedFeature"]["@id"], r.element_id(x).to_string());
+    assert_eq!(edge["redefinedFeature"]["@ref"], "x");
+    assert!(
+        check::validate_model(&model)
+            .iter()
+            .any(|(_, d)| d.message.contains("unresolved reference `x`"))
+    );
 }
 
 #[cfg(feature = "json")]
 #[test]
 fn redefinition_fanout_does_not_hide_missing_or_ambiguous_targets() {
     use sysmlv2_parser::check;
+    let generals = "part def L { ref part items : Item[*]; }
+          part def R { ref part items : Item[*]; }";
+    // A redefinition header tries the written generals in order: with
+    // `L, R` both redefinitions take `L::items`. An ambiguity inside the
+    // one general `LR` still surfaces.
+    let joined = format!("{generals} part def LR :> L, R;");
     for (definitions, typing, diagnostic) in [
         ("part def C;", "C", "unresolved reference `items`"),
-        (
-            "part def L { ref part items : Item[*]; }
-          part def R { ref part items : Item[*]; }",
-            "L, R",
-            "ambiguous reference `items`",
-        ),
+        (joined.as_str(), "LR", "ambiguous reference `items`"),
     ] {
         let mut model = Model::new();
         model.add_source(
@@ -1116,6 +1219,26 @@ fn redefinition_fanout_does_not_hide_missing_or_ambiguous_targets() {
             "{findings:?}"
         );
     }
+    let mut model = Model::new();
+    model.add_source(
+        "ordered.sysml",
+        &format!(
+            "package P {{
+            part def Item; {generals} part a : Item;
+            part c : L, R {{ ref :>> items = a; ref :>> items = a; }}
+        }}"
+        ),
+    );
+    assert!(check::validate_model(&model).is_empty());
+    let mut resolved = sysmlv2_parser::json::ResolvedModel::build(&model);
+    let items = resolved.resolve_qualified("P::L::items").unwrap();
+    let targets: Vec<_> = resolved
+        .reference_sites()
+        .iter()
+        .filter(|site| site.kind == "redefinedFeature")
+        .map(|site| site.target)
+        .collect();
+    assert_eq!(targets, [items, items]);
     // Ordinary references to indistinguishable siblings remain ambiguous.
     let mut model = Model::new();
     model.add_source(
@@ -1344,33 +1467,37 @@ fn inherited_members_imports_and_redefinition_siblings() {
         "y and x both removed by the intersection condition, got {leftover:?}"
     );
 
-    // (4) Alias memberships inherit as memberships: `alias m for mass`
-    // in the base arrives on the subtype, navigable to its target.
-    let mut model = Model::new();
-    model.add_source(
-        "a.sysml",
-        "package P {
-            part def Base { attribute mass; alias m for mass; }
-            part def Sub :> Base;
-         }",
-    );
-    let mut r = ResolvedModel::build(&model);
-    let sub = r.resolve_qualified("P::Sub").unwrap();
-    let memberships = r.inherited_memberships(sub, false);
-    let alias = memberships
-        .iter()
-        .copied()
-        .find(|&m| r.membership_is_alias(m))
-        .expect("inherited alias membership");
-    assert_eq!(r.membership_member_name(alias).as_deref(), Some("m"));
-    let mass = r.resolve_qualified("P::Base::mass").unwrap();
-    assert_eq!(r.membership_member(alias), Some(mass));
-    // The ordinary membership for `mass` is present too.
-    assert!(
-        memberships
-            .iter()
-            .any(|&m| !r.membership_is_alias(m) && r.membership_member(m) == Some(mass))
-    );
+    // (4) A Feature's owning membership and alias suppress each other.
+    // If the original membership is private, the public alias alone inherits
+    // and remains navigable to that same Feature.
+    for visibility in ["", "private"] {
+        let mut model = Model::new();
+        model.add_source(
+            "a.sysml",
+            &format!(
+                "package P {{
+                part def Base {{ {visibility} attribute mass; alias m for mass; }}
+                part def Sub :> Base;
+             }}"
+            ),
+        );
+        let mut r = ResolvedModel::build(&model);
+        let sub = r.resolve_qualified("P::Sub").unwrap();
+        let memberships = r.inherited_memberships(sub, false);
+        if visibility.is_empty() {
+            assert!(
+                memberships.is_empty(),
+                "distinct memberships mutually suppress"
+            );
+        } else {
+            assert_eq!(memberships.len(), 1);
+            let alias = memberships[0];
+            assert!(r.membership_is_alias(alias));
+            assert_eq!(r.membership_member_name(alias).as_deref(), Some("m"));
+            let mass = r.resolve_qualified("P::Base::mass").unwrap();
+            assert_eq!(r.membership_member(alias), Some(mass));
+        }
+    }
 }
 
 /// Composition corner cases: nested re-export filter policy,
@@ -1410,30 +1537,37 @@ fn inherited_members_import_policy_composition() {
         "nested [@Safety] filter must hold through the re-export: {names:?}"
     );
 
-    // (2) Aliases reached through a public import are enumerated.
-    let mut model = Model::new();
-    model.add_source(
-        "a.sysml",
-        "package P {
-            package Lib {
-                part x;
-                alias a for x;
-            }
-            part def Base { public import Lib::*; }
-            part def Sub :> Base;
-         }",
-    );
-    let mut r = ResolvedModel::build(&model);
-    let sub = r.resolve_qualified("P::Sub").unwrap();
-    let memberships = r.inherited_memberships(sub, false);
-    let alias = memberships
-        .iter()
-        .copied()
-        .find(|&m| r.membership_is_alias(m))
-        .expect("imported alias membership");
-    assert_eq!(r.membership_member_name(alias).as_deref(), Some("a"));
-    let x = r.resolve_qualified("P::Lib::x").unwrap();
-    assert_eq!(r.membership_member(alias), Some(x));
+    // (2) Imported alias and owning memberships of one Feature suppress
+    // each other; a public alias of an excluded private member inherits alone.
+    for visibility in ["", "private"] {
+        let mut model = Model::new();
+        model.add_source(
+            "a.sysml",
+            &format!(
+                "package P {{
+                package Lib {{ {visibility} part x; alias a for x; }}
+                part def Base {{ public import Lib::*; }}
+                part def Sub :> Base;
+             }}"
+            ),
+        );
+        let mut r = ResolvedModel::build(&model);
+        let sub = r.resolve_qualified("P::Sub").unwrap();
+        let memberships = r.inherited_memberships(sub, false);
+        if visibility.is_empty() {
+            assert!(
+                memberships.is_empty(),
+                "distinct memberships mutually suppress"
+            );
+        } else {
+            assert_eq!(memberships.len(), 1);
+            let alias = memberships[0];
+            assert!(r.membership_is_alias(alias));
+            assert_eq!(r.membership_member_name(alias).as_deref(), Some("a"));
+            let x = r.resolve_qualified("P::Lib::x").unwrap();
+            assert_eq!(r.membership_member(alias), Some(x));
+        }
+    }
 
     // (3) Redefiners of unrelated heritage branches never suppress one
     // another; an owned redefiner still suppresses both.

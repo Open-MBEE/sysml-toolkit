@@ -23,9 +23,10 @@ use crate::position::Mapper;
 use lsp_types::{DocumentSymbol, SymbolKind};
 use sysmlv2_parser::ast::{
     DefKind, Definition, FeatureSpecialization, Identification, Member, MemberKind, SourceUnit,
-    TargetRef, Usage, UsageKind,
+    TargetRef, Usage, UsageKind, Visibility,
 };
 use sysmlv2_parser::span::Span;
+use sysmlv2_parser::visit::{self, Visit};
 
 /// Build the outline for one parsed unit over its source text.
 ///
@@ -91,6 +92,244 @@ pub(crate) fn short_names(
     let mut out = std::collections::HashMap::new();
     collect_short_names(&unit.members, mapper, &mut out);
     out
+}
+
+/// A unit's namespace plumbing that the completion tier's symbol
+/// tables read differently from the outline, at any depth, keyed by
+/// member start (the outline node's `range.start`).
+#[derive(Default)]
+pub(crate) struct Plumbing {
+    /// The `import` and `expose` members. The outline lists each under
+    /// its target's spelling, but they declare nothing.
+    pub imports: std::collections::HashSet<lsp_types::Position>,
+    /// What each `import` member names and how (an `expose` shows
+    /// elements in a view and makes nothing visible).
+    pub import_forms: std::collections::HashMap<lsp_types::Position, ImportForm>,
+    /// The `alias` members' targets, as written. An alias names what its
+    /// target does.
+    pub aliases: std::collections::HashMap<lsp_types::Position, Written>,
+    /// The members declared `private` or `protected`: no member of
+    /// their namespace for anyone outside it.
+    pub hidden: std::collections::HashSet<lsp_types::Position>,
+    /// What each declaration specializes (see [`Base`]), when anything.
+    pub bases: std::collections::HashMap<lsp_types::Position, Vec<Base>>,
+    /// The name each unnamed usage is found by (see [`effective_name`]),
+    /// and where the text spells it.
+    pub effective: std::collections::HashMap<lsp_types::Position, (String, lsp_types::Range)>,
+}
+
+/// A reference as written: an alias's target, or what a declaration
+/// specializes.
+#[derive(Clone, Debug)]
+pub(crate) struct Written {
+    /// One raw name per segment.
+    pub target: Vec<String>,
+    /// `$::`-rooted.
+    pub global: bool,
+}
+
+/// What a declaration specializes, as written: a type a usage is typed
+/// by, a feature it subsets, redefines, or references, a definition a
+/// definition specializes. Its members are the declaration's too.
+#[derive(Clone, Debug)]
+pub(crate) struct Base {
+    pub written: Written,
+    /// A feature the declaration redefines: found among what the
+    /// declaration's owner inherits, never the declaration itself.
+    pub redefines: bool,
+}
+
+/// An `import` statement's target, as written, and its form.
+pub(crate) struct ImportForm {
+    /// One raw name per segment.
+    pub target: Vec<String>,
+    /// `$::`-rooted.
+    pub global: bool,
+    /// `::*`: the target's members rather than the target itself.
+    pub namespace: bool,
+    /// `::**`: recursively.
+    pub recursive: bool,
+    /// Re-exported to the owning namespace's clients: `public`, or no
+    /// visibility keyword at all.
+    pub public: bool,
+    /// `import all`: the target's members whatever their visibility, as
+    /// a name written inside the target finds them.
+    pub all: bool,
+    /// Conditioned — by a `[…]` filter of its own, or by a `filter`
+    /// member of the namespace it sits in — so it brings in only the
+    /// members the condition admits, which the syntax tier cannot tell.
+    pub filtered: bool,
+}
+
+/// Collect a unit's [`Plumbing`] in one walk.
+pub(crate) fn plumbing(unit: &SourceUnit, mapper: &Mapper<'_>) -> Plumbing {
+    struct Walk<'m> {
+        mapper: &'m Mapper<'m>,
+        out: Plumbing,
+        /// The imports of namespace bodies that hold a `filter` member,
+        /// by member start.
+        conditioned: std::collections::HashSet<u32>,
+    }
+    impl Walk<'_> {
+        /// A `filter` member conditions every import of its namespace.
+        fn note_filters(&mut self, body: &[Member]) {
+            if body.iter().any(|b| matches!(b.kind, MemberKind::Filter(_))) {
+                let imports = body
+                    .iter()
+                    .filter(|b| matches!(b.kind, MemberKind::Import(_)));
+                self.conditioned.extend(imports.map(|b| b.span.start));
+            }
+        }
+    }
+    impl<'a> Visit<'a> for Walk<'_> {
+        fn visit_member(&mut self, m: &'a Member) {
+            if let MemberKind::Package(p) = &m.kind {
+                self.note_filters(p.body.as_deref().unwrap_or_default());
+            }
+            let at = || self.mapper.position(m.span.start);
+            if matches!(
+                m.visibility,
+                Some(Visibility::Private | Visibility::Protected)
+            ) {
+                self.out.hidden.insert(at());
+            }
+            match &m.kind {
+                MemberKind::Import(i) => {
+                    self.out.imports.insert(at());
+                    let form = ImportForm {
+                        target: i.target.segments.iter().map(|s| s.value.clone()).collect(),
+                        global: i.target.is_global,
+                        namespace: i.is_namespace,
+                        recursive: i.is_recursive,
+                        public: matches!(m.visibility, None | Some(Visibility::Public)),
+                        all: i.is_import_all,
+                        filtered: !i.filters.is_empty() || self.conditioned.contains(&m.span.start),
+                    };
+                    self.out.import_forms.insert(at(), form);
+                }
+                MemberKind::Expose(_) => {
+                    self.out.imports.insert(at());
+                }
+                MemberKind::Definition(d) => {
+                    let bases: Vec<Base> = d
+                        .specializes
+                        .iter()
+                        .filter_map(|t| base(t, false))
+                        .collect();
+                    if !bases.is_empty() {
+                        self.out.bases.insert(at(), bases);
+                    }
+                }
+                _ if crate::kinds::usage(m).is_some() => {
+                    if let Some(name) = effective_name_of(m) {
+                        let range = self.mapper.range(name.span);
+                        self.out.effective.insert(at(), (name.value.clone(), range));
+                    }
+                    let u = crate::kinds::usage(m).expect("a usage");
+                    let mut bases = Vec::new();
+                    for spec in &u.declaration.specializations {
+                        match spec {
+                            FeatureSpecialization::TypedBy(types) => {
+                                bases.extend(types.iter().filter_map(|t| base(&t.target, false)));
+                            }
+                            FeatureSpecialization::Subsets(ts) => {
+                                bases.extend(ts.iter().filter_map(|t| base(t, false)));
+                            }
+                            FeatureSpecialization::Redefines(ts) => {
+                                bases.extend(ts.iter().filter_map(|t| base(t, true)));
+                            }
+                            FeatureSpecialization::References(t) => bases.extend(base(t, false)),
+                            FeatureSpecialization::Crosses(_) => {}
+                        }
+                    }
+                    if !bases.is_empty() {
+                        self.out.bases.insert(at(), bases);
+                    }
+                }
+                MemberKind::Alias(a) => {
+                    let target = Written {
+                        target: a.target.segments.iter().map(|s| s.value.clone()).collect(),
+                        global: a.target.is_global,
+                    };
+                    self.out.aliases.insert(at(), target);
+                }
+                _ => {}
+            }
+            visit::walk_member(self, m);
+        }
+    }
+    let mut walk = Walk {
+        mapper,
+        out: Plumbing::default(),
+        conditioned: std::collections::HashSet::new(),
+    };
+    walk.note_filters(&unit.members);
+    walk.visit_unit(unit);
+    walk.out
+}
+
+/// A specialization's target as a [`Base`]; `None` for a feature chain,
+/// which names no one declaration by its path.
+fn base(target: &TargetRef, redefines: bool) -> Option<Base> {
+    let TargetRef::Name(qn) = target else {
+        return None;
+    };
+    Some(Base {
+        written: Written {
+            target: qn.segments.iter().map(|s| s.value.clone()).collect(),
+            global: qn.is_global,
+        },
+        redefines,
+    })
+}
+
+/// The name the member `m`, a usage without a name of its own, is found
+/// by (see [`effective_name`]).
+pub(crate) fn effective_name_of(m: &Member) -> Option<&sysmlv2_parser::ast::Name> {
+    let u = crate::kinds::usage(m)?;
+    let references = matches!(
+        u.kind,
+        UsageKind::Perform | UsageKind::Exhibit | UsageKind::Include
+    ) || matches!(m.kind, MemberKind::RequirementConstraint { .. });
+    effective_name(u, references)
+}
+
+/// The name an unnamed usage is found by, as the resolver names it: the
+/// last segment of the first feature it redefines (`:>> engine`,
+/// `attribute redefines fuelMassMax = 60 [kg];`), or of the one it
+/// references (`satisfy Requirements::vehicleSpecification by
+/// vehicle_b`); where the usage is `references`-named — a `perform`,
+/// `exhibit`, or `include`, or an `assume` or `require` constraint —
+/// or a variant, the one it references alone, the last step of a
+/// feature chain too for the former (`perform providePower.distributeTorque;`
+/// is found as `distributeTorque`). `None` for a usage with a name or a
+/// short name, and for one naming nothing so.
+fn effective_name(u: &Usage, references: bool) -> Option<&sysmlv2_parser::ast::Name> {
+    let specs = &u.declaration.specializations;
+    if !u.declaration.id.is_empty() {
+        return None;
+    }
+    let by_reference = (references || u.prefix.is_variant)
+        && specs
+            .iter()
+            .any(|s| matches!(s, FeatureSpecialization::References(_)));
+    for s in specs {
+        let (target, chained) = match s {
+            FeatureSpecialization::References(t) => (t, references),
+            FeatureSpecialization::Redefines(ts) if !by_reference => match ts.first() {
+                Some(t) => (t, false),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let qn = match target {
+            TargetRef::Name(qn) => qn,
+            TargetRef::Chain(links) if chained => links.last()?,
+            TargetRef::Chain(_) => return None,
+        };
+        return qn.segments.last();
+    }
+    None
 }
 
 fn collect_short_names(

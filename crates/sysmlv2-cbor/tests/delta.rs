@@ -455,9 +455,10 @@ fn elided_delta_tampering_fails_a_digest_hard() {
     let base = compact_of(&[("m.sysml", BASE_UNIT)]);
     let target = compact_of(&[("m.sysml", TARGET_UNIT)]);
     let bytes = delta_compact_cbor_elided(&base, &target, &opts(false), &none).unwrap();
-    // Every single-byte mutation must die cleanly (malformed, digest,
-    // or refused header — never a panic, never silent acceptance of a
-    // divergent state); some mutation must reach each digest guard.
+    // Body mutations must die cleanly (malformed or digest), never
+    // silently accept a divergent state. A 2→3 header flip is meaningful
+    // metadata over this graph with no conditional operands; both schemes
+    // derive the same IDs. Session boundaries separately enforce the contract.
     let (mut id_digest_failures, mut ok) = (0usize, 0usize);
     for i in 0..bytes.len() {
         let mut bad = bytes.clone();
@@ -471,6 +472,11 @@ fn elided_delta_tampering_fails_a_digest_hard() {
                 // A mutation that still applies must be a no-op flip
                 // landing on the identical state.
                 assert_eq!(v, delta_canonical(&target).unwrap());
+                assert_eq!(i, 16, "only the supported graph-format stamp may change");
+                assert_eq!(
+                    sysmlv2_cbor::describe(&bad).unwrap()["versions"]["scheme"],
+                    3
+                );
                 ok += 1;
             }
         }
@@ -479,7 +485,7 @@ fn elided_delta_tampering_fails_a_digest_hard() {
         id_digest_failures > 0,
         "some mutation reached the created-id digest"
     );
-    assert_eq!(ok, 0, "no mutation silently applied");
+    assert_eq!(ok, 1, "only the graph-format stamp changed");
 }
 
 #[test]
@@ -1084,5 +1090,30 @@ mod implied_owner_deltas {
         let described = sysmlv2_cbor::describe(&bytes).unwrap();
         assert_eq!(described["delta"]["impliedOwners"], true);
         assert_eq!(described["delta"]["ownerExceptions"], 0);
+    }
+}
+
+#[test]
+fn previous_id_scheme_refuses_elided_deltas_but_accepts_explicit_ids() {
+    let base = compact_of(&[("m.sysml", BASE_UNIT)]);
+    let target = compact_of(&[("m.sysml", TARGET_UNIT)]);
+    let mut elided = delta_compact_cbor_elided(&base, &target, &opts(false), &none).unwrap();
+    assert_eq!(elided[9], 0x1B);
+    elided[16] = 1;
+    let err = apply_delta_cbor_with(&elided, &base, &none)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("id-derivation scheme"), "{err}");
+    assert_eq!(
+        sysmlv2_cbor::describe(&elided).unwrap()["versions"]["supported"],
+        false
+    );
+    for portable in [false, true] {
+        let mut explicit = delta_compact_cbor(&base, &target, &opts(portable)).unwrap();
+        explicit[16] = 1;
+        assert_eq!(
+            apply_delta_cbor(&explicit, &base).unwrap(),
+            delta_canonical(&target).unwrap()
+        );
     }
 }

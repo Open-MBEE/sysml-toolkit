@@ -28,7 +28,7 @@ fn main() {
     files.sort();
     for f in &files {
         let src = fs::read_to_string(f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        model.add_source(sysmlv2_testkit::relative_source_name(root, f), &src);
     }
     let diags = validate_model(&model);
     let mut unresolved = 0;

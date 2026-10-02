@@ -1,5 +1,5 @@
 // Hazard: pilot-era (pre-formal-spec) spellings that circulate in older
-// models (GfSE VehicleModel): `alias X as Y`, `id '1'`, `stream`,
+// community models: `alias X as Y`, `id '1'`, `stream`,
 // `@[unit]` quantities, `{…}` sequence literals, `do ref(args)`.
 package P {
     part def D;

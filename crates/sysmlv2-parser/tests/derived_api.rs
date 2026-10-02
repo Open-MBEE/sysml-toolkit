@@ -462,7 +462,11 @@ fn definition_back_references_follow_the_declared_type() {
     let go = elem(&mut r, "P::go");
     let god = elem(&mut r, "P::Go");
     assert_eq!(many(&mut r, go, "actionDefinition"), [god]);
-    assert_eq!(derives("ActionUsage", "actionDefinition"), Derives::Exact);
+    // Definition filters inherit the qualified type projection.
+    assert_eq!(
+        derives("ActionUsage", "actionDefinition"),
+        Derives::Passthrough
+    );
     // A composition over a passthrough base is passthrough; the same
     // name on FlowDefinition is another property (`associationEnd`).
     assert_eq!(derives("FlowUsage", "flowEnd"), Derives::Passthrough);
@@ -556,10 +560,13 @@ fn a_composition_is_not_computed_where_its_base_is_another_property() {
     // Compositions over the owned relationships are exact.
     assert_eq!(derives("PartDefinition", "ownedDisjoining"), Derives::Exact);
     assert_eq!(derives("PartUsage", "nestedEnumeration"), Derives::Exact);
-    assert_eq!(derives("PortUsage", "portDefinition"), Derives::Exact);
+    // This filter depends on type, rather than only owned relationships.
+    assert_eq!(derives("PortUsage", "portDefinition"), Derives::Passthrough);
+    // The typing's same-named single reference follows the conjugated
+    // definition's original, independently of the usage composition.
     assert_eq!(
         derives("ConjugatedPortTyping", "portDefinition"),
-        Derives::NotComputed
+        Derives::Exact
     );
 }
 
@@ -656,7 +663,7 @@ fn string(r: &mut ResolvedModel, e: ElementRef, name: &str) -> Option<String> {
 
 /// `Element::name` / `shortName` / `qualifiedName` per KerML 8.2.3.5: an
 /// unnamed feature is named by the feature it redefines (recursively),
-/// references, or chains to; `qualifiedName` falls back to the short name
+/// or references under SysML naming rules; `qualifiedName` falls back to the short name
 /// where `name` does not.
 #[test]
 fn names_follow_the_naming_feature() {
@@ -844,13 +851,13 @@ fn qualified_name_needs_a_membership_chain() {
     let c = elem(&mut r, "P::c");
     let end = many(&mut r, c, "ownedEndFeature")[0];
     // The end references a chain feature it owns through the
-    // ReferenceSubsetting; the chain is named by its last link but has
-    // no owning namespace.
+    // ReferenceSubsetting; the anonymous chain has neither a name nor
+    // an owning namespace.
     let chain = many(&mut r, end, "ownedElement")
         .into_iter()
         .find(|&e| r.element_type(e) == "Feature" || r.element_type(e) == "ReferenceUsage")
         .expect("chain feature");
-    assert_eq!(string(&mut r, chain, "name").as_deref(), Some("mass"));
+    assert_eq!(string(&mut r, chain, "name"), None);
     assert_eq!(string(&mut r, chain, "qualifiedName"), None);
     assert_eq!(r.element_qualified_name(chain), None);
     // The reference spelling joins the lookup names, not the
@@ -941,6 +948,39 @@ fn references_outside_the_model_are_reported() {
 /// and carry the endpoint families like any relationship — while the
 /// explicit graph the resolver and lints iterate stays as built. None
 /// exist for a model whose library bases are unknown.
+/// A parameter, end or result redefines its general's by position, and
+/// `type` follows that implied redefinition as it follows a written one.
+#[test]
+fn a_positional_redefinition_types_the_redefining_feature() {
+    let src = "package P {
+            part def P1; part def P2;
+            action def A { in p : P1; in q : P2; }
+            action def Swapped :> A { in q; in p; }
+            action def Renamed :> A { in x :>> p; in y; }
+            action swappedUse : A { in q; in p; }
+            calc def C1 { in i; return r : P1; }
+            calc def C2 :> C1 { return s; }
+            connection def Conn { end e1 : P1; end e2 : P2; }
+            connection def Conn2 :> Conn { end f1; end f2; }
+        }";
+    let mut r = build(src);
+    let p1 = elem(&mut r, "P::P1");
+    let p2 = elem(&mut r, "P::P2");
+    for (feature, expected) in [
+        ("P::Swapped::q", p1),
+        ("P::Swapped::p", p2),
+        ("P::Renamed::x", p1),
+        ("P::Renamed::y", p2),
+        ("P::swappedUse::q", p1),
+        ("P::C2::s", p1),
+        ("P::Conn2::f1", p1),
+        ("P::Conn2::f2", p2),
+    ] {
+        let f = elem(&mut r, feature);
+        assert_eq!(many(&mut r, f, "type"), vec![expected], "{feature}");
+    }
+}
+
 #[test]
 fn implied_relationships_are_materialized_on_demand() {
     let src = "package P {
@@ -1242,7 +1282,7 @@ fn members_and_qualified_names_through_unnamed_owners() {
     assert_eq!(string(&mut r, child, "qualifiedName"), None);
 }
 
-// ---- M33f: behavior, expression, requirement and view structure ----
+// ---- behavior, expression, requirement and view structure ----
 
 /// States and transitions: the sub-actions by membership kind; the
 /// transition's trigger, guard, effect, succession, source and target.
@@ -1593,7 +1633,8 @@ fn requirement_case_and_view_structure() {
     assert_eq!(one(&mut r, filter_m, "condition"), Some(conditions[0]));
     let v1 = elem(&mut r, "P::v1");
     let exposed = many(&mut r, v1, "exposedElement");
-    assert!(exposed.contains(&car));
+    // VD's inherited condition applies to v1; car has no Safety metadata.
+    assert!(!exposed.contains(&car));
     let vp = elem(&mut r, "P::VP");
     let sfv = elem(&mut r, "P::VP::sfv");
     assert_eq!(many(&mut r, vp, "framedConcern"), vec![sfv]);
@@ -1883,7 +1924,7 @@ fn chained_references_in_behavior_and_cases() {
     assert_eq!(one(&mut r, vd, "viewRendering"), Some(as_tree));
 }
 
-// ---- M33g: type operations, association types, featuring, evaluability ----
+// ---- type operations, association types, featuring, evaluability ----
 
 /// Unioning, intersecting and differencing types and their relationship
 /// ends; an association's related, source and target types.
@@ -2018,7 +2059,7 @@ fn model_level_evaluability() {
     );
 }
 
-// ---- M33h: the closures and the inheritance-aware switch ----
+// ---- the closures and the inheritance-aware switch ----
 
 /// The four closure names answer through the resolver's walks whatever
 /// the policy; under the closure policy the inheritance-aware families
@@ -2090,8 +2131,7 @@ fn closures_and_the_inheritance_aware_switch() {
     assert!(u_memberships.contains(&imported[0]));
     assert!(refs(&mut r, u, "member").contains(&Reference::Element(own)));
     // The written-heritage tier stays passthrough; the closure with the
-    // implied heritage is the specification's value, except for the three
-    // approximations.
+    // implied heritage still has incomplete semantic dependencies.
     let written = ClosurePolicy::Closure {
         include_implied: false,
     };
@@ -2104,11 +2144,11 @@ fn closures_and_the_inheritance_aware_switch() {
     );
     assert_eq!(
         derives_under("PartDefinition", "feature", full),
-        Derives::Exact
+        Derives::Passthrough
     );
     assert_eq!(
         derives_under("PartDefinition", "inheritedMembership", full),
-        Derives::Exact
+        Derives::Passthrough
     );
     assert_eq!(
         derives_under("OperatorExpression", "isModelLevelEvaluable", full),
@@ -2123,10 +2163,10 @@ fn closures_and_the_inheritance_aware_switch() {
     assert_eq!(many(&mut r, w, "feature"), vec![extra]);
 }
 
-/// A heritage deeper than the resolver's budget is reported, never
-/// presented as a complete closure.
+/// Iterative inheritance has no depth cap; bounded import traversal
+/// still reports a cut rather than presenting it as a complete closure.
 #[test]
-fn a_deep_heritage_reports_truncation() {
+fn deep_heritage_completes_while_deep_imports_report_truncation() {
     use sysmlv2_parser::json::ClosurePolicy;
     let mut src = String::from("package P { part def D0 { attribute a0; }");
     for i in 1..=26 {
@@ -2141,11 +2181,12 @@ fn a_deep_heritage_reports_truncation() {
     r.set_closure_policy(ClosurePolicy::Closure {
         include_implied: false,
     });
-    assert!(r.closure_truncated(deep));
+    assert!(!r.closure_truncated(deep));
+    assert_eq!(many(&mut r, deep, "feature").len(), 27);
     let shallow = elem(&mut r, "P::D3");
     assert!(!r.closure_truncated(shallow));
     assert_eq!(many(&mut r, shallow, "feature").len(), 4);
-    // The import walk has the same budget.
+    // The import walk retains its bounded traversal.
     let mut src = String::from("package P { package I0 { part x; }");
     for i in 1..=26 {
         src.push_str(&format!(" package I{i} {{ public import I{}::*; }}", i - 1));
@@ -2296,4 +2337,231 @@ fn computable_names_are_the_computed_names_the_gate_admits() {
     }
     // A metaclass outside the catalog has no computable names.
     assert!(r.computable_names("NoSuchMetaclass").is_empty());
+}
+
+#[test]
+fn implied_specializations_follow_reachability_and_preserve_existing_ids() {
+    let mut model = Model::new();
+    for (file, source) in [
+        (
+            "parts.kerml",
+            "standard library package Parts { class Part; feature parts : Part; }",
+        ),
+        (
+            "items.kerml",
+            "standard library package Items { class Item; feature items : Item; }",
+        ),
+    ] {
+        let unit = model.add_library_source(file, source);
+        assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    }
+    let unit = model.add_source(
+        "model.sysml",
+        "package P {
+        item def Other;
+        part def Broken :> Other;
+        part def Good :> Base;
+        part def Base;
+        part def CycleA :> CycleB;
+        part def CycleB :> CycleA;
+        variation part def Choice { variant part bySub : Sub; }
+        part def Sub :> Choice;
+        variation part a { variant part b :> middle; }
+        part middle :> a;
+        item unrelated;
+        variation part def Choice2 { variant part pick :> unrelated; }
+    }",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    let part = elem(&mut r, "Parts::Part");
+    let broken = elem(&mut r, "P::Broken");
+    let good = elem(&mut r, "P::Good");
+    let cycle_a = elem(&mut r, "P::CycleA");
+    let cycle_b = elem(&mut r, "P::CycleB");
+    let by_sub = elem(&mut r, "P::Choice::bySub");
+    let choice = elem(&mut r, "P::Choice");
+    let b = elem(&mut r, "P::a::b");
+    let a = elem(&mut r, "P::a");
+    let pick = elem(&mut r, "P::Choice2::pick");
+    let choice2 = elem(&mut r, "P::Choice2");
+    let original_owned = r.owned_relationships(pick);
+    let original_elements: Vec<_> = r.user_elements().collect();
+
+    assert!(
+        !r.conforms(broken, part),
+        "the existing limited query remains compatible"
+    );
+    assert!(r.conforms_with_implied(broken, part));
+    let broken_edges = r.implied_relationships(broken);
+    assert_eq!(
+        broken_edges.len(),
+        1,
+        "an unrelated subclassification does not cover Parts::Part"
+    );
+    assert_eq!(
+        r.relationship_ends(broken_edges[0]).1,
+        vec![Reference::Element(part)]
+    );
+    assert!(
+        r.implied_relationships(good).is_empty(),
+        "an explicit path through Base already reaches its required library base"
+    );
+    assert!(r.conforms_with_implied(good, part));
+    assert!(r.conforms_with_implied(cycle_a, part));
+    assert!(r.conforms_with_implied(cycle_b, part));
+    assert_eq!(
+        r.implied_relationships(cycle_a).len() + r.implied_relationships(cycle_b).len(),
+        1,
+        "an explicit cycle retains one required library anchor"
+    );
+    assert!(r.conforms_with_implied(by_sub, choice));
+    for edge in r.implied_relationships(by_sub) {
+        assert_ne!(
+            r.element_type(edge),
+            "FeatureTyping",
+            "indirect typing already specializes the variation"
+        );
+    }
+    assert!(r.conforms_with_implied(b, a));
+    for edge in r.implied_relationships(b) {
+        assert_ne!(
+            r.relationship_ends(edge).1,
+            vec![Reference::Element(a)],
+            "indirect subsetting already specializes the variation"
+        );
+    }
+    let pick_edges = r.implied_relationships(pick);
+    assert_eq!(
+        pick_edges.len(),
+        2,
+        "new required base coexists with existing variant typing"
+    );
+    let typing = pick_edges
+        .into_iter()
+        .find(|&e| r.element_type(e) == "FeatureTyping")
+        .unwrap();
+    assert_eq!(
+        r.relationship_ends(typing).1,
+        vec![Reference::Element(choice2)]
+    );
+    let old_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("{}/implied0", r.element_id(pick)).as_bytes(),
+    );
+    assert_eq!(
+        r.element_id(typing),
+        old_id,
+        "inserting a newly required base must not renumber the existing typing"
+    );
+    assert_eq!(r.owned_relationships(pick), original_owned);
+    assert_eq!(r.user_elements().collect::<Vec<_>>(), original_elements);
+    let old_part_id = r.element_id(part);
+    let new_part_id = uuid::Uuid::new_v4();
+    r.override_ids(&std::collections::HashMap::from([
+        (old_part_id, new_part_id),
+        (r.element_id(broken), uuid::Uuid::new_v4()),
+    ]));
+    assert!(r.conforms_with_implied(broken, part));
+    assert_eq!(r.element_by_id(&new_part_id.to_string()), Some(part));
+    assert_eq!(r.element_by_id(&old_part_id.to_string()), None);
+}
+
+#[test]
+fn implied_reachability_is_independent_of_declaration_order() {
+    for reverse in [false, true] {
+        let mut declarations = vec!["part def T0;".to_string()];
+        for i in 1..256 {
+            declarations.push(format!("part def T{i} :> T{};", i - 1));
+        }
+        declarations.extend(["part def A :> B;".into(), "part def B :> A;".into()]);
+        if reverse {
+            declarations.reverse();
+        }
+        let mut model = Model::new();
+        model.add_library_source(
+            "parts.kerml",
+            "standard library package Parts { class Part; }",
+        );
+        let unit = model.add_source(
+            "chain.sysml",
+            &format!("package P {{ {} }}", declarations.join("\n")),
+        );
+        assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+        let mut r = ResolvedModel::build(&model);
+        let part = elem(&mut r, "Parts::Part");
+        for name in ["T0", "T255", "A", "B"] {
+            let e = elem(&mut r, &format!("P::{name}"));
+            assert!(
+                r.conforms_with_implied(e, part),
+                "{name}, reverse={reverse}"
+            );
+        }
+        let mut count = 0;
+        for i in 0..256 {
+            let e = elem(&mut r, &format!("P::T{i}"));
+            count += r.implied_relationships(e).len();
+        }
+        assert_eq!(count, 1, "one library anchor suffices for the chain");
+    }
+}
+
+#[test]
+fn multiple_required_library_bases_are_covered_individually() {
+    let mut model = Model::new();
+    model.add_library_source(
+        "actions.kerml",
+        "standard library package Actions { feature transitionActions; }",
+    );
+    model.add_library_source(
+        "states.kerml",
+        "standard library package States { feature stateTransitions; }",
+    );
+    let unit = model.add_source(
+        "transition.sysml",
+        "package P { state a; state b; transition t first a then b; }",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let relation = model.add_source(
+        "relation.kerml",
+        "subset P::t subsets Actions::transitionActions;",
+    );
+    assert!(
+        relation.diagnostics.is_empty(),
+        "{:?}",
+        relation.diagnostics
+    );
+    let mut r = ResolvedModel::build(&model);
+    let t = elem(&mut r, "P::t");
+    let actions = elem(&mut r, "Actions::transitionActions");
+    let states = elem(&mut r, "States::stateTransitions");
+    let edges = r.implied_relationships(t);
+    assert_eq!(
+        edges.len(),
+        1,
+        "the written action base does not cover the state base"
+    );
+    assert_eq!(
+        r.relationship_ends(edges[0]).1,
+        vec![Reference::Element(states)]
+    );
+    assert!(r.conforms_with_implied(t, actions));
+    assert!(r.conforms_with_implied(t, states));
+}
+
+#[test]
+fn implied_reachability_refreshes_after_binding_uuid_references() {
+    let target_id = uuid::Uuid::new_v4();
+    let mut r = build(&format!(
+        "package P {{ part def Target; part def Source :> '{target_id}'; }}"
+    ));
+    let source = elem(&mut r, "P::Source");
+    let target = elem(&mut r, "P::Target");
+    r.override_ids(&std::collections::HashMap::from([(
+        r.element_id(target),
+        target_id,
+    )]));
+    assert!(!r.conforms_with_implied(source, target));
+    assert!(r.bind_id_spelled_references().contains(&target_id));
+    assert!(r.conforms_with_implied(source, target));
 }

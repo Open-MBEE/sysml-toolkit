@@ -6,12 +6,14 @@ mod actions;
 mod chains;
 mod connectors;
 mod dimensions;
+mod directions;
 mod distinguishability;
 mod endpoints;
 mod expressions;
 pub(crate) mod facts;
 mod invocations;
 mod multiplicities;
+mod multiplicity_domains;
 mod relationships;
 mod scalars;
 mod specialization;
@@ -319,17 +321,6 @@ fn normative_rule(rule: &'static str) -> &'static str {
     }
 }
 
-/// The number an evaluated value is, as `f64` — the reading the bound
-/// checks share. `None` for anything that is not a scalar number.
-pub(crate) fn scalar_f64(v: &crate::eval::Value) -> Option<f64> {
-    match v {
-        crate::eval::Value::Integer(i) => Some(*i as f64),
-        crate::eval::Value::Rational(r) => Some(r.to_f64()),
-        crate::eval::Value::Real(f) => Some(*f),
-        _ => None,
-    }
-}
-
 /// [`user_rows`] over a table keyed by owning element.
 pub(crate) fn user_entries<'a, V: Clone + 'a>(
     b: &crate::json::Builder,
@@ -349,6 +340,19 @@ pub(crate) fn user_entries<'a, V: Clone + 'a>(
 /// - **Multiplicity sanity** (errors): bounds that *provably* evaluate to a
 ///   negative number or to `lower > upper`. Bounds that reference unbound
 ///   features or fail to evaluate are left undecided (no diagnostic).
+/// - **Explicit multiplicity containment** (warnings): supported header, body
+///   and named domains are compared exactly in the specializing receiver.
+///   Redefinition checks both ends; subsetting checks only the upper end.
+///   Both features must have a unique explicit local domain. Incomplete,
+///   cyclic, invalid or unevaluable domains cannot establish containment; a
+///   bound referring to a member inside the constrained feature may be unsupported.
+/// - **Contextual multiplicity validity** (errors): an explicit subsetting or
+///   redefinition can make an authored valid range invalid in its receiver.
+///   Each side is checked independently, even if the other has no local domain.
+///   A finding requires a complete supported domain and a provably valid lexical
+///   baseline; unknown baselines stay undecided. Shared named ranges are reported
+///   once per specialization. Reporting is bounded to the first invalid range
+///   on each side, so it is not an exhaustive validation of inherited ranges.
 /// - **Self / circular subclassification** (errors): a definition that
 ///   (transitively) specializes itself. Feature subsetting/redefinition is
 ///   exempt — resolving a feature's own name to an inherited feature is the
@@ -391,6 +395,7 @@ pub fn validate_semantics_with(
     let facts = facts::Facts::new(&mut r.b);
     out.extend(connectors::validate(r, model, &facts));
     out.extend(structural::validate(r, model, &facts));
+    out.extend(structural::validate_directions(r, model, &facts));
     out.extend(endpoints::validate(r, model, &facts));
     out.extend(values::validate(r, model, &facts));
     out.extend(relationships::validate(r, model, &facts));
@@ -421,8 +426,7 @@ fn collect_feature_refs<'a>(
         | ExprKind::Null
         | ExprKind::Extent { .. }
         | ExprKind::MetadataAccess { .. }
-        | ExprKind::Body { .. }
-        | ExprKind::BodyTerminator => {}
+        | ExprKind::Body { .. } => {}
         ExprKind::Conditional {
             cond,
             then_branch,
@@ -729,5 +733,48 @@ mod tests {
         warm.add_source("user.kerml", USER);
         assert!(ResolvedModel::build(&warm).b.library_facts.is_some());
         assert_eq!(findings(&warm), cold_findings);
+    }
+
+    /// Reporting spans cost at most one ownership step per element,
+    /// however deep the ownership nests. Measured in steps rather than in
+    /// wall-clock time: the count is the work the walk does, and does not
+    /// depend on the machine.
+    ///
+    /// An operator chain lowers four ownership levels per operator, so the
+    /// longest chain the parser admits nests its first operand over four
+    /// thousand levels deep. Walking up from each element separately took
+    /// over seventy million steps over its seventeen thousand elements.
+    #[test]
+    fn span_resolution_is_linear_in_the_ownership_depth() {
+        // Lowering the chain recurses once per operator, so the probe runs
+        // on a thread with room for it; the count is kept per thread, so
+        // the checks run there too.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let terms = sysmlv2_syntax::parser::MAX_EXPR_OPERATORS as usize;
+                let chain = (0..terms)
+                    .map(|i| format!("a{i} > 0"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                let mut model = Model::new();
+                model.add_source(
+                    "chain.sysml",
+                    &format!("package P {{ part x {{ attribute v = {chain}; }} }}"),
+                );
+                assert!(!model.has_errors());
+                let mut r = ResolvedModel::build(&model);
+                let elements = r.b.explicit_len();
+                let before = super::facts::span_steps();
+                super::validate_semantics_with(&mut r, &model);
+                let steps = super::facts::span_steps() - before;
+                assert!(
+                    steps <= elements,
+                    "{steps} ownership steps resolving spans over {elements} elements"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

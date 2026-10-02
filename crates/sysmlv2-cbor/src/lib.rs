@@ -28,9 +28,10 @@ pub mod index;
 pub mod resolver;
 
 pub use canonical::{canonicalize_compact, graph_normalize, graph_normalize_compact};
+pub use decode::{DecodedCompactGraph, from_cbor_with_format};
 pub use decode::{
-    from_cbor, from_cbor_with, from_cbor_with_units, from_compact_cbor, from_compact_cbor_elided,
-    from_compact_cbor_units, from_full_cbor,
+    assert_graph_format, from_cbor, from_cbor_with, from_cbor_with_units, from_compact_cbor,
+    from_compact_cbor_elided, from_compact_cbor_units, from_full_cbor, graph_format,
 };
 pub use delta::{
     ApplyReport, Claim, DeltaOptions, FLAG_DELTA, FLAG_DELTA_PORTABLE, apply_delta_cbor,
@@ -41,9 +42,10 @@ pub use delta::{
 pub use describe::describe;
 pub use encode::{
     FLAG_ELIDE_IDS, FLAG_EXPLICIT_IDS, FLAG_FULL_FORM, FLAG_IMPLIED_OWNERS, FLAG_UNIT_PATHS,
-    to_compact_cbor, to_compact_cbor_elided, to_compact_cbor_elided_with_units,
-    to_compact_cbor_with_units, to_compact_cbor_with_units_explicit, to_full_cbor,
-    to_full_cbor_with_units,
+    to_compact_cbor, to_compact_cbor_elided, to_compact_cbor_elided_with_format,
+    to_compact_cbor_elided_with_units, to_compact_cbor_explicit_with_format,
+    to_compact_cbor_with_format, to_compact_cbor_with_units, to_compact_cbor_with_units_explicit,
+    to_full_cbor, to_full_cbor_with_format, to_full_cbor_with_units,
 };
 pub use sysmlv2_model::cbor_tables as tables;
 
@@ -72,7 +74,10 @@ pub const LAYOUT_VERSION: u8 = 1;
 /// of `IDS.md`). Consulted only where derivation is actually in play
 /// — id-elided payloads, snapshot or delta — so a scheme change never
 /// blocks decoding payloads that carry their ids explicitly.
-pub const ID_SCHEME_VERSION: u8 = 1;
+pub const ID_SCHEME_VERSION: u8 = 2;
+/// Opt-in authored conditional graph contract. The graph derivation algorithm is
+/// shared with scheme 2; wrappers change its input graph and therefore identities.
+pub const CANONICAL_GRAPH_VERSION: u8 = 3;
 
 pub(crate) fn strip_magic(bytes: &[u8]) -> Result<&[u8], Error> {
     match bytes.strip_prefix(MAGIC) {

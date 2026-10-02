@@ -10,6 +10,10 @@
 //!   exactly this sequence, so consumers must add units in array order
 //!   (the binding's `parse_sources` does).
 //! - `sysml-library.libcache.gz` — `LibraryCache::to_bytes`, gzip.
+//! - `sysml-library.prepared.gz` — `PreparedLibrary::to_bytes`, gzip: the
+//!   library resolved and frozen, keyed by the bundle's content, for the
+//!   binding's `PreparedLibrary.fromSnapshot(prepared, bundle, libcache)`,
+//!   which decodes it instead of resolving at boot.
 //! - `manifest.json` — toolkit version, unit count, raw/compressed sizes.
 //!
 //! Browsers decompress with `DecompressionStream("gzip")`, node with
@@ -125,6 +129,25 @@ fn main() {
         .expect("recording armed before the build")
         .to_bytes();
 
+    // The prepared snapshot: the same library prepared over the recording
+    // just made, as the binding's `PreparedLibrary.new(bundle, libcache)`
+    // prepares it, then encoded under the bundle's content key.
+    let prepared = {
+        let mut model = Model::new();
+        for (name, src) in &units {
+            model.add_library_source(name.clone(), src);
+        }
+        let cache = sysmlv2_model::libcache::LibraryCache::from_bytes(&snapshot)
+            .expect("the recording just made decodes");
+        model.set_library_cache(cache);
+        let library = model.prepare_library().expect("the library prepares");
+        let key = sysmlv2_model::libcache::hash_units(
+            units
+                .iter()
+                .map(|(name, text)| (name.as_str(), text.as_str())),
+        );
+        library.to_bytes(key).expect("the prepared library encodes")
+    };
     let bundle = serde_json::to_string(
         &units
             .iter()
@@ -143,6 +166,7 @@ fn main() {
     };
     let bundle_gz = write("sysml-library.json.gz", &gzip(bundle.as_bytes()));
     let snapshot_gz = write("sysml-library.libcache.gz", &gzip(&snapshot));
+    let prepared_gz = write("sysml-library.prepared.gz", &gzip(&prepared));
     let manifest = serde_json::json!({
         "toolkitVersion": env!("CARGO_PKG_VERSION"),
         "units": units.len(),
@@ -157,18 +181,25 @@ fn main() {
             "rawBytes": snapshot.len(),
             "gzipBytes": snapshot_gz,
         },
+        "prepared": {
+            "file": "sysml-library.prepared.gz",
+            "rawBytes": prepared.len(),
+            "gzipBytes": prepared_gz,
+        },
     });
     write(
         "manifest.json",
         serde_json::to_string_pretty(&manifest).unwrap().as_bytes(),
     );
     println!(
-        "{} units; bundle {} -> {} gz; snapshot {} -> {} gz; {} library-internal unresolved",
+        "{} units; bundle {} -> {} gz; snapshot {} -> {} gz; prepared {} -> {} gz; {} library-internal unresolved",
         units.len(),
         bundle.len(),
         bundle_gz,
         snapshot.len(),
         snapshot_gz,
+        prepared.len(),
+        prepared_gz,
         unresolved,
     );
 }

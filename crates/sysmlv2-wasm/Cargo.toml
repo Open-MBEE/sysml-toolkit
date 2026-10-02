@@ -29,3 +29,7 @@ sysmlv2-lint.workspace = true
 wasm-bindgen = "0.2"
 # gen-stdlib-bundle only (native tool; gzip emission).
 miniz_oxide.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# the streaming snapshot constructor reads a host-held buffer
+js-sys = "0.3"

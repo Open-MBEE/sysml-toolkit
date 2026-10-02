@@ -21,13 +21,21 @@ pub(super) fn validate(
             continue;
         }
         let span = g.span(&r.b, e);
-        if let Some((_, value)) = r.b.values.get(&e) {
-            if g.redefined(&r.b, e)
-                .iter()
-                .any(|t| r.b.values.contains_key(t) && !r.b.default_values.contains(t))
+        if let Some(value_span) = r.b.values.get(&e).map(|(_, value)| value.span) {
+            if let Some(target) = g
+                .redefined(&r.b, e)
+                .into_iter()
+                .find(|t| r.b.values.contains_key(t) && !r.b.default_values.contains(t))
             {
-                out.push((unit, super::rule_error(value.span, "validateFeatureValueOverriding",
-                    "Cannot override an inherited binding value; the redefined value must be default")));
+                let name = r
+                    .element_qualified_name(ElementRef(target))
+                    .unwrap_or_else(|| format!("@{}", r.element_id(ElementRef(target))));
+                let target_unit = r.b.unit_of_elem(target);
+                let binding_span = r.b.values.get(&target).unwrap().1.span;
+                let source = &model.units()[target_unit];
+                let position = source.lines.line_col(binding_span.start);
+                out.push((unit, super::rule_error(value_span, "validateFeatureValueOverriding",
+                    format!("Cannot override the non-default value of `{name}`, bound at {}:{}:{}; the inherited value must be default to allow a new value", source.name, position.line, position.col))));
             }
         }
         if is(&r.b, e, "EnumerationUsage") {
@@ -99,8 +107,10 @@ pub(super) fn validate(
                         "A metadata body feature must redefine one feature of its metadata type")));
                 }
                 if let Some((scope, expr)) = r.b.values.get(&m).cloned() {
-                    if super::expressions::model_level(&mut r.b, g, scope, &expr, 0) == Some(false)
-                    {
+                    let origin = r.b.set_identity_origin(m);
+                    let evaluable = super::expressions::model_level(&mut r.b, g, scope, &expr, 0);
+                    r.b.identity_origin_unit = origin;
+                    if evaluable == Some(false) {
                         out.push((
                             unit,
                             super::rule_error(
@@ -117,7 +127,9 @@ pub(super) fn validate(
     for (e, scope, mult) in super::user_rows(&r.b, model, r.b.multiplicities.iter(), |row| row.0) {
         let unit = r.b.unit_of_elem(e);
         for expr in mult.lower.iter().chain(std::iter::once(&mult.upper)) {
+            let origin = r.b.set_identity_origin(e);
             let ts = super::expressions::types(&mut r.b, g, scope, expr, 0);
+            r.b.identity_origin_unit = origin;
             if !ts.is_empty() && ts.iter().all(|&t| !is(&r.b, t, "DataType")) {
                 out.push((
                     unit,
@@ -130,41 +142,46 @@ pub(super) fn validate(
             }
         }
     }
-    for (annotated, metas) in super::user_entries(&r.b, model, r.b.metadata_of.iter()) {
-        let unit = r.b.unit_of_elem(annotated);
-        for meta in metas {
-            let candidates: Vec<_> = g
-                .effective_members(&r.b, meta)
-                .into_iter()
-                .filter(|&member| {
-                    g.closure(member)
-                        .iter()
-                        .any(|&f| g.named(&r.b, f, "Metaobjects::Metaobject::annotatedElement"))
-                })
-                .collect();
-            // Separate subsetting features specify alternative permitted
-            // metaclasses; a single feature's multiple types are conjunctive.
-            let specific: Vec<_> = candidates
-                .iter()
-                .copied()
-                .filter(|t| {
-                    !candidates
-                        .iter()
-                        .any(|other| other != t && g.closure(*other).contains(t))
-                })
-                .collect();
-            if let Some(reflection) = r.b.reflection_metaclass(r.b.elements[annotated].ty) {
-                let actual = g.context(reflection);
-                let allowed: Vec<_> = specific.iter().map(|&m| g.typed(&r.b, m)).collect();
-                if !allowed.is_empty()
-                    && allowed.iter().all(|ts| !ts.is_empty())
-                    && !allowed
-                        .iter()
-                        .any(|ts| ts.iter().all(|t| actual.contains(t)))
-                {
-                    out.push((unit, super::rule_error(g.span(&r.b, meta), "validateMetadataFeatureAnnotatedElement",
+    let associations: Vec<_> = r
+        .b
+        .metadata_of
+        .iter()
+        .flat_map(|(&annotated, metas)| metas.iter().copied().map(move |meta| (annotated, meta)))
+        .filter(|&(_, meta)| !model.is_library_unit(r.b.unit_of_elem(meta)))
+        .collect();
+    for (annotated, meta) in associations {
+        let unit = r.b.unit_of_elem(meta);
+        let candidates: Vec<_> = g
+            .effective_members(&r.b, meta)
+            .into_iter()
+            .filter(|&member| {
+                g.closure(member)
+                    .iter()
+                    .any(|&f| g.named(&r.b, f, "Metaobjects::Metaobject::annotatedElement"))
+            })
+            .collect();
+        // Separate subsetting features specify alternative permitted
+        // metaclasses; a single feature's multiple types are conjunctive.
+        let specific: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|t| {
+                !candidates
+                    .iter()
+                    .any(|other| other != t && g.closure(*other).contains(t))
+            })
+            .collect();
+        if let Some(reflection) = r.b.reflection_metaclass(r.b.elements[annotated].ty) {
+            let actual = g.context(reflection);
+            let allowed: Vec<_> = specific.iter().map(|&m| g.typed(&r.b, m)).collect();
+            if !allowed.is_empty()
+                && allowed.iter().all(|ts| !ts.is_empty())
+                && !allowed
+                    .iter()
+                    .any(|ts| ts.iter().all(|t| actual.contains(t)))
+            {
+                out.push((unit, super::rule_error(g.span(&r.b, meta), "validateMetadataFeatureAnnotatedElement",
                         "The annotated element's metaclass does not conform to annotatedElement's type")));
-                }
             }
         }
     }

@@ -399,7 +399,7 @@ pub fn walk_target_ref<'a, V: Visit<'a> + ?Sized>(v: &mut V, n: &'a TargetRef) {
 
 pub fn walk_expr<'a, V: Visit<'a> + ?Sized>(v: &mut V, n: &'a Expr) {
     match &n.kind {
-        ExprKind::Literal(_) | ExprKind::Null | ExprKind::BodyTerminator => {}
+        ExprKind::Literal(_) | ExprKind::Null => {}
         ExprKind::Ref(qn) | ExprKind::MetadataAccess { target: qn } => v.visit_qualified_name(qn),
         ExprKind::Conditional {
             cond,

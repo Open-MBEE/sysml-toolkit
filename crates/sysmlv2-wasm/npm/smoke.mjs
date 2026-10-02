@@ -116,6 +116,73 @@ const real = s2.resolve("ScalarValues::Real");
 assert.ok(real, "stdlib element resolves");
 assert.ok(s2.isLibraryElement(real));
 
+// A session started from the outcomes the previous build settled on answers
+// as a cold one — over the same units and after an edit — and the outcomes
+// outlive the session that produced them, so the host frees it first.
+const settledLibrary = new PreparedLibrary(bundle, snapshot);
+const workspace = (carName) => JSON.stringify([
+  {
+    name: "defs.sysml",
+    text: `package VehicleDefs {
+      private import ISQ::*;
+      part def Vehicle { attribute mass : MassValue; part engine : Engine; }
+      part def Engine { attribute power : PowerValue; port fuelIn : FuelPort; }
+      port def FuelPort { in item fuel : Fuel; }
+      item def Fuel;
+      calc def KineticEnergy { in m : MassValue; in v : SpeedValue; return : EnergyValue = 0.5 * m * v ** 2; }
+    }`,
+  },
+  {
+    name: "usage.sysml",
+    text: `package VehicleUsage {
+      private import VehicleDefs::*;
+      private import ISQ::*;
+      private import SI::*;
+      part ${carName} : Vehicle {
+        attribute :>> mass = 1500 [kg];
+        part :>> engine { attribute :>> power = 150000 [W]; }
+      }
+      part tank { port fuelOut : ~FuelPort; }
+      connect tank.fuelOut to ${carName}.engine.fuelIn;
+      attribute ke : EnergyValue = KineticEnergy(${carName}.mass, 30 [m/s]);
+    }`,
+  },
+  {
+    name: "views.sysml",
+    text: `package VehicleViews {
+      private import VehicleUsage::*;
+      private import Views::*;
+      view def PartTree;
+      view carTree : PartTree { expose car::**; render asTreeDiagram; }
+    }`,
+  },
+]);
+const answerOf = (session) => session.toFullJson(true) + "\n" + session.check() + "\n" + session.unresolvedCount();
+const previous = Session.fromSourcesWithPreparedLibrary(workspace("car"), settledLibrary);
+const previousAnswer = answerOf(previous);
+const settled = previous.settledOutcomes();
+assert.ok(settled, "a build on the prepared library keeps the outcomes it settled on");
+assert.equal(settled.unitCount(), 3);
+previous.free();
+const t3 = performance.now();
+const sameSeeded = Session.fromSourcesSettled(workspace("car"), settledLibrary, settled);
+const sameSeededMs = performance.now() - t3;
+assert.equal(answerOf(sameSeeded), previousAnswer, "the same units again");
+sameSeeded.free();
+const t4 = performance.now();
+const editedCold = Session.fromSourcesWithPreparedLibrary(workspace("truck"), settledLibrary);
+const editedColdMs = performance.now() - t4;
+const t5 = performance.now();
+const editedSeeded = Session.fromSourcesSettled(workspace("truck"), settledLibrary, settled);
+const editedSeededMs = performance.now() - t5;
+assert.equal(answerOf(editedSeeded), answerOf(editedCold), "after a rename that unresolves another unit's references");
+assert.ok(JSON.parse(editedSeeded.check()).length > 0, "the rename leaves findings");
+settled.free();
+editedCold.free();
+editedSeeded.free();
+settledLibrary.free();
+console.log(`settled start: same units ${sameSeededMs.toFixed(1)} ms; after an edit cold ${editedColdMs.toFixed(1)} ms, seeded ${editedSeededMs.toFixed(1)} ms`);
+
 // Shared graph preparation preserves results, including after the host releases
 // its handle. Each session keeps its own reference and resolver state.
 const prepared = new PreparedLibrary(bundle, snapshot);
@@ -128,6 +195,34 @@ const liftedShared = Session.fromInterchangeJsonWithPreparedLibrary(shared.toCom
 assert.deepEqual(JSON.parse(liftedShared.check()), []);
 liftedShared.free();
 prepared.free();
+
+// The prepared snapshot decodes for the package's own bundle, equals the
+// source-prepared graph, and is refused for any other bundle.
+const preparedBytes = new Uint8Array(gunzipSync(readFileSync(join(stdlibDir, "sysml-library.prepared.gz"))));
+const tDecoded = performance.now();
+const decoded = PreparedLibrary.fromSnapshot(preparedBytes, bundle, snapshot);
+console.log(`stdlib prepared snapshot: decoded in ${(performance.now() - tDecoded).toFixed(0)} ms`);
+const overDecoded = Session.fromSourcesWithPreparedLibrary(user, decoded);
+assert.equal(overDecoded.toCompactJson(), shared.toCompactJson());
+assert.equal(overDecoded.check(), shared.check());
+overDecoded.free();
+decoded.free();
+// ... and streamed from the host's buffer, one window at a time.
+const tStreamed = performance.now();
+const streamed = PreparedLibrary.fromSnapshotStream(preparedBytes, bundle, snapshot);
+console.log(`stdlib prepared snapshot: streamed in ${(performance.now() - tStreamed).toFixed(0)} ms`);
+const overStreamed = Session.fromSourcesWithPreparedLibrary(user, streamed);
+assert.equal(overStreamed.toCompactJson(), shared.toCompactJson());
+overStreamed.free();
+streamed.free();
+const flipped = new Uint8Array(preparedBytes);
+flipped[flipped.length - 1] ^= 0xff;
+assert.throws(() => PreparedLibrary.fromSnapshotStream(flipped, bundle, snapshot), "a corrupt snapshot is refused after the decode");
+assert.throws(
+  () => PreparedLibrary.fromSnapshot(preparedBytes, JSON.stringify([...JSON.parse(bundle), { name: "x.sysml", text: "package X;" }]), snapshot),
+  /another toolkit build or from other library units/,
+  "a snapshot of other units is refused"
+);
 shared.edit(JSON.stringify([{ op: "rename", target: "Demo::car", newName: "vehicle" }]));
 const edited = shared.resolve("Demo::vehicle");
 assert.ok(edited);

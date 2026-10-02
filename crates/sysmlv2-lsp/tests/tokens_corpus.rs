@@ -2,7 +2,8 @@
 //!
 //! 1. The keyword vocabulary is *generated* from the vendored normative
 //!    grammars — this test regenerates it and compares, so grammar bumps
-//!    cannot silently drift the highlighting.
+//!    cannot silently drift the highlighting — and each dialect's share
+//!    of it is its own grammar's words, which completion offers.
 //! 2. The corpus sweep is the completeness oracle: in a clean-parsing
 //!    file every `Ident` token is either a recorded name or a keyword,
 //!    so an unclassified `Ident` means a vocabulary gap or a name span
@@ -12,13 +13,14 @@
 use std::collections::BTreeSet;
 use sysmlv2_lsp::tokens;
 use sysmlv2_lsp::{Encoding, Mapper};
+use sysmlv2_parser::ast::Dialect;
 use sysmlv2_parser::parser::{parse_kerml_source, parse_source};
 
-#[test]
-fn vocabulary_matches_the_grammars() {
+/// The word-shaped terminals of the named vendored grammars.
+fn grammar_words(grammars: &[&str]) -> BTreeSet<String> {
     let specs = sysmlv2_testkit::workspace_root().join("spec-refs");
     let mut words = BTreeSet::new();
-    for grammar in ["KerML.xtext", "SysML.xtext", "KerMLExpressions.xtext"] {
+    for grammar in grammars {
         let text = std::fs::read_to_string(specs.join(grammar))
             .unwrap_or_else(|e| panic!("{grammar}: {e} (vendored grammar missing?)"));
         let bytes = text.as_bytes();
@@ -40,12 +42,45 @@ fn vocabulary_matches_the_grammars() {
             i += 1;
         }
     }
+    words
+}
+
+#[test]
+fn vocabulary_matches_the_grammars() {
+    let words = grammar_words(&["KerML.xtext", "SysML.xtext", "KerMLExpressions.xtext"]);
     let generated: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
     assert_eq!(
         tokens::VOCABULARY,
         generated.as_slice(),
         "vocabulary drifted from the grammars — regenerate the VOCABULARY table"
     );
+}
+
+/// Each dialect's keywords are its own grammar's words and the shared
+/// expression grammar's — no more: completion offers a `.sysml` file
+/// no KerML-only word and a `.kerml` file no SysML-only one.
+#[test]
+fn keywords_split_by_grammar() {
+    for (dialect, grammar) in [
+        (Dialect::Sysml, "SysML.xtext"),
+        (Dialect::Kerml, "KerML.xtext"),
+    ] {
+        let words = grammar_words(&[grammar, "KerMLExpressions.xtext"]);
+        let generated: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        let split: Vec<&str> = tokens::keywords(dialect).collect();
+        assert_eq!(
+            split, generated,
+            "{dialect:?} keywords drifted from {grammar}"
+        );
+    }
+    let sysml: Vec<&str> = tokens::keywords(Dialect::Sysml).collect();
+    let kerml: Vec<&str> = tokens::keywords(Dialect::Kerml).collect();
+    for word in ["const", "datatype", "featuring"] {
+        assert!(!sysml.contains(&word) && kerml.contains(&word), "{word}");
+    }
+    for word in ["part", "parallel", "calc"] {
+        assert!(sysml.contains(&word) && !kerml.contains(&word), "{word}");
+    }
 }
 
 #[test]

@@ -8,7 +8,7 @@
 //! Derivation: `id(child) = uuid5(id(parent), segment)` — the
 //! *parent's payload id* is the namespace, so one divergent parent
 //! never cascades into its subtree. Segments per IDS.md (id
-//! scheme 1): a single-member membership with a named member chains
+//! scheme 2): a single-member membership with a named member chains
 //! **past the membership** — the member takes `"::" + escaped
 //! id-name` directly under its owner and the membership takes `"m"`
 //! under the member; alias memberships take `"::" + escapedName`;
@@ -70,6 +70,13 @@ impl From<IdError> for String {
     fn from(error: IdError) -> String {
         error.to_string()
     }
+}
+
+/// Preserve the unresolved spelling convention used by structural identity
+/// paths. Recovery annotations must use the same suffix, including quotes;
+/// decoding a name here would change existing identities.
+pub(crate) fn reference_path_name(spelling: &str) -> &str {
+    spelling.rsplit("::").next().unwrap_or(spelling)
 }
 
 /// Per element of `compact` (payload order): the graph-derived id, or
@@ -227,7 +234,24 @@ fn walk(
     };
     let mut names: Vec<Option<String>> = (0..n).map(declared).collect();
     let effective = |i: usize, names: &[Option<String>]| -> Option<String> {
+        let membership = obj(i)
+            .get("owningRelationship")
+            .and_then(|v| v.get("@id"))
+            .and_then(Value::as_str)
+            .and_then(|id| index.get(id))
+            .map(|&r| ty(r));
+        let named_reference = crate::json::naming::reference_names_feature(ty(i), membership)
+            .then(|| {
+                owned_rels[i]
+                    .iter()
+                    .copied()
+                    .find(|&r| ty(r) == "ReferenceSubsetting")
+            })
+            .flatten();
         for &r in &owned_rels[i] {
+            if named_reference.is_some() && Some(r) != named_reference {
+                continue;
+            }
             let key = match ty(r) {
                 "Redefinition" => "redefinedFeature",
                 "ReferenceSubsetting" => "referencedFeature",
@@ -235,11 +259,28 @@ fn walk(
             };
             let target = obj(r).get(key)?;
             if let Some(s) = target.get("@ref").and_then(Value::as_str) {
-                return Some(s.rsplit("::").next().unwrap_or(s).to_string());
+                return Some(reference_path_name(s).to_string());
             }
             let s = target.get("@id").and_then(Value::as_str)?;
             return match index.get(s) {
-                Some(&t) => names[t].clone(),
+                Some(&t) => {
+                    if key == "referencedFeature"
+                        && crate::json::naming::reference_names_feature_target(ty(i), membership)
+                    {
+                        if let Some(&last) = owned_rels[t]
+                            .iter()
+                            .rev()
+                            .find(|&&r| ty(r) == "FeatureChaining")
+                        {
+                            let id = obj(last).get("chainingFeature")?.get("@id")?.as_str()?;
+                            return match index.get(id) {
+                                Some(&t) => names[t].clone(),
+                                None => external_name(id),
+                            };
+                        }
+                    }
+                    names[t].clone()
+                }
                 None => external_name(s),
             };
         }
@@ -305,6 +346,21 @@ fn walk(
         for (i, &rel) in owned_rels[owner].iter().enumerate() {
             let kids = &owned_elems[rel];
             let membership = ty(rel).ends_with("Membership");
+            // This structural role cannot reuse a legacy argument's r1/e0
+            // identity or acquire the instantiated type's effective name.
+            if ty(owner) == "ConstructorExpression"
+                && ty(rel) == "ReturnParameterMembership"
+                && kids.len() == 1
+                && ty(kids[0]) == "Feature"
+            {
+                derived[rel] = Some(Uuid::new_v5(&owner_ns, b"result"));
+                paths.extend(rel, owner, "result");
+                let rel_ns = final_of(rel, &derived)?;
+                derived[kids[0]] = Some(Uuid::new_v5(&rel_ns, b"e0"));
+                paths.extend(kids[0], rel, "e0");
+                stack.extend([rel, kids[0]]);
+                continue;
+            }
             // A single-member membership whose member has an id-name
             // chains **past the membership**: the member
             // takes the owner-scope named segment, and the membership

@@ -7,11 +7,11 @@ use crate::{
     layered::LayeredVec,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(super) enum Names {
-    Owned(HashMap<String, Vec<Binding>>),
+    Owned(crate::layered::IdMap<String, Vec<Binding>>),
     Table {
         rows: Row<Name>,
         bindings: Arc<Vec<Binding>>,
@@ -19,7 +19,7 @@ pub(super) enum Names {
 }
 impl Default for Names {
     fn default() -> Self {
-        Self::Owned(HashMap::new())
+        Self::Owned(crate::layered::IdMap::default())
     }
 }
 #[derive(Clone, Serialize, Deserialize)]

@@ -19,6 +19,8 @@ pub mod libcache;
 pub mod lift;
 pub mod loader;
 mod metaclass;
+pub mod metamodel;
+mod operation_catalog;
 
 /// The canonical (`'static`) spelling of an abstract-syntax metaclass
 /// name, `None` for a name the metamodel does not declare.
@@ -27,12 +29,13 @@ pub fn metaclass_name(name: &str) -> Option<&'static str> {
 }
 #[cfg(test)]
 mod metaclass_tests;
+pub mod migration;
 pub mod model;
 pub mod prepared;
 pub mod quantity;
 pub mod rational;
-pub mod render;
 mod schema_props;
+mod semantic_catalog;
 pub mod structure;
 
 mod semantic_memo;

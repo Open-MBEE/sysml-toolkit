@@ -102,7 +102,12 @@ pub(super) fn types(
                 return ts;
             }
             if let Some((s, value)) = b.values.get(&e).cloned() {
-                return types(b, g, s, &value, depth + 1);
+                // The value's bound identities belong to its declaration,
+                // which may be in a different unit from the referencing bound.
+                let origin = b.set_identity_origin(e);
+                let result = types(b, g, s, &value, depth + 1);
+                b.identity_origin_unit = origin;
+                return result;
             }
         }
         ExprKind::Constructor { ty, .. }
@@ -263,7 +268,10 @@ pub(super) fn model_level(
                 return Some(is(b, o, "Metaclass") || is(b, o, "MetadataFeature"));
             }
             let (s, value) = b.values.get(&e)?.clone();
-            model_level(b, g, s, &value, depth + 1)
+            let origin = b.set_identity_origin(e);
+            let result = model_level(b, g, s, &value, depth + 1);
+            b.identity_origin_unit = origin;
+            result
         }
         ExprKind::Invocation { ty, args } => {
             let t = b.resolve(scope, ty.as_name()?, 0)?;
@@ -323,6 +331,7 @@ pub(super) fn validate(
     let mut out = Vec::new();
     for (owner, scope, expr) in roots {
         let unit = r.b.unit_of_elem(owner);
+        let origin = r.b.set_identity_origin(owner);
         let mut expressions = Expressions(Vec::new());
         expressions.visit_expr(&expr);
         for expr in expressions.0 {
@@ -429,16 +438,18 @@ pub(super) fn validate(
                 _ => {}
             }
         }
+        r.b.identity_origin_unit = origin;
     }
     let filters: Vec<_> =
         r.b.filter_exprs
             .iter()
-            .filter_map(|(scope, expr)| {
-                let unit = r.b.unit_of_elem(r.b.nearest_scope_owner(*scope)?);
-                (!model.is_library_unit(unit)).then(|| (unit, *scope, expr.clone()))
+            .filter_map(|(owner, scope, expr)| {
+                let unit = r.b.unit_of_elem(*owner);
+                (!model.is_library_unit(unit)).then(|| (*owner, unit, *scope, expr.clone()))
             })
             .collect();
-    for (unit, scope, expr) in filters {
+    for (owner, unit, scope, expr) in filters {
+        let origin = r.b.set_identity_origin(owner);
         if wrong_type(&mut r.b, g, scope, &expr, "ScalarValues::Boolean") {
             out.push((
                 unit,
@@ -459,6 +470,101 @@ pub(super) fn validate(
                 ),
             ));
         }
+        r.b.identity_origin_unit = origin;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn expression_and_invocation_checks_restore_active_source_identity() {
+        let mut model = Model::new();
+        model.add_source("first.kerml", "package A;");
+        model.add_source("second.kerml", "package B { function actual { in a; in b default 2; a } class '88888888-8888-4888-8888-888888888888'; feature good = '88888888-8888-4888-8888-888888888888'(1); feature invalid = actual(unknown=1); feature unresolved = missing(1); feature empty = (); class Other; feature not_callable = Other(); filter true; filter ~1; }");
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let actual = r.resolve_qualified("B::actual").unwrap();
+        let id = "88888888-8888-4888-8888-888888888888".parse().unwrap();
+        r.override_ids(&HashMap::from([(r.element_id(actual), id)]));
+        let good = r.resolve_qualified("B::good").unwrap();
+        let expr = r.members_via(good, "FeatureValue")[0];
+        let edge = r
+            .owned_relationships(expr)
+            .into_iter()
+            .find(|e| r.element_type(*e) == "Membership")
+            .unwrap();
+        let mut hints = HashMap::from([((r.element_id(edge), "memberElement".into()), id)]);
+        assert!(r.bind_id_spelled_references_with(&mut hints).contains(&id));
+        let g = Facts::new(&mut r.b);
+        for origin in [None, Some(0)] {
+            r.b.identity_origin_unit = origin;
+            let findings = validate(&mut r, &model, &g);
+            assert_eq!(findings.len(), 2, "{findings:?}");
+            assert!(findings.iter().any(|(_, d)| {
+                d.message
+                    .contains("validateInvocationExpressionInstantiatedType")
+            }));
+            assert!(findings.iter().any(|(_, d)| {
+                d.message
+                    .contains("validateElementFilterMembershipIsModelLevelEvaluable")
+            }));
+            assert_eq!(r.b.identity_origin_unit, origin);
+            let findings = super::super::invocations::validate(&mut r, &model);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(findings[0].1.message.contains("unknown parameter"));
+            assert_eq!(r.b.identity_origin_unit, origin);
+        }
+        // No roots must also preserve the caller's state.
+        let mut empty = ResolvedModel::build(&Model::new());
+        let g = Facts::new(&mut empty.b);
+        for origin in [None, Some(0)] {
+            empty.b.identity_origin_unit = origin;
+            assert!(validate(&mut empty, &Model::new(), &g).is_empty());
+            assert!(super::super::invocations::validate(&mut empty, &Model::new()).is_empty());
+            assert_eq!(empty.b.identity_origin_unit, origin);
+        }
+    }
+
+    #[test]
+    fn model_level_dependency_restores_origin_for_known_unknown_and_depth_limit() {
+        for (value, expected) in [
+            ("true", Some(true)),
+            ("Holder::runtime", Some(false)),
+            ("missing", None),
+            ("loop", None),
+        ] {
+            let mut model = Model::new();
+            model.add_source("first.kerml", "package A;");
+            model.add_source("second.kerml", &format!("package B {{ class Holder {{ feature runtime; }} feature Actual = {value}; feature loop = Actual; feature '88888888-8888-4888-8888-888888888888'=true; feature bridge = '88888888-8888-4888-8888-888888888888'; }}"));
+            model.add_source("third.kerml", "package C { feature checked = B::bridge; }");
+            assert!(!model.has_errors());
+            let mut r = ResolvedModel::build(&model);
+            let actual = r.resolve_qualified("B::Actual").unwrap();
+            let id = "88888888-8888-4888-8888-888888888888".parse().unwrap();
+            r.override_ids(&HashMap::from([(r.element_id(actual), id)]));
+            let bridge = r.resolve_qualified("B::bridge").unwrap();
+            let expr = r.members_via(bridge, "FeatureValue")[0];
+            let edge = r
+                .owned_relationships(expr)
+                .into_iter()
+                .find(|e| r.element_type(*e) == "Membership")
+                .unwrap();
+            let mut hints = HashMap::from([((r.element_id(edge), "memberElement".into()), id)]);
+            assert!(r.bind_id_spelled_references_with(&mut hints).contains(&id));
+            let checked = r.resolve_qualified("C::checked").unwrap();
+            let (scope, expr) = r.b.values.get(&checked.0).unwrap().clone();
+            let g = Facts::new(&mut r.b);
+            for origin in [None, Some(0)] {
+                r.b.identity_origin_unit = origin;
+                assert_eq!(model_level(&mut r.b, &g, scope, &expr, 0), expected);
+                assert_eq!(r.b.identity_origin_unit, origin);
+                assert_eq!(model_level(&mut r.b, &g, scope, &expr, 32), None);
+                assert_eq!(r.b.identity_origin_unit, origin);
+            }
+        }
+    }
 }

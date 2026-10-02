@@ -44,21 +44,21 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/Open-MBEE/sysml-toolkit"
 
 [workspace.dependencies]
-sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.9.1" }
-sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.9.1" }
-sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.9.1" }
-sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.9.1" }
+sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.10.0" }
+sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.10.0" }
+sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.10.0" }
+sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.10.0" }
 sysmlv2-testkit = { path = "crates/sysmlv2-testkit" }
-sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.9.1" }
-sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.9.1" }
-sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.9.1" }
+sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.10.0" }
+sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.10.0" }
+sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.10.0" }
 lsp-server = "0.10"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
@@ -69,6 +69,9 @@ serde = { version = "1", features = ["derive"] }
 # can land 1 ULP off (e.g. "1e-28"), silently splitting digests.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4", "v5", "js"] }
+# The SHA-1 behind version-5 identities, used directly to extend an
+# owner's hash state by a child's path segment.
+sha1_smol = "1"
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
 jsonschema = "0.56"
 miniz_oxide = "0.9"

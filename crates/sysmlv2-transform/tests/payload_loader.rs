@@ -1,4 +1,4 @@
-//! The id-preserving payload loader (plan §33c): a document loaded into
+//! The id-preserving payload loader: a document loaded into
 //! a session keeps the ids it carried — this toolkit's own, a foreign
 //! producer's, or ids of elements the textual notation cannot name.
 
@@ -316,7 +316,7 @@ fn library_references_stay_ids_without_a_library() {
 
 #[test]
 fn references_to_unnamed_elements_are_bound_by_id() {
-    // API-GAPS issue 13: a legal payload may reference an element with
+    // A legal payload may reference an element with
     // no name; the text cannot spell it, but the loaded model must keep
     // the link.
     let src = "package P {
@@ -383,7 +383,7 @@ fn references_to_unnamed_elements_are_bound_by_id() {
 /// another corpus file. The lift spells cross-scope references rooted at
 /// the model root (`$::Name::…`), which is unambiguous within one
 /// document but not in a model that holds two documents declaring the
-/// same top-level name (API-GAPS issue 15); the text route resolves
+/// same top-level name; the text route resolves
 /// those references lexically.
 #[test]
 fn corpus_payload_route_matches_the_text_route() {
@@ -488,20 +488,11 @@ fn corpus_payload_route_body() {
     let reloaded = loaded.to_compact_json();
     let (a, b) = (by_id(&compact), by_id(&reloaded));
     assert_eq!(a.len(), b.len(), "element count");
-    // API-GAPS issue 16: one reference to a library return parameter is
-    // spelled by the parameter's effective name and does not re-resolve.
-    const KNOWN_UNRESOLVED: &str = "$::Requirements::RequirementConstraintCheck::result";
-    let mut known = 0usize;
-    let mut known_ids: Vec<String> = Vec::new();
     let mut differing = 0usize;
     let mut example = String::new();
     for (id, el) in &a {
         match b.get(id) {
             Some(x) if canon(x) == canon(el) => {}
-            Some(x) if x["memberElement"]["@ref"] == KNOWN_UNRESOLVED => {
-                known += 1;
-                known_ids.push(id.clone());
-            }
             other => {
                 differing += 1;
                 if example.is_empty() {
@@ -510,7 +501,6 @@ fn corpus_payload_route_body() {
             }
         }
     }
-    assert_eq!(known, 1, "exactly one known unresolvable spelling");
     assert_eq!(
         differing, 0,
         "compact round trip through the loader; e.g. {example}"
@@ -520,24 +510,12 @@ fn corpus_payload_route_body() {
     let loaded_full = loaded.to_full_json_with(false);
     let (a, b) = (by_id(&direct_full), by_id(&loaded_full));
     assert_eq!(a.len(), b.len(), "full-form element count");
-    // The known unresolvable reference becomes a deterministic dangling
-    // id in the full form; skip it and every element that carries that
-    // id in a derived property.
-    let dangling: Vec<String> = known_ids
-        .iter()
-        .filter_map(|id| b.get(id.as_str()))
-        .filter_map(|x| x["memberElement"]["@id"].as_str().map(str::to_string))
-        .collect();
     let mut differing = 0usize;
     for (id, el) in &a {
         if b.get(id).map(|x| canon(x)) != Some(canon(el)) {
-            let text = canon(b[id]);
-            if known_ids.contains(id) || dangling.iter().any(|d| text.contains(d)) {
-                continue;
-            }
             differing += 1;
             if differing == 1 {
-                eprintln!("first full-form difference at {id}: {}", canon(b[id]));
+                eprintln!("first full-form difference at {id}: {:?}", b.get(id));
             }
         }
     }
@@ -596,4 +574,491 @@ fn long_expressions_keep_their_value_through_json_and_cbor_sessions() {
             assert!(Session::from_compact_cbor(&bytes).is_err());
         },
     );
+}
+
+#[test]
+fn unnamed_type_references_restore_semantic_queries_and_survive_rebuild() {
+    let source = "package P {
+        part def Base { attribute mass = 7; }
+        part def Child :> Base;
+        part p : Base[1];
+        attribute result = p.mass;
+    }";
+    let original = Session::from_sources(vec![("p.sysml".into(), source.into())]).unwrap();
+    let (mut document, _) = foreignize(&original.to_compact_json());
+    let base = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "Base")
+        .unwrap();
+    let base_id = base["@id"].as_str().unwrap().to_owned();
+    base.as_object_mut().unwrap().remove("declaredName");
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    for iteration in 0..2 {
+        let model = loaded.resolved();
+        let base = model.element_by_id(&base_id).unwrap();
+        let child = model.resolve_qualified("P::Child").unwrap();
+        let p = model.resolve_qualified("P::p").unwrap();
+        assert_eq!(model.typings(p), vec![base]);
+        assert!(model.conforms(p, base));
+        assert!(model.conforms(child, base));
+        let mass = model.resolve_qualified("P::p::mass").unwrap();
+        assert_eq!(model.resolve_qualified("P::Child::mass"), Some(mass));
+        assert!(model.inherited_features(p, false).contains(&mass));
+        assert!(matches!(
+            model.evaluate_qualified("P::result"),
+            Ok(sysmlv2_model::eval::Value::Integer(7))
+        ));
+        let sites = model.references_to(base);
+        assert_eq!(sites.iter().filter(|s| s.kind == "type").count(), 1);
+        assert_eq!(
+            sites.iter().filter(|s| s.kind == "superclassifier").count(),
+            1
+        );
+        assert!(
+            sites.iter().all(|s| !s.plain),
+            "identity references must not be respelled as names"
+        );
+        assert_eq!(model.unresolved_count(), 0);
+        assert!(
+            model.bind_id_spelled_references().is_empty(),
+            "binding is idempotent"
+        );
+        if iteration == 0 {
+            let p = loaded.resolved().resolve_qualified("P").unwrap();
+            let mut edit = loaded.edit();
+            edit.insert_member(p, "part unrelated;");
+            edit.commit().unwrap();
+        }
+    }
+}
+
+#[test]
+fn unresolved_external_type_keeps_identity_without_invented_semantics() {
+    let source = "package P { part def Base; part p : Base; }";
+    let original = Session::from_sources(vec![("p.sysml".into(), source.into())]).unwrap();
+    let mut document = original.to_compact_json();
+    let external = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"external-type").to_string();
+    for element in document.as_array_mut().unwrap() {
+        if element["@type"] == "FeatureTyping" {
+            element["type"]["@id"] = Value::String(external.clone());
+        }
+    }
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    let p = model.resolve_qualified("P::p").unwrap();
+    assert!(model.typings(p).is_empty());
+    assert!(model.element_by_id(&external).is_none());
+    assert_eq!(
+        model.unresolved_count(),
+        0,
+        "known external identities are not unresolved names"
+    );
+    assert!(
+        loaded
+            .warnings()
+            .iter()
+            .any(|w| w.contains("outside the document"))
+    );
+    let output = loaded.to_compact_json();
+    let typing = output
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["@type"] == "FeatureTyping")
+        .unwrap();
+    assert_eq!(typing["type"]["@id"], external);
+}
+
+#[test]
+fn uuid_spelling_in_text_remains_a_lexical_name() {
+    let name = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"ordinary-name").to_string();
+    let source = format!("package P {{ part def '{name}'; part p : '{name}'; }}");
+    let mut session = Session::from_sources(vec![("p.sysml".into(), source)]).unwrap();
+    let model = session.resolved();
+    let p = model.resolve_qualified("P::p").unwrap();
+    let typ = model.resolve_qualified(&format!("P::'{name}'")).unwrap();
+    assert_eq!(model.typings(p), vec![typ]);
+    assert_ne!(model.element_id(typ).to_string(), name);
+}
+
+#[test]
+fn unnamed_redefinition_targets_restore_shadowing_and_default_evaluation() {
+    let source = "package P {
+        part def Base { attribute mass default = 7; }
+        part def Child :> Base { attribute weight :>> mass; }
+    }";
+    let original = Session::from_sources(vec![("p.sysml".into(), source.into())]).unwrap();
+    let (mut document, _) = foreignize(&original.to_compact_json());
+    let mass = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "mass")
+        .unwrap();
+    let mass_id = mass["@id"].as_str().unwrap().to_owned();
+    mass.as_object_mut().unwrap().remove("declaredName");
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    let mass = model.element_by_id(&mass_id).unwrap();
+    let child = model.resolve_qualified("P::Child").unwrap();
+    let weight = model.resolve_qualified("P::Child::weight").unwrap();
+    assert!(
+        model
+            .explicit_specializations(weight)
+            .contains(&("Redefinition", mass))
+    );
+    assert_eq!(model.redefiners(mass), vec![weight]);
+    assert!(!model.inherited_features(child, false).contains(&mass));
+    assert!(matches!(
+        model.evaluate_qualified("P::Child::weight"),
+        Ok(sysmlv2_model::eval::Value::Integer(7))
+    ));
+    let site = model
+        .references_to(mass)
+        .into_iter()
+        .find(|s| s.kind == "redefinedFeature")
+        .unwrap();
+    assert!(!site.plain);
+    let before = loaded.to_compact_json();
+    let warnings = loaded.warnings().to_vec();
+    let p = loaded.resolved().resolve_qualified("P").unwrap();
+    let mut edit = loaded.edit();
+    edit.insert_member(p, "part unrelated;");
+    edit.check().unwrap();
+    assert_eq!(loaded.to_compact_json(), before);
+    assert_eq!(loaded.warnings(), warnings);
+    // Qualification minimization rebuilds and verifies the semantic graph too.
+    loaded.minimize_qualifications().unwrap();
+    let model = loaded.resolved();
+    let mass = model.element_by_id(&mass_id).unwrap();
+    let weight = model.resolve_qualified("P::Child::weight").unwrap();
+    assert_eq!(model.redefiners(mass), vec![weight]);
+}
+
+#[test]
+fn unnamed_namespace_import_replays_dependents_without_duplicating_reference_arrays() {
+    let source = "package Q {
+        attribute a = 3;
+        attribute b = 4;
+        dependency D from a, b to a, b;
+    }
+    package P { public import Q::*; attribute total = a + b; }";
+    let original = Session::from_sources(vec![("p.sysml".into(), source.into())]).unwrap();
+    let (mut document, _) = foreignize(&original.to_compact_json());
+    let namespace = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "Q")
+        .unwrap();
+    namespace.as_object_mut().unwrap().remove("declaredName");
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    assert!(model.resolve_qualified("P::a").is_some());
+    assert!(matches!(
+        model.evaluate_qualified("P::total"),
+        Ok(sysmlv2_model::eval::Value::Integer(7))
+    ));
+    assert_eq!(model.unresolved_count(), 0);
+    let output = loaded.to_compact_json();
+    let dependency = output
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["@type"] == "Dependency")
+        .unwrap();
+    assert_eq!(dependency["client"].as_array().unwrap().len(), 2);
+    assert_eq!(dependency["supplier"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn loaded_identity_spelling_does_not_capture_a_distinct_uuid_named_type() {
+    let target_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"anonymous-type").to_string();
+    let source = format!(
+        "package P {{
+        part def Anonymous;
+        part def '{target_id}';
+        part anonymous : Anonymous;
+        part named : '{target_id}';
+    }}"
+    );
+    let original = Session::from_sources(vec![("p.sysml".into(), source)]).unwrap();
+    let mut document = original.to_compact_json();
+    let target = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "Anonymous")
+        .unwrap();
+    let old_id = target["@id"].as_str().unwrap().to_owned();
+    target.as_object_mut().unwrap().remove("declaredName");
+    // Substitute the anonymous type's identity consistently in the payload.
+    fn replace(value: &mut Value, old: &str, new: &str) {
+        match value {
+            Value::String(s) if s == old => *s = new.to_owned(),
+            Value::Array(a) => a.iter_mut().for_each(|v| replace(v, old, new)),
+            Value::Object(o) => o.values_mut().for_each(|v| replace(v, old, new)),
+            _ => {}
+        }
+    }
+    replace(&mut document, &old_id, &target_id);
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    for iteration in 0..2 {
+        let model = loaded.resolved();
+        let anonymous = model.resolve_qualified("P::anonymous").unwrap();
+        let named = model.resolve_qualified("P::named").unwrap();
+        let target = model.element_by_id(&target_id).unwrap();
+        let lexical = model
+            .resolve_qualified(&format!("P::'{target_id}'"))
+            .unwrap();
+        assert_ne!(target, lexical);
+        assert_eq!(model.typings(anonymous), vec![target]);
+        assert_eq!(model.typings(named), vec![lexical]);
+        if iteration == 0 {
+            let p = loaded.resolved().resolve_qualified("P").unwrap();
+            let mut edit = loaded.edit();
+            edit.insert_member(p, "part unrelated;");
+            edit.commit().unwrap();
+        }
+    }
+}
+
+#[test]
+fn later_document_root_scope_restores_anonymous_typing() {
+    let original = Session::from_sources(vec![
+        ("one.sysml".into(), "part initialPart;".into()),
+        ("two.sysml".into(), "part def Base; part p : Base;".into()),
+    ])
+    .unwrap();
+    let mut document = original.to_compact_json();
+    let base = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "Base")
+        .unwrap();
+    let id = base["@id"].as_str().unwrap().to_owned();
+    base.as_object_mut().unwrap().remove("declaredName");
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    let base = model.element_by_id(&id).unwrap();
+    let p = model.resolve_qualified("p").unwrap();
+    assert_eq!(model.typings(p), vec![base]);
+    assert!(model.conforms(p, base));
+}
+
+#[test]
+fn inherited_default_with_anonymous_reference_preserves_its_identity() {
+    let original = Session::from_sources(vec![("p.sysml".into(),
+        "package P { attribute original = 7; part def Base { attribute value default = original; } part def Child :> Base { attribute result :>> value; } }".into())]).unwrap();
+    let mut document = original.to_compact_json();
+    let original = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "original")
+        .unwrap();
+    original.as_object_mut().unwrap().remove("declaredName");
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    assert!(matches!(
+        loaded.resolved().evaluate_qualified("P::Child::result"),
+        Ok(sysmlv2_model::eval::Value::Integer(7))
+    ));
+}
+
+#[test]
+fn equal_spans_in_distinct_documents_do_not_confuse_identity_and_lexical_references() {
+    let target_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"anonymous-type").to_string();
+    let original = Session::from_sources(vec![
+        ("one.sysml".into(), "part aLong : Anonymous;".into()),
+        ("two.sysml".into(), format!("part ab : '{target_id}';")),
+        (
+            "defs.sysml".into(),
+            format!("part def Anonymous; part def '{target_id}';"),
+        ),
+    ])
+    .unwrap();
+    let mut document = original.to_compact_json();
+    let target = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "Anonymous")
+        .unwrap();
+    let old = target["@id"].as_str().unwrap().to_owned();
+    target.as_object_mut().unwrap().remove("declaredName");
+    let mut document = serde_json::from_str::<Value>(
+        &serde_json::to_string(&document)
+            .unwrap()
+            .replace(&old, &target_id),
+    )
+    .unwrap();
+    // Ensure no declared name or target spelling is normalized away.
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    let target = model.element_by_id(&target_id).unwrap();
+    let lexical = model.resolve_qualified(&format!("'{target_id}'")).unwrap();
+    let a = model.resolve_qualified("aLong").unwrap();
+    let b = model.resolve_qualified("ab").unwrap();
+    assert_eq!(model.typings(a), vec![target]);
+    assert_eq!(model.typings(b), vec![lexical]);
+    let identity_site = model
+        .references_to(target)
+        .into_iter()
+        .find(|s| s.kind == "type")
+        .unwrap();
+    let lexical_site = model
+        .references_to(lexical)
+        .into_iter()
+        .find(|s| s.kind == "type")
+        .unwrap();
+    assert_eq!(identity_site.name_span, lexical_site.name_span);
+    assert_ne!(identity_site.unit, lexical_site.unit);
+    document.as_array_mut().unwrap().reverse();
+    let mut reordered = Session::from_interchange_json(&document).unwrap();
+    let model = reordered.resolved();
+    let a = model.resolve_qualified("aLong").unwrap();
+    let target = model.element_by_id(&target_id).unwrap();
+    assert_eq!(model.typings(a), vec![target]);
+}
+
+#[test]
+fn cross_document_alias_keeps_its_anonymous_target_provenance() {
+    let original = Session::from_sources(vec![
+        ("defs.sysml".into(), "package Defs { part def Base { attribute mass = 7; } alias Alias for Base; }".into()),
+        ("uses.sysml".into(), "package Uses { part p : Defs::Alias[1]; attribute total = p.mass; public import Defs::Alias; part q : Alias; }".into()),
+    ]).unwrap();
+    let mut document = original.to_compact_json();
+    let base = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "Base")
+        .unwrap();
+    let base_id = base["@id"].as_str().unwrap().to_owned();
+    base.as_object_mut().unwrap().remove("declaredName");
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    let base = model.element_by_id(&base_id).unwrap();
+    assert_eq!(model.resolve_qualified("Defs::Alias"), Some(base));
+    let p = model.resolve_qualified("Uses::p").unwrap();
+    let q = model.resolve_qualified("Uses::q").unwrap();
+    assert_eq!(model.typings(p), vec![base]);
+    assert_eq!(model.typings(q), vec![base]);
+    assert!(
+        matches!(
+            model.evaluate_qualified("Uses::total"),
+            Ok(sysmlv2_model::eval::Value::Integer(7))
+        ),
+        "{:?}",
+        model.evaluate_qualified("Uses::total")
+    );
+}
+
+#[test]
+fn uuid_shaped_unresolved_names_keep_legacy_identity_recovery() {
+    let original = Session::from_sources(vec![(
+        "p.sysml".into(),
+        "package P { part def Base; part p : Base; part lexical : Missing; }".into(),
+    )])
+    .unwrap();
+    let mut document = original.to_compact_json();
+    let base = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "Base")
+        .unwrap();
+    base.as_object_mut().unwrap().remove("declaredName");
+    let spelling = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"unresolved-name").to_string();
+    for element in document.as_array_mut().unwrap() {
+        if element["@type"] == "FeatureTyping" && element["type"].get("@ref").is_some() {
+            element["type"] = serde_json::json!({"@ref":format!("'{spelling}'")});
+        }
+    }
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    assert_eq!(model.unresolved_count(), 0);
+    let lexical = model.resolve_qualified("P::lexical").unwrap();
+    let typing = model
+        .owned_relationships(lexical)
+        .into_iter()
+        .find(|e| model.element_type(*e) == "FeatureTyping")
+        .unwrap();
+    assert_eq!(model.element_properties(typing)["type"]["@id"], spelling);
+    assert!(model.typings(lexical).is_empty());
+}
+
+#[test]
+fn identity_resolution_follows_explicit_id_overrides_after_loading() {
+    let original = Session::from_sources(vec![(
+        "p.sysml".into(),
+        "package P { attribute original = 7; attribute answer = original; }".into(),
+    )])
+    .unwrap();
+    let mut document = original.to_compact_json();
+    let target = document
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["declaredName"] == "original")
+        .unwrap();
+    let old = Uuid::parse_str(target["@id"].as_str().unwrap()).unwrap();
+    target.as_object_mut().unwrap().remove("declaredName");
+    let mut loaded = Session::from_interchange_json(&document).unwrap();
+    let model = loaded.resolved();
+    let new = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"replacement-identity");
+    model.override_ids(&HashMap::from([(old, new)]));
+    assert!(model.element_by_id(&old.to_string()).is_none());
+    assert!(model.element_by_id(&new.to_string()).is_some());
+    assert!(matches!(
+        model.evaluate_qualified("P::answer"),
+        Ok(sysmlv2_model::eval::Value::Integer(7))
+    ));
+}
+#[test]
+fn sysml_generated_binding_full_json_and_cbor_preserve_source_and_foreign_ids() {
+    let source = Session::from_sources(vec![(
+        "reference.sysml".into(),
+        "part def Container { attribute n; attribute x=n; }".into(),
+    )])
+    .unwrap();
+    let original = source.to_compact_json();
+    for foreign in [false, true] {
+        // Foreignize only authored compact rows: generated identities should
+        // be derived from their preserved owners, not imported as source IDs.
+        let compact = if foreign {
+            foreignize(&original).0
+        } else {
+            original.clone()
+        };
+        let session =
+            Session::from_interchange_json_named(&compact, None, &["reference.sysml".into()])
+                .unwrap();
+        assert!(session.warnings().is_empty(), "{:?}", session.warnings());
+        assert_eq!(by_id(&session.to_compact_json()), by_id(&compact));
+        let full = session.to_full_json_with(false);
+        assert!(
+            full.as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["@type"] == "BindingConnector" && row["isImplied"] == true })
+        );
+        let binary = session.to_full_cbor(false);
+        let decoded = session.decode_cbor(&binary).unwrap();
+        assert_eq!(by_id(&decoded), by_id(&full));
+        for payload in [&full, &decoded] {
+            let lifted = sysmlv2_model::lift::from_compact_json(payload).unwrap();
+            assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+            assert_eq!(lifted.unit.dialect, sysmlv2_syntax::ast::Dialect::Sysml);
+            let loaded =
+                Session::from_interchange_json_named(payload, None, &["reference.sysml".into()])
+                    .unwrap();
+            assert!(loaded.warnings().is_empty(), "{:?}", loaded.warnings());
+            assert_eq!(by_id(&loaded.to_compact_json()), by_id(&compact));
+            assert_eq!(by_id(&loaded.to_full_json_with(false)), by_id(&full));
+        }
+    }
 }

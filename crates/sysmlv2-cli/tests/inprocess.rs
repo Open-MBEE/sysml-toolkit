@@ -146,26 +146,15 @@ fn a_verb_that_cannot_resolve_its_name_says_so() {
 }
 
 #[test]
-fn the_expression_verbs_refuse_an_argument_list_they_cannot_read() {
+fn query_refuses_an_argument_list_it_cannot_read() {
     let ws = Workspace::new("args", &[("m.sysml", "package M {\n    part def V;\n}\n")]);
     let model = ws.path("m.sysml").display().to_string();
 
-    let e = sysmlv2_cli::run_query(
-        None,
-        vec![model.clone(), "1".into(), "2".into()],
-        None,
-        true,
-    )
-    .expect_err("refused");
+    let e = sysmlv2_cli::run_query(None, vec![model, "1".into(), "2".into()], None, true)
+        .expect_err("refused");
     assert_eq!(
         message(&e).as_deref(),
         Some("expected exactly one query expression, got 2")
-    );
-
-    let e = sysmlv2_cli::run_render(vec![model], None, false, true).expect_err("refused");
-    assert_eq!(
-        message(&e).as_deref(),
-        Some("expected exactly one view usage name, got 0")
     );
 }
 

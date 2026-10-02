@@ -350,3 +350,41 @@ fn metadata_body_implicit_redefinition() {
     };
     assert!(matches!(targets.as_slice(), [TargetRef::Chain(links)] if links.len() == 2));
 }
+
+#[test]
+fn a_missing_feature_value_is_reported_at_its_terminator() {
+    // A `;` where a feature value's expression belongs: one error, at the
+    // `;`, which still ends the declaration — the feature stays in the
+    // tree without a value, and the member after it parses clean.
+    for value in ["=", ":=", "default", "default =", "default :="] {
+        let src = format!("package K {{ feature x {value} ; classifier Y; }}");
+        let semi = src.find(" ;").unwrap() + 1;
+        let Parse { unit, diagnostics } = parse_kerml_source(&src);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    d.span.start as usize,
+                    d.span.end as usize,
+                    d.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            [(semi, semi + 1, "expected an expression, found `;`")],
+            "{src:?}"
+        );
+        let MemberKind::Package(p) = &unit.members[0].kind else {
+            panic!("{src:?}")
+        };
+        let [x, y] = p.body.as_deref().unwrap() else {
+            panic!("{src:?}")
+        };
+        let MemberKind::Usage(x) = &x.kind else {
+            panic!("{src:?}")
+        };
+        assert!(x.value.is_none(), "{src:?}: {x:#?}");
+        assert!(matches!(y.kind, MemberKind::Definition(_)), "{src:?}");
+    }
+}

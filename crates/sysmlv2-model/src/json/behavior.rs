@@ -21,7 +21,7 @@
 //! compensated for rather than read literally: an accept action's
 //! trigger (`accept x at t`) is lowered as a TriggerInvocationExpression
 //! that is itself a parameter member, where the pilot's grammar makes it
-//! the payload parameter's value (API-GAPS issue 20) — it is not counted
+//! the payload parameter's value — it is not counted
 //! as an input parameter, and an accept's `payloadArgument` falls back to
 //! it.
 
@@ -130,13 +130,7 @@ impl ResolvedModel {
         }
         let m = self.b.elements[f.0].owning_relationship?;
         let ty = self.b.elements[m].ty;
-        if conforms(ty, "ReturnParameterMembership") {
-            Some("out")
-        } else if conforms(ty, "ParameterMembership") {
-            Some("in")
-        } else {
-            None
-        }
+        parameter_direction_default(ty)
     }
 
     /// `inputParameters() = input->select(f | f.owner = self)`: the owned
@@ -166,7 +160,7 @@ impl ResolvedModel {
     /// The argument an input parameter carries: its FeatureValue's value
     /// — or, for a trigger invocation's argument, which this lowering owns
     /// as the parameter itself without the Feature-and-FeatureValue
-    /// wrapper (API-GAPS issue 20), the expression that is the parameter.
+    /// wrapper, the expression that is the parameter.
     fn d_argument_of(&self, p: ElementRef) -> Option<ElementRef> {
         self.d_feature_value_of(p).or_else(|| {
             let owner = self.b.elements[p.0]
@@ -190,8 +184,7 @@ impl ResolvedModel {
 
     /// `AcceptActionUsage::payloadArgument = argument(1)`: the payload
     /// parameter's value, else the trigger this lowering owns beside the
-    /// payload (the pilot's grammar makes the trigger the payload's value;
-    /// API-GAPS issue 20).
+    /// payload (the pilot's grammar makes the trigger the payload's value).
     pub(super) fn d_accept_payload_argument(&self, e: ElementRef) -> Option<ElementRef> {
         self.d_argument(e, 1).or_else(|| {
             self.d_owned_features(e)
@@ -282,12 +275,40 @@ impl ResolvedModel {
 
     /// `Expression::result` / `Function::result`: the owned member
     /// parameter of the first ReturnParameterMembership (the inherited
-    /// result waits for the closure policy).
+    /// result waits for the closure policy). Operators use their library
+    /// Function's result even under passthrough. Supported scope-less literals
+    /// and metadata access inherit the actual semantic-library return identity.
     pub(super) fn d_result(&mut self, e: ElementRef) -> Option<ElementRef> {
-        self.d_feature_memberships(e)
+        if !self.b.elem_scope.contains_key(&e.0)
+            && super::implied::literal_implied_base(self.b.elements[e.0].ty).is_some()
+        {
+            let include_implied = self.closure_policy.include_implied()?;
+            let inherited = self.b.literal_inherited_memberships(e.0, include_implied);
+            if inherited.incomplete || inherited.truncated {
+                return None;
+            }
+            return self
+                .b
+                .literal_inherited_result(&inherited, &mut super::MembershipContext::default())
+                .map(ElementRef);
+        }
+        let result = self
+            .d_feature_memberships(e)
             .into_iter()
             .find(|&m| self.is_kind(m, "ReturnParameterMembership"))
-            .and_then(|m| self.d_owned_member_element(m))
+            .and_then(|m| self.d_owned_member_element(m));
+        if result.is_some() || self.element_type(e) != "OperatorExpression" {
+            return result;
+        }
+        // An operator specializes its library Function. Its return parameter
+        // remains a real reference even when passthrough emission leaves the
+        // inherited-member lists empty. A missing library/function/result is
+        // still unavailable, and no result identity is synthesized here.
+        let function = self.d_instantiated_type(e)?.element()?;
+        if self.element_type(function) != "Function" {
+            return None;
+        }
+        self.d_result(function)
     }
 
     /// The types of `e` of the given kind: `Expression::function`,
@@ -312,7 +333,10 @@ impl ResolvedModel {
     pub(super) fn d_instantiated_type(&mut self, e: ElementRef) -> Option<Reference> {
         self.ensure_by_id();
         if self.is_kind(e, "OperatorExpression") {
-            let operator = self.prop_str(e.0, "operator")?.to_string();
+            let operator = self.prop_str(e.0, "operator")?;
+            // The two exponentiation spellings share the normative '^'
+            // library endpoint (KerML 1.0, Table 5).
+            let operator = if operator == "**" { "^" } else { operator }.to_string();
             let candidates: Vec<(String, String)> =
                 ["BaseFunctions", "DataFunctions", "ControlFunctions"]
                     .iter()
@@ -376,6 +400,24 @@ impl ResolvedModel {
     /// reading.
     pub(super) fn d_arguments(&mut self, e: ElementRef) -> Vec<Reference> {
         self.ensure_by_id();
+        if self.b.graph_format == crate::model::GraphFormat::CanonicalV3
+            && self.is_kind(e, "ConstructorExpression")
+        {
+            // Omitted earlier features cannot hide a later supplied argument.
+            // Compatibility export uses the same complete ordering certificate;
+            // an empty fallback is explicitly uncertified when proof is absent.
+            return self
+                .constructor_binding_report(e)
+                .arguments
+                .map(|report| {
+                    report
+                        .bindings
+                        .into_iter()
+                        .map(|binding| Reference::Element(binding.value))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         let params = self.d_input_parameters(e);
         let callee = self.d_instantiated_type(e);
         let targets: Vec<ElementRef> = match callee {
@@ -558,6 +600,17 @@ impl ResolvedModel {
             .find(|&m| self.is_kind(m, "ConjugatedPortDefinition"))
     }
 
+    /// `ConjugatedPortTyping::portDefinition =
+    /// conjugatedPortDefinition.originalPortDefinition`.
+    pub(super) fn d_typing_port_definition(&mut self, e: ElementRef) -> Option<ElementRef> {
+        // The owned reader accepts inherited storage aliases and validates
+        // the target kind before following the conjugated definition's owner.
+        let target = self.property(e, "conjugatedPortDefinition").ok()?;
+        let conjugated = self.element_by_id(target.get("@id")?.as_str()?)?;
+        self.d_owning_namespace(conjugated)
+            .filter(|&original| self.is_kind(original, "PortDefinition"))
+    }
+
     // ---- helpers ----
 
     /// A kind test on a reference: an element of the model passes when
@@ -582,5 +635,16 @@ impl ResolvedModel {
             .get(key)
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
+    }
+}
+
+/// Normative ParameterMembership direction defaults shared with checked readers.
+pub(super) fn parameter_direction_default(kind: &str) -> Option<&'static str> {
+    if conforms(kind, "ReturnParameterMembership") {
+        Some("out")
+    } else if conforms(kind, "ParameterMembership") {
+        Some("in")
+    } else {
+        None
     }
 }

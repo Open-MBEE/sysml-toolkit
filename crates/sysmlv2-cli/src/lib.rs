@@ -8,7 +8,9 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::{HashMap, HashSet};
-use std::fs::{OpenOptions, Permissions};
+use std::fs::OpenOptions;
+#[cfg(not(target_os = "wasi"))]
+use std::fs::Permissions;
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -809,28 +811,6 @@ enum Command {
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
-    /// Render a view's template over its exposed model slice (semantic mode)
-    #[command(
-        long_about = "Render the component template a view usage presents over the\n\
-                      model elements the view exposes (semantic mode): the\n\
-                      view's rendering definition owns an imported template root whose\n\
-                      translated expressions evaluate over the exposed slice. Prints the\n\
-                      rendered tree as JSON, or as HTML with --html. The model is not\n\
-                      modified.",
-        after_help = "EXAMPLES:\n\
-                      \x20 sysmlv2 render --lib sysml.library model.sysml PackagesView.sysml Site::packagesView\n\
-                      \x20 sysmlv2 render --lib sysml.library --html app.sysml App::home"
-    )]
-    Render {
-        /// Model files (.sysml/.kerml) followed by the view usage's qualified name
-        args: Vec<String>,
-        /// Standard-library directory for reference resolution
-        #[arg(long, env = "SYSMLV2_LIB_DIR")]
-        lib: Option<PathBuf>,
-        /// Print HTML instead of the JSON node tree
-        #[arg(long)]
-        html: bool,
-    },
     /// Describe one element: metaclass, owner, typing, position
     #[command(
         long_about = "Describe one element of the resolved model: its metaclass,\n\
@@ -921,8 +901,8 @@ enum Command {
         /// SYSMLV2_MODEL_DIR is set
         files: Vec<PathBuf>,
         /// View to render. Default: tree — except when --element
-        /// targets a view usage, whose own `render` member picks the
-        /// style
+        /// targets a view usage, whose rendering (its own `render`
+        /// member, else the one it inherits) picks the style
         #[arg(long, value_enum)]
         view: Option<DiagramView>,
         /// Root the diagram at this ::-qualified element
@@ -1052,8 +1032,8 @@ enum RefactorOp {
                             root-level name collision. Run again on a moved file to\n\
                             split deeper.\n\n\
                             EXAMPLES:\n\
-                            \x20 sysmlv2 refactor split model.sysml TMT --dry-run\n\
-                            \x20 sysmlv2 refactor split model.sysml TMT --slug"
+                            \x20 sysmlv2 refactor split model.sysml Rover --dry-run\n\
+                            \x20 sysmlv2 refactor split model.sysml Rover --slug"
     )]
     Split {
         /// Input file (.sysml or .kerml); optional when SYSMLV2_MODEL_DIR
@@ -1147,11 +1127,17 @@ fn parse_file(path: &Path, src: &str) -> Parse {
 }
 
 fn report(path: &Path, src: &str, diags: &[Diagnostic]) {
-    let reporter = Reporter::new(path, src);
+    let mut reporter = Reporter::new(path, src);
     for d in diags {
         reporter.report(d);
     }
 }
+
+/// The most characters of a source line the text report shows under a
+/// finding. A longer line is cut to this many around the finding, so the
+/// report on a one-line model grows with its findings, not with findings
+/// times the line's length.
+const EXCERPT_WIDTH: usize = 160;
 
 /// Diagnostics for one source, rendered against a line index built once.
 /// Loops that emit findings one at a time across several files keep one
@@ -1161,6 +1147,10 @@ struct Reporter<'a> {
     path: &'a Path,
     src: &'a str,
     index: LineIndex,
+    /// The start of the line the last finding was on and the end of its
+    /// text, trailing whitespace trimmed. Findings on one long line reuse
+    /// it instead of scanning to the line's end each time.
+    line: Option<(usize, usize)>,
 }
 
 impl<'a> Reporter<'a> {
@@ -1169,10 +1159,17 @@ impl<'a> Reporter<'a> {
             path,
             src,
             index: LineIndex::new(src),
+            line: None,
         }
     }
 
-    fn report(&self, d: &Diagnostic) {
+    fn report(&mut self, d: &Diagnostic) {
+        eprint!("{}", self.render(d));
+    }
+
+    /// One finding as the text report writes it: the message, its
+    /// location, an excerpt of its line and a caret line under its span.
+    fn render(&mut self, d: &Diagnostic) -> String {
         let severity = match d.severity {
             sysmlv2_parser::diag::Severity::Error => "error",
             sysmlv2_parser::diag::Severity::Warning => "warning",
@@ -1180,22 +1177,93 @@ impl<'a> Reporter<'a> {
         let pos = self.index.line_col(d.span.start);
         // The diagnostic's own line, located from its offset rather than by
         // counting lines from the top of the file.
+        let start = (d.span.start - (pos.col - 1)) as usize;
+        let end = match self.line {
+            Some((line, end)) if line == start => end,
+            _ => {
+                let rest = &self.src[start..];
+                let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+                let end = start + line.trim_end().len();
+                self.line = Some((start, end));
+                end
+            }
+        };
+        let text = &self.src[start..end];
+        // The span in the line's text: a start past the text (in trailing
+        // whitespace, or at the end of the source) is marked just past it.
         let mut at = (d.span.start as usize).min(self.src.len());
         while !self.src.is_char_boundary(at) {
             at -= 1;
         }
-        let (before, after) = self.src.split_at(at);
-        let start = before.rfind('\n').map_or(0, |i| i + 1);
-        let end = at + after.find('\n').unwrap_or(after.len());
-        let line = &self.src[start..end];
-        eprintln!(
-            "{severity}: {}\n  --> {}:{}:{}\n   |\n   | {}\n",
+        let at = at.min(end) - start;
+        let mut to = (d.span.end as usize)
+            .saturating_sub(start)
+            .clamp(at, text.len());
+        while !text.is_char_boundary(to) {
+            to -= 1;
+        }
+        let (excerpt, caret) = excerpt(text, at, to);
+        format!(
+            "{severity}: {}\n  --> {}:{}:{}\n   |\n   | {excerpt}\n   | {caret}\n\n",
             d.message,
             self.path.display(),
             pos.line,
             pos.col,
-            line.trim_end()
-        );
+        )
+    }
+}
+
+/// The excerpt of a line's text shown under a finding spanning its bytes
+/// `at..to`, and the caret line marking that span. A line of at most
+/// [`EXCERPT_WIDTH`] characters shows whole. A longer one shows that many,
+/// up to a third of them before the finding, with `…` where it was cut.
+/// The caret line copies the tabs it passes, so the carets stay under the
+/// span at any tab width; every other character counts as one column.
+fn excerpt(text: &str, at: usize, to: usize) -> (String, String) {
+    let whole = text.len() <= EXCERPT_WIDTH || text.chars().nth(EXCERPT_WIDTH).is_none();
+    let (from, until) = if whole {
+        (0, text.len())
+    } else {
+        excerpt_window(text, at)
+    };
+    let mut shown = String::new();
+    let mut caret = String::new();
+    if from > 0 {
+        shown.push('…');
+        caret.push(' ');
+    }
+    shown.push_str(&text[from..until]);
+    if until < text.len() {
+        shown.push('…');
+    }
+    let blank = |c: char| if c == '\t' { '\t' } else { ' ' };
+    caret.extend(text[from..at].chars().map(blank));
+    let marked = text[at..to.min(until)].chars().count().max(1);
+    caret.extend(std::iter::repeat_n('^', marked));
+    (shown, caret)
+}
+
+/// The bytes of a line longer than [`EXCERPT_WIDTH`] characters shown
+/// around byte `at`: that many characters, starting up to a third of them
+/// before `at`, or the line's last ones when it ends sooner. Each walk
+/// covers at most the window, whatever the line's length.
+fn excerpt_window(text: &str, at: usize) -> (usize, usize) {
+    let from = text[..at]
+        .char_indices()
+        .rev()
+        .take(EXCERPT_WIDTH / 3)
+        .last()
+        .map_or(at, |(i, _)| i);
+    match text[from..].char_indices().nth(EXCERPT_WIDTH) {
+        Some((until, _)) => (from, from + until),
+        None => {
+            let from = text
+                .char_indices()
+                .rev()
+                .nth(EXCERPT_WIDTH - 1)
+                .map_or(0, |(i, _)| i);
+            (from, text.len())
+        }
     }
 }
 
@@ -2314,6 +2382,7 @@ struct StagedRefactorFile {
 
 #[derive(Debug)]
 struct RefactorFileMetadata {
+    #[cfg(not(target_os = "wasi"))]
     permissions: Permissions,
     #[cfg(all(unix, not(target_os = "wasi")))]
     uid: u32,
@@ -2555,42 +2624,52 @@ fn write_refactor_sidecar(
     ))
 }
 
+#[cfg(all(unix, not(target_os = "wasi")))]
 fn refactor_file_metadata(file: &std::fs::File) -> std::io::Result<RefactorFileMetadata> {
-    let metadata = file.metadata()?;
-    #[cfg(all(unix, not(target_os = "wasi")))]
-    {
-        use std::os::unix::fs::MetadataExt;
-        use xattr::FileExt;
+    use std::os::unix::fs::MetadataExt;
+    use xattr::FileExt;
 
-        if metadata.nlink() != 1 {
-            return Err(std::io::Error::other(format!(
-                "has {} hard links; refusing to split linked paths during atomic replacement",
-                metadata.nlink()
-            )));
-        }
-        let mut xattrs = Vec::new();
-        match file.list_xattr() {
-            Ok(names) => {
-                for name in names {
-                    if let Some(value) = file.get_xattr(&name)? {
-                        xattrs.push((name, value));
-                    }
+    let metadata = file.metadata()?;
+    if metadata.nlink() != 1 {
+        return Err(std::io::Error::other(format!(
+            "has {} hard links; refusing to split linked paths during atomic replacement",
+            metadata.nlink()
+        )));
+    }
+    let mut xattrs = Vec::new();
+    match file.list_xattr() {
+        Ok(names) => {
+            for name in names {
+                if let Some(value) = file.get_xattr(&name)? {
+                    xattrs.push((name, value));
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
-            Err(e) => return Err(e),
         }
-        Ok(RefactorFileMetadata {
-            permissions: metadata.permissions(),
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            xattrs,
-        })
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(e),
     }
-    #[cfg(not(all(unix, not(target_os = "wasi"))))]
     Ok(RefactorFileMetadata {
         permissions: metadata.permissions(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        xattrs,
     })
+}
+
+#[cfg(all(not(unix), not(target_os = "wasi")))]
+fn refactor_file_metadata(file: &std::fs::File) -> std::io::Result<RefactorFileMetadata> {
+    Ok(RefactorFileMetadata {
+        permissions: file.metadata()?.permissions(),
+    })
+}
+
+#[cfg(target_os = "wasi")]
+fn refactor_file_metadata(file: &std::fs::File) -> std::io::Result<RefactorFileMetadata> {
+    // Nothing carries over to the sidecars here (see the WASI
+    // `set_refactor_sidecar_metadata`), but a target the host cannot
+    // inspect is still refused.
+    file.metadata()?;
+    Ok(RefactorFileMetadata {})
 }
 
 #[cfg(all(unix, not(target_os = "wasi")))]
@@ -4510,38 +4589,6 @@ pub fn run_eval(
     Ok(())
 }
 
-/// `render`: evaluate one view usage and write the nodes it exposes,
-/// as JSON or as an HTML fragment.
-pub fn run_render(
-    args: Vec<String>,
-    lib: Option<&Path>,
-    html: bool,
-    quiet: bool,
-) -> Result<(), CliError> {
-    let (files, names): (Vec<String>, Vec<String>) =
-        args.into_iter().partition(|a| is_model_source(a));
-    let [view_name] = names.as_slice() else {
-        return Err(fail(format!(
-            "expected exactly one view usage name, got {}",
-            names.len()
-        )));
-    };
-    let mut resolved =
-        load_model(files.into_iter().map(PathBuf::from).collect(), lib, quiet)?.into_resolved();
-    let Some(view) = resolved.resolve_qualified(view_name) else {
-        return Err(fail(format!("element not found: {view_name}")));
-    };
-    let nodes = resolved.render_view(view).map_err(fail)?;
-    if html {
-        let html = sysmlv2_parser::render::to_html(&nodes) + "\n";
-        write_bytes(None, html.as_bytes())?;
-    } else {
-        let json = serde_json::Value::Array(nodes.iter().map(|n| n.to_json()).collect());
-        write_json(None, &json)?;
-    }
-    Ok(())
-}
-
 /// `query`: evaluate one expression against the model's root scope and
 /// write its value, one line per item of a sequence.
 pub fn run_query(
@@ -4729,8 +4776,9 @@ pub fn run_viz(args: VizArgs, quiet: bool) -> Result<(), CliError> {
     };
     // A view usage directs its own rendering: the diagram's
     // elements are what the view exposes (filter conditions
-    // applied), and its `render` member picks the style unless
-    // --view was given explicitly.
+    // applied), and its rendering — its own `render` member, else
+    // the one it inherits — picks the style unless --view was given
+    // explicitly.
     let (root, view, roots) = match root {
         Some(e) => match sysmlv2_viz::view_directed(&mut resolved, e) {
             Some((style, exposed)) => (None, view.or(style), Some(exposed)),
@@ -4936,9 +4984,6 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             lib,
         } => finish(run_eval(input, names, all, lib.as_deref(), quiet)),
 
-        Command::Render { args, lib, html } => {
-            finish(run_render(args, lib.as_deref(), html, quiet))
-        }
         Command::Query { input, args, lib } => {
             finish(run_query(input, args, lib.as_deref(), quiet))
         }
@@ -5244,5 +5289,180 @@ mod stack_tests {
         assert!(said.contains("no room for a thread"), "{said}");
         assert!(said.contains("nesting bound"), "{said}");
         assert!(said.contains("without a diagnostic"), "{said}");
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// The text report of a warning `w` at bytes `start..end` of `src`.
+    fn render(src: &str, start: u32, end: u32) -> String {
+        Reporter::new(Path::new("m.sysml"), src)
+            .render(&Diagnostic::warning(Span::new(start, end), "w"))
+    }
+
+    /// The excerpt line and the caret line of a rendered finding, without
+    /// their `   | ` gutter.
+    fn excerpt_lines(report: &str) -> (String, String) {
+        let lines: Vec<&str> = report.lines().collect();
+        (lines[3][5..].to_string(), lines[4][5..].to_string())
+    }
+
+    /// Where the carets start in the caret line, in characters, and how
+    /// many there are.
+    fn carets(caret: &str) -> (usize, usize) {
+        let at = caret.chars().take_while(|&c| c != '^').count();
+        (at, caret.chars().filter(|&c| c == '^').count())
+    }
+
+    /// A line of `n` five-character words, `w000 w001 …`: a finding on
+    /// word `i` starts at byte and character `5 * i`.
+    fn words(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("w{i:03} "))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn a_short_line_shows_whole_with_carets_under_the_span() {
+        let src = "package P {\n    part x : Missing;\n}\n";
+        let caret = format!("{}^^^^^^^", " ".repeat(13));
+        assert_eq!(
+            render(src, 25, 32),
+            format!(
+                "warning: w\n  --> m.sysml:2:14\n   |\n   |     part x : Missing;\n   | {caret}\n\n"
+            )
+        );
+    }
+
+    /// Terminals expand a tab to the next tab stop, which the caret line
+    /// reaches only by passing a tab of its own at the same place.
+    #[test]
+    fn the_caret_line_copies_tabs_before_the_span() {
+        let src = "\tpart x :\tMissing;";
+        let (_, caret) = excerpt_lines(&render(src, 10, 17));
+        assert_eq!(caret, "\t        \t^^^^^^^");
+    }
+
+    #[test]
+    fn a_long_line_is_cut_around_the_finding() {
+        let line = words(200);
+        let report = render(&line, 500, 504);
+        let (shown, caret) = excerpt_lines(&report);
+        assert!(shown.starts_with('…') && shown.ends_with('…'), "{shown}");
+        assert_eq!(shown.chars().count(), EXCERPT_WIDTH + 2);
+        // A third of the width before the finding, after the leading `…`.
+        assert_eq!(carets(&caret), (1 + EXCERPT_WIDTH / 3, 4));
+        let marked: String = shown.chars().skip(1 + EXCERPT_WIDTH / 3).take(4).collect();
+        assert_eq!(marked, "w100");
+        // The location keeps the finding's column in the whole line.
+        assert!(report.contains("--> m.sysml:1:501\n"), "{report}");
+    }
+
+    #[test]
+    fn a_finding_near_either_end_keeps_the_full_width() {
+        let line = words(200);
+        let (shown, caret) = excerpt_lines(&render(&line, 10, 14));
+        assert!(!shown.starts_with('…') && shown.ends_with('…'), "{shown}");
+        assert_eq!(shown.chars().count(), EXCERPT_WIDTH + 1);
+        assert_eq!(carets(&caret), (10, 4));
+
+        let last = line.len() - 4;
+        let (shown, caret) = excerpt_lines(&render(&line, last as u32, line.len() as u32));
+        assert!(shown.starts_with('…') && !shown.ends_with('…'), "{shown}");
+        assert_eq!(shown.chars().count(), EXCERPT_WIDTH + 1);
+        assert!(shown.ends_with("w199"), "{shown}");
+        assert_eq!(carets(&caret), (1 + EXCERPT_WIDTH - 4, 4));
+    }
+
+    #[test]
+    fn a_line_of_the_full_width_shows_whole_and_one_more_character_is_cut() {
+        let line = "x".repeat(EXCERPT_WIDTH);
+        let (shown, _) = excerpt_lines(&render(&line, 0, 1));
+        assert_eq!(shown, line);
+
+        let line = "x".repeat(EXCERPT_WIDTH + 1);
+        let (shown, _) = excerpt_lines(&render(&line, 0, 1));
+        assert_eq!(shown, format!("{}…", "x".repeat(EXCERPT_WIDTH)));
+    }
+
+    /// The width counts characters and the cuts fall between them, so a
+    /// line of multibyte characters shows as many as an ASCII one.
+    #[test]
+    fn a_line_of_multibyte_characters_is_cut_between_characters() {
+        let line = "⋅".repeat(1000);
+        let at = 3 * 500;
+        let (shown, caret) = excerpt_lines(&render(&line, at, at + 3));
+        assert_eq!(shown.chars().count(), EXCERPT_WIDTH + 2);
+        assert_eq!(carets(&caret), (1 + EXCERPT_WIDTH / 3, 1));
+    }
+
+    /// Carets mark the span only as far as the excerpt shows it: to the
+    /// cut, or to the end of a line the span runs past.
+    #[test]
+    fn carets_stop_where_the_excerpt_ends() {
+        let line = words(200);
+        let (_, caret) = excerpt_lines(&render(&line, 500, 900));
+        assert_eq!(
+            carets(&caret),
+            (1 + EXCERPT_WIDTH / 3, EXCERPT_WIDTH - EXCERPT_WIDTH / 3)
+        );
+
+        let src = "part x {\n}\n";
+        let (_, caret) = excerpt_lines(&render(src, 5, 10));
+        assert_eq!(caret, "     ^^^");
+    }
+
+    /// A span that is empty, or starts at the end of the source or in a
+    /// line's trailing whitespace, still gets one caret, just past the
+    /// text when it starts beyond it.
+    #[test]
+    fn an_empty_span_or_one_past_the_text_gets_one_caret() {
+        let src = "part x : ;";
+        let (_, caret) = excerpt_lines(&render(src, 9, 9));
+        assert_eq!(caret, "         ^");
+
+        let src = "part x {   ";
+        let (shown, caret) = excerpt_lines(&render(src, 11, 11));
+        assert_eq!(shown, "part x {");
+        assert_eq!(caret, "        ^");
+
+        let src = "part x {\n";
+        let report = render(src, 9, 9);
+        assert!(
+            report.ends_with("--> m.sysml:2:1\n   |\n   | \n   | ^\n\n"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_ending_the_line_is_not_shown() {
+        let src = "part x : Missing;\r\npart y;\r\n";
+        let (shown, caret) = excerpt_lines(&render(src, 9, 16));
+        assert_eq!(shown, "part x : Missing;");
+        assert_eq!(caret, "         ^^^^^^^");
+    }
+
+    /// The reporter remembers the end of the last finding's line; a
+    /// finding on another line, then on the first again, renders as a
+    /// fresh reporter renders it.
+    #[test]
+    fn findings_alternating_between_lines_render_as_alone() {
+        let src = format!("{}\npart x : Missing;\n", words(200));
+        let second = src.find("Missing").unwrap() as u32;
+        let spans = [
+            (500, 504),
+            (second, second + 7),
+            (10, 14),
+            (second, second + 7),
+        ];
+        let mut reporter = Reporter::new(Path::new("m.sysml"), &src);
+        for (start, end) in spans {
+            let finding = Diagnostic::warning(Span::new(start, end), "w");
+            assert_eq!(reporter.render(&finding), render(&src, start, end));
+        }
     }
 }

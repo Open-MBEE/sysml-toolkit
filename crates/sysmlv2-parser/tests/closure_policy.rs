@@ -1,4 +1,4 @@
-//! The closure policy on the standard corpus (plan §33h): the full form
+//! The closure policy on the standard corpus: the full form
 //! with the inheritance and import closures materialized per element
 //! stays schema-shaped and a superset of the passthrough form, and its
 //! size is measured — the number INTEROP.md's "passthrough level"
@@ -8,6 +8,7 @@
 
 #![cfg(feature = "json")]
 
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use sysmlv2_parser::full::{EmissionPolicy, UnresolvedReferencePolicy, resolved_to_full_json};
@@ -123,11 +124,11 @@ fn corpus_closure_form_is_a_superset_and_measured() {
         },
     );
     // Per element: the closure names are empty at the passthrough level
-    // and the inheritance-aware lists grow into supersets. The lengths
-    // the implied heritage is measured against outlive the two documents
+    // and the inheritance-aware lists retain every owned member. Owned
+    // feature references outlive the two documents
     // they come from — a third corpus document alongside them is
     // gigabytes, so they are carried out and the documents dropped.
-    let implied_floor: HashMap<String, [Option<usize>; 2]> = {
+    let owned_features: HashMap<String, Vec<Value>> = {
         let pass = by_id(&passthrough);
         let closed = by_id(&explicit);
         assert_eq!(pass.len(), closed.len());
@@ -190,11 +191,11 @@ fn corpus_closure_form_is_a_superset_and_measured() {
         );
         assert!(closure_nonempty > 0);
         assert!(feature_grew > 0);
-        closed
-            .iter()
-            .map(|(id, c)| {
-                let len = |name: &str| c.get(name).and_then(|v| v.as_array()).map(Vec::len);
-                ((*id).to_string(), [len("feature"), len("inheritedFeature")])
+        pass.iter()
+            .filter_map(|(id, p)| {
+                p.get("feature")
+                    .and_then(Value::as_array)
+                    .map(|features| ((*id).to_owned(), features.clone()))
             })
             .collect()
     };
@@ -211,19 +212,15 @@ fn corpus_closure_form_is_a_superset_and_measured() {
         explicit_bytes as f64 / pass_bytes as f64,
         implied_bytes as f64 / pass_bytes as f64
     );
-    // The implied heritage only adds.
+    // Implied redefinitions can remove previously inherited features.
+    // They must never remove a feature owned by the queried element.
     let more = by_id(&implied);
-    for (id, floor) in &implied_floor {
-        let m = more[id.as_str()];
-        for (name, b) in ["feature", "inheritedFeature"].iter().zip(floor) {
-            let (Some(b), Some(c2)) = (b, m.get(*name).and_then(|v| v.as_array())) else {
-                continue;
-            };
-            assert!(
-                c2.len() >= *b,
-                "{id}.{name} shrank with the implied heritage"
-            );
-        }
+    for (id, owned) in &owned_features {
+        let features = more[id.as_str()]["feature"].as_array().unwrap();
+        assert!(
+            contains_all(owned, features),
+            "{id}.feature lost an owned feature"
+        );
     }
 }
 

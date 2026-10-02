@@ -1061,9 +1061,6 @@ pub enum ExprKind {
     Body {
         members: Vec<Member>,
     },
-    /// The non-braced SysML `ExpressionBody` alternative, inherited from a
-    /// semicolon-bodied `CalculationBody`.
-    BodyTerminator,
     /// `(a, b, c)` — sequence.
     Sequence(Vec<Expr>),
     /// `x.metadata` — metadata access.

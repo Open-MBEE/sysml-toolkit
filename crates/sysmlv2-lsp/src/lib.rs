@@ -28,7 +28,7 @@ use lsp_types::notification::{
 use lsp_types::request::{
     CodeActionRequest, CodeLensRequest, Completion, DocumentHighlightRequest,
     DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest, References,
-    Rename, Request as _, SemanticTokensFullRequest, WorkspaceSymbolRequest,
+    Rename, Request as _, SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -44,8 +44,10 @@ use sysmlv2_parser::ast::Dialect;
 use sysmlv2_parser::check;
 use sysmlv2_parser::parser::{parse_kerml_source, parse_source};
 
+mod accept;
 mod autofix;
 mod autoimport;
+mod kinds;
 // lsp-types mandates `Uri` map keys (`WorkspaceEdit::changes`, the
 // document store), and `Uri` has interior mutability; nothing here
 // mutates one while it is a key.
@@ -54,7 +56,14 @@ mod nav;
 mod outline;
 mod position;
 mod push;
+mod receiver;
+mod reuse;
+mod salvage;
+#[allow(clippy::mutable_key_type)] // see the note on `mod nav`
+mod signature;
+mod site;
 pub mod tokens;
+mod units;
 mod worker;
 
 pub use outline::{document_symbols, spell_name, spell_symbols};
@@ -129,6 +138,8 @@ pub fn run_with_options(
     nav.set_hide_redundant_value_hints(hide_redundant_value_hints(&init).unwrap_or(true));
     nav.set_infer_unit_types(infer_unit_types(&init).unwrap_or(true));
     nav.set_snippet_completions(snippet_completions(&init));
+    nav.set_insert_replace_completions(insert_replace_completions(&init));
+    nav.set_signature_label_offsets(signature_label_offsets(&init));
     let client = connection.sender.clone();
     let server = Server {
         connection,
@@ -202,6 +213,33 @@ pub(crate) fn snippet_completions(init: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
+/// The client's `completionItem.insertReplaceSupport` capability:
+/// whether a completion's main edit may carry both an insert and a
+/// replace range. Absent means no.
+pub(crate) fn insert_replace_completions(init: &InitializeParams) -> bool {
+    init.capabilities
+        .text_document
+        .as_ref()
+        .and_then(|t| t.completion.as_ref())
+        .and_then(|c| c.completion_item.as_ref())
+        .and_then(|i| i.insert_replace_support)
+        .unwrap_or(false)
+}
+
+/// The client's `signatureHelp.signatureInformation.parameterInformation.
+/// labelOffsetSupport` capability: whether a signature's parameters may
+/// be sent as offsets into its label. Absent means no.
+pub(crate) fn signature_label_offsets(init: &InitializeParams) -> bool {
+    init.capabilities
+        .text_document
+        .as_ref()
+        .and_then(|t| t.signature_help.as_ref())
+        .and_then(|s| s.signature_information.as_ref())
+        .and_then(|i| i.parameter_information.as_ref())
+        .and_then(|p| p.label_offset_support)
+        .unwrap_or(false)
+}
+
 /// UTF-8 when the client lists it in `general.positionEncodings`
 /// (LSP 3.17), else the mandatory UTF-16 default.
 pub(crate) fn negotiate_encoding(init: &InitializeParams) -> Encoding {
@@ -216,6 +254,46 @@ pub(crate) fn negotiate_encoding(init: &InitializeParams) -> Encoding {
     } else {
         Encoding::Utf16
     }
+}
+
+/// Keep the completion items the word typed before `offset` (its
+/// identifier characters, past leading digits, which start no word) can
+/// still match: its characters, case aside, in order in the item's
+/// filter text, its label when it has none. An editor's filter needs at
+/// least that — whatever text it matches from the item's own range
+/// start ends in the word — so dropping the rest changes nothing it
+/// shows.
+fn retain_typed_matches(items: &mut Vec<lsp_types::CompletionItem>, text: &str, offset: u32) {
+    let at = text.floor_char_boundary(offset as usize);
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| c.is_ascii_alphanumeric() || c == '_')
+        .last()
+        .map_or(at, |(i, _)| i);
+    let typed: Vec<char> = text[start..at]
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect();
+    if typed.is_empty() {
+        return;
+    }
+    items.retain(|item| {
+        let mut want = typed.iter().peekable();
+        for c in item
+            .filter_text
+            .as_deref()
+            .unwrap_or(&item.label)
+            .chars()
+            .flat_map(char::to_lowercase)
+        {
+            if want.peek() == Some(&&c) {
+                want.next();
+            }
+        }
+        want.peek().is_none()
+    });
 }
 
 pub(crate) fn capabilities(encoding: Encoding) -> ServerCapabilities {
@@ -247,8 +325,16 @@ pub(crate) fn capabilities(encoding: Encoding) -> ServerCapabilities {
         )),
         completion_provider: Some(lsp_types::CompletionOptions {
             // `:` opens after a `::` qualifier, `.` after a feature
-            // chain step (member completions).
-            trigger_characters: Some(vec![":".to_string(), ".".to_string()]),
+            // chain step (member completions), `[` in a quantity's unit
+            // bracket (units; a multiplicity's `[` answers nothing).
+            trigger_characters: Some(vec![":".to_string(), ".".to_string(), "[".to_string()]),
+            ..Default::default()
+        }),
+        // `(` opens an invocation's argument list, `,` moves to the next
+        // argument, and `)` closes the list — the answer is then none.
+        signature_help_provider: Some(lsp_types::SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![")".to_string()]),
             ..Default::default()
         }),
         inlay_hint_provider: Some(OneOf::Left(true)),
@@ -463,8 +549,7 @@ impl Server {
                     .offset_of(&d.text_document.uri, d.position)
                     .and_then(|o| {
                         self.nav
-                            .references(&self.docs, &d.text_document.uri, o, true, self.encoding)
-                            .map(|locs| nav::highlights_in(locs, &d.text_document.uri))
+                            .highlights(&self.docs, &d.text_document.uri, o, self.encoding)
                     });
                 Response::new_ok(id, hl)
             }
@@ -518,10 +603,44 @@ impl Server {
                 let (id, p): (_, lsp_types::CompletionParams) = cast(req)?;
                 let d = &p.text_document_position;
                 let offset = self.offset_of(&d.text_document.uri, d.position);
-                let items =
+                let (mut items, incomplete) =
                     self.nav
                         .completions(&self.docs, &d.text_document.uri, offset, self.encoding);
-                Response::new_ok(id, Some(lsp_types::CompletionResponse::Array(items)))
+                let doc = self.docs.get(&d.text_document.uri);
+                if let (true, Some(offset), Some(doc)) =
+                    (self.nav.insert_replace_completions(), offset, doc)
+                {
+                    accept::word_edits(&mut items, &doc.text, offset, self.encoding);
+                }
+                if let (true, Some(offset), Some(doc)) = (incomplete, offset, doc) {
+                    // Asked for again at every keystroke, the list need
+                    // carry only what the word typed can still match.
+                    retain_typed_matches(&mut items, &doc.text, offset);
+                }
+                let list = if incomplete {
+                    lsp_types::CompletionResponse::List(lsp_types::CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })
+                } else {
+                    lsp_types::CompletionResponse::Array(items)
+                };
+                Response::new_ok(id, Some(list))
+            }
+            SignatureHelpRequest::METHOD => {
+                let (id, p): (_, lsp_types::SignatureHelpParams) = cast(req)?;
+                let d = &p.text_document_position_params;
+                let help = self
+                    .offset_of(&d.text_document.uri, d.position)
+                    .and_then(|o| {
+                        signature::signature_help(
+                            &mut self.nav,
+                            &self.docs,
+                            &d.text_document.uri,
+                            o,
+                        )
+                    });
+                Response::new_ok(id, help)
             }
             InlayHintRequest::METHOD => {
                 let (id, p): (_, lsp_types::InlayHintParams) = cast(req)?;
@@ -552,7 +671,8 @@ impl Server {
                     };
                     let mapper = Mapper::new(&doc.text, self.encoding);
                     let symbols = outline::document_symbols(&parse.unit, &doc.text, &mapper);
-                    nav::flatten_symbols(&symbols, uri, &p.query, &mut out);
+                    let imports = outline::plumbing(&parse.unit, &mapper).imports;
+                    nav::flatten_symbols(&symbols, uri, &p.query, &imports, &mut out);
                 }
                 Response::new_ok(id, Some(out))
             }
@@ -812,6 +932,7 @@ impl Server {
             self.unused_import_fix(uri, d, &mut out);
             self.unresolved_reference_fixes(uri, d, &mut out);
             self.import_visibility_fixes(uri, d, &mut out);
+            self.stray_terminator_fix(uri, d, &mut out);
         }
         self.lint_fix_actions(params, &mut out);
         if requested(params, "source.organizeImports") {
@@ -853,6 +974,48 @@ impl Server {
                 }],
             ),
             false,
+        ));
+    }
+
+    /// A `;` an error sits on, where no `;` belongs: after a body's
+    /// result expression (`mass <= limit; }`), or where a member would
+    /// start — doubling the terminator before it (`;;`), or after a body
+    /// or a comment that took none (`{ … };`). Removing it is the fix.
+    /// Not for an error expecting something else at the `;`: there the
+    /// `;` stands where the statement ends, and what is missing comes
+    /// before it — a body expression's closing `)` (`f({ in x; x };`).
+    fn stray_terminator_fix(
+        &self,
+        uri: &Uri,
+        d: &lsp_types::Diagnostic,
+        out: &mut Vec<lsp_types::CodeActionOrCommand>,
+    ) {
+        let Some(doc) = self.docs.get(uri) else {
+            return;
+        };
+        let mapper = Mapper::new(&doc.text, self.encoding);
+        let start = mapper.offset(d.range.start) as usize;
+        let end = mapper.offset(d.range.end) as usize;
+        if d.severity != Some(DiagnosticSeverity::ERROR) || doc.text.get(start..end) != Some(";") {
+            return;
+        }
+        let after_result = d.message == sysmlv2_parser::parser::RESULT_EXPRESSION_TERMINATOR;
+        if !after_result
+            && (d.message.starts_with("expected ") || !at_member_start(&doc.text[..start]))
+        {
+            return;
+        }
+        out.push(quick_fix(
+            "Remove `;`".to_string(),
+            d,
+            one_file_edit(
+                uri,
+                vec![TextEdit {
+                    range: d.range,
+                    new_text: String::new(),
+                }],
+            ),
+            true,
         ));
     }
 
@@ -1448,6 +1611,25 @@ fn requested(params: &lsp_types::CodeActionParams, kind: &str) -> bool {
             let k = k.as_str();
             kind == k || (kind.starts_with(k) && kind.as_bytes().get(k.len()) == Some(&b'.'))
         })
+    })
+}
+
+/// Does the end of `prefix` stand where a member starts — after a
+/// terminator, a body's braces, or a comment, which is a member of its
+/// own — counted on the toolkit's tokens, so notes and whitespace in
+/// between do not matter?
+fn at_member_start(prefix: &str) -> bool {
+    use sysmlv2_parser::token::TokenKind;
+    let tokens = sysmlv2_parser::lexer::tokenize(prefix).0;
+    let last = tokens
+        .iter()
+        .rev()
+        .find(|t| t.kind != TokenKind::Eof && !t.kind.is_trivia());
+    last.is_none_or(|t| {
+        matches!(
+            t.kind,
+            TokenKind::Semi | TokenKind::LBrace | TokenKind::RBrace | TokenKind::RegularComment
+        )
     })
 }
 

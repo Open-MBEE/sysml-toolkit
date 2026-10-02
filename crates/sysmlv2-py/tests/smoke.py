@@ -70,7 +70,9 @@ assert s2.closure_policy() == "passthrough"
 s2.set_closure_policy("closure")
 assert s2.closure_policy() == "closure"
 assert [s2.name(f) for f in s2.derived(b, "feature")] == ["x"]
-s2.edit([{"op": "moveMember", "target": "O::w", "index": 0}])
+closure_edit = s2.edit()
+closure_edit.rename(w, "renamed")
+s2.commit(closure_edit)
 assert s2.closure_policy() == "closure"
 s2.set_closure_policy("passthrough")
 

@@ -112,39 +112,54 @@ impl Client {
     }
 }
 
+/// A statement's start takes keywords, a type position names: the
+/// part definition declared in another document.
 #[test]
-fn completion_offers_keywords_and_workspace_names() {
+fn completion_offers_keywords_and_names_by_position() {
     let mut client = Client::start();
     let defs = uri("defs.sysml");
     let u = uri("u.sysml");
     client.open(&defs, "package Defs { part def Wheel; }\n");
-    client.open(&u, "package U {\n    part w : \n}\n");
-
-    let resp = client.request_ok::<Completion>(CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: u },
-            position: Position {
-                line: 1,
-                character: 13,
+    client.open(&u, "package U {\n    part w : ;\n    \n}\n");
+    let mut complete = |line: u32, character: u32| {
+        let resp = client.request_ok::<Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: u.clone() },
+                position: Position { line, character },
             },
-        },
-        work_done_progress_params: WorkDoneProgressParams::default(),
-        partial_result_params: PartialResultParams::default(),
-        context: None,
-    });
-    let Some(CompletionResponse::Array(items)) = resp else {
-        panic!("expected items: {resp:?}");
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: None,
+        });
+        let Some(CompletionResponse::Array(items)) = resp else {
+            panic!("expected items: {resp:?}");
+        };
+        items
     };
-    let part = items
-        .iter()
-        .find(|i| i.label == "part")
-        .expect("keyword `part`");
-    assert_eq!(part.kind, Some(CompletionItemKind::KEYWORD));
-    let wheel = items
+
+    let typed = complete(1, 13);
+    let wheel = typed
         .iter()
         .find(|i| i.label == "Wheel")
         .expect("cross-document name `Wheel`");
     assert_eq!(wheel.kind, Some(CompletionItemKind::CLASS));
+    assert!(
+        typed
+            .iter()
+            .all(|i| i.kind != Some(CompletionItemKind::KEYWORD)),
+        "no keyword at a type"
+    );
+
+    let start = complete(2, 4);
+    let part = start
+        .iter()
+        .find(|i| i.label == "part")
+        .expect("keyword `part`");
+    assert_eq!(part.kind, Some(CompletionItemKind::KEYWORD));
+    assert!(
+        start.iter().all(|i| i.label != "Wheel"),
+        "a statement's first word declares, it names nothing"
+    );
     client.shutdown();
 }
 

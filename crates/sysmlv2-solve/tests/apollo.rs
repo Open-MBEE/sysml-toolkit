@@ -1,7 +1,7 @@
 //! Solving gate over the Airbus Apollo 11 external validation model.
 //! Skips without the submodule or a `z3` binary; the
 //! outcome tuple is a ratchet — `valid`/`unsatisfiable` must stay 0 on
-//! the conforming scaffold, `satisfiable` should only grow.
+//! the conforming scaffold; other changes require semantic adjudication.
 
 use sysmlv2_model::model::Model;
 use sysmlv2_solve::{SolveOutcome, SolverConfig, solve_constraints, z3_version};
@@ -47,10 +47,13 @@ fn apollo_solve_ratchet() {
             Some(other) => panic!("unhandled solve conclusion: {other:?}"),
         }
     }
+    // 31 former witnesses treated quantities explicitly subsetting [*]
+    // library features as scalars. These usages have no implicit singleton
+    // declaration; preserving their inherited bounds leaves them unknown.
     assert_eq!(
         (valid, sat, unsat, unknown),
-        (0, 56, 0, 2),
+        (0, 25, 0, 33),
         "apollo solve ratchet moved — unsatisfiable/valid must stay 0; \
-         satisfiable should only grow via translator improvements"
+         satisfiable/unknown changes require an explained improvement or soundness correction"
     );
 }

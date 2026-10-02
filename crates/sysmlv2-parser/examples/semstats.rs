@@ -9,7 +9,10 @@ fn main() {
         .unwrap();
     for f in sysmlv2_testkit::user_files() {
         let src = std::fs::read_to_string(&f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     let diags = validate_semantics(&model);
     for (u, d) in &diags {

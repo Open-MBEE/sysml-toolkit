@@ -46,6 +46,35 @@ pub fn corpus_root() -> PathBuf {
     root
 }
 
+/// A stable source-unit name relative to a chosen corpus root.
+///
+/// Source names seed user document identities. Preserve the directory components
+/// so files with the same basename remain distinct, and omit checkout-specific
+/// prefixes so moving the checkout preserves those identities. The returned
+/// separator is `/` on every platform. This helper does no filesystem I/O.
+///
+/// Panics if `path` is not below `root`, contains a parent traversal, or has a
+/// non-UTF-8 component; lossy conversion would not preserve distinct names.
+pub fn relative_source_name(root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .expect("source lies below corpus root");
+    let segments: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => {
+                name.to_str().expect("corpus source names are UTF-8")
+            }
+            _ => panic!("source path must have only normal relative components"),
+        })
+        .collect();
+    assert!(
+        !segments.is_empty(),
+        "source path names a file below the root"
+    );
+    segments.join("/")
+}
+
 /// The OMG standard library directory within the corpus.
 pub fn library_dir() -> PathBuf {
     corpus_root().join("sysml.library")
@@ -123,4 +152,47 @@ pub fn apollo_files() -> Option<Vec<PathBuf>> {
     files.sort();
     assert!(files.len() >= 28, "expected the full Apollo checkout");
     Some(files)
+}
+
+#[cfg(test)]
+mod source_identity_tests {
+    use super::relative_source_name;
+    use std::path::Path;
+
+    #[test]
+    fn relative_source_names_preserve_directories_and_ignore_checkout_location() {
+        let first = relative_source_name(
+            Path::new("checkout-a"),
+            Path::new("checkout-a/examples/model.sysml"),
+        );
+        let second = relative_source_name(
+            Path::new("checkout-a"),
+            Path::new("checkout-a/validation/model.sysml"),
+        );
+        assert_eq!(first, "examples/model.sysml");
+        assert_eq!(second, "validation/model.sysml");
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            relative_source_name(
+                Path::new("checkout-b"),
+                Path::new("checkout-b/examples/model.sysml")
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "source lies below corpus root")]
+    fn unrelated_paths_do_not_fall_back_to_a_basename() {
+        relative_source_name(Path::new("checkout-a"), Path::new("checkout-b/model.sysml"));
+    }
+
+    #[test]
+    #[should_panic(expected = "normal relative components")]
+    fn parent_traversal_is_not_a_relative_identity() {
+        relative_source_name(
+            Path::new("checkout-a"),
+            Path::new("checkout-a/../model.sysml"),
+        );
+    }
 }

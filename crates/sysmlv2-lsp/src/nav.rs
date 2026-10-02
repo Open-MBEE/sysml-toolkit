@@ -18,6 +18,7 @@
 //! *reject atomically* and surface as request errors instead of
 //! corrupting the model.
 
+use crate::accept::Accept;
 use crate::position::{Mapper, UnitMappers, offset32};
 use crate::{Document, Encoding, Report};
 use lsp_types::{Location, Position, Range, TextEdit, Uri, WorkspaceEdit};
@@ -30,8 +31,93 @@ use sysmlv2_parser::span::Span;
 use sysmlv2_parser::visit::Visit as _;
 use sysmlv2_transform::{Library, Session, SessionError};
 
+mod namespaces;
+#[cfg(test)]
+pub(crate) use namespaces::WORK;
+use namespaces::{Access, Links, SymbolTable};
+
+/// The document a workspace table is layered for, and every other open
+/// document's text — held, and compared by identity, so a document
+/// reopened with new text never passes for the one it replaces.
+struct RestKey {
+    current: String,
+    others: Vec<(String, Arc<str>)>,
+}
+
+impl RestKey {
+    fn same(&self, other: &RestKey) -> bool {
+        self.current == other.current
+            && self.others.len() == other.others.len()
+            && self
+                .others
+                .iter()
+                .zip(&other.others)
+                .all(|((a, x), (b, y))| a == b && Arc::ptr_eq(x, y))
+    }
+}
+
 /// The session fingerprint, the package, and the actions planned for it.
 type SplitCache = (Vec<(String, i32)>, ElementRef, Vec<(String, WorkspaceEdit)>);
+
+/// The session read-only navigation answers from while the strict one
+/// cannot build (see [`Nav::read_session`]): the strict session's
+/// sources, the units that do not parse salvaged, for one fingerprint —
+/// `None` when even that could not build.
+struct Tolerant {
+    fingerprint: Vec<(String, i32)>,
+    session: Option<Session>,
+    /// Each unit as written, in the order the session was built from:
+    /// positions in the session's units are read off these. Salvage
+    /// keeps every byte's offset, not every line break — it may write a
+    /// `;` over one.
+    written: Vec<(String, String)>,
+    /// Its build (see [`Nav::built`]).
+    build: u64,
+}
+
+/// A session read-only navigation answers from (see
+/// [`Nav::read_session`]), with the units as written when it is the
+/// tolerant one.
+struct ReadSession<'a> {
+    session: &'a mut Session,
+    written: Option<&'a [(String, String)]>,
+}
+
+impl ReadSession<'_> {
+    /// Where `span` of `unit` lies, read off the unit as written.
+    fn location(&self, unit: usize, span: Span, enc: Encoding) -> Option<Location> {
+        let written = self.session.units().find_map(|(i, name, _)| {
+            (i == unit)
+                .then(|| {
+                    self.written?
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, t)| (name, t))
+                })
+                .flatten()
+        });
+        match written {
+            Some((name, text)) => Some(Location {
+                uri: Uri::from_str(name).ok()?,
+                range: Mapper::new(text, enc).range(span),
+            }),
+            None => Nav::location_static(self.session, unit, span, enc),
+        }
+    }
+}
+
+/// A statement's sources key with where it starts, a session's build,
+/// and how the texts that session was built from differ from the
+/// statement's (see [`Nav::cut_answer`]).
+type ReusedChanges = ((u64, u32), u64, Option<Arc<crate::reuse::Changes>>);
+
+/// What a member-access receiver reaches (see
+/// `Nav::chain_member_completions`): its members as (name, kind,
+/// detail), and whether it is a package or another namespace.
+struct Reached {
+    members: Vec<(String, lsp_types::CompletionItemKind, Option<String>)>,
+    namespace: bool,
+}
 
 /// The package a split request names.
 pub enum SplitTarget {
@@ -88,11 +174,16 @@ pub struct SplitResponse {
 pub struct Nav {
     pub library: Option<Library>,
     /// Every named symbol in the standard library with its qualified
-    /// path — computed once per Nav from the library *texts* (a
-    /// syntax-tier parse; no model build), since structure is syntactic.
-    /// Feeds both the flat completion list (packages + direct members)
-    /// and the qualifier-filtered import/member completions.
-    library_symbols: Option<Vec<QualifiedSymbol>>,
+    /// path, and the library's imports — computed once per Nav from the
+    /// library *texts* (a syntax-tier parse; no model build), since
+    /// structure is syntactic. Feeds both the flat completion list
+    /// (packages + direct members) and the qualifier-filtered
+    /// import/member completions; shared with every workspace table,
+    /// which layers over it.
+    library_symbols: Option<Arc<SymbolTable>>,
+    /// The measurement-unit types the library declares (see
+    /// [`crate::kinds::unit_types`]), built with the library's table.
+    library_unit_types: std::collections::HashSet<String>,
     /// Workspace root: on-disk units under it join every session build
     /// (open documents overlaid), so navigation crosses into units the
     /// client never opened. Re-read at rebuild time — the worker tier's
@@ -104,13 +195,26 @@ pub struct Nav {
     /// same uri strings the client opens documents under. Takes the
     /// role of the root walk when set.
     workspace: Option<Arc<Vec<(String, String)>>>,
-    /// Qualified symbols of the seeded workspace units, parsed once per
-    /// seed (the [`Self::library_symbols`] pattern) — import fixes and
-    /// completions must see the whole workspace, not just what happens
-    /// to be open, without a per-keystroke full-workspace parse. Units
-    /// shadowed by an open document are filtered at query time.
-    workspace_seed_symbols: Option<Vec<QualifiedSymbol>>,
+    /// Qualified symbols and imports of the seeded workspace units,
+    /// parsed once per seed (the [`Self::library_symbols`] pattern) —
+    /// import fixes and completions must see the whole workspace, not
+    /// just what happens to be open, without a per-keystroke
+    /// full-workspace parse. Units shadowed by an open document are
+    /// filtered at query time.
+    workspace_seed_symbols: Option<(Vec<QualifiedSymbol>, Links)>,
+    /// The workspace below the document last completed in — every
+    /// other open document and the seed units not open — kept while the
+    /// key (that document, the others' texts) holds.
+    workspace_rest: Option<(RestKey, Arc<SymbolTable>)>,
     session: Option<Session>,
+    /// The fingerprint the strict session last failed to build for — a
+    /// unit that does not parse — so a request with the same documents
+    /// does not parse them all again to find that out.
+    strict_failed: Option<Vec<(String, i32)>>,
+    /// Read-only navigation's session while the strict one cannot build.
+    tolerant: Option<Tolerant>,
+    /// What the tolerant session's builds made of each unit.
+    tolerant_salvage: crate::salvage::SalvageCache,
     /// Failures behind an empty answer, waiting for the server to pass
     /// them to the client ([`Nav::take_reports`]).
     reports: Vec<Report>,
@@ -145,6 +249,18 @@ pub struct Nav {
     /// auto-inserted text. Off by default — a non-snippet client
     /// would render the stop literally.
     snippet_completions: bool,
+    /// The client declared `completionItem.insertReplaceSupport` at
+    /// `initialize`: with the cursor inside a word, a completion's main
+    /// edit carries an insert range (up to the cursor) and a replace
+    /// range (through the rest of the word), and the client's own
+    /// setting picks one. Off by default — other clients get the
+    /// insert range alone.
+    insert_replace_completions: bool,
+    /// The client declared `signatureHelp.signatureInformation.
+    /// parameterInformation.labelOffsetSupport` at `initialize`: a
+    /// signature's parameters are sent as offsets into its label rather
+    /// than as substrings the client searches for.
+    signature_label_offsets: bool,
     /// Accepting a unit completion inside the quantity bracket of an
     /// *untyped* attribute declaration also declares the type the unit
     /// determines (exactly one, or nothing is inserted). Default on;
@@ -157,6 +273,51 @@ pub struct Nav {
     /// everything *outside* the blanked statement, so keystrokes
     /// within one statement reuse the build.
     completion_session: Option<(u64, Session)>,
+    /// The key of the completion session build that failed last: the
+    /// same sources would fail again, so they are not rebuilt until they
+    /// change.
+    completion_failed: Option<u64>,
+    /// The key of the sources, the member the live text reads a
+    /// statement in cut out whole, whose model named no members last
+    /// (see [`Self::read_inherited`]): the same text would name none
+    /// again, so it is not built again until it changes.
+    member_cut_failed: Option<u64>,
+    /// Sessions built so far, of either kind, and the count at which
+    /// [`Self::session`] and [`Self::completion_session`] were built:
+    /// which of the two is the most recent.
+    builds: u64,
+    session_build: u64,
+    completion_build: u64,
+    /// The sources [`Self::session`] and [`Self::completion_session`]
+    /// were built from, as written (the statement being typed cut out of
+    /// the latter): what their answers are current for.
+    session_sources: Vec<(String, String)>,
+    completion_sources: Vec<(String, String)>,
+    /// The inherited members last named for enclosing elements, most
+    /// recent first, by the text they depend on (see
+    /// [`Self::inherited_members`]).
+    member_cache: Vec<(u64, Vec<ScopeMember>)>,
+    /// Each seeded unit's name and a hash of its text, taken once per
+    /// seed: what a named member's key holds for the units not open (see
+    /// [`Self::inherited_members`]).
+    seed_hashes: Vec<(String, u64)>,
+    /// The library's units in a session's model, classified once per
+    /// session build (see [`crate::units::UnitEntry`]), by library symbol
+    /// index, with the build they were classified in (see [`Read`]).
+    library_units: Option<(u64, Vec<(usize, crate::units::UnitEntry)>)>,
+    /// How the texts each of the last few sessions built was built from
+    /// differ from those a build for a statement would read (see
+    /// [`Self::cut_answer`]): the key of the statement's sources with
+    /// where it starts, the session's build, and the changes — `None`
+    /// where the check cannot place them. Most recent first.
+    reused: Vec<ReusedChanges>,
+    /// What the import and alias statements of the sessions built make
+    /// an answer read off them depend on (see [`crate::reuse::Imports`]),
+    /// by build.
+    reused_imports: Vec<(u64, Arc<crate::reuse::Imports>)>,
+    /// What the completion session's builds made of each workspace unit
+    /// (see [`crate::salvage::SalvageCache`]).
+    salvage: crate::salvage::SalvageCache,
 }
 
 impl Nav {
@@ -175,9 +336,11 @@ impl Nav {
         Nav {
             library,
             library_symbols: None,
+            library_unit_types: std::collections::HashSet::new(),
             root: None,
             workspace: None,
             workspace_seed_symbols: None,
+            workspace_rest: None,
             session: None,
             fingerprint: Vec::new(),
             verify: None,
@@ -185,8 +348,26 @@ impl Nav {
             split_cache: None,
             hide_redundant_value_hints: true,
             snippet_completions: false,
+            insert_replace_completions: false,
+            signature_label_offsets: false,
             infer_unit_types: true,
             completion_session: None,
+            completion_failed: None,
+            member_cut_failed: None,
+            builds: 0,
+            session_build: 0,
+            completion_build: 0,
+            session_sources: Vec::new(),
+            completion_sources: Vec::new(),
+            member_cache: Vec::new(),
+            seed_hashes: Vec::new(),
+            library_units: None,
+            reused: Vec::new(),
+            reused_imports: Vec::new(),
+            salvage: crate::salvage::SalvageCache::default(),
+            strict_failed: None,
+            tolerant: None,
+            tolerant_salvage: crate::salvage::SalvageCache::default(),
             reports: Vec::new(),
             config: LintConfig::under(None),
         }
@@ -203,6 +384,45 @@ impl Nav {
     /// `completionItem.snippetSupport` capability at `initialize`.
     pub fn set_snippet_completions(&mut self, on: bool) {
         self.snippet_completions = on;
+    }
+
+    /// Set whether completion edits may carry insert and replace ranges
+    /// both — from the client's `completionItem.insertReplaceSupport`
+    /// capability at `initialize`.
+    pub fn set_insert_replace_completions(&mut self, on: bool) {
+        self.insert_replace_completions = on;
+    }
+
+    /// Whether completion edits may carry insert and replace ranges
+    /// both (see [`Self::set_insert_replace_completions`]).
+    pub fn insert_replace_completions(&self) -> bool {
+        self.insert_replace_completions
+    }
+
+    /// Set whether signature help may send parameters as offsets into
+    /// the signature's label — from the client's `labelOffsetSupport`
+    /// capability at `initialize`.
+    pub fn set_signature_label_offsets(&mut self, on: bool) {
+        self.signature_label_offsets = on;
+    }
+
+    /// Whether signature help may send parameters as label offsets (see
+    /// [`Self::set_signature_label_offsets`]).
+    pub fn signature_label_offsets(&self) -> bool {
+        self.signature_label_offsets
+    }
+
+    /// What accepting an item of a completion request in `uri` writes
+    /// (see [`Accept`]), as the client's capabilities allow.
+    fn accept<'a>(&self, text: &'a str, uri: &Uri, cx: &CompletionCx, enc: Encoding) -> Accept<'a> {
+        Accept::new(
+            text,
+            enc,
+            cx,
+            crate::dialect_of(uri),
+            self.snippet_completions,
+            self.insert_replace_completions,
+        )
     }
 
     /// Set whether evaluated-value inlay hints that restate the
@@ -224,34 +444,74 @@ impl Nav {
     /// Unit names must be the same uri strings the client opens
     /// documents under, or an open document duplicates its on-model
     /// unit instead of overlaying it.
+    ///
+    /// The completion tier's session stays: it is kept by the texts it
+    /// was built from, so a re-seed that leaves them as they were — the
+    /// host seeds every open document after each pause in typing —
+    /// leaves it current, and one that changes them has the next request
+    /// build another.
     pub fn set_workspace_sources(&mut self, units: Arc<Vec<(String, String)>>) {
         self.workspace = Some(units);
         self.workspace_seed_symbols = None;
-        self.invalidate();
+        self.workspace_rest = None;
+        self.seed_hashes = self
+            .workspace
+            .iter()
+            .flat_map(|units| units.iter())
+            .map(|(name, text)| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                text.hash(&mut hasher);
+                (name.clone(), hasher.finish())
+            })
+            .collect();
+        self.invalidate_navigation();
     }
 
-    /// Drop the cached session (after a rename commit mutated it, the
+    /// Drop the cached sessions (after a rename commit mutated one, the
     /// client must re-sync before answers are trustworthy again).
     pub fn invalidate(&mut self) {
+        self.invalidate_navigation();
+        self.completion_session = None;
+        self.library_units = None;
+        self.completion_sources.clear();
+    }
+
+    /// Drop the navigation session and what was derived from it: it is
+    /// kept by the open documents' versions, which tell nothing of the
+    /// seeded units a re-seed replaces.
+    fn invalidate_navigation(&mut self) {
         self.session = None;
         self.fingerprint.clear();
+        self.strict_failed = None;
+        self.tolerant = None;
         self.verify = None;
         self.lint = None;
         self.split_cache = None;
-        self.completion_session = None;
+        self.session_sources.clear();
     }
 
-    /// Completions for a feature-chain step (`tank.|`, `tank.liq|`,
-    /// `a.b.|`): the members the step could reach. The chain resolves
-    /// the way the evaluator resolves chains — the head from the
-    /// innermost enclosing declaration outward (inherited members
-    /// included, via [`ResolvedModel::member_of`]), later segments as
-    /// members of the segment before them — and enumeration walks the
-    /// reached feature's own body, its declared types, and their
-    /// explicit specialization closure, nearest declaration winning a
-    /// name. `None` when the prefix does not resolve or reaches
-    /// something memberless: the caller falls back to the
-    /// position-blind list.
+    /// Completions for a member access (`tank.|`, `tank.liq|`, `a.b.|`,
+    /// `wheels#(1).|`, `f(x).|`): the members the receiver could reach.
+    /// The receiver resolves the way the evaluator resolves it — a head
+    /// name from the innermost enclosing declaration outward (inherited
+    /// members included, via [`ResolvedModel::member_of`]), each step as
+    /// a member of the one before it, an indexed feature as its elements
+    /// (which have the feature's type), an invocation as its callee's
+    /// result — and enumeration takes the reached element's own features
+    /// and those it inherits through its written specializations (its
+    /// declared types, conjugated port types included, and their
+    /// specialization closure), nearest declaration winning a name. The
+    /// inheritance is the model's own (`Type::inheritedMemberships`):
+    /// a feature an owned feature redefines is not inherited, though a
+    /// chain step naming it still resolves, and a protected member is
+    /// listed even where a step from outside its type cannot reach it.
+    /// A receiver named by a reference (`x.`, `P::x.`) also takes the
+    /// `metadata` keyword of a metadata access, sorted after its members
+    /// — unless it is a package, whose dot is usually a slip for `::`.
+    /// `None` when the cursor does not follow a member-access dot. A
+    /// receiver that does not resolve answers an empty list: after a dot
+    /// the position-blind list is never what is wanted.
     ///
     /// [`ResolvedModel::member_of`]: sysmlv2_parser::json::ResolvedModel::member_of
     fn chain_member_completions(
@@ -260,134 +520,474 @@ impl Nav {
         uri: &Uri,
         cx: &CompletionCx,
         enc: Encoding,
-        snippets: bool,
     ) -> Option<Vec<lsp_types::CompletionItem>> {
-        // The statement being typed, cut for the session build (its
-        // parse error would refuse the whole session): statement start
-        // to the end of the cursor's line.
         let text = &docs.get(uri)?.text;
-        let line_end = text[(cx.offset as usize).min(text.len())..]
-            .find('\n')
-            .map(|i| cx.offset + offset32(i))
-            .unwrap_or(offset32(text.len()));
-        let session = self.completion_session(docs, uri, Span::new(cx.stmt_start, line_end))?;
-        let unit = Self::unit_of_static(uri, session)?;
-        let resolved = session.resolved();
-        // The declarations enclosing the statement, innermost first:
-        // the scopes the chain head resolves from. Queried at the
-        // statement's start — the same scopes as the cursor, at an
-        // offset the cut cannot have shifted.
-        let at = cx.stmt_start;
-        let mut enclosing: Vec<(ElementRef, u32)> = resolved
-            .user_elements()
-            .filter_map(|e| {
-                let (u, span) = resolved.member_extent(e)?;
-                (u == unit && span.start <= at && at <= span.end).then(|| (e, span.len()))
-            })
-            .collect();
-        enclosing.sort_by_key(|&(_, len)| len);
-        let qn = |name: &str| sysmlv2_parser::ast::QualifiedName {
-            is_global: false,
-            segments: vec![sysmlv2_parser::ast::Name {
-                value: name.to_string(),
-                span: Span::new(0, 0),
-            }],
-            span: Span::new(0, 0),
+        // A member typed quoted (`q.'max|`): the receiver is read where the
+        // quote opens; the accept still replaces the quoted name.
+        let after_quote = cx
+            .quoted
+            .map(|q| q.open())
+            .filter(|&open| open > 0 && text.as_bytes().get(open as usize - 1) == Some(&b'.'))
+            .map(|open| completion_context(text, open, crate::dialect_of(uri)));
+        let at = after_quote.as_ref().unwrap_or(cx);
+        // The receiver: the name chain the context read, else — for a
+        // chain ending in an index or an invocation, or one whose head is
+        // qualified (`P::part.`), where that scan stops short — the
+        // receiver read off the tokens.
+        let chain_len: usize = at.dot_chain.iter().map(|link| link.len() + 1).sum();
+        let head = (at.partial_start as usize).saturating_sub(chain_len);
+        let qualified_head = text.get(..head).is_some_and(|t| t.ends_with("::"));
+        let receiver = match at.dot_chain.as_slice() {
+            chain if !chain.is_empty() && !qualified_head => {
+                Some(crate::receiver::chain_expr(chain))
+            }
+            _ => {
+                // A dot after a name is a member access even where the
+                // tokens spell no receiver: it answers nothing, never the
+                // position-blind list.
+                let Some(span) =
+                    crate::receiver::postfix_receiver(text, at.stmt_start, at.partial_start)
+                else {
+                    return (!at.dot_chain.is_empty()).then(Vec::new);
+                };
+                crate::receiver::parse_receiver(
+                    &text[span.start as usize..span.end as usize],
+                    crate::dialect_of(uri),
+                )
+            }
         };
-        let root = resolved.root_scope();
-        let head = qn(&cx.dot_chain[0]);
-        let mut cur = enclosing
-            .iter()
-            .find_map(|&(e, _)| resolved.member_of(e, &head).map(|(hit, _)| hit))
-            .or_else(|| resolved.resolve_in(root, &head))?;
-        for seg in &cx.dot_chain[1..] {
-            cur = resolved.member_of(cur, &qn(seg))?.0;
-        }
-        // Enumerate: own body first, then declared types and their
-        // specialization closure (breadth-first, so the nearest
-        // declaration of a name shadows farther ones).
-        let mut members: Vec<(String, ElementRef)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut visited = std::collections::HashSet::new();
-        let mut frontier = std::collections::VecDeque::from([cur]);
-        while let Some(scope_el) = frontier.pop_front() {
-            if !visited.insert(scope_el) {
-                continue;
-            }
-            for m in resolved.owned_features(scope_el) {
-                if let Some(n) = resolved.element_name(m) {
-                    if seen.insert(n.to_string()) {
-                        members.push((n.to_string(), m));
-                    }
-                }
-            }
-            for t in resolved.typings(scope_el) {
-                frontier.push_back(t);
-            }
-            for s in resolved.explicit_supertypes(scope_el) {
-                frontier.push_back(s);
-            }
-        }
-        if members.is_empty() {
-            return None;
-        }
-        // Kind + detail while the session borrow lasts; items after.
-        let details: Vec<(String, lsp_types::CompletionItemKind, Option<String>)> = members
-            .into_iter()
-            .map(|(n, m)| {
-                let kind = member_kind(resolved.element_type(m));
-                let detail = resolved.element_qualified_name(m);
-                (n, kind, detail)
-            })
-            .collect();
+        // `x.metadata` reads an element's metadata: a receiver named by a
+        // reference takes the keyword once it resolves — but not a
+        // package, whose dot is usually a slip for `::`, nor where a name
+        // is typed quoted.
+        let by_reference = after_quote.is_none()
+            && receiver
+                .as_ref()
+                .is_some_and(|r| matches!(r.kind, sysmlv2_parser::ast::ExprKind::Ref(_)));
+        let reached = receiver.and_then(|receiver| {
+            self.receiver_members(docs, uri, at.stmt_start, cx.offset, &receiver)
+        });
+        let metadata = by_reference && reached.as_ref().is_some_and(|r| !r.namespace);
         let d = docs.get(uri)?;
-        let mapper = Mapper::new(&d.text, enc);
-        Some(
-            details
-                .into_iter()
-                .map(|(name, kind, detail)| {
-                    let (text_edit, repair, insert_text_format) = item_edits(
-                        &d.text,
-                        &mapper,
-                        cx,
-                        crate::dialect_of(uri),
-                        &name,
-                        snippets,
-                    );
+        let accept = self.accept(&d.text, uri, cx, enc);
+        let mut items: Vec<lsp_types::CompletionItem> = reached
+            .map(|r| r.members)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, kind, detail)| {
+                let label = crate::outline::spell_name(&name);
+                accept.name(&name).fill(
                     lsp_types::CompletionItem {
-                        label: crate::outline::spell_name(&name),
+                        // The members in the order of their labels, as
+                        // with no sort text; the keyword after them all.
+                        sort_text: Some(format!("0{label}")),
+                        label,
                         kind: Some(kind),
                         detail,
-                        text_edit,
-                        additional_text_edits: repair.map(|e| vec![e]),
-                        insert_text_format,
                         ..Default::default()
-                    }
+                    },
+                    Vec::new(),
+                )
+            })
+            .collect();
+        if metadata {
+            items.push(lsp_types::CompletionItem {
+                label: "metadata".to_string(),
+                kind: Some(lsp_types::CompletionItemKind::KEYWORD),
+                sort_text: Some("1metadata".to_string()),
+                ..Default::default()
+            });
+        }
+        Some(items)
+    }
+
+    /// What `receiver` reaches (see [`Reached`] and
+    /// [`Self::chain_member_completions`]), read in a model without the
+    /// statement starting at `stmt_start` (see
+    /// [`Self::statement_answer`]); the declarations enclosing the
+    /// statement's start are the scopes a head name resolves from. `None`
+    /// when no session can be built or the receiver does not resolve.
+    fn receiver_members(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        stmt_start: u32,
+        cursor: u32,
+        receiver: &sysmlv2_parser::ast::Expr,
+    ) -> Option<Reached> {
+        self.statement_answer(docs, uri, stmt_start, cursor, |at| {
+            let resolved = at.session.resolved();
+            let enclosing = crate::receiver::enclosing_declarations(resolved, at.unit, at.at);
+            at.needs.scopes(&enclosing);
+            at.needs.expr(receiver);
+            let mut reached = Vec::new();
+            let target =
+                crate::receiver::receiver_reached(resolved, &enclosing, receiver, &mut reached)?;
+            reached.into_iter().for_each(|e| at.needs.read(e));
+            let mut seen = std::collections::HashSet::new();
+            let mut members = Vec::new();
+            for m in resolved.effective_features(target, false) {
+                let Some(name) = resolved.element_lookup_name(m) else {
+                    continue;
+                };
+                if seen.insert(name.clone()) {
+                    let kind = member_kind(resolved.element_type(m));
+                    members.push((name, kind, resolved.element_qualified_name(m)));
+                }
+            }
+            Some(Reached {
+                members,
+                namespace: matches!(
+                    resolved.element_type(target),
+                    "Package" | "LibraryPackage" | "Namespace"
+                ),
+            })
+        })
+    }
+
+    /// Completions inside a `[` (see [`crate::units::bracket_at`]). In
+    /// a quantity's unit bracket, the units: those of the quantity the
+    /// value is declared as first (a `DurationValue` takes `s`, `min`,
+    /// `h`, `d`) — for a value no declaration's whole, the quantity of
+    /// the operand it is compared with or added to, or of the parameter
+    /// it binds as an argument (see [`crate::units::unit_context`]) —
+    /// each group's short symbols ahead of its long names,
+    /// the other units after them — a factor of a compound unit (`m` in
+    /// `[m/s]`) measures something else than the whole — each carrying
+    /// its import and an untyped declaration's inferred typing like any
+    /// other name. In any other bracket — a multiplicity, a filter —
+    /// nothing while nothing or a number is typed there; nothing either
+    /// right after a `[` that opens no bracket (one in a comment or a
+    /// string) or an import's filter condition. `None` outside a
+    /// bracket, after a qualifier, once a name is typed in any bracket
+    /// but a unit's (a bound may name a feature, `[1..numberOfBolts]`),
+    /// or in a unit bracket no model can be built for.
+    fn bracket_completions(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cx: &CompletionCx,
+        enc: Encoding,
+        unit_type_cx: Option<&UnitTypeCx>,
+    ) -> Option<Vec<lsp_types::CompletionItem>> {
+        let text = &docs.get(uri)?.text;
+        let after_bracket = text
+            .get(..cx.offset as usize)
+            .is_some_and(|t| t.ends_with('['));
+        // An import's filter condition (`::*[@Safe`) lists the import's
+        // names once a word is typed: a `[` alone offers nothing.
+        if cx.import {
+            return after_bracket.then(Vec::new);
+        }
+        let dialect = crate::dialect_of(uri);
+        // A qualified name in a unit bracket (`[SI::k`) is a unit of that
+        // namespace; anywhere else in a bracket (`[1..Limits::`), a member
+        // of it like any other.
+        let qualified = (!cx.qualifier.is_empty()).then(|| cx.qualifier.join("::"));
+        let (open, header) = match crate::units::bracket_at(text, cx, dialect) {
+            Some(crate::units::Bracket::Unit { open, header }) => (open, header),
+            _ if qualified.is_some() => return None,
+            // A bound or a filter: quiet while nothing or a number is
+            // typed; a name typed there (`[1..count`, `[@Safe`) is
+            // completed like one anywhere else.
+            Some(crate::units::Bracket::Other) => {
+                let typed = &text.as_bytes()[cx.partial_start as usize..cx.offset as usize];
+                return typed.first().is_none_or(u8::is_ascii_digit).then(Vec::new);
+            }
+            None => return after_bracket.then(Vec::new),
+        };
+        let accept = self.accept(text, uri, cx, enc);
+        // Only a name accepted as the whole bracket content, not as a
+        // factor of a compound unit, is measured by the declared
+        // quantity: nothing but blanks between the `[` and where
+        // accepting it starts replacing (a typed quote, or the typed
+        // spelling of the name, it absorbs).
+        let replacement = crate::accept::Replacement::new(text, cx);
+        let written = qualified.as_ref().map(|path| format!("{path}::"));
+        let whole = |name: &str| {
+            text.get(open as usize + 1..replacement.start_for(text, name) as usize)
+                .is_some_and(|s| {
+                    let s = s.trim();
+                    s.is_empty()
+                        || written
+                            .as_deref()
+                            .is_some_and(|w| s == w || s.strip_prefix("$::") == Some(w))
                 })
-                .collect(),
+        };
+        let workspace = self.all_workspace_symbols(docs, uri, enc);
+        let library_table = self.library_table();
+        let library: &[QualifiedSymbol] = library_table.symbols();
+        let parsed = if crate::is_kerml(uri.path().as_str()) {
+            sysmlv2_parser::parser::parse_kerml_source(text)
+        } else {
+            sysmlv2_parser::parser::parse_source(text)
+        };
+        let auto = crate::autoimport::AutoImport::new(
+            text,
+            &parsed.unit,
+            cx.offset,
+            Span::new(cx.partial_start, cx.offset),
         )
+        .with_reexports(&workspace);
+        let cut = crate::salvage::typed_statement_cut(text, cx.stmt_start, cx.offset);
+        // Rank: the declared quantity's short symbols, its long names,
+        // then the other units' — within a group the workspace's units
+        // ahead of the library's, then by package, in declaration order.
+        // A unit not visible here claims no name; after a qualifier, the
+        // namespace's own units and those it re-exports are the ones,
+        // needing no import.
+        let reexported: std::collections::HashSet<&str> = qualified
+            .as_deref()
+            .map(|path| {
+                workspace
+                    .reexported_members(path, Access::Clients)
+                    .into_iter()
+                    .map(|s| s.qualified.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut ranked = self.cut_answer(docs, uri, cut, |at| {
+            let unit_of: HashMap<String, usize> = at
+                .session
+                .units()
+                .map(|(i, name, _)| (name.to_string(), i))
+                .collect();
+            let resolved = at.session.resolved();
+            let enclosing = crate::receiver::enclosing_declarations(resolved, at.unit, at.at);
+            at.needs.scopes(&enclosing);
+            at.needs.units();
+            let declared = match header {
+                Some(h) => {
+                    let header = &text[h.start as usize..h.end as usize];
+                    at.needs.declaration(resolved, &enclosing, header, dialect);
+                    crate::units::declared_measure(resolved, &enclosing, header, dialect)
+                }
+                None => crate::units::unit_context(text, cx).and_then(|context| {
+                    at.needs
+                        .context(resolved, &enclosing, text, &context, dialect);
+                    crate::units::context_measure(resolved, &enclosing, text, &context, dialect)
+                }),
+            };
+            // The workspace's units, classified per request, by what their
+            // declarations say; the library's, once per session build.
+            let mut units = crate::units::Units::new(resolved);
+            let mut tops = None;
+            let mut workspace_units: Vec<(&QualifiedSymbol, crate::units::UnitEntry)> = Vec::new();
+            for s in workspace.iter().filter(|s| !s.effective) {
+                let site = s.site.as_ref().map(|(uri, _)| uri.as_str());
+                let Some(element) =
+                    declared_element(resolved, &s.qualified, site, &unit_of, &mut tops)
+                else {
+                    continue;
+                };
+                if let Some(entry) = units.entry_of(resolved, element, &s.name) {
+                    at.needs.read(element);
+                    workspace_units.push((s, entry));
+                }
+            }
+            if at
+                .library_units
+                .as_ref()
+                .is_none_or(|(build, _)| *build != at.build)
+            {
+                *at.library_units = Some((
+                    at.build,
+                    library
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.depth <= 1)
+                        .filter_map(|(i, s)| {
+                            Some((i, units.entry(resolved, &s.qualified, &s.name)?))
+                        })
+                        .collect(),
+                ));
+            }
+            let library_units = &at.library_units.as_ref()?.1;
+            let mut seen = std::collections::HashSet::new();
+            let mut ranked = Vec::new();
+            for (from_library, s, entry) in workspace_units
+                .iter()
+                .map(|(s, entry)| (false, *s, entry))
+                .chain(
+                    library_units
+                        .iter()
+                        .map(|(i, entry)| (true, &library[*i], entry)),
+                )
+            {
+                if seen.contains(s.name.as_str()) {
+                    continue;
+                }
+                let import = match qualified.as_deref() {
+                    Some(path)
+                        if s.is_member_of(path) || reexported.contains(s.qualified.as_str()) =>
+                    {
+                        None
+                    }
+                    Some(_) => continue,
+                    None => match reach(&auto, s) {
+                        Some(import) => import,
+                        None => continue,
+                    },
+                };
+                seen.insert(s.name.as_str());
+                let fits = whole(&s.name)
+                    && declared
+                        .as_ref()
+                        .is_some_and(|d| crate::units::Units::fits(resolved, entry, d));
+                let package = s
+                    .qualified
+                    .strip_suffix(s.name.as_str())
+                    .unwrap_or_default();
+                ranked.push((
+                    (
+                        u8::from(!fits) * 2 + u8::from(!entry.short),
+                        from_library,
+                        package,
+                    ),
+                    s,
+                    import,
+                ));
+            }
+            Some(ranked)
+        })?;
+        ranked.sort_by_key(|&(key, ..)| key);
+        // Where the declared quantity puts its own units first, only they
+        // keep the typed word's whole match of a symbol of one or two
+        // characters (see [`unmatched_whole`]): `k` ranks `kg` ahead of
+        // kelvin's `K`.
+        let fitting = ranked.first().is_some_and(|((rank, ..), ..)| *rank < 2);
+        let mapper = Mapper::new(text, enc);
+        let mut out = Vec::with_capacity(ranked.len());
+        let mut meta = Vec::with_capacity(ranked.len());
+        for (i, ((rank, ..), s, import)) in ranked.into_iter().enumerate() {
+            let (imports, label_details) =
+                match import.and_then(|edit| import_for(&mapper, dialect, s, edit)) {
+                    Some((edits, details)) => (edits, Some(details)),
+                    None => (Vec::new(), None),
+                };
+            meta.push(offered(i, s));
+            let mut edits = accept.name(&s.name);
+            let label = crate::outline::spell_name(&s.name);
+            if fitting && rank >= 2 && label.chars().count() <= 2 {
+                edits.filter_text = Some(unmatched_whole(
+                    edits.filter_text.as_deref().unwrap_or(&label),
+                    s.long.as_deref().unwrap_or(&label),
+                ));
+            }
+            out.push(edits.fill(
+                lsp_types::CompletionItem {
+                    label: crate::outline::spell_name(&s.name),
+                    kind: Some(s.kind),
+                    detail: Some(s.qualified.clone()),
+                    documentation: s.documentation(),
+                    label_details,
+                    // A client ranks equally good matches by this: the
+                    // order above.
+                    sort_text: Some(format!("{i:05}")),
+                    ..Default::default()
+                },
+                imports,
+            ));
+        }
+        if let Some(tcx) = unit_type_cx {
+            self.append_unit_type_edits(docs, uri, enc, (cx, tcx), &meta, &mut out);
+        }
+        Some(out)
     }
 
     /// The session over the current open documents, rebuilding if any
-    /// version moved. `None` when a document fails to build a session
-    /// (never expected — sessions tolerate parse errors — but a broken
-    /// library directory reports here).
+    /// version moved. `None` when a unit does not parse (see
+    /// [`Self::build_session`]) — found once per fingerprint — or the
+    /// library cannot be read.
     fn session(&mut self, docs: &BTreeMap<Uri, Document>) -> Option<&mut Session> {
-        let mut fp: Vec<(String, i32)> = docs
-            .iter()
-            .map(|(u, d)| (u.to_string(), d.version))
-            .collect();
-        fp.sort();
+        let fp = Self::fingerprint_of(docs);
         if self.session.is_none() || fp != self.fingerprint {
+            if self.strict_failed.as_ref() == Some(&fp) {
+                return None;
+            }
             let sources = self.assemble_sources(docs, &fp);
-            let session = self.build_session(sources)?;
+            let Some(session) = self.build_session(sources.clone()) else {
+                self.strict_failed = Some(fp);
+                return None;
+            };
             self.session = Some(session);
+            self.session_sources = sources;
+            self.tolerant = None;
+            self.builds += 1;
+            self.session_build = self.builds;
             self.fingerprint = fp;
             self.verify = None;
             self.lint = None;
             self.split_cache = None;
         }
         self.session.as_mut()
+    }
+
+    /// The models held right now: the strict session, read-only
+    /// navigation's tolerant one, the completion session.
+    #[cfg(test)]
+    pub(crate) fn sessions_held(&self) -> usize {
+        usize::from(self.session.is_some())
+            + usize::from(self.tolerant.as_ref().is_some_and(|t| t.session.is_some()))
+            + usize::from(self.completion_session.is_some())
+    }
+
+    /// (uri string, version) per open document, sorted: what a session
+    /// is current for.
+    fn fingerprint_of(docs: &BTreeMap<Uri, Document>) -> Vec<(String, i32)> {
+        let mut fp: Vec<(String, i32)> = docs
+            .iter()
+            .map(|(u, d)| (u.to_string(), d.version))
+            .collect();
+        fp.sort();
+        fp
+    }
+
+    /// The session read-only navigation — hover, definition, document
+    /// highlights — answers from: the strict session, else, while a unit
+    /// does not parse, one the units that do not parse join salvaged
+    /// (see [`crate::salvage`]) or, when they cannot be, stay out of. It
+    /// answers for everything outside what salvage blanks, which is
+    /// enough to show and to jump; references, rename, code actions and
+    /// refactors plan over every reference and keep the strict session.
+    /// Built once per fingerprint, reusing what the last build made of
+    /// each unit.
+    fn read_session(&mut self, docs: &BTreeMap<Uri, Document>) -> Option<ReadSession<'_>> {
+        if self.session(docs).is_some() {
+            return self.session.as_mut().map(|session| ReadSession {
+                session,
+                written: None,
+            });
+        }
+        let fp = Self::fingerprint_of(docs);
+        if self.tolerant.as_ref().is_none_or(|t| t.fingerprint != fp) {
+            self.tolerant = None;
+            // The strict session is for versions these documents have
+            // left, and answers nothing for them: let it go rather than
+            // hold a third model beside this one and the completion
+            // session's. The next strict build replaces it anyway.
+            self.session = None;
+            self.session_sources = Vec::new();
+            self.verify = None;
+            self.lint = None;
+            self.split_cache = None;
+            let sources = self.assemble_sources(docs, &fp);
+            let written = sources.clone();
+            let salvaged = self.tolerant_salvage.salvage_all(sources);
+            let session = self.build_parsed_session(salvaged);
+            self.builds += 1;
+            self.tolerant = Some(Tolerant {
+                fingerprint: fp,
+                session,
+                written,
+                build: self.builds,
+            });
+        }
+        let t = self.tolerant.as_mut()?;
+        Some(ReadSession {
+            session: t.session.as_mut()?,
+            written: Some(&t.written),
+        })
     }
 
     /// The session source list: workspace units first (in-memory seed,
@@ -414,24 +1014,67 @@ impl Nav {
     /// A session over `sources`, the configured library loaded. `None`
     /// when any unit fails to parse (sessions refuse parse errors) —
     /// the ordinary state of a document mid-edit, and the syntax tier
-    /// already shows those errors. A library that cannot be read is not
-    /// ordinary and is recorded for the client: without it every
-    /// model-backed answer here is silently empty.
+    /// already shows those errors; the units are parsed ahead of the
+    /// library, so that refusal costs no model build. A library that
+    /// cannot be read is not ordinary and is recorded for the client:
+    /// without it every model-backed answer here is silently empty.
     fn build_session(&mut self, sources: Vec<(String, String)>) -> Option<Session> {
-        let mut session = match Session::from_sources(sources) {
-            Ok(session) => session,
-            Err(e) => {
-                self.note_failure(&e, false);
-                return None;
-            }
+        let parses = |(name, text): &(String, String)| {
+            let parse = if crate::is_kerml(name) {
+                sysmlv2_parser::parser::parse_kerml_source(text)
+            } else {
+                sysmlv2_parser::parser::parse_source(text)
+            };
+            !parse.has_errors()
         };
-        if let Some(lib) = &self.library {
-            if let Err(e) = session.load_library_from(lib.clone()) {
-                self.note_failure(&e, true);
-                return None;
+        if !sources.iter().all(parses) {
+            return None;
+        }
+        self.build_parsed_session(sources)
+    }
+
+    /// [`Self::build_session`] for the completion tier, where one unit's
+    /// syntax errors must not take the rest of the workspace down with
+    /// them: a unit that does not parse joins salvaged — a missing `;`
+    /// written, the other members in error blanked, the braces they
+    /// leave open closed (see [`crate::salvage`]) — or, when it cannot
+    /// be salvaged, stays out.
+    /// Its errors still reach the client through the syntax tier.
+    /// Navigation that plans over references keeps the strict build — a
+    /// rename planned over a salvaged unit would miss the references the
+    /// salvage blanked; read-only navigation falls back to a salvaged
+    /// session of its own (see [`Self::read_session`]).
+    fn build_tolerant_session(&mut self, sources: Vec<(String, String)>) -> Option<Session> {
+        let sources = self.salvage.salvage_all(sources);
+        self.build_parsed_session(sources)
+    }
+
+    /// A session over `sources`, every one of which parses, built in one
+    /// pass with the configured library — resolving the units, then
+    /// loading the library into the session, would resolve them twice.
+    fn build_parsed_session(&mut self, sources: Vec<(String, String)>) -> Option<Session> {
+        #[cfg(test)]
+        SESSION_BUILDS.with(|n| n.set(n.get() + 1));
+        // The outcomes the most recent session settled on: the units this
+        // one shares with it start from them.
+        let settled = self
+            .built_by_recency()
+            .first()
+            .and_then(|&kind| self.built(kind))
+            .and_then(|(session, _)| session.settled_outcomes());
+        match Session::from_sources_settled(sources, self.library.clone(), settled) {
+            Ok(session) => Some(session),
+            Err(e) => {
+                // With every unit parsing, what refuses the session is the
+                // library — or a blank unit name.
+                let library = !matches!(
+                    e,
+                    SessionError::Parse { .. } | SessionError::InvalidUnitName(_)
+                );
+                self.note_failure(&e, library);
+                None
             }
         }
-        Some(session)
     }
 
     /// Record a session failure for the client, unless it is a unit
@@ -447,22 +1090,243 @@ impl Nav {
         std::mem::take(&mut self.reports)
     }
 
+    /// The kinds of session built, the most recent first.
+    fn built_by_recency(&self) -> Vec<Built> {
+        let mut kinds: Vec<(u64, Built)> = Built::ALL
+            .into_iter()
+            .filter_map(|kind| Some((self.built(kind)?.1, kind)))
+            .collect();
+        kinds.sort_by_key(|&(build, _)| std::cmp::Reverse(build));
+        kinds.into_iter().map(|(_, kind)| kind).collect()
+    }
+
+    /// The session of `kind` built, if one is, and its build.
+    fn built(&self, kind: Built) -> Option<(&Session, u64)> {
+        match kind {
+            Built::Navigation => Some((self.session.as_ref()?, self.session_build)),
+            Built::Tolerant => {
+                let t = self.tolerant.as_ref()?;
+                Some((t.session.as_ref()?, t.build))
+            }
+            Built::Completion => {
+                Some((&self.completion_session.as_ref()?.1, self.completion_build))
+            }
+        }
+    }
+
+    /// [`Self::built`]'s session to read, with the sources it was built
+    /// from as they were read — read-only navigation's tolerant one's as
+    /// written, before salvage; the completion tier's with its statement
+    /// cut out.
+    fn built_mut(&mut self, kind: Built) -> Option<(&mut Session, &[(String, String)])> {
+        match kind {
+            Built::Navigation => Some((self.session.as_mut()?, &self.session_sources)),
+            Built::Tolerant => {
+                let t = self.tolerant.as_mut()?;
+                Some((t.session.as_mut()?, &t.written))
+            }
+            Built::Completion => Some((
+                &mut self.completion_session.as_mut()?.1,
+                &self.completion_sources,
+            )),
+        }
+    }
+
+    /// The answer `read` gives for the statement being typed in `uri` —
+    /// it starts at `stmt_start`, the cursor at `cursor` — in a model the
+    /// statement is cut out of (see [`crate::salvage::typed_statement_cut`]
+    /// and [`Self::cut_answer`]).
+    fn statement_answer<T>(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        stmt_start: u32,
+        cursor: u32,
+        read: impl FnMut(&mut Read<'_>) -> Option<T>,
+    ) -> Option<T> {
+        let cut = crate::salvage::typed_statement_cut(&docs.get(uri)?.text, stmt_start, cursor);
+        self.cut_answer(docs, uri, cut, read)
+    }
+
+    /// The answer `read` gives in a model of the workspace with `cut`
+    /// taken out of `uri` (see [`Self::completion_session`]): off the
+    /// completion session built from exactly those texts, else off the
+    /// most recent session built, of either kind, whose texts differ from
+    /// them only where the answer does not look (see [`crate::reuse`]) —
+    /// so the next statement builds nothing where what it reads is as it
+    /// was — else off a completion session built for them now. `None`
+    /// when no session can be built or `read` answers nothing.
+    fn cut_answer<T>(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cut: Span,
+        mut read: impl FnMut(&mut Read<'_>) -> Option<T>,
+    ) -> Option<T> {
+        let (sources, key) = self.cut_sources(docs, uri, cut);
+        if self.completion_session.as_ref().map(|(k, _)| *k) != Some(key) {
+            if self.completion_failed == Some(key) {
+                return None;
+            }
+            let mut fresh = None;
+            if let Some(answer) =
+                self.reused_answer(uri, cut, (&sources, key), &mut fresh, &mut read)
+            {
+                return Some(answer);
+            }
+            let fresh = fresh.unwrap_or_else(|| self.salvage.salvage_all(sources.clone()));
+            let Some(session) = self.build_parsed_session(fresh) else {
+                self.completion_failed = Some(key);
+                return None;
+            };
+            self.completion_session = Some((key, session));
+            self.completion_sources = sources;
+            self.builds += 1;
+            self.completion_build = self.builds;
+        }
+        let (_, session) = self.completion_session.as_mut()?;
+        let unit = Self::unit_of_static(uri, session)?;
+        read(&mut Read {
+            session,
+            unit,
+            at: cut.start,
+            needs: crate::reuse::Needs::default(),
+            library_units: &mut self.library_units,
+            build: self.completion_build,
+        })
+    }
+
+    /// [`Self::cut_answer`] off a session built from other texts than
+    /// `sources` (keyed `key`), the most recent first, when what the
+    /// answer read there is unchanged in them (see
+    /// [`crate::reuse::Changes::allow`]). `fresh` holds the texts a build
+    /// for the statement would read once they are worked out.
+    fn reused_answer<T>(
+        &mut self,
+        uri: &Uri,
+        cut: Span,
+        (sources, key): (&[(String, String)], u64),
+        fresh: &mut Option<Vec<(String, String)>>,
+        read: &mut impl FnMut(&mut Read<'_>) -> Option<T>,
+    ) -> Option<T> {
+        let name = uri.to_string();
+        for kind in self.built_by_recency() {
+            let Some((_, build)) = self.built(kind) else {
+                continue;
+            };
+            // Worked out once per statement and session.
+            let known = self
+                .reused
+                .iter()
+                .find(|m| m.0 == (key, cut.start) && m.1 == build)
+                .map(|(_, _, changes)| changes.clone());
+            let changes = match known {
+                Some(changes) => changes,
+                None => {
+                    if fresh.is_none() {
+                        *fresh = Some(self.salvage.salvage_all(sources.to_vec()));
+                    }
+                    let (built, _) = self.built(kind)?;
+                    let changes = crate::reuse::Changes::between(
+                        built.units().map(|(_, n, t)| (n, t)),
+                        fresh.as_deref()?,
+                        &name,
+                        cut.start,
+                    )
+                    .map(Arc::new);
+                    self.reused
+                        .insert(0, ((key, cut.start), build, changes.clone()));
+                    self.reused.truncate(REUSED);
+                    changes
+                }
+            };
+            let Some(changes) = changes else {
+                continue;
+            };
+            let imports = match self.reused_imports.iter().find(|(b, _)| *b == build) {
+                Some((_, imports)) => Arc::clone(imports),
+                None => {
+                    let (session, _) = self.built_mut(kind)?;
+                    let imports = Arc::new(crate::reuse::Imports::of(session));
+                    self.reused_imports.insert(0, (build, Arc::clone(&imports)));
+                    self.reused_imports.truncate(Built::ALL.len());
+                    imports
+                }
+            };
+            let mut library_units = self.library_units.take();
+            let answer = self.built_mut(kind).and_then(|(session, _)| {
+                let unit = Self::unit_of_static(uri, session)?;
+                let mut at = Read {
+                    session,
+                    unit,
+                    at: changes.at,
+                    needs: crate::reuse::Needs::default(),
+                    library_units: &mut library_units,
+                    build,
+                };
+                let answer = read(&mut at);
+                let Read { session, needs, .. } = at;
+                answer.filter(|_| changes.allow(session, &needs, &imports))
+            });
+            self.library_units = library_units;
+            if answer.is_some() {
+                #[cfg(test)]
+                REUSED_ANSWERS.with(|n| n.set(n.get() + 1));
+                return answer;
+            }
+        }
+        None
+    }
+
     /// The completion tier's session: [`Self::assemble_sources`] with
-    /// `cut` (the statement being typed, in `uri`) removed outright —
+    /// `cut` (the statement being typed, in `uri`; see
+    /// [`crate::salvage::typed_statement_cut`]) removed outright —
     /// a mid-statement cursor nearly always means a parse error, which
     /// sessions refuse, and the statement itself contributes nothing a
     /// member listing needs. The reduced text is identical for every
     /// keystroke inside the statement, so the cache (keyed by a hash
     /// of the reduced sources) rebuilds only when something *outside*
-    /// the statement changes. Position queries against this session
-    /// must use offsets at or before `cut.start` — later spans shifted.
-    /// `None` when the rest of the workspace does not parse either.
+    /// the statement changes. Syntax errors elsewhere — in this document
+    /// or any other unit — are salvaged around
+    /// ([`Self::build_tolerant_session`]), which moves no offset.
+    /// Position queries against this session must use offsets at or
+    /// before `cut.start` — later spans shifted. A document that cannot
+    /// be salvaged is not in the session at all. A build that fails —
+    /// the library's, above all — is not tried again until the sources
+    /// change: every keystroke would parse them all again for nothing.
     fn completion_session(
         &mut self,
         docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         cut: Span,
     ) -> Option<&mut Session> {
+        let (sources, key) = self.cut_sources(docs, uri, cut);
+        if self.completion_session.as_ref().map(|(k, _)| *k) != Some(key) {
+            if self.completion_failed == Some(key) {
+                return None;
+            }
+            let Some(session) = self.build_tolerant_session(sources.clone()) else {
+                self.completion_failed = Some(key);
+                return None;
+            };
+            self.completion_session = Some((key, session));
+            self.completion_sources = sources;
+            self.builds += 1;
+            self.completion_build = self.builds;
+            self.library_units = None;
+        }
+        self.completion_session.as_mut().map(|(_, s)| s)
+    }
+
+    /// The sources a session for a statement in `uri` reads — every
+    /// unit, with `cut` taken out of `uri`'s text outright (see
+    /// [`Self::completion_session`]) — and the key they are kept under.
+    fn cut_sources(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cut: Span,
+    ) -> (Vec<(String, String)>, u64) {
         use std::hash::{Hash, Hasher};
         let mut fp: Vec<(String, i32)> = docs
             .iter()
@@ -485,12 +1349,7 @@ impl Nav {
             n.hash(&mut hasher);
             text.hash(&mut hasher);
         }
-        let key = hasher.finish();
-        if self.completion_session.as_ref().map(|(k, _)| *k) != Some(key) {
-            let session = self.build_session(sources)?;
-            self.completion_session = Some((key, session));
-        }
-        self.completion_session.as_mut().map(|(_, s)| s)
+        (sources, hasher.finish())
     }
 
     /// The element under `offset` in `uri`: a reference site's target
@@ -523,11 +1382,45 @@ impl Nav {
         offset: u32,
         enc: Encoding,
     ) -> Option<Location> {
-        let session = self.session(docs)?;
-        let unit = Self::unit_of_static(uri, session)?;
-        let (target, _) = Self::element_at(session, unit, offset)?;
-        let (dunit, dspan) = session.resolved().declaration_site(target)?;
-        Self::location_static(session, dunit, dspan, enc)
+        let read = self.read_session(docs)?;
+        let unit = Self::unit_of_static(uri, read.session)?;
+        let (target, _) = Self::element_at(read.session, unit, offset)?;
+        let (dunit, dspan) = read.session.resolved().declaration_site(target)?;
+        read.location(dunit, dspan, enc)
+    }
+
+    /// document highlights: where the element under the cursor is
+    /// declared and referenced in `uri` — off the read-only session, so
+    /// they hold while a unit does not parse (see [`Self::read_session`]).
+    pub fn highlights(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        offset: u32,
+        enc: Encoding,
+    ) -> Option<Vec<lsp_types::DocumentHighlight>> {
+        let read = self.read_session(docs)?;
+        let unit = Self::unit_of_static(uri, read.session)?;
+        let (target, _) = Self::element_at(read.session, unit, offset)?;
+        let resolved = read.session.resolved();
+        let spans: Vec<Span> = resolved
+            .declaration_site(target)
+            .filter(|(u, _)| *u == unit)
+            .map(|(_, span)| span)
+            .into_iter()
+            .chain(
+                resolved
+                    .references_to(target)
+                    .into_iter()
+                    .filter(|s| s.unit == unit)
+                    .map(|s| s.name_span),
+            )
+            .collect();
+        let locations = spans
+            .into_iter()
+            .filter_map(|span| read.location(unit, span, enc))
+            .collect();
+        Some(highlights_in(locations, uri))
     }
 
     /// references (find-usages): every site resolving to the element
@@ -652,7 +1545,8 @@ impl Nav {
         offset: u32,
         enc: Encoding,
     ) -> Option<(String, Range)> {
-        let session = self.session(docs)?;
+        let read = self.read_session(docs)?;
+        let session = &mut *read.session;
         let unit = Self::unit_of_static(uri, session)?;
         let (target, site) = Self::element_at(session, unit, offset)?;
         let resolved = session.resolved();
@@ -666,13 +1560,18 @@ impl Nav {
         // with a signature the way a function hover does: a fenced
         // block (editor font), parameter names with their types (`in`
         // implied, `out`/`inout` spelled), and the return type after
-        // `→`. Types render exactly as the declaration spells them
-        // (`:>` subsetting included), so the reader sees the author's
-        // qualification. The fence is tagged `sysml-signature` — the
-        // notation is not SysML source, so clients colorize it with a
-        // dedicated signature grammar (plain monospace where none is
-        // registered).
-        let parts = def_signature(resolved, target, metaclass);
+        // `→`. Types render as the declaration spells them (a subsetted
+        // feature standing in for a type not written: `in a :> isp`),
+        // so the reader sees the author's qualification; parameters
+        // inherited come after the callable's own (see
+        // [`crate::receiver::parameters`]); a library callable's types,
+        // whose text the session does not carry, are spelled from the
+        // model the shortest way that resolves here (see [`SigTypes`]).
+        // The fence is tagged `sysml-signature` — the notation is not
+        // SysML source, so clients colorize it with a dedicated
+        // signature grammar (plain monospace where none is registered).
+        let at = SigAt::in_unit(resolved, unit, offset, crate::dialect_of(uri));
+        let parts = def_signature(resolved, target, metaclass, &at);
         // Slicing the spelled types needs the unit texts — the resolved
         // borrow ends here and is re-acquired after.
         let sig = parts.map(|p| render_signature(p, session));
@@ -799,9 +1698,99 @@ impl Nav {
                 .filter(|(u, _)| *u == unit)
                 .map(|(_, s)| s)
         })?;
-        let (_, _, src) = session.units().find(|(i, _, _)| *i == unit)?;
-        let mapper = Mapper::new(src, enc);
-        Some((text, mapper.range(span)))
+        let range = ReadSession {
+            session,
+            written: read.written,
+        }
+        .location(unit, span, enc)?
+        .range;
+        Some((text, range))
+    }
+
+    /// The signature of what `callee` — a name, or a feature chain's
+    /// step on its receiver (`vehicle.ke`) — invoked in the statement
+    /// being typed (`cut`, see [`crate::salvage::typed_statement_cut`])
+    /// in `uri`, calls — the hover card's signature line, with where each
+    /// parameter sits in it — and the callable's documentation, else
+    /// the nearest its written heritage carries (see
+    /// [`crate::receiver::nearest_in_heritage`]). The callee resolves as
+    /// the evaluator resolves an invocation's target (see
+    /// [`crate::receiver::receiver_element`]), in a model with the
+    /// statement cut out (see [`Self::cut_answer`]); its parameters
+    /// include those it inherits (`calc c : F;`, `calc def G :> F;`, see
+    /// [`crate::receiver::parameters`]), and a feature typed by a
+    /// function answers with the function's, under its own name. `None`
+    /// when the callee does not resolve, or not to something an
+    /// invocation can call.
+    pub(crate) fn invocation_signature(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cut: Span,
+        callee: &sysmlv2_parser::ast::Expr,
+    ) -> Option<(SignatureLine, Option<String>)> {
+        self.cut_answer(docs, uri, cut, |at| {
+            let resolved = at.session.resolved();
+            let enclosing = crate::receiver::enclosing_declarations(resolved, at.unit, at.at);
+            at.needs.scopes(&enclosing);
+            at.needs.expr(callee);
+            let mut reached = Vec::new();
+            let target =
+                crate::receiver::receiver_reached(resolved, &enclosing, callee, &mut reached)?;
+            reached.into_iter().for_each(|e| at.needs.read(e));
+            let sig_at = SigAt::in_unit(resolved, at.unit, at.at, crate::dialect_of(uri));
+            let (source, mut parts) = std::iter::once(target)
+                .chain(resolved.typings(target))
+                .find_map(|e| {
+                    def_signature(resolved, e, resolved.element_type(e), &sig_at).map(|p| (e, p))
+                })?;
+            at.needs.read(source);
+            // A type spelled from the model is spelled the shortest way
+            // that resolves where the signature is read: by the names of
+            // its owners, or under `ISQ` — the types of the parameters
+            // shown, inherited ones included (declared in the general
+            // types read with the source), and of the result, each with
+            // what it redefines: one redefining without a type is spelled
+            // with the type of what it redefines (see [`spelled_types`]).
+            at.needs.name("ISQ");
+            let parameters: Vec<ElementRef> = crate::receiver::parameters(resolved, source)
+                .into_iter()
+                .map(|(p, _)| p)
+                .chain(crate::receiver::result_parameter(resolved, source))
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            let mut chain = parameters;
+            while let Some(p) = chain.pop() {
+                if !seen.insert(p) {
+                    continue;
+                }
+                chain.extend(resolved.redefinition_targets(p));
+                for t in resolved.explicit_supertypes(p) {
+                    let mut owner = Some(t);
+                    while let Some(e) = owner {
+                        if let Some(name) = resolved.element_name(e) {
+                            at.needs.name(name);
+                        }
+                        owner = resolved.owner(e);
+                    }
+                }
+            }
+            if source != target {
+                if let Some(own) = crate::receiver::feature_name(resolved, target) {
+                    parts.name = own;
+                }
+            }
+            let doc = crate::receiver::nearest_in_heritage(resolved, target, |resolved, e| {
+                let bodies: Vec<String> = resolved
+                    .element_docs(e)
+                    .into_iter()
+                    .map(|(_, b)| doc_markdown(&b))
+                    .filter(|b| !b.is_empty())
+                    .collect();
+                (!bodies.is_empty()).then(|| bodies.join("\n\n"))
+            });
+            Some((signature_line(parts, at.session), doc))
+        })
     }
 
     /// rename: through the Session edit engine (declaration + every
@@ -1423,30 +2412,55 @@ impl Nav {
         }
     }
 
+    /// The standard library's qualified symbols ([`Self::library_table_ref`]).
+    fn library_symbols(&mut self) -> &[QualifiedSymbol] {
+        self.library_table_ref().symbols()
+    }
+
     /// The standard library's qualified symbol table, built once per Nav
     /// from a syntax-tier parse of the library texts. Model-free by
     /// design: structure is syntactic, and this must not add a
     /// per-keystroke model build.
-    fn library_symbols(&mut self) -> &[QualifiedSymbol] {
+    fn library_table_ref(&mut self) -> &SymbolTable {
         if self.library_symbols.is_none() {
             let mut symbols: Vec<QualifiedSymbol> = Vec::new();
+            let mut links = Links::default();
             if let Some(lib) = &self.library {
                 for (name, text) in Self::library_sources(lib) {
-                    let parse = if crate::is_kerml(name.as_str()) {
-                        sysmlv2_parser::parser::parse_kerml_source(&text)
-                    } else {
-                        sysmlv2_parser::parser::parse_source(&text)
-                    };
-                    let mapper = Mapper::new(&text, Encoding::Utf8);
-                    let roots = crate::document_symbols(&parse.unit, &text, &mapper);
-                    let bodies = crate::outline::doc_bodies(&parse.unit, &mapper);
-                    let shorts = crate::outline::short_names(&parse.unit, &mapper);
-                    collect_qualified(&roots, "", 0, true, None, &bodies, &shorts, &mut symbols);
+                    let kerml = crate::is_kerml(name.as_str());
+                    collect_unit(&text, kerml, None, Encoding::Utf8, &mut symbols, &mut links);
                 }
             }
-            self.library_symbols = Some(symbols);
+            let table = SymbolTable::new(symbols, links, None);
+            // The library's measurement-unit type, and the definitions
+            // specializing it — aliases of them too, as the table takes
+            // them.
+            let root = table
+                .symbols()
+                .iter()
+                .find(|s| {
+                    s.qualified == "MeasurementReferences::MeasurementUnit"
+                        && matches!(s.decl, crate::kinds::Decl::Definition(_))
+                })
+                .map(|s| s.name.as_str());
+            self.library_unit_types = crate::kinds::unit_types(
+                root,
+                &std::collections::HashSet::new(),
+                definitions(table.symbols()),
+            );
+            self.library_symbols = Some(Arc::new(table));
         }
-        self.library_symbols.as_deref().unwrap_or(&[])
+        self.library_symbols.as_deref().expect("built above")
+    }
+
+    /// [`Self::library_symbols`]' table, shared.
+    fn library_table(&mut self) -> Arc<SymbolTable> {
+        self.library_table_ref();
+        Arc::clone(
+            self.library_symbols
+                .as_ref()
+                .expect("built by library_symbols"),
+        )
     }
 
     /// Workspace symbols across BOTH tiers: fresh parses of the open
@@ -1454,49 +2468,78 @@ impl Nav {
     /// is not open (an open document's live text shadows its seed
     /// copy). Everything that offers or auto-inserts an import must use
     /// this — the open-documents map alone hides most of the workspace.
+    ///
+    /// Layered for the request's document `uri`: that document's
+    /// symbols, over the rest of the workspace, over the library. The
+    /// rest is kept between requests while no other document changes,
+    /// so typing in one document neither re-parses the others nor
+    /// forgets what their namespaces make visible. A re-exporting import
+    /// elsewhere that resolves only with `uri` taken into account has
+    /// the whole workspace built as one layer instead.
     fn all_workspace_symbols(
         &mut self,
         docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
         enc: Encoding,
-    ) -> Vec<QualifiedSymbol> {
-        let mut out = workspace_symbols(docs, enc);
+    ) -> SymbolTable {
+        let library = self.library_table();
         if self.workspace_seed_symbols.is_none() {
             if let Some(units) = &self.workspace {
-                let mut symbols: Vec<QualifiedSymbol> = Vec::new();
+                let mut seed: Vec<QualifiedSymbol> = Vec::new();
+                let mut seed_links = Links::default();
                 for (name, text) in units.iter() {
-                    let parse = if crate::is_kerml(name) {
-                        sysmlv2_parser::parser::parse_kerml_source(text)
-                    } else {
-                        sysmlv2_parser::parser::parse_source(text)
-                    };
-                    let mapper = Mapper::new(text, enc);
-                    let roots = crate::document_symbols(&parse.unit, text, &mapper);
-                    let bodies = crate::outline::doc_bodies(&parse.unit, &mapper);
-                    let shorts = crate::outline::short_names(&parse.unit, &mapper);
-                    collect_qualified(
-                        &roots,
-                        "",
-                        0,
-                        true,
-                        Some(name.as_str()),
-                        &bodies,
-                        &shorts,
-                        &mut symbols,
-                    );
+                    let kerml = crate::is_kerml(name);
+                    collect_unit(text, kerml, Some(name), enc, &mut seed, &mut seed_links);
                 }
-                self.workspace_seed_symbols = Some(symbols);
+                self.workspace_seed_symbols = Some((seed, seed_links));
             }
         }
-        if let Some(seed) = &self.workspace_seed_symbols {
-            let open: std::collections::HashSet<String> =
-                docs.keys().map(|u| u.to_string()).collect();
-            out.extend(
-                seed.iter()
-                    .filter(|s| s.site.as_ref().is_none_or(|(u, _)| !open.contains(u)))
-                    .cloned(),
-            );
+        let current = uri.to_string();
+        let key = RestKey {
+            others: docs
+                .iter()
+                .map(|(u, d)| (u.to_string(), Arc::clone(&d.text)))
+                .filter(|(u, _)| *u != current)
+                .collect(),
+            current,
+        };
+        let current = &key.current;
+        let rest = match &self.workspace_rest {
+            Some((known, rest)) if known.same(&key) => Arc::clone(rest),
+            _ => {
+                let (mut symbols, mut links) =
+                    workspace_symbols(docs.iter().filter(|(u, _)| u.to_string() != *current), enc);
+                if let Some((seed, seed_links)) = &self.workspace_seed_symbols {
+                    let open: std::collections::HashSet<String> =
+                        docs.keys().map(|u| u.to_string()).collect();
+                    symbols.extend(
+                        seed.iter()
+                            .filter(|s| s.site.as_ref().is_none_or(|(u, _)| !open.contains(u)))
+                            .cloned(),
+                    );
+                    links.imports.extend(
+                        seed_links
+                            .imports
+                            .iter()
+                            .filter(|i| i.unit.as_ref().is_none_or(|u| !open.contains(u)))
+                            .cloned(),
+                    );
+                }
+                let rest = Arc::new(SymbolTable::new(symbols, links, Some(Arc::clone(&library))));
+                self.workspace_rest = Some((key, Arc::clone(&rest)));
+                rest
+            }
+        };
+        let (symbols, links) = workspace_symbols(docs.get_key_value(uri).into_iter(), enc);
+        let table = SymbolTable::new(symbols, links, Some(Arc::clone(&rest)));
+        if !rest.resolves_above(&table) {
+            return table;
         }
-        out
+        let (mut symbols, mut links) = table.parts();
+        let (rest_symbols, rest_links) = rest.parts();
+        symbols.extend(rest_symbols);
+        links.imports.extend(rest_links.imports);
+        SymbolTable::new(symbols, links, Some(library))
     }
 
     /// "Optimize imports": every provably-unused private import in
@@ -1742,14 +2785,15 @@ impl Nav {
         if crate::autoimport::within_import(&parse.unit.members, offset) {
             return;
         }
+        let ws = self.all_workspace_symbols(docs, uri, enc);
         let auto = crate::autoimport::AutoImport::new(
             text,
             &parse.unit,
             offset,
             Span::new(offset, offset + token_len),
-        );
+        )
+        .with_reexports(&ws);
         let mapper = Mapper::new(text, enc);
-        let ws = self.all_workspace_symbols(docs, enc);
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for s in ws.iter().chain(self.library_symbols()) {
             if out.len() >= 5 {
@@ -1759,14 +2803,16 @@ impl Nav {
             {
                 continue;
             }
-            let Some((at, new_text)) = auto.import_edit(&s.name, &s.qualified) else {
+            let Some(Some(edit)) = reach(&auto, s) else {
                 continue;
             };
+            let title = format!(
+                "Add import {}",
+                edit.spelled(crate::dialect_of(uri), &s.qualified)
+            );
+            let (at, new_text) = (edit.at, edit.text);
             out.push((
-                format!(
-                    "Add import {}",
-                    crate::autoimport::escape_qualified(crate::dialect_of(uri), &s.qualified)
-                ),
+                title,
                 uri.clone(),
                 TextEdit {
                     range: mapper.range(Span::new(at, at)),
@@ -1784,83 +2830,105 @@ impl Nav {
     /// quantity type, accepting the completion also inserts a
     /// `: <Type>` typing after the attribute's name — spelled as the
     /// shortest reference that resolves at the declaration's scope.
-    /// `meta` pairs each item index with the symbol's (name,
-    /// qualified) it was built from.
+    /// `meta` holds what each item was built from (see [`Offered`]).
     fn append_unit_type_edits(
         &mut self,
         docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         enc: Encoding,
         (cx, tcx): (&CompletionCx, &UnitTypeCx),
-        meta: &[(usize, String, String)],
+        meta: &[Offered],
         out: &mut [lsp_types::CompletionItem],
     ) {
         let Some(doc) = docs.get(uri) else { return };
         let text = &doc.text;
-        let at_cursor = (cx.offset as usize).min(text.len());
-        let line_end = text[at_cursor..]
+        let replacement = crate::accept::Replacement::new(text, cx);
+        let after = (replacement.end() as usize).min(text.len());
+        let line_end = text[after..]
             .find('\n')
-            .map(|i| at_cursor + i)
+            .map(|i| after + i)
             .unwrap_or(text.len());
-        // Anything after the cursor other than the closing bracket
-        // means the accepted name is only a factor of a larger unit
-        // expression — its type says nothing about the whole.
-        let rest = text[at_cursor..line_end].trim_start();
-        if !(rest.is_empty() || rest.starts_with(']')) {
+        // Anything after the accepted name other than the closing
+        // bracket — or the end of the line or of the statement, where the
+        // accept writes that bracket behind the name — means it is only a
+        // factor of a larger unit expression: its type says nothing
+        // about the whole. The accept writes the bracket only where
+        // nothing but blanks follows the statement's `;` on the line (see
+        // [`crate::autofix::statement_repairs`]); before a `}` or a
+        // comment there the bracket stays open, and a typing would
+        // declare the type of a value that does not parse.
+        let rest = text[after..line_end].trim_start();
+        let closed = rest.is_empty()
+            || rest.starts_with(']')
+            || rest
+                .strip_prefix(';')
+                .is_some_and(|tail| tail.trim().is_empty());
+        if !closed {
             return;
         }
         let mapper = Mapper::new(text, enc);
         let insert_at = mapper.range(Span::new(tcx.name_end, tcx.name_end));
-        let Some(session) =
-            self.completion_session(docs, uri, Span::new(cx.stmt_start, offset32(line_end)))
-        else {
-            return;
-        };
-        let Some(unit) = Self::unit_of_static(uri, session) else {
-            return;
-        };
-        let resolved = session.resolved();
-        // The declaration's resolution scope: the innermost enclosing
-        // declaration's body, the root namespace as the fallback.
-        let at = cx.stmt_start;
-        let mut enclosing: Vec<(ElementRef, u32)> = resolved
-            .user_elements()
-            .filter_map(|e| {
-                let (u, span) = resolved.member_extent(e)?;
-                (u == unit && span.start <= at && at <= span.end).then(|| (e, span.len()))
-            })
-            .collect();
-        enclosing.sort_by_key(|&(_, len)| len);
-        let scope = enclosing
-            .iter()
-            .find_map(|&(e, _)| resolved.element_scope(e))
-            .unwrap_or_else(|| resolved.root_scope());
-        for (idx, name, qualified) in meta {
-            let range =
-                crate::autoimport::replace_range_for(text, cx.partial_start, cx.offset, name);
-            let interior = text
-                .get(tcx.bracket_open as usize + 1..range.start as usize)
-                .map(str::trim);
-            if interior != Some("") {
-                continue;
-            }
-            let Some(elem) = resolved.resolve_qualified(qualified) else {
-                continue;
-            };
-            let mut types: Vec<ElementRef> = Vec::new();
-            for def in resolved.typings(elem) {
-                for t in resolved.quantity_types_for_unit_def(def) {
-                    if !types.contains(&t) {
-                        types.push(t);
+        let cut = crate::salvage::typed_statement_cut(text, cx.stmt_start, cx.offset);
+        let dialect = crate::dialect_of(uri);
+        let spellings = self.cut_answer(docs, uri, cut, |at| {
+            let unit_of: HashMap<String, usize> = at
+                .session
+                .units()
+                .map(|(i, name, _)| (name.to_string(), i))
+                .collect();
+            let resolved = at.session.resolved();
+            let enclosing = crate::receiver::enclosing_declarations(resolved, at.unit, at.at);
+            at.needs.scopes(&enclosing);
+            // The declaration's resolution scope: the innermost enclosing
+            // declaration's body, the root namespace as the fallback.
+            let scope = enclosing
+                .iter()
+                .find_map(|&e| resolved.element_scope(e))
+                .unwrap_or_else(|| resolved.root_scope());
+            let mut spellings = Vec::new();
+            let mut tops = None;
+            for (idx, name, qualified, site) in meta {
+                let start = replacement.start_for(text, name);
+                let interior = text
+                    .get(tcx.bracket_open as usize + 1..start as usize)
+                    .map(str::trim);
+                if interior != Some("") {
+                    continue;
+                }
+                let site = site.as_deref();
+                let Some(elem) = declared_element(resolved, qualified, site, &unit_of, &mut tops)
+                else {
+                    continue;
+                };
+                at.needs.read(elem);
+                let mut types: Vec<ElementRef> = Vec::new();
+                for def in resolved.typings(elem) {
+                    for t in resolved.quantity_types_for_unit_def(def) {
+                        if !types.contains(&t) {
+                            types.push(t);
+                        }
                     }
                 }
+                let [target] = types[..] else { continue };
+                // The spellings tried: the type's name under each of its
+                // owners', and under `ISQ`.
+                at.needs.read(target);
+                at.needs.name("ISQ");
+                let mut owner = Some(target);
+                while let Some(e) = owner {
+                    if let Some(name) = resolved.element_name(e) {
+                        at.needs.name(name);
+                    }
+                    owner = resolved.owner(e);
+                }
+                if let Some(spelling) = resolved.type_spelling_at(Some(dialect), scope, target) {
+                    spellings.push((*idx, spelling));
+                }
             }
-            let [target] = types[..] else { continue };
-            let dialect = Some(crate::dialect_of(uri));
-            let Some(spelling) = resolved.type_spelling_at(dialect, scope, target) else {
-                continue;
-            };
-            out[*idx]
+            Some(spellings)
+        });
+        for (idx, spelling) in spellings.unwrap_or_default() {
+            out[idx]
                 .additional_text_edits
                 .get_or_insert_with(Vec::new)
                 .push(TextEdit {
@@ -1870,27 +2938,334 @@ impl Nav {
         }
     }
 
+    /// The features in scope at the statement being completed that a
+    /// position names besides the symbol tables' names (see
+    /// [`crate::site::Members`]): those the enclosing element inherits —
+    /// through its specializations and typings, and from the library
+    /// base every element of its kind implicitly specializes — and, for
+    /// [`crate::site::Members::Scope`], its own.
+    ///
+    /// The element's own body is read off the live text: its own
+    /// features are the ones it declares now, and a feature an earlier
+    /// statement redefines — explicitly, or by declaring the same name —
+    /// is no inherited member any longer. What it inherits depends on
+    /// the text outside its body alone (see [`Self::inherited_members`]).
+    /// Empty when the statement sits in no declaration.
+    fn scope_members(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cx: &CompletionCx,
+        members: crate::site::Members,
+    ) -> Vec<ScopeMember> {
+        use crate::site::Members;
+        if members == Members::None {
+            return Vec::new();
+        }
+        let Some(doc) = docs.get(uri) else {
+            return Vec::new();
+        };
+        let text = Arc::clone(&doc.text);
+        let parse = if crate::is_kerml(uri.path().as_str()) {
+            sysmlv2_parser::parser::parse_kerml_source(&text)
+        } else {
+            sysmlv2_parser::parser::parse_source(&text)
+        };
+        let (around, body) = crate::kinds::enclosing(&parse.unit, cx.stmt_start);
+        // At a unit's top level no type encloses the statement: nothing
+        // to name, and no session to build for it.
+        let Some(innermost) = around.last() else {
+            return Vec::new();
+        };
+        // A package inherits nothing.
+        let inherited = if innermost.decl == crate::kinds::Decl::Namespace {
+            Vec::new()
+        } else {
+            // The member the live text reads the statement in.
+            let statement = body
+                .iter()
+                .find(|m| m.span.start <= cx.stmt_start && cx.stmt_start < m.span.end)
+                .map(|m| m.span);
+            self.inherited_members(docs, uri, cx, &text, &around, statement)
+        };
+        let own = crate::kinds::body_features(body, cx.stmt_start);
+        let mut out = Vec::new();
+        if members == Members::Scope {
+            let path: Option<Vec<&str>> = around.iter().map(|e| e.name.as_deref()).collect();
+            let path = path.map(|p| p.join("::"));
+            for (name, decl) in &own {
+                // A redefinition declaring no kind of its own (`ref :>>
+                // start`) ranks, and shows, as the feature it redefines.
+                let redefined = inherited.iter().find(|m| m.name == *name);
+                use sysmlv2_parser::ast::UsageKind as U;
+                let kindless = matches!(
+                    decl,
+                    crate::kinds::Decl::Usage(U::Default | U::Ref | U::Feature)
+                );
+                let (decl, kind) = match redefined {
+                    Some(m) if kindless => (m.decl, m.kind),
+                    Some(m) => (*decl, m.kind),
+                    None => (*decl, lsp_types::CompletionItemKind::PROPERTY),
+                };
+                out.push(ScopeMember {
+                    qualified: path.as_ref().map(|p| format!("{p}::{name}")),
+                    name: name.clone(),
+                    decl,
+                    kind,
+                    library: false,
+                });
+            }
+        }
+        // What the live body redefines — explicitly, or by declaring the
+        // same name — is no inherited member any longer.
+        let mut redefined = crate::kinds::redefined_names(body, cx.stmt_start);
+        redefined.extend(own.into_iter().map(|(name, _)| name));
+        out.extend(
+            inherited
+                .into_iter()
+                .filter(|m| !redefined.contains(&m.name)),
+        );
+        out
+    }
+
+    /// What the innermost of the declarations `around` the statement
+    /// being completed in `uri` inherits (see [`Self::scope_members`]).
+    ///
+    /// That depends on the text outside the element's own body alone —
+    /// its header, its supertypes wherever they are declared — so the
+    /// answer is kept by that text: the other open documents', the
+    /// seeded units' no open document shadows, and this one's before and
+    /// after the body. Edits inside the body, session rebuilds, and a
+    /// re-seed changing only open documents' copies leave it; any edit
+    /// outside asks again. The units a workspace root's walk reads from
+    /// disk are not in the key: a change there, made outside the editor,
+    /// surfaces with the next edit elsewhere. It is
+    /// read off the most recent session already built — the completion
+    /// tier's or navigation's — whose text outside the body is the live
+    /// one, finding the element by the qualified name the live text
+    /// gives it (one with no name, or where the lookup fails, by where
+    /// it is declared), else off a completion session built for the
+    /// statement (see [`Self::completion_session`]), which salvages
+    /// syntax errors elsewhere. Empty when that does not build either.
+    fn inherited_members(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cx: &CompletionCx,
+        text: &str,
+        around: &[crate::kinds::Enclosing],
+        statement: Option<Span>,
+    ) -> Vec<ScopeMember> {
+        let Some(innermost) = around.last() else {
+            return Vec::new();
+        };
+        let (before, after) = outside_body(text, innermost.span);
+        let key = member_key(docs, uri, text, (before, after), around, &self.seed_hashes);
+        if let Some(i) = self.member_cache.iter().position(|(k, _)| *k == key) {
+            let entry = self.member_cache.remove(i);
+            let found = entry.1.clone();
+            self.member_cache.insert(0, entry);
+            return found;
+        }
+        let Some(found) = self.read_inherited(docs, uri, cx, around, statement, (before, after))
+        else {
+            return Vec::new();
+        };
+        self.member_cache.insert(0, (key, found.clone()));
+        self.member_cache.truncate(MEMBER_CACHE);
+        found
+    }
+
+    /// [`Self::inherited_members`] off a session: a built one whose text
+    /// outside the element's body — `before` and `after` bytes of this
+    /// document, every other unit whole — is the live one's, the most
+    /// recent first, else one built for the statement. The element is
+    /// the one the live text encloses the statement in (see
+    /// [`built_inherited`]).
+    fn read_inherited(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cx: &CompletionCx,
+        around: &[crate::kinds::Enclosing],
+        statement: Option<Span>,
+        (before, after): (usize, usize),
+    ) -> Option<Vec<ScopeMember>> {
+        let mut fp: Vec<(String, i32)> = docs
+            .iter()
+            .map(|(u, d)| (u.to_string(), d.version))
+            .collect();
+        fp.sort();
+        let now = self.assemble_sources(docs, &fp);
+        let name = uri.to_string();
+        // The text outside the body tells nothing of a statement salvaged
+        // into the body itself.
+        for kind in self
+            .built_by_recency()
+            .into_iter()
+            .filter(|kind| !kind.salvages_statements())
+        {
+            let Some((session, built)) = self.built_mut(kind) else {
+                continue;
+            };
+            if !outside_unchanged(built, &now, &name, before, after) {
+                continue;
+            }
+            let unit = Self::unit_of_static(uri, session);
+            if let Some(found) = built_inherited(session.resolved(), around, unit) {
+                return Some(found);
+            }
+        }
+        let typed =
+            crate::salvage::typed_statement_cut(&docs.get(uri)?.text, cx.stmt_start, cx.offset);
+        // A build that fails is not tried again with another cut: what
+        // failed it is elsewhere.
+        let session = self.completion_session(docs, uri, typed)?;
+        if let Some(unit) = Self::unit_of_static(uri, session) {
+            if let Some(found) = built_inherited(session.resolved(), around, Some(unit)) {
+                return Some(found);
+            }
+        }
+        // Cut where its tokens end it, the statement can leave the rest of
+        // the document past salvaging, out of the model — a transition's
+        // `then` after the `}` of its `do` action reads as a statement of
+        // its own, and the transition is left without it — or the element
+        // out of it: then the member the live text reads the statement in
+        // goes whole, in a session of its own, for the statement's stays
+        // where the other tiers read it; and where that one names nothing
+        // either, it is not built again for the same text.
+        let member = statement.filter(|&s| s != typed)?;
+        let (sources, key) = self.cut_sources(docs, uri, member);
+        if self.member_cut_failed == Some(key) {
+            return None;
+        }
+        let found = self
+            .build_tolerant_session(sources)
+            .and_then(|mut session| {
+                let unit = Self::unit_of_static(uri, &session)?;
+                built_inherited(session.resolved(), around, Some(unit))
+            });
+        if found.is_none() {
+            self.member_cut_failed = Some(key);
+        }
+        found
+    }
+
     /// Completion. Position-aware where it matters:
+    /// - nothing inside a comment, a note, a documentation body, or a
+    ///   string literal, nor inside a number or at a range bound
+    ///   (`5.`, `[0..`) — not even when a trigger character opened the
+    ///   request;
+    /// - where the word being typed is a name the statement declares
+    ///   (`part def Boat`, `in item fuel`, an enumeration literal),
+    ///   only the keywords that may stand in its place (`part` →
+    ///   `def`), never an existing element's name;
+    /// - after a member-access dot (`tank.`, `wheels#(1).`, `f(x).`),
+    ///   only the members the receiver reaches — none when it does not
+    ///   resolve (see [`Self::chain_member_completions`]);
+    /// - inside a quantity's unit bracket (`5.5 [`), only units, those of
+    ///   the declared quantity first; inside any other bracket, a
+    ///   multiplicity above all, nothing until a name is typed (see
+    ///   [`Self::bracket_completions`]);
+    /// - elsewhere the position decides which keywords of the
+    ///   document's dialect and which kinds of element are offered, and
+    ///   ranks them (`sortText`): after `part p :` the part definitions,
+    ///   then the other structures, then namespaces; after `=` features,
+    ///   invocable definitions, and literal keywords, measurement units
+    ///   last — first where the statement's type is a unit type; at a
+    ///   statement's start the keywords its body takes (see
+    ///   [`crate::site`]); where it names the enclosing element's
+    ///   features — a redefinition, a succession, a usage's subsetting, a
+    ///   metadata body — those first: its body read off the live text,
+    ///   what it inherits off a model current outside that body (see
+    ///   [`Self::scope_members`]); within a group, shorter names first;
     /// - after a qualifier (`Foo::`), only the members of `Foo`
     ///   (workspace and library), matched by qualified-path suffix;
     /// - inside an `import` statement's path, symbols at any depth are
     ///   offered by simple name and accepting one inserts its full
     ///   qualified path over the typed partial word (a `textEdit`), so
     ///   the import actually resolves;
-    /// - everywhere else, the position-blind list: keyword
-    ///   vocabulary + workspace names + library packages and their
-    ///   direct members.
+    /// - a position the statement does not tell apart takes every
+    ///   keyword of the dialect, every workspace name, and the library's
+    ///   packages and their direct members.
+    ///
+    /// Multi-word library names — units and the like, see
+    /// [`QualifiedSymbol::is_multiword_library_name`] — are offered
+    /// only inside an open bracket, where a unit is written; never in
+    /// an import path. A qualifier (`Foo::`) still lists them.
+    ///
+    /// Operator functions (`'+'`, `'not'`, see
+    /// [`QualifiedSymbol::is_operator_function`]) are written as
+    /// operators, never by name: only a qualifier lists them.
+    ///
+    /// With the items comes whether the list is to be sent incomplete,
+    /// for the client to ask again as the user types: in a quantity's
+    /// unit bracket, a list read with a `]` right after the cursor
+    /// closing the bracket, since what its accepts write depends on that
+    /// `]` — the bracket's repair, whether a unit is the bracket's whole
+    /// content. Editors add the `]` with the `[`, and the user may delete
+    /// it and type on; a client refiltering the list it has would accept
+    /// an item read with the `]` still there.
     pub fn completions(
         &mut self,
         docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
         offset: Option<u32>,
         enc: Encoding,
+    ) -> (Vec<lsp_types::CompletionItem>, bool) {
+        let dialect = crate::dialect_of(uri);
+        let cx = offset.and_then(|o| {
+            docs.get(uri)
+                .map(|d| completion_context(&d.text, o, dialect))
+        });
+        // Only a quantity's unit bracket: a name typed into a bound or a
+        // filter would ask again for the flat list — thousands of names —
+        // at every keystroke.
+        let incomplete = cx.as_ref().zip(docs.get(uri)).is_some_and(|(cx, d)| {
+            cx.in_bracket
+                && {
+                    let end = crate::accept::Replacement::new(&d.text, cx).end() as usize;
+                    d.text
+                        .get(end..)
+                        .is_some_and(|rest| rest.trim_start_matches([' ', '\t']).starts_with(']'))
+                }
+                && matches!(
+                    crate::units::bracket_at(&d.text, cx, dialect),
+                    Some(crate::units::Bracket::Unit { .. })
+                )
+        });
+        (self.completion_items(docs, uri, cx, enc), incomplete)
+    }
+
+    /// The items [`Self::completions`] offers with the cursor where `cx`
+    /// reads it.
+    fn completion_items(
+        &mut self,
+        docs: &BTreeMap<Uri, Document>,
+        uri: &Uri,
+        cx: Option<CompletionCx>,
+        enc: Encoding,
     ) -> Vec<lsp_types::CompletionItem> {
         use lsp_types::{CompletionItem, CompletionItemKind};
-        // Copied out: the symbol iterators below hold `self` borrows.
-        let snippets = self.snippet_completions;
-        let cx = offset.and_then(|o| docs.get(uri).map(|d| completion_context(&d.text, o)));
+        let dialect = crate::dialect_of(uri);
+        // What the position takes: the default list below offers only
+        // these keywords and names, in this order.
+        let open = crate::site::Want::open(dialect);
+        let want = match cx.as_ref().map(|cx| &cx.slot) {
+            Some(crate::site::Slot::Quiet) => return Vec::new(),
+            Some(crate::site::Slot::Declared(keywords)) => {
+                return keywords
+                    .iter()
+                    .map(|kw| CompletionItem {
+                        label: kw.to_string(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+            Some(crate::site::Slot::Want(want)) => want,
+            Some(crate::site::Slot::Open) | None => &open,
+        };
         // Unit-typing context (see `append_unit_type_edits`), decided
         // once per request.
         let unit_type_cx = self
@@ -1914,46 +3289,168 @@ impl Nav {
         let is_phantom =
             |s: &QualifiedSymbol| partial_pos.is_some_and(|pos| s.declared_at(&uri_str, pos));
 
-        // Feature-chain context (`tank.` / `tank.liq`): the members the
-        // chain step could actually reach, from the semantic session. A
-        // prefix the session cannot resolve falls through to the
-        // position-blind list below.
-        if let Some(cx) = cx.as_ref().filter(|cx| !cx.dot_chain.is_empty()) {
-            if let Some(items) = self.chain_member_completions(docs, uri, cx, enc, snippets) {
-                return items;
-            }
+        // Member access (`tank.` / `tank.liq` / `wheels#(1).` / `f(x).`):
+        // the members the receiver could actually reach, from the
+        // semantic session — nothing when it reaches none.
+        if let Some(items) = cx
+            .as_ref()
+            .and_then(|cx| self.chain_member_completions(docs, uri, cx, enc))
+        {
+            return items;
         }
 
-        // Qualifier context: members of the qualified namespace only.
+        // Inside a `[`: a quantity's unit bracket lists units, the
+        // declared quantity's first; a multiplicity lists nothing.
+        if let Some(items) = cx
+            .as_ref()
+            .and_then(|cx| self.bracket_completions(docs, uri, cx, enc, unit_type_cx.as_ref()))
+        {
+            return items;
+        }
+
+        // Qualifier context: the members the qualified namespace makes
+        // visible — its own first, since they hide what an import
+        // brings in under the same name, then what its public imports
+        // bring in (`ISQ::` lists `MassValue`, which `ISQ` re-exports
+        // from `ISQBase`). A re-exported member carries no documentation
+        // here — a facade re-exports thousands, and each is documented
+        // where its own namespace lists it.
         if let Some(cx) = cx.as_ref().filter(|cx| !cx.qualifier.is_empty()) {
             let path = cx.qualifier.join("::");
-            let quoting = docs.get(uri).map(|d| (Mapper::new(&d.text, enc), &d.text));
+            let accept = docs.get(uri).map(|d| self.accept(&d.text, uri, cx, enc));
             let mut out: Vec<CompletionItem> = Vec::new();
-            let mut meta: Vec<(usize, String, String)> = Vec::new();
+            let mut meta: Vec<Offered> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let ws = self.all_workspace_symbols(docs, enc);
-            for s in ws.iter().chain(self.library_symbols()) {
+            let ws = self.all_workspace_symbols(docs, uri, enc);
+            // An `import all` names the members whatever their visibility,
+            // and what every import of the namespace brings in.
+            let import_all = docs
+                .get(uri)
+                .is_some_and(|d| imports_all(&d.text, cx.partial_start));
+            // A private member only from inside its namespace, and a
+            // member of a private one only from inside the namespace
+            // owning that: the document is read for that only when one
+            // comes up.
+            let parsed = std::cell::OnceCell::new();
+            let inside = |ns: &str| {
+                let Some(doc) = docs.get(uri) else {
+                    return false;
+                };
+                let parse = parsed.get_or_init(|| {
+                    if crate::is_kerml(uri.path().as_str()) {
+                        sysmlv2_parser::parser::parse_kerml_source(&doc.text)
+                    } else {
+                        sysmlv2_parser::parser::parse_source(&doc.text)
+                    }
+                });
+                let partial = Span::new(cx.partial_start, cx.offset);
+                crate::autoimport::AutoImport::new(&doc.text, &parse.unit, cx.offset, partial)
+                    .inside(ns)
+            };
+            let visible = |s: &QualifiedSymbol| {
+                if s.enclosed().is_some_and(|ns| !inside(ns)) {
+                    return false;
+                }
+                if s.public || import_all {
+                    return true;
+                }
+                s.site.is_some() && s.parent().is_some_and(inside)
+            };
+            self.library_symbols();
+            let unit_types =
+                crate::kinds::unit_types(None, &self.library_unit_types, definitions(ws.iter()));
+            let unit_group = want.unit_group(&unit_types);
+            let owned = ws
+                .iter()
+                .chain(self.library_symbols())
+                .filter(|s| s.is_member_of(&path) && visible(s))
+                .map(|s| (s, true));
+            let access = if import_all {
+                Access::Inside
+            } else {
+                Access::Clients
+            };
+            let reexported = ws
+                .reexported_members(&path, access)
+                .into_iter()
+                .map(|s| (s, false));
+            // Ranked as names anywhere else, the position read off the
+            // text ahead of the qualified name: by its groups — measurement
+            // units by the statement's type at an operand — what it does
+            // not take after everything it does, then the workspace's
+            // ahead of the library's, then shorter labels first
+            // (`attribute x : ISQ::` puts `MassValue` among the first, its
+            // quantity features after every definition). A qualifier names
+            // the namespace: none of its members is left out.
+            let mut ranked: Vec<(u8, Option<&str>)> = Vec::new();
+            for (s, own) in owned.chain(reexported) {
                 if is_phantom(s) {
                     continue;
                 }
-                if s.is_member_of(&path) && seen.insert(s.name.clone()) {
-                    let (text_edit, repair, insert_text_format) = match &quoting {
-                        Some((mapper, text)) => {
-                            item_edits(text, mapper, cx, crate::dialect_of(uri), &s.name, snippets)
-                        }
-                        None => (None, None, None),
-                    };
-                    meta.push((out.len(), s.name.clone(), s.qualified.clone()));
-                    out.push(CompletionItem {
-                        label: crate::outline::spell_name(&s.name),
-                        kind: Some(s.kind),
-                        detail: Some(s.qualified.clone()),
-                        documentation: s.documentation(),
-                        text_edit,
-                        additional_text_edits: repair.map(|e| vec![e]),
-                        insert_text_format,
-                        ..Default::default()
+                let workspace = s.site.is_some();
+                let group = want
+                    .group(s.decl, workspace)
+                    .map_or(9, |group| match unit_group {
+                        Some(units) if s.is_unit(&unit_types) => units,
+                        _ => group,
                     });
+                if seen.insert(s.name.clone()) {
+                    let edits = accept.as_ref().map(|a| a.name(&s.name)).unwrap_or_default();
+                    meta.push(offered(out.len(), s));
+                    let source = if workspace { 0 } else { 2 };
+                    let label = crate::outline::spell_name(&s.name);
+                    ranked.push((group, s.long.as_deref()));
+                    out.push(edits.fill(
+                        CompletionItem {
+                            sort_text: Some(crate::site::sort_text(
+                                crate::site::name_key(group, source, want.tier(s.decl)),
+                                &label,
+                            )),
+                            label,
+                            kind: Some(s.kind),
+                            detail: Some(s.qualified.clone()),
+                            documentation: own.then(|| s.documentation()).flatten(),
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    ));
+                }
+            }
+            // Only the best group keeps the typed word's whole match of a
+            // label of one or two characters (see [`unmatched_whole`]).
+            if let Some(best) = ranked.iter().map(|&(group, _)| group).min() {
+                for (item, &(group, long)) in out.iter_mut().zip(&ranked) {
+                    if group > best && item.label.chars().count() <= 2 {
+                        item.filter_text = Some(unmatched_whole(
+                            item.filter_text.as_deref().unwrap_or(&item.label),
+                            long.unwrap_or(&item.label),
+                        ));
+                    }
+                }
+            }
+            // An import or expose path can name the members themselves:
+            // `*`, and `**` for everything below them.
+            let path_statement = docs
+                .get(uri)
+                .is_some_and(|d| in_import_path(&d.text, cx.partial_start));
+            if path_statement && !out.is_empty() {
+                for (wildcard, detail) in [
+                    ("*", format!("every member of {path}")),
+                    ("**", format!("every member of {path}, recursively")),
+                ] {
+                    let edits = accept
+                        .as_ref()
+                        .map(|a| a.spelled(wildcard, wildcard.to_string()))
+                        .unwrap_or_default();
+                    out.push(edits.fill(
+                        CompletionItem {
+                            label: wildcard.to_string(),
+                            kind: Some(CompletionItemKind::OPERATOR),
+                            detail: Some(detail),
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    ));
                 }
             }
             if let Some(tcx) = unit_type_cx.as_ref() {
@@ -1963,69 +3460,74 @@ impl Nav {
         }
 
         // Import context: everything importable, inserted as its full
-        // qualified path so the reference resolves from the root.
+        // qualified path so the reference resolves from the root — the
+        // path the symbol tables choose, which may run through a
+        // re-exporting package (`ISQ::MassValue`).
         if let (Some(cx), Some(doc)) = (cx.as_ref().filter(|cx| cx.import), docs.get(uri)) {
-            let mapper = Mapper::new(&doc.text, enc);
-            let replace = mapper.range(Span::new(cx.partial_start, cx.offset));
-            // Statement repairs (the import statement's own `;`) —
-            // identical for every item: the replace range is the
-            // partial word regardless of candidate.
-            let repairs = crate::autofix::statement_repairs(
-                &doc.text,
-                cx.stmt_start,
-                cx.partial_start,
-                cx.offset,
-            );
-            let (suffix, repair) = match repairs {
-                Some(r) => (
-                    r.suffix,
-                    r.insert.map(|(at, fix)| TextEdit {
-                        range: mapper.range(Span::new(at, at)),
-                        new_text: fix,
-                    }),
-                ),
-                None => (String::new(), None),
-            };
-            // The repair suffix rides every item's main edit the same
-            // way — snippet-stop the cursor ahead of it where the
-            // client allows (see `item_edits`).
-            let snippet = snippets && !suffix.is_empty();
+            let accept = self.accept(&doc.text, uri, cx, enc);
             let mut out: Vec<CompletionItem> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let ws = self.all_workspace_symbols(docs, enc);
+            let ws = self.all_workspace_symbols(docs, uri, enc);
             for s in ws.iter().chain(self.library_symbols()) {
                 // Depth cap: packages, their members, and one level
                 // below — deeper targets are reached by typing the
                 // qualifier (the branch above). Keeps the unfiltered
                 // import list from carrying the whole stdlib tree.
-                if is_phantom(s) || s.depth > 2 || !seen.insert(s.qualified.clone()) {
+                // Only what packages own: a definition's features are
+                // not imported by path.
+                if is_phantom(s)
+                    || s.depth > 2
+                    || !s.importable
+                    || s.is_multiword_library_name()
+                    || s.is_operator_function()
+                {
                     continue;
                 }
-                let qualified =
-                    crate::autoimport::escape_qualified(crate::dialect_of(uri), &s.qualified);
-                out.push(CompletionItem {
-                    label: crate::outline::spell_name(&s.name),
-                    kind: Some(s.kind),
-                    detail: Some(if s.depth == 0 {
-                        "standard library".to_string()
-                    } else {
-                        s.qualified.clone()
-                    }),
-                    documentation: s.documentation(),
-                    text_edit: Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
-                        range: replace,
-                        new_text: if snippet {
-                            format!("{}$0{suffix}", snippet_escape(&qualified))
-                        } else {
-                            format!("{qualified}{suffix}")
+                // A symbol its own or an ancestor's visibility confines
+                // only through a package re-exporting it.
+                let path = ws.import_path(&s.name, &s.qualified);
+                if (s.confined().is_some() && path == s.qualified)
+                    || !seen.insert(s.qualified.clone())
+                {
+                    continue;
+                }
+                let qualified = crate::autoimport::escape_qualified(crate::dialect_of(uri), &path);
+                let label = crate::outline::spell_name(&s.name);
+                // An import path usually names a package: packages sort
+                // ahead of the members the same word matches.
+                let package = s.kind == CompletionItemKind::MODULE;
+                out.push(accept.spelled(&s.name, qualified).fill(
+                    CompletionItem {
+                        sort_text: Some(format!("{}{label}", if package { 0 } else { 1 })),
+                        label,
+                        kind: Some(s.kind),
+                        detail: match (s.depth, &s.site) {
+                            (0, None) => Some("standard library".to_string()),
+                            (0, Some(_)) => None,
+                            _ => Some(path),
                         },
-                    })),
-                    additional_text_edits: repair.clone().map(|e| vec![e]),
-                    insert_text_format: snippet.then_some(lsp_types::InsertTextFormat::SNIPPET),
-                    ..Default::default()
-                });
+                        documentation: s.documentation(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                ));
             }
             return out;
+        }
+
+        // A position taking keywords alone — a statement's start in a
+        // body that takes no names — needs no symbol table.
+        if want.names.is_none() {
+            return want
+                .keywords
+                .iter()
+                .map(|&(kw, key)| CompletionItem {
+                    label: kw.to_string(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    sort_text: Some(crate::site::sort_text(key, kw)),
+                    ..Default::default()
+                })
+                .collect();
         }
 
         // Position-blind default, with an auto-import tier: a
@@ -2044,119 +3546,263 @@ impl Nav {
             }),
             _ => None,
         };
+        let ws = self.all_workspace_symbols(docs, uri, enc);
         let auto = match (cx.as_ref(), parsed.as_ref().zip(doc)) {
-            (Some(cx), Some((p, d))) => Some(crate::autoimport::AutoImport::new(
-                &d.text,
-                &p.unit,
-                cx.offset,
-                Span::new(cx.partial_start, cx.offset),
-            )),
+            (Some(cx), Some((p, d))) => Some(
+                crate::autoimport::AutoImport::new(
+                    &d.text,
+                    &p.unit,
+                    cx.offset,
+                    Span::new(cx.partial_start, cx.offset),
+                )
+                .with_reexports(&ws),
+            ),
             _ => None,
         };
         let mapper = doc.map(|d| Mapper::new(&d.text, enc));
-        // The import edit + source annotation for a symbol offered by
-        // simple name, `None` when accepting it needs no import.
-        let import_extras = |s: &QualifiedSymbol| {
-            let (auto, mapper) = auto.as_ref().zip(mapper.as_ref())?;
-            if s.depth == 0 || !s.importable {
-                return None;
-            }
-            let (at, new_text) = auto.import_edit(&s.name, &s.qualified)?;
-            let parent = s
-                .qualified
-                .strip_suffix(s.name.as_str())?
-                .strip_suffix("::")?;
-            Some((
-                vec![TextEdit {
-                    range: mapper.range(Span::new(at, at)),
-                    new_text,
-                }],
-                lsp_types::CompletionItemLabelDetails {
-                    detail: None,
-                    description: Some(format!("import {parent}")),
-                },
-            ))
+        // The names the statement being typed declares ahead of the
+        // cursor (`attribute zz = `): none is what it names itself.
+        let statement = cx
+            .as_ref()
+            .zip(mapper.as_ref())
+            .map(|(cx, m)| (m.position(cx.stmt_start), m.position(cx.offset)));
+        let own_statement = |s: &QualifiedSymbol| {
+            statement.is_some_and(|(from, to)| s.declared_within(&uri_str, from, to))
+        };
+        // What accepting a symbol offered by simple name takes to resolve
+        // (see [`reach`]): `None` when nothing inserted gives it, so it
+        // is not offered; nothing to tell without a cursor.
+        let reached = |s: &QualifiedSymbol| match auto.as_ref() {
+            Some(auto) => reach(auto, s),
+            None => Some(None),
         };
         // Restricted names insert quoted, replacing the typed spelling.
         // The main edit (quoting + repair suffix) and the repair
-        // insertion, per item; merged with the import edit below.
-        let edits_for = |s: &QualifiedSymbol| match cx.as_ref().zip(mapper.as_ref().zip(doc)) {
-            Some((cx, (mapper, d))) => item_edits(
-                &d.text,
-                mapper,
-                cx,
-                crate::dialect_of(uri),
-                &s.name,
-                snippets,
-            ),
-            None => (None, None, None),
-        };
-        let assemble = |s: &QualifiedSymbol| {
-            let (text_edit, repair, insert_text_format) = edits_for(s);
-            let (import_edits, label_details) = match import_extras(s) {
-                Some((e, d)) => (Some(e), Some(d)),
-                None => (None, None),
+        // insertion, per item, with the import edit ahead of the repair.
+        let accept = cx
+            .as_ref()
+            .zip(doc)
+            .map(|(cx, d)| self.accept(&d.text, uri, cx, enc));
+        let assemble = |s: &QualifiedSymbol,
+                        import: Option<crate::autoimport::ImportEdit>,
+                        item: CompletionItem| {
+            let edits = accept.as_ref().map(|a| a.name(&s.name)).unwrap_or_default();
+            let extras = import
+                .zip(mapper.as_ref())
+                .and_then(|(edit, mapper)| import_for(mapper, crate::dialect_of(uri), s, edit));
+            let (imports, label_details) = match extras {
+                Some((e, d)) => (e, Some(d)),
+                None => (Vec::new(), None),
             };
-            let additional: Vec<TextEdit> =
-                import_edits.into_iter().flatten().chain(repair).collect();
-            (
-                text_edit,
-                (!additional.is_empty()).then_some(additional),
-                label_details,
-                insert_text_format,
+            edits.fill(
+                CompletionItem {
+                    label_details,
+                    ..item
+                },
+                imports,
             )
         };
-        let mut out: Vec<CompletionItem> = crate::tokens::VOCABULARY
+        // The position's keywords and names only, ranked by the
+        // position's groups (`sortText`), then by source: workspace
+        // names before the library's, and among each, names that
+        // resolve as they stand before those needing an import.
+        let mut out: Vec<CompletionItem> = want
+            .keywords
             .iter()
-            .map(|kw| CompletionItem {
+            .map(|&(kw, key)| CompletionItem {
                 label: kw.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
+                sort_text: Some(crate::site::sort_text(key, kw)),
                 ..Default::default()
             })
             .collect();
-        let mut meta: Vec<(usize, String, String)> = Vec::new();
+        let mut meta: Vec<Offered> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for s in &self.all_workspace_symbols(docs, enc) {
-            if seen.insert(s.name.clone()) {
-                let (text_edit, additional_text_edits, label_details, insert_text_format) =
-                    assemble(s);
-                meta.push((out.len(), s.name.clone(), s.qualified.clone()));
-                out.push(CompletionItem {
-                    label: crate::outline::spell_name(&s.name),
-                    kind: Some(s.kind),
-                    detail: (!s.qualified.eq(&s.name)).then(|| s.qualified.clone()),
-                    documentation: s.documentation(),
-                    text_edit,
-                    additional_text_edits,
-                    label_details,
-                    insert_text_format,
+        // Measurement units rank by the statement's type at an
+        // expression operand (see `Want::unit_group`); the unit types are
+        // the library's and those the workspace derives from them.
+        self.library_symbols();
+        let unit_types =
+            crate::kinds::unit_types(None, &self.library_unit_types, definitions(ws.iter()));
+        let unit_group = want.unit_group(&unit_types);
+        let group_of = |s: &QualifiedSymbol, workspace: bool| {
+            let group = want.group(s.decl, workspace)?;
+            Some(match unit_group {
+                Some(units) if s.is_unit(&unit_types) => units,
+                _ => group,
+            })
+        };
+        // The enclosing element's features the position names, those of
+        // the kinds it prefers ahead of every other name: names in
+        // scope, needing no import.
+        let members = match cx.as_ref() {
+            Some(cx) => self.scope_members(docs, uri, cx, want.members()),
+            None => Vec::new(),
+        };
+        // A member the symbol tables hold too takes their documentation
+        // and kind, as the same name offered from them would: the
+        // workspace's table finds the library's symbols as well.
+        let tabled = |m: &ScopeMember| ws.symbol_at(m.qualified.as_deref()?);
+        let before_members = out.len();
+        for m in &members {
+            if want.group(m.decl, !m.library) != Some(1) || !seen.insert(m.name.clone()) {
+                continue;
+            }
+            let edits = accept.as_ref().map(|a| a.name(&m.name)).unwrap_or_default();
+            let source = if m.library { 2 } else { 0 };
+            let label = crate::outline::spell_name(&m.name);
+            let known = tabled(m);
+            out.push(edits.fill(
+                CompletionItem {
+                    sort_text: Some(crate::site::sort_text(
+                        crate::site::name_key(0, source, want.tier(m.decl)),
+                        &label,
+                    )),
+                    label,
+                    kind: Some(known.map_or(m.kind, |s| s.kind)),
+                    detail: m.qualified.clone(),
+                    documentation: known.and_then(QualifiedSymbol::documentation),
                     ..Default::default()
+                },
+                Vec::new(),
+            ));
+        }
+        // An editor ranks a label the typed word matches whole ahead of
+        // every other (`m` for `m`, ahead of `mass`), whatever the order
+        // given: where the enclosing element's features are named, only
+        // they keep that for a label of one or two characters, which a
+        // letter or two typed matches whole by chance — every other such
+        // name is filtered by more than its label (see
+        // [`unmatched_whole`]). A longer name typed whole keeps its match
+        // (`mass` at `attribute m :> mass`, ahead of `massFlow`).
+        let members_named = out.len() > before_members;
+        let unit_position = cx.as_ref().zip(doc).is_some_and(|(cx, d)| {
+            matches!(
+                crate::units::bracket_at(&d.text, cx, crate::dialect_of(uri)),
+                Some(crate::units::Bracket::Unit { .. })
+            )
+        });
+        // An expression's operand outside a unit bracket takes no unit
+        // spelled apart from the names around it, one only a quoted name
+        // writes (`m/s`, `m²/(V⋅s)`): a `)` or an operator typed after a
+        // name matches its symbol, and would accept it. Its plain symbols
+        // (`kg`, `N`) stay, and while a quoted name is typed every unit
+        // does: a derived unit's definition names them so (`Btu_IT/'°F'`,
+        // `referenceUnit = 'm⋅s⁻²'`).
+        let operand = matches!(want.names, Some(crate::site::Names::Operands { .. }));
+        let typing_quoted = cx.as_ref().is_some_and(|cx| cx.quoted.is_some());
+        let spelled_apart = |s: &QualifiedSymbol| {
+            operand
+                && !unit_position
+                && !typing_quoted
+                && s.is_unit(&unit_types)
+                && sysmlv2_parser::ast::escape_name(&s.name).starts_with('\'')
+        };
+        let outranked = |s: &QualifiedSymbol, item: CompletionItem| {
+            if !members_named || item.label.chars().count() > 2 {
+                return item;
+            }
+            let filter_text = unmatched_whole(
+                item.filter_text.as_deref().unwrap_or(&item.label),
+                s.long.as_deref().unwrap_or(&item.label),
+            );
+            CompletionItem {
+                filter_text: Some(filter_text),
+                ..item
+            }
+        };
+        for s in ws.iter() {
+            let Some(group) = group_of(s, true) else {
+                continue;
+            };
+            // The statement being typed names an unnamed usage by the
+            // word typed (`satisfy Max`): that one is no candidate.
+            if seen.contains(&s.name)
+                || (s.effective && auto.is_none())
+                || is_phantom(s)
+                || own_statement(s)
+                || s.is_operator_function()
+                || spelled_apart(s)
+            {
+                continue;
+            }
+            let Some(import) = reached(s) else {
+                continue;
+            };
+            if seen.insert(s.name.clone()) {
+                meta.push(offered(out.len(), s));
+                let item = assemble(
+                    s,
+                    import,
+                    CompletionItem {
+                        label: crate::outline::spell_name(&s.name),
+                        kind: Some(s.kind),
+                        detail: (!s.qualified.eq(&s.name)).then(|| s.qualified.clone()),
+                        documentation: s.documentation(),
+                        ..Default::default()
+                    },
+                );
+                let source = u8::from(item.label_details.is_some());
+                let item = outranked(s, item);
+                out.push(CompletionItem {
+                    sort_text: Some(crate::site::sort_text(
+                        crate::site::name_key(group, source, want.tier(s.decl)),
+                        &item.label,
+                    )),
+                    ..item
                 });
             }
         }
         // Standard-library names last: workspace names shadow them. Kept
         // to packages + direct members — the full table would flood the
-        // unfiltered list.
+        // unfiltered list. Multi-word names only where a unit is written:
+        // inside a quantity's unit bracket the statement leaves open
+        // ahead of the word being completed — not a multiplicity's.
+        // Operator functions never.
         for s in self.library_symbols() {
-            if s.depth > 1 || !seen.insert(s.name.clone()) {
+            // The cheap tests first: most symbols are deeper members,
+            // and many a name is offered already.
+            if s.depth > 1 || seen.contains(&s.name) {
                 continue;
             }
-            let (text_edit, additional_text_edits, label_details, insert_text_format) = assemble(s);
-            meta.push((out.len(), s.name.clone(), s.qualified.clone()));
+            let Some(group) = group_of(s, false) else {
+                continue;
+            };
+            if spelled_apart(s)
+                || (!unit_position && s.is_multiword_library_name())
+                || s.is_operator_function()
+                || (auto.is_none() && s.is_private_library_member())
+            {
+                continue;
+            }
+            let Some(import) = reached(s) else {
+                continue;
+            };
+            seen.insert(s.name.clone());
+            meta.push(offered(out.len(), s));
+            let item = assemble(
+                s,
+                import,
+                CompletionItem {
+                    label: crate::outline::spell_name(&s.name),
+                    kind: Some(s.kind),
+                    detail: Some(if s.depth == 0 {
+                        "standard library".to_string()
+                    } else {
+                        s.qualified.clone()
+                    }),
+                    documentation: s.documentation(),
+                    ..Default::default()
+                },
+            );
+            let source = 2 + u8::from(item.label_details.is_some());
+            let item = outranked(s, item);
             out.push(CompletionItem {
-                label: crate::outline::spell_name(&s.name),
-                kind: Some(s.kind),
-                detail: Some(if s.depth == 0 {
-                    "standard library".to_string()
-                } else {
-                    s.qualified.clone()
-                }),
-                documentation: s.documentation(),
-                text_edit,
-                additional_text_edits,
-                label_details,
-                insert_text_format,
-                ..Default::default()
+                sort_text: Some(crate::site::sort_text(
+                    crate::site::name_key(group, source, want.tier(s.decl)),
+                    &item.label,
+                )),
+                ..item
             });
         }
         if let (Some(cx), Some(tcx)) = (cx.as_ref(), unit_type_cx.as_ref()) {
@@ -2556,15 +4202,24 @@ pub struct LintFixSet {
 }
 
 /// Flatten one document's outline into (name, kind, range) triples for
-/// `workspace/symbol`.
+/// `workspace/symbol`. The `import` and `expose` members (`imports`, by
+/// start; see [`crate::outline::Plumbing`]) declare nothing and are
+/// left out, and so are anonymous members (`«part»`), which have no
+/// name to search for — the named members inside them stay. The
+/// outline keeps both.
 pub fn flatten_symbols(
     symbols: &[lsp_types::DocumentSymbol],
     uri: &Uri,
     query: &str,
+    imports: &std::collections::HashSet<Position>,
     out: &mut Vec<lsp_types::SymbolInformation>,
 ) {
     for s in symbols {
-        if query.is_empty() || s.name.to_lowercase().contains(&query.to_lowercase()) {
+        if imports.contains(&s.range.start) {
+            continue;
+        }
+        let named = !s.name.starts_with('«');
+        if named && (query.is_empty() || s.name.to_lowercase().contains(&query.to_lowercase())) {
             #[allow(deprecated)]
             out.push(lsp_types::SymbolInformation {
                 name: crate::outline::spell_name(&s.name),
@@ -2579,7 +4234,7 @@ pub fn flatten_symbols(
             });
         }
         if let Some(children) = &s.children {
-            flatten_symbols(children, uri, query, out);
+            flatten_symbols(children, uri, query, imports, out);
         }
     }
 }
@@ -2857,13 +4512,28 @@ fn collect_import_runs(
     }
 }
 
+/// The filter text of an item ranked below the best group a list holds:
+/// `filter` — its label, or the text it is filtered by already — then
+/// `_` and `tail`, the name it is spelled for (`K_kelvin`, `m_metre`) or
+/// its label again. An editor ranks a label the typed word matches whole
+/// ahead of every other (`K` for `k`, ahead of `kg`), whatever the order
+/// the server gives; this one the word matches no more than in part, so
+/// the order given decides. No whitespace: a typed space still closes
+/// the list.
+fn unmatched_whole(filter: &str, tail: &str) -> String {
+    format!("{filter}_{}", tail.replace(char::is_whitespace, "_"))
+}
+
 /// A named symbol with its `::`-qualified path, flattened from an
 /// outline tree. `depth` counts nesting from the unit root (0 = a
 /// top-level package). Workspace symbols carry their declaration site
-/// (`uri` + name span) so completion can drop the phantom symbol the
-/// half-typed statement itself declares — `private import Real` parses
-/// as a member named `Real`, and offering it back (qualified into its
-/// accidental owner) would outrank the real target.
+/// (`uri` + name span) so the import and qualifier branches of
+/// completion can drop the phantom symbol the half-typed statement
+/// itself declares — an import missing its `;` runs on into the next
+/// statement (`private import Kit::*` ⏎ `part def Widg|;`), which
+/// declares the very word being typed, and offering that back
+/// (qualified into its accidental owner) would outrank the real
+/// target.
 #[derive(Clone)]
 pub(crate) struct QualifiedSymbol {
     name: String,
@@ -2879,9 +4549,46 @@ pub(crate) struct QualifiedSymbol {
     site: Option<(String, lsp_types::Range)>,
     /// The declaration's `doc` body, display-normalized.
     doc: Option<String>,
+    /// Named by an operator and naming a function
+    /// ([`Self::is_operator_function`]).
+    operator: bool,
+    /// Declared without `private` or `protected`: a member of its
+    /// namespace for clients outside it too, which a public import of
+    /// the namespace re-exports.
+    public: bool,
+    /// What the declaration is: completion admits and ranks candidates
+    /// by it.
+    decl: crate::kinds::Decl,
+    /// The types the declaration names, last segment only (see
+    /// [`crate::kinds::Declared::types`]).
+    types: Vec<String>,
+    /// The declared name, for an entry spelled by its short name (`m`
+    /// for `metre`).
+    long: Option<String>,
+    /// What an alias names, as written: the symbol table it is indexed
+    /// in takes it as its target (see [`SymbolTable`]).
+    alias: Option<Box<crate::outline::Written>>,
+    /// The length of the path, a prefix of `qualified`, of the
+    /// namespace owning the innermost of the symbol's ancestors that is
+    /// private or protected: outside it, no path through that ancestor
+    /// names the symbol (see [`Self::enclosed`]).
+    enclosed: Option<u32>,
+    /// A usage without a name of its own, found by the name of the
+    /// feature it redefines or references (see
+    /// [`crate::outline::Plumbing::effective`]): a recursive import
+    /// brings it in, but nothing it holds.
+    effective: bool,
 }
 
 impl QualifiedSymbol {
+    /// Does this symbol name a measurement unit — a usage typed by one
+    /// of `unit_types` (see [`crate::kinds::unit_types`]), or an alias
+    /// of one?
+    fn is_unit(&self, unit_types: &std::collections::HashSet<String>) -> bool {
+        matches!(self.decl, crate::kinds::Decl::Usage(_))
+            && self.types.iter().any(|t| unit_types.contains(t))
+    }
+
     /// The symbol's doc body as completion-item documentation.
     fn documentation(&self) -> Option<lsp_types::Documentation> {
         self.doc.as_ref().map(|d| {
@@ -2891,6 +4598,61 @@ impl QualifiedSymbol {
             })
         })
     }
+
+    /// A library name containing whitespace. In the standard library
+    /// these are measurement vocabulary: units and their aliases
+    /// (`'metric ton'`), measurement scales, and the systems of units
+    /// and quantities; a library a host supplies is held to the same
+    /// rule. Offered only where a unit is written: anywhere else they
+    /// are noise, some 380 labels in every response.
+    fn is_multiword_library_name(&self) -> bool {
+        self.site.is_none() && self.name.chars().any(char::is_whitespace)
+    }
+
+    /// The qualified path of the namespace owning the symbol; `None` at
+    /// the root.
+    fn parent(&self) -> Option<&str> {
+        self.qualified
+            .strip_suffix(self.name.as_str())?
+            .strip_suffix("::")
+    }
+
+    /// The namespace outside which an ancestor's visibility keeps the
+    /// symbol from being named by its path: the one owning the innermost
+    /// ancestor that is private or protected. `None` when none is.
+    fn enclosed(&self) -> Option<&str> {
+        self.enclosed.map(|n| &self.qualified[..n as usize])
+    }
+
+    /// The namespace outside which the symbol cannot be named by its
+    /// path: its own when it is private or protected, else the one its
+    /// ancestors keep it in ([`Self::enclosed`]). `None` when it can be
+    /// named anywhere.
+    fn confined(&self) -> Option<&str> {
+        if self.public {
+            self.enclosed()
+        } else {
+            Some(self.parent().unwrap_or_default())
+        }
+    }
+
+    /// A private or protected member of a library namespace: no name a
+    /// model can use.
+    fn is_private_library_member(&self) -> bool {
+        self.site.is_none() && !self.public
+    }
+
+    /// A function named by an operator of the expression notation —
+    /// a run of punctuation (`'+'`, `'['`, `'..'`) or a reserved word
+    /// (`'not'`, `'xor'`, `'implies'`) — or an alias naming one
+    /// (`alias '*' for scalarVectorMult;`). The notation writes it as
+    /// that operator and never by name, so only a qualifier offers it.
+    /// The element decides, not the spelling: a unit spelled with a
+    /// symbol is no function, and a function whose quoted name holds a
+    /// word (`'cartesian+'`) is a name like any other.
+    fn is_operator_function(&self) -> bool {
+        self.operator
+    }
 }
 
 impl QualifiedSymbol {
@@ -2899,6 +4661,19 @@ impl QualifiedSymbol {
     fn declared_at(&self, uri: &str, pos: lsp_types::Position) -> bool {
         match &self.site {
             Some((u, range)) => u == uri && range.start <= pos && pos <= range.end,
+            None => false,
+        }
+    }
+
+    /// Is the symbol declared in `uri` between `from` and `to`?
+    fn declared_within(
+        &self,
+        uri: &str,
+        from: lsp_types::Position,
+        to: lsp_types::Position,
+    ) -> bool {
+        match &self.site {
+            Some((u, range)) => u == uri && from <= range.start && range.end <= to,
             None => false,
         }
     }
@@ -2916,7 +4691,9 @@ impl QualifiedSymbol {
         else {
             return false;
         };
-        parent == path || parent.ends_with(&format!("::{path}"))
+        parent
+            .strip_suffix(path)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with("::"))
     }
 }
 
@@ -2942,15 +4719,24 @@ fn completion_kind(k: lsp_types::SymbolKind) -> lsp_types::CompletionItemKind {
         SymbolKind::FIELD => CompletionItemKind::FIELD,
         SymbolKind::CONSTANT => CompletionItemKind::CONSTANT,
         SymbolKind::FILE => CompletionItemKind::FILE,
-        SymbolKind::KEY => CompletionItemKind::KEYWORD,
+        // Metadata definitions and usages: keywords alone carry the
+        // keyword kind, and no other symbol completes as a reference.
+        SymbolKind::KEY => CompletionItemKind::REFERENCE,
         SymbolKind::OBJECT | SymbolKind::STRING => CompletionItemKind::VALUE,
         _ => CompletionItemKind::VARIABLE,
     }
 }
 
-/// Flatten an outline tree into qualified symbols. Anonymous
+/// Flatten an outline tree into qualified symbols, the nodes at this
+/// level kept by their ancestors inside the namespace `enclosed` gives
+/// the length of (see [`QualifiedSymbol::enclosed`]). Anonymous
 /// (`«keyword»`) members have no referenceable name — their subtrees
 /// are skipped, since a qualified path through them would not resolve.
+/// Neither are the `import` and `expose` members (see
+/// [`crate::outline::Plumbing`]): the outline lists them under their
+/// target's spelling, but they declare nothing — an `import SI::m;` in
+/// `P` is no member `P::SI::m`. The imports are recorded in `links`
+/// instead, against the namespace they sit in.
 #[allow(clippy::too_many_arguments)] // one recursive walk, one context set
 fn collect_qualified(
     nodes: &[lsp_types::DocumentSymbol],
@@ -2960,44 +4746,101 @@ fn collect_qualified(
     uri: Option<&str>,
     docs: &HashMap<lsp_types::Position, String>,
     shorts: &HashMap<lsp_types::Position, String>,
+    plumbing: &mut crate::outline::Plumbing,
+    links: &mut Links,
+    decls: &HashMap<lsp_types::Position, crate::kinds::Declared>,
+    enclosed: Option<u32>,
     out: &mut Vec<QualifiedSymbol>,
 ) {
     for s in nodes {
-        if s.name.starts_with('«') {
+        // An unnamed usage is found by the name of what it redefines or
+        // references, and what it holds by paths through that name.
+        let effective = plumbing.effective.get(&s.range.start);
+        if s.name.starts_with('«') && effective.is_none() {
             continue;
         }
+        // Such a usage's name is where the text spells what names it.
+        let (name, spelled) = effective.map_or((&s.name, s.selection_range), |(n, r)| (n, *r));
+        if plumbing.imports.contains(&s.range.start) {
+            if let Some(form) = plumbing.import_forms.get(&s.range.start) {
+                links.import(prefix, form, uri);
+            }
+            continue;
+        }
+        // What completion shows, admits, and ranks the symbol as. An
+        // alias is what it names, which the symbol table it is indexed in
+        // finds; until then, and when the target does not resolve, it
+        // keeps the module kind of its outline node and may name
+        // anything.
+        let alias = plumbing.aliases.get(&s.range.start).cloned().map(Box::new);
+        let kind = completion_kind(s.kind);
+        let function = alias.is_none()
+            && matches!(
+                s.kind,
+                lsp_types::SymbolKind::FUNCTION
+                    | lsp_types::SymbolKind::OPERATOR
+                    | lsp_types::SymbolKind::BOOLEAN
+            );
         let qualified = if prefix.is_empty() {
-            s.name.clone()
+            name.clone()
         } else {
-            format!("{prefix}::{}", s.name)
+            format!("{prefix}::{name}")
         };
+        let decl = decl_at(decls, s.selection_range.start);
+        let types = types_at(decls, s.selection_range.start);
         out.push(QualifiedSymbol {
-            name: s.name.clone(),
+            name: name.clone(),
             qualified: qualified.clone(),
-            kind: completion_kind(s.kind),
+            kind,
             depth,
             importable: in_packages,
-            site: uri.map(|u| (u.to_string(), s.selection_range)),
+            site: uri.map(|u| (u.to_string(), spelled)),
             doc: docs.get(&s.selection_range.start).cloned(),
+            operator: is_operator_spelling(name) && function,
+            public: !plumbing.hidden.contains(&s.range.start),
+            decl,
+            types: types.clone(),
+            long: None,
+            alias: alias.clone(),
+            enclosed,
+            effective: effective.is_some(),
         });
+        // What it specializes, as written, goes to the links, the short
+        // symbol below sharing it.
+        let bases = plumbing.bases.remove(&s.range.start);
         // A short symbol (`<'m/s²'>`) alongside the regular name is its
         // own referenceable spelling — its own entry, same everything
         // else. Nothing nests under it: children path through the
         // regular name.
         if let Some(short) = shorts.get(&s.selection_range.start) {
+            let path = if prefix.is_empty() {
+                short.clone()
+            } else {
+                format!("{prefix}::{short}")
+            };
+            if let Some(bases) = &bases {
+                links.bases.push((path.clone(), bases.clone()));
+            }
             out.push(QualifiedSymbol {
                 name: short.clone(),
-                qualified: if prefix.is_empty() {
-                    short.clone()
-                } else {
-                    format!("{prefix}::{short}")
-                },
-                kind: completion_kind(s.kind),
+                qualified: path,
+                kind,
                 depth,
                 importable: in_packages,
                 site: uri.map(|u| (u.to_string(), s.selection_range)),
                 doc: docs.get(&s.selection_range.start).cloned(),
+                operator: is_operator_spelling(short) && function,
+                public: !plumbing.hidden.contains(&s.range.start),
+                decl,
+                types,
+                long: Some(s.name.clone()),
+                alias,
+                enclosed,
+                effective: false,
             });
+        }
+        if let Some(bases) = bases {
+            links.bases.push((qualified.clone(), bases));
         }
         if let Some(children) = &s.children {
             let nested = in_packages
@@ -3013,42 +4856,463 @@ fn collect_qualified(
                 uri,
                 docs,
                 shorts,
+                plumbing,
+                links,
+                decls,
+                // A private or protected member keeps what it holds
+                // inside the namespace owning it.
+                if plumbing.hidden.contains(&s.range.start) {
+                    Some(u32::try_from(prefix.len()).unwrap_or(u32::MAX))
+                } else {
+                    enclosed
+                },
                 out,
             );
         }
     }
 }
 
-/// Every open document's outline, flattened to qualified symbols.
-fn workspace_symbols(docs: &BTreeMap<Uri, Document>, enc: Encoding) -> Vec<QualifiedSymbol> {
+/// A name the expression notation spells as an operator: a run of
+/// punctuation (`+`, `[`, `..`) or a reserved word (`not`, `xor`) of
+/// the kernel language, whose expression notation both dialects share.
+fn is_operator_spelling(name: &str) -> bool {
+    let punctuation =
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_punctuation() && c != '_');
+    punctuation || sysmlv2_parser::parser::is_reserved(sysmlv2_parser::ast::Dialect::Kerml, name)
+}
+
+/// The definitions among `symbols`, with the names they specialize.
+fn definitions<'a>(
+    symbols: impl IntoIterator<Item = &'a QualifiedSymbol>,
+) -> impl Iterator<Item = (&'a str, &'a [String])> {
+    symbols
+        .into_iter()
+        .filter(|s| matches!(s.decl, crate::kinds::Decl::Definition(_)))
+        .map(|s| (s.name.as_str(), s.types.as_slice()))
+}
+
+/// The declaration kind recorded at an outline selection position.
+fn decl_at(
+    decls: &HashMap<lsp_types::Position, crate::kinds::Declared>,
+    at: lsp_types::Position,
+) -> crate::kinds::Decl {
+    decls.get(&at).map_or(crate::kinds::Decl::Other, |d| d.decl)
+}
+
+/// The types the declaration at an outline selection position names.
+fn types_at(
+    decls: &HashMap<lsp_types::Position, crate::kinds::Declared>,
+    at: lsp_types::Position,
+) -> Vec<String> {
+    decls.get(&at).map(|d| d.types.clone()).unwrap_or_default()
+}
+
+/// Open documents' outlines, flattened to qualified symbols, and the
+/// documents' imports.
+fn workspace_symbols<'d>(
+    docs: impl Iterator<Item = (&'d Uri, &'d Document)>,
+    enc: Encoding,
+) -> (Vec<QualifiedSymbol>, Links) {
     let mut out = Vec::new();
+    let mut links = Links::default();
     for (uri, doc) in docs {
-        let parse = if crate::is_kerml(uri.path().as_str()) {
-            sysmlv2_parser::parser::parse_kerml_source(&doc.text)
-        } else {
-            sysmlv2_parser::parser::parse_source(&doc.text)
-        };
-        let mapper = Mapper::new(&doc.text, enc);
-        let roots = crate::document_symbols(&parse.unit, &doc.text, &mapper);
-        let bodies = crate::outline::doc_bodies(&parse.unit, &mapper);
-        let shorts = crate::outline::short_names(&parse.unit, &mapper);
-        collect_qualified(
-            &roots,
-            "",
-            0,
-            true,
-            Some(uri.to_string().as_str()),
-            &bodies,
-            &shorts,
-            &mut out,
-        );
+        let kerml = crate::is_kerml(uri.path().as_str());
+        let uri = uri.to_string();
+        collect_unit(&doc.text, kerml, Some(&uri), enc, &mut out, &mut links);
+    }
+    (out, links)
+}
+
+/// Flatten one unit's outline into `symbols` and record its imports in
+/// `links`. `uri` is the declaration site of a workspace unit's symbols.
+fn collect_unit(
+    text: &str,
+    kerml: bool,
+    uri: Option<&str>,
+    enc: Encoding,
+    symbols: &mut Vec<QualifiedSymbol>,
+    links: &mut Links,
+) {
+    let parse = if kerml {
+        sysmlv2_parser::parser::parse_kerml_source(text)
+    } else {
+        sysmlv2_parser::parser::parse_source(text)
+    };
+    let mapper = Mapper::new(text, enc);
+    let roots = crate::document_symbols(&parse.unit, text, &mapper);
+    let bodies = crate::outline::doc_bodies(&parse.unit, &mapper);
+    let shorts = crate::outline::short_names(&parse.unit, &mapper);
+    let mut plumbing = crate::outline::plumbing(&parse.unit, &mapper);
+    let decls = crate::kinds::declarations(&parse.unit, &mapper);
+    collect_qualified(
+        &roots,
+        "",
+        0,
+        true,
+        uri,
+        &bodies,
+        &shorts,
+        &mut plumbing,
+        links,
+        &decls,
+        None,
+        symbols,
+    );
+}
+
+/// What `owner` inherits (see [`Nav::inherited_members`]), whatever
+/// its body holds. The model's inheritance leaves out what the owner's
+/// own features redefine — explicitly, by position (a parameter, an
+/// end, a calculation's `return`, a `subject`), or by declaring the same
+/// name — and the body the model was built from need not be the live
+/// one (see [`Nav::scope_members`]): the statement being typed is cut
+/// out of it, which moves the parameters after it. So what it left out
+/// comes back: the features of the types the element is typed by,
+/// specializes, subsets, or redefines, and of the library bases it
+/// specializes implicitly (an action's `Actions::Action`, whose `start`
+/// and `done` every action has), each as its type has them — but for
+/// those another feature of the heritage redefines and those private to
+/// their type. A redefinition's target may be more general than the
+/// feature inherited (`:>> elements` names a collection's), and one not
+/// inherited at all stays out. The live body then takes out what it
+/// redefines by name; what it redefines by position alone stays
+/// offered, whichever of its statements was typed first. A metadata
+/// usage inherits nothing in the model: its body names the features of
+/// the metadata definition it is typed by.
+fn inherited_of(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    owner: ElementRef,
+) -> Vec<ScopeMember> {
+    use std::collections::HashSet;
+    let mut features = resolved.inherited_features(owner, true);
+    // With no feature of its own, the owner loses nothing to its body —
+    // and one inheriting nothing then is a metadata usage, whose members
+    // are its definition's.
+    if resolved.owned_features(owner).is_empty() {
+        if features.is_empty() {
+            for t in resolved.typings(owner) {
+                features.extend(resolved.effective_features(t, true));
+            }
+        }
+        return scope_members_of(resolved, features);
+    }
+    let mut general = resolved.typings(owner);
+    for g in resolved.explicit_supertypes(owner) {
+        if !general.contains(&g) {
+            general.push(g);
+        }
+    }
+    // The features of the general types, each once.
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for &g in &general {
+        for f in resolved.effective_features(g, true) {
+            if seen.insert(f) {
+                candidates.push(f);
+            }
+        }
+    }
+    // The implied library bases, which no written relationship names:
+    // the types the inherited features beyond those come from.
+    let mut implied = Vec::new();
+    for &f in &features {
+        if seen.contains(&f) {
+            continue;
+        }
+        if let Some(t) = resolved.owner(f) {
+            if !general.contains(&t) && !implied.contains(&t) {
+                implied.push(t);
+            }
+        }
+    }
+    for t in implied {
+        for f in resolved.effective_features(t, true) {
+            if seen.insert(f) {
+                candidates.push(f);
+            }
+        }
+    }
+    // What a feature of the heritage redefines, directly or not, is not
+    // inherited.
+    let mut covered = HashSet::new();
+    for &f in features.iter().chain(&candidates) {
+        covered.extend(redefined_closure(resolved, f));
+    }
+    let inherited: HashSet<ElementRef> = features.iter().copied().collect();
+    for f in candidates {
+        if !inherited.contains(&f)
+            && !covered.contains(&f)
+            && resolved.member_visibility(f) != Some("private")
+        {
+            features.push(f);
+        }
+    }
+    scope_members_of(resolved, features)
+}
+
+/// What `f` redefines, directly or through the features it redefines.
+fn redefined_closure(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    f: ElementRef,
+) -> std::collections::HashSet<ElementRef> {
+    let mut out = std::collections::HashSet::new();
+    let mut walk = vec![f];
+    while let Some(g) = walk.pop() {
+        for t in resolved.redefinition_targets(g) {
+            if out.insert(t) {
+                walk.push(t);
+            }
+        }
     }
     out
 }
 
+/// The element declared where `innermost` is, in `unit` of a model built
+/// from a text whose part ahead of its body is the live one: an element
+/// with no name of its own, or where the qualified-name lookup fails —
+/// not the innermost element holding the statement, which may be deeper
+/// than it (a feature whose value holds an expression's body, `?{in p :>
+/// …}`), and whose members would be kept for the element's. A statement
+/// led by `then` records its succession over the same text, ahead of
+/// what it declares: the last is the declaration.
+fn declared_where(
+    resolved: &sysmlv2_parser::json::ResolvedModel,
+    unit: usize,
+    innermost: &crate::kinds::Enclosing,
+) -> Option<ElementRef> {
+    let start = innermost.span.start;
+    resolved
+        .user_elements()
+        .filter(|&e| {
+            resolved
+                .member_extent(e)
+                .is_some_and(|(u, span)| u == unit && span.start == start)
+        })
+        .last()
+}
+
+/// [`inherited_of`] in a model built from an earlier text, of the
+/// innermost of the declarations `around` a statement (see
+/// [`crate::kinds::enclosing`]): found by their qualified name, else —
+/// an element with no name (`@Safety { … }`, `part :> slot : Q { … }`),
+/// or where the lookup fails — by where it is declared in `unit`, the
+/// document's unit in that model (see [`declared_where`]). `None` when
+/// the model holds no such element.
+fn built_inherited(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    around: &[crate::kinds::Enclosing],
+    unit: Option<usize>,
+) -> Option<Vec<ScopeMember>> {
+    let qualified: Option<Vec<String>> = around
+        .iter()
+        .map(|e| e.name.as_deref().map(sysmlv2_parser::ast::escape_name))
+        .collect();
+    let owner = qualified
+        .and_then(|names| resolved.resolve_qualified(&names.join("::")))
+        .or_else(|| declared_where(resolved, unit?, around.last()?))?;
+    Some(inherited_of(resolved, owner))
+}
+
+/// How many enclosing elements' inherited members are kept (see
+/// [`Nav::inherited_members`]).
+const MEMBER_CACHE: usize = 8;
+
+/// How many statements' changes against the sessions built are kept
+/// (see [`Nav::cut_answer`]).
+const REUSED: usize = 4;
+
+/// A kind of session built (see [`Nav::built`]). An answer read off
+/// one is checked against the texts that one was built from — salvaged,
+/// or with a statement cut out, as they are — so any of them serves the
+/// completion tier, which reads a salvaged model of its own; what plans
+/// edits over every reference, and read-only navigation, read only the
+/// sessions [`Nav::session`] and [`Nav::read_session`] give them.
+#[derive(Clone, Copy)]
+enum Built {
+    /// Navigation's, over the documents as written.
+    Navigation,
+    /// Read-only navigation's while the strict one cannot build, the
+    /// units that do not parse salvaged.
+    Tolerant,
+    /// The completion tier's, the statement it was built for cut out.
+    Completion,
+}
+
+impl Built {
+    /// Every kind: one session of each is kept.
+    const ALL: [Built; 3] = [Built::Navigation, Built::Tolerant, Built::Completion];
+
+    /// Whether the session's model may hold the statement being typed as
+    /// something else: the tolerant session salvages a statement left
+    /// unfinished into the declaration it reads as, which the members an
+    /// element inherits — read off any session whose text outside the
+    /// element's body is the live one (see [`Nav::inherited_members`]) —
+    /// would be named after.
+    fn salvages_statements(self) -> bool {
+        matches!(self, Built::Tolerant)
+    }
+}
+
+/// A model a statement's answer is read off (see [`Nav::cut_answer`]).
+pub(crate) struct Read<'a> {
+    pub session: &'a mut Session,
+    /// The session's unit for the document.
+    pub unit: usize,
+    /// Where the statement starts in the session's text of that unit —
+    /// the text before it is the document's own when the session was
+    /// built for the statement, and holds the same declarations around
+    /// it otherwise.
+    pub at: u32,
+    /// What the answer read there (see [`crate::reuse::Needs`]).
+    pub needs: crate::reuse::Needs,
+    /// The library's units as last classified, with the build of the
+    /// session they were classified in (see [`Nav::library_units`]).
+    pub library_units: &'a mut Option<(u64, Vec<(usize, crate::units::UnitEntry)>)>,
+    /// This session's build.
+    pub build: u64,
+}
+
+/// The lengths of `text` ahead of and behind the body of the member
+/// spanning `span`: through its opening brace, and from its closing one
+/// — the whole rest of the text when the body is not closed.
+fn outside_body(text: &str, span: Span) -> (usize, usize) {
+    use sysmlv2_parser::token::TokenKind;
+    let start = (span.start as usize).min(text.len());
+    let end = (span.end as usize).clamp(start, text.len());
+    let member = &text[start..end];
+    let tokens = sysmlv2_parser::lexer::tokenize(member).0;
+    let open = tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::LBrace)
+        .map_or(end, |t| start + t.span.end as usize);
+    let close = tokens
+        .iter()
+        .rev()
+        .find(|t| t.kind != TokenKind::Eof && !t.kind.is_trivia())
+        .filter(|t| t.kind == TokenKind::RBrace && start + t.span.start as usize >= open)
+        .map_or(end, |t| start + t.span.start as usize);
+    (open, text.len() - close)
+}
+
+/// The key the inherited members of the innermost of `around` are kept
+/// under (see [`Nav::inherited_members`]): the declarations around it,
+/// the text of `uri` outside its body — `before` and `after` bytes —
+/// every other open document's text, and the text hashes of the seeded
+/// units no open document shadows, taken once per `seed`.
+fn member_key(
+    docs: &BTreeMap<Uri, Document>,
+    uri: &Uri,
+    text: &str,
+    (before, after): (usize, usize),
+    around: &[crate::kinds::Enclosing],
+    seed: &[(String, u64)],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for e in around {
+        e.name.hash(&mut hasher);
+        for t in &e.types {
+            t.is_global.hash(&mut hasher);
+            for segment in &t.segments {
+                segment.value.hash(&mut hasher);
+            }
+        }
+    }
+    let bytes = text.as_bytes();
+    uri.to_string().hash(&mut hasher);
+    bytes[..before].hash(&mut hasher);
+    bytes[bytes.len() - after..].hash(&mut hasher);
+    let mut open = std::collections::HashSet::new();
+    for (u, d) in docs {
+        let name = u.to_string();
+        if u != uri {
+            name.hash(&mut hasher);
+            d.text.hash(&mut hasher);
+        }
+        open.insert(name);
+    }
+    // The seeded units no open document shadows, as of the last seed.
+    for (name, text) in seed {
+        if !open.contains(name) {
+            name.hash(&mut hasher);
+            text.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Is the text a session was built from (`built`) the same as the text
+/// now (`now`) outside the body of an element of the unit `uri` — its
+/// first `before` and last `after` bytes there, every other unit whole?
+fn outside_unchanged(
+    built: &[(String, String)],
+    now: &[(String, String)],
+    uri: &str,
+    before: usize,
+    after: usize,
+) -> bool {
+    built.len() == now.len()
+        && built.iter().zip(now).all(|((bn, bt), (nn, nt))| {
+            if bn != nn {
+                return false;
+            }
+            if bn != uri {
+                return bt == nt;
+            }
+            let (b, n) = (bt.as_bytes(), nt.as_bytes());
+            b.len() >= before + after
+                && n.len() >= before + after
+                && b[..before] == n[..before]
+                && b[b.len() - after..] == n[n.len() - after..]
+        })
+}
+
+/// `features` as [`ScopeMember`]s, each name once — a feature's lookup
+/// name, so a redefinition declaring no name of its own counts under
+/// the name of the feature it redefines.
+fn scope_members_of(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    features: Vec<ElementRef>,
+) -> Vec<ScopeMember> {
+    #[cfg(test)]
+    MEMBER_READS.with(|n| n.set(n.get() + 1));
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in features {
+        let Some(name) = resolved.element_lookup_name(m) else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let meta = resolved.element_type(m);
+        out.push(ScopeMember {
+            name,
+            qualified: resolved.element_qualified_name(m),
+            decl: crate::kinds::feature_decl(meta),
+            kind: member_kind(meta),
+            library: resolved.is_library_element(m),
+        });
+    }
+    out
+}
+
+/// A feature in scope at a statement, from the completion tier's session
+/// (see [`Nav::scope_members`]).
+#[derive(Clone)]
+struct ScopeMember {
+    name: String,
+    qualified: Option<String>,
+    decl: crate::kinds::Decl,
+    kind: lsp_types::CompletionItemKind,
+    /// Declared in the library, not the workspace.
+    library: bool,
+}
+
 /// What the cursor is completing: the partial word being typed, the
-/// `::`-chained qualifier before it, and whether the enclosing
-/// statement (back to the previous `;`/`{`/`}`) is an `import`.
+/// `::`-chained qualifier before it, and the statement it belongs to,
+/// read off the toolkit's tokens of the text ahead of the cursor (see
+/// [`crate::site`]).
 pub(crate) struct CompletionCx {
     pub qualifier: Vec<String>,
     /// The `.`-chained feature path before the partial word
@@ -3059,10 +5323,84 @@ pub(crate) struct CompletionCx {
     /// Byte range of the partial word: `partial_start..offset`.
     pub partial_start: u32,
     pub offset: u32,
+    /// The statement is an `import`.
     pub import: bool,
-    /// Statement start (after the previous `;`/`{`/`}`) — the autofix
-    /// tier's scan anchor.
+    /// Statement start: its first token after the last `;`, `{`, `}`,
+    /// or comment body token ahead of the cursor, the cursor when it has
+    /// none yet — never inside a comment, note, string, or quoted name.
+    /// The autofix tier's scan anchor.
     pub stmt_start: u32,
+    /// The quoted name the cursor is typing, if any (see
+    /// [`crate::accept`]): found by the token pass that reads the rest
+    /// of the context, once per request, since each completion tier's
+    /// accepts start from it.
+    pub quoted: Option<crate::accept::Quoted>,
+    /// The statement leaves a `[` open ahead of the partial word: the
+    /// cursor sits where a quantity's unit is written (`9.8 [m`), or in
+    /// a multiplicity (`[0..*]`), which the tokens cannot tell apart.
+    /// The completion's own opening quote (`['deg`) leaves the bracket
+    /// open. Read once per request, for the tiers that offer multi-word
+    /// unit names and for the accepts that take such a name typed word
+    /// by word.
+    pub in_bracket: bool,
+    /// What the partial word fills: nothing, a declared name, or a
+    /// position taking some keywords and kinds of element.
+    pub slot: crate::site::Slot,
+}
+
+/// Does the statement being typed at byte offset `at` import or expose
+/// — is an `import` or `expose` keyword among its tokens? Read on the
+/// toolkit's tokens of the text up to `at`, starting over at every `;`,
+/// `{`, and `}` token and at a `[`, which opens an import's filter
+/// condition, so the words in strings, quoted names, comments, notes,
+/// and filter expressions never count.
+pub(crate) fn in_import_path(text: &str, at: u32) -> bool {
+    use sysmlv2_parser::token::TokenKind;
+    let Some(prefix) = text.get(..at as usize) else {
+        return false;
+    };
+    let mut keyword = false;
+    for token in sysmlv2_parser::lexer::tokenize(prefix).0 {
+        match token.kind {
+            // A `[` opens an import's filter condition: an expression,
+            // no longer the path.
+            TokenKind::Semi | TokenKind::LBrace | TokenKind::RBrace | TokenKind::LBracket => {
+                keyword = false;
+            }
+            TokenKind::Ident => {
+                keyword |= matches!(token.span.slice(prefix), "import" | "expose");
+            }
+            _ => {}
+        }
+    }
+    keyword
+}
+
+/// Does the statement being typed at byte offset `at` import with `all`
+/// — is `import all` among its tokens, read as [`in_import_path`] reads
+/// them? Such an import names a namespace's members whatever their
+/// visibility.
+pub(crate) fn imports_all(text: &str, at: u32) -> bool {
+    use sysmlv2_parser::token::TokenKind;
+    let Some(prefix) = text.get(..at as usize) else {
+        return false;
+    };
+    let (mut after_import, mut all) = (false, false);
+    for token in sysmlv2_parser::lexer::tokenize(prefix).0 {
+        match token.kind {
+            TokenKind::Whitespace | TokenKind::LineNote | TokenKind::BlockNote => {}
+            TokenKind::Semi | TokenKind::LBrace | TokenKind::RBrace | TokenKind::LBracket => {
+                (after_import, all) = (false, false);
+            }
+            TokenKind::Ident => {
+                let word = token.span.slice(prefix);
+                all |= after_import && word == "all";
+                after_import = word == "import";
+            }
+            _ => after_import = false,
+        }
+    }
+    all
 }
 
 /// The declare-the-type context for unit completions: the cursor sits
@@ -3075,81 +5413,16 @@ pub(crate) struct UnitTypeCx {
     pub bracket_open: u32,
 }
 
-/// Detect [`UnitTypeCx`] textually on the live document — the
-/// statement being typed rarely parses, so the model cannot answer.
-/// Conservative: any `:` between the name and the `=` (typing,
-/// subsetting, redefinition) bails, as does a cursor not inside an
-/// open `[`.
+/// Detect [`UnitTypeCx`] on the live document's tokens — the statement
+/// being typed rarely parses, so the model cannot answer (see
+/// [`crate::units::untyped_attribute`]). Conservative: a typing or
+/// specialization between the name and the `=` bails, as does a cursor
+/// not inside an open `[` of the value.
 pub(crate) fn untyped_attribute_unit_context(text: &str, cx: &CompletionCx) -> Option<UnitTypeCx> {
-    let seg = text.get(cx.stmt_start as usize..cx.partial_start as usize)?;
-    let bytes = seg.as_bytes();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    // `attribute` as its own word.
-    let kw = "attribute";
-    let mut from = 0;
-    let kw_end = loop {
-        let at = from + seg[from..].find(kw)?;
-        let end = at + kw.len();
-        let before_ok = at == 0 || !is_word(bytes[at - 1]);
-        let after_ok = end >= seg.len() || !is_word(bytes[end]);
-        if before_ok && after_ok {
-            break end;
-        }
-        from = end;
-    };
-    let skip_ws = |mut p: usize| {
-        while p < bytes.len() && bytes[p].is_ascii_whitespace() {
-            p += 1;
-        }
-        p
-    };
-    let mut p = skip_ws(kw_end);
-    // Optional short-name group `<...>`.
-    if bytes.get(p) == Some(&b'<') {
-        p = p + seg[p..].find('>')? + 1;
-        p = skip_ws(p);
-    }
-    // The declared name: an identifier or a quoted name.
-    let name_start = p;
-    if bytes.get(p) == Some(&b'\'') {
-        p = p + 1 + seg[p + 1..].find('\'')? + 2;
-    } else {
-        while p < bytes.len() && is_word(bytes[p]) {
-            p += 1;
-        }
-    }
-    if p == name_start {
-        return None;
-    }
-    let name_end = p;
-    // Between the name and the `=`: whitespace and at most a
-    // multiplicity group — any `:` means the declaration is typed.
-    let eq = name_end + seg[name_end..].find('=')?;
-    if seg[name_end..eq].contains(':') {
-        return None;
-    }
-    // The cursor must sit inside an open quantity bracket of the value.
-    let mut open: Option<usize> = None;
-    let mut depth = 0i32;
-    for (j, b) in seg.bytes().enumerate().skip(eq) {
-        match b {
-            b'[' => {
-                depth += 1;
-                open = Some(j);
-            }
-            b']' => {
-                depth -= 1;
-                if depth <= 0 {
-                    open = None;
-                }
-            }
-            _ => {}
-        }
-    }
-    let bracket_open = open?;
+    let (name_end, bracket_open) = crate::units::untyped_attribute(text, cx)?;
     Some(UnitTypeCx {
-        name_end: cx.stmt_start + offset32(name_end),
-        bracket_open: cx.stmt_start + offset32(bracket_open),
+        name_end,
+        bracket_open,
     })
 }
 
@@ -3159,22 +5432,52 @@ pub(crate) fn doc_markdown(body: &str) -> String {
     sysmlv2_parser::json::doc_display_text(body)
 }
 
-/// A parameter's (or return's) type references: the written
-/// specialization clauses of its declaration (typing, subsetting,
-/// redefinition — the qualified name spans as the author spelled
-/// them), plus resolved simple names as the fallback for declarations
-/// with nothing spelled (interchange-lifted units).
-struct SigTypes {
-    refs: Vec<(usize, Span)>,
-    fallback: Vec<String>,
+/// A parameter's (or return's) types as a signature line spells them.
+enum SigTypes {
+    /// The written typings of a declaration in the workspace, failing
+    /// those its other specialization clauses (subsetting, redefinition)
+    /// — the qualified name spans as the author spelled them — sliced
+    /// out of its unit, and its declared multiplicity as
+    /// [`multiplicity_suffix`] spells it.
+    Written(Vec<(usize, Span)>, String),
+    /// Spelled from the model: a library declaration, whose text the
+    /// session does not carry, or one with nothing written
+    /// (interchange-lifted units) — see [`model_types`].
+    Spelled(String),
+}
+
+/// Where a signature is read, for the types spelled from the model: the
+/// document's dialect and the scope names resolve from there.
+struct SigAt {
+    dialect: sysmlv2_parser::ast::Dialect,
+    scope: sysmlv2_parser::json::ScopeRef,
+}
+
+impl SigAt {
+    /// The innermost of the user declarations in `unit` enclosing byte
+    /// `at` that has a scope, the root namespace as the fallback.
+    fn in_unit(
+        resolved: &sysmlv2_parser::json::ResolvedModel,
+        unit: usize,
+        at: u32,
+        dialect: sysmlv2_parser::ast::Dialect,
+    ) -> SigAt {
+        let scope = crate::receiver::enclosing_declarations(resolved, unit, at)
+            .into_iter()
+            .find_map(|e| resolved.element_scope(e))
+            .unwrap_or_else(|| resolved.root_scope());
+        SigAt { dialect, scope }
+    }
 }
 
 /// One rendered-signature parameter: direction prefix (`in` is implied
-/// and empty), name, types.
+/// and empty), name, types, and whether an argument binds it (see
+/// [`crate::receiver::binds_argument`]).
 struct SigParam {
     prefix: String,
     name: String,
     types: SigTypes,
+    input: bool,
 }
 
 /// A callable's signature before type-spelling extraction.
@@ -3187,57 +5490,168 @@ struct SigParts {
     ret_name: Option<String>,
 }
 
-/// The type references of a feature's declaration, spelled clauses
-/// first (see [`SigTypes`]).
-fn spelled_types(resolved: &mut sysmlv2_parser::json::ResolvedModel, e: ElementRef) -> SigTypes {
-    let refs = resolved.specialization_spans(e);
-    let fallback = if refs.is_empty() {
-        let mut targets = resolved.typings(e);
-        if targets.is_empty() {
-            targets = resolved.explicit_supertypes(e);
+/// The types of a feature's declaration (see [`SigTypes`]): as written
+/// where the workspace declares it, else spelled from the model — its
+/// typings either way, failing those what it subsets or redefines
+/// (`in a :> isp`), so `in :>> m : Heavy` reads `m: Heavy`. A feature
+/// that only redefines, writing no type, reads with the type of what it
+/// redefines: `in :>> m` is `m: Mass`, not `m: m`.
+fn spelled_types(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    e: ElementRef,
+    at: &SigAt,
+) -> SigTypes {
+    let mut e = e;
+    let multiplicity = multiplicity_suffix(resolved, e);
+    for _ in 0..8 {
+        let redefined = resolved.redefinition_targets(e);
+        let only_redefines = resolved.typing_spans(e).is_empty()
+            && !redefined.is_empty()
+            && resolved
+                .explicit_supertypes(e)
+                .iter()
+                .all(|t| redefined.contains(t));
+        match redefined.first() {
+            Some(&next) if only_redefines => e = next,
+            _ => break,
         }
-        targets
-            .into_iter()
-            .filter_map(|t| resolved.element_name(t).map(str::to_string))
-            .collect()
+    }
+    let mut refs = resolved.typing_spans(e);
+    if refs.is_empty() {
+        refs = resolved.specialization_spans(e);
+    }
+    // The multiplicity the parameter declares, else what it redefines.
+    let multiplicity = if multiplicity.is_empty() {
+        multiplicity_suffix(resolved, e)
     } else {
-        Vec::new()
+        multiplicity
     };
-    SigTypes { refs, fallback }
+    if refs.is_empty() || resolved.is_library_element(e) {
+        SigTypes::Spelled(model_types(resolved, e, at, &multiplicity))
+    } else {
+        SigTypes::Written(refs, multiplicity)
+    }
+}
+
+/// A feature's declared multiplicity as a signature line appends it to
+/// the types (`[0..*]`, `[2]`), empty when it declares none or exactly
+/// one.
+fn multiplicity_suffix(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    e: ElementRef,
+) -> String {
+    let bound = |b: f64| {
+        if b.is_infinite() {
+            "*".to_string()
+        } else {
+            format!("{b}")
+        }
+    };
+    match resolved.declared_multiplicity(e) {
+        Some((lo, hi)) if (lo, hi) != (1.0, 1.0) => {
+            if lo == hi {
+                format!("[{}]", bound(hi))
+            } else {
+                format!("[{}..{}]", bound(lo), bound(hi))
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// A feature's types spelled from the model where `at` reads them: its
+/// typings, or failing those its other written specializations, each
+/// spelled the shortest way that resolves there — the fully qualified
+/// name when nothing does — followed by `multiplicity` (see
+/// [`multiplicity_suffix`], `Real[0..*]`). Empty when the feature
+/// declares no type.
+fn model_types(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    e: ElementRef,
+    at: &SigAt,
+    multiplicity: &str,
+) -> String {
+    let mut targets = resolved.typings(e);
+    if targets.is_empty() {
+        targets = resolved.explicit_supertypes(e);
+    }
+    let dialect = Some(at.dialect);
+    let names: Vec<String> = targets
+        .into_iter()
+        .filter_map(|t| {
+            resolved
+                .type_spelling_at(dialect, at.scope, t)
+                .or_else(|| resolved.full_spelling(dialect, t))
+        })
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    let mut spelled = names.join(", ");
+    spelled.push_str(multiplicity);
+    spelled
 }
 
 /// Assemble the signature line, slicing each type's written spelling
 /// out of its unit's source.
 fn render_signature(parts: SigParts, session: &Session) -> String {
+    signature_line(parts, session).label
+}
+
+/// A rendered signature line, with each parameter's name and the byte
+/// range its text takes in the line, and the parameters arguments bind,
+/// in order, by their index in `params`: the inputs, outputs passed over.
+pub(crate) struct SignatureLine {
+    pub label: String,
+    pub params: Vec<(String, std::ops::Range<usize>)>,
+    pub inputs: Vec<usize>,
+}
+
+/// [`render_signature`], keeping where each parameter's text lands.
+fn signature_line(parts: SigParts, session: &Session) -> SignatureLine {
     let types = |t: &SigTypes| -> Vec<String> {
-        let spelled: Vec<String> = t
-            .refs
-            .iter()
-            .filter_map(|(unit, span)| {
-                let (_, _, src) = session.units().find(|(i, _, _)| i == unit)?;
-                src.get(span.start as usize..span.end as usize)
-                    .map(|s| s.trim().to_string())
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-        if spelled.is_empty() {
-            t.fallback.clone()
-        } else {
-            spelled
+        match t {
+            SigTypes::Written(refs, multiplicity) => {
+                let mut written: Vec<String> = refs
+                    .iter()
+                    .filter_map(|(unit, span)| {
+                        let (_, _, src) = session.units().find(|(i, _, _)| i == unit)?;
+                        src.get(span.start as usize..span.end as usize)
+                            .map(|s| s.trim().to_string())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                // The multiplicity follows the last type, as a declaration
+                // writes it (`Mass[0..*]`).
+                if let Some(last) = written.last_mut() {
+                    last.push_str(multiplicity);
+                }
+                written
+            }
+            SigTypes::Spelled(spelled) if spelled.is_empty() => Vec::new(),
+            SigTypes::Spelled(spelled) => vec![spelled.clone()],
         }
     };
-    let params: Vec<String> = parts
-        .params
-        .iter()
-        .map(|p| {
-            let ts = types(&p.types);
-            if ts.is_empty() {
-                format!("{}{}", p.prefix, p.name)
-            } else {
-                format!("{}{}: {}", p.prefix, p.name, ts.join(", "))
-            }
-        })
-        .collect();
+    let mut label = format!("{}(", parts.name);
+    let mut params = Vec::new();
+    let mut inputs = Vec::new();
+    for (i, p) in parts.params.iter().enumerate() {
+        if i > 0 {
+            label.push_str(", ");
+        }
+        let start = label.len();
+        let ts = types(&p.types);
+        if ts.is_empty() {
+            label.push_str(&format!("{}{}", p.prefix, p.name));
+        } else {
+            label.push_str(&format!("{}{}: {}", p.prefix, p.name, ts.join(", ")));
+        }
+        if p.input {
+            inputs.push(params.len());
+        }
+        params.push((p.name.clone(), start..label.len()));
+    }
+    label.push(')');
     let ret = parts
         .ret
         .as_ref()
@@ -3245,24 +5659,34 @@ fn render_signature(parts: SigParts, session: &Session) -> String {
         .filter(|ts| !ts.is_empty())
         .map(|ts| ts.join(", "))
         .or(parts.ret_name);
-    let ret = ret.map(|r| format!(" → {r}")).unwrap_or_default();
-    format!("{}({}){ret}", parts.name, params.join(", "))
+    if let Some(r) = ret {
+        label.push_str(&format!(" → {r}"));
+    }
+    SignatureLine {
+        label,
+        params,
+        inputs,
+    }
 }
 
 /// A callable's function signature —
 /// `calculateDeltaV(isp: specificImpulse, g0: ISQ::acceleration) →
-/// ISQ::speed` — from its directed parameters and return parameter,
-/// for every metaclass an invocation expression can call: the SysML
-/// calc/constraint/action definitions AND usages (a package-level
-/// `calc <ln> naturalLogarithm { … }` is a CalculationUsage), and the
-/// KerML behavioral classifiers (`function`, `predicate`, `behavior`).
+/// ISQ::speed` — from the parameters it owns or inherits (see
+/// [`crate::receiver::parameters`]) and the closest return parameter
+/// (see [`crate::receiver::result_parameter`]), for every metaclass an
+/// invocation expression can call: the SysML calc/constraint/action
+/// definitions AND usages (a package-level `calc <ln> naturalLogarithm
+/// { … }` is a CalculationUsage), and the KerML behavioral classifiers
+/// (`function`, `predicate`, `behavior`).
 /// `in` is the implied direction and stays silent; `out`/`inout` are
-/// spelled. `None` for other metaclasses and for callables declaring
-/// no parameters (the bare card already says everything).
+/// spelled. Types read as `at` sees them (see [`SigTypes`]). `None` for
+/// other metaclasses and for callables with neither parameters nor a
+/// result, own or inherited (the bare card already says everything).
 fn def_signature(
     resolved: &mut sysmlv2_parser::json::ResolvedModel,
     target: ElementRef,
     metaclass: &str,
+    at: &SigAt,
 ) -> Option<SigParts> {
     if !matches!(
         metaclass,
@@ -3278,91 +5702,199 @@ fn def_signature(
     ) {
         return None;
     }
-    let ret = resolved.calc_return_param(target);
-    let params: Vec<ElementRef> = resolved
-        .owned_features(target)
-        .into_iter()
-        .filter(|p| Some(*p) != ret && resolved.declared_direction(*p).is_some())
-        .collect();
+    let ret = crate::receiver::result_parameter(resolved, target);
+    let params = crate::receiver::parameters(resolved, target);
     if params.is_empty() && ret.is_none() {
         return None;
     }
-    let name = resolved
-        .element_name(target)
-        .unwrap_or("<anonymous>")
-        .to_string();
+    // `calc :>> ke { … }` is called by what it redefines.
+    let name = crate::receiver::feature_name(resolved, target)
+        .unwrap_or_else(|| "<anonymous>".to_string());
     let params: Vec<SigParam> = params
         .into_iter()
-        .map(|p| SigParam {
+        .map(|(p, name)| SigParam {
             prefix: match resolved.declared_direction(p) {
                 Some("in") | None => String::new(),
                 Some(dir) => format!("{dir} "),
             },
-            name: resolved.element_name(p).unwrap_or("_").to_string(),
-            types: spelled_types(resolved, p),
+            name: name.unwrap_or_else(|| "_".to_string()),
+            types: spelled_types(resolved, p, at),
+            input: crate::receiver::binds_argument(resolved, p),
         })
         .collect();
     Some(SigParts {
         name,
-        ret: ret.map(|r| spelled_types(resolved, r)),
+        ret: ret.map(|r| spelled_types(resolved, r, at)),
         ret_name: ret.and_then(|r| resolved.element_name(r).map(str::to_string)),
         params,
     })
 }
 
-/// The edits accepting `name` should perform, beyond inserting the
-/// label: restricted names insert quoted (`'m/s²'` — the raw label
-/// would parse as an expression) over the typed spelling (see
-/// [`crate::autoimport::replace_range_for`]), and the autofix tier's
-/// statement repairs ride along — the suffix on the main edit, the
-/// rest as a separate insertion past the cursor. When a repair suffix
-/// rides the main edit and the client takes snippets, the edit
-/// carries a `$0` stop between name and suffix: the cursor belongs
-/// where typing continues, before the auto-inserted `];`, not after
-/// it. `(None, None, None)` for a basic name needing no repairs:
-/// plain label insertion is right and keeps the item light.
-fn item_edits(
-    text: &str,
-    mapper: &Mapper<'_>,
-    cx: &CompletionCx,
-    dialect: sysmlv2_parser::ast::Dialect,
-    name: &str,
-    snippets: bool,
-) -> (
-    Option<lsp_types::CompletionTextEdit>,
-    Option<TextEdit>,
-    Option<lsp_types::InsertTextFormat>,
-) {
-    // Insert text is source for this document: a name the dialect
-    // reserves (`'view'`) and a non-basic name are quoted, a word the
-    // dialect does not reserve stays bare — the label keeps the raw name.
-    let escaped = sysmlv2_parser::name::spell_name_in(Some(dialect), name);
-    let range = crate::autoimport::replace_range_for(text, cx.partial_start, cx.offset, name);
-    let repairs = crate::autofix::statement_repairs(text, cx.stmt_start, range.start, cx.offset);
-    let (suffix, insert) = match repairs {
-        Some(r) => (r.suffix, r.insert),
-        None => (String::new(), None),
+/// An item a list offers by simple name, as the declare-the-type edits
+/// read it: its index in the list, the symbol's name and path, and the
+/// document declaring it (`None`: the library).
+type Offered = (usize, String, String, Option<String>);
+
+/// What the item at `index` offering `s` was built from.
+fn offered(index: usize, s: &QualifiedSymbol) -> Offered {
+    let site = s.site.as_ref().map(|(uri, _)| uri.clone());
+    (index, s.name.clone(), s.qualified.clone(), site)
+}
+
+/// The element the symbol at `qualified`, declared in the document
+/// `site` (`None`: the library), stands for in a session whose units
+/// are `unit_of` by name: the one its path names from the root, unless
+/// another document declares the path's top-level package too and the
+/// path finds that one's — then the one it names inside the top-level
+/// package of the document declaring it. `tops` holds the top-level
+/// elements by unit and name, once a symbol needed them.
+fn declared_element(
+    resolved: &mut sysmlv2_parser::json::ResolvedModel,
+    qualified: &str,
+    site: Option<&str>,
+    unit_of: &HashMap<String, usize>,
+    tops: &mut Option<HashMap<(usize, String), ElementRef>>,
+) -> Option<ElementRef> {
+    let by_path = resolved.resolve_qualified(qualified);
+    let Some(unit) = site.and_then(|uri| unit_of.get(uri)).copied() else {
+        return by_path;
     };
-    let snippet = snippets && !suffix.is_empty();
-    let text_edit = (escaped != name || !suffix.is_empty()).then(|| {
-        lsp_types::CompletionTextEdit::Edit(TextEdit {
-            range: mapper.range(range),
-            new_text: if snippet {
-                format!("{}$0{suffix}", snippet_escape(&escaped))
-            } else {
-                format!("{escaped}{suffix}")
-            },
+    let declared_here = |resolved: &sysmlv2_parser::json::ResolvedModel, e: ElementRef| {
+        resolved.member_extent(e).is_some_and(|(u, _)| u == unit)
+    };
+    if by_path.is_some_and(|e| declared_here(resolved, e)) {
+        return by_path;
+    }
+    let mut segments = qualified.split("::");
+    let first = segments.next()?;
+    let tops = tops.get_or_insert_with(|| {
+        let elements: Vec<ElementRef> = resolved.user_elements().collect();
+        let mut out = HashMap::new();
+        for e in elements {
+            let top = resolved
+                .owner(e)
+                .is_some_and(|root| resolved.owner(root).is_none());
+            let site = resolved.member_extent(e).map(|(u, _)| u);
+            if let (true, Some(u), Some(name)) = (top, site, resolved.element_name(e)) {
+                out.entry((u, name.to_string())).or_insert(e);
+            }
+        }
+        out
+    });
+    let top = *tops.get(&(unit, first.to_string()))?;
+    let rest: Vec<sysmlv2_parser::ast::Name> = segments
+        .map(|value| sysmlv2_parser::ast::Name {
+            value: value.to_string(),
+            span: Span::default(),
         })
+        .collect();
+    if rest.is_empty() {
+        return Some(top);
+    }
+    let path = sysmlv2_parser::ast::QualifiedName {
+        is_global: false,
+        segments: rest,
+        span: Span::default(),
+    };
+    resolved.member_of(top, &path).map(|(e, _)| e)
+}
+
+/// What accepting `s` by simple name takes to resolve at the cursor
+/// `auto` describes: `Some(None)` nothing, `Some(Some(edit))` the import
+/// `edit`, `None` when no import gives it — a member of a type, or a
+/// usage without a name of its own, outside its owner, a name that finds
+/// something else at the cursor (see
+/// [`crate::autoimport::AutoImport::needs`]), or a symbol its own or an
+/// ancestor's visibility keeps from being named here by its path, which
+/// only an existing import the symbol tables follow, or one through a
+/// package re-exporting it, brings in.
+fn reach(
+    auto: &crate::autoimport::AutoImport<'_>,
+    s: &QualifiedSymbol,
+) -> Option<Option<crate::autoimport::ImportEdit>> {
+    use crate::autoimport::Needs;
+    if s.depth == 0 {
+        return Some(None);
+    }
+    // A member of a type, or of something a type holds, has no path an
+    // import could name: it is offered by its simple name where that
+    // name finds it — inside its owner, inside what inherits it, and
+    // where an import in scope brings it in. So is a usage without a
+    // name of its own, by the name it is found by: elsewhere that name
+    // is the feature's own, or another member's.
+    if !s.importable || s.effective {
+        let found = s
+            .parent()
+            .is_some_and(|owner| auto.may_find(&s.name, &s.qualified, owner))
+            && matches!(auto.needs(&s.name, &s.qualified), Needs::Nothing);
+        return found.then_some(None);
+    }
+    let seen = if !s.public {
+        auto.sees_hidden(&s.name, &s.qualified)
+    } else if s.enclosed().is_some_and(|ns| !auto.inside(ns)) {
+        auto.sees_enclosed(&s.name, &s.qualified)
+    } else {
+        return match auto.needs(&s.name, &s.qualified) {
+            Needs::Nothing => Some(None),
+            Needs::Import(edit) => Some(Some(edit)),
+            Needs::Qualifier => None,
+        };
+    };
+    if seen {
+        return Some(None);
+    }
+    match auto.needs(&s.name, &s.qualified) {
+        Needs::Import(edit) if edit.route.is_some() => Some(Some(edit)),
+        Needs::Nothing | Needs::Import(_) | Needs::Qualifier => None,
+    }
+}
+
+/// The text edit and source annotation of the import `edit` accepting
+/// `s` by simple name needs: the annotation names the package the import
+/// runs through, spelled as the statement spells it in `dialect`.
+fn import_for(
+    mapper: &Mapper<'_>,
+    dialect: sysmlv2_parser::ast::Dialect,
+    s: &QualifiedSymbol,
+    edit: crate::autoimport::ImportEdit,
+) -> Option<(Vec<TextEdit>, lsp_types::CompletionItemLabelDetails)> {
+    let parent = edit
+        .route
+        .as_deref()
+        .unwrap_or(&s.qualified)
+        .strip_suffix(s.name.as_str())?
+        .strip_suffix("::")?;
+    // Most paths need no quote: those are taken as they are.
+    let plain = parent.split("::").all(|segment| {
+        segment
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !sysmlv2_parser::parser::is_reserved(dialect, segment)
     });
-    let extra = insert.map(|(at, fix)| TextEdit {
-        range: mapper.range(Span::new(at, at)),
-        new_text: fix,
-    });
-    (
-        text_edit,
-        extra,
-        snippet.then_some(lsp_types::InsertTextFormat::SNIPPET),
-    )
+    let parent: std::borrow::Cow<'_, str> = if plain {
+        parent.into()
+    } else {
+        crate::autoimport::escape_qualified(dialect, parent).into()
+    };
+    let description = if edit.global {
+        format!("import $::{parent}")
+    } else {
+        format!("import {parent}")
+    };
+    Some((
+        vec![TextEdit {
+            range: mapper.range(Span::new(edit.at, edit.at)),
+            new_text: edit.text,
+        }],
+        lsp_types::CompletionItemLabelDetails {
+            detail: None,
+            description: Some(description),
+        },
+    ))
 }
 
 /// A member's completion-item kind from its abstract-syntax metaclass
@@ -3382,20 +5914,11 @@ fn member_kind(meta: &str) -> lsp_types::CompletionItemKind {
     }
 }
 
-/// A completion's literal text made safe for snippet-format delivery:
-/// `$`, `}`, and `\` are snippet syntax and must arrive escaped.
-fn snippet_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(c, '$' | '}' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-pub(crate) fn completion_context(text: &str, offset: u32) -> CompletionCx {
+pub(crate) fn completion_context(
+    text: &str,
+    offset: u32,
+    dialect: sysmlv2_parser::ast::Dialect,
+) -> CompletionCx {
     let bytes = text.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let offset = (offset as usize).min(bytes.len());
@@ -3439,49 +5962,121 @@ pub(crate) fn completion_context(text: &str, offset: u32) -> CompletionCx {
         }
         dot_chain.reverse();
     }
-    let stmt_start = text[..j].rfind([';', '{', '}']).map(|k| k + 1).unwrap_or(0);
-    let import = text[stmt_start..j]
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|w| w == "import");
+    // A qualified name stands where its first segment does: the position
+    // is read off the text ahead of it (`attribute x : ISQ::Mas` takes
+    // what a typing takes), a global `$::` included.
+    let word_start = if qualifier.is_empty() {
+        partial_start
+    } else if text[..j].ends_with("$::") {
+        j - 3
+    } else {
+        j
+    };
+    let scan = crate::site::scan(text, offset32(word_start), offset32(offset), dialect);
     CompletionCx {
         qualifier,
         dot_chain,
         partial_start: offset32(partial_start),
         offset: offset32(offset),
-        import,
-        stmt_start: offset32(stmt_start),
+        import: scan.import,
+        stmt_start: scan.stmt_start,
+        quoted: scan
+            .quote
+            .and_then(|open| crate::accept::quoted_from(text, open, offset32(offset))),
+        in_bracket: scan.in_bracket,
+        slot: scan.slot,
     }
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Answers read off a session built from other texts on this thread
+    /// (see [`Nav::cut_answer`]), so a test can pin where one was.
+    pub(crate) static REUSED_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Session builds on this thread, so a test can pin what a request
+    /// costs.
+    pub(crate) static SESSION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Enclosing elements' member lists read off a model on this thread.
+    pub(crate) static MEMBER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod context_tests {
-    use super::completion_context;
+    use super::{completion_context, offset32};
+    use sysmlv2_parser::ast::Dialect;
+
+    #[test]
+    fn open_bracket_detection() {
+        for (stmt, open) in [
+            ("attribute g = 9.8 [", true),
+            ("attribute g = 9.8 [m/", true),
+            // the completion's own opening quote keeps it open
+            ("attribute g = 9.8 ['", true),
+            // closed again: an expression continues
+            ("attribute g = 9.8 [m] + ", false),
+            ("attribute g : ", false),
+            // a multiplicity counts, nested brackets count once open
+            ("part w : Wheel [0..", true),
+            ("attribute a = b[c[d]", true),
+            // brackets in strings, quoted names, and comments do not
+            ("attribute s = \"[\" + ", false),
+            ("attribute s = 'a[' + ", false),
+            ("attribute s /* [ */ = ", false),
+            ("attribute s // [\n = ", false),
+            // an unterminated string or comment is not a bracket
+            ("attribute s = \"a [", false),
+            ("attribute s /* [", false),
+            // a note runs to its `*/`, across lines
+            ("attribute g = 9.8 //* see\n [ */ + ", false),
+            ("attribute g = 9.8 [ //* see\n ] */ + ", true),
+            // statement boundaries count only as tokens: a `;` inside a
+            // comment neither ends the statement nor exposes the text
+            // after it
+            (
+                "part def V {\n doc /* mass; it's wet */\n attribute a = 9.8 [",
+                true,
+            ),
+            ("part def V {\n /* note; [draft */\n attribute x : ", false),
+            // a statement boundary closes what the statement left open
+            ("attribute a = 9.8 [m;\n attribute b : ", false),
+        ] {
+            assert_eq!(
+                completion_context(stmt, offset32(stmt.len()), Dialect::Sysml).in_bracket,
+                open,
+                "{stmt:?}"
+            );
+        }
+    }
 
     #[test]
     fn qualifier_and_import_detection() {
         let text = "package P { private import ScalarFunctions:: }";
-        let cx = completion_context(text, 44);
+        let cx = completion_context(text, 44, Dialect::Sysml);
         assert_eq!(cx.qualifier, vec!["ScalarFunctions"]);
         assert!(cx.import);
 
         let text = "package P { private import Real }";
-        let cx = completion_context(text, 31);
+        let cx = completion_context(text, 31, Dialect::Sysml);
         assert!(cx.qualifier.is_empty());
         assert!(cx.import);
         assert_eq!(&text[cx.partial_start as usize..cx.offset as usize], "Real");
 
         let text = "package P { part x : ISQ::Torque }";
-        let cx = completion_context(text, 32);
+        let cx = completion_context(text, 32, Dialect::Sysml);
         assert_eq!(cx.qualifier, vec!["ISQ"]);
         assert!(!cx.import);
 
         let text = "package P { import A::B:: }";
-        let cx = completion_context(text, 25);
+        let cx = completion_context(text, 25, Dialect::Sysml);
         assert_eq!(cx.qualifier, vec!["A", "B"]);
         assert!(cx.import);
 
         let text = "part w : ";
-        let cx = completion_context(text, 9);
+        let cx = completion_context(text, 9, Dialect::Sysml);
         assert!(cx.qualifier.is_empty());
         assert!(!cx.import);
     }
@@ -3490,26 +6085,26 @@ mod context_tests {
     fn dot_chain_detection() {
         // Bare dot, and a partial after it.
         let text = "package P { attribute t = fuelTank. }";
-        let cx = completion_context(text, 35);
+        let cx = completion_context(text, 35, Dialect::Sysml);
         assert_eq!(cx.dot_chain, vec!["fuelTank"]);
         let text = "package P { attribute t = fuelTank.vol }";
-        let cx = completion_context(text, 38);
+        let cx = completion_context(text, 38, Dialect::Sysml);
         assert_eq!(cx.dot_chain, vec!["fuelTank"]);
         assert_eq!(&text[cx.partial_start as usize..cx.offset as usize], "vol");
 
         // Multi-hop chains keep every segment, in order.
         let text = "package P { attribute t = sys.tank.liq }";
-        let cx = completion_context(text, 38);
+        let cx = completion_context(text, 38, Dialect::Sysml);
         assert_eq!(cx.dot_chain, vec!["sys", "tank"]);
 
         // A literal's decimal point is no chain step.
         let text = "package P { attribute t = 9.8 }";
-        let cx = completion_context(text, 29);
+        let cx = completion_context(text, 29, Dialect::Sysml);
         assert!(cx.dot_chain.is_empty());
 
         // `::` qualifiers keep their own context.
         let text = "package P { part x : ISQ::Torque }";
-        let cx = completion_context(text, 32);
+        let cx = completion_context(text, 32, Dialect::Sysml);
         assert!(cx.dot_chain.is_empty());
     }
 }

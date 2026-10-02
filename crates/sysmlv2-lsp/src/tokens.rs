@@ -18,8 +18,8 @@ use crate::position::{Mapper, offset32};
 use lsp_types::{SemanticToken, SemanticTokenModifier, SemanticTokenType};
 use std::collections::HashMap;
 use sysmlv2_parser::ast::{
-    DefKind, FeatureSpecialization, Identification, Member, MemberKind, QualifiedName, SourceUnit,
-    TargetRef, UsageKind,
+    DefKind, Dialect, FeatureSpecialization, Identification, Member, MemberKind, QualifiedName,
+    SourceUnit, TargetRef, UsageKind,
 };
 use sysmlv2_parser::span::Span;
 use sysmlv2_parser::token::{Token, TokenKind};
@@ -203,6 +203,18 @@ pub const VOCABULARY: &[&str] = &[
     "while",
     "xor",
 ];
+
+/// The keywords of one dialect: the words of its own grammar and the
+/// shared expression grammar, in [`VOCABULARY`] order — exactly the
+/// words the dialect reserves (`const` and `datatype` are KerML's, `part`
+/// and `calc` SysML's). The `keywords_split_by_grammar` gate
+/// regenerates each dialect's set from its grammars.
+pub fn keywords(dialect: Dialect) -> impl Iterator<Item = &'static str> {
+    VOCABULARY
+        .iter()
+        .copied()
+        .filter(move |w| sysmlv2_parser::parser::is_reserved(dialect, w))
+}
 
 /// Legend indices — the order is the wire protocol; append only.
 #[must_use]

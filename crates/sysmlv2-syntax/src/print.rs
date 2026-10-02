@@ -2249,7 +2249,6 @@ impl Printer {
                 self.print_args(args);
             }
             ExprKind::Body { members } => self.print_expr_body(members, e.span),
-            ExprKind::BodyTerminator => self.w(";"),
             ExprKind::Sequence(items) => {
                 self.w("(");
                 for (i, item) in items.iter().enumerate() {

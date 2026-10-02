@@ -133,6 +133,74 @@ impl Ctx {
             Ctx::KRoot | Ctx::KPackage | Ctx::KType | Ctx::KFunction
         )
     }
+
+    /// Does a body of this context end in a result expression (and take
+    /// a `return` parameter): the calculation, case, and function bodies.
+    fn takes_result(self) -> bool {
+        matches!(self, Ctx::Calculation | Ctx::Case | Ctx::KFunction)
+    }
+}
+
+/// Body context of a definition's body in `dialect`, per its kind.
+fn def_body_ctx(dialect: Dialect, k: DefKind) -> Ctx {
+    use DefKind::*;
+    if dialect == Dialect::Kerml {
+        return match k {
+            Function | Predicate => Ctx::KFunction,
+            _ => Ctx::KType,
+        };
+    }
+    match k {
+        Enum => Ctx::Enumeration,
+        Interface => Ctx::Interface,
+        Action => Ctx::Action,
+        State => Ctx::State,
+        Calc | Constraint => Ctx::Calculation,
+        Requirement | Concern | Viewpoint => Ctx::Requirement,
+        Case | Analysis | Verification | UseCase => Ctx::Case,
+        View => Ctx::ViewDef,
+        // KerML kinds are unreachable in a SysML parse.
+        _ => Ctx::Definition,
+    }
+}
+
+/// Body context of a usage's body in `dialect`, per its kind.
+fn usage_body_ctx(dialect: Dialect, k: UsageKind) -> Ctx {
+    use UsageKind::*;
+    if dialect == Dialect::Kerml {
+        return match k {
+            Expr | BoolExpr | Invariant => Ctx::KFunction,
+            Metadata => Ctx::Metadata,
+            _ => Ctx::KType,
+        };
+    }
+    match k {
+        Interface => Ctx::Interface,
+        Action | Perform | Accept | Send | Assign | Terminate | IfNode | WhileLoop | ForLoop
+        | Merge | Decide | Join | Fork | Transition => Ctx::Action,
+        State | Exhibit => Ctx::State,
+        Calc | Constraint | AssertConstraint => Ctx::Calculation,
+        Requirement | Concern | Viewpoint | Satisfy => Ctx::Requirement,
+        Case | Analysis | Verification | UseCase | Include => Ctx::Case,
+        View => Ctx::View,
+        Metadata => Ctx::Metadata,
+        Expr | BoolExpr | Invariant => Ctx::KFunction,
+        Feature | Step | Connector => Ctx::KType,
+        _ => Ctx::Definition,
+    }
+}
+
+/// Does the body of a `k` definition in `dialect` end in a result
+/// expression? Asked by the parser, so that it reads a body's last
+/// member by the same table as the body-context check.
+pub(crate) fn definition_body_takes_result(dialect: Dialect, k: DefKind) -> bool {
+    def_body_ctx(dialect, k).takes_result()
+}
+
+/// Does the body of a `k` usage in `dialect` end in a result expression?
+/// (See [`definition_body_takes_result`].)
+pub(crate) fn usage_body_takes_result(dialect: Dialect, k: UsageKind) -> bool {
+    usage_body_ctx(dialect, k).takes_result()
 }
 
 /// Grammar category of a SysML usage member (`NonOccurrenceUsageElement`,
@@ -483,51 +551,12 @@ struct Validator {
 impl Validator {
     /// Body context of a definition's body, per its kind.
     fn ctx_for_def(&self, k: DefKind) -> Ctx {
-        use DefKind::*;
-        if self.dialect == Dialect::Kerml {
-            return match k {
-                Function | Predicate => Ctx::KFunction,
-                _ => Ctx::KType,
-            };
-        }
-        match k {
-            Enum => Ctx::Enumeration,
-            Interface => Ctx::Interface,
-            Action => Ctx::Action,
-            State => Ctx::State,
-            Calc | Constraint => Ctx::Calculation,
-            Requirement | Concern | Viewpoint => Ctx::Requirement,
-            Case | Analysis | Verification | UseCase => Ctx::Case,
-            View => Ctx::ViewDef,
-            // KerML kinds are unreachable in a SysML parse.
-            _ => Ctx::Definition,
-        }
+        def_body_ctx(self.dialect, k)
     }
 
     /// Body context of a usage's body, per its kind.
     fn ctx_for_usage(&self, k: UsageKind) -> Ctx {
-        use UsageKind::*;
-        if self.dialect == Dialect::Kerml {
-            return match k {
-                Expr | BoolExpr | Invariant => Ctx::KFunction,
-                Metadata => Ctx::Metadata,
-                _ => Ctx::KType,
-            };
-        }
-        match k {
-            Interface => Ctx::Interface,
-            Action | Perform | Accept | Send | Assign | Terminate | IfNode | WhileLoop
-            | ForLoop | Merge | Decide | Join | Fork | Transition => Ctx::Action,
-            State | Exhibit => Ctx::State,
-            Calc | Constraint | AssertConstraint => Ctx::Calculation,
-            Requirement | Concern | Viewpoint | Satisfy => Ctx::Requirement,
-            Case | Analysis | Verification | UseCase | Include => Ctx::Case,
-            View => Ctx::View,
-            Metadata => Ctx::Metadata,
-            Expr | BoolExpr | Invariant => Ctx::KFunction,
-            Feature | Step | Connector => Ctx::KType,
-            _ => Ctx::Definition,
-        }
+        usage_body_ctx(self.dialect, k)
     }
 
     /// Context for members of a `{ … }` expression body.
@@ -841,9 +870,7 @@ impl Validator {
             MemberKind::StateSubaction { .. } => ctx == Ctx::State,
             MemberKind::Expose(_) => ctx == Ctx::View,
             MemberKind::Render(_) => matches!(ctx, Ctx::ViewDef | Ctx::View),
-            MemberKind::Return(_) | MemberKind::Result(_) => {
-                matches!(ctx, Ctx::Calculation | Ctx::Case | Ctx::KFunction)
-            }
+            MemberKind::Return(_) | MemberKind::Result(_) => ctx.takes_result(),
             MemberKind::Usage(u) => self.usage_ok(ctx, u),
         };
         if !ok {
@@ -1157,7 +1184,6 @@ impl Validator {
         match &e.kind {
             ExprKind::Literal(_)
             | ExprKind::Null
-            | ExprKind::BodyTerminator
             | ExprKind::Ref(_)
             | ExprKind::MetadataAccess { .. }
             | ExprKind::Extent { .. } => {}

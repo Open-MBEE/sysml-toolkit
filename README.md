@@ -71,11 +71,13 @@ Two environment variables control it:
 
 ### Ambient libraries and model context
 
-Every model that loads a library also sees the generated Web platform libraries under [local-packages/](local-packages/) (`Web::DOM`, `Web::HTML::Elements`, `Template`, `Svelte`, `WebApp`, `SvelteKit`, `TransformMeta`) without naming their files; `SYSMLV2_AMBIENT=off` switches them off. `SYSMLV2_MODEL_DIR` and `SYSMLV2_LIB_DIR` supply inputs and the library for verbs invoked without file arguments.
+Every model that loads a library also sees `TransformMeta` ([local-packages/](local-packages/)), the metadata vocabulary for generated elements, without naming its file; `SYSMLV2_AMBIENT=off` switches it off. `SYSMLV2_MODEL_DIR` and `SYSMLV2_LIB_DIR` supply inputs and the library for verbs invoked without file arguments.
 
 ### Calculation and static-analysis boundaries
 
 Calculations with expression results, local feature values, and positional or named inputs can be evaluated. Duplicate bindings and missing required inputs fail explicitly; omitted inputs use their own defaults without capturing same-named caller parameters. Bodies requiring assignments, loops, or action execution return `Unsupported`, including direct reads of their output initializers, and are not inlined by the solver. Behavioral execution belongs to a separate layer. Lambda bodies with unmodelled local declarations also fail explicitly.
+
+Unbound collections retain integer cardinality bounds from headers, KerML body-declared ranges and supported named multiplicity domains, and through explicit subsettings and redefinitions: `size` can answer four for a valueless `[4]` feature, but member rollups stay indeterminate until the members are available. Exact `[0]` collections are empty; explicit sequences of singleton usages still evaluate. Tuple and cast wrappers do not turn unknown collections into single values. Tuples containing an indeterminate constituent conservatively remain indeterminate because its arity is unknown. Eligible structural usages owned by definitions/usages receive implicit singleton bounds; otherwise unconstrained features default to `[0..*]`. These evaluator rules do not implement complete normative multiplicity semantics.
 
 Dimensional arithmetic is checked from declared quantity types even when parameter values are unbound. Unknown dimensions remain undecided. This check is conservative: it does not yet infer dimensions through arbitrary invocations or lambda bodies. The pinned [OpenSysML negative fixtures](crates/sysmlv2-parser/tests/fixtures/opensysml/) record both diagnostic baselines and remaining gaps; accepting a negative fixture is not counted as validation success.
 
@@ -85,7 +87,7 @@ Work-in-progress models with unresolved references are first-class: `check` repo
 
 ## Crates
 
-The repository is a Cargo workspace. Everything is licensed under Apache-2.0; the bindings ship as a wheel and an npm package.
+The repository is a Cargo workspace licensed under Apache-2.0; the bindings ship as a wheel and an npm package (the npm package also bundles the EPL-2.0 standard library — see [License](#license)).
 
 | Crate | What it provides |
 |---|---|
@@ -106,7 +108,7 @@ The repository is a Cargo workspace. Everything is licensed under Apache-2.0; th
 Alongside the crates:
 
 - [`editors/vscode`](editors/vscode) — the VS Code extension: semantic highlighting with a TextMate fallback, plus the language-server client.
-- [`local-packages/`](local-packages) — the generated ambient libraries and their provenance sidecars; checked-in sources work without a generator.
+- [`local-packages/`](local-packages) — `TransformMeta`, the ambient metadata library for generated elements.
 - [`spec-refs/`](spec-refs) — the pinned normative grammars, JSON schemas, and metamodel XMI, plus the official corpus and an external validation corpus as submodules (see [spec-refs/README.md](spec-refs/README.md)).
 - [`tools/`](tools) — the generators for the spec-derived tables (`gen_cbor_tables.py`, `gen_metaclass_hierarchy.py`, `xmi_props.py`), the `SDK.md` doctest runner, and the release and public-export scripts.
 
@@ -123,7 +125,7 @@ Alongside the crates:
 | Multi-file models + standard-library resolution | ✅ `model::Model`; 99.92% of corpus references resolve |
 | Normative library element IDs (KerML 9.1) | ✅ verified against published OMG XMI |
 | Textual printer + formatter (`sysmlv2 fmt`) | ✅ idempotency/semantic/note gates over the corpus |
-| `sysmlv2` CLI with example-rich `--help` | ✅ convert / payload / fmt / check / lint / verify / eval / query / render / describe / members / parse / viz / refactor / lsp |
+| `sysmlv2` CLI with example-rich `--help` | ✅ convert / payload / fmt / check / lint / verify / eval / query / describe / members / parse / viz / refactor / lsp |
 | JSON reader (`lift`) + conversion matrix: text ⇄ compact JSON, full-JSON input normalized | ✅ corpus round-trip gate (`emit∘parse∘print∘lift = id`) |
 | Full JSON form (derived props + implied relationships, `--to full-json`) | ✅ 52,048 corpus elements validate against the published schema |
 | Binary interchange (`--to compact-cbor` / `full-cbor`, `.s2c`) | ✅ deterministic, byte-for-byte reconstructable; elided ids; digest-verified deltas |
@@ -162,7 +164,7 @@ source text ──lexer──▶ tokens ──parser──▶ syntax AST ──b
 
 **Superset parsing.** Bodies accept the union of member kinds across contexts (a state member is not rejected inside a part body). Context validation is a semantic-checker concern; keeping it out of the parser simplified the grammar dramatically without losing any conforming model.
 
-**Error tolerance.** Lexer and parser never abort: they emit diagnostics with byte spans (plus a `LineIndex` for line/column) and recover at member boundaries, so one pass reports many errors and the AST remains usable on broken input. Trailing result expressions (`constraint { mass <= limit }`) are disambiguated from member declarations by checkpoint-and-backtrack.
+**Error tolerance.** Lexer and parser never abort: they emit diagnostics with byte spans (plus a `LineIndex` for line/column) and recover at member boundaries, so one pass reports many errors and the AST remains usable on broken input. Trailing result expressions (`constraint { mass <= limit }`) are disambiguated from member declarations by checkpoint-and-backtrack. A result expression terminated like a statement (`constraint { mass <= limit; }`) is reported at its `;` and still kept as the body's result.
 
 **Name resolution** follows KerML scoping: per scope, owned members (declared *and* short names) → aliases → membership imports → inherited members → namespace imports, with imports followed transitively (re-exports like `ISQ::mass`) and recursively for `::**`. Inherited-member lookup walks explicit specialization/typing targets **plus** the implied library bases of SysML Tables 31/32 (every `action` sees `Actions::Action`'s `start`/`done`) — used for resolution only, never serialized. All paths are cycle-guarded and cached per scope.
 
@@ -189,7 +191,6 @@ source text ──lexer──▶ tokens ──parser──▶ syntax AST ──b
 - The compact form deliberately does not satisfy the published JSON schemas' `required` lists — those describe the *full* (derived) form, which `--to full-json` produces.
 - Body contexts parse as a superset; `sysmlv2 check` closes the gap post-parse (body-context legality, duplicate names, variant ownership, import visibility). Remaining syntax fidelity limits include effect-only transition shorthands and result-expression-last positioning. Metadata-body implicit redefinitions and their static value checks are implemented.
 - Unnamed library elements keep deterministic local IDs instead of the normative positional `path()` IDs (never referenced from user text).
-- The [generated Web library](local-packages/README.md) has nine invalid attribute typings when checked as user input; its generator mappings need correction. Library-mode loading suppresses those library diagnostics.
 - Behavioral execution is not implemented. Calculations that require statement execution return an explicit unsupported error; unbound inputs may yield an indeterminate value. Static action/state checks do not execute behaviors.
 - Only the decidable fragment of constraint expressions reaches the SMT translator; the rest stay `undecided` with a stated reason.
 
@@ -214,4 +215,10 @@ The Python binding builds with `maturin develop` in `crates/sysmlv2-py` (it is o
 
 ## License
 
-Apache License 2.0 — Copyright 2026 Open-MBEE (see [LICENSE](LICENSE)). Reference material under `spec-refs/` keeps its upstream licenses (EPL-2.0 grammars, LGPL-3.0 corpus, MPL-2.0 external corpus).
+Apache License 2.0 — Copyright 2026 Planetary Utilities (see [LICENSE](LICENSE)).
+
+Third-party material keeps its upstream license and is not covered by the above:
+
+- `spec-refs/` — the vendored grammars (EPL-2.0), the OMG schemas and metamodel XMI (OMG specification terms), and two corpus submodules whose files this repository references by pinned revision rather than copies (EPL-2.0 and MPL-2.0). See [spec-refs/README.md](spec-refs/README.md).
+- `crates/sysmlv2-parser/tests/fixtures/opensysml/` — external test fixtures under Apache-2.0, with their upstream copyright notice in that directory's [LICENSE](crates/sysmlv2-parser/tests/fixtures/opensysml/LICENSE).
+- The npm package bundles the SysML v2 standard library, which stays under EPL-2.0; the package ships that license as `LICENSE-EPL-2.0` and the upstream copyright notices in `THIRD-PARTY-NOTICES.md`.

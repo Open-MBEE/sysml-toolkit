@@ -44,4 +44,4 @@ reset that context; unresolved markers do not become initial transitions.
 
 ## License
 
-Apache License 2.0 — Copyright 2026 Open-MBEE.
+Apache License 2.0 — Copyright 2026 Planetary Utilities.

@@ -4,8 +4,9 @@
 //! never panic).
 
 use sysmlv2_parser::eval::{EvalError, Value};
-use sysmlv2_parser::json::ResolvedModel;
+use sysmlv2_parser::json::{ElementRef, ResolvedModel};
 use sysmlv2_parser::model::Model;
+use sysmlv2_parser::parser::parse_expression;
 use sysmlv2_parser::rational::Rational;
 
 /// Evaluate `expr` as `attribute result = <expr>;` inside a package with
@@ -44,8 +45,8 @@ fn unknown_member_provenance_survives_value_operations() {
         part def Child { attribute flag default = false; }
         part def SpecializedChild :> Child { attribute :>> flag; }
         part def Parent { part child : SpecializedChild; part children : Child[0..*]; }
-        part installed : Child;
-        requirement def R { subject unit : Parent; }
+        part installed : Child[1];
+        requirement def R { subject unit : Parent[1]; }
         calc def Identity { in x; return result = x; }
     ";
     for expr in [
@@ -101,8 +102,8 @@ fn library_calls_preserve_unknown_receiver_members() {
                 part child : Child;
                 attribute independent = L::LocalDefault();
             }
-            requirement def R { subject unit : Parent; }
-            part installed : Parent;
+            requirement def R { subject unit : Parent[1]; }
+            part installed : Parent[1];
             attribute unknownResult = L::Read(R::unit);
             attribute knownResult = L::Read(installed);
             attribute localDefault = R::unit.independent;
@@ -130,10 +131,10 @@ fn unknown_receivers_agree_across_evaluation_entry_points() {
             part def Child { attribute flag default = false; }
             part def Parent { part child : Child; attribute flag default = false; }
             requirement def R {
-                subject unit : Parent;
+                subject unit : Parent[1];
                 ref part aliasUnit : Parent = unit;
             }
-            part installed : Parent;
+            part installed : Parent[1];
         }",
     );
     let mut r = ResolvedModel::build(&model);
@@ -386,7 +387,7 @@ fn featuring_context_redefinition() {
                  attribute extra = 100;
                  attribute total = baseMass + extra;
              }
-             part car : Vehicle { attribute :>> baseMass = 1200; }
+             part car : Vehicle[1] { attribute :>> baseMass = 1200; }
              attribute carTotal = car.total;
              attribute defTotal = Vehicle::total;
          }",
@@ -427,9 +428,9 @@ fn chain_member_through_overriding_usage() {
              part def L { attribute d; }
              part def N :> L { attribute :>> d = 5; }
              part def D { part c : L; attribute v = c.d; }
-             part unnamed : D { part :>> c : N; }
-             part named : D { part c :>> c : N; }
-             part subset : D { part :> c : N; }
+             part unnamed : D[1] { part :>> c : N; }
+             part named : D[1] { part c :>> c : N; }
+             part subset : D[1] { part :> c : N; }
              attribute chainUnnamed = unnamed.c.d;
              attribute chainNamed = named.c.d;
              attribute chainSubset = subset.c.d;
@@ -478,12 +479,12 @@ fn implicit_redefinition_by_name_shadows_in_diamonds() {
              part def Base { attribute f; }
              part def Base2 :> Base { attribute f = 7; }
              part def C { part p : Base; }
-             part c1 : C { part :>> p : Base2; }
+             part c1 : C[1] { part :>> p : Base2; }
              attribute probe = c1.p.f;
 
              part def A1 { attribute g = 1; }
              part def A2 { attribute g = 2; }
-             part q { part x : A1, A2; }
+             part q[1] { part x : A1, A2; }
              attribute unrelated = q.x.g;
          }",
     );
@@ -512,14 +513,14 @@ fn that_denotes_the_featuring_instance() {
         "t.sysml",
         "package T {
              part def Boxy;
-             part outer : Boxy {
+             part outer : Boxy[1] {
                  part inner {
                      attribute me = that;
                  }
              }
              attribute probeMe = outer.inner.me istype Boxy;
              attribute probeChain = outer.inner.that istype Boxy;
-             part shadow { attribute that = 42; attribute reads = that; }
+             part shadow[1] { attribute that = 42; attribute reads = that; }
              attribute probeShadow = shadow.reads;
          }",
     );
@@ -655,8 +656,9 @@ fn unbound_operands_degrade_to_indeterminate() {
         eval_with(u, "(u == 1) implies true"),
         Ok(Value::Boolean(true))
     );
-    // Collection membership is also three-valued: a known match decides,
-    // but a wholly unknown search value cannot fabricate absence.
+    // Collection membership is three-valued. An indeterminate tuple
+    // constituent may denote a collection of unknown arity, so the tuple
+    // stays indeterminate even when another constituent is a known match.
     assert_eq!(
         eval_with(u, "includes((1, 2), u + 1)"),
         Ok(Value::Indeterminate)
@@ -667,11 +669,11 @@ fn unbound_operands_degrade_to_indeterminate() {
     );
     assert_eq!(
         eval_with(u, "includes((1, u + 1), 1)"),
-        Ok(Value::Boolean(true))
+        Ok(Value::Indeterminate)
     );
     assert_eq!(
         eval_with(u, "excludes((1, u + 1), 1)"),
-        Ok(Value::Boolean(false))
+        Ok(Value::Indeterminate)
     );
     // Indeterminate propagates through further arithmetic.
     assert_eq!(eval_with(u, "(u + 5) * 2"), Ok(Value::Indeterminate));
@@ -825,11 +827,10 @@ fn user_defined_calculations() {
         eval_with(calc, "Torque(lever = 3, force = 10)"),
         Err(EvalError::Unresolved(_))
     ));
-    // KFL names stay reserved: a user calc named `sum` does not shadow the
-    // intrinsic.
+    // A declared calculation takes precedence over an intrinsic spelling.
     assert_eq!(
         eval_with("calc def sum { in x; 0 }", "sum((1, 2, 3))"),
-        Ok(int(6))
+        Ok(int(0))
     );
     // The `return x = expr;` spelling (a bound return parameter) also
     // yields the calculation's result — the rocket equation, no less.
@@ -924,10 +925,10 @@ fn implied_collections_roll_up() {
         "package T {
             private import ScalarValues::*;
             action def Step { attribute cost : Real default 0; }
-            action a1 : Step { attribute :>> cost = 5; }
-            action a2 : Step { attribute :>> cost = 7; }
-            action a3 : Step { attribute :>> cost = 10; }
-            part p { perform a1; perform a2; }
+            action a1 : Step[1] { attribute :>> cost = 5; }
+            action a2 : Step[1] { attribute :>> cost = 7; }
+            action a3 : Step[1] { attribute :>> cost = 10; }
+            part p[1] { perform a1; perform a2; }
             part rollup {
                 attribute total : Real = RealFunctions::sum((p.performedActions as Step).cost);
             }
@@ -936,6 +937,66 @@ fn implied_collections_roll_up() {
     let mut r = ResolvedModel::build(&model);
     let e = r.resolve_qualified("T::rollup::total").expect("resolves");
     assert_eq!(r.evaluate(e), Ok(Value::Integer(12)));
+}
+
+/// A query of a feature that a part redefines answers as the redefining
+/// part does: the part's owned parts do not stand in for it, and a part
+/// that owns none does not answer empty. Feature values read the same way.
+/// The receivers are single instances (`[1]`) so that the redefinition,
+/// not an unknown receiver, decides each answer where unbound collections
+/// answer indeterminate.
+#[test]
+fn a_redefined_feature_answers_as_its_redefining_part() {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .expect("library");
+    model.add_source(
+        "t.sysml",
+        "package P {
+            part def Wheel;
+            part def Car { part wheels : Wheel[0..*]; }
+            part car : Car[1] {
+                part frontWheels :>> wheels {
+                    part left : Wheel;
+                    part right : Wheel;
+                }
+            }
+            part car2 : Car[1] {
+                part frontWheels :>> wheels {
+                    attribute mass = 12;
+                }
+            }
+            attribute viaRedefined = car2.wheels.mass;
+            attribute viaRedefining = car2.frontWheels.mass;
+        }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let root = r.root_scope();
+    let query = |r: &mut ResolvedModel, text: &str| {
+        let parsed = parse_expression(text);
+        r.query(root, &parsed.expr.expect("expression"))
+    };
+    for (redefined, redefining) in [
+        ("P::car.wheels", "P::car.frontWheels"),
+        ("P::car2.wheels", "P::car2.frontWheels"),
+        ("P::car2.wheels.mass", "P::car2.frontWheels.mass"),
+    ] {
+        let answer = query(&mut r, redefined);
+        assert!(answer.is_ok(), "{redefined}: {answer:?}");
+        assert_eq!(
+            answer,
+            query(&mut r, redefining),
+            "{redefined} answers as {redefining}"
+        );
+    }
+    let value = |r: &mut ResolvedModel, name: &str| {
+        let e = r.resolve_qualified(name).expect(name);
+        r.evaluate(e)
+    };
+    let via_redefined = value(&mut r, "P::viaRedefined");
+    assert!(via_redefined.is_ok(), "{via_redefined:?}");
+    assert_eq!(via_redefined, value(&mut r, "P::viaRedefining"));
 }
 
 /// Corpus smoke gate: every feature value in the full corpus (with the
@@ -949,7 +1010,10 @@ fn corpus_feature_values_evaluate_or_fail_cleanly() {
         .expect("library");
     for f in sysmlv2_testkit::user_files() {
         let src = std::fs::read_to_string(&f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     let mut r = ResolvedModel::build(&model);
     let features = r.features_with_values();
@@ -968,6 +1032,88 @@ fn corpus_feature_values_evaluate_or_fail_cleanly() {
         "only {ok}/{} corpus feature values evaluated",
         features.len()
     );
+}
+
+/// The parameters an invocation binds, read off a callable's heritage
+/// alone, are the parameters among the model's own view of its features
+/// (implied heritage included), for every type of the library and the
+/// corpus but a few the inherited view reads differently: a performed
+/// action reached through a feature chain, whose parameters the walk pairs
+/// by position where the inherited view keeps both; a state's performed
+/// action, whose inherited view also lists an accept action's payload
+/// registered in the enclosing scope; and a requirement's subject that
+/// redefines its general's subject explicitly, which the inherited view
+/// gives none.
+#[test]
+fn corpus_callable_parameters_agree_with_the_inherited_view() {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .expect("library");
+    for f in sysmlv2_testkit::user_files() {
+        let src = std::fs::read_to_string(&f).unwrap();
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
+    }
+    let mut r = ResolvedModel::build(&model);
+    let mut checked = 0;
+    let mut differ = Vec::new();
+    for callee in r.elements().collect::<Vec<_>>() {
+        if r.inheritance_incomplete(callee, true) {
+            continue;
+        }
+        let inherited: Vec<_> = r
+            .effective_features(callee, true)
+            .into_iter()
+            .filter(|&f| {
+                r.is_parameter(f)
+                    && r.owning_membership_type(f) != Some("ReturnParameterMembership")
+            })
+            .collect();
+        let Some(parameters) = r.callable_parameters(callee) else {
+            let name = r.element_qualified_name(callee).unwrap_or_default();
+            panic!("no signature for {} {name}", r.element_type(callee));
+        };
+        let parameters: Vec<_> = parameters.into_iter().map(|p| p.element).collect();
+        if parameters.is_empty() && inherited.is_empty() {
+            continue;
+        }
+        checked += 1;
+        if parameters != inherited {
+            let metaclass = r.element_type(callee);
+            let name = r.element_qualified_name(callee).unwrap_or_default();
+            let spell = |r: &mut ResolvedModel, list: &[ElementRef]| {
+                list.iter()
+                    .map(|&p| r.element_qualified_name(p).unwrap_or_default())
+                    .collect::<Vec<_>>()
+            };
+            let (walk, view) = (spell(&mut r, &parameters), spell(&mut r, &inherited));
+            let difference = format!("{metaclass} {name}: walk {walk:?}, view {view:?}");
+            assert!(
+                matches!(metaclass, "PerformActionUsage" | "Step" | "ReferenceUsage"),
+                "{difference}"
+            );
+            differ.push(difference);
+        }
+    }
+    assert!(checked > 6000, "only {checked} types with parameters");
+    assert!(differ.len() <= 13, "{differ:#?}");
+}
+
+/// Arguments bind inherited parameters by position, whatever the
+/// specialization names its own: `Swapped`'s first parameter `b` stands
+/// for `Diff::a`.
+#[test]
+fn arguments_bind_by_position_not_by_name() {
+    let decls = "calc def Diff { in a; in b; a - b }
+                 calc def Swapped :> Diff { in b; in a; }
+                 calc def Renamed :> Diff { in x; in y; }";
+    assert_eq!(eval_with(decls, "Swapped(10, 3)"), Ok(int(7)));
+    assert_eq!(eval_with(decls, "Swapped(b = 10, a = 3)"), Ok(int(7)));
+    assert_eq!(eval_with(decls, "Renamed(10, 3)"), Ok(int(7)));
+    assert_eq!(eval_with(decls, "Renamed(y = 3, x = 10)"), Ok(int(7)));
 }
 
 /// Units normalize to exponent maps: derived-unit definitions expand,
@@ -1125,10 +1271,10 @@ fn quantity_zero_identity() {
 fn chain_over_sequence_maps_and_dedups() {
     let decls = "part def E { attribute v = 304; }
                  part def P { attribute m; }
-                 part e1 : E; part e2 : E; part e3 : E;
-                 part a : P { attribute :>> m = 1; }
-                 part b : P { attribute :>> m = 2; }
-                 part s { part es = (e1, e2, e3); part ps = (a, b); }";
+                 part e1 : E[1]; part e2 : E[1]; part e3 : E[1];
+                 part a : P[1] { attribute :>> m = 1; }
+                 part b : P[1] { attribute :>> m = 2; }
+                 part s[1] { part es = (e1, e2, e3); part ps = (a, b); }";
     assert_eq!(eval_with(decls, "s.es.v"), Ok(int(304)));
     assert_eq!(
         eval_with(decls, "s.ps.m"),
@@ -1148,16 +1294,16 @@ fn featuring_context_depth_and_recursive_rollup() {
                     attribute m2 = base * 2;
                     attribute base;
                 }
-                part car : V { attribute :>> base = 10; }";
+                part car : V[1] { attribute :>> base = 10; }";
     assert_eq!(eval_with(deep, "car.total"), Ok(int(21)));
     let rollup = "part def M {
                       part subs : M [*] default null;
                       attribute mass;
                       attribute totalMass = mass + sum(subs.totalMass);
                   }
-                  part leaf1 : M { attribute :>> mass = 1; }
-                  part leaf2 : M { attribute :>> mass = 2; }
-                  part root : M {
+                  part leaf1 : M[1] { attribute :>> mass = 1; }
+                  part leaf2 : M[1] { attribute :>> mass = 2; }
+                  part root : M[1] {
                       attribute :>> mass = 5;
                       part :>> subs = (leaf1, leaf2);
                   }";
@@ -1372,8 +1518,8 @@ fn classification_operators() {
     let decls = "part def Component;
                  part def Engine :> Component;
                  part def Wheel :> Component;
-                 part e : Engine;
-                 part w : Wheel;
+                 part e : Engine[1];
+                 part w : Wheel[1];
                  part parts = (e, w);";
     // Declared conformance is a guaranteed true.
     assert_eq!(
@@ -1474,10 +1620,10 @@ fn performed_actions_rollup_evaluates() {
         "package Tally {
             private import ScalarValues::*;
             action def Chore { attribute effort : Real default 0; }
-            action c1 : Chore { attribute :>> effort = 4.0; }
-            action c2 : Chore { attribute :>> effort = 9.0; }
-            action c3 : Chore { attribute :>> effort = 100.0; }
-            part worker {
+            action c1 : Chore[1] { attribute :>> effort = 4.0; }
+            action c2 : Chore[1] { attribute :>> effort = 9.0; }
+            action c3 : Chore[1] { attribute :>> effort = 100.0; }
+            part worker[1] {
                 perform c1;
                 perform c2;
             }
@@ -1502,14 +1648,13 @@ fn performed_actions_rollup_evaluates() {
 /// else answers *indeterminate* rather than fabricating (the
 /// placeholder used to count as one element, silently mis-measuring
 /// every multi-valued feature and making `(1..size(xs)-1)->forAll`
-/// bodies vacuously true). Sequence literals containing placeholders
-/// keep their written arity, and enum literals stay closed one-element
-/// values.
+/// bodies vacuously true). Sequence literals cannot establish the arity
+/// of unknown collections, and enum literals stay closed one-element values.
 #[test]
 fn unbound_cardinality_comes_from_declared_multiplicity() {
     let decls = "
         part def D;
-        part rack {
+        part rack[1] {
             part slots[3] : D;
             part gear[1..*] : D;
             part loose[0..2] : D;
@@ -1519,7 +1664,7 @@ fn unbound_cardinality_comes_from_declared_multiplicity() {
     ";
     // Exact declared multiplicity answers.
     assert_eq!(eval_with(decls, "size(rack.slots)"), Ok(int(3)));
-    // The KerML default `[1..1]` answers for a bare feature.
+    // A structural usage inside a usage has implicit multiplicity `[1..1]`.
     assert_eq!(eval_with(decls, "size(rack.lone)"), Ok(int(1)));
     // A lower bound settles non-emptiness; the size stays unknown.
     assert_eq!(
@@ -1535,10 +1680,10 @@ fn unbound_cardinality_comes_from_declared_multiplicity() {
         eval_with(decls, "isEmpty(rack.loose)"),
         Ok(Value::Indeterminate)
     );
-    // Written arity survives placeholders inside sequence literals.
+    // Flat sequences cannot wrap unknown collections into scalar placeholders.
     assert_eq!(
         eval_with(decls, "size((rack.gear, rack.loose))"),
-        Ok(int(2))
+        Ok(Value::Indeterminate)
     );
     // Enum literals stay closed single values.
     assert_eq!(eval_with(decls, "size(Mode::ON)"), Ok(int(1)));
@@ -1567,6 +1712,244 @@ fn unbound_cardinality_comes_from_declared_multiplicity() {
         eval_with(decls, "rack.slots#(0)"),
         Err(EvalError::Type(_))
     ));
+}
+
+#[test]
+fn cardinality_inherits_redefinitions_without_rounding_or_guessing() {
+    let decls = "
+        part def Rack { part slots[4]; }
+        part def Middle :> Rack { part :>> slots; }
+        part rack : Middle[1] { part :>> slots; }
+        part huge[9007199254740993];
+        part optional[0..1];
+        part def Left { part slots[2..5]; }
+        part def Right { part slots[4..7]; }
+        part both[1] { part slots :>> Left::slots, Right::slots; }
+        part missing[1] { part slots :>> Left::slots, absent; }
+        part cyclic :>> cyclic;
+        part a :>> b; part b :>> a;
+        attribute count = size(recursive);
+        part recursive[count];
+        attribute unknown;
+        part invalid[unknown] :>> Rack::slots;
+        attribute neg = -1; part negative[neg];
+    ";
+    assert_eq!(eval_with(decls, "size(rack.slots)"), Ok(int(4)));
+    assert_eq!(eval_with(decls, "size(huge)"), Ok(int(9007199254740993)));
+    assert!(matches!(
+        eval_with(decls, "huge#(9007199254740994)"),
+        Err(EvalError::Type(_))
+    ));
+    assert_eq!(eval_with(decls, "optional#(1)"), Ok(Value::Indeterminate));
+    assert_eq!(
+        eval_with(decls, "notEmpty(both.slots)"),
+        Ok(Value::Boolean(true))
+    );
+    for expr in [
+        "size(both.slots)",
+        "size(missing.slots)",
+        "size(cyclic)",
+        "size(a)",
+        "size(recursive)",
+        "size(invalid)",
+        "size(negative)",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+}
+
+#[test]
+fn cardinality_defaults_follow_usage_kind_owner_and_subsetting() {
+    let mut model = Model::new();
+    model.add_source(
+        "defaults.sysml",
+        r#"
+        package P {
+            attribute a; item i; part p; port q;
+            part def D {
+                attribute a; item i; part p; port q;
+                ref item reference; in attribute input;
+                connection c; interface face; allocation alloc;
+                action act; occurrence occ; ref generic;
+                package Nested { attribute a; part p; }
+            }
+            part holder { attribute a; item i; part p; port q; }
+            part explicit[1];
+            part base[2..5]; part other[4..7];
+            part subset :> base; part intersection :> base, other;
+            part smaller[1] :> base;
+            part chain :>> subset; part mixed :> base :>> other;
+            part missing :> absent; part partial :> base, absent;
+            part cycle :> cycle; part ca :> cb; part cb :>> ca;
+            part noBound; part inheritedDefault :> noBound;
+            part Dsubset :> D::p;
+            part low[0..1]; part conflict :> base, low;
+            part def Container { part subset :> P::base; }
+        }
+    "#,
+    );
+    model.add_source(
+        "defaults.kerml",
+        "package K { feature a; class C { feature a; } }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    for name in [
+        "D::a",
+        "D::i",
+        "D::p",
+        "D::q",
+        "D::reference",
+        "D::input",
+        "holder::a",
+        "holder::i",
+        "holder::p",
+        "holder::q",
+        "explicit",
+        "Dsubset",
+    ] {
+        let e = r.resolve_qualified(&format!("P::{name}")).unwrap();
+        assert_eq!(r.effective_cardinality(e), Some((1, Some(1))), "{name}");
+    }
+    for name in [
+        "P::a",
+        "P::i",
+        "P::p",
+        "P::q",
+        "P::holder",
+        "P::D::c",
+        "P::D::face",
+        "P::D::alloc",
+        "P::D::act",
+        "P::D::occ",
+        "P::D::generic",
+        "P::D::Nested::a",
+        "P::D::Nested::p",
+        "P::inheritedDefault",
+        "K::a",
+        "K::C::a",
+    ] {
+        let e = r.resolve_qualified(name).unwrap();
+        assert_eq!(r.effective_cardinality(e), Some((0, None)), "{name}");
+    }
+    for (name, bounds) in [
+        ("subset", (2, Some(5))),
+        ("intersection", (4, Some(5))),
+        ("smaller", (1, Some(1))),
+        ("chain", (2, Some(5))),
+        ("mixed", (4, Some(5))),
+        ("Container::subset", (2, Some(5))),
+    ] {
+        let e = r.resolve_qualified(&format!("P::{name}")).unwrap();
+        assert_eq!(r.effective_cardinality(e), Some(bounds), "{name}");
+    }
+    for name in ["missing", "partial", "cycle", "ca", "conflict"] {
+        let e = r.resolve_qualified(&format!("P::{name}")).unwrap();
+        assert_eq!(r.effective_cardinality(e), None, "{name}");
+    }
+}
+
+#[test]
+fn inherited_subsetting_bounds_control_collection_operations() {
+    let decls = "part base[4]; part middle :> base; part inherited :>> middle;
+        part empty[0]; part emptySubset :> empty;
+        part variable[2..5]; part variableSubset :> variable;
+        part unknown; part def D { part singleton; }";
+    assert_eq!(eval_with(decls, "size(inherited)"), Ok(int(4)));
+    assert_eq!(
+        eval_with(decls, "isEmpty(emptySubset)"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        eval_with(decls, "notEmpty(variableSubset)"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(eval_with(decls, "size(unknown)"), Ok(Value::Indeterminate));
+    assert_eq!(eval_with(decls, "size(D::singleton)"), Ok(int(1)));
+    assert!(matches!(
+        eval_with(decls, "inherited#(5)"),
+        Err(EvalError::Type(_))
+    ));
+}
+
+#[test]
+fn unsupported_owned_multiplicities_and_subsettings_stay_unknown() {
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "unsupported.kerml",
+        "package K {
+            feature base[2];
+            feature ranged { multiplicity [3]; }
+            feature named { multiplicity bounds [4]; }
+            feature conflicting[1] { multiplicity bounds [2]; }
+            feature inherited subsets base { multiplicity bounds [4]; }
+            feature reference references base;
+            feature receiver { feature leaf[2]; }
+            feature crossing crosses receiver.leaf;
+        }",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let unit = model.add_source(
+        "enum.sysml",
+        "enum def Choice { on; off; }
+        enum root : Choice;
+        part def D { enum choice : Choice; }",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    for (name, count) in [("ranged", 3), ("named", 4), ("inherited", 4)] {
+        let e = r.resolve_qualified(&format!("K::{name}")).unwrap();
+        assert_eq!(
+            r.effective_cardinality(e),
+            Some((count, Some(count))),
+            "{name}"
+        );
+    }
+    for name in ["conflicting", "reference", "crossing"] {
+        let e = r.resolve_qualified(&format!("K::{name}")).unwrap();
+        assert_eq!(r.effective_cardinality(e), None, "{name}");
+    }
+    let root = r.resolve_qualified("root").unwrap();
+    assert_eq!(r.effective_cardinality(root), Some((0, None)));
+    let member = r.resolve_qualified("D::choice").unwrap();
+    assert_eq!(r.effective_cardinality(member), Some((1, Some(1))));
+}
+
+#[test]
+fn inherited_cardinality_uses_the_redefining_context() {
+    let decls = "part def Rack { attribute count = 4; part slots[count]; }
+        part rack : Rack[1] { attribute :>> count = 6; part :>> slots; }
+        part zero[0]; part empty :>> zero;
+        part low[2..3]; part high[4..5]; part conflict :>> low, high;
+        part broad[2..8]; part narrowed[6] :>> broad;";
+    assert_eq!(eval_with(decls, "size(rack.slots)"), Ok(int(6)));
+    assert_eq!(eval_with(decls, "size(empty)"), Ok(int(0)));
+    assert_eq!(eval_with(decls, "size(narrowed)"), Ok(int(6)));
+    assert_eq!(eval_with(decls, "isEmpty(empty)"), Ok(Value::Boolean(true)));
+    assert_eq!(eval_with(decls, "size(conflict)"), Ok(Value::Indeterminate));
+}
+
+#[test]
+fn cardinality_keeps_unknown_receivers_and_shared_heritage_bounded() {
+    let decls = "part def Rack { attribute count default = 4; part slots[count]; part fixed[4]; }
+        requirement def R { subject unit : Rack[1]; }";
+    assert_eq!(
+        eval_with(decls, "size(R::unit.slots)"),
+        Ok(Value::Indeterminate)
+    );
+    assert_eq!(eval_with(decls, "size(R::unit.fixed)"), Ok(int(4)));
+
+    let mut diamond = String::from("part a0[4]; part b0[4];");
+    for n in 1..24 {
+        diamond.push_str(&format!(
+            "part a{n} :>> a{}, b{}; part b{n} :>> a{}, b{};",
+            n - 1,
+            n - 1,
+            n - 1,
+            n - 1
+        ));
+    }
+    assert_eq!(eval_with(&diamond, "size(a23)"), Ok(int(4)));
 }
 
 /// Lib-gated: verification verdict helpers evaluate — the library's
@@ -1884,4 +2267,270 @@ fn evaluation_budget_covers_intrinsics_and_per_item_results() {
         matches!(&folded, Err(EvalError::Budget(m)) if m.contains("bytes")),
         "{folded:?}"
     );
+}
+
+#[test]
+fn intrinsic_names_do_not_override_user_calculations() {
+    let decls = "
+        calc def sum { in x; return r = 99; }
+        calc def min { in x; in y; return r = 88; }
+        calc def '+' { in x; in y; return r = 77; }
+        alias renamed for sum;
+        calc def Call { in sum; return r = sum(1); }
+    ";
+    for expr in [
+        "sum(1)",
+        "T::sum(1)",
+        "1->sum()",
+        "1->T::sum()",
+        "renamed(1)",
+        "Call(sum)",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(int(99)), "{expr}");
+    }
+    for expr in ["(1, 2)->reduce min", "(1, 2)->reduce T::min"] {
+        assert_eq!(eval_with(decls, expr), Ok(int(88)), "{expr}");
+    }
+    for expr in ["(1, 2)->reduce '+'", "(1, 2)->reduce T::'+'"] {
+        assert_eq!(eval_with(decls, expr), Ok(int(77)), "{expr}");
+    }
+    assert!(matches!(
+        eval("Missing::sum(1)"),
+        Err(EvalError::Unsupported(_))
+    ));
+    assert!(matches!(
+        eval("(1, 2)->Missing::reduce '+'"),
+        Err(EvalError::Unsupported(_))
+    ));
+    assert!(matches!(
+        eval_with("calc def reduce;", "(1, 2)->reduce '+'"),
+        Err(EvalError::Unsupported(_))
+    ));
+    assert!(matches!(
+        eval_with("calc def collect;", "(1, 2)->collect { in x; x }"),
+        Err(EvalError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn intrinsic_dispatch_follows_library_identity_and_aliases() {
+    let mut model = Model::new();
+    for (file, source) in [
+        (
+            "numeric.kerml",
+            "standard library package NumericalFunctions { abstract function sum { in x; return r; } }",
+        ),
+        (
+            "control.kerml",
+            "standard library package ControlFunctions { abstract function reduce { in x; in fn; return r; } }",
+        ),
+        (
+            "other.kerml",
+            "standard library package Other { function sum { in x; return r = 42; } }",
+        ),
+    ] {
+        let unit = model.add_library_source(file, source);
+        assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    }
+    let unit = model.add_source(
+        "user.sysml",
+        "package T {
+        alias total for NumericalFunctions::sum;
+        alias fold for ControlFunctions::reduce;
+        calc def sum { in x; return r = 99; }
+        calc def Call { in sum; return r = sum((1, 2, 3)); }
+        attribute builtin = total((1, 2, 3));
+        attribute qualified = NumericalFunctions::sum((1, 2, 3));
+        attribute arrow = (1, 2, 3)->total();
+        attribute indirect = Call(total);
+        attribute folded = (1, 2)->fold '+';
+        attribute own = sum(1);
+        attribute libraryBody = Other::sum(1);
+    }",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    for (name, value) in [
+        ("builtin", 6),
+        ("qualified", 6),
+        ("arrow", 6),
+        ("indirect", 6),
+        ("folded", 3),
+        ("own", 99),
+        ("libraryBody", 42),
+    ] {
+        let e = r.resolve_qualified(&format!("T::{name}")).unwrap();
+        assert_eq!(r.evaluate(e), Ok(int(value)), "{name}");
+    }
+}
+
+#[test]
+fn standard_library_operator_aliases_reduce_by_identity() {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .unwrap();
+    let unit = model.add_source(
+        "t.sysml",
+        "package T {
+        alias add for DataFunctions::'+';
+        alias concatenate for StringFunctions::'+';
+        alias fold for ControlFunctions::reduce;
+        attribute numeric = (1, 2, 3)->fold add;
+        attribute text = (\"a\", \"b\")->fold concatenate;
+        attribute integer = (1, 2, 3)->fold IntegerFunctions::'+';
+        attribute scalar = (1, 2, 3)->fold ScalarFunctions::'+';
+    }",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    for name in ["numeric", "integer", "scalar"] {
+        let e = r.resolve_qualified(&format!("T::{name}")).unwrap();
+        assert_eq!(r.evaluate(e), Ok(int(6)), "{name}");
+    }
+    let text = r.resolve_qualified("T::text").unwrap();
+    assert_eq!(r.evaluate(text), Ok(Value::String("ab".into())));
+}
+
+#[test]
+fn ambiguous_intrinsic_spelling_is_not_a_missing_builtin() {
+    let decls = "package A { calc def sum { in x; return r = 1; } }
+        package B { calc def sum { in x; return r = 2; } }
+        import A::*; import B::*;";
+    assert!(matches!(
+        eval_with(decls, "sum(3)"),
+        Err(EvalError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn inaccessible_intrinsic_spelling_is_not_a_missing_builtin() {
+    let decls = "package A { private calc def sum { in x; return r = 1; } } import A::*;";
+    assert!(matches!(
+        eval_with(decls, "sum(3)"),
+        Err(EvalError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn unbound_collections_never_materialize_as_single_instances() {
+    let decls = "
+        part def Motor { attribute mass = 0.55; }
+        part def Rack { part motors : Motor[4]; }
+        part def Middle :> Rack { part :>> motors; }
+        part rack : Middle[1] { part :>> motors; }
+        part motors : Motor[4];
+        part optional : Motor[0..1];
+        part empty : Motor[0];
+        part m1 : Motor[1]; part m2 : Motor[1]; part m3 : Motor[1]; part m4 : Motor[1];
+        part concrete = (m1, m2, m3, m4);
+        calc def Identity { in x; return result = x; }
+    ";
+    for collection in ["motors", "rack.motors", "optional"] {
+        for expr in [
+            format!("{collection}.mass"),
+            format!("sum({collection}.mass)"),
+            format!("{collection}->collect {{ in m; m.mass }}"),
+            format!("{collection}->reduce {{ in a; in b; a }}"),
+            format!("{collection}->forAll {{ in m; m.mass == 0.55 }}"),
+            format!("{collection}->exists {{ in m; true }}"),
+            format!("size(({collection},))"),
+            format!("size({collection} as Motor)"),
+            format!("size(m1->collect {{ in m; {collection} }})"),
+            format!("sum(Identity({collection}).mass)"),
+            format!("size(tail({collection}))"),
+            format!("size(reverse({collection}))"),
+            format!("size(union({collection}, m1))"),
+            format!("head({collection}).mass"),
+            format!("last({collection}).mass"),
+            format!("max({collection})"),
+            format!("min({collection})"),
+            format!("product({collection})"),
+        ] {
+            assert_eq!(eval_with(decls, &expr), Ok(Value::Indeterminate), "{expr}");
+        }
+    }
+    for (expr, expected) in [
+        ("size(rack.motors)", int(4)),
+        ("size(concrete)", int(4)),
+        ("size((m1, m2))", int(2)),
+        ("sum(concrete->collect { in m; m.mass })", rat(11, 5)),
+        ("sum(concrete.mass)", rat(11, 20)), // existing unique dot-chain semantics
+        ("sum(empty.mass)", int(0)),
+        ("product(empty.mass)", int(1)),
+        ("size((empty, m1))", int(1)),
+        ("empty->forAll { in m; false }", Value::Boolean(true)),
+        ("empty->exists { in m; true }", Value::Boolean(false)),
+        ("size(empty->collect { in m; m.mass })", int(0)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+}
+
+#[test]
+fn indexing_chained_collections_requires_known_flattened_positions() {
+    let declarations = "
+        part def A {
+            attribute xs[4] ordered;
+            attribute flag[1];
+            attribute items[0..*] ordered = if flag ? xs else xs;
+            attribute scalar[1];
+        }
+        part def B { attribute items[1] = 99; attribute scalar[1] = 99; }
+        part a : A[1]; part b : B[1];
+    ";
+    for expression in ["(a, b).items#(2)", "(a, b).items#(3)", "(b, a).items#(2)"] {
+        assert_eq!(
+            eval_with(declarations, expression),
+            Ok(Value::Indeterminate),
+            "{expression}"
+        );
+    }
+    // Exact singleton placeholders retain a position, even though their value
+    // remains unknown. Direct unknown collections retain their upper bounds.
+    assert!(matches!(
+        eval_with(declarations, "(a, b).scalar#(1)"),
+        Ok(Value::Unbound(_))
+    ));
+    assert_eq!(eval_with(declarations, "(a, b).scalar#(2)"), Ok(int(99)));
+    assert_eq!(
+        eval_with(declarations, "a.xs#(2)"),
+        Ok(Value::Indeterminate)
+    );
+    assert!(matches!(
+        eval_with(declarations, "a.xs#(5)"),
+        Err(EvalError::Type(_))
+    ));
+}
+
+#[test]
+fn qualified_collection_receivers_preserve_indeterminate_values() {
+    use sysmlv2_parser::ast::{Name, QualifiedName};
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "t.sysml",
+        "package P {
+        part def Motor { attribute mass = 0.55; }
+        part motors : Motor[4];
+        part wrapped : Motor = (motors,);
+    }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let mut r = ResolvedModel::build(&model);
+    let member = QualifiedName {
+        is_global: false,
+        segments: vec![Name {
+            value: "mass".into(),
+            span: Default::default(),
+        }],
+        span: Default::default(),
+    };
+    for name in ["P::motors", "P::wrapped"] {
+        let root = r.resolve_qualified(name).unwrap();
+        assert_eq!(r.evaluate_chain(root, &[&member]), Ok(Value::Indeterminate));
+        assert_eq!(
+            r.evaluate_qualified(&format!("{name}::mass")),
+            Ok(Value::Indeterminate)
+        );
+    }
 }

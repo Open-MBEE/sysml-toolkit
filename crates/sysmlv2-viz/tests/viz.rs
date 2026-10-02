@@ -1056,7 +1056,10 @@ fn graph_state_view_pseudostates_and_transition_identity() {
 /// to its individually exposed members, so filtered-out siblings stay
 /// off the canvas) and `render` picks the style. Metadata-filtered
 /// connectors disappear as edges; the kept connector still draws
-/// between the kept parts' ports.
+/// between the kept parts' ports. The ports the parts inherit from
+/// their definitions are exposed too, since a part's visible members
+/// include its inherited ones, but they draw once, on each part's box,
+/// never again as boxes of their own.
 #[test]
 fn view_directed_rendering() {
     let src = "package VD {
@@ -1076,6 +1079,10 @@ fn view_directed_rendering() {
             expose stage::**;
             filter not (@LOUD);
         }
+        view whole {
+            expose Amp;
+            expose stage::**;
+        }
     }";
     let mut r = resolved(src);
     let view = r.resolve_qualified("VD::quiet").expect("view resolves");
@@ -1084,12 +1091,19 @@ fn view_directed_rendering() {
     assert_eq!(style, None);
     let names: Vec<String> = roots
         .iter()
-        .filter_map(|&e| r.element_qualified_name(e))
+        .map(|&e| {
+            r.element_qualified_name(e)
+                .unwrap_or_else(|| r.element_type(e).to_string())
+        })
         .collect();
-    assert!(
-        names.contains(&"VD::stage::amp".to_string())
-            && names.contains(&"VD::stage::main".to_string()),
-        "{names:?}"
+    assert_eq!(
+        names,
+        [
+            "VD::stage::amp",
+            "VD::stage::main",
+            "VD::stage::monitor",
+            "InterfaceUsage"
+        ]
     );
     let opts = VizOptions::default()
         .with_view(View::Interconnection)
@@ -1099,13 +1113,149 @@ fn view_directed_rendering() {
     // LOUD-tagged one is filtered off. The untagged parts (including
     // `monitor`) all stay — only a provably-matching condition hides a
     // member — and the `stage` wrapper defers to its exposed members
-    // (no duplicate subtrees).
-    assert_eq!(out.matches("«interface»").count(), 1, "{out}");
-    assert!(out.contains("monitor : Speaker"), "{out}");
-    assert!(!out.contains("\"stage\""), "{out}");
+    // (no duplicate subtrees). Each part's box carries its definition's
+    // ports, and those are the only port nodes.
+    assert_eq!(
+        out,
+        r#"@startuml
+rectangle "amp : Amp" as n1 <<part>> {
+  port "line : Jack" as n2
+  port "aux : Jack" as n3
+}
+rectangle "main : Speaker" as n4 <<part>> {
+  port "feed : Jack" as n5
+}
+rectangle "monitor : Speaker" as n6 <<part>> {
+  port "feed : Jack" as n7
+}
+n2 -- n5 : «interface»
+@enduml
+"#
+    );
+    // A definition the view exposes whole stays a node of its own: the
+    // ports `amp` inherits from it do not take it apart.
+    let view = r.resolve_qualified("VD::whole").expect("view resolves");
+    let (_, roots) = sysmlv2_viz::view_directed(&mut r, view).expect("a view usage");
+    let names: Vec<String> = roots
+        .iter()
+        .filter_map(|&e| r.element_qualified_name(e))
+        .collect();
+    assert!(names.contains(&"VD::Amp".to_string()), "{names:?}");
+    assert!(
+        !names
+            .iter()
+            .any(|n| ["VD::Amp::", "VD::Speaker::", "VD::Jack::"]
+                .iter()
+                .any(|owner| n.starts_with(owner))),
+        "{names:?}"
+    );
     // A non-view element answers None.
     let part = r.resolve_qualified("VD::stage").unwrap();
     assert!(sysmlv2_viz::view_directed(&mut r, part).is_none());
+}
+
+/// A view usage without a `render` member of its own takes its style
+/// from the rendering its definition declares; its own `render` member
+/// wins over the inherited one.
+#[test]
+fn view_directed_style_follows_an_inherited_rendering() {
+    let mut r = resolved(
+        "package VI {
+            package Views {
+                rendering asTreeDiagram;
+                rendering asInterconnectionDiagram;
+            }
+            part rig { part amp; }
+            view def Wiring { render Views::asInterconnectionDiagram; }
+            view wiring : Wiring { expose rig; }
+            view outline : Wiring {
+                expose rig;
+                render Views::asTreeDiagram;
+            }
+        }",
+    );
+    let rig = r.resolve_qualified("VI::rig").unwrap();
+    for (name, expected) in [
+        ("VI::wiring", View::Interconnection),
+        ("VI::outline", View::Tree),
+    ] {
+        let view = r.resolve_qualified(name).expect("view resolves");
+        let (style, roots) = sysmlv2_viz::view_directed(&mut r, view).expect("a view usage");
+        assert_eq!(style, Some(expected), "{name}");
+        assert_eq!(roots, vec![rig], "{name}");
+    }
+}
+
+/// Finest granularity follows ownership whatever else inherits: a
+/// definition whose members the view reaches through ownership still
+/// defers to them, so the member its condition rejects stays off the
+/// diagram, though a specialization inherits the same members.
+#[test]
+fn view_directed_owned_members_defer_despite_inheritance() {
+    let mut r = resolved(
+        "package Kit {
+            metadata def LOUD;
+            part def Base { part x; #LOUD part y; }
+            part def Derived :> Base;
+        }
+        package Show {
+            view kit {
+                expose Kit::**;
+                filter not (@Kit::LOUD);
+            }
+        }",
+    );
+    let view = r.resolve_qualified("Show::kit").expect("view resolves");
+    let (_, roots) = sysmlv2_viz::view_directed(&mut r, view).expect("a view usage");
+    let names: Vec<String> = roots
+        .iter()
+        .filter_map(|&e| r.element_qualified_name(e))
+        .collect();
+    assert!(
+        names.contains(&"Kit::Base::x".to_string())
+            && names.contains(&"Kit::Derived".to_string())
+            && !names.contains(&"Kit::Base".to_string()),
+        "{names:?}"
+    );
+    let out = plantuml(&mut r, None, &VizOptions::default().with_roots(Some(roots)));
+    assert!(!out.contains("\"y\""), "{out}");
+}
+
+/// `expose x::*` exposes what `x` inherits besides what it owns, from
+/// the model's own definitions and from the standard library alike.
+/// Those members render through `x`, so the diagram gets `x`'s owned
+/// members only, not a node for every feature a part inherits.
+#[test]
+fn view_directed_leaves_inherited_members_to_their_inheritor() {
+    let lib = sysmlv2_testkit::library_dir();
+    let mut model = Model::new();
+    model.load_library_dir(&lib).expect("library loads");
+    model.add_source(
+        "rig.sysml".to_string(),
+        "package Rig {
+            part def Frame { part brace; }
+            part rig : Frame {
+                part amp;
+                part spare;
+            }
+            view shallow { expose rig::*; }
+        }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    let view = r.resolve_qualified("Rig::shallow").expect("view resolves");
+    let exposed = r.view_exposed_elements(view);
+    let brace = r.resolve_qualified("Rig::Frame::brace").unwrap();
+    assert!(exposed.contains(&brace));
+    assert!(exposed.iter().any(|&e| r.is_library_element(e)));
+    let (_, roots) = sysmlv2_viz::view_directed(&mut r, view).expect("a view usage");
+    let names: Vec<String> = roots
+        .iter()
+        .map(|&e| {
+            r.element_qualified_name(e)
+                .unwrap_or_else(|| r.element_type(e).to_string())
+        })
+        .collect();
+    assert_eq!(names, ["Rig::rig::amp", "Rig::rig::spare"]);
 }
 
 /// Action-view flow anchors: a bare `then x;` succession sources from

@@ -115,10 +115,10 @@ where
 /// packed big-endian into one uint. Decoders refuse `layout`
 /// unconditionally, `tables` whenever they decode element records,
 /// and `scheme` only when id derivation is in play (elided payloads).
-pub(crate) fn header_word(flags: u8) -> u64 {
+pub(crate) fn header_word_with_scheme(flags: u8, scheme: u8) -> u64 {
     (crate::LAYOUT_VERSION as u64) << 32
         | (crate::tables::CBOR_TABLES_VERSION as u64) << 16
-        | (crate::ID_SCHEME_VERSION as u64) << 8
+        | (scheme as u64) << 8
         | flags as u64
 }
 
@@ -538,7 +538,14 @@ fn encode(
     units: &[(usize, String)],
     implied_owners: bool,
 ) -> Result<Vec<u8>, Error> {
-    encode_flagged(elements, full, units, implied_owners, 0)
+    encode_flagged(
+        elements,
+        full,
+        units,
+        implied_owners,
+        0,
+        crate::ID_SCHEME_VERSION,
+    )
 }
 
 fn encode_flagged(
@@ -547,6 +554,7 @@ fn encode_flagged(
     units: &[(usize, String)],
     implied_owners: bool,
     extra_flags: u8,
+    scheme: u8,
 ) -> Result<Vec<u8>, Error> {
     let elems = elems_of(elements, table_set(full))?;
     let units = check_units(units, elems.len())?;
@@ -563,7 +571,7 @@ fn encode_flagged(
     }
     let mut w = Writer::with_magic_for(elems.len());
     w.array(4 + usize::from(implied) + usize::from(units.is_some()));
-    w.uint(header_word(flags));
+    w.uint(header_word_with_scheme(flags, scheme));
     w.array(interner.ext.len());
     for u in &interner.ext {
         w.bstr(u.as_bytes());
@@ -596,7 +604,10 @@ pub fn to_compact_cbor(value: &Value) -> Result<Vec<u8>, Error> {
 /// [`FLAG_IMPLIED_OWNERS`]. State digests canonicalize through this,
 /// so wire-format elision never moves a digest. Not a wire emitter.
 pub(crate) fn to_compact_cbor_canonical(elements: &[&Value]) -> Result<Vec<u8>, Error> {
-    encode(elements, false, &[], false)
+    // This encodes explicit ids for hashing, with no id derivation. Keep
+    // the original scheme stamp so a wire scheme change cannot invalidate
+    // persisted state digests or explicit-id deltas.
+    encode_flagged(elements, false, &[], false, 0, 1)
 }
 
 /// [`to_compact_cbor`] carrying the model's **unit structure**: each
@@ -624,6 +635,7 @@ pub fn to_compact_cbor_with_units_explicit(
         units,
         true,
         FLAG_EXPLICIT_IDS,
+        crate::ID_SCHEME_VERSION,
     )
 }
 
@@ -667,6 +679,78 @@ pub fn to_compact_cbor_elided_with_units(
     external_name: &dyn Fn(&str) -> Option<String>,
     units: &[(usize, String)],
 ) -> Result<Vec<u8>, Error> {
+    encode_elided(value, external_name, units, crate::ID_SCHEME_VERSION)
+}
+
+/// Encode a validated authored graph with an explicit lowering/identity contract.
+/// Existing encoding functions retain their legacy scheme stamp.
+pub fn to_compact_cbor_with_format(
+    value: &Value,
+    units: &[(usize, String)],
+    format: sysmlv2_model::model::GraphFormat,
+) -> Result<Vec<u8>, Error> {
+    sysmlv2_model::migration::validate_graph_format(value, format).map_err(Error::new)?;
+    encode_flagged(
+        &element_views(value)?,
+        false,
+        units,
+        true,
+        0,
+        format.version(),
+    )
+}
+
+/// Explicit-ID counterpart of [`to_compact_cbor_with_format`].
+pub fn to_compact_cbor_explicit_with_format(
+    value: &Value,
+    units: &[(usize, String)],
+    format: sysmlv2_model::model::GraphFormat,
+) -> Result<Vec<u8>, Error> {
+    sysmlv2_model::migration::validate_graph_format(value, format).map_err(Error::new)?;
+    encode_flagged(
+        &element_views(value)?,
+        false,
+        units,
+        true,
+        FLAG_EXPLICIT_IDS,
+        format.version(),
+    )
+}
+
+/// Full-form emit view with an explicit lowering/identity contract.
+/// The caller supplies the format used to build the full graph.
+pub fn to_full_cbor_with_format(
+    value: &Value,
+    units: &[(usize, String)],
+    format: sysmlv2_model::model::GraphFormat,
+) -> Result<Vec<u8>, Error> {
+    encode_flagged(
+        &element_views(value)?,
+        true,
+        units,
+        false,
+        0,
+        format.version(),
+    )
+}
+
+/// ID-elided counterpart of [`to_compact_cbor_with_format`].
+pub fn to_compact_cbor_elided_with_format(
+    value: &Value,
+    external_name: &dyn Fn(&str) -> Option<String>,
+    units: &[(usize, String)],
+    format: sysmlv2_model::model::GraphFormat,
+) -> Result<Vec<u8>, Error> {
+    sysmlv2_model::migration::validate_graph_format(value, format).map_err(Error::new)?;
+    encode_elided(value, external_name, units, format.version())
+}
+
+fn encode_elided(
+    value: &Value,
+    external_name: &dyn Fn(&str) -> Option<String>,
+    units: &[(usize, String)],
+    scheme: u8,
+) -> Result<Vec<u8>, Error> {
     let elements = element_views(value)?;
     let elems = elems_of(&elements, table_set(false))?;
     let units = check_units(units, elems.len())?;
@@ -686,7 +770,7 @@ pub fn to_compact_cbor_elided_with_units(
     }
     let mut w = Writer::with_magic_for(elems.len());
     w.array(5 + usize::from(units.is_some()));
-    w.uint(header_word(flags));
+    w.uint(header_word_with_scheme(flags, scheme));
     w.array(interner.ext.len());
     for u in &interner.ext {
         w.bstr(u.as_bytes());

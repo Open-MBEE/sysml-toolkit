@@ -40,7 +40,7 @@ use uuid::Uuid;
 /// value" from "a value it has no element for". The full form spells an
 /// `External` id as it is and an `Unresolved` spelling as the dangling id
 /// the unresolved-reference policy derives from it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Reference {
     /// An element of the model.
@@ -138,7 +138,9 @@ pub enum Derives {
     Exact,
 }
 
-/// The names this module computes exactly (sorted; binary-searched).
+/// Handwritten computations with exact default fidelity (sorted). Explicit
+/// dependency qualifications below can downgrade a name without changing the
+/// public computed-name traversal order or the compatibility dispatch.
 const EXACT: &[&str] = &[
     "annotatedElement",
     "annotatingElement",
@@ -320,9 +322,13 @@ const PASSTHROUGH: &[&str] = &[
 /// related features past the source; `FeatureChainExpression::targetFeature`
 /// the accessed feature; `RequirementVerificationMembership::verifiedRequirement`
 /// one referenced requirement, a verification case's the list its
-/// objective verifies): computed, with the listed fidelity, only where
-/// the metaclass conforms to a listed kind.
+/// objective verifies): computed with the listed fidelity where the metaclass
+/// conforms to a listed kind. A name otherwise provided by a generated
+/// composition keeps that composition on its other declaring metaclasses.
 const HAND_WRITTEN_ON: &[(&str, &str, Derives)] = &[
+    ("portDefinition", "ConjugatedPortTyping", Derives::Exact),
+    ("relatedElement", "Connector", Derives::Passthrough),
+    ("relatedElement", "Relationship", Derives::Exact),
     ("targetFeature", "Connector", Derives::Passthrough),
     ("targetFeature", "FeatureChainExpression", Derives::Exact),
     (
@@ -487,6 +493,19 @@ fn composition(name: &str) -> Option<(&'static str, &'static str, bool)> {
         .map(|i| (COMPOSITIONS[i].1, COMPOSITIONS[i].2, COMPOSITIONS[i].3))
 }
 
+/// The generated composition applicable to this declaration. A same-named
+/// hand-written property or membership-side reference has its own derivation
+/// and must not borrow the composition's base chain or collection shape.
+fn composition_on(metaclass: &str, name: &str) -> Option<(&'static str, &'static str, bool)> {
+    composition(name).filter(|_| {
+        !is_hand_written(name)
+            && member_side(metaclass, name).is_none()
+            && !HAND_WRITTEN_ON
+                .iter()
+                .any(|(n, kind, _)| *n == name && conforms(metaclass, kind))
+    })
+}
+
 /// Whether `metaclass` carries the property `name` at all (owned or
 /// derived), per the schema catalog.
 fn carries(metaclass: &str, name: &str) -> bool {
@@ -517,6 +536,21 @@ fn declared(metaclass: &str, name: &str) -> bool {
             .any(|(n, classes)| *n == name && classes.contains(&metaclass))
 }
 
+/// These compatibility readers depend on Feature.type's incomplete graph.
+/// Keep their dispatch-list position stable; only fidelity changes. Generated
+/// kind-filtered compositions inherit the same qualification from their base.
+const TYPE_DEPENDENT: &[&str] = &[
+    "association",
+    "definition",
+    "function",
+    "individualDefinition",
+    "interaction",
+    "metaclass",
+    "payloadType",
+    "predicate",
+    "type",
+];
+
 /// The fidelity of a declared `name` on `metaclass`: hand-written names
 /// by their list; a composition by its base's fidelity *on the same
 /// metaclass* — the same name is a different property on a metaclass
@@ -532,17 +566,19 @@ fn fidelity(metaclass: &str, name: &str, depth: usize) -> Derives {
         .iter()
         .filter(|(n, _, _)| *n == name)
         .collect();
-    if !gated.is_empty() {
-        return gated
-            .iter()
-            .find(|(_, kind, _)| conforms(metaclass, kind))
-            .map_or(Derives::NotComputed, |(_, _, f)| *f);
+    if let Some((_, _, fidelity)) = gated.iter().find(|(_, kind, _)| conforms(metaclass, kind)) {
+        return *fidelity;
     }
-    if is_exact(name) {
+    if !gated.is_empty() && is_hand_written(name) {
+        return Derives::NotComputed;
+    }
+    if TYPE_DEPENDENT.binary_search(&name).is_ok() {
+        Derives::Passthrough
+    } else if is_exact(name) {
         Derives::Exact
     } else if is_passthrough(name) {
         Derives::Passthrough
-    } else if let Some((base, _, _)) = composition(name) {
+    } else if let Some((base, _, _)) = composition_on(metaclass, name) {
         if depth > 8 {
             return Derives::NotComputed;
         }
@@ -582,37 +618,15 @@ pub fn derives(metaclass: &str, name: &str) -> Derives {
     derives_under(metaclass, name, super::ClosurePolicy::Passthrough)
 }
 
-/// Passthrough names whose approximation is not the closure and that
-/// no policy makes exact: `isModelLevelEvaluable` (the library-function
-/// over-approximation), `exposedElement` (the exposed namespaces' own
-/// members, not their imported and inherited memberships) and
-/// `defaultFeaturingType` (the omitted `specializes` clauses).
-const APPROXIMATE: &[&str] = &[
-    "defaultFeaturingType",
-    "exposedElement",
-    "isModelLevelEvaluable",
-];
-
-/// [`derives`] under a closure policy: with the closures in force *and
-/// the implied heritage included* ([`super::ClosurePolicy::Closure`] with
-/// `include_implied: true` — the specification's `inheritedMemberships`
-/// does not exclude the implied heritage) every passthrough name but
-/// `defaultFeaturingType`, `exposedElement` and `isModelLevelEvaluable`
-/// is computed as specified and answers
-/// `Exact`; the written-heritage tier (`include_implied: false`) is a
-/// documented deviation and stays `Passthrough`.
-pub fn derives_under(metaclass: &str, name: &str, policy: super::ClosurePolicy) -> Derives {
+/// Fidelity under a closure policy. A closure changes the available values,
+/// not the completeness of their derivation: implied redefinitions and some
+/// import/inheritance cases are not fully implemented. Such properties remain
+/// `Passthrough` under every policy until their semantic dependencies are exact.
+pub fn derives_under(metaclass: &str, name: &str, _policy: super::ClosurePolicy) -> Derives {
     if !declared(metaclass, name) {
         return Derives::NotDeclared;
     }
-    match fidelity(metaclass, name, 0) {
-        Derives::Passthrough
-            if policy.include_implied() == Some(true) && !APPROXIMATE.contains(&name) =>
-        {
-            Derives::Exact
-        }
-        f => f,
-    }
+    fidelity(metaclass, name, 0)
 }
 
 /// Every derived name this module can answer on some metaclass: the
@@ -703,7 +717,15 @@ impl ResolvedModel {
     /// arm, so callers hold the invariant.
     pub(crate) fn derived_computable(&mut self, e: ElementRef, name: &str) -> Derived {
         let ty = self.b.elements[e.0].ty;
+        if ty == "FeatureReferenceExpression" {
+            self.ensure_implied();
+        }
         use DerivedValue as V;
+        // The typing-side original is a single reference, unlike PortUsage's
+        // same-named definition list generated below.
+        if conforms(ty, "ConjugatedPortTyping") && name == "portDefinition" {
+            return Derived::Value(opt(self.d_typing_port_definition(e)));
+        }
         // A membership-side reference: the owned member.
         if member_side(ty, name).is_some() {
             return Derived::Value(opt(self.d_owned_member_element(e)));
@@ -712,7 +734,7 @@ impl ResolvedModel {
         // wins (`ownedMembership` is spelled as a composition over the
         // owned relationships but computed directly): the base's list
         // filtered by kind.
-        if let Some((base, kind, single)) = composition(name).filter(|_| !is_hand_written(name)) {
+        if let Some((base, kind, single)) = composition_on(ty, name) {
             // A composition keeps its base's shape; over a reference-typed
             // base, a target outside the model passes the kind filter as
             // it is (see [`ResolvedModel::cast`]).
@@ -729,7 +751,7 @@ impl ResolvedModel {
                     Derived::Value(V::Element(x)) => (vec![Reference::Element(x)], false),
                     Derived::Value(V::References(items)) => (items, true),
                     Derived::Value(V::Reference(r)) => (vec![r], true),
-                    Derived::Value(V::Null) => (Vec::new(), by_reference_base(base)),
+                    Derived::Value(V::Null) => (Vec::new(), by_reference_base(ty, base)),
                     _ => return Derived::NotComputed,
                 }
             };
@@ -974,6 +996,12 @@ impl ResolvedModel {
                 .d_owned_specializations(e, "CrossSubsetting")
                 .into_iter()
                 .next()),
+            // Connector::relatedFeature redefines relatedElement as a
+            // non-unique sequence. Its targetFeature is an ordered set, so
+            // source + target cannot reconstruct repeated n-ary endpoints.
+            "relatedElement" if self.is_kind(e, "Connector") => {
+                V::References(self.d_related_features(e))
+            }
             "relatedElement" => {
                 let (mut source, target) = self.relationship_ends(e);
                 source.extend(target);
@@ -985,9 +1013,22 @@ impl ResolvedModel {
                 V::Elements(self.d_ends(features))
             }
             "relatedFeature" => V::References(self.d_related_features(e)),
-            "sourceFeature" => opt_ref(self.d_related_features(e).into_iter().next()),
+            "sourceFeature" => opt_ref(
+                self.d_related_feature_positions(e)
+                    .into_iter()
+                    .next()
+                    .flatten(),
+            ),
             "targetFeature" => {
-                V::References(self.d_related_features(e).into_iter().skip(1).collect())
+                let mut seen = std::collections::HashSet::new();
+                V::References(
+                    self.d_related_feature_positions(e)
+                        .into_iter()
+                        .skip(1)
+                        .flatten()
+                        .filter(|r| seen.insert(r.clone()))
+                        .collect(),
+                )
             }
             "sourceOutputFeature" => opt(self.d_flow_end_feature(e, 0)),
             "targetInputFeature" => opt(self.d_flow_end_feature(e, 1)),
@@ -1069,7 +1110,7 @@ impl ResolvedModel {
     }
 
     /// `Element::owningNamespace = owningMembership.membershipOwningNamespace`.
-    fn d_owning_namespace(&mut self, e: ElementRef) -> Option<ElementRef> {
+    pub(super) fn d_owning_namespace(&mut self, e: ElementRef) -> Option<ElementRef> {
         let m = self.d_owning_membership(e)?;
         self.d_owning_related_element(m)
     }
@@ -1077,10 +1118,9 @@ impl ResolvedModel {
     /// `Element::ownedElement = ownedRelationship.ownedRelatedElement`, in
     /// relationship order then related-element order.
     fn d_owned_elements(&self, e: ElementRef) -> Vec<ElementRef> {
-        self.b.elements[e.0]
-            .owned_relationships
-            .iter()
-            .flat_map(|&r| self.b.elements[r].children.iter().copied())
+        self.projected_owned_relationships(e)
+            .into_iter()
+            .flat_map(|r| self.b.elements[r.0].children.iter().copied())
             .map(ElementRef)
             .collect()
     }
@@ -1092,12 +1132,9 @@ impl ResolvedModel {
         e: ElementRef,
         general: &str,
     ) -> Vec<ElementRef> {
-        self.b.elements[e.0]
-            .owned_relationships
-            .iter()
-            .copied()
-            .filter(|&r| conforms(self.b.elements[r].ty, general))
-            .map(ElementRef)
+        self.projected_owned_relationships(e)
+            .into_iter()
+            .filter(|r| conforms(self.b.elements[r.0].ty, general))
             .collect()
     }
 
@@ -1224,12 +1261,23 @@ impl ResolvedModel {
     /// its source side taking the owner as its source. Both are *owned*
     /// properties of Relationship in the abstract syntax (derived only on
     /// `TransitionUsage`), so [`Self::derived`] does not answer them;
-    /// this is their navigation accessor, and the derived
-    /// `relatedElement` is their union. A target outside the model is
+    /// this is their navigation accessor. Connector source/target use its
+    /// sourceFeature/targetFeature projections; its relatedElement retains
+    /// the full non-unique relatedFeature sequence. A target outside the model is
     /// reported as such; empty for an element that is no relationship.
     pub fn relationship_ends(&mut self, e: ElementRef) -> (Vec<Reference>, Vec<Reference>) {
         self.ensure_by_id();
         let t = self.b.elements[e.0].ty;
+        if conforms(t, "Connector") {
+            let mut related = self.d_related_feature_positions(e).into_iter();
+            let source = related.next().flatten().into_iter().collect();
+            let mut seen = std::collections::HashSet::new();
+            let targets = related
+                .flatten()
+                .filter(|r| seen.insert(r.clone()))
+                .collect();
+            return (source, targets);
+        }
         let owner = self.d_owning_related_element(e).map(Reference::Element);
         let get = |this: &Self, key: &str| -> Option<Reference> {
             this.b.elements[e.0]
@@ -1545,12 +1593,13 @@ impl ResolvedModel {
     /// `Feature::type`: the targets of the feature's own typings
     /// (`FeatureTyping`, `ConjugatedPortTyping`) and, transitively, of its
     /// typing features — the features it subsets, redefines or references
-    /// through an owned Subsetting kind, and the last link of an owned
-    /// feature chain (KerML `Feature::typingFeatures`, closed). A typing
-    /// target outside the model (a library type when no library is
-    /// loaded) is reported as such; the walk through typing features stays
-    /// inside the model (library features included when loaded) and
-    /// guards cycles.
+    /// through an owned Subsetting kind, the features it redefines by
+    /// position (an implied Redefinition of another user feature), and the
+    /// last link of an owned feature chain (KerML `Feature::typingFeatures`,
+    /// closed). A typing target outside the model (a library type when no
+    /// library is loaded) is reported as such; the walk through typing
+    /// features stays inside the model (library features included when
+    /// loaded) and guards cycles.
     pub(super) fn d_types(&mut self, e: ElementRef) -> Vec<Reference> {
         self.ensure_by_id();
         let mut out: Vec<Reference> = Vec::new();
@@ -1560,19 +1609,34 @@ impl ResolvedModel {
             if !visited.insert(f) {
                 continue;
             }
-            // The explicit relationships and the implied *typings* (a
-            // variant's typing by its variation definition). The implied
-            // library subsettings are deliberately not followed: they
-            // would append the library chain (`Part`, `Item`, `Occurrence`,
-            // `Anything`) to every usage's types, a growth that belongs
-            // with the inheritance closure policy and its measurement.
+            // The explicit relationships, the implied *typings* (a
+            // variant's typing by its variation definition) and the implied
+            // *redefinitions* of user features (a parameter, end or result
+            // paired by position with its general's: `in q;` first under
+            // `Swapped :> A` is typed as `A`'s first parameter is). The
+            // implied library subsettings and redefinitions are deliberately
+            // not followed: they would append the library chain (`Part`,
+            // `Item`, `Occurrence`, `Anything`) to every usage's types, a
+            // growth that belongs with the inheritance closure policy and
+            // its measurement.
             let mut rels: Vec<usize> = self.b.elements[f].owned_relationships.to_vec();
-            rels.extend(
-                self.implied_relationships(ElementRef(f))
-                    .into_iter()
-                    .map(|r| r.0)
-                    .filter(|&r| self.b.elements[r].ty == "FeatureTyping"),
-            );
+            let implied: Vec<usize> = self
+                .implied_relationships(ElementRef(f))
+                .into_iter()
+                .map(|r| r.0)
+                .collect();
+            for r in implied {
+                let follows = match self.b.elements[r].ty {
+                    "FeatureTyping" => true,
+                    "Redefinition" => self
+                        .prop_target(r, "redefinedFeature")
+                        .is_some_and(|target| !self.is_library_element(ElementRef(target))),
+                    _ => false,
+                };
+                if follows {
+                    rels.push(r);
+                }
+            }
             let mut last_chain: Option<usize> = None;
             for r in rels {
                 let ty = self.b.elements[r].ty;
@@ -1651,18 +1715,25 @@ impl ResolvedModel {
     /// connector ends (`connectorEnd.ownedReferenceSubsetting.referencedFeature`),
     /// in end order; an end without a reference subsetting contributes
     /// nothing, a target outside the model is reported as such.
-    /// `sourceFeature` is the first, `targetFeature` the rest.
+    /// Source/target projections retain the original end positions even when
+    /// this compatibility sequence omits a missing reference.
     pub(super) fn d_related_features(&mut self, e: ElementRef) -> Vec<Reference> {
+        self.d_related_feature_positions(e)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn d_related_feature_positions(&mut self, e: ElementRef) -> Vec<Option<Reference>> {
         self.ensure_by_id();
         let features = self.d_features(e);
-        let ends = self.d_ends(features);
-        ends.into_iter()
-            .filter_map(|end| {
-                self.owned_relationships_of_kind(end, "ReferenceSubsetting")
+        self.d_ends(features)
+            .into_iter()
+            .map(|end| {
+                let r = self
+                    .d_owned_specializations(end, "ReferenceSubsetting")
                     .into_iter()
-                    .next()
-            })
-            .filter_map(|r| {
+                    .next()?;
                 self.b.elements[r.0]
                     .props
                     .get("referencedFeature")
@@ -1775,7 +1846,7 @@ impl ResolvedModel {
 
 /// Whether a composition base answers by reference (so an empty base
 /// yields an empty `References` rather than `Elements`).
-fn by_reference_base(base: &str) -> bool {
+fn by_reference_base(metaclass: &str, base: &str) -> bool {
     matches!(
         base,
         "type"
@@ -1787,7 +1858,7 @@ fn by_reference_base(base: &str) -> bool {
             | "function"
             | "instantiatedType"
             | "referent"
-    ) || composition(base).is_some_and(|(b, _, _)| by_reference_base(b))
+    ) || composition_on(metaclass, base).is_some_and(|(b, _, _)| by_reference_base(metaclass, b))
 }
 
 fn opt(e: Option<ElementRef>) -> DerivedValue {
@@ -1827,6 +1898,7 @@ mod tests {
 
     #[test]
     fn hand_written_tables_are_sorted() {
+        assert!(super::TYPE_DEPENDENT.windows(2).all(|w| w[0] < w[1]));
         assert!(super::EXACT.windows(2).all(|w| w[0] < w[1]));
         assert!(super::PASSTHROUGH.windows(2).all(|w| w[0] < w[1]));
         let mut seen = std::collections::HashSet::new();
@@ -1840,21 +1912,14 @@ mod tests {
     /// declared there.
     #[test]
     fn composition_fidelity_follows_the_declared_base_chain() {
-        use super::{Derives, OWNED_BASES, carries, composition, declared, derives, member_side};
+        use super::{Derives, OWNED_BASES, carries, composition_on, declared, derives};
         for (m, _) in crate::schema_props::METACLASS_PROPS {
             for name in super::computed_names() {
                 if !matches!(derives(m, name), Derives::Exact | Derives::Passthrough) {
                     continue;
                 }
-                // A membership-side name is the owned member there, not the
-                // composition of the same name on the owner.
-                if member_side(m, name).is_some() {
-                    continue;
-                }
                 let mut at = name;
-                while let Some((base, _, _)) =
-                    composition(at).filter(|_| !super::is_hand_written(at))
-                {
+                while let Some((base, _, _)) = composition_on(m, at) {
                     if OWNED_BASES.contains(&base) {
                         assert!(
                             carries(m, base),
@@ -1867,6 +1932,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn port_definition_declarations_keep_their_distinct_derivations() {
+        use super::{Derives, composition_on, derives};
+        assert_eq!(
+            composition_on("ConjugatedPortTyping", "portDefinition"),
+            None
+        );
+        assert_eq!(
+            composition_on("PortUsage", "portDefinition"),
+            Some(("definition", "PortDefinition", false))
+        );
+        assert_eq!(
+            derives("ConjugatedPortTyping", "portDefinition"),
+            Derives::Exact
+        );
+        assert_eq!(derives("PortUsage", "portDefinition"), Derives::Passthrough);
     }
 
     #[test]

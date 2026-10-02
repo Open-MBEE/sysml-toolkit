@@ -86,7 +86,7 @@ fn short_names_share_the_name_space() {
 }
 
 #[test]
-fn a_usage_typed_by_the_offending_definition_inherits_both() {
+fn a_usage_inherits_the_filtered_definition_members() {
     let out = findings(
         "package P {
             private import ScalarValues::*;
@@ -95,9 +95,9 @@ fn a_usage_typed_by_the_offending_definition_inherits_both() {
             attribute def LanStatus { attribute m1 : M1SwitchStatus; }
         }",
     );
-    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(out.len(), 1, "{out:?}");
     assert!(
-        out.iter().any(|m| m.starts_with(
+        !out.iter().any(|m| m.starts_with(
             "`downlinkPort` is inherited from both `M1SwitchStatus` and `SwitchStatus`"
         )),
         "{out:?}"
@@ -271,11 +271,11 @@ fn a_chain_names_the_nearest_declaring_type() {
             part c : C;
         }",
     );
-    assert_eq!(out.len(), 3, "{out:?}");
+    assert_eq!(out.len(), 2, "{out:?}");
     assert!(out.contains(&"`x` duplicates the inherited member name from `A` — redefine it (`:>>`) or rename it [validateNamespaceDistinguishibility]".to_string()), "{out:?}");
     assert!(out.contains(&"`x` duplicates the inherited member name from `B` — redefine it (`:>>`) or rename it [validateNamespaceDistinguishibility]".to_string()), "{out:?}");
     assert!(
-        out.iter()
+        !out.iter()
             .any(|m| m.starts_with("`x` is inherited from both")),
         "{out:?}"
     );
@@ -357,6 +357,54 @@ fn parameters_redefine_positionally_only_under_behaviors() {
     assert_eq!(out.len(), 1, "{out:?}");
     assert!(
         out[0].starts_with("`x` duplicates the inherited member name from `A`"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_parameter_reusing_the_name_of_one_at_another_position_is_reported() {
+    // Positions pair the parameters: `Partial::b` redefines `Diff::a`, so
+    // `Diff::b` is still inherited and its name reused; `Swapped` redefines
+    // both; `Same` pairs each name with itself.
+    let out = findings(
+        "package P {
+            private import ScalarValues::*;
+            calc def Diff { in a : Real; in b : Real; }
+            calc def Partial :> Diff { in b : Real; }
+            calc def Swapped :> Diff { in b : Real; in a : Real; }
+            calc def Same :> Diff { in a : Real; in b : Real; }
+            action def Act { in x : Real; in y : Real; }
+            action def ActPartial :> Act { in y : Real; }
+        }",
+    );
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(
+        out[0].starts_with("`b` duplicates the inherited member name from `Diff`"),
+        "{out:?}"
+    );
+    assert!(
+        out[1].starts_with("`y` duplicates the inherited member name from `Act`"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_result_named_like_one_of_two_inherited_results_is_reported() {
+    // `C1` inherits two results from unrelated generals, so its heritage
+    // does not say which one `D1`'s result redefines: it redefines neither,
+    // and reusing `r` is the collision.
+    let out = findings(
+        "package P {
+            private import ScalarValues::*;
+            calc def A1 { return r : Real; }
+            calc def B1 { return s : Real; }
+            calc def C1 :> A1, B1;
+            calc def D1 :> C1 { return r : Real; }
+        }",
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        out[0].starts_with("`r` duplicates the inherited member name from `A1`"),
         "{out:?}"
     );
 }

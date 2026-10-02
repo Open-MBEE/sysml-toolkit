@@ -263,6 +263,14 @@ where
 /// ships against.
 pub const MAX_EXPR_OPERATORS: u32 = 1024;
 
+/// The error reported at a `;` written after the result expression of a
+/// body that takes one — a calculation, constraint, case, or function
+/// body (`calc def F { in x : Real; x * 2; }`): the result expression is
+/// the body's last member and ends at the closing `}`. The parser keeps
+/// the expression as the body's result, so the `;` is all there is to
+/// fix — which is what a consumer offering the fix can key on.
+pub const RESULT_EXPRESSION_TERMINATOR: &str = "a result expression takes no terminating `;`";
+
 thread_local! {
     static ACCEPT_LOOKAHEAD_TOKENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -896,6 +904,14 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_body_members(&mut self) -> Vec<Member> {
+        self.parse_body_members_taking(false)
+    }
+
+    /// The members of a body; `takes_result`: the body may end in a
+    /// result expression — a calculation, case, or function body — after
+    /// which a `;` is reported for what it is (see
+    /// [`Self::stray_result_terminators`]).
+    fn parse_body_members_taking(&mut self, takes_result: bool) -> Vec<Member> {
         if self.depth >= MAX_NESTING {
             self.error_here(format!(
                 "nesting is too deep (more than {MAX_NESTING} levels of bodies and expressions)"
@@ -904,7 +920,7 @@ impl<'s> Parser<'s> {
             return Vec::new();
         }
         self.depth += 1;
-        let members = self.parse_body_members_inner();
+        let members = self.parse_body_members_inner(takes_result);
         self.depth -= 1;
         members
     }
@@ -929,7 +945,7 @@ impl<'s> Parser<'s> {
         }
     }
 
-    fn parse_body_members_inner(&mut self) -> Vec<Member> {
+    fn parse_body_members_inner(&mut self, takes_result: bool) -> Vec<Member> {
         let mut members = Vec::new();
         // Members of a body are siblings: each spells a chain of its own
         // rather than continuing the one its predecessor spelled, and the
@@ -941,7 +957,16 @@ impl<'s> Parser<'s> {
             let before = self.pos;
             let diags_before = self.diags.len();
             match self.parse_member() {
-                Some(m) => members.push(m),
+                Some(m) => {
+                    // A conditional result (`if c ? a else b`) parses as
+                    // a member of its own; a `;` after it is reported as
+                    // after any result.
+                    let result = matches!(m.kind, MemberKind::Result(_));
+                    members.push(m);
+                    if result && takes_result {
+                        self.stray_result_terminators();
+                    }
+                }
                 None => {
                     // The member parse failed. Before recovering, try the
                     // trailing-result-expression form (calc/case/constraint
@@ -966,8 +991,16 @@ impl<'s> Parser<'s> {
                     };
                     let expr_diags_before = self.diags.len();
                     if let Some(expr) = self.parse_expr() {
-                        if self.at(TokenKind::RBrace) && self.diags.len() == expr_diags_before {
-                            let span = start.join(self.prev_end_span());
+                        // Terminated like a statement (`x * 2; }`) in a
+                        // body that takes a result, the expression is still
+                        // the body's result: the error is the `;`, not the
+                        // operator the member parse tripped over. The
+                        // member's span ends with the expression.
+                        let span = start.join(self.prev_end_span());
+                        if self.diags.len() == expr_diags_before
+                            && (self.at(TokenKind::RBrace)
+                                || (takes_result && self.stray_result_terminators()))
+                        {
                             members.push(Member {
                                 visibility,
                                 leading_then: false,
@@ -1021,6 +1054,29 @@ impl<'s> Parser<'s> {
         }
         self.expr_chain = deepest.max(self.expr_chain);
         members
+    }
+
+    /// The `;` tokens between a body's result expression and the body's
+    /// closing `}` — the result terminated like a statement — each
+    /// reported at its own span and consumed, so the result stands and
+    /// the body closes. `false`, consuming nothing, unless nothing but
+    /// `;` stands between the cursor and a `}`.
+    fn stray_result_terminators(&mut self) -> bool {
+        let mut n = 0;
+        while self.nth(n).kind == TokenKind::Semi {
+            n += 1;
+        }
+        if n == 0 || self.nth(n).kind != TokenKind::RBrace {
+            return false;
+        }
+        for _ in 0..n {
+            let semi = self.bump();
+            self.diags.push(Diagnostic::error(
+                semi.span,
+                RESULT_EXPRESSION_TERMINATOR.to_string(),
+            ));
+        }
+        true
     }
 
     fn parse_member(&mut self) -> Option<Member> {
@@ -1391,7 +1447,7 @@ impl<'s> Parser<'s> {
             self.parse_feature_specializations(&mut declaration);
         }
         let value = self.parse_value_part();
-        let body = self.parse_body_or_semi()?;
+        let body = self.parse_usage_body_or_semi(kind)?;
         Some(Usage {
             prefix,
             kind,
@@ -3691,9 +3747,10 @@ impl<'s> Parser<'s> {
         }
         let is_parallel = kind == DefKind::State && self.eat_kw("parallel");
         let body = if kind == DefKind::Enum {
-            self.parse_body_or_semi_ctx(false, true)?
+            self.parse_body_or_semi_ctx(false, true, false)?
         } else {
-            self.parse_body_or_semi()?
+            let takes_result = crate::check::definition_body_takes_result(self.dialect, kind);
+            self.parse_body_or_semi_ctx(false, false, takes_result)?
         };
         Some(Definition {
             prefix,
@@ -3715,19 +3772,27 @@ impl<'s> Parser<'s> {
     /// Like [`Parser::parse_brace_body`] but distinguishes `None` (a `;`
     /// body) from a parse failure.
     fn parse_body_or_semi(&mut self) -> Option<Option<Vec<Member>>> {
-        self.parse_body_or_semi_ctx(false, false)
+        self.parse_body_or_semi_ctx(false, false, false)
+    }
+
+    /// The body of a `kind` usage: [`Parser::parse_body_or_semi`], ending
+    /// in a result expression where the kind's body takes one.
+    fn parse_usage_body_or_semi(&mut self, kind: UsageKind) -> Option<Option<Vec<Member>>> {
+        let takes_result = crate::check::usage_body_takes_result(self.dialect, kind);
+        self.parse_body_or_semi_ctx(false, false, takes_result)
     }
 
     /// `MetadataBody`: same surface shape, but members parse in metadata
     /// context (implicit qualified-name redefinitions).
     fn parse_metadata_body_or_semi(&mut self) -> Option<Option<Vec<Member>>> {
-        self.parse_body_or_semi_ctx(true, false)
+        self.parse_body_or_semi_ctx(true, false, false)
     }
 
     fn parse_body_or_semi_ctx(
         &mut self,
         meta: bool,
         enum_body: bool,
+        takes_result: bool,
     ) -> Option<Option<Vec<Member>>> {
         if self.eat(TokenKind::Semi) {
             return Some(None);
@@ -3737,7 +3802,7 @@ impl<'s> Parser<'s> {
             let saved_enum = self.enum_body;
             self.meta_body = meta;
             self.enum_body = enum_body;
-            let members = self.parse_body_members();
+            let members = self.parse_body_members_taking(takes_result);
             self.meta_body = saved;
             self.enum_body = saved_enum;
             self.expect(TokenKind::RBrace, "`}` closing body");
@@ -3851,7 +3916,7 @@ impl<'s> Parser<'s> {
         }
 
         let is_parallel = kind == UsageKind::State && self.eat_kw("parallel");
-        let body = self.parse_body_or_semi()?;
+        let body = self.parse_usage_body_or_semi(kind)?;
         Some(Usage {
             prefix,
             kind,
@@ -3874,7 +3939,7 @@ impl<'s> Parser<'s> {
         let value = self.parse_value_part();
         let is_parallel =
             matches!(kind, UsageKind::State | UsageKind::Exhibit) && self.eat_kw("parallel");
-        let body = self.parse_body_or_semi()?;
+        let body = self.parse_usage_body_or_semi(kind)?;
         Some(Usage {
             prefix,
             kind,
@@ -5232,7 +5297,7 @@ impl<'s> Parser<'s> {
                 // otherwise a feature-chain step.
                 self.charge_chain(1)?;
                 match self.nth(1).kind {
-                    TokenKind::LBrace | TokenKind::Semi => {
+                    TokenKind::LBrace => {
                         self.bump();
                         let body = self.branch(Self::parse_body_expr)?;
                         let span = expr.span.join(body.span);
@@ -5325,9 +5390,7 @@ impl<'s> Parser<'s> {
                 self.charge_chain(1)?;
                 self.bump();
                 let ty = self.parse_target_ref()?;
-                let args = if self.at(TokenKind::LBrace)
-                    || (self.dialect == Dialect::Sysml && self.at(TokenKind::Semi))
-                {
+                let args = if self.at(TokenKind::LBrace) {
                     ArrowArgs::Body(Box::new(self.branch(Self::parse_body_expr)?))
                 } else if self.at(TokenKind::LParen) {
                     ArrowArgs::List(self.branch(Self::parse_argument_list)?)
@@ -5422,11 +5485,13 @@ impl<'s> Parser<'s> {
             });
         }
 
-        // SysML redefines ExpressionBody to CalculationBody, whose
-        // non-braced alternative is a single semicolon.
-        if self.at(TokenKind::LBrace)
-            || (self.dialect == Dialect::Sysml && self.at(TokenKind::Semi))
-        {
+        // SysML redefines ExpressionBody to CalculationBody, whose other
+        // alternative is a bare `;`. That is not read as an expression: a
+        // `;` where one belongs is the terminator of the declaration
+        // around it, the expression missing (`attribute x = ;`), so it
+        // falls through to the error below — reported at the `;` and left
+        // for the declaration to end with, as in KerML.
+        if self.at(TokenKind::LBrace) {
             return self.parse_body_expr();
         }
 
@@ -5525,19 +5590,14 @@ impl<'s> Parser<'s> {
         })
     }
 
-    /// Expression body. SysML overrides these to full calculation bodies,
-    /// including both the braced member form and a bare `;` alternative.
+    /// Expression body. SysML overrides these to full calculation bodies;
+    /// only the braced member form is read (the bare `;` alternative is
+    /// not an expression — see [`Self::parse_base`]).
     fn parse_body_expr(&mut self) -> Option<Expr> {
         let start = self.cur().span;
-        if self.dialect == Dialect::Sysml && self.eat(TokenKind::Semi) {
-            return Some(Expr {
-                kind: ExprKind::BodyTerminator,
-                span: start,
-            });
-        }
         self.expect(TokenKind::LBrace, "`{`")?;
         let saved = std::mem::take(&mut self.meta_body);
-        let members = self.parse_body_members();
+        let members = self.parse_body_members_taking(true);
         self.meta_body = saved;
         let end = self.cur().span;
         self.expect(TokenKind::RBrace, "`}` closing expression body");

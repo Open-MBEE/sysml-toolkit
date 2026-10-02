@@ -765,6 +765,14 @@ impl Session {
         Ok(self.inner.resolved().conforms(e.e, ancestor.e))
     }
 
+    /// Reachability including supported implied library and variation bases.
+    /// A negative result does not establish complete non-conformance.
+    fn conforms_with_implied(&mut self, e: &Element, ancestor: &Element) -> PyResult<bool> {
+        self.guard(e.gen)?;
+        self.guard(ancestor.gen)?;
+        Ok(self.inner.resolved().conforms_with_implied(e.e, ancestor.e))
+    }
+
     /// Every element of the given metaclass.
     fn elements_of_metaclass(&mut self, ty: &str) -> Vec<Element> {
         let gen = self.gen;
@@ -849,6 +857,25 @@ impl Session {
     fn to_full_json(&self, recover_refs: bool) -> String {
         serde_json::to_string_pretty(&self.inner.to_full_json_with(recover_refs))
             .expect("serializable")
+    }
+
+    /// Checked owned/derived property as JSON, with references encoded by ID.
+    fn property_json(&mut self, e: &Element, name: &str) -> PyResult<String> {
+        self.guard(e.gen)?;
+        self.inner
+            .resolved()
+            .property(e.e, name)
+            .map(|v| v.to_string())
+            .map_err(refused)
+    }
+
+    /// Strict full JSON; refuses approximate or unavailable properties.
+    #[allow(clippy::wrong_self_convention)] // Lazy semantic caches require mutable access.
+    fn to_full_json_strict(&mut self) -> PyResult<String> {
+        self.inner
+            .to_full_json_strict()
+            .map(|v| v.to_string())
+            .map_err(refused)
     }
 
     /// Map an interchange document's ids to this session's ids by

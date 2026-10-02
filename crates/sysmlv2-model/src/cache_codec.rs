@@ -61,9 +61,158 @@ pub(crate) fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     Ok(out.0)
 }
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    decode_from(Slice(bytes))
+}
+
+/// Where a decoder's bytes come from. A slice serves them in place; a
+/// chunked source serves them through a window it refills from a feed, so
+/// a payload a host holds elsewhere (a browser's heap) is never copied into
+/// this memory whole. `take` yields bytes valid until the next call.
+pub(crate) trait Source {
+    /// Bytes not yet taken.
+    fn remaining(&self) -> usize;
+    /// The next byte, left in place; `None` at the end.
+    fn peek(&mut self) -> Option<u8>;
+    /// The next `n` bytes, consumed.
+    fn take(&mut self, n: usize) -> Result<&[u8]>;
+}
+
+/// The bytes in place.
+pub(crate) struct Slice<'a>(pub(crate) &'a [u8]);
+
+impl Source for Slice<'_> {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.0.len()
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<u8> {
+        self.0.first().copied()
+    }
+    #[inline]
+    fn take(&mut self, n: usize) -> Result<&[u8]> {
+        if n > self.0.len() {
+            return Err(bad());
+        }
+        let (v, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(v)
+    }
+}
+
+/// A window over a feed: `fill` copies the next bytes of the payload into
+/// the buffer it is given and answers how many (0 at the end). Everything
+/// taken is folded into a checksum the caller reads back at the end, so a
+/// payload is verified once it has been consumed whole.
+pub(crate) struct Chunked<F: FnMut(&mut [u8]) -> usize> {
+    fill: F,
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
+    remaining: usize,
+    hash: crate::libcache::Fnv,
+}
+
+impl<F: FnMut(&mut [u8]) -> usize> Chunked<F> {
+    /// A window of `window` bytes over a payload of `len` bytes.
+    pub(crate) fn new(len: usize, window: usize, fill: F) -> Self {
+        Self {
+            fill,
+            buf: vec![0; window.max(16)],
+            start: 0,
+            end: 0,
+            remaining: len,
+            hash: crate::libcache::Fnv::new(),
+        }
+    }
+
+    /// Checksum of every byte taken since the last reset.
+    pub(crate) fn checksum(&self) -> u64 {
+        self.hash.finish()
+    }
+
+    /// Start the checksum over (after a header the checksum does not cover).
+    pub(crate) fn reset_checksum(&mut self) {
+        self.hash = crate::libcache::Fnv::new();
+    }
+
+    /// Make at least `n` contiguous bytes available at `start`.
+    fn ensure(&mut self, n: usize) -> Result<()> {
+        if self.end - self.start >= n {
+            return Ok(());
+        }
+        if n > self.remaining {
+            return Err(bad());
+        }
+        // compact, then grow for a single item wider than the window
+        self.buf.copy_within(self.start..self.end, 0);
+        self.end -= self.start;
+        self.start = 0;
+        if self.buf.len() < n {
+            self.buf.resize(n, 0);
+        }
+        while self.end < n {
+            // what the buffer can hold, bounded by what the payload still has beyond the buffered bytes
+            let room = (self.buf.len() - self.end).min(self.remaining - self.end);
+            if room == 0 {
+                return Err(bad());
+            }
+            let got = (self.fill)(&mut self.buf[self.end..self.end + room]);
+            if got == 0 || got > room {
+                return Err(bad());
+            }
+            self.end += got;
+        }
+        Ok(())
+    }
+}
+
+impl<F: FnMut(&mut [u8]) -> usize> Source for Chunked<F> {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<u8> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.ensure(1).ok()?;
+        Some(self.buf[self.start])
+    }
+    #[inline]
+    fn take(&mut self, n: usize) -> Result<&[u8]> {
+        self.ensure(n)?;
+        let v = &self.buf[self.start..self.start + n];
+        self.hash.update(v);
+        self.start += n;
+        self.remaining -= n;
+        Ok(v)
+    }
+}
+
+impl<S: Source> Source for &mut S {
+    #[inline]
+    fn remaining(&self) -> usize {
+        (**self).remaining()
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<u8> {
+        (**self).peek()
+    }
+    #[inline]
+    fn take(&mut self, n: usize) -> Result<&[u8]> {
+        (**self).take(n)
+    }
+}
+
+/// Decode from any source. The string table at the front is copied into
+/// an arena the decoded strings borrow from while decoding (a table entry's
+/// address identifies it to `shared_string`); the rest streams.
+pub(crate) fn decode_from<T: DeserializeOwned, S: Source>(src: S) -> Result<T> {
     let _strings = SharedStrings::enter();
     let mut r = Reader {
-        bytes,
+        src,
         depth: 0,
         strings: Vec::new(),
     };
@@ -71,13 +220,29 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     if count > 1_048_576 {
         return Err(bad());
     }
+    let mut arena = Vec::new();
+    let mut spans = Vec::with_capacity(count);
     for _ in 0..count {
         let len = r.length()?;
-        let text = std::str::from_utf8(r.take(len)?).map_err(|_| bad())?;
-        r.strings.push(text);
+        let text = r.src.take(len)?;
+        std::str::from_utf8(text).map_err(|_| bad())?;
+        spans.push((arena.len(), len));
+        arena.extend_from_slice(text);
     }
+    // the arena is complete; the table borrows it for the rest of the decode
+    let mut r = Reader {
+        src: r.src,
+        depth: 0,
+        strings: spans
+            .iter()
+            .map(|&(at, len)| {
+                // validated above
+                std::str::from_utf8(&arena[at..at + len]).map_err(|_| bad())
+            })
+            .collect::<Result<Vec<&str>>>()?,
+    };
     let value = T::deserialize(&mut r)?;
-    if !r.bytes.is_empty() {
+    if r.src.remaining() != 0 {
         return Err(bad());
     }
     Ok(value)
@@ -286,24 +451,19 @@ macro_rules! compound_struct {
 }
 compound_struct!(SerializeStruct);
 compound_struct!(SerializeStructVariant);
-struct Reader<'de> {
-    bytes: &'de [u8],
+struct Reader<'de, S: Source> {
+    src: S,
     depth: usize,
     strings: Vec<&'de str>,
 }
-impl<'de> Reader<'de> {
-    #[inline]
-    fn take(&mut self, n: usize) -> Result<&'de [u8]> {
-        if n > self.bytes.len() {
-            return Err(bad());
-        }
-        let (v, rest) = self.bytes.split_at(n);
-        self.bytes = rest;
-        Ok(v)
-    }
+impl<S: Source> Reader<'_, S> {
     #[inline]
     fn tag(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        Ok(self.src.take(1)?[0])
+    }
+    #[inline]
+    fn skip(&mut self) -> Result<()> {
+        self.src.take(1).map(|_| ())
     }
     #[inline]
     fn count(&mut self) -> Result<u64> {
@@ -323,17 +483,17 @@ impl<'de> Reader<'de> {
     #[inline]
     fn length(&mut self) -> Result<usize> {
         let n = usize::try_from(self.count()?).map_err(|_| bad())?;
-        if n > self.bytes.len() {
+        if n > self.src.remaining() {
             return Err(bad());
         }
         Ok(n)
     }
 }
-struct Access<'a, 'de> {
-    r: &'a mut Reader<'de>,
+struct Access<'a, 'de, S: Source> {
+    r: &'a mut Reader<'de, S>,
     remaining: usize,
 }
-impl<'de> SeqAccess<'de> for Access<'_, 'de> {
+impl<'de, S: Source> SeqAccess<'de> for Access<'_, 'de, S> {
     type Error = Error;
     fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>> {
         if self.remaining == 0 {
@@ -346,7 +506,7 @@ impl<'de> SeqAccess<'de> for Access<'_, 'de> {
         Some(self.remaining.min(1_048_576))
     }
 }
-impl<'de> MapAccess<'de> for Access<'_, 'de> {
+impl<'de, S: Source> MapAccess<'de> for Access<'_, 'de, S> {
     type Error = Error;
     fn next_key_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>> {
         self.next_element_seed(seed)
@@ -358,15 +518,15 @@ impl<'de> MapAccess<'de> for Access<'_, 'de> {
         Some(self.remaining.min(1_048_576))
     }
 }
-impl<'de> de::Deserializer<'de> for &mut Reader<'de> {
+impl<'de, S: Source> de::Deserializer<'de> for &mut Reader<'de, S> {
     type Error = Error;
     fn is_human_readable(&self) -> bool {
         false
     }
     fn deserialize_any<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
-        match self.bytes.first() {
-            Some(&SEQ) => return self.collection(v, false),
-            Some(&MAP) => return self.collection(v, true),
+        match self.src.peek() {
+            Some(SEQ) => return self.collection(v, false),
+            Some(MAP) => return self.collection(v, true),
             _ => {}
         }
         if self.depth >= 256 {
@@ -383,7 +543,7 @@ impl<'de> de::Deserializer<'de> for &mut Reader<'de> {
                 v.visit_i64(((n >> 1) as i64) ^ -((n & 1) as i64))
             }
             FLOAT => v.visit_f64(f64::from_le_bytes(
-                self.take(8)?.try_into().map_err(|_| bad())?,
+                self.src.take(8)?.try_into().map_err(|_| bad())?,
             )),
             STR => {
                 let index = usize::try_from(self.count()?).map_err(|_| bad())?;
@@ -391,7 +551,7 @@ impl<'de> de::Deserializer<'de> for &mut Reader<'de> {
             }
             BYTES => {
                 let n = self.length()?;
-                v.visit_borrowed_bytes(self.take(n)?)
+                v.visit_bytes(self.src.take(n)?)
             }
             _ => Err(bad()),
         };
@@ -459,35 +619,34 @@ impl<'de> de::Deserializer<'de> for &mut Reader<'de> {
         result
     }
     fn deserialize_u64<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
-        if self.bytes.first() != Some(&UINT) {
+        if self.src.peek() != Some(UINT) {
             return self.deserialize_any(v);
         }
-        self.bytes = &self.bytes[1..];
+        self.skip()?;
         v.visit_u64(self.count()?)
     }
     fn deserialize_i64<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
-        if self.bytes.first() != Some(&INT) {
+        if self.src.peek() != Some(INT) {
             return self.deserialize_any(v);
         }
-        self.bytes = &self.bytes[1..];
+        self.skip()?;
         let n = self.count()?;
         v.visit_i64(((n >> 1) as i64) ^ -((n & 1) as i64))
     }
     fn deserialize_bool<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
-        match self.bytes.first() {
-            Some(&TRUE) | Some(&FALSE) => {
-                let b = self.bytes[0] == TRUE;
-                self.bytes = &self.bytes[1..];
-                v.visit_bool(b)
+        match self.src.peek() {
+            Some(b @ (TRUE | FALSE)) => {
+                self.skip()?;
+                v.visit_bool(b == TRUE)
             }
             _ => self.deserialize_any(v),
         }
     }
     fn deserialize_str<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
-        if self.bytes.first() != Some(&STR) {
+        if self.src.peek() != Some(STR) {
             return self.deserialize_any(v);
         }
-        self.bytes = &self.bytes[1..];
+        self.skip()?;
         let i = usize::try_from(self.count()?).map_err(|_| bad())?;
         v.visit_borrowed_str(self.strings.get(i).copied().ok_or_else(bad)?)
     }
@@ -514,7 +673,7 @@ impl<'de> de::Deserializer<'de> for &mut Reader<'de> {
     }
     serde::forward_to_deserialize_any! { f32 f64 char bytes byte_buf unit unit_struct identifier ignored_any }
 }
-impl<'de> Reader<'de> {
+impl<'de, S: Source> Reader<'de, S> {
     fn fixed<V: Visitor<'de>>(&mut self, v: V, n: usize) -> Result<V::Value> {
         if self.depth >= 256 {
             return Err(bad());
@@ -560,18 +719,18 @@ impl<'de> Reader<'de> {
         result
     }
 }
-struct Variant<'a, 'de> {
-    r: &'a mut Reader<'de>,
+struct Variant<'a, 'de, S: Source> {
+    r: &'a mut Reader<'de, S>,
     index: u32,
 }
-impl<'a, 'de> EnumAccess<'de> for Variant<'a, 'de> {
+impl<'a, 'de, S: Source> EnumAccess<'de> for Variant<'a, 'de, S> {
     type Error = Error;
     type Variant = Self;
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self)> {
         Ok((seed.deserialize(self.index.into_deserializer())?, self))
     }
 }
-impl<'de> VariantAccess<'de> for Variant<'_, 'de> {
+impl<'de, S: Source> VariantAccess<'de> for Variant<'_, 'de, S> {
     type Error = Error;
     fn unit_variant(self) -> Result<()> {
         Ok(())
@@ -636,6 +795,39 @@ mod tests {
             decode::<Vec<Choice>>(&[SEQ, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255])
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+    /// A feed over a slice that hands out at most `step` bytes per call.
+    fn feed(bytes: &[u8], step: usize) -> impl FnMut(&mut [u8]) -> usize + '_ {
+        let mut at = 0;
+        move |buf: &mut [u8]| {
+            let n = buf.len().min(step).min(bytes.len() - at);
+            buf[..n].copy_from_slice(&bytes[at..at + n]);
+            at += n;
+            n
+        }
+    }
+    #[test]
+    fn chunked_sources_decode_like_slices_and_checksum_what_they_took() {
+        let value = serde_json::json!({"signed":i64::MIN,"text":"a long repeated property and qualified name","nested":[[1.5,true,null],{"k":"a long repeated property and qualified name"}],"bytes":[0,255,128]});
+        let bytes = encode(&value).unwrap();
+        for (window, step) in [(16, 1), (16, 5), (7, 7), (64 * 1024, 64 * 1024), (3, 1000)] {
+            let mut src = Chunked::new(bytes.len(), window, feed(&bytes, step));
+            let decoded: serde_json::Value = decode_from(&mut src).unwrap();
+            assert_eq!(decoded, value, "window {window}, step {step}");
+            let mut hash = crate::libcache::Fnv::new();
+            hash.update(&bytes);
+            assert_eq!(src.checksum(), hash.finish(), "every byte was taken once");
+        }
+        // a feed that ends early is a truncation, and a payload length past the feed too
+        let mut short = Chunked::new(bytes.len(), 16, feed(&bytes[..bytes.len() / 2], 16));
+        assert!(decode_from::<serde_json::Value, _>(&mut short).is_err());
+        let mut long = Chunked::new(bytes.len() + 1, 16, feed(&bytes, 16));
+        assert!(decode_from::<serde_json::Value, _>(&mut long).is_err());
     }
 }
 

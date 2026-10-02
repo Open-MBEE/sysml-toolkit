@@ -648,6 +648,12 @@ fn relationship_side_owners_derive() {
         ref_of_prop(featuring, "owningFeatureOfType").as_deref(),
         Some(f.as_str())
     );
+    assert_eq!(
+        ref_of_prop(featuring, "featureOfType").as_deref(),
+        Some(f.as_str()),
+        "owned featuring's source is its Feature, never the relationship itself"
+    );
+    assert_eq!(refs_of_prop(featuring, "source"), [f.as_str()]);
 
     // The anonymous redefining feature in C owns its Redefinition.
     let redefinition = elements
@@ -702,6 +708,15 @@ fn relationship_side_owners_derive() {
             );
         }
     }
+    let featuring = standalone
+        .iter()
+        .find(|e| e["@type"] == "TypeFeaturing")
+        .unwrap();
+    let g = elem_id(find_named(elements, "g"));
+    assert_eq!(ref_of_prop(featuring, "featureOfType"), Some(g.clone()));
+    assert_eq!(refs_of_prop(featuring, "source"), [g.as_str()]);
+    assert_eq!(ref_of_prop(featuring, "featuringType"), Some(b.clone()));
+
     // A standalone conjugation still has its spelled ends.
     let conj = standalone
         .iter()
@@ -1108,10 +1123,10 @@ fn closure_policy_writes_the_closures() {
     assert_eq!(find(&passthrough, "R")["membership"], serde_json::json!([]));
     // The policy is restored after the emission.
     assert_eq!(r.closure_policy(), ClosurePolicy::Passthrough);
-    // A heritage deeper than the budget.
-    let mut src = String::from("package P { part def D0;");
+    // Import traversal still has a depth budget; acyclic inheritance does not.
+    let mut src = String::from("package P { package D0 { part leaf; }");
     for i in 1..=26 {
-        src.push_str(&format!(" part def D{i} :> D{};", i - 1));
+        src.push_str(&format!(" package D{i} {{ public import D{}::*; }}", i - 1));
     }
     src.push('}');
     let mut deep = Model::new();
@@ -1134,4 +1149,158 @@ fn closure_policy_writes_the_closures() {
     // Restored after the refusal too.
     assert_eq!(r.closure_policy(), ClosurePolicy::Passthrough);
     assert!(resolved_to_full_json(&mut r, &deep, EmissionPolicy::default()).is_ok());
+}
+
+#[test]
+fn conjugated_port_typing_exports_the_original_definition() {
+    use sysmlv2_parser::json::{
+        Derived, DerivedValue, Derives, ElementRef, ResolvedModel, derives,
+    };
+    let mut model = Model::new();
+    assert!(
+        model
+            .add_source(
+                "ports.sysml",
+                "port def Signal; part def Device { port input : ~Signal; }"
+            )
+            .diagnostics
+            .is_empty()
+    );
+    let mut resolved = ResolvedModel::build(&model);
+    let original = resolved.resolve_qualified("Signal").unwrap();
+    let full = model_to_full_json(&model);
+    let typing = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["@type"] == "ConjugatedPortTyping")
+        .unwrap();
+    let id = resolved.element_id(original).to_string();
+    assert_eq!(typing["portDefinition"], json!({"@id": id}));
+    assert_ne!(typing["portDefinition"]["@id"], typing["@id"]);
+    let e: ElementRef = resolved
+        .element_by_id(typing["@id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        derives("ConjugatedPortTyping", "portDefinition"),
+        Derives::Exact
+    );
+    assert_eq!(
+        resolved.derived(e, "portDefinition"),
+        Derived::Value(DerivedValue::Element(original))
+    );
+    assert_eq!(
+        resolved.property(e, "portDefinition").unwrap(),
+        typing["portDefinition"]
+    );
+    let port = resolved.resolve_qualified("Device::input").unwrap();
+    assert!(matches!(
+        resolved.derived(port, "portDefinition"),
+        Derived::Value(DerivedValue::References(_))
+    ));
+}
+
+#[test]
+fn full_export_preserves_owned_scalar_defaults_and_explicit_values() {
+    use sysmlv2_parser::json::ResolvedModel;
+    let mut model = Model::new();
+    assert!(
+        model
+            .add_source(
+                "defaults.sysml",
+                "part def Box; individual part def OneBox; abstract part def AbstractBox;"
+            )
+            .diagnostics
+            .is_empty()
+    );
+    let mut resolved = ResolvedModel::build(&model);
+    let full = model_to_full_json(&model);
+    for (name, individual, abstract_) in [
+        ("Box", false, false),
+        ("OneBox", true, false),
+        ("AbstractBox", false, true),
+    ] {
+        let e = resolved.resolve_qualified(name).unwrap();
+        let id = resolved.element_id(e).to_string();
+        let row = full
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["@id"] == id)
+            .unwrap();
+        for (property, expected) in [("isIndividual", individual), ("isAbstract", abstract_)] {
+            assert_eq!(row[property], json!(expected), "{name}.{property}");
+            assert_eq!(resolved.property(e, property).unwrap(), row[property]);
+        }
+    }
+}
+
+#[test]
+fn operator_result_exports_the_library_return_parameter() {
+    use sysmlv2_parser::json::{Derived, DerivedValue, ResolvedModel};
+    let mut model = Model::new();
+    assert!(model.add_library_source("operators.kerml", "standard library package DataFunctions { function '+' { in x; in y; return sum; } }").diagnostics.is_empty());
+    assert!(
+        model
+            .add_source("sum.sysml", "attribute total = 1 + 2;")
+            .diagnostics
+            .is_empty()
+    );
+    let mut resolved = ResolvedModel::build(&model);
+    let result = resolved
+        .resolve_qualified("DataFunctions::'+'::sum")
+        .unwrap();
+    let full = model_to_full_json(&model);
+    let operator = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["@type"] == "OperatorExpression")
+        .unwrap();
+    let e = resolved
+        .element_by_id(operator["@id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        resolved.derived(e, "result"),
+        Derived::Value(DerivedValue::Element(result))
+    );
+    assert_eq!(
+        operator["result"],
+        json!({"@id": resolved.element_id(result).to_string()})
+    );
+    assert_ne!(operator["result"]["@id"], operator["@id"]);
+    // The compatibility improvement does not claim complete checked expression evidence.
+    assert!(resolved.property(e, "result").is_err());
+}
+
+#[test]
+fn missing_port_and_operator_targets_remain_unavailable_to_checked_reads() {
+    use sysmlv2_parser::json::{Derived, DerivedValue, ResolvedModel};
+    let mut model = Model::new();
+    assert!(
+        model
+            .add_source(
+                "missing.sysml",
+                "part def Device { port input : ~Missing; attribute total = 1 + 2; }"
+            )
+            .diagnostics
+            .is_empty()
+    );
+    let mut resolved = ResolvedModel::build(&model);
+    let receivers: Vec<_> = resolved
+        .elements()
+        .filter_map(|e| match resolved.element_type(e) {
+            "ConjugatedPortTyping" => Some((e, "portDefinition")),
+            "OperatorExpression" => Some((e, "result")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(receivers.len(), 2);
+    for (e, property) in receivers {
+        assert_eq!(
+            resolved.derived(e, property),
+            Derived::Value(DerivedValue::Null)
+        );
+        assert!(resolved.property(e, property).is_err());
+    }
 }

@@ -166,12 +166,25 @@ fn plain_decoders_refuse_elided_payloads() {
 #[test]
 fn foreign_derivation_scheme_refuses_elided_payloads_only() {
     let (compact, _) = golden_compact();
-    let mut elided = to_compact_cbor_elided(&compact, &no_external).unwrap();
-    // Header word bytes: 8 magic + array(4) + 0x1B, scheme at [16].
-    assert_eq!(elided[9], 0x1B);
-    elided[16] = 0xFF;
-    let err = from_compact_cbor_elided(&elided, &no_external)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("id-derivation scheme"), "{err}");
+    for scheme in [1, 0xFF] {
+        let mut elided = to_compact_cbor_elided(&compact, &no_external).unwrap();
+        // Header word bytes: 8 magic + array + 0x1B, scheme at [16].
+        assert_eq!(elided[9], 0x1B);
+        elided[16] = scheme;
+        let err = from_compact_cbor_elided(&elided, &no_external)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("id-derivation scheme"), "{err}");
+        assert_eq!(
+            sysmlv2_cbor::describe(&elided).unwrap()["versions"]["supported"],
+            false
+        );
+        let mut explicit = to_compact_cbor(&compact).unwrap();
+        explicit[16] = scheme;
+        assert_eq!(from_compact_cbor(&explicit).unwrap(), compact);
+        assert_eq!(
+            sysmlv2_cbor::describe(&explicit).unwrap()["versions"]["supported"],
+            true
+        );
+    }
 }

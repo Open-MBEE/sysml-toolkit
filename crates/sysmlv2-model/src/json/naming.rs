@@ -11,13 +11,16 @@
 //! / `effectiveShortName()`: `if declaredShortName <> null or declaredName
 //! <> null then declaredName else namingFeature().effectiveName()` — a
 //! feature that declares either name declares both): the feature
-//! it explicitly redefines, else — for the memberships whose owned
+//! it explicitly redefines, else a positional redefinition target read from
+//! its owner's heritage, else — for memberships whose owned
 //! feature implicitly redefines a library feature (a binary connector's
 //! two ends, a flow's payload, a return parameter, a subject, an objective,
 //! a view rendering, a transition's accepter, an invocation's positional
 //! arguments) — the positional name the pilot implementation computes
-//! from that implied redefinition, else the feature it references, else
-//! the last link of its feature chain. The naming feature's name is
+//! from that implied redefinition, else the feature selected by a SysML
+//! reference naming rule. Specialized SysML reference rules take precedence
+//! over redefinition. Anonymous feature chains do not confer names. The
+//! naming feature's name is
 //! itself effective, so a chain of unnamed redefinitions resolves to the
 //! first named ancestor. A naming feature outside the model (a library
 //! feature when no library is loaded) is named through
@@ -33,6 +36,50 @@
 use super::{ElementRef, ResolvedModel};
 use crate::metaclass::conforms;
 use crate::properties::Atom;
+
+/// SysML reference forms whose naming rule uses the referenced feature's
+/// `featureTarget`. This does not give the anonymous chain itself a name.
+pub(crate) fn reference_names_feature_target(ty: &str, membership: Option<&str>) -> bool {
+    conforms(ty, "PerformActionUsage")
+        || (conforms(ty, "ConstraintUsage")
+            && membership == Some("RequirementConstraintMembership"))
+}
+
+/// Reference-based SysML naming takes precedence over the generic
+/// redefinition rule. Variants name through the reference itself.
+pub(crate) fn reference_names_feature(ty: &str, membership: Option<&str>) -> bool {
+    reference_names_feature_target(ty, membership) || membership == Some("VariantMembership")
+}
+
+impl super::Builder {
+    /// A generic reference spelling is retained as a replay locator, but it
+    /// contributes no semantic name to a recursive namespace import. Keep
+    /// specialized reference naming, explicit redefinitions and positional
+    /// members out of this bounded absence proof.
+    pub(super) fn reference_locator_has_no_semantic_name(&self, e: usize) -> bool {
+        let element = &self.elements[e];
+        let membership = element.owning_relationship.map(|r| self.elements[r].ty);
+        self.effective_name(e).is_none()
+            && self.effective_hint.contains_key(&e)
+            && !reference_names_feature(element.ty, membership)
+            && !matches!(
+                membership,
+                Some(
+                    "ParameterMembership"
+                        | "EndFeatureMembership"
+                        | "ReturnParameterMembership"
+                        | "SubjectMembership"
+                        | "ObjectiveMembership"
+                        | "ViewRenderingMembership"
+                        | "TransitionFeatureMembership"
+                )
+            )
+            && !element
+                .owned_relationships
+                .iter()
+                .any(|&r| self.elements[r].ty == "Redefinition")
+    }
+}
 
 /// The feature that names an unnamed one, once found.
 enum Naming {
@@ -91,6 +138,7 @@ impl ResolvedModel {
     }
 
     fn ensure_name_memo(&mut self) {
+        self.sync_semantic_publication();
         let n = self.b.elements.len();
         if self.name_memo.len() != n {
             self.name_memo = vec![None; n];
@@ -118,52 +166,78 @@ impl ResolvedModel {
         }
     }
 
-    /// The naming feature of an unnamed element, in the pilot's
-    /// precedence: the first explicitly redefined feature that resolved,
-    /// the implied positional redefinition, then — unless the
+    /// The naming feature of an unnamed element: a specialized SysML
+    /// reference rule takes precedence; otherwise the first explicitly
+    /// redefined feature, the positional target from its owner's heritage,
+    /// the library-role fallback, then — unless the
     /// element is an actor or stakeholder parameter, whose reference
     /// subsets the library collection and carries no name — the referenced
-    /// feature, then the chain's last link. Only explicit relationships
-    /// count; the implied library specializations name nothing.
+    /// feature selected by the applicable SysML naming rule. Redefinitions
+    /// confer names; other implied library specializations do not.
     fn naming_feature(&mut self, e: usize) -> Option<Naming> {
         self.ensure_by_id();
         let rels: Vec<usize> = self.b.elements[e].owned_relationships.to_vec();
+        let owning_ty = self.b.elements[e]
+            .owning_relationship
+            .map(|r| self.b.elements[r].ty);
+        // Specialized SysML naming overrides Feature::namingFeature, even
+        // when a written redefinition is unresolved or has another name.
+        let named_reference = reference_names_feature(self.b.elements[e].ty, owning_ty)
+            .then(|| {
+                rels.iter()
+                    .copied()
+                    .find(|&r| self.b.elements[r].ty == "ReferenceSubsetting")
+            })
+            .flatten();
         let mut reference: Option<Atom> = None;
-        let mut last_chain: Option<Atom> = None;
         for r in rels {
+            if named_reference.is_some() && Some(r) != named_reference {
+                continue;
+            }
             match self.b.elements[r].ty {
                 "Redefinition" => {
-                    if let Some(target) = self.b.elements[r].props.get("redefinedFeature").cloned()
-                    {
-                        if let Some(naming) = self.naming_target(&target) {
-                            return Some(naming);
-                        }
-                    }
+                    let target = self.b.elements[r].props.get("redefinedFeature").cloned()?;
+                    return self.naming_target(&target);
                 }
-                "ReferenceSubsetting" => {
-                    if reference.is_none() {
-                        reference = self.b.elements[r].props.get("referencedFeature").cloned();
-                    }
-                }
-                "FeatureChaining" => {
-                    last_chain = self.b.elements[r].props.get("chainingFeature").cloned();
+                "ReferenceSubsetting" if named_reference == Some(r) && reference.is_none() => {
+                    reference = self.b.elements[r].props.get("referencedFeature").cloned();
                 }
                 _ => {}
+            }
+        }
+        // Use the actual positional target before the library-role fallback.
+        // A specializing requirement's subject may redefine a user subject
+        // whose name (and short name) differs from the library's `subj`.
+        if named_reference.is_none() {
+            if let Some(target) = self.positional_redefinition_targets(ElementRef(e)).first() {
+                return Some(Naming::Feature(target.0));
             }
         }
         if let Some(n) = self.implied_member_name(e) {
             return Some(Naming::Positional(n));
         }
-        let owning_ty = self.b.elements[e]
-            .owning_relationship
-            .map(|r| self.b.elements[r].ty);
         if matches!(owning_ty, Some("ActorMembership" | "StakeholderMembership")) {
             return None;
         }
-        if let Some(naming) = reference.and_then(|t| self.naming_target(&t)) {
-            return Some(naming);
+        let target = reference?;
+        let naming = self.naming_target(&target)?;
+        if reference_names_feature_target(self.b.elements[e].ty, owning_ty) {
+            if let Naming::Feature(t) = naming {
+                if let Some(last) = self.b.elements[t]
+                    .owned_relationships
+                    .iter()
+                    .rev()
+                    .find_map(|&r| {
+                        (self.b.elements[r].ty == "FeatureChaining")
+                            .then(|| self.b.elements[r].props.get("chainingFeature").cloned())
+                            .flatten()
+                    })
+                {
+                    return self.naming_target(&last);
+                }
+            }
         }
-        last_chain.and_then(|t| self.naming_target(&t))
+        Some(naming)
     }
 
     /// A resolved naming target: a model element (whatever its own names

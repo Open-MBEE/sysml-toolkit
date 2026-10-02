@@ -218,20 +218,39 @@ pub fn solve_constraints(
 ) -> Result<Vec<SolvedConstraint>, SolveError> {
     z3_version(cfg)?;
     let mut r = ResolvedModel::build(model);
-    let tables = translate::EnumTables::build(&r);
+    solve_resolved(&mut r, model, cfg)
+}
+
+/// Solve against an existing resolved graph, preserving its bound identities.
+/// `model` must be the source model from which `r` was built.
+pub fn solve_constraints_with(
+    r: &mut ResolvedModel,
+    model: &Model,
+    cfg: &SolverConfig,
+) -> Result<Vec<SolvedConstraint>, SolveError> {
+    z3_version(cfg)?;
+    solve_resolved(r, model, cfg)
+}
+
+fn solve_resolved(
+    r: &mut ResolvedModel,
+    model: &Model,
+    cfg: &SolverConfig,
+) -> Result<Vec<SolvedConstraint>, SolveError> {
+    let tables = translate::EnumTables::build(r);
     let mut out = Vec::new();
     for c in r.constraints() {
         if model.is_library_unit(c.unit) {
             continue;
         }
-        let verdict = constraint_verdict(&mut r, &c);
+        let verdict = constraint_verdict(r, &c);
         let solve = match &verdict {
-            ConstraintVerdict::Undecided(_) => Some(solve_one(&mut r, &tables, &c, cfg, None)),
+            ConstraintVerdict::Undecided(_) => Some(solve_one(r, &tables, &c, cfg, None)),
             _ => None,
         };
         let bindings = match verdict {
             ConstraintVerdict::Satisfied => Vec::new(),
-            _ => constraint_bindings(&mut r, &c),
+            _ => constraint_bindings(r, &c),
         };
         out.push(SolvedConstraint {
             unit: c.unit,
@@ -294,7 +313,9 @@ pub struct FeatureRange {
 #[non_exhaustive]
 pub enum PropagateOutcome {
     /// The body's forward interval is `{true}`: holds for every assignment
-    /// consistent with the narrowed domains.
+    /// consistent with the narrowed domains. If translation approximated any
+    /// feature definition in the joint unit, the body must also be true over
+    /// the declaration domains before asserted constraints narrow them.
     Satisfied,
     /// The body's forward interval is `{false}`: holds for none.
     Violated,
@@ -354,18 +375,28 @@ pub struct Propagation {
 #[must_use]
 pub fn propagate_constraints(model: &Model, cfg: &PropagateConfig) -> Propagation {
     let mut r = ResolvedModel::build(model);
-    let tables = translate::EnumTables::build(&r);
-    let all = user_constraints(&mut r, model);
-    let verdicts: Vec<ConstraintVerdict> =
-        all.iter().map(|c| constraint_verdict(&mut r, c)).collect();
-    let (outcomes, ranges, features) = propagate_core(&mut r, &tables, &all, &verdicts, cfg);
+    propagate_constraints_with(&mut r, model, cfg)
+}
+
+/// Propagate against an existing resolved graph, preserving its bound identities.
+/// `model` must be the source model from which `r` was built.
+#[must_use]
+pub fn propagate_constraints_with(
+    r: &mut ResolvedModel,
+    model: &Model,
+    cfg: &PropagateConfig,
+) -> Propagation {
+    let tables = translate::EnumTables::build(r);
+    let all = user_constraints(r, model);
+    let verdicts: Vec<ConstraintVerdict> = all.iter().map(|c| constraint_verdict(r, c)).collect();
+    let (outcomes, ranges, features) = propagate_core(r, &tables, &all, &verdicts, cfg);
     let constraints = all
         .iter()
         .enumerate()
         .map(|(i, c)| {
             let bindings = match verdicts[i] {
                 ConstraintVerdict::Satisfied => Vec::new(),
-                _ => constraint_bindings(&mut r, c),
+                _ => constraint_bindings(r, c),
             };
             PropagatedConstraint {
                 unit: c.unit,
@@ -447,7 +478,7 @@ fn propagate_core(
         let cs: Vec<&sysmlv2_model::json::ConstraintInfo> = idxs.iter().map(|&i| &all[i]).collect();
         let jt = match translate::translate_all(r, tables, &cs) {
             Ok(jt) => jt,
-            Err(translate::Unsupported(m)) => {
+            Err(translate::Unsupported(m, _)) => {
                 for &i in idxs {
                     if undecided(i) {
                         outcomes[i] = Some(PropagateOutcome::Unsupported(format!(
@@ -529,7 +560,25 @@ fn propagate_core(
                 // operand, so a reference to an emptied feature reads as
                 // `Empty` here.)
                 translate::JointRoot::Root(t) => match ival::eval_term(t, &doms) {
-                    ival::Dom::B(ival::Tri::True) => PropagateOutcome::Satisfied,
+                    ival::Dom::B(ival::Tri::True) => {
+                        // Approximate definitions can affect other roots through
+                        // shared variables. Only declaration-only validity may
+                        // certify a positive result in an approximate joint unit.
+                        // Exact translations retain their existing fast path.
+                        if jt.approx.is_empty()
+                            || matches!(
+                                ival::eval_term(t, &baseline),
+                                ival::Dom::B(ival::Tri::True)
+                            )
+                        {
+                            PropagateOutcome::Satisfied
+                        } else {
+                            PropagateOutcome::Unsupported(format!(
+                                "cannot certify satisfaction with approximated definitions: `{}`",
+                                jt.approx.join("`, `")
+                            ))
+                        }
+                    }
                     ival::Dom::B(ival::Tri::False) => PropagateOutcome::Violated,
                     d if d.is_empty() => PropagateOutcome::Unsatisfiable,
                     _ => PropagateOutcome::Undecided,
@@ -619,11 +668,33 @@ pub fn verify_constraints(
         z3_version(cfg)?;
     }
     let mut r = ResolvedModel::build(model);
-    let tables = translate::EnumTables::build(&r);
-    let all = user_constraints(&mut r, model);
-    let verdicts: Vec<ConstraintVerdict> =
-        all.iter().map(|c| constraint_verdict(&mut r, c)).collect();
-    let (propagate, ranges, features) = propagate_core(&mut r, &tables, &all, &verdicts, prop_cfg);
+    verify_resolved(&mut r, model, solver, prop_cfg)
+}
+
+/// Verify against an existing resolved graph, preserving its bound identities.
+/// `model` must be the source model from which `r` was built.
+pub fn verify_constraints_with(
+    r: &mut ResolvedModel,
+    model: &Model,
+    solver: Option<&SolverConfig>,
+    prop_cfg: &PropagateConfig,
+) -> Result<VerifyReport, SolveError> {
+    if let Some(cfg) = solver {
+        z3_version(cfg)?;
+    }
+    verify_resolved(r, model, solver, prop_cfg)
+}
+
+fn verify_resolved(
+    r: &mut ResolvedModel,
+    model: &Model,
+    solver: Option<&SolverConfig>,
+    prop_cfg: &PropagateConfig,
+) -> Result<VerifyReport, SolveError> {
+    let tables = translate::EnumTables::build(r);
+    let all = user_constraints(r, model);
+    let verdicts: Vec<ConstraintVerdict> = all.iter().map(|c| constraint_verdict(r, c)).collect();
+    let (propagate, ranges, features) = propagate_core(r, &tables, &all, &verdicts, prop_cfg);
 
     let mut constraints = Vec::with_capacity(all.len());
     for (i, c) in all.iter().enumerate() {
@@ -634,13 +705,13 @@ pub fn verify_constraints(
                 if matches!(verdicts[i], ConstraintVerdict::Undecided(_))
                     && !propagation_is_definitive(&propagate[i]) =>
             {
-                Some(solve_one(&mut r, &tables, c, cfg, Some(prop_cfg)))
+                Some(solve_one(r, &tables, c, cfg, Some(prop_cfg)))
             }
             _ => None,
         };
         let bindings = match verdicts[i] {
             ConstraintVerdict::Satisfied => Vec::new(),
-            _ => constraint_bindings(&mut r, c),
+            _ => constraint_bindings(r, c),
         };
         constraints.push(VerifiedConstraint {
             unit: c.unit,
@@ -744,7 +815,7 @@ fn solve_one(
 ) -> SolveOutcome {
     let tr = match translate::translate(r, tables, c) {
         Ok(tr) => tr,
-        Err(translate::Unsupported(m)) => {
+        Err(translate::Unsupported(m, _)) => {
             return SolveOutcome::Unknown(format!("not in the solvable fragment: {m}"));
         }
     };
@@ -972,7 +1043,10 @@ mod witness_containment {
             .unwrap();
         for f in sysmlv2_testkit::user_files() {
             let src = std::fs::read_to_string(&f).unwrap();
-            model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+            model.add_source(
+                sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+                &src,
+            );
         }
         let mut r = ResolvedModel::build(&model);
         let tables = translate::EnumTables::build(&r);
@@ -1114,7 +1188,10 @@ mod bound_injection {
             .unwrap();
         for f in sysmlv2_testkit::user_files() {
             let src = std::fs::read_to_string(&f).unwrap();
-            model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+            model.add_source(
+                sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+                &src,
+            );
         }
         let mut r = ResolvedModel::build(&model);
         let tables = translate::EnumTables::build(&r);

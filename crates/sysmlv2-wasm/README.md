@@ -38,10 +38,11 @@ A defect in the toolkit is different. It aborts the call with `RuntimeError: unr
 
 ## The standard library
 
-The package ships the OMG standard library under `stdlib/`:
+The package ships the OMG standard library under `stdlib/`. The library is licensed under EPL-2.0, not under this package's Apache-2.0: the package carries that license as `LICENSE-EPL-2.0`, and the upstream copyright notices, source repository and revision in `THIRD-PARTY-NOTICES.md`.
 
 - `sysml-library.json.gz` — the 94 library units as `[{name, text}]` (array order is load order — pass the decompressed text through unchanged).
 - `sysml-library.libcache.gz` — a sealed resolution snapshot recorded against exactly that bundle; passing it makes library resolution replay instead of search (several times faster). Stale or corrupt bytes are rejected safely and the build falls back to a cold resolve.
+- `sysml-library.prepared.gz` — the library resolved and frozen, keyed by the bundle's content: `PreparedLibrary.fromSnapshot(prepared, bundle, libcache)` decodes it instead of resolving at startup and keeps no syntax trees in memory (about half the memory of `new PreparedLibrary(bundle, libcache)`). A snapshot from another build or another bundle throws; prepare from source then.
 - `manifest.json` — toolkit version, unit count, sizes.
 
 Serve the two `.gz` files statically and load them once (cache them — they change only with the toolkit version):
@@ -81,6 +82,28 @@ paid once per handle, so retain it across builds to amortize them. Existing sour
 and snapshot APIs remain available. `fromInterchangeJsonWithPreparedLibrary`,
 `fromCompactCborWithPreparedLibrary`, and `loadPreparedLibrary` accept the same
 handle; attaching a library invalidates existing element handles.
+
+A host that rebuilds its session after every edit starts the next build from the
+outcomes the previous one settled on, which a build on a prepared library keeps
+once its resolution has run more than one pass and settled (`settledOutcomes()` is
+`undefined` otherwise, and after a joint build). The outcomes are a handle of their
+own, so the previous session is freed first; a unit that resolves as it did is then
+confirmed in one pass, an edited one is carried through as many passes as it takes,
+and the session answers as one built cold:
+
+```js
+let session = Session.fromSourcesWithPreparedLibrary(sources, library);
+let settled = session.settledOutcomes();
+// …on each edit:
+session.free();
+session = settled
+  ? Session.fromSourcesSettled(editedSources, library, settled)
+  : Session.fromSourcesWithPreparedLibrary(editedSources, library);
+settled?.free();
+settled = session.settledOutcomes();
+```
+
+`LspServer.withPreparedLibrary(library)` builds the language server on such a handle. A session reuses the library's prepared resolution, where `LspServer.withLibrary(bundle, snapshot)` re-parses the library's sources and rebuilds its graph for every session; a workspace that may change what the library's own names resolve to still has the library resolved together with it: a root name the library looked up and missed replays the resolution recorded in the handle's snapshot (or recorded while preparing, when the snapshot is unusable), a root filter keeps that recording's element identities but resolves the library's references again, and a root declaration named like a library package resolves the library from scratch.
 
 ## Running the command-line module
 

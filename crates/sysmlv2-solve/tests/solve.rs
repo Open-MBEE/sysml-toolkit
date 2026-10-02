@@ -44,7 +44,7 @@ fn integer_witness() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x > 3 & x < 5 }
         }",
     ) else {
@@ -61,7 +61,7 @@ fn integer_unsatisfiable() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x > 5 & x < 4 }
         }",
     ) else {
@@ -77,7 +77,7 @@ fn parity_scaling_unsatisfiable_over_integers() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x * 2 == 5 }
         }",
     ) else {
@@ -92,7 +92,7 @@ fn real_witness_by_default_sort() {
     // still satisfiable.
     let Some(out) = outcome(
         "package P {
-            attribute x;
+            attribute x[1];
             assert constraint c { x > 3 & x < 4 }
         }",
     ) else {
@@ -116,7 +116,7 @@ fn boolean_tautology_is_valid() {
     let Some(out) = outcome(
         "package P {
             attribute def Boolean;
-            attribute b : Boolean;
+            attribute b[1] : Boolean;
             assert constraint c { b or not b }
         }",
     ) else {
@@ -130,7 +130,7 @@ fn negated_assert_flips_the_goal() {
     // `assert not` of a contradiction holds for every x.
     let Some(out) = outcome(
         "package P {
-            attribute x;
+            attribute x[1];
             assert not constraint c { x != x }
         }",
     ) else {
@@ -144,7 +144,7 @@ fn enum_witness_and_unsat() {
     let Some(solved) = solve(
         "package P {
             enum def Phase { halt; mid; init; }
-            attribute c : Phase;
+            attribute c[1] : Phase;
             assert constraint pick { c != Phase::halt & c != Phase::mid }
             assert constraint clash { c == Phase::halt & c == Phase::mid }
         }",
@@ -173,7 +173,7 @@ fn variant_values_solve_as_finite_sorts() {
                 variant part engine4Cyl;
                 variant part engine6Cyl;
             }
-            part engine : Engine;
+            part engine[1] : Engine;
             assert constraint pick { engine != Engine::engine4Cyl }
             assert constraint clash {
                 engine == Engine::engine4Cyl & engine == Engine::engine6Cyl
@@ -202,7 +202,7 @@ fn calculation_bodies_inline() {
         "package P {
             attribute def Integer;
             calc def Double { in x; x * 2 }
-            attribute y : Integer;
+            attribute y[1] : Integer;
             assert constraint c { Double(y) == 14 }
             assert constraint t { Double(y) == y * 2 }
         }",
@@ -219,6 +219,32 @@ fn calculation_bodies_inline() {
     assert_eq!(outs[1], SolveOutcome::Valid);
 }
 
+/// A calculation that declares no result inlines the nearest one its
+/// heritage declares, its own parameters standing for those they redefine.
+#[test]
+fn inherited_calculation_bodies_inline() {
+    let Some(solved) = solve(
+        "package P {
+            attribute def Integer;
+            calc def Diff { in a; in b; return r = a - b; }
+            calc def D3 :> Diff { in x; }
+            attribute y[1] : Integer;
+            assert constraint c { D3(y, 3) == 4 }
+        }",
+    ) else {
+        return;
+    };
+    let outs: Vec<_> = solved.iter().filter_map(|s| s.solve.clone()).collect();
+    assert_eq!(
+        outs,
+        [SolveOutcome::Satisfiable(vec![(
+            "y".to_string(),
+            WitnessValue::Int(7)
+        )])],
+        "{solved:?}"
+    );
+}
+
 /// Same-dimension quantities in different units convert through their
 /// measurement references: `x <= 2 [min]` and `x >= 90 [s]` constrain
 /// one variable, and the witness stays in the first unit seen.
@@ -227,14 +253,14 @@ fn units_convert_across_scales() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute s; attribute m;
+            attribute s[1]; attribute m[1];
             attribute min {
                 attribute unitConversion {
                     attribute referenceUnit = s;
                     attribute conversionFactor = 60;
                 }
             }
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x * 1 [min] <= 2 [min] & x * 1 [min] >= 90 [s] }
         }",
     ) else {
@@ -254,7 +280,7 @@ fn null_coalescing_translates() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { (x ?? 99) == 7 }
         }",
     ) else {
@@ -268,7 +294,7 @@ fn null_coalescing_translates() {
         "package P {
             attribute def Integer;
             attribute a = null;
-            attribute y : Integer;
+            attribute y[1] : Integer;
             assert constraint c { (a ?? y) == 3 }
         }",
     ) else {
@@ -287,8 +313,8 @@ fn chained_definitions_inline() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
-            attribute y : Integer = x * x;
+            attribute x[1] : Integer;
+            attribute y[1] : Integer = x * x;
             assert constraint c { y == 49 & x < 0 }
         }",
     ) else {
@@ -308,7 +334,7 @@ fn natural_lower_bound_side_constraint() {
     let Some(out) = outcome(
         "package P {
             attribute def Natural;
-            attribute n : Natural;
+            attribute n[1] : Natural;
             assert constraint c { n < 0 }
         }",
     ) else {
@@ -322,7 +348,7 @@ fn int_real_mixing_coerces() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x + 0.5 > 2.4 & x < 3 }
         }",
     ) else {
@@ -340,9 +366,9 @@ fn independent_units_solve_with_tagged_witnesses() {
     // variable lives in one unit — witnesses carry the inferred unit.
     let Some(out) = outcome(
         "package P {
-            attribute d; attribute kB;
-            attribute duration;
-            attribute volume;
+            attribute d[1]; attribute kB[1];
+            attribute duration[1];
+            attribute volume[1];
             assert constraint c { duration >= 30 [d] & volume >= 100 [kB] }
         }",
     ) else {
@@ -363,8 +389,8 @@ fn one_variable_in_two_unrelated_units_is_unknown() {
     // `variable_converts_across_same_dimension_units`.)
     let Some(out) = outcome(
         "package P {
-            attribute h; attribute min;
-            attribute duration;
+            attribute h[1]; attribute min[1];
+            attribute duration[1];
             assert constraint c { duration <= 2 [h] & duration >= 30 [min] }
         }",
     ) else {
@@ -385,7 +411,7 @@ fn one_variable_in_two_unrelated_units_is_unknown() {
 fn variable_converts_across_same_dimension_units() {
     let Some(out) = outcome(
         "package P {
-            attribute s;
+            attribute s[1];
             attribute beat {
                 attribute unitConversion {
                     attribute referenceUnit = s;
@@ -398,7 +424,7 @@ fn variable_converts_across_same_dimension_units() {
                     attribute conversionFactor = 16;
                 }
             }
-            attribute x; attribute y;
+            attribute x[1]; attribute y[1];
             assert constraint c { x >= 8 [beat] & x + y == 5 [bar] & y == 0 [bar] }
         }",
     ) else {
@@ -427,8 +453,8 @@ fn unit_propagates_through_addition_and_linked_vars() {
     // `c >= 30 [min]` must then conflict.
     let Some(out) = outcome(
         "package P {
-            attribute h; attribute min;
-            attribute a; attribute b; attribute c;
+            attribute h[1]; attribute min[1];
+            attribute a[1]; attribute b[1]; attribute c[1];
             assert constraint k { a + b <= 5 [h] & b == c & c >= 1 [min] }
         }",
     ) else {
@@ -444,8 +470,8 @@ fn unit_propagates_through_addition_and_linked_vars() {
 fn scalar_scaling_keeps_the_unit() {
     let Some(out) = outcome(
         "package P {
-            attribute mm;
-            attribute width;
+            attribute mm[1];
+            attribute width[1];
             assert constraint c { 2 * width <= 10 [mm] & width >= 4 [mm] }
         }",
     ) else {
@@ -474,7 +500,7 @@ fn unsupported_construct_is_unknown() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { (1..x)->size() == 2 }
         }",
     ) else {
@@ -547,7 +573,7 @@ fn modulo_truncated_semantics() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x > -10 & x < 0 & x % 3 == -1 }
         }",
     ) else {
@@ -573,7 +599,7 @@ fn modulo_unsatisfiable_range() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x == -1 & x % 3 == 2 }
         }",
     ) else {
@@ -590,7 +616,7 @@ fn string_equality_witness() {
     let Some(out) = outcome(
         "package P {
             attribute def String;
-            attribute s : String;
+            attribute s[1] : String;
             assert constraint c { s == \"on\" }
         }",
     ) else {
@@ -612,7 +638,7 @@ fn string_disequality_unsatisfiable() {
     let Some(out) = outcome(
         "package P {
             attribute def String;
-            attribute s : String;
+            attribute s[1] : String;
             assert constraint c { s == \"on\" & s != \"on\" }
         }",
     ) else {
@@ -634,14 +660,14 @@ fn bracket_over_unbound_magnitude() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute s;
+            attribute s[1];
             attribute min {
                 attribute unitConversion {
                     attribute referenceUnit = s;
                     attribute conversionFactor = 60;
                 }
             }
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x [min] <= 2 [min] & x [min] >= 90 [s] }
         }",
     ) else {
@@ -660,8 +686,8 @@ fn bracket_over_compound_magnitude() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute s;
-            attribute x : Integer;
+            attribute s[1];
+            attribute x[1] : Integer;
             assert constraint c { (x + 1) [s] == 3 [s] }
         }",
     ) else {
@@ -680,8 +706,8 @@ fn bracket_units_mismatch_is_unknown() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute kg; attribute s;
-            attribute x : Integer;
+            attribute kg[1]; attribute s[1];
+            attribute x[1] : Integer;
             assert constraint c { x [kg] > 2 [s] }
         }",
     ) else {
@@ -703,14 +729,14 @@ fn bracket_dimensionless_scale_folds() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute m;
+            attribute m[1];
             attribute km {
                 attribute unitConversion {
                     attribute referenceUnit = m;
                     attribute conversionFactor = 1000;
                 }
             }
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x [km/m] == 5000 & x > 0 }
         }",
     ) else {
@@ -731,9 +757,9 @@ fn sum_over_bound_sequence() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute total : Integer;
-            attribute a : Integer;
-            attribute b : Integer;
+            attribute total[1] : Integer;
+            attribute a[1] : Integer;
+            attribute b[1] : Integer;
             attribute ps : Integer[0..*] = (a, b);
             assert constraint c { total == sum(ps) & a == 2 & b == 3 }
         }",
@@ -756,10 +782,10 @@ fn size_flattens_nested_sequences() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute n : Integer;
-            attribute a : Integer;
-            attribute b : Integer;
-            attribute c : Integer;
+            attribute n[1] : Integer;
+            attribute a[1] : Integer;
+            attribute b[1] : Integer;
+            attribute c[1] : Integer;
             attribute ps : Integer[0..*] = (a, (b, c));
             assert constraint k { n == size(ps) & notEmpty(ps) }
         }",
@@ -779,10 +805,10 @@ fn max_min_fold_to_ite_chains() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute hi : Integer;
-            attribute lo : Integer;
-            attribute a : Integer;
-            attribute b : Integer;
+            attribute hi[1] : Integer;
+            attribute lo[1] : Integer;
+            attribute a[1] : Integer;
+            attribute b[1] : Integer;
             assert constraint c {
                 hi == max((a, b)) & lo == min(a, b) & a == 2 & b == 7
             }
@@ -815,12 +841,12 @@ fn product_abs_head_last_fold() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute p : Integer;
-            attribute y : Integer;
-            attribute h : Integer;
-            attribute l : Integer;
-            attribute a : Integer;
-            attribute b : Integer;
+            attribute p[1] : Integer;
+            attribute y[1] : Integer;
+            attribute h[1] : Integer;
+            attribute l[1] : Integer;
+            attribute a[1] : Integer;
+            attribute b[1] : Integer;
             assert constraint c {
                 p == product((a, b)) & y == abs(0 - a) &
                 h == head((a, b)) & l == last((a, b)) &
@@ -858,14 +884,14 @@ fn sum_converts_units_across_scales() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute s; attribute m;
+            attribute s[1]; attribute m[1];
             attribute min {
                 attribute unitConversion {
                     attribute referenceUnit = s;
                     attribute conversionFactor = 60;
                 }
             }
-            attribute x : Integer;
+            attribute x[1] : Integer;
             assert constraint c { x [s] == sum((1 [min], 30 [s])) }
         }",
     ) else {
@@ -884,7 +910,7 @@ fn sum_over_valueless_collection_bails_with_arity_reason() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute total : Integer;
+            attribute total[1] : Integer;
             attribute ps : Integer[0..*];
             assert constraint c { total == sum(ps) }
         }",
@@ -907,8 +933,8 @@ fn forall_over_bound_sequence_conjunction() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute a : Integer;
-            attribute b : Integer;
+            attribute a[1] : Integer;
+            attribute b[1] : Integer;
             attribute ps : Integer[0..*] = (a, b);
             assert constraint c { ps->forAll {in v; v > 0} & b == 0 - 3 }
         }",
@@ -925,8 +951,8 @@ fn exists_over_bound_sequence_disjunction() {
     let Some(out) = outcome(
         "package P {
             attribute def Integer;
-            attribute a : Integer;
-            attribute b : Integer;
+            attribute a[1] : Integer;
+            attribute b[1] : Integer;
             assert constraint c {
                 (a, b)->exists {in v; v == 7} & a == 1 & b == 2
             }
@@ -945,8 +971,8 @@ fn forall_skolemizes_bounded_multiplicity() {
         "package P {
             attribute def Real;
             part def W {
-                attribute r : Real;
-                attribute d : Real;
+                attribute r[1] : Real;
+                attribute d[1] : Real;
             }
             part ws : W[4];
             assert constraint c { ws->forAll {in w; 2 * w.r < w.d} }
@@ -971,7 +997,7 @@ fn quantifiers_share_skolem_instances() {
         "package P {
             attribute def Real;
             part def W {
-                attribute r : Real;
+                attribute r[1] : Real;
             }
             part ws : W[2];
             assert constraint c {
@@ -991,7 +1017,7 @@ fn skolemization_respects_the_cap() {
         "package P {
             attribute def Real;
             part def W {
-                attribute r : Real;
+                attribute r[1] : Real;
             }
             part ws : W[64];
             assert constraint c { ws->forAll {in w; w.r > 0} }
@@ -1003,4 +1029,123 @@ fn skolemization_respects_the_cap() {
         panic!("expected a cap bail, got {out:?}");
     };
     assert!(reason.contains("expansion cap"), "{reason}");
+}
+
+#[test]
+fn collection_cardinality_is_not_recovered_from_scalar_approximations() {
+    for expression in [
+        "sum(rack.motors.mass) < 1",
+        "total < 1",
+        "size(if choose ? xs else xs) == 1",
+        "size(if choose ? copied else copied) == 1",
+        "Count(if choose ? copied else copied) == 1",
+    ] {
+        let Some(out) = outcome(&format!(
+            "package P {{
+            attribute def Real; attribute def Integer; attribute def Boolean;
+            part def Motor {{ attribute mass[1] : Real = 0.55; }}
+            part def Rack {{ part motors : Motor[4]; }}
+            part rack : Rack {{ part :>> motors; }}
+            attribute total[1] : Real = sum(rack.motors.mass);
+            attribute xs : Integer[4]; attribute choose[1] : Boolean;
+            attribute copied[1] : Integer = xs;
+            calc def Count {{ in things; return n = size(things); }}
+            assert constraint c {{ {expression} }}
+        }}"
+        )) else {
+            return;
+        };
+        assert!(
+            matches!(out, SolveOutcome::Unknown(_)),
+            "{expression}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn quantified_nested_collections_do_not_prove_singleton_size() {
+    for expression in [
+        "size(x.motors.mass) == 1",
+        "size(x.values) == 1",
+        "sum(x.motors.mass) < 1",
+    ] {
+        let Some(out) = outcome(&format!(
+            "package P {{
+            attribute def Integer; attribute def Real;
+            part def Motor {{ attribute mass[1] : Real = 0.55; }}
+            part def Item {{ part motors : Motor[4]; attribute values : Integer[4]; }}
+            part items : Item[2];
+            assert constraint c {{ items->forAll {{ in x; {expression} }} }}
+        }}"
+        )) else {
+            return;
+        };
+        assert!(
+            matches!(out, SolveOutcome::Unknown(_)),
+            "{expression}: {out:?}"
+        );
+    }
+}
+
+#[path = "common/collection_identity.rs"]
+mod collection_identity;
+
+#[test]
+fn contextual_member_formulas_do_not_capture_quantifier_bindings() {
+    for source in collection_identity::contextual_formulas() {
+        let Some(out) = outcome(&source) else { return };
+        assert!(matches!(out, SolveOutcome::Unknown(_)), "{source}: {out:?}");
+    }
+    for size in [1, 2] {
+        let Some(out) = outcome(&collection_identity::closed_member_formula(size)) else {
+            return;
+        };
+        assert!(matches!(out, SolveOutcome::Satisfiable(_)), "{out:?}");
+    }
+}
+
+#[test]
+fn quantified_members_preserve_reference_identity() {
+    for source in collection_identity::contradictions() {
+        let Some(out) = outcome(&source) else { return };
+        assert_eq!(out, SolveOutcome::Unsatisfiable, "{source}");
+    }
+    for size in [1, 2] {
+        let source = collection_identity::distinct_receivers(size);
+        let Some(out) = outcome(&source) else { return };
+        assert!(
+            matches!(out, SolveOutcome::Satisfiable(_)),
+            "{source}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn scalar_admission_respects_defaults_and_subsetting() {
+    for (source, scalar) in collection_identity::scalar_admission() {
+        let Some(out) = outcome(&source) else { return };
+        if scalar {
+            assert_eq!(out, SolveOutcome::Unsatisfiable, "{source}");
+        } else {
+            assert!(matches!(out, SolveOutcome::Unknown(_)), "{source}: {out:?}");
+        }
+    }
+}
+
+#[test]
+fn scalar_admission_respects_body_and_named_multiplicity() {
+    let cfg = SolverConfig::default();
+    if z3_version(&cfg).is_err() {
+        return;
+    }
+    for (model, scalar) in collection_identity::body_scalar_admission() {
+        let solved = solve_constraints(&model, &cfg).unwrap();
+        assert_eq!(solved.len(), 1);
+        let out = solved[0].solve.as_ref().unwrap();
+        if scalar {
+            assert_eq!(*out, SolveOutcome::Unsatisfiable);
+        } else {
+            assert!(matches!(out, SolveOutcome::Unknown(_)), "{out:?}");
+        }
+    }
 }

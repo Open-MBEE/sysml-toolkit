@@ -1178,10 +1178,13 @@ fn visibility_blocked_reference_offers_to_widen_the_member() {
 
 #[test]
 fn visibility_blocked_reference_covers_inherited_and_qualified_members() {
+    // A redefinition header resolves in its general, where the private
+    // member is addressable, so `Redefining` blocks nothing.
     let src = "package P {
     part def Base { private attribute v; }
-    part def Sub :> Base { attribute :>> v = 1; }
+    part def Sub :> Base { attribute u = v; }
     part def Other { attribute w = Base::v; }
+    part def Redefining :> Base { attribute :>> v = 1; }
 }
 ";
     let mut model = Model::new();
@@ -1191,7 +1194,7 @@ fn visibility_blocked_reference_covers_inherited_and_qualified_members() {
     let names: Vec<&str> = blocked.iter().map(|b| b.spelling.as_str()).collect();
     assert_eq!(names, ["v", "Base::v"], "{blocked:?}");
     assert!(blocked.iter().all(|b| b.visibility == "private"));
-    // The redefinition reaches `v` through the specialization, so
+    // The reference in `Sub` reaches `v` through the specialization, so
     // `protected` suffices there; the qualified reference from `Other`
     // needs `public`.
     assert_eq!(
@@ -1280,7 +1283,7 @@ package A { private package B { import Outer::Hidden::*; part h : H; } }
 }
 
 // ---------------------------------------------------------------------------
-// M32d: kind and referential fixes
+// Kind and referential fixes
 // ---------------------------------------------------------------------------
 
 fn rule_findings(sources: &[(&str, &str)], rule: &str) -> Vec<Finding> {
@@ -1609,7 +1612,7 @@ fn import_visibility_recommends_public_for_dependents_reaching_through_a_chain()
 fn inherited_name_shadow_spells_the_redefinition() {
     let src = "package P {\n    attribute def Real;\n    attribute def SwitchStatus { attribute downlinkPort : Real; }\n    attribute def M1 :> SwitchStatus { attribute downlinkPort : Real[6]; }\n    attribute def Lan { attribute m1 : M1; }\n}\n";
     let findings = rule_findings(&[("a.sysml", src)], "inherited-name-shadow");
-    assert_eq!(findings.len(), 2, "{findings:?}");
+    assert_eq!(findings.len(), 1, "{findings:?}");
     let owned = findings
         .iter()
         .find(|f| f.element.as_deref() == Some("P::M1::downlinkPort"))
@@ -1625,16 +1628,12 @@ fn inherited_name_shadow_spells_the_redefinition() {
         "{fixed}"
     );
     assert!(rule_findings(&[("a.sysml", &fixed)], "inherited-name-shadow").is_empty());
-    // The inheriting usage carries the finding without a fix: nothing to
-    // redefine on its side.
-    let both = findings
-        .iter()
-        .find(|f| f.element.as_deref() == Some("P::Lan::m1"))
-        .expect("inherited-twice collision");
-    assert!(both.fix.is_none());
+    // The base has already removed the shadowed membership, so its typed
+    // usage inherits one member and needs no duplicate downstream finding.
     assert!(
-        both.message
-            .starts_with("`downlinkPort` is inherited from both `M1` and `SwitchStatus`")
+        !findings
+            .iter()
+            .any(|f| f.element.as_deref() == Some("P::Lan::m1"))
     );
 }
 
@@ -1718,10 +1717,9 @@ fn inherited_name_shadow_admits_conforming_redefinitions() {
 }
 
 #[test]
-fn inherited_name_shadow_targets_the_nearest_of_a_chain_by_qualified_name() {
-    // `C::x` hides both `B::x` and `A::x`; the fix redefines the nearer,
-    // qualified — the simple name is ambiguous there — and together with
-    // the fix on `B::x` the model comes out clean.
+fn inherited_name_shadow_targets_the_filtered_nearest_base() {
+    // B has already removed A's membership, so C sees only B's x. The
+    // simple redefinition spelling identifies that nearest inherited member.
     let src = "package P {\n    attribute def Real;\n    part def A { attribute x : Real; }\n    part def B :> A { attribute x : Real; }\n    part def C :> B { attribute x : Real; }\n}\n";
     let findings = rule_findings(&[("a.sysml", src)], "inherited-name-shadow");
     assert_eq!(findings.len(), 2, "{findings:?}");
@@ -1736,7 +1734,7 @@ fn inherited_name_shadow_targets_the_nearest_of_a_chain_by_qualified_name() {
         "{fixed}"
     );
     assert!(
-        fixed.contains("part def C :> B { attribute :>> P::B::x : Real; }"),
+        fixed.contains("part def C :> B { attribute :>> x : Real; }"),
         "{fixed}"
     );
     assert!(rule_findings(&[("a.sysml", &fixed)], "inherited-name-shadow").is_empty());
@@ -1877,4 +1875,254 @@ fn only_unreadable_config_is_an_error() {
     let findings = run(&[("a.sysml", CALC)], &cfg);
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].rule, "lint-config");
+}
+
+#[test]
+fn redefinition_outside_inheritance_reports_the_actual_target_without_a_fix() {
+    let source = "package Quantities { attribute mass; }
+        package P {
+            private import Quantities::*;
+            part def Vehicle { part chassis { attribute mass = 0.4; } }
+            part tiny : Vehicle;
+            part analyzed :> tiny { attribute :>> mass = 0.4; }
+            part medium : Vehicle { attribute :>> chassis.mass = 2.5; }
+            part mediumAnalyzed :> medium { attribute :>> mass = 2.5; }
+            part intentional :> tiny { attribute :>> Quantities::mass = 0.4; }
+            part named : Vehicle { attribute mass :>> chassis.mass default = 2.5; }
+            part namedAnalyzed :> named { attribute :>> mass = 2.5; }
+        }";
+    let findings = rule_findings(
+        &[("model.sysml", source)],
+        "redefinition-outside-inheritance",
+    );
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    let mut model = Model::new();
+    model.add_source("model.sysml", source);
+    let mut resolved = ResolvedModel::build(&model);
+    assert!(
+        !sysmlv2_parser::check::validate_model_with(&mut resolved, &model)
+            .iter()
+            .any(|(_, d)| d.message.contains("validateFeatureValueOverriding"))
+    );
+    for f in &findings {
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("Quantities::mass"), "{f:?}");
+        assert!(f.message.contains("chassis.mass"), "{f:?}");
+        assert_eq!(f.span.unwrap().slice(source), "mass");
+        assert!(f.fix.is_none() && f.alternatives.is_empty());
+    }
+    let config =
+        Config::from_json(r#"{"rules":{"redefinition-outside-inheritance":"off"}}"#).unwrap();
+    assert!(
+        !run(&[("model.sysml", source)], &config)
+            .iter()
+            .any(|f| f.rule == "redefinition-outside-inheritance")
+    );
+    let config = Config::from_json(r#"{"rules":{"redefinition-outside-inheritance":{"severity":"off","scopes":{"AttributeUsage":"warn"}}}}"#).unwrap();
+    assert_eq!(
+        run(&[("model.sysml", source)], &config)
+            .iter()
+            .filter(|f| f.rule == "redefinition-outside-inheritance")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn redefinition_fallback_provenance_preserves_base_order_aliases_and_cache_modes() {
+    use std::sync::Arc;
+    use sysmlv2_parser::{libcache::LibraryCache, prepared::PreparedLibrary};
+    let library = "package Quantities { feature mass; }
+        package Outer {
+            private import Quantities::*;
+            class Empty;
+            class Real { feature mass; }
+            class Imported { private import Quantities::mass; }
+            class Aliased { alias mass for Quantities::mass; }
+        }";
+    let user = "package P {
+        class Accidental specializes Outer::Empty { feature measured redefines mass = 1; }
+        class FirstWins specializes Outer::Empty, Outer::Imported { feature measured redefines mass = 1; }
+        class RealMember specializes Outer::Real { feature redefines mass = 1; }
+        class ImportedMember specializes Outer::Imported { feature redefines mass = 1; }
+        class AliasedMember specializes Outer::Aliased { feature redefines mass = 1; }
+        class Qualified specializes Outer::Empty { feature redefines Quantities::mass = 1; }
+        class Global specializes Outer::Empty { feature redefines $::Quantities::mass = 1; }
+        class Missing specializes Outer::Empty { feature redefines unknown = 1; }
+        class Incomplete specializes Outer::Empty, MissingBase { feature redefines mass = 1; }
+    }";
+    let mut base = Model::new();
+    base.add_library_source("lib.kerml", library);
+    base.record_library_cache();
+    let _ = ResolvedModel::build(&base);
+    let cache =
+        LibraryCache::from_bytes(&base.take_recorded_library_cache().unwrap().to_bytes()).unwrap();
+    let prepared = base.prepare_library().unwrap();
+    let decoded =
+        Arc::new(PreparedLibrary::from_bytes(&prepared.to_bytes(41).unwrap(), 41).unwrap());
+    let mut baseline = None;
+    for mode in 0..4 {
+        let mut model = Model::new();
+        match mode {
+            2 => prepared.clone().install(&mut model).unwrap(),
+            3 => decoded.clone().install(&mut model).unwrap(),
+            _ => {
+                model.add_library_source("lib.kerml", library);
+                if mode == 1 {
+                    model.set_library_cache(cache.clone());
+                }
+            }
+        }
+        model.add_source("user.kerml", user);
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let before = sysmlv2_parser::check::validate_model_with(&mut r, &model);
+        let findings: Vec<_> = lint(&mut r, &Config::default())
+            .into_iter()
+            .filter(|f| f.rule == "redefinition-outside-inheritance")
+            .collect();
+        assert_eq!(findings.len(), 2, "mode {mode}: {findings:?}");
+        let messages: Vec<_> = findings.iter().map(|f| f.message.clone()).collect();
+        assert!(messages[0].contains("P::Accidental"));
+        assert!(messages[1].contains("P::FirstWins"));
+        if let Some(ref baseline) = baseline {
+            assert_eq!(&messages, baseline);
+        } else {
+            baseline = Some(messages);
+        }
+        let after = sysmlv2_parser::check::validate_model_with(&mut r, &model);
+        assert_eq!(
+            before, after,
+            "lint must not change unused-import diagnostics"
+        );
+        let again: Vec<_> = lint(&mut r, &Config::default())
+            .into_iter()
+            .filter(|f| f.rule == "redefinition-outside-inheritance")
+            .map(|f| f.message)
+            .collect();
+        assert_eq!(again, *baseline.as_ref().unwrap());
+    }
+}
+
+#[test]
+fn redefinition_provenance_requires_complete_transitive_providers() {
+    use std::sync::Arc;
+    use sysmlv2_parser::{libcache::LibraryCache, prepared::PreparedLibrary};
+    let mut cases = vec![
+        ("class Base;", true),
+        ("class Base specializes Absent;", false),
+        (
+            "class Ancestor specializes Absent; class Base specializes Ancestor;",
+            false,
+        ),
+        ("class Base { public import Absent::*; }", false),
+        (
+            "package Provider { public import Absent::*; } class Base { public import Provider::*; }",
+            false,
+        ),
+        (
+            "class Ancestor { public import Absent::*; } feature Base : Ancestor;",
+            false,
+        ),
+        ("class Base { private import Absent::mass; }", false),
+        ("class Base { alias mass for Absent::mass; }", false),
+        ("class Base { private import Quantities::mass; }", false),
+        ("class Base { alias mass for Quantities::mass; }", false),
+        ("class Base { public import Quantities::*; }", false),
+        (
+            "package Provider { public import Quantities::*; } class Base { public import Provider::*; }",
+            false,
+        ),
+        (
+            "package Provider { feature other; } class Base { public import Provider::*; }",
+            true,
+        ),
+        (
+            "package Provider { public import Absent::*; feature other; } class Base { private import Provider::other; }",
+            true,
+        ),
+        (
+            "package Unrelated { public import Absent::*; } class Base;",
+            true,
+        ),
+        ("class Base { public import Quantities::*[true]; }", false),
+        ("class Base { public import Quantities::**; }", false),
+        (
+            "class A specializes B; class B specializes A; class Base specializes A;",
+            false,
+        ),
+        (
+            "package A { public import B::*; } package B { public import A::*; } class Base { public import A::*; }",
+            false,
+        ),
+    ];
+    cases.push(("class Container { feature item; } feature root : Container; feature Base subsets root.item;", false));
+    cases.push(("class Root; class Left specializes Root; class Right specializes Root; class Base specializes Left, Right;", true));
+    let mut deep = String::from("class Level0; ");
+    for i in 1..32 {
+        deep.push_str(&format!("class Level{i} specializes Level{}; ", i - 1));
+    }
+    deep.push_str("class Base specializes Level31;");
+    cases.push((&deep, false));
+    for (case, (declarations, warns)) in cases.into_iter().enumerate() {
+        let library = format!(
+            "package Quantities {{ feature mass; }} package Outer {{ private import Quantities::*; {declarations} }}"
+        );
+        let user = "package P { private import Quantities::*;
+            part x : Outer::Base; part Child :> x {
+                attribute measured :>> mass = 1;
+            }
+        }";
+        let mut base = Model::new();
+        base.add_library_source("lib.kerml", &library);
+        assert!(!base.has_errors(), "{declarations}");
+        base.record_library_cache();
+        ResolvedModel::build(&base);
+        let cache =
+            LibraryCache::from_bytes(&base.take_recorded_library_cache().unwrap().to_bytes())
+                .unwrap();
+        let prepared = base.prepare_library().unwrap();
+        let decoded =
+            Arc::new(PreparedLibrary::from_bytes(&prepared.to_bytes(41).unwrap(), 41).unwrap());
+        for mode in 0..4 {
+            let mut model = Model::new();
+            match mode {
+                2 => prepared.clone().install(&mut model).unwrap(),
+                3 => decoded.clone().install(&mut model).unwrap(),
+                _ => {
+                    model.add_library_source("lib.kerml", &library);
+                    if mode == 1 {
+                        model.set_library_cache(cache.clone());
+                    }
+                }
+            }
+            model.add_source("user.sysml", user);
+            assert!(!model.has_errors());
+            let mut r = ResolvedModel::build(&model);
+            let before = sysmlv2_parser::check::validate_model_with(&mut r, &model);
+            if (1..=5).contains(&case) {
+                let feature = r.resolve_qualified("P::Child::measured").unwrap();
+                let mass = r.resolve_qualified("Quantities::mass").unwrap();
+                assert_eq!(
+                    r.redefinition_targets(feature),
+                    vec![mass],
+                    "mode {mode}: {declarations}"
+                );
+            }
+            for _ in 0..2 {
+                let warnings = r.redefinitions_outside_inheritance();
+                assert_eq!(
+                    warnings.len(),
+                    usize::from(warns),
+                    "mode {mode}: {declarations}"
+                );
+                if warns {
+                    let mass = r.resolve_qualified("Quantities::mass").unwrap();
+                    assert_eq!(warnings[0].0.target, mass);
+                }
+            }
+            let after = sysmlv2_parser::check::validate_model_with(&mut r, &model);
+            assert_eq!(before, after, "query effects: mode {mode}: {declarations}");
+        }
+    }
 }

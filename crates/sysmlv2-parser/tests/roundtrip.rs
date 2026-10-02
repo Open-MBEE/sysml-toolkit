@@ -674,7 +674,7 @@ fn deep_ownership_chain_lifts_without_overflowing() {
 }
 
 /// One naming rule, several representations: an unnamed feature is named
-/// by the feature it redefines, references, or chains to. The lift reads
+/// by its redefined feature or applicable SysML reference naming rule. The lift reads
 /// that rule off payload JSON (for the qualified names a cross-document
 /// reference prints), the full form derives it over its own element maps
 /// (for `name` and `memberName`), and the id derivation runs it as a
@@ -1014,5 +1014,275 @@ fn full_form_preserves_elements_the_lifter_cannot_reconstruct() {
         assert_eq!(output["@type"], element["@type"]);
         assert_eq!(output["declaredName"], element["declaredName"]);
         assert_eq!(output["ownedRelationship"], element["ownedRelationship"]);
+    }
+}
+
+#[test]
+fn anonymous_chains_stay_unnamed_across_interchange() {
+    let source = "package P {
+        part def Base { part chassis { attribute mass; } attribute other; }
+        part anonymous : Base { attribute :>> chassis.mass, other = 2; }
+        part named : Base { attribute mass :>> chassis.mass = 2; }
+        part child :> named { attribute :>> mass = 3; }
+        action actions { action run; }
+        perform actions.run;
+        requirement r { require constraint check { true } }
+        requirement s { require r.check; }
+    }";
+    let parsed = parse(source, Dialect::Sysml);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let compact = to_compact_json(&parsed.unit);
+    let elements = compact.as_array().unwrap();
+    let full = sysmlv2_parser::full::from_compact_value(compact.clone(), &Default::default(), true);
+    let names = sysmlv2_parser::lift::document_name_map(&compact);
+    for el in elements
+        .iter()
+        .filter(|e| e["@type"] == "Feature" && e["declaredName"].is_null())
+    {
+        if !elements.iter().any(|r| {
+            r["@type"] == "FeatureChaining"
+                && el["ownedRelationship"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|owned| owned["@id"] == r["@id"])
+        }) {
+            continue;
+        }
+        let derived = full
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["@id"] == el["@id"])
+            .unwrap();
+        assert!(derived["name"].is_null(), "{derived}");
+        assert!(!names.contains_key(el["@id"].as_str().unwrap()));
+    }
+    let anonymous_owner = elements
+        .iter()
+        .find(|e| e["declaredName"] == "anonymous")
+        .unwrap();
+    let membership = elements
+        .iter()
+        .find(|e| {
+            e["@type"] == "FeatureMembership"
+                && anonymous_owner["ownedRelationship"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["@id"] == e["@id"])
+        })
+        .unwrap();
+    let attr = elements
+        .iter()
+        .find(|e| e["owningRelationship"]["@id"] == membership["@id"])
+        .unwrap();
+    let derived = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["@id"] == attr["@id"])
+        .unwrap();
+    assert!(derived["name"].is_null(), "{derived}");
+    assert!(!names.contains_key(attr["@id"].as_str().unwrap()));
+    let lifted = from_compact_json(&compact).unwrap();
+    assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+    let text = print_source(&lifted.unit);
+    assert_eq!(
+        to_compact_json(&parse(&text, Dialect::Sysml).unit),
+        compact,
+        "{text}"
+    );
+    let paths = sysmlv2_parser::ids::segment_paths(&compact, &|_| None).unwrap();
+    let i = elements
+        .iter()
+        .position(|e| e["@id"] == attr["@id"])
+        .unwrap();
+    assert!(!paths[i].as_ref().unwrap().1.ends_with("::mass"));
+}
+
+#[test]
+fn specialized_reference_names_do_not_name_their_anonymous_chains() {
+    let source = "package P {
+        action actions { action run; }
+        perform actions.run;
+        requirement r { require constraint check { true } }
+        requirement s { require r.check; }
+        part vehicle { part chassis; }
+        variation part choices { variant part ::> vehicle.chassis; }
+    }";
+    let parsed = parse(source, Dialect::Sysml);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let compact = to_compact_json(&parsed.unit);
+    let elements = compact.as_array().unwrap();
+    let full = sysmlv2_parser::full::from_compact_value(compact.clone(), &Default::default(), true);
+    let names = sysmlv2_parser::lift::document_name_map(&compact);
+    for (kind, expected) in [
+        ("PerformActionUsage", Some("run")),
+        ("ConstraintUsage", Some("check")),
+        ("PartUsage", None),
+    ] {
+        let candidates: Vec<_> = elements
+            .iter()
+            .filter(|e| {
+                e["@type"] == kind
+                    && e["declaredName"].is_null()
+                    && elements.iter().any(|r| {
+                        r["@type"] == "ReferenceSubsetting"
+                            && e["ownedRelationship"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|owned| owned["@id"] == r["@id"])
+                    })
+            })
+            .collect();
+        assert_eq!(candidates.len(), 1, "{kind}: {compact}");
+        let el = candidates[0];
+        let derived = full
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["@id"] == el["@id"])
+            .unwrap();
+        assert_eq!(derived["name"].as_str(), expected, "{kind}");
+        assert_eq!(
+            names
+                .get(el["@id"].as_str().unwrap())
+                .and_then(|p| p.last())
+                .map(String::as_str),
+            expected,
+            "{kind}"
+        );
+    }
+    let lifted = from_compact_json(&compact).unwrap();
+    assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+    let text = print_source(&lifted.unit);
+    assert_eq!(
+        to_compact_json(&parse(&text, Dialect::Sysml).unit),
+        compact,
+        "{text}"
+    );
+}
+
+#[test]
+fn redefining_a_named_chain_preserves_its_name() {
+    let source = "package P {
+        class Base { feature b { feature x; } feature path chains b.x; }
+        class Child specializes Base { feature redefines path; }
+    }";
+    let compact = to_compact_json(&parse(source, Dialect::Kerml).unit);
+    let elements = compact.as_array().unwrap();
+    let redefinition = elements
+        .iter()
+        .find(|e| e["@type"] == "Redefinition")
+        .unwrap();
+    let id = redefinition["redefiningFeature"]["@id"].as_str().unwrap();
+    let names = sysmlv2_parser::lift::document_name_map(&compact);
+    assert_eq!(names.get(id).unwrap(), &["P", "Child", "path"]);
+    let full = sysmlv2_parser::full::from_compact_value(compact.clone(), &Default::default(), true);
+    let e = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["@id"] == id)
+        .unwrap();
+    assert_eq!(e["name"], "path");
+    let lifted = from_compact_json(&compact).unwrap();
+    assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+    assert_eq!(
+        to_compact_json(&parse(&print_source(&lifted.unit), Dialect::Kerml).unit),
+        compact
+    );
+}
+
+#[test]
+fn specialized_reference_names_take_precedence_over_redefinitions() {
+    for target in ["missing", "other"] {
+        for (usage, kind, expected) in [
+            (
+                format!("perform actions.run :>> {target};"),
+                "PerformActionUsage",
+                Some("run"),
+            ),
+            (
+                format!("requirement s {{ require constraint :>> {target} ::> r.check; }}"),
+                "ConstraintUsage",
+                Some("check"),
+            ),
+            (
+                format!(
+                    "variation part choices {{ variant part :>> {target} ::> vehicle.chassis; }}"
+                ),
+                "PartUsage",
+                None,
+            ),
+            (
+                format!("variation part choices {{ variant part :>> {target} ::> vehicle; }}"),
+                "PartUsage",
+                Some("vehicle"),
+            ),
+        ] {
+            let source = format!(
+                "package P {{ action actions {{ action run; }} requirement r {{ require constraint check {{ true }} }} part vehicle {{ part chassis; }} part other; {usage} }}"
+            );
+            let parsed = parse(&source, Dialect::Sysml);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{usage}: {:?}",
+                parsed.diagnostics
+            );
+            let compact = to_compact_json(&parsed.unit);
+            let elements = compact.as_array().unwrap();
+            let el = elements
+                .iter()
+                .find(|e| {
+                    e["@type"] == kind
+                        && e["declaredName"].is_null()
+                        && elements.iter().any(|r| {
+                            r["@type"] == "ReferenceSubsetting"
+                                && e["ownedRelationship"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|owned| owned["@id"] == r["@id"])
+                        })
+                })
+                .unwrap();
+            let names = sysmlv2_parser::lift::document_name_map(&compact);
+            let full = sysmlv2_parser::full::from_compact_value(
+                compact.clone(),
+                &Default::default(),
+                true,
+            );
+            let derived = full
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["@id"] == el["@id"])
+                .unwrap();
+            assert_eq!(derived["name"].as_str(), expected, "{usage}");
+            assert_eq!(
+                names
+                    .get(el["@id"].as_str().unwrap())
+                    .and_then(|p| p.last())
+                    .map(String::as_str),
+                expected,
+                "{usage}"
+            );
+            let paths = sysmlv2_parser::ids::segment_paths(&compact, &|_| None).unwrap();
+            if let Some(expected) = expected {
+                let i = elements.iter().position(|e| e["@id"] == el["@id"]).unwrap();
+                assert!(
+                    paths[i]
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .ends_with(&format!("::{expected}")),
+                    "{usage}: {:?}",
+                    paths[i]
+                );
+            }
+        }
     }
 }

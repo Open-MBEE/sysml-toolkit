@@ -381,15 +381,6 @@ fn transition_effect_remaining_alternatives() {
 }
 
 #[test]
-fn sysml_semicolon_expression_bodies() {
-    sysml_ok("package P { attribute a = ;; }");
-    sysml_ok("package P { attribute a = 1 + ;; }");
-    sysml_ok("package P { attribute a = xs.;; }");
-    sysml_ok("package P { attribute a = xs.?;; }");
-    sysml_ok("package P { attribute a = xs->F ;; }");
-}
-
-#[test]
 fn empty_usage_after_special_prefixes_and_in_enumerations() {
     sysml_ok("package P { connection def C { end; } }");
     sysml_ok("package P { occurrence def O { individual; snapshot; timeslice; } }");

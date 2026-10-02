@@ -89,7 +89,9 @@ impl Inference<'_> {
                 // Diagnostics belong to the value's own traversal, not every
                 // reference to it in a different file.
                 let before = self.findings.len();
+                let origin = self.model.b.set_identity_origin(e);
                 let d = self.expr(scope, &expr);
+                self.model.b.identity_origin_unit = origin;
                 self.findings.truncate(before);
                 result = d;
             }
@@ -299,7 +301,9 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         if model.is_library_unit(unit) {
             continue;
         }
+        let origin = infer.model.b.set_identity_origin(owner);
         infer.expr(scope, &expr);
+        infer.model.b.identity_origin_unit = origin;
         out.extend(
             infer
                 .findings
@@ -308,4 +312,42 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::facts::Facts;
+
+    #[test]
+    fn checker_tail_restores_active_origin_on_errors_unknowns_and_cycles() {
+        let mut model = Model::new();
+        model.add_library_source("lib.kerml", "package Quantities { datatype QuantityValue; } package ScalarValues { datatype Boolean; datatype Integer; }");
+        model.add_source("user.kerml", "package P { feature Actual=1; feature '88888888-8888-4888-8888-888888888888'=true; feature value='88888888-8888-4888-8888-888888888888'; feature unknown=missing; feature cyclic=loop; feature loop=cyclic; class Holder { feature n; } metaclass M { feature x; } metadata m:M { feature x=Holder::n; } class C { feature n=Holder::n; feature a { feature leaf; } } feature chain subsets C::a.leaf; datatype T; datatype U; feature t:T; function f { return r:U; t } }");
+        model.add_source("actions.sysml", "package Actions { attribute x:ScalarValues::Integer; part def D; part p; action def Work { assign D := 1; send 1 to p; accept when x; accept after missing; } state def S { state a; state b; transition first a if x then b; } }");
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let actual = r.resolve_qualified("P::Actual").unwrap();
+        let value = r.resolve_qualified("P::value").unwrap();
+        let id = "88888888-8888-4888-8888-888888888888".parse().unwrap();
+        r.override_ids(&HashMap::from([(r.element_id(actual), id)]));
+        let expr = r.members_via(value, "FeatureValue")[0];
+        let edge = r.owned_relationships(expr)[0];
+        let mut hints = HashMap::from([((r.element_id(edge), "memberElement".into()), id)]);
+        assert!(r.bind_id_spelled_references_with(&mut hints).contains(&id));
+        let g = Facts::new(&mut r.b);
+        for origin in [None, Some(0)] {
+            r.b.identity_origin_unit = origin;
+            validate(&mut r, &model);
+            assert_eq!(r.b.identity_origin_unit, origin);
+            super::super::actions::validate(&mut r, &model, &g);
+            assert_eq!(r.b.identity_origin_unit, origin);
+            super::super::relationships::validate(&mut r, &model, &g);
+            assert_eq!(r.b.identity_origin_unit, origin);
+            super::super::values::validate(&mut r, &model, &g);
+            assert_eq!(r.b.identity_origin_unit, origin);
+            super::super::chains::validate(&mut r, &model);
+            assert_eq!(r.b.identity_origin_unit, origin);
+        }
+    }
 }

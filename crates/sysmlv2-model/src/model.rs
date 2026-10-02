@@ -86,9 +86,58 @@ impl ParsedSource {
     }
 }
 
+/// Original owned Boolean inputs from one structurally paired payload row.
+/// This is source provenance, not inferred semantic state.
+#[derive(Clone)]
+pub(crate) struct PayloadOwnedFlags {
+    pub(crate) metaclass: &'static str,
+    pub(crate) flags: crate::properties::Properties,
+}
+
+// Retain the original syntax allocation so an edited or replaced source cannot
+// reuse payload values merely by occupying the same ordinal and lowering path.
+struct PayloadSource {
+    name: String,
+    syntax: std::sync::Arc<SourceUnit>,
+    flags: std::collections::HashMap<String, PayloadOwnedFlags>,
+}
+
+pub(crate) const PAYLOAD_USAGE_FLAGS: &[&str] =
+    &["isConstant", "isEnd", "isComposite", "isPortion"];
+
+pub(crate) fn is_payload_usage_flag(metaclass: &str, name: &str) -> bool {
+    PAYLOAD_USAGE_FLAGS.contains(&name)
+        && crate::metaclass::conforms(metaclass, "Usage")
+        && crate::semantic_catalog::property(metaclass, name)
+            .and_then(|(_, effective)| effective)
+            .is_some_and(|p| !p.derived && p.target == "Boolean")
+}
+
+/// Authored graph/identity contract. Existing constructors retain the legacy shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum GraphFormat {
+    #[default]
+    LegacyV2,
+    /// Conditional operands own expression-reference wrappers; constructor
+    /// arguments are owned by an explicit result Feature. Textual end constancy
+    /// uses checked variability evidence.
+    CanonicalV3,
+}
+impl GraphFormat {
+    /// Version carried by graph-aware caches and binary interchange.
+    pub const fn version(self) -> u8 {
+        match self {
+            Self::LegacyV2 => 2,
+            Self::CanonicalV3 => 3,
+        }
+    }
+}
+
 /// A set of parsed source units sharing one global root namespace.
 #[derive(Default)]
 pub struct Model {
+    graph_format: GraphFormat,
     units: Vec<ModelUnit>,
     // Original text is retained only for library snapshots. Public ModelUnit
     // continues to expose the exact, shared syntax tree.
@@ -100,6 +149,25 @@ pub struct Model {
     /// Interior mutability: the builder consumes hints / deposits a
     /// recording through `&Model`.
     lib_cache: std::cell::RefCell<LibCacheSlot>,
+    // Original unit ordinal + lowering path identify immutable input syntax
+    // before graph-effective IDs are assigned. Empty entries still mark a
+    // lifted payload unit, which must not acquire text-only defaults.
+    payload_sources: std::collections::HashMap<usize, PayloadSource>,
+    /// The outcomes the next build starts from, and the outcomes a build
+    /// settled on (see [`crate::json::settled`]). Interior mutability: the
+    /// builder takes the one and deposits the other through `&Model`.
+    settled: std::cell::RefCell<SettledSlot>,
+}
+
+/// The settled-outcomes state carried by a [`Model`].
+#[derive(Default)]
+pub(crate) struct SettledSlot {
+    /// Whether a build keeps the outcomes it settles on.
+    keep: bool,
+    /// The outcomes the next build starts from.
+    start: Option<std::sync::Arc<crate::json::settled::SettledOutcomes>>,
+    /// The outcomes the last build settled on, when kept.
+    kept: Option<std::sync::Arc<crate::json::settled::SettledOutcomes>>,
 }
 
 /// Library-cache state carried by a [`Model`].
@@ -115,12 +183,83 @@ pub(crate) enum LibCacheSlot {
     Record,
     /// Outcomes recorded by a build, awaiting [`Model::take_recorded_library_cache`].
     Recorded(crate::libcache::LibraryCache),
-    /// A recording on disk, read only if a build cannot reuse the prepared
+    /// A recording held back, read only if a build cannot reuse the prepared
     /// graph. Prepared builds never pay for loading it.
-    Lazy(std::path::PathBuf),
+    Lazy(LazyRecording),
+}
+
+/// Where a held-back recording comes from: a cache file, or the encoded
+/// bytes a host already holds (a browser fetched them beside the prepared
+/// snapshot), decoded only when a build needs them.
+pub(crate) enum LazyRecording {
+    File(std::path::PathBuf),
+    Bytes(std::sync::Arc<[u8]>),
+}
+
+impl LazyRecording {
+    fn load(&self) -> Option<crate::libcache::LibraryCache> {
+        match self {
+            Self::File(path) => crate::libcache::LibraryCache::load(path),
+            Self::Bytes(bytes) => crate::libcache::LibraryCache::from_bytes(bytes),
+        }
+    }
 }
 
 impl Model {
+    /// Choose the authored graph format before loading sources or prepared libraries.
+    pub fn with_graph_format(graph_format: GraphFormat) -> Self {
+        Self {
+            graph_format,
+            ..Self::default()
+        }
+    }
+
+    pub fn graph_format(&self) -> GraphFormat {
+        self.graph_format
+    }
+
+    pub(crate) fn add_payload_source(&mut self, name: impl Into<String>, text: &str) -> &ModelUnit {
+        let index = self.unit_count();
+        let unit = self.add_source(name, text);
+        let origin = PayloadSource {
+            name: unit.name.clone(),
+            syntax: unit.unit.clone(),
+            flags: std::collections::HashMap::new(),
+        };
+        self.payload_sources.insert(index, origin);
+        self.unit(index)
+    }
+
+    pub(crate) fn payload_source_flags(
+        &self,
+        unit: usize,
+    ) -> Option<&std::collections::HashMap<String, PayloadOwnedFlags>> {
+        let origin = self.payload_sources.get(&unit)?;
+        if unit >= self.unit_count() {
+            return None;
+        }
+        let current = self.unit(unit);
+        (!current.is_library
+            && current.name == origin.name
+            && std::sync::Arc::ptr_eq(&current.unit, &origin.syntax))
+        .then_some(&origin.flags)
+    }
+
+    pub(crate) fn retain_payload_flags(
+        &mut self,
+        unit: usize,
+        path: String,
+        input: PayloadOwnedFlags,
+    ) {
+        if self.payload_source_flags(unit).is_some() {
+            self.payload_sources
+                .get_mut(&unit)
+                .unwrap()
+                .flags
+                .insert(path, input);
+        }
+    }
+
     pub(crate) fn install_prepared(
         &mut self,
         library: std::sync::Arc<crate::prepared::PreparedLibrary>,
@@ -131,9 +270,44 @@ impl Model {
                 "install a prepared library before adding source units",
             ));
         }
+        if library.graph_format() != self.graph_format {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared library graph format differs from the model",
+            ));
+        }
         self.library = Some(library.units.clone());
+        // A library decoded from a snapshot keeps no recording, but it may hold
+        // the encoded one for the build that must resolve it jointly after all.
+        if library.recording.is_none() {
+            if let Some(bytes) = &library.lazy_recording {
+                let mut slot = self.lib_cache.borrow_mut();
+                if matches!(*slot, LibCacheSlot::Off) {
+                    *slot = LibCacheSlot::Lazy(LazyRecording::Bytes(std::sync::Arc::clone(bytes)));
+                }
+            }
+        }
         self.prepared = Some(library);
         Ok(())
+    }
+
+    /// Arm the recording the installed prepared library keeps, for a build
+    /// that cannot reuse its prepared graph: such a build then replays the
+    /// recording instead of resolving the whole library afresh. A slot the
+    /// caller set (a recording in progress, a snapshot, a lazy cache file)
+    /// stays in place.
+    pub(crate) fn arm_prepared_recording(&self) {
+        let Some(recording) = self
+            .prepared
+            .as_ref()
+            .and_then(|library| library.recording.as_ref())
+        else {
+            return;
+        };
+        let mut slot = self.lib_cache.borrow_mut();
+        if matches!(*slot, LibCacheSlot::Off) {
+            *slot = LibCacheSlot::Use(std::sync::Arc::clone(recording));
+        }
     }
 
     /// Prepare and retain this library-only model for subsequent user builds.
@@ -191,6 +365,13 @@ impl Model {
     /// Parse and add a user source. The dialect is chosen by the name's
     /// extension, read without case (`.kerml` → KerML, anything else →
     /// SysML).
+    ///
+    /// The name also seeds the source document's root identity and therefore
+    /// its derived user-element IDs. Give distinct documents distinct stable
+    /// names, such as project-relative paths; a basename alone is insufficient
+    /// when files in different directories share it. Names are not deduplicated
+    /// or normalized by this method. Reusing a name can produce duplicate IDs;
+    /// changing it changes the freshly derived identities for that document.
     pub fn add_source(&mut self, name: impl Into<String>, src: &str) -> &ModelUnit {
         self.add_parsed_source(ParsedSource::new(name, src))
     }
@@ -301,6 +482,52 @@ impl Model {
         sources
     }
 
+    /// Keep the outcomes the next build settles on, for
+    /// [`Self::settled_outcomes`].
+    pub fn keep_settled_outcomes(&mut self) {
+        self.settled.get_mut().keep = true;
+    }
+
+    /// Start the next build, on a prepared library, from `outcomes`, the
+    /// outcomes a previous build settled on (see [`crate::json::settled`]):
+    /// a unit lowered to the references it was lowered to then starts from
+    /// their outcomes, and is confirmed in one pass when it resolves as it
+    /// did; any other unit starts unresolved. The outcomes the build
+    /// settles on are kept in turn.
+    pub fn start_from_settled(
+        &mut self,
+        outcomes: std::sync::Arc<crate::json::settled::SettledOutcomes>,
+    ) {
+        let slot = self.settled.get_mut();
+        slot.start = Some(outcomes);
+        slot.keep = true;
+    }
+
+    /// The outcomes the last build settled on, when kept; `None` when it
+    /// did not settle.
+    pub fn settled_outcomes(
+        &self,
+    ) -> Option<std::sync::Arc<crate::json::settled::SettledOutcomes>> {
+        self.settled.borrow().kept.clone()
+    }
+
+    pub(crate) fn take_settled(
+        &self,
+    ) -> Option<std::sync::Arc<crate::json::settled::SettledOutcomes>> {
+        self.settled.borrow_mut().start.take()
+    }
+
+    pub(crate) fn keeps_settled(&self) -> bool {
+        self.settled.borrow().keep
+    }
+
+    pub(crate) fn deposit_settled(
+        &self,
+        outcomes: std::sync::Arc<crate::json::settled::SettledOutcomes>,
+    ) {
+        self.settled.borrow_mut().kept = Some(outcomes);
+    }
+
     /// Replay `cache` on the next build of this model (library units must
     /// match the content the cache was recorded from — key by
     /// [`crate::libcache::hash_library_dir`]).
@@ -336,7 +563,7 @@ impl Model {
             // invocation may build more than once).
             LibCacheSlot::Use(c) => LibCacheSlot::Use(std::sync::Arc::clone(c)),
             LibCacheSlot::Record => std::mem::take(&mut *slot),
-            LibCacheSlot::Lazy(path) => match crate::libcache::LibraryCache::load(path) {
+            LibCacheSlot::Lazy(source) => match source.load() {
                 Some(cache) => {
                     let cache = std::sync::Arc::new(cache);
                     *slot = LibCacheSlot::Use(std::sync::Arc::clone(&cache));
@@ -351,10 +578,21 @@ impl Model {
         }
     }
 
+    /// The resolution recording the last library build replayed or made.
+    pub(crate) fn library_recording(
+        &self,
+    ) -> Option<std::sync::Arc<crate::libcache::LibraryCache>> {
+        match &*self.lib_cache.borrow() {
+            LibCacheSlot::Use(cache) => Some(std::sync::Arc::clone(cache)),
+            LibCacheSlot::Recorded(cache) => Some(std::sync::Arc::new(cache.clone())),
+            _ => None,
+        }
+    }
+
     /// Keep a recording available for builds that fall back from the
     /// prepared graph, without reading it up front or disabling that graph.
     pub(crate) fn set_lazy_library_cache(&self, path: std::path::PathBuf) {
-        *self.lib_cache.borrow_mut() = LibCacheSlot::Lazy(path);
+        *self.lib_cache.borrow_mut() = LibCacheSlot::Lazy(LazyRecording::File(path));
     }
 
     #[cfg(test)]
@@ -433,5 +671,86 @@ mod dialect_tests {
         // `class` is KerML's; a SysML parse of the same text fails.
         let unit = model.add_source("M.KERML", "package P { class A; }");
         assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    }
+}
+
+#[cfg(test)]
+mod payload_source_tests {
+    use super::*;
+
+    fn model() -> Model {
+        let mut m = Model::new();
+        m.add_payload_source("input.sysml", "part def P { end part p; }");
+        m.add_payload_source("second.sysml", "part def Q { end part p; }");
+        assert!(m.payload_source_flags(0).is_some());
+        m
+    }
+
+    #[test]
+    fn payload_origin_refuses_replacement_edit_reinsert_reorder_and_role_changes() {
+        let mut m = model();
+        let find = |resolved: &crate::json::ResolvedModel| {
+            resolved
+                .user_elements()
+                .find(|&e| {
+                    resolved
+                        .element_properties(e)
+                        .get("declaredName")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("p")
+                })
+                .unwrap()
+        };
+        let initial = crate::json::ResolvedModel::build(&m);
+        let (_, path) = initial.payload_owned_flag_anchor(find(&initial)).unwrap();
+        let mut flags = crate::properties::Properties::new();
+        flags.insert_payload_flag("isConstant", serde_json::json!("original payload"));
+        m.retain_payload_flags(
+            0,
+            path,
+            PayloadOwnedFlags {
+                metaclass: "PartUsage",
+                flags,
+            },
+        );
+        let retained = crate::json::ResolvedModel::build(&m);
+        assert_eq!(
+            retained.element_properties(find(&retained))["isConstant"],
+            serde_json::json!("original payload")
+        );
+        let mut replacement = Model::new();
+        assert!(
+            replacement
+                .add_source("input.sysml", "part def P { constant end part p; }")
+                .diagnostics
+                .is_empty()
+        );
+        m.units[0] = replacement.units.remove(0);
+        assert!(m.payload_source_flags(0).is_none());
+        let rebuilt = crate::json::ResolvedModel::build(&m);
+        assert_eq!(
+            rebuilt.element_properties(find(&rebuilt))["isConstant"],
+            serde_json::json!(true)
+        );
+        let mut m = model();
+        std::sync::Arc::make_mut(&mut m.units[0].unit)
+            .members
+            .clear();
+        assert!(m.payload_source_flags(0).is_none());
+        let mut m = model();
+        m.units.remove(0);
+        m.add_source("input.sysml", "part def P { end part p; }");
+        assert!(m.payload_source_flags(0).is_none());
+        assert!(m.payload_source_flags(1).is_none());
+        let mut m = model();
+        m.units.swap(0, 1);
+        assert!(m.payload_source_flags(0).is_none());
+        assert!(m.payload_source_flags(1).is_none());
+        let mut m = model();
+        m.units[0].is_library = true;
+        assert!(m.payload_source_flags(0).is_none());
+        let mut m = model();
+        m.units[0].name = "renamed.sysml".into();
+        assert!(m.payload_source_flags(0).is_none());
     }
 }

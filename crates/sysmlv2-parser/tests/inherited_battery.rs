@@ -178,7 +178,7 @@ fn direct_import_filter_applies_at_first_hop() {
 fn alias_with_short_name_only_inherits() {
     let mut r = build(
         "package P {
-            part def Base { attribute mass; alias <m2> for mass; }
+            part def Base { part def Mass; alias <m2> for Mass; }
             part def Sub :> Base;
          }",
     );
@@ -290,9 +290,9 @@ fn owned_redefinition_seed_is_one_hop() {
 }
 
 #[test]
-fn deep_heritage_reports_truncation_and_terminates() {
-    // The walk shares lookup's recursion budget; past it the enumeration
-    // says so instead of silently presenting a cut result.
+fn deep_heritage_is_complete_independent_of_cache_warming() {
+    // Acyclic membership dependencies are evaluated iteratively, including
+    // chains deeper than name lookup's recursion budget.
     let chain = |n: usize| -> String {
         let mut src = String::from("package P { part def T0 { attribute a0; }");
         for i in 1..=n {
@@ -309,14 +309,21 @@ fn deep_heritage_reports_truncation_and_terminates() {
     assert!(!r.inheritance_walk_truncated(leaf, false));
     assert_eq!(r.inherited_features(leaf, false).len(), 10);
 
-    let mut r = build(&chain(30));
-    let leaf = r.resolve_qualified("P::T30").unwrap();
-    assert!(r.inheritance_walk_truncated(leaf, false));
-    let n = r.inherited_features(leaf, false).len();
-    assert!((24..30).contains(&n), "cut at the budget, got {n}");
-    // A shallow type in the same model is complete.
-    let mid = r.resolve_qualified("P::T5").unwrap();
-    assert!(!r.inheritance_walk_truncated(mid, false));
+    let mut snapshots = Vec::new();
+    for warm in [false, true] {
+        let mut r = build(&chain(40));
+        if warm {
+            for i in 1..40 {
+                let e = r.resolve_qualified(&format!("P::T{i}")).unwrap();
+                r.inherited_memberships(e, false);
+            }
+        }
+        let leaf = r.resolve_qualified("P::T40").unwrap();
+        assert!(!r.inheritance_walk_truncated(leaf, false));
+        assert_eq!(r.inherited_features(leaf, false).len(), 40);
+        snapshots.push(inherited_names(&mut r, "P::T40"));
+    }
+    assert_eq!(snapshots[0], snapshots[1]);
 }
 
 #[test]

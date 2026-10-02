@@ -23,7 +23,11 @@ fn corpus_solve_ratchet() {
         .unwrap();
     for f in sysmlv2_testkit::user_files() {
         let src = std::fs::read_to_string(&f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        // Distinct source paths can share a basename; keep their identity seeds distinct.
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     let solved = solve_constraints(&model, &cfg).unwrap();
     let (mut valid, mut sat, mut unsat, mut unknown) = (0, 0, 0, 0);
@@ -86,9 +90,23 @@ fn corpus_solve_ratchet() {
     // Example and `generator.generateTorque.torque` in 12b-Allocation-1
     // now stay unknown. Supporting them again requires preserving each
     // receiver path in the solver's variable identity.
+    // 63/29 → 61/32 with effective cardinality and guarded collection
+    // translation: one scenario's inherited unbound samples stop making
+    // its size-dependent quantifier vacuously true (enters unknown).
+    // An unbound componentMasses redefinition inherits [0..*], so it
+    // cannot supply one scalar summand; an autoPort with an unresolved
+    // redefinition likewise cannot supply a known singleton. Both lose
+    // fabricated scalar witnesses. Exact expanded variant instances
+    // still solve, independently of their root collection's multiplicity.
+    // 61/32 → 37/58 with normative defaults and inherited subsettings:
+    // 24 scalar witnesses depended on explicitly subsetted [*] quantities,
+    // generic parameters, non-structural variation usages, or package-owned
+    // receivers whose cardinality is not one. Two formerly static verdicts
+    // likewise become unknown. Requirement/case subjects retain their actual
+    // inherited [1] through complete supported positional redefinitions.
     assert_eq!(
         (valid, sat, unsat, unknown),
-        (1, 63, 0, 29),
+        (1, 37, 0, 58),
         "solve ratchet moved — unsatisfiable must stay 0 on the \
          conforming corpus; satisfiable/unknown changes require an \
          explained translation improvement or soundness correction"

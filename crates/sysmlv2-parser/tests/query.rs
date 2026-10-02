@@ -20,7 +20,7 @@ const DEMO: &str = "package Demo {
         part spare : SpareWheel;
         part engine : Engine;
     }
-    part car : Vehicle;
+    part car : Vehicle[1];
 }";
 
 fn resolved(src: &str) -> ResolvedModel {
@@ -284,7 +284,7 @@ fn istype_follows_semantic_metadata_annotation() {
             metadata def TaggedU :> Metaobjects::SemanticMetadata {
                 :>> baseType = pulses meta U;
             }
-            #TaggedU action blip;
+            #TaggedU action blip[1];
         }";
     // Annotated definition: Blink -> (semantic) Pulse.
     assert_eq!(
@@ -475,4 +475,61 @@ fn constructors_bind_inherited_fields() {
         q("(new Collections::KeyValuePair(\"k\", 9)).val"),
         Ok(Value::Integer(9))
     );
+}
+
+#[test]
+fn query_reflection_does_not_hijack_declared_functions() {
+    let src = "package P { part vehicle; calc def ownedMember { in x; return r = 99; } }";
+    assert_eq!(
+        query(src, "P::ownedMember(P::vehicle)"),
+        Ok(Value::Integer(99))
+    );
+    assert_eq!(
+        query(src, "ownedMember(P::vehicle)"),
+        Ok(Value::Sequence(vec![]))
+    );
+    assert!(matches!(
+        query(src, "Missing::ownedMember(P::vehicle)"),
+        Err(EvalError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn unbound_redefined_collections_do_not_become_query_declarations() {
+    let source = "package P {
+        part def Motor { attribute mass = 0.55; }
+        part def Rack { part motors : Motor[4]; }
+        part rack : Rack[1] { part <slot> :>> motors; }
+        ref part unknown : Rack;
+    }";
+    for expression in [
+        "P::rack.slot.mass",
+        "P::rack.motors.mass",
+        "P::unknown.motors.mass",
+    ] {
+        assert_eq!(
+            query(source, expression),
+            Ok(Value::Indeterminate),
+            "{expression}"
+        );
+    }
+    assert_eq!(query(source, "size(P::rack.slot)"), Ok(Value::Integer(4)));
+}
+
+#[test]
+fn indexing_uncertain_chained_query_values_does_not_invent_positions() {
+    let source = "package P {
+        part def A {
+            attribute xs[4] ordered;
+            attribute flag[1];
+            attribute items[0..*] ordered = if flag ? xs else xs;
+        }
+        part def B { attribute items[1] = 99; }
+        part a : A[1]; part b : B[1];
+    }";
+    assert_eq!(
+        query(source, "(P::a, P::b).items#(2)"),
+        Ok(Value::Indeterminate)
+    );
+    assert_eq!(query(source, "P::b.items#(1)"), Ok(Value::Integer(99)));
 }

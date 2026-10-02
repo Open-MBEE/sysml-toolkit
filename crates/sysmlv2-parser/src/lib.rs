@@ -17,8 +17,8 @@ pub use sysmlv2_syntax::{ast, diag, lexer, name, parser, print, span, token, vis
 
 #[cfg(feature = "json")]
 pub use sysmlv2_model::{
-    ambient, eval, full, ids, json, libcache, lift, loader, model, prepared, quantity, rational,
-    render,
+    ambient, eval, full, ids, json, libcache, lift, loader, migration, model, prepared, quantity,
+    rational,
 };
 
 /// Post-parse validation: body-context legality (syntax-level) and — with

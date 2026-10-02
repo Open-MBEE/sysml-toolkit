@@ -3,7 +3,7 @@
 //! abstract syntax owns or derives it, the derivation layer's fidelity at
 //! the passthrough level and under the closure policy, the interchange
 //! shape, and — for derived rows — the XMI's type and multiplicity. The
-//! table a per-language SDK generator consumes (plan §33i); a consumer
+//! table a per-language SDK generator consumes; a consumer
 //! keys on `fidelity`, never on corpus fill rate.
 //!
 //! Usage: `cargo run --example derived_correspondence` from the workspace

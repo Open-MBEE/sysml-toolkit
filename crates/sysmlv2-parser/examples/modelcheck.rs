@@ -30,7 +30,7 @@ fn main() {
     let n = files.len();
     for f in &files {
         let src = fs::read_to_string(f).unwrap();
-        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        let name = sysmlv2_testkit::relative_source_name(root, f);
         model.add_source(name, &src);
     }
     let v = model_to_compact_json(&model);

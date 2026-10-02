@@ -313,10 +313,10 @@ pub(super) fn validate(
     for (e, (scope, expr)) in super::user_entries(&r.b, model, r.b.values.iter()) {
         let unit = r.b.unit_of_elem(e);
         if let ExprKind::Ref(_) = &expr.kind {
-            if let (Some(context), Some(t)) = (
-                g.featuring(&r.b, e),
-                expressions::referent(&mut r.b, scope, &expr),
-            ) {
+            let origin = r.b.set_identity_origin(e);
+            let target = expressions::referent(&mut r.b, scope, &expr);
+            r.b.identity_origin_unit = origin;
+            if let (Some(context), Some(t)) = (g.featuring(&r.b, e), target) {
                 if !featured_within(&r.b, g, t, context) {
                     errors.push((
                         unit,
@@ -341,7 +341,9 @@ pub(super) fn validate(
             .collect();
         if let [ret] = returns.as_slice() {
             let a = g.typed(&r.b, *ret);
+            let origin = r.b.set_identity_origin(e);
             let z = expressions::types(&mut r.b, g, scope, &expr, 0);
+            r.b.identity_origin_unit = origin;
             bindings.push((unit, expr.span, a, z));
         }
     }
@@ -352,6 +354,7 @@ pub(super) fn validate(
         {
             let span = qn.span;
             let a = g.typed(&r.b, s);
+            let origin = r.b.set_identity_origin(e);
             let z = expressions::types(
                 &mut r.b,
                 g,
@@ -362,6 +365,7 @@ pub(super) fn validate(
                 },
                 0,
             );
+            r.b.identity_origin_unit = origin;
             bindings.push((unit, span, a, z));
         }
     }

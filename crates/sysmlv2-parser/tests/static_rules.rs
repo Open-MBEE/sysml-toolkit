@@ -788,3 +788,33 @@ fn standalone_typing_participates_in_binding_conformance() {
         );
     }
 }
+
+#[test]
+fn fixed_value_override_names_the_original_binding_even_for_equal_values() {
+    for (base_value, new_value, rejected) in [
+        ("= 1", "= 1", true),
+        ("= 1", "default = 1", true),
+        ("default = 1", "= 2", false),
+    ] {
+        let mut model = Model::new();
+        model.add_source("base.kerml", &format!("class Base {{\n    feature mass {base_value};\n}}\nclass Mid specializes Base {{ feature redefines mass; }}"));
+        let source =
+            format!("class Child specializes Mid {{ feature redefines mass {new_value}; }}");
+        model.add_source("child.kerml", &source);
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let findings: Vec<_> = check::validate_semantics_with(&mut r, &model)
+            .into_iter()
+            .filter(|(_, d)| d.code == Some("validateFeatureValueOverriding"))
+            .collect();
+        assert_eq!(findings.len(), usize::from(rejected), "{findings:?}");
+        if rejected {
+            let (unit, d) = &findings[0];
+            assert_eq!(*unit, 1);
+            assert_eq!(d.span.slice(&source), "1");
+            assert!(d.message.contains("`Base::mass`"), "{d:?}");
+            assert!(d.message.contains("base.kerml:2:"), "{d:?}");
+            assert!(d.message.contains("inherited value must be default"));
+        }
+    }
+}

@@ -341,7 +341,18 @@ def concrete_carriers(classes, prop_names):
     return carriers, derived_on, dual
 
 
-def write_compositions(records):
+# Published 20250201 constraint bodies conflict with their property types.
+# Keep these adjudications keyed to the exact rule tuple: a changed source rule
+# must be reviewed again instead of receiving an unconditional name override.
+COMPOSITION_ERRATA = {
+    ("ownedFlow", "ownedUsage", "FlowConnectionUsage"): "FlowUsage",
+    ("nestedFlow", "nestedUsage", "FlowConnectionUsage"): "FlowUsage",
+    ("ownedInterface", "ownedUsage", "ReferenceUsage"): "InterfaceUsage",
+    ("nestedInterface", "nestedUsage", "ReferenceUsage"): "InterfaceUsage",
+}
+
+
+def composition_rows(records, ancestors_of):
     """The kind-filtered compositions: every derived property whose OCL
     rule is `name = base->selectByKind(Kind)` (or `selectAsKind`), plus
     the rule-less `*Definition` back-references, which the normative
@@ -352,15 +363,24 @@ def write_compositions(records):
     # side (a few rules spell the expression alone).
     pat = re.compile(r"^\s*(?:(\w+)\s*=\s*)?(\w+)\s*->\s*select(?:By|As)Kind\(\s*(\w+)\s*\)\s*$")
     rows = {}
+    required_types = defaultdict(set)
     for r in records:
         name = r["name"]
         single = all(d["multiplicity"].endswith("..1") for d in r["declaring"])
-        for body in r["rules"].values():
+        for owner, body in r["rules"].items():
             m = pat.match(body.replace("\n", " "))
             lhs = LHS_ALIASES.get(m.group(1), m.group(1)) if m else None
             if m and lhs in (None, name):
                 base = BASE_ALIASES.get(m.group(2), m.group(2))
-                rows.setdefault(name, (base, m.group(3), single))
+                kind = COMPOSITION_ERRATA.get((name, base, m.group(3)), m.group(3))
+                candidate = (base, kind, single)
+                if name in rows and rows[name] != candidate:
+                    raise ValueError(f"conflicting composition rules for {name}: {rows[name]} / {candidate}")
+                rows[name] = candidate
+                for decl in r["declaring"]:
+                    declaring = decl["metaclass"]
+                    if declaring == owner or declaring in ancestors_of.get(owner, ()) or owner in ancestors_of.get(declaring, ()):
+                        required_types[name].add(decl["type"])
         # A `*Definition` back-reference declared on a usage without a rule
         # on that usage (per declaration: `PortUsage::portDefinition` has
         # no rule although `ConjugatedPortTyping::portDefinition` does).
@@ -374,6 +394,20 @@ def write_compositions(records):
                 kinds = sorted({d["type"] for d in decls})
                 if len(kinds) == 1:
                     rows.setdefault(name, ("definition", kinds[0], single))
+                    required_types[name].update(kinds)
+    for name, (_, kind, _) in rows.items():
+        if kind not in ancestors_of:
+            raise ValueError(f"unknown selected metaclass {kind} for {name}")
+        if not required_types[name]:
+            raise ValueError(f"no applicable result declaration for {name}")
+        for required in required_types[name]:
+            if kind != required and required not in ancestors_of[kind]:
+                raise ValueError(f"{name}: selected {kind} does not conform to {required}")
+    return rows
+
+
+def write_compositions(records, ancestors_of):
+    rows = composition_rows(records, ancestors_of)
     lines = [
         "//! Generated from `spec-refs/{KerML,SysML}.xmi` (normative metamodel",
         "//! 20250201) by `tools/derived_census.py` — do not edit.",
@@ -497,7 +531,7 @@ def main():
         )
 
     write_rust_table(classes, prop_names, set(derived), dual)
-    n_comp = write_compositions(records)
+    n_comp = write_compositions(records, ancestors_of)
     OUT_JSON.write_text(json.dumps({"source": "spec-refs/{KerML,SysML}.xmi 20250201", "generator": "tools/derived_census.py", "properties": records}, indent=1) + "\n")
 
     by_class = defaultdict(list)

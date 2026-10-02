@@ -92,42 +92,51 @@ error: an import must declare an explicit visibility (`public`, `private`, or `p
   --> broken.sysml:2:5
    |
    |     import Definitions::*;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
 
 error: a transition usage is not allowed in a definition or usage body
   --> broken.sysml:5:9
    |
    |         transition first parked then driving;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error: validateSubjectMembershipOwningType: a `subject` member is not allowed in a definition or usage body
   --> broken.sysml:6:9
    |
    |         subject v;
+   |         ^^^^^^^^^^
 
 error: a `variant` member is only allowed in the body of a `variation` definition or usage
   --> broken.sysml:9:9
    |
    |         variant part manual;
+   |         ^^^^^^^^^^^^^^^^^^^^
 
 warning: unresolved reference `Definitions`
   --> broken.sysml:2:12
    |
    |     import Definitions::*;
+   |            ^^^^^^^^^^^
 
 warning: unresolved reference `parked`
   --> broken.sysml:5:26
    |
    |         transition first parked then driving;
+   |                          ^^^^^^
 
 warning: unresolved reference `driving`
   --> broken.sysml:5:38
    |
    |         transition first parked then driving;
+   |                                      ^^^^^^^
 
 3 warning(s)
 4 error(s)
 $ echo $?
 1
 ```
+
+Each finding shows its line with carets under the span it reports. A line longer than 160 characters shows 160 of them, up to a third before the finding, with `…` where it was cut, so a model written on one line reports at a bounded cost per finding. The location keeps the finding's column in the whole line.
 
 The legality matrix is transcribed from the normative Xtext grammars' `*BodyItem` rules and is gated at zero false positives over all 345 corpus files (`tests/check.rs`).
 
@@ -156,26 +165,31 @@ warning: unresolved reference `Missing`
   --> refs.sysml:3:20
    |
    |     private import Missing::*;
+   |                    ^^^^^^^
 
 warning: unresolved reference `Vel`
   --> refs.sysml:7:27
    |
    |         attribute speed : Vel;
+   |                           ^^^
 
 warning: alias target `Vehicel` does not resolve
   --> refs.sysml:9:17
    |
    |     alias v for Vehicel;
+   |                 ^^^^^^^
 
 warning: circular namespace import: `B` transitively imports this namespace back
   --> refs.sysml:10:31
    |
    |     package A { public import B::*; }
+   |                               ^
 
 warning: circular namespace import: `A` transitively imports this namespace back
   --> refs.sysml:11:31
    |
    |     package B { public import A::*; }
+   |                               ^
 
 5 warning(s)
 $ echo $?
@@ -201,11 +215,13 @@ warning: root package `Requirements` shadows the standard library package `Requi
   --> shadow.sysml:1:9
    |
    | package Requirements {
+   |         ^^^^^^^^^^^^
 
 warning: unresolved reference `Requirements::Speed`
   --> shadow.sysml:5:21
    |
    |     requirement s : Requirements::Speed;
+   |                     ^^^^^^^^^^^^^^^^^^^
 
 2 warning(s)
 ```
@@ -235,31 +251,37 @@ error: `Cyclic` cannot specialize itself
   --> sem.sysml:3:24
    |
    |     part def Cyclic :> Cyclic;
+   |                        ^^^^^^
 
 error: circular specialization: this definition transitively specializes itself
   --> sem.sysml:4:19
    |
    |     part def A :> B;
+   |                   ^
 
 error: circular specialization: this definition transitively specializes itself
   --> sem.sysml:5:19
    |
    |     part def B :> A;
+   |                   ^
 
 warning: duplicate specialization of `Wheel`
   --> sem.sysml:6:29
    |
    |     part def Cart :> Wheel, Wheel;
+   |                             ^^^^^
 
 error: multiplicity lower bound 5 exceeds upper bound 2
   --> sem.sysml:8:25
    |
    |     part wheels : Wheel [5..2];
+   |                         ^^^^^^
 
 error: multiplicity upper bound is negative
   --> sem.sysml:9:24
    |
    |     part spare : Wheel [spares];
+   |                        ^^^^^^^^
 
 1 warning(s)
 5 error(s)
@@ -354,6 +376,7 @@ warning: definition name `spare_wheel` should be PascalCase [naming-convention]
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
 1 warning(s)
 $ echo $?
@@ -368,21 +391,25 @@ warning: definition name `spare_wheel` should be PascalCase [naming-convention]
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
 warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
 warning: `Torque` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
   --> rig.sysml:5:14
    |
    |     calc def Torque {
+   |              ^^^^^^
 
 warning: input parameter `radius` of `Torque` is never used [unused-parameter]
   --> rig.sysml:7:12
    |
    |         in radius : Real;
+   |            ^^^^^^
 
 4 warning(s)
 ```
@@ -406,11 +433,13 @@ warning: `spare_wheel` is never referenced in these units (closed world: outside
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
 warning: input parameter `radius` of `Torque` is never used [unused-parameter]
   --> rig.sysml:7:12
    |
    |         in radius : Real;
+   |            ^^^^^^
 
 2 warning(s)
 ```
@@ -424,8 +453,15 @@ warning: `spare_wheel` is never referenced in these units (closed world: outside
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
-2 warning(s)
+warning: input parameter `radius` of `Torque` is never used [unused-parameter]
+  --> rig.sysml:7:12
+   |
+   |         in radius : Real;
+   |            ^^^^^^
+
+3 warning(s)
 ```
 
 Warnings exit 0; `error`-level findings exit 1, and `--strict` fails on any finding at all (infos and hints included):
@@ -436,11 +472,13 @@ warning: `spare_wheel` is never referenced in these units (closed world: outside
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
 warning: input parameter `radius` of `Torque` is never used [unused-parameter]
   --> rig.sysml:7:12
    |
    |         in radius : Real;
+   |            ^^^^^^
 
 2 warning(s)
 --strict: warnings are failures
@@ -458,11 +496,13 @@ warning: `spare_wheel` is never referenced in these units (closed world: outside
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
 warning: input parameter `radius` of `Torque` is never used [unused-parameter]
   --> rig.sysml:7:12
    |
    |         in radius : Real;
+   |            ^^^^^^
 
 1 deletion fix(es) available but not applied — deleting model text needs --fix --fix-deletes
 2 warning(s)
@@ -471,11 +511,13 @@ warning: `spare_wheel` is never referenced in these units (closed world: outside
   --> rig.sysml:3:14
    |
    |     part def spare_wheel;
+   |              ^^^^^^^^^^^
 
 warning: input parameter `radius` of `Torque` is never used [unused-parameter]
   --> rig.sysml:7:12
    |
    |         in radius : Real;
+   |            ^^^^^^
 
 fixed: rig.sysml
 2 warning(s)
@@ -574,6 +616,7 @@ rig.sysml:7:12 warn unused-parameter
 | `unused-parameter` | off | an input parameter of a calc / constraint / action definition never used in its body | deletes the parameter (`--fix-deletes`) |
 | `import-visibility` | info | an import without a visibility keyword — the syntax check reports the error, this finding carries the fix | declares the visibility its dependents need; the other keywords as alternatives |
 | `visibility-blocked-reference` | warn | an unresolved reference that names a member reachable only by ignoring visibility | widens the member to `public` (`--fix-semantic`) |
+| `redefinition-outside-inheritance` | warn | a bare redefinition resolving through an enclosing namespace instead of a member of its selected general; reports the actual target and, when unique, a possible nested part feature | — |
 | `usage-kind-mismatch` | info | a usage typed by a definition of another kind — the semantic check reports the error, this finding carries the fix | rewrites the usage keyword (`--fix-semantic`) |
 | `port-member-referential` | info | a composite non-port usage inside a port body | inserts `ref` |
 | `unqualified-enum-literal` | warn | an unresolved simple name matching exactly one enumeration literal | qualifies it |
@@ -587,6 +630,9 @@ rig.sysml:7:12 warn unused-parameter
 | `generated-element-modified` | warn | a generated member drifting from its provenance baseline (format-only drift, baseline drift, or a semantic edit) | — |
 
 `--lib` supplies resolution context only (`dimensional-consistency` stays silent without the standard library's quantity types); library elements are never linted.
+
+`redefinition-outside-inheritance` is an authoring heuristic for owners with complete recorded explicit general contexts. It preserves intentionally imported or aliased members of the general, and skips qualified, unresolved and identity-spelled references. For example, `attribute :>> mass` can resolve to an imported quantity feature when the inherited vehicle has only `chassis.mass`. The warning names the target; it does not change the reference or insert `default`. To allow replacement of an inherited binding, `default` belongs on the earlier declaration that supplies that binding, not on the attempted override.
+
 
 ---
 
@@ -707,16 +753,14 @@ Native directory loading saves a build- and content-identified `.prepared` snaps
 
 ### Ambient libraries
 
-Whenever a library loads, the toolkit's generated libraries load with it: `Web` (`Web::DOM`, `Web::HTML`, `Web::HTML::Elements` — the Web platform from the standards' WebIDL), `Template` and `Svelte` (the template metamodel and its engine overlay), `WebApp` and `SvelteKit` (the application and route/SSR layers) and `TransformMeta`. A model can reference them without naming their files:
+Whenever a library loads, the toolkit's ambient library loads with it: `TransformMeta`, the metadata vocabulary that generated elements and their provenance records are annotated with. A model can reference it without naming its file:
 
 ```console
-$ printf 'package V { private import Web::HTML::Elements::*; part shell : Div { :>> id = "app"; } }\n' > v.sysml
+$ printf 'package V {\n    #TransformMeta::Generated part def Beam;\n}\n' > v.sysml
 $ $sysmlv2 check --strict --lib "$lib" v.sysml
-$ $sysmlv2 query --lib "$lib" v.sysml 'V::shell.localName'
-"div"
 ```
 
-Their sources are `local-packages/*.sysml` in the repository; see `local-packages/README.md` for their contents, provenance, and local validation commands.
+Its source is `local-packages/TransformMeta.sysml` in the repository; see `local-packages/README.md`. `SYSMLV2_AMBIENT=off` leaves it out.
 
 ---
 
@@ -987,19 +1031,6 @@ $ $sysmlv2 query "$vehicle" "size(ownedFeature($vb))"
 40
 ```
 
-## 11a. `render` — evaluate a view's component template
-
-A component template represented as a `rendering def` plus a `view def` can be evaluated over a model. A `view` usage of that definition exposes a model slice, and `render` evaluates the template over it — each blocks iterate the exposed elements, expression tags evaluate their translated KerML — printing the rendered node tree as JSON, or HTML with `--html`. The model is not modified.
-
-```console
-$ $sysmlv2 render --lib "$lib" --html PackagesView.sysml fleet.sysml Site::packagesView
-<h3 id="packages-heading">Vehicles</h3><filterable-list>…</filterable-list>
-```
-
-Expressions the importer could not translate render as their opaque source (`{expr}`) or as an `<!-- error: … -->` marker, so a view always renders.
-
----
-
 ## 12. `verify` — constraint verdicts, witnesses, proofs
 
 `verify` evaluates every constraint, requirement, and invariant body that carries its own result expression to a verdict — satisfied, VIOLATED (exit 1), or undecided with the reason:
@@ -1086,7 +1117,7 @@ The wagon's 950 kg is inside the 1000 kg laden cap (satisfied) but over the 900 
 
 ### `--ranges` — interval propagation (no solver)
 
-With `--ranges`, every unbound feature gets an interval domain that the asserted constraints contract by bidirectional propagation. There is no external solver — it is ~300 lines of interval arithmetic in `sysmlv2-solve`. The result is a **finite range per feature** plus verdict upgrades that are definitive (a range holds for *every* consistent assignment): a body that is true over the whole narrowed domain is satisfied, one that is false everywhere is VIOLATED, and a domain that contracts to empty (`∅`) proves the constraint unsatisfiable.
+With `--ranges`, every unbound feature gets an interval domain that the asserted constraints contract by bidirectional propagation. There is no external solver — it is ~300 lines of interval arithmetic in `sysmlv2-solve`. The result is a **finite range per feature** plus verdict upgrades that are definitive (a range holds for *every* consistent assignment): a body that is true over the whole narrowed domain is satisfied, one that is false everywhere is VIOLATED, and a domain that contracts to empty (`∅`) proves the constraint unsatisfiable. If a feature definition is outside the supported fragment, narrowed ranges remain useful, but a positive propagation verdict must also hold over the original declaration domains. Otherwise propagation reports the approximation and leaves verification to the solver.
 
 ```sysml
 package Demo {
@@ -1138,7 +1169,7 @@ tank.sysml:7:30  fits (AssertConstraintUsage): undecided (result is indeterminat
 0 satisfied, 0 violated, 1 undecided
 ```
 
-What stays undecided is honestly undecided — a contingent constraint reports a witness instead of a guess, constructs outside the decidable fragment (sequences, strings, quantity brackets…) say so, and a feature whose definition can't be encoded is over-approximated in a way that keeps `VIOLATED`/`satisfied` upgrades definitive. Across the corpus, 43 of the 80 evaluator-undecided constraints get witnesses this way, and none are unsatisfiable (`crates/sysmlv2-solve/tests/corpus.rs` gates exactly that). The solving layer lives in the dependency-free `sysmlv2-solve` crate — Z3 runs as a subprocess, nothing links libz3.
+What stays undecided is honestly undecided — a contingent constraint reports a witness instead of a guess, constructs outside the decidable fragment (sequences, strings, quantity brackets…) say so, and a feature whose definition can't be encoded is treated as free. Refutations remain definitive; propagation withholds satisfaction that depends on narrowing through such an approximation, and Z3 reports an approximate witness as unknown. Across the corpus, 43 of the 80 evaluator-undecided constraints get witnesses this way, and none are unsatisfiable (`crates/sysmlv2-solve/tests/corpus.rs` gates exactly that). The solving layer lives in the dependency-free `sysmlv2-solve` crate — Z3 runs as a subprocess, nothing links libz3.
 
 ## 13. `viz` — PlantUML diagrams
 
@@ -1253,7 +1284,7 @@ Every non-library corpus file emits a balanced diagram for every view (`sysmlv2-
 
 ### View-directed diagrams
 
-A *view usage* carries its own diagram definition: `expose` picks the elements (with the model's `filter` conditions applied through the same machinery that governs import visibility), and `render` picks the style. Pointing `--element` at a view renders exactly that slice — `--view` is only needed to override the view's own choice:
+A *view usage* carries its own diagram definition: `expose` picks the elements (with the model's `filter` conditions applied through the same machinery that governs import visibility), and `render` picks the style. A view without a `render` member of its own takes the rendering it inherits, so `view wiring : Wiring;` over `view def Wiring { render Views::asInterconnectionDiagram; }` draws an interconnection diagram, and its own `render` member would win over the inherited one. Pointing `--element` at a view renders exactly that slice — `--view` is only needed to override the view's own choice:
 
 ```sysml
 package Stage {
@@ -1465,7 +1496,7 @@ $ $sysmlv2 payload --tables -o s2c-tables.json
 $ jq '{magic, versions, flags}' s2c-tables.json
 {
   "magic": "d9d9f7da24533243",
-  "versions": { "layout": 1, "scheme": 1, "tables": 1 },
+  "versions": { "layout": 1, "scheme": 2, "tables": 1 },
   "flags": { "delta": 4, "deltaPortable": 8, "elideIds": 1, "explicitIds": 64, "fullForm": 2, "impliedOwners": 32, "unitPaths": 16 }
 }
 $ jq '.metaclasses[] | select(.name == "AcceptActionUsage") | .fields[15]' s2c-tables.json

@@ -194,6 +194,32 @@ pub fn resolved_to_full_json(
     policy: EmissionPolicy,
 ) -> Result<Value, EmissionError> {
     let compact = model_to_compact_json(model);
+    resolved_compact_to_full_json_impl(resolved, model, compact, policy, false)
+}
+
+/// Full-form emission from a compact array and a matching resolved projection.
+/// Payload loaders restore identities and bind references before deriving full
+/// properties; a post-emission JSON overlay cannot restore missing semantics.
+/// `compact` and `resolved` must represent the same graph and element identities.
+/// The model supplies the canonical library element-name table only. Identity
+/// references must already be encoded as `@id`; every remaining `@ref`, including
+/// a UUID-shaped lexical name, follows the chosen unresolved-reference policy.
+pub fn resolved_compact_to_full_json(
+    resolved: &mut crate::json::ResolvedModel,
+    model: &Model,
+    compact: Value,
+    policy: EmissionPolicy,
+) -> Result<Value, EmissionError> {
+    resolved_compact_to_full_json_impl(resolved, model, compact, policy, true)
+}
+
+fn resolved_compact_to_full_json_impl(
+    resolved: &mut crate::json::ResolvedModel,
+    model: &Model,
+    compact: Value,
+    policy: EmissionPolicy,
+    lexical_uuid_names: bool,
+) -> Result<Value, EmissionError> {
     // Elements only: membership ids share their member's qualified name and
     // must not win the name→id inversion (implied bases target elements).
     let lib_names = crate::json::library_element_name_map(model);
@@ -204,13 +230,14 @@ pub fn resolved_to_full_json(
     let previous = resolved.closure_policy();
     resolved.set_closure_policy(policy.closures);
     let mut truncated: Vec<String> = Vec::new();
-    let result = full_from_compact_policy(
+    let result = full_from_compact_policy_with_reference_mode(
         compact,
         &by_name,
         policy.unresolved,
         Some(resolved),
         policy.closures,
         &mut truncated,
+        lexical_uuid_names,
     );
     resolved.set_closure_policy(previous);
     let value = result?;
@@ -304,7 +331,7 @@ pub fn from_compact_value_with_policy(
 ) -> Result<Value, UnresolvedReferenceError> {
     if policy == UnresolvedReferencePolicy::Reject {
         let mut references = Vec::new();
-        unresolved_ref_spellings(&compact, &mut references);
+        unresolved_ref_spellings(&compact, &mut references, false);
         references.sort();
         references.dedup();
         if !references.is_empty() {
@@ -438,23 +465,23 @@ fn is_import(t: &str) -> bool {
     )
 }
 
-fn unresolved_ref_spellings(value: &Value, out: &mut Vec<String>) {
+fn unresolved_ref_spellings(value: &Value, out: &mut Vec<String>, lexical_uuid_names: bool) {
     match value {
         Value::Object(object) => {
             if let Some(spelling) = object.get("@ref").and_then(Value::as_str) {
-                // An id-shaped spelling is a reference by id (kept as such
-                // on the wire), not an unresolved name.
-                if Uuid::parse_str(spelling.trim_matches('\'')).is_err() {
+                // Legacy mode keeps ID-shaped spellings as identities; the
+                // bound-compact mode treats every remaining @ref as lexical.
+                if lexical_uuid_names || Uuid::parse_str(spelling.trim_matches('\'')).is_err() {
                     out.push(spelling.to_string());
                 }
             }
             for value in object.values() {
-                unresolved_ref_spellings(value, out);
+                unresolved_ref_spellings(value, out, lexical_uuid_names);
             }
         }
         Value::Array(values) => {
             for value in values {
-                unresolved_ref_spellings(value, out);
+                unresolved_ref_spellings(value, out, lexical_uuid_names);
             }
         }
         _ => {}
@@ -469,33 +496,88 @@ fn full_from_compact_policy(
     closures: ClosurePolicy,
     truncated: &mut Vec<String>,
 ) -> Result<Value, UnresolvedReferenceError> {
+    full_from_compact_policy_with_reference_mode(
+        compact,
+        lib_by_name,
+        policy,
+        projection,
+        closures,
+        truncated,
+        false,
+    )
+}
+
+fn full_from_compact_policy_with_reference_mode(
+    compact: Value,
+    lib_by_name: &HashMap<String, String>,
+    policy: UnresolvedReferencePolicy,
+    projection: Option<&mut crate::json::ResolvedModel>,
+    closures: ClosurePolicy,
+    truncated: &mut Vec<String>,
+    lexical_uuid_names: bool,
+) -> Result<Value, UnresolvedReferenceError> {
     if policy == UnresolvedReferencePolicy::Reject {
         let mut references = Vec::new();
-        unresolved_ref_spellings(&compact, &mut references);
+        unresolved_ref_spellings(&compact, &mut references, lexical_uuid_names);
         references.sort();
         references.dedup();
         if !references.is_empty() {
             return Err(UnresolvedReferenceError { references });
         }
     }
-    Ok(full_from_compact_with(
-        compact,
-        lib_by_name,
-        policy == UnresolvedReferencePolicy::Preserve,
-        projection,
-        closures,
-        truncated,
-    ))
+    if lexical_uuid_names {
+        Ok(full_from_compact_with_reference_mode(
+            compact,
+            lib_by_name,
+            policy == UnresolvedReferencePolicy::Preserve,
+            projection,
+            closures,
+            truncated,
+            true,
+        ))
+    } else {
+        Ok(full_from_compact_with(
+            compact,
+            lib_by_name,
+            policy == UnresolvedReferencePolicy::Preserve,
+            projection,
+            closures,
+            truncated,
+        ))
+    }
 }
 
 pub(crate) fn full_from_compact_with(
     compact: Value,
     lib_by_name: &HashMap<String, String>,
     recover_refs: bool,
-    mut projection: Option<&mut crate::json::ResolvedModel>,
+    projection: Option<&mut crate::json::ResolvedModel>,
     closures: ClosurePolicy,
     truncated: &mut Vec<String>,
 ) -> Value {
+    full_from_compact_with_reference_mode(
+        compact,
+        lib_by_name,
+        recover_refs,
+        projection,
+        closures,
+        truncated,
+        false,
+    )
+}
+
+fn full_from_compact_with_reference_mode(
+    compact: Value,
+    lib_by_name: &HashMap<String, String>,
+    recover_refs: bool,
+    mut projection: Option<&mut crate::json::ResolvedModel>,
+    closures: ClosurePolicy,
+    truncated: &mut Vec<String>,
+    lexical_uuid_names: bool,
+) -> Value {
+    let canonical = projection
+        .as_ref()
+        .is_some_and(|resolved| resolved.b.graph_format == crate::model::GraphFormat::CanonicalV3);
     let Value::Array(items) = compact else {
         return compact;
     };
@@ -508,28 +590,31 @@ pub(crate) fn full_from_compact_with(
         .collect();
 
     if recover_refs {
-        inject_unresolved_reps(&mut elements);
+        inject_unresolved_reps(&mut elements, lexical_uuid_names);
     }
 
     // Replace `{"@ref": name}` placeholders with deterministic dangling IDs
     // (`additionalProperties: false` forbids @ref in the published schema).
     for el in &mut elements {
         for v in el.values_mut() {
-            patch_refs(v);
+            patch_refs(v, lexical_uuid_names);
         }
     }
 
     // ---- implied relationships ----
     // The layer synthesizes them (`json/implied.rs`) when the library
-    // bases are known (a loaded library or a name table — the layer
-    // synthesizes none otherwise, so `isImpliedIncluded` stays false
-    // exactly where no implied relationship is listed); the full form
+    // bases are known, and derives positional redefinitions from local
+    // specializations even without a library. The full form
     // lists them under their owner's `ownedRelationship` and as elements
     // of the array. Without a model to project from, none can be offered.
     if let Some(resolved) = projection.as_deref_mut() {
         add_implied_relationships(&mut elements, resolved);
     }
-    let implied_included = projection.is_some() && !lib_by_name.is_empty();
+    let implied_included = projection.is_some()
+        && (!lib_by_name.is_empty()
+            || elements
+                .iter()
+                .any(|e| e.get("isImplied").and_then(Value::as_bool) == Some(true)));
 
     // ---- graph indexes ----
     let index: HashMap<String, usize> = elements
@@ -582,6 +667,55 @@ pub(crate) fn full_from_compact_with(
                 .unwrap_or_default()
         })
         .collect();
+
+    if canonical {
+        // Constructor structural carriers have no independent flag syntax.
+        // Emit their actual owned defaults, not nullable schema placeholders,
+        // so a full document preserves the same contract as compact source.
+        // Stop at the argument expressions: their semantics are independent.
+        let mut pending: Vec<_> = elements
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| ty(row) == "ConstructorExpression")
+            .flat_map(|(i, _)| owned_rels[i].iter().copied())
+            .collect();
+        let mut seen = vec![false; elements.len()];
+        while let Some(i) = pending.pop() {
+            if seen[i]
+                || !matches!(
+                    ty(&elements[i]),
+                    "Membership"
+                        | "OwningMembership"
+                        | "ReturnParameterMembership"
+                        | "ParameterMembership"
+                        | "Feature"
+                        | "FeatureChaining"
+                        | "FeatureValue"
+                        | "Redefinition"
+                )
+            {
+                continue;
+            }
+            seen[i] = true;
+            if let Some(properties) = metaclass_props(ty(&elements[i])) {
+                for &(name, _) in properties {
+                    if elements[i].contains_key(name) {
+                        continue;
+                    }
+                    let default = crate::semantic_catalog::property(ty(&elements[i]), name)
+                        .and_then(|(_, effective)| effective)
+                        .filter(|spec| !spec.derived)
+                        .and_then(|spec| spec.default_json)
+                        .and_then(|value| serde_json::from_str(value).ok());
+                    if let Some(default) = default {
+                        elements[i].insert(name.into(), default);
+                    }
+                }
+            }
+            pending.extend(owned_rels[i].iter().copied());
+            pending.extend(related_elems[i].iter().copied());
+        }
+    }
 
     // Effective names (pilot `Feature::namingFeature`): an unnamed
     // feature is named by the first feature it explicitly redefines or
@@ -701,6 +835,21 @@ pub(crate) fn full_from_compact_with(
                         derived.insert((*name).to_string(), derived_to_json(resolved, &v));
                     }
                 }
+                // Connector ends redefine owned Relationship properties, so
+                // the computed-name loop does not project these generic aliases.
+                // Use the same endpoint view as typed and generic navigation.
+                if conforms(&t, "Connector") {
+                    let (source, target) = resolved.relationship_ends(e);
+                    for (name, values) in [("source", source), ("target", target)] {
+                        derived.insert(
+                            name.into(),
+                            derived_to_json(
+                                resolved,
+                                &crate::json::DerivedValue::References(values),
+                            ),
+                        );
+                    }
+                }
                 // Relationships this pass added to the array and the model
                 // does not hold — the unresolved-reference recovery
                 // annotations' memberships — still belong to their owner's
@@ -812,9 +961,27 @@ pub(crate) fn full_from_compact_with(
                     derived.insert("owningType".into(), oref);
                 }
             }
-            // End features are constant (KerML 2025 metamodel); the pilot's
-            // FlowEnds are not.
-            if is_end && t != "FlowEnd" {
+            if is_end && t == "Feature" {
+                // End membership alone does not imply constancy. Feature's
+                // owned default applies when absent; retained values (even
+                // invalid ones) remain evidence for validation.
+                let default = crate::semantic_catalog::property(&t, "isConstant")
+                    .and_then(|(_, effective)| effective)
+                    .filter(|spec| {
+                        !spec.derived
+                            && !spec
+                                .storage_names
+                                .iter()
+                                .any(|name| elements[i].contains_key(*name))
+                    })
+                    .and_then(|spec| spec.default_json)
+                    .and_then(|value| serde_json::from_str(value).ok());
+                if let Some(default) = default {
+                    derived.insert("isConstant".into(), default);
+                }
+            } else if is_end && t != "FlowEnd" && !(canonical && conforms(&t, "Usage")) {
+                // Preserve the existing subtype projection. Usage's
+                // conditional end rules are handled separately below.
                 derived.insert("isConstant".into(), Value::Bool(true));
             }
         }
@@ -892,17 +1059,41 @@ pub(crate) fn full_from_compact_with(
                 );
             }
         }
-        // End *usages* are constant, variable, and time-varying regardless
-        // of how they are owned (interface-body ends ride a plain
-        // FeatureMembership) — but the pilot's FlowEnds are none of these.
-        // Overrides: the compact form spells the textual defaults.
-        if elements[i].get("isEnd").and_then(|v| v.as_bool()) == Some(true)
+        // LegacyV2 preserves its historical blanket completion of Usage end
+        // flags. CanonicalV3 below requires current checked variability.
+        if !canonical
+            && elements[i].get("isEnd").and_then(|v| v.as_bool()) == Some(true)
             && t != "FlowEnd"
             && t.ends_with("Usage")
         {
             overrides.insert("isConstant".into(), Value::Bool(true));
             overrides.insert("isVariable".into(), Value::Bool(true));
             overrides.insert("mayTimeVary".into(), Value::Bool(true));
+        }
+        if canonical
+            && conforms(&t, "Usage")
+            && elements[i].get("isEnd").and_then(Value::as_bool) == Some(true)
+        {
+            // The compatibility emitter shares the checked provider; it must
+            // not replace an unavailable proof with a blanket end heuristic.
+            derived.remove("isVariable");
+            derived.remove("mayTimeVary");
+            if let Some(resolved) = projection.as_deref_mut() {
+                if let Some(e) = resolved
+                    .element_by_id(&this_id)
+                    .filter(|&e| resolved.element_type(e) == t)
+                {
+                    if let Ok(variable) = resolved.usage_variability_report(e).value {
+                        overrides.insert("isVariable".into(), Value::Bool(variable));
+                        overrides.insert("mayTimeVary".into(), Value::Bool(variable));
+                    }
+                    if let Some(report) = resolved.canonical_end_constant_with_budget(e, 0) {
+                        if let Ok(constant) = report.value {
+                            overrides.insert("isConstant".into(), Value::Bool(constant));
+                        }
+                    }
+                }
+            }
         }
         // A state's *inline* entry/do/exit action is composite at the
         // model level; perform-references (`do performedAction;`) stay
@@ -1915,7 +2106,18 @@ pub(crate) fn full_from_compact_with(
                 if el.get(*name).map(|v| !v.is_null()).unwrap_or(false) {
                     continue;
                 }
-                let default = match shape {
+                // Interchange nullability is not the semantic default. Owned
+                // scalar defaults come from the effective XMI declaration;
+                // keep explicitly retained values and derived computations.
+                let owned_default = crate::semantic_catalog::property(&t, name)
+                    .and_then(|(_, effective)| effective)
+                    .filter(|spec| {
+                        !spec.derived
+                            && !spec.storage_names.iter().any(|name| el.contains_key(*name))
+                    })
+                    .and_then(|spec| spec.default_json)
+                    .and_then(|value| serde_json::from_str(value).ok());
+                let default = owned_default.unwrap_or_else(|| match shape {
                     b'A' => Value::Array(Vec::new()),
                     b'B' => Value::Bool(false),
                     // Required references: membership redefinitions alias
@@ -1929,7 +2131,7 @@ pub(crate) fn full_from_compact_with(
                         }
                     }
                     _ => Value::Null,
-                };
+                });
                 el.insert((*name).to_string(), default);
             }
             // Drop compact-form properties the metaclass doesn't declare
@@ -1962,26 +2164,29 @@ pub(crate) fn full_from_compact_with(
 /// (root, name). Injected in compact shape so the ordinary full-form
 /// derivation completes ownership lists, defaults, and derived properties
 /// exactly as for hand-written `rep` members.
-fn inject_unresolved_reps(elements: &mut Vec<Map<String, Value>>) {
+fn inject_unresolved_reps(elements: &mut Vec<Map<String, Value>>, lexical_uuid_names: bool) {
     let by_id: HashMap<String, usize> = elements
         .iter()
         .enumerate()
         .map(|(i, e)| (eid(e).to_string(), i))
         .collect();
-    fn collect_refs(v: &Value, out: &mut Vec<String>) {
+    fn collect_refs(v: &Value, out: &mut Vec<String>, lexical_uuid_names: bool) {
         match v {
             Value::Object(m) => {
                 if let Some(Value::String(s)) = m.get("@ref") {
-                    // Id-shaped spellings are ids, not names to recover.
-                    if Uuid::parse_str(s.trim_matches('\'')).is_ok() {
+                    // Legacy mode interprets ID-shaped spellings as identities.
+                    if !lexical_uuid_names && Uuid::parse_str(s.trim_matches('\'')).is_ok() {
                         return;
                     }
                     out.push(s.clone());
                     return;
                 }
-                m.values().for_each(|x| collect_refs(x, out));
+                m.values()
+                    .for_each(|x| collect_refs(x, out, lexical_uuid_names));
             }
-            Value::Array(a) => a.iter().for_each(|x| collect_refs(x, out)),
+            Value::Array(a) => a
+                .iter()
+                .for_each(|x| collect_refs(x, out, lexical_uuid_names)),
             _ => {}
         }
     }
@@ -2015,7 +2220,8 @@ fn inject_unresolved_reps(elements: &mut Vec<Map<String, Value>>) {
     let mut sites: Vec<(usize, String)> = Vec::new();
     for (i, el) in elements.iter().enumerate() {
         let mut refs = Vec::new();
-        el.values().for_each(|v| collect_refs(v, &mut refs));
+        el.values()
+            .for_each(|v| collect_refs(v, &mut refs, lexical_uuid_names));
         if !refs.is_empty() {
             let root = root_of(i);
             sites.extend(refs.into_iter().map(|s| (root, s)));
@@ -2063,30 +2269,30 @@ fn inject_unresolved_reps(elements: &mut Vec<Map<String, Value>>) {
     }
 }
 
-fn patch_refs(v: &mut Value) {
+fn patch_refs(v: &mut Value, lexical_uuid_names: bool) {
     match v {
         Value::Object(m) => {
             if let Some(Value::String(s)) = m.get("@ref") {
-                // An id-shaped spelling is a reference by id (the lift
-                // spells a target it cannot name — an unnamed element, or
+                // In legacy mode an id-shaped spelling is a reference by id
+                // (the lift spells a target it cannot name — an unnamed element, or
                 // a library element with no library loaded — as its quoted
                 // id): keep the id. Anything else gets a deterministic
                 // dangling id.
                 let id = match Uuid::parse_str(s.trim_matches('\'')) {
-                    Ok(id) => id.to_string(),
-                    Err(_) => dangling_id(s),
+                    Ok(id) if !lexical_uuid_names => id.to_string(),
+                    _ => dangling_id(s),
                 };
                 m.clear();
                 m.insert("@id".into(), Value::String(id));
                 return;
             }
             for x in m.values_mut() {
-                patch_refs(x);
+                patch_refs(x, lexical_uuid_names);
             }
         }
         Value::Array(a) => {
             for x in a {
-                patch_refs(x);
+                patch_refs(x, lexical_uuid_names);
             }
         }
         _ => {}
@@ -2096,17 +2302,10 @@ fn patch_refs(v: &mut Value) {
 /// Effective name of an element (pilot `Element::effectiveName`): the
 /// declared name, else the name of the first feature this one explicitly
 /// redefines (`Feature::namingFeature`) or references (SysML reference
-/// forms), else — for chain features — the last chaining target's name.
+/// forms). Anonymous feature chains do not confer names.
 ///
-/// One naming rule, four representations. The implementations are this
-/// one (over the full form's element maps, the only one that also
-/// derives the positional implied names),
-/// `json::Builder::graph_effective_name` (over the lowered element
-/// graph, where `Builder::effective_name` is the declaration-only half),
-/// `lift::Lifter::effective_name` (over payload JSON), and the fixpoint
-/// inside `ids::walk` (over a compact payload, for id segments). They
-/// agree by construction and by the differential test in the round-trip
-/// gate; a change to one belongs in all of them.
+/// Semantic naming fallback for records outside the shared projection.
+/// The versioned ID label in `ids` is intentionally a separate contract.
 fn effective_name_of(
     i: usize,
     elements: &[Map<String, Value>],
@@ -2121,38 +2320,52 @@ fn effective_name_of(
     if let Some(n) = elements[i].get("declaredName").and_then(|v| v.as_str()) {
         return Some(n.to_string());
     }
+    if elements[i]
+        .get("declaredShortName")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return None;
+    }
     let resolve = |tid: String| -> Option<String> {
         if let Some(&k) = index.get(&tid) {
             return effective_name_of(k, elements, owned_rels, index, lib_id_names, depth + 1);
         }
         lib_id_names.get(tid.as_str()).map(|n| n.to_string())
     };
-    // Naming precedence mirrors the pilot: explicitly redefined feature,
-    // then the computed (implied positional) redefinition, then the
-    // referenced feature, then a chain's last link.
+    // Specialized SysML reference naming takes precedence. Otherwise use
+    // the first explicit redefinition, the implied positional redefinition,
+    // then the feature selected by a specialized reference naming rule.
+    let owning_ty = elements[i]
+        .get("owningRelationship")
+        .and_then(ref_of)
+        .and_then(|id| index.get(&id).copied())
+        .map(|r| ty(&elements[r]));
+    let named_reference = crate::json::naming::reference_names_feature(ty(&elements[i]), owning_ty)
+        .then(|| {
+            owned_rels[i]
+                .iter()
+                .copied()
+                .find(|&r| ty(&elements[r]) == "ReferenceSubsetting")
+        })
+        .flatten();
     let mut reference: Option<String> = None;
-    let mut last_chain: Option<String> = None;
     for &r in &owned_rels[i] {
+        if named_reference.is_some() && Some(r) != named_reference {
+            continue;
+        }
         if elements[r].get("isImplied").and_then(|v| v.as_bool()) == Some(true) {
             continue;
         }
         match ty(&elements[r]) {
             "Redefinition" => {
-                if let Some(n) = elements[r]
+                return elements[r]
                     .get("redefinedFeature")
                     .and_then(ref_of)
-                    .and_then(&resolve)
-                {
-                    return Some(n);
-                }
+                    .and_then(&resolve);
             }
-            "ReferenceSubsetting" => {
-                if reference.is_none() {
-                    reference = elements[r].get("referencedFeature").and_then(ref_of);
-                }
-            }
-            "FeatureChaining" => {
-                last_chain = elements[r].get("chainingFeature").and_then(ref_of);
+            "ReferenceSubsetting" if named_reference == Some(r) && reference.is_none() => {
+                reference = elements[r].get("referencedFeature").and_then(ref_of);
             }
             _ => {}
         }
@@ -2163,18 +2376,22 @@ fn effective_name_of(
     // Actor/stakeholder parameters implicitly *subset* the library
     // `actors`/`stakeholders` collections — subsetting carries no name, so
     // a reference-spelled `actor ::> x;` stays anonymous (pilot naming).
-    let owning_ty = elements[i]
-        .get("owningRelationship")
-        .and_then(ref_of)
-        .and_then(|id| index.get(&id).copied())
-        .map(|r| ty(&elements[r]));
     if matches!(owning_ty, Some("ActorMembership" | "StakeholderMembership")) {
         return None;
     }
-    if let Some(n) = reference.and_then(&resolve) {
-        return Some(n);
+    let mut target = reference?;
+    if crate::json::naming::reference_names_feature_target(ty(&elements[i]), owning_ty) {
+        if let Some(&t) = index.get(&target) {
+            if let Some(last) = owned_rels[t].iter().rev().find_map(|&r| {
+                (ty(&elements[r]) == "FeatureChaining")
+                    .then(|| elements[r].get("chainingFeature").and_then(ref_of))
+                    .flatten()
+            }) {
+                target = last;
+            }
+        }
     }
-    last_chain.and_then(resolve)
+    resolve(target)
 }
 
 /// Positional names of implicitly-redefining members (the pilot's computed
@@ -2275,6 +2492,9 @@ fn invocation_arg_name(
     elements: &[Map<String, Value>],
     index: &HashMap<String, usize>,
 ) -> Option<String> {
+    // A written Redefinition makes a named argument; an implied one (the
+    // accept's payload and receiver redefining `AcceptAction`'s by position)
+    // is the positional pairing itself and names nothing here.
     let has_redefinition = elements[i]
         .get("ownedRelationship")
         .and_then(|v| v.as_array())
@@ -2282,7 +2502,10 @@ fn invocation_arg_name(
             a.iter()
                 .filter_map(ref_of)
                 .filter_map(|id| index.get(&id).copied())
-                .any(|r| ty(&elements[r]) == "Redefinition")
+                .any(|r| {
+                    ty(&elements[r]) == "Redefinition"
+                        && elements[r].get("isImplied").and_then(Value::as_bool) != Some(true)
+                })
         });
     if has_redefinition {
         return None;
@@ -2517,6 +2740,9 @@ fn fill_relationship_endpoints(
             }
             "TypeFeaturing" => {
                 let source = get("featureOfType").or_else(|| owner.clone());
+                if let Some(feature) = &source {
+                    derived.insert("featureOfType".into(), feature.clone());
+                }
                 let target = get("featuringType");
                 (source.into_iter().collect(), target.into_iter().collect())
             }
@@ -2557,41 +2783,37 @@ fn add_implied_relationships(
     elements: &mut Vec<Map<String, Value>>,
     resolved: &mut crate::json::ResolvedModel,
 ) {
-    let mut additions: Vec<(usize, Map<String, Value>)> = Vec::new();
-    for (i, el) in elements.iter().enumerate() {
-        let own_id = eid(el);
-        let t = ty(el);
-        // Same id *and* same metaclass, as the projection requires.
-        let Some(e) = resolved
-            .element_by_id(own_id)
-            .filter(|&e| resolved.element_type(e) == t)
+    let mut roots = Vec::new();
+    for (owner_index, element) in elements.iter_mut().enumerate() {
+        let Some(owner) = resolved
+            .element_by_id(eid(element))
+            .filter(|&e| resolved.element_type(e) == ty(element))
         else {
             continue;
         };
-        for r in resolved.implied_relationships(e) {
-            let rel_id = resolved.element_id(r).to_string();
-            let mut rel = Map::new();
-            rel.insert("@type".into(), json!(resolved.element_type(r)));
-            rel.insert("@id".into(), json!(rel_id));
-            rel.insert("elementId".into(), json!(rel_id));
-            rel.insert("isImpliedIncluded".into(), json!(true));
-            rel.insert("ownedRelationship".into(), json!([]));
-            rel.insert("ownedRelatedElement".into(), json!([]));
-            rel.insert("owningRelatedElement".into(), id_ref(own_id));
-            rel.insert("owningRelationship".into(), Value::Null);
-            rel.extend(resolved.element_properties(r));
-            rel.insert("aliasIds".into(), json!([]));
-            rel.insert("declaredName".into(), Value::Null);
-            rel.insert("declaredShortName".into(), Value::Null);
-            additions.push((i, rel));
+        for relationship in resolved.implied_relationships(owner) {
+            if let Some(Value::Array(owned)) = element.get_mut("ownedRelationship") {
+                owned.push(id_ref(&resolved.element_id(relationship).to_string()));
+            }
+            roots.push((owner_index, relationship));
         }
     }
-    for (owner_idx, rel) in additions {
-        let rel_ref = id_ref(eid(&rel));
-        if let Some(Value::Array(rels)) = elements[owner_idx].get_mut("ownedRelationship") {
-            rels.push(rel_ref);
+    // Emit each generated subtree together. Non-relationship Features keep
+    // ordinary child ownership; no synthetic isImplied Feature property exists.
+    let mut seen = std::collections::HashSet::new();
+    for (_, root) in roots {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            let Some(record) = resolved.generated_node_record(node) else {
+                continue;
+            };
+            let children = resolved.generated_node_children(node);
+            stack.extend(children.into_iter().rev());
+            elements.push(record);
         }
-        elements.push(rel);
     }
 }
 
@@ -2623,6 +2845,212 @@ mod tests {
                         .map(|i| p[i].0)),
                     Some(*name)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_completion_does_not_replace_retained_invalid_values() {
+        for retained in [Value::Null, json!("invalid"), json!(17)] {
+            let input = json!([{
+                "@id": "00000000-0000-0000-0000-000000000001",
+                "@type": "PartDefinition",
+                "isIndividual": retained,
+            }]);
+            let full = full_from_compact_with(
+                input,
+                &HashMap::new(),
+                false,
+                None,
+                ClosurePolicy::Passthrough,
+                &mut Vec::new(),
+            );
+            assert_eq!(full[0]["isIndividual"], retained);
+        }
+    }
+
+    fn connector_end_fixture() -> (Model, Value, Vec<String>) {
+        let mut model = Model::new();
+        assert!(
+            model
+                .add_source(
+                    "ends.kerml",
+                    "class A { end feature x; end feature y; connector c from x to y; }"
+                )
+                .diagnostics
+                .is_empty()
+        );
+        let compact = model_to_compact_json(&model);
+        let sparse_ends = compact
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row["@type"] == "Feature" && row["isEnd"] == true && row.get("isConstant").is_none()
+            })
+            .map(|row| row["@id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(sparse_ends.len(), 2);
+        (model, compact, sparse_ends)
+    }
+
+    #[test]
+    fn ordinary_connector_end_defaults_match_owned_property_without_changing_source() {
+        let (model, compact, sparse_ends) = connector_end_fixture();
+        let mut resolved = crate::json::ResolvedModel::build(&model);
+        let original_ids = compact
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["@id"].clone())
+            .collect::<Vec<_>>();
+        for closures in [
+            ClosurePolicy::Passthrough,
+            ClosurePolicy::Closure {
+                include_implied: false,
+            },
+            ClosurePolicy::Closure {
+                include_implied: true,
+            },
+        ] {
+            let full = resolved_to_full_json(
+                &mut resolved,
+                &model,
+                EmissionPolicy {
+                    unresolved: UnresolvedReferencePolicy::Reject,
+                    closures,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                full.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["@id"].clone())
+                    .collect::<Vec<_>>(),
+                original_ids
+            );
+            let ends = full
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["@type"] == "Feature" && row["isEnd"] == true)
+                .collect::<Vec<_>>();
+            assert_eq!(ends.len(), 4);
+            for row in ends {
+                assert_eq!(row["isConstant"], false);
+                let element = resolved
+                    .elements()
+                    .find(|&e| resolved.element_id(e).to_string() == row["@id"].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    row["isConstant"],
+                    resolved.property(element, "isConstant").unwrap()
+                );
+                if sparse_ends.iter().any(|id| row["@id"] == *id) {
+                    assert!(
+                        !resolved
+                            .element_properties(element)
+                            .contains_key("isConstant")
+                    );
+                }
+            }
+            assert_eq!(model_to_compact_json(&model), compact);
+        }
+    }
+
+    #[test]
+    fn exact_feature_end_default_preserves_retained_values_including_invalid_ones() {
+        let (_, compact, sparse_ends) = connector_end_fixture();
+        for (constant, variable) in [
+            (None, None),
+            (None, Some(json!(true))),
+            (Some(json!(true)), Some(json!(true))),
+            (Some(json!(true)), Some(json!(false))),
+            (Some(json!(false)), Some(json!(true))),
+            (Some(Value::Null), Some(json!(false))),
+            (Some(json!("invalid")), Some(json!(false))),
+            (Some(json!(17)), None),
+            (Some(json!([])), None),
+            (Some(json!({})), None),
+        ] {
+            let mut input = compact.clone();
+            let row = input
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row["@id"] == sparse_ends[0])
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            if let Some(value) = &constant {
+                row.insert("isConstant".into(), value.clone());
+            }
+            if let Some(value) = &variable {
+                row.insert("isVariable".into(), value.clone());
+            }
+            let before = input.clone();
+            let full = from_compact_value(input, &HashMap::new(), true);
+            let row = full
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["@id"] == sparse_ends[0])
+                .unwrap();
+            assert_eq!(row["isConstant"], constant.unwrap_or(json!(false)));
+            if let Some(variable) = variable {
+                assert_eq!(row["isVariable"], variable);
+            }
+            assert_eq!(
+                full.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["@id"].clone())
+                    .collect::<Vec<_>>(),
+                before
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["@id"].clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn end_subtypes_keep_computed_flags_and_use_owned_defaults() {
+        let (_, compact, sparse_ends) = connector_end_fixture();
+        for (metaclass, constant) in [
+            ("FlowEnd", json!(false)),
+            ("ReferenceUsage", json!(true)),
+            ("Step", json!(true)),
+        ] {
+            let mut input = compact.clone();
+            let row = input
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row["@id"] == sparse_ends[0])
+                .unwrap();
+            row["@type"] = json!(metaclass);
+            let full = full_from_compact_with(
+                input,
+                &HashMap::new(),
+                false,
+                None,
+                ClosurePolicy::Passthrough,
+                &mut Vec::new(),
+            );
+            let row = full
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["@id"] == sparse_ends[0])
+                .unwrap();
+            assert_eq!(row["isConstant"], constant, "{metaclass}");
+            if metaclass == "ReferenceUsage" {
+                assert_eq!(row["isVariable"], true);
+                assert_eq!(row["mayTimeVary"], true);
             }
         }
     }

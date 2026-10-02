@@ -302,7 +302,7 @@ fn hover_chain_member_uses_the_receiver_context() {
     let u = uri("chain.sysml");
     client.open(
         &u,
-        "package T {\n    part def Vehicle {\n        attribute baseMass = 1000;\n        attribute total = baseMass + 100;\n    }\n    part car : Vehicle { attribute :>> baseMass = 1200; }\n    part garage { part slot : Vehicle { attribute :>> baseMass = 2000; } }\n    attribute carTotal = car.total;\n    attribute deep = garage.slot.total;\n}\n",
+        "package T {\n    part def Vehicle {\n        attribute baseMass = 1000;\n        attribute total = baseMass + 100;\n    }\n    part car : Vehicle[1] { attribute :>> baseMass = 1200; }\n    part garage[1] { part slot : Vehicle { attribute :>> baseMass = 2000; } }\n    attribute carTotal = car.total;\n    attribute deep = garage.slot.total;\n}\n",
     );
     let hover_value = |client: &mut Client, line: u32, character: u32| {
         let hover: Option<Hover> = client.request_ok::<HoverRequest>(HoverParams {
@@ -365,6 +365,36 @@ fn hover_shows_calc_def_signature() {
         text.contains("```sysml-signature\nDouble(x)\n```"),
         "{text}"
     );
+    client.shutdown();
+}
+
+/// A callable's hover signature lists the parameters it inherits after
+/// its own: a definition specializing another, a usage typed by one.
+#[test]
+fn hover_signature_lists_inherited_parameters() {
+    let mut client = Client::start();
+    let u = uri("i.sysml");
+    client.open(
+        &u,
+        "package P {\n    attribute def Mass;\n    attribute def Speed;\n    attribute def Energy;\n    calc def KineticEnergy { in m : Mass; in v : Speed; return : Energy; }\n    calc def KE2 :> KineticEnergy;\n    calc ke2 : KE2;\n}\n",
+    );
+    for (line, character, sig) in [
+        (5, 13, "KE2(m: Mass, v: Speed) → Energy"),
+        (6, 9, "ke2(m: Mass, v: Speed) → Energy"),
+    ] {
+        let hover: Option<Hover> = client.request_ok::<HoverRequest>(HoverParams {
+            text_document_position_params: Client::pos_params(&u, line, character),
+            work_done_progress_params: Default::default(),
+        });
+        let lsp_types::HoverContents::Markup(m) = hover.expect("hover").contents else {
+            panic!("expected markup");
+        };
+        assert!(
+            m.value.contains(&format!("```sysml-signature\n{sig}\n```")),
+            "{}",
+            m.value
+        );
+    }
     client.shutdown();
 }
 

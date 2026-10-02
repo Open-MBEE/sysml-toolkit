@@ -20,7 +20,7 @@
 # only if a variant's delta ever grows past caring about. The test job
 # clippy-checks the slim variant so it cannot rot between releases.
 #
-# The wasm job gates the browser face: clippy for
+# The wasm job gates the browser face: clippy for the wasi CLI and for
 # wasm32-unknown-unknown, then the real pipeline — wasm-pack build, the
 # stdlib bundle + sealed-snapshot generation, and a node smoke test that
 # loads the built module and asserts snapshot replay is engaged. On tags
@@ -67,7 +67,8 @@ env:
 jobs:
   test:
     name: test (full corpus gates)
-    timeout-minutes: 45
+    # The full corpus plus lint/docs outgrew 45 minutes on a cold runner.
+    timeout-minutes: 90
     # Release PRs (release/* -> main, opened and admin-merged by
     # tools/release.sh in one step) run these gates like any other PR.
     # Skipping them costs less than it looks: the tag is pushed by the
@@ -98,6 +99,10 @@ jobs:
           rustup show active-toolchain
       - name: Formatting
         run: cargo fmt --all -- --check
+      - name: Generated semantic catalogs
+        run: |
+          python3 tools/semantic_catalog.py --check
+          python3 tools/operation_catalog.py --check
       - name: Run the full test suite
         run: cargo test --release
       - name: Clippy
@@ -108,17 +113,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps
-      - name: Generated libraries (strict check against the stdlib, canonical formatting)
-        # The committed files are checked as candidates: SYSMLV2_AMBIENT=off
-        # keeps the toolkit's built-in copies out so they cannot collide.
+      - name: Ambient library (strict candidate check; resolves without naming its file)
+        # SYSMLV2_AMBIENT=off keeps the built-in copy out of the candidate
+        # check so the two cannot collide.
         run: |
-          SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/Web.sysml local-packages/Template.sysml local-packages/Svelte.sysml local-packages/WebApp.sysml local-packages/SvelteKit.sysml
-          cargo run --release -p sysmlv2-cli -- fmt --check local-packages/Web.sysml local-packages/Template.sysml local-packages/Svelte.sysml local-packages/WebApp.sysml local-packages/SvelteKit.sysml
-      - name: Ambient libraries resolve without naming files
-        run: |
-          # Qualified element kinds: an `Elements::*` import would bring the
-          # `<template>` element kind into scope and shadow the `Template` package.
-          printf 'package V { part shell : Web::HTML::Elements::Div { :>> id = "app"; } part t : Template::Text; part k : Svelte::KeyBlock; part a : WebApp::Application; part r : SvelteKit::RouteSegment; }\n' > /tmp/ambient.sysml
+          SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/TransformMeta.sysml
+          printf 'package V {\n    #TransformMeta::Generated part def G;\n}\n' > /tmp/ambient.sysml
           cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library /tmp/ambient.sysml
 
   msrv:
@@ -166,14 +166,23 @@ jobs:
           rustup show active-toolchain
       - name: Clippy (wasm32)
         run: cargo clippy --release -p sysmlv2-wasm --target wasm32-unknown-unknown -- -D warnings
+      # The CLI's wasi branches compile for no other target, so the
+      # native clippy runs never see them. The features are the ones
+      # build.mjs ships the CLI with; change the two together.
+      - name: Clippy (wasi CLI — the features build.mjs ships)
+        run: cargo clippy --release -p sysmlv2-cli --no-default-features --features solve,viz --target wasm32-wasip1 -- -D warnings
       - name: Install wasm-pack
         # Pinned release binary. The rustwasm.github.io installer script
         # is stale (the project moved to drager/wasm-pack) and serves
-        # 0.13.1 forever; old release URLs redirect to the new repo.
+        # 0.13.1 forever; old release URLs redirect to the new repo. Its
+        # pin also pins the optimizer: the binaryen release it fetches to
+        # optimize the module is the wasm-opt build.mjs runs on the CLI.
         run: |
           v=0.15.0
-          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${v}/wasm-pack-v${v}-x86_64-unknown-linux-musl.tar.gz" | tar xz
-          mv "wasm-pack-v${v}-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/"
+          tool_dir=$(mktemp -d)
+          trap 'rm -rf "$tool_dir"' EXIT
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${v}/wasm-pack-v${v}-x86_64-unknown-linux-musl.tar.gz" | tar xz -C "$tool_dir"
+          mv "$tool_dir/wasm-pack-v${v}-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/"
           wasm-pack --version
       # The runtime the smokes run under is pinned, not inherited. The
       # image's own Node 22 on x86_64 faults inside its WASI host on this

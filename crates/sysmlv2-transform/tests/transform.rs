@@ -993,7 +993,7 @@ fn move_member_reorders_within_owner() {
     let front_at = t.find("part front : Wheel;").unwrap();
     assert!(spare_at < front_at, "order not swapped:\n{t}");
     // Named members chain past their membership's ordinal (IDS.md,
-    // id scheme 1), so reordering named siblings moves **no**
+    // id scheme 2), so reordering named siblings moves **no**
     // ids at all — selections in UIs survive the reorder unmapped.
     // (Positional members would still remap; `Vehicle`'s parts are
     // all named.)

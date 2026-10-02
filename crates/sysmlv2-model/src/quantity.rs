@@ -195,7 +195,18 @@ impl ResolvedModel {
         value
     }
     fn quantity_dims_of_type_uncached(&mut self, ty: ElementRef) -> Option<QuantityDims> {
-        let (mref, _) = self.member_of(ty, &simple_qn("mRef"))?;
+        let mref = match self.member_of(ty, &simple_qn("mRef")) {
+            Some((mref, _)) => mref,
+            // A feature of two quantity types at once — a parameter that
+            // redefines one feature by name and another by position —
+            // inherits two `mRef`s, and the lookup answers neither. The
+            // one its written heritage reaches is the quantity it spells.
+            None => [false, true].into_iter().find_map(|implied| {
+                self.effective_features(ty, implied)
+                    .into_iter()
+                    .find(|&f| self.b.id_name(f.0).as_deref() == Some("mRef"))
+            })?,
+        };
         self.typings(mref)
             .into_iter()
             .find_map(|def| self.unit_def_dims(def))
@@ -297,10 +308,16 @@ impl ResolvedModel {
     fn power_factor(&mut self, f: ElementRef) -> Option<(usize, i64)> {
         let (qm, _) = self.member_of(f, &simple_qn("quantity"))?;
         let (qscope, qexpr) = self.value_expr(qm)?;
-        let quantity = self.expr_element(qscope, &qexpr)?;
+        let origin = self.b.set_identity_origin(qm.0);
+        let quantity = self.expr_element(qscope, &qexpr);
+        self.b.identity_origin_unit = origin;
+        let quantity = quantity?;
         let (em, _) = self.member_of(f, &simple_qn("exponent"))?;
         let (escope, eexpr) = self.value_expr(em)?;
-        let exp = match self.evaluate_in(escope, &eexpr).ok()? {
+        let origin = self.b.set_identity_origin(em.0);
+        let value = self.evaluate_in(escope, &eexpr);
+        self.b.identity_origin_unit = origin;
+        let exp = match value.ok()? {
             Value::Integer(i) => i64::try_from(i).ok()?,
             // A literal `2.0` canonicalizes to the integer arm; the double
             // arm covers a computed approximate integer.
@@ -413,6 +430,7 @@ impl ResolvedModel {
     }
 
     fn ensure_quantity_index(&mut self) {
+        self.sync_semantic_publication();
         if self.quantity_index.is_none() {
             let index = self.build_quantity_index();
             self.quantity_index = Some(index);
@@ -629,6 +647,49 @@ impl ResolvedModel {
 #[cfg(test)]
 mod memo_tests {
     use super::*;
+    #[test]
+    fn factor_and_header_reads_restore_origin_before_error_returns() {
+        use std::collections::HashMap;
+        for value in ["2", "true", "missing"] {
+            let mut model = crate::model::Model::new();
+            model.add_library_source(
+                "lib.kerml",
+                "package Quantities { datatype QuantityPowerFactor; }",
+            );
+            model.add_source("user.kerml",&format!("package P {{ feature Actual={value}; feature '88888888-8888-4888-8888-888888888888'=1; feature L; datatype Unit {{ feature pf:Quantities::QuantityPowerFactor {{ feature quantity=L; feature exponent='88888888-8888-4888-8888-888888888888'; }} }} datatype Amount {{ feature mRef:Unit; }} feature sized['88888888-8888-4888-8888-888888888888']; }}"));
+            assert!(!model.has_errors());
+            let mut r = ResolvedModel::build(&model);
+            let actual = r.resolve_qualified("P::Actual").unwrap();
+            let ordinary = r
+                .resolve_qualified("P::'88888888-8888-4888-8888-888888888888'")
+                .unwrap();
+            let id = "88888888-8888-4888-8888-888888888888".parse().unwrap();
+            r.override_ids(&HashMap::from([(r.element_id(actual), id)]));
+            let mut hints: HashMap<_, _> = r
+                .references_to(ordinary)
+                .into_iter()
+                .map(|s| ((r.element_id(s.owner), "memberElement".into()), id))
+                .collect();
+            assert!(r.bind_id_spelled_references_with(&mut hints).contains(&id));
+            let amount = r.resolve_qualified("P::Amount").unwrap();
+            let sized = r.resolve_qualified("P::sized").unwrap();
+            for origin in [None, Some(0)] {
+                r.b.identity_origin_unit = origin;
+                let dims = r.quantity_dims_of_type(amount);
+                assert_eq!(
+                    dims.as_ref().map(|d| d.render(&r)),
+                    (value == "2").then(|| "L^2".to_owned())
+                );
+                assert_eq!(r.b.identity_origin_unit, origin);
+                assert_eq!(
+                    r.declared_multiplicity(sized),
+                    (value == "2").then_some((2.0, 2.0))
+                );
+                assert_eq!(r.b.identity_origin_unit, origin);
+            }
+        }
+    }
+
     #[test]
     fn dimensions_match_uncached_queries_and_replay_complete_import_evidence() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

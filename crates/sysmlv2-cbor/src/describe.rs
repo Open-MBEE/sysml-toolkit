@@ -41,7 +41,7 @@ fn uuid16(r: &mut Reader) -> Result<Uuid, Error> {
 ///   "form": "compact" | "full" | "delta",
 ///   "explicitIds": bool (compact: the ids are not all graph-derived),
 ///   "bytes": 1234,
-///   "versions": { "layout": 1, "tables": 1, "scheme": 1,
+///   "versions": { "layout": 1, "tables": 1, "scheme": 2,
 ///                 "supported": true },
 ///   // snapshots:
 ///   "elements": 91319, "externals": 2, "idsElided": false,
@@ -103,7 +103,9 @@ pub fn describe(bytes: &[u8]) -> Result<Value, Error> {
             | crate::FLAG_EXPLICIT_IDS,
     )?;
     let supported = tables == crate::tables::CBOR_TABLES_VERSION
-        && (!elided || scheme == crate::ID_SCHEME_VERSION);
+        && (!elided
+            || scheme == crate::ID_SCHEME_VERSION
+            || scheme == crate::CANONICAL_GRAPH_VERSION);
     let mut out = Map::new();
     out.insert(
         "form".into(),

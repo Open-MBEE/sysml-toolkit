@@ -190,7 +190,10 @@ pub(super) fn validate(
                 .and_then(|p| r.b.contract_exprs.get(p))
                 .cloned()
             {
-                if let Some(t) = expressions::referent(&mut r.b, scope, &expr) {
+                let origin = r.b.set_identity_origin(e);
+                let target = expressions::referent(&mut r.b, scope, &expr);
+                r.b.identity_origin_unit = origin;
+                if let Some(t) = target {
                     let rule = if !is(&r.b, t, "Feature") {
                         Some((
                             "validateAssignmentActionUsageReferent",
@@ -227,9 +230,10 @@ pub(super) fn validate(
                 .and_then(|p| r.b.contract_exprs.get(p))
                 .cloned()
             {
-                if expressions::referent(&mut r.b, scope, &expr)
-                    .is_some_and(|t| g.effective_kind(&r.b, t, "PortUsage"))
-                {
+                let origin = r.b.set_identity_origin(e);
+                let target = expressions::referent(&mut r.b, scope, &expr);
+                r.b.identity_origin_unit = origin;
+                if target.is_some_and(|t| g.effective_kind(&r.b, t, "PortUsage")) {
                     out.push((
                         unit,
                         super::rule_warning(
@@ -266,6 +270,7 @@ pub(super) fn validate(
                 ),
                 _ => continue,
             };
+            let origin = r.b.set_identity_origin(e);
             let mut bad = expressions::wrong_type(&mut r.b, g, scope, &expr, required);
             if kind == "after" {
                 if let Some(t) = expressions::library_type(&mut r.b, required) {
@@ -277,6 +282,7 @@ pub(super) fn validate(
                     }
                 }
             }
+            r.b.identity_origin_unit = origin;
             if bad {
                 out.push((
                     unit,
@@ -291,12 +297,14 @@ pub(super) fn validate(
     }
     for (e, (scope, expr)) in super::user_entries(&r.b, model, r.b.transition_guards.iter()) {
         let unit = r.b.unit_of_elem(e);
+        let origin = r.b.set_identity_origin(e);
         let mut bad = expressions::wrong_type(&mut r.b, g, scope, &expr, "ScalarValues::Boolean");
         if let Some(t) = expressions::referent(&mut r.b, scope, &expr) {
             bad |= r
                 .declared_multiplicity(ElementRef(t))
                 .is_some_and(|m| m != (1.0, 1.0));
         }
+        r.b.identity_origin_unit = origin;
         if bad {
             out.push((
                 unit,

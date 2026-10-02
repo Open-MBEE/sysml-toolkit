@@ -62,7 +62,10 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
             if model.is_library_unit(unit) {
                 continue;
             }
-            let Some(root) = r.b.resolve(scope, &links[0], 0) else {
+            let origin = r.b.set_identity_origin(owner);
+            let root = r.b.resolve(scope, &links[0], 0);
+            r.b.identity_origin_unit = origin;
+            let Some(root) = root else {
                 continue;
             };
             let Some(root_type) = owning_type(r, root) else {

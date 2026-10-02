@@ -89,7 +89,9 @@ pub fn from_compact_json(value: &Value) -> Result<Lifted, LiftError> {
 /// multi-document list, so cross-document references print as
 /// `$::`-rooted qualified names instead of unresolvable ids (the same
 /// mechanism [`crate::json::library_name_map`] provides for standard-
-/// library ids).
+/// library ids). These replay locators retain historical anonymous reference
+/// labels; they are not normative semantic names. For those, use
+/// [`crate::json::ResolvedModel::element_effective_name`].
 pub fn document_name_map(value: &Value) -> std::collections::HashMap<String, Vec<String>> {
     let mut out = std::collections::HashMap::new();
     let Some(elements) = value.as_array() else {
@@ -100,8 +102,8 @@ pub fn document_name_map(value: &Value) -> std::collections::HashMap<String, Vec
         .enumerate()
         .filter_map(|(i, e)| e.get("@id").and_then(|v| v.as_str()).map(|id| (id, i)))
         .collect();
-    // Anonymous features are findable by their *effective* name (KerML
-    // 8.2.3.5 — redefinition / reference-subsetting derived): a
+    // Anonymous features remain findable by their existing syntax locator
+    // (including historical reference-subsetting labels): a
     // whole-list Lifter supplies it exactly as an in-document lift
     // would, so a cross-document reference to an anonymous redefining
     // feature (a chain landing on `attribute :>> x = …;` in another
@@ -202,7 +204,8 @@ pub fn document_name_map(value: &Value) -> std::collections::HashMap<String, Vec
 /// imports reference memberships directly, and a cross-document one
 /// must still print its member's name. This map adds each membership
 /// id → its member's path (`memberElement` where the payload carries
-/// it, else the owned member itself). Use it as `extra_names` when
+/// it, else the owned member itself), or the declaring namespace's path
+/// plus the alias name for named non-owning Memberships. Use it as `extra_names` when
 /// lifting; keep [`document_name_map`] where entries must be
 /// *elements* (id-identity comparisons).
 pub fn document_reference_name_map(
@@ -212,6 +215,14 @@ pub fn document_reference_name_map(
     let Some(elements) = value.as_array() else {
         return out;
     };
+    let roots: HashSet<&str> = elements
+        .iter()
+        .filter(|e| {
+            e.get("@type").and_then(Value::as_str) == Some("Namespace")
+                && e.get("owningRelationship").is_none_or(Value::is_null)
+        })
+        .filter_map(|e| e.get("@id").and_then(Value::as_str))
+        .collect();
     for e in elements {
         let t = e.get("@type").and_then(|v| v.as_str()).unwrap_or("");
         let Some(id) = e.get("@id").and_then(|v| v.as_str()) else {
@@ -219,6 +230,25 @@ pub fn document_reference_name_map(
         };
         if !t.ends_with("Membership") || out.contains_key(id) {
             continue;
+        }
+        if t == "Membership" {
+            if let Some(name) = e
+                .get("memberName")
+                .and_then(Value::as_str)
+                .or_else(|| e.get("memberShortName").and_then(Value::as_str))
+            {
+                if let Some(owner) = e.get("owningRelatedElement").and_then(ref_id) {
+                    let path = out
+                        .get(owner)
+                        .cloned()
+                        .or_else(|| roots.contains(owner).then(Vec::new));
+                    if let Some(mut path) = path {
+                        path.push(name.to_owned());
+                        out.insert(id.to_owned(), path);
+                        continue;
+                    }
+                }
+            }
         }
         let member = e
             .get("memberElement")
@@ -385,6 +415,76 @@ pub fn from_compact_json_on_this_stack(
     lift_document(value, extra_names)
 }
 
+/// Collect omission roots while reading a row. Every row contributes seeds,
+/// even when duplicate IDs later replace it in the compatibility identity map.
+fn collect_omission_seeds<'a>(element: El<'a>, pending: &mut Vec<&'a str>) {
+    if element.get("isImplied").and_then(Value::as_bool) == Some(true) {
+        if let Some(id) = element.get("@id").and_then(Value::as_str) {
+            pending.push(id);
+        }
+    }
+    if element.get("language").and_then(Value::as_str) == Some(crate::full::UNRESOLVED_REP_LANGUAGE)
+    {
+        if let Some(id) = element.get("@id").and_then(Value::as_str) {
+            pending.push(id);
+        }
+        if let Some(id) = element
+            .get("owningRelationship")
+            .and_then(|relationship| relationship.get("@id"))
+            .and_then(Value::as_str)
+        {
+            pending.push(id);
+        }
+    }
+}
+
+/// Follow composition edges only; semantic references never propagate omission.
+/// The already validated lifter index and the loader wrapper share this walk.
+fn omission_closure<'a>(
+    mut pending: Vec<&'a str>,
+    by_id: &HashMap<&'a str, El<'a>>,
+) -> HashSet<&'a str> {
+    let mut omitted = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !omitted.insert(id) {
+            continue;
+        }
+        let Some(element) = by_id.get(id) else {
+            continue;
+        };
+        for key in ["ownedRelationship", "ownedRelatedElement"] {
+            if let Some(children) = element.get(key).and_then(Value::as_array) {
+                pending.extend(children.iter().filter_map(|child| child["@id"].as_str()));
+            }
+        }
+    }
+    omitted
+}
+
+/// Rows omitted when reconstructing source syntax, including the complete
+/// composition subtree of implied relationships and reference recovery notes.
+/// Semantic cross-references never propagate omission.
+pub(crate) fn omitted_element_ids(document: &Value) -> HashSet<&str> {
+    let Some(elements) = document.as_array() else {
+        return HashSet::new();
+    };
+    let mut pending = Vec::new();
+    for element in elements.iter().filter_map(Value::as_object) {
+        collect_omission_seeds(element, &mut pending);
+    }
+    if pending.is_empty() {
+        return HashSet::new();
+    }
+    let by_id = elements
+        .iter()
+        .filter_map(|element| {
+            let element = element.as_object()?;
+            Some((element.get("@id")?.as_str()?, element))
+        })
+        .collect();
+    omission_closure(pending, &by_id)
+}
+
 fn lift_document(
     value: &Value,
     extra_names: &HashMap<String, Vec<String>>,
@@ -394,6 +494,7 @@ fn lift_document(
     };
     let mut by_id: HashMap<&str, El> = HashMap::new();
     let mut order: Vec<&str> = Vec::new();
+    let mut omission_seeds = Vec::new();
     for item in items {
         let Value::Object(el) = item else {
             return Err(LiftError::NotAnElement);
@@ -401,9 +502,11 @@ fn lift_document(
         let Some(id) = el.get("@id").and_then(|v| v.as_str()) else {
             return Err(LiftError::ElementWithoutId);
         };
+        collect_omission_seeds(el, &mut omission_seeds);
         by_id.insert(id, el);
         order.push(id);
     }
+    let omitted = omission_closure(omission_seeds, &by_id);
     // Unresolved-reference recovery annotations: dangling id → spelling.
     let mut unresolved_names = HashMap::new();
     for el in by_id.values() {
@@ -435,7 +538,7 @@ fn lift_document(
         depth: 0,
         incomplete: false,
     };
-    lifter.dialect = lifter.detect_dialect();
+    lifter.dialect = lifter.detect_dialect(&omitted);
     lifter.compute_qnames(&order);
 
     // Roots: elements with no *in-document* owner — not owned by a
@@ -455,6 +558,9 @@ fn lift_document(
     };
     let mut members = Vec::new();
     for id in &order {
+        if omitted.contains(id) {
+            continue;
+        }
         let el = lifter.by_id[id];
         let unowned = !in_doc(&lifter, el, "owningRelationship")
             && !in_doc(&lifter, el, "owningRelatedElement");
@@ -844,10 +950,43 @@ impl<'a> Lifter<'a> {
         self.depth -= 1;
     }
 
-    fn detect_dialect(&self) -> Dialect {
-        for el in self.by_id.values() {
+    fn detect_dialect(&self, omitted: &HashSet<&str>) -> Dialect {
+        for (id, el) in &self.by_id {
+            if omitted.contains(id) {
+                continue;
+            }
             if KERML_MARKERS.contains(&ty(el)) {
                 return Dialect::Kerml;
+            }
+            // Ordinary namespace-owned Feature declarations are KerML. Do not
+            // let parameter/result or chained Features generated inside SysML
+            // expressions choose the dialect.
+            if ty(el) == "Feature" {
+                let membership = el
+                    .get("owningRelationship")
+                    .and_then(ref_id)
+                    .and_then(|id| self.by_id.get(id).copied());
+                if let Some(membership) =
+                    membership.filter(|m| matches!(ty(m), "OwningMembership" | "FeatureMembership"))
+                {
+                    let owns = membership
+                        .get("ownedRelatedElement")
+                        .and_then(Value::as_array)
+                        .is_some_and(|children| {
+                            children.len() == 1 && children.first().and_then(ref_id) == Some(*id)
+                        });
+                    if owns
+                        && self.owner_of(el).is_some_and(|owner| {
+                            matches!(ty(owner), "Namespace" | "Package")
+                                && self
+                                    .owned_rels(owner)
+                                    .iter()
+                                    .any(|r| std::ptr::eq(*r, membership))
+                        })
+                    {
+                        return Dialect::Kerml;
+                    }
+                }
             }
         }
         Dialect::Sysml
@@ -886,18 +1025,8 @@ impl<'a> Lifter<'a> {
     /// referenced or redefined feature (KerML 8.2.3.5 / SysML reference
     /// forms), mirroring the emitter's scope registration.
     ///
-    /// One naming rule, four representations — an element is named by
-    /// its declaration, else by its *naming feature*: the first feature
-    /// it redefines, else the one it references, else the last link of
-    /// its chain, each followed transitively. The implementations are
-    /// this one (over payload JSON), `json::Builder::graph_effective_name`
-    /// (over the lowered element graph, where `Builder::effective_name`
-    /// is the declaration-only half), `full::effective_name_of` (over the
-    /// full form's element maps, which also derives the positional
-    /// implied names), and the fixpoint inside `ids::walk` (over a
-    /// compact payload, for id segments). They agree by construction and
-    /// by the differential test in the round-trip gate; a change to one
-    /// belongs in all of them.
+    /// This syntax locator preserves labels accepted by the resolver, including
+    /// historical anonymous reference labels. It is not semantic name selection.
     fn effective_name(&self, el: El<'a>, depth: usize) -> Option<String> {
         // A binary connector-family end is findable only as `source`/
         // `target` (its implied redefinition of the BinaryConnection ends —
@@ -912,7 +1041,20 @@ impl<'a> Lifter<'a> {
         if depth > 8 {
             return None;
         }
-        for rel in self.owned_rels(el) {
+        let membership = el
+            .get("owningRelationship")
+            .and_then(ref_id)
+            .and_then(|id| self.by_id.get(id))
+            .map(|r| ty(r));
+        let reference_chain =
+            crate::json::naming::reference_names_feature_target(ty(el), membership);
+        let rels = self.owned_rels(el);
+        let named_reference = crate::json::naming::reference_names_feature(ty(el), membership)
+            && rels.iter().any(|r| ty(r) == "ReferenceSubsetting");
+        for rel in rels {
+            if named_reference && ty(rel) != "ReferenceSubsetting" {
+                continue;
+            }
             let key = match ty(rel) {
                 "ReferenceSubsetting" => "referencedFeature",
                 "Redefinition" => "redefinedFeature",
@@ -922,17 +1064,22 @@ impl<'a> Lifter<'a> {
             if let Some(s) = v.get("@ref").and_then(|x| x.as_str()) {
                 return match target_from_ref_string(s) {
                     TargetRef::Name(qn) => qn.segments.last().map(|n| n.value.clone()),
-                    TargetRef::Chain(links) => links
-                        .last()
-                        .and_then(|l| l.segments.last())
-                        .map(|n| n.value.clone()),
+                    TargetRef::Chain(links) if reference_chain && key == "referencedFeature" => {
+                        links
+                            .last()
+                            .and_then(|l| l.segments.last())
+                            .map(|n| n.value.clone())
+                    }
+                    TargetRef::Chain(_) => None,
                 };
             }
             if let Some(id) = ref_id(v) {
                 if let Some(&target) = self.by_id.get(id) {
-                    // A chained target (owned chain Feature) takes its name
-                    // from the last link, mirroring the emitter.
-                    if let Some(last) = self.last_chaining_target(target) {
+                    // Only specialized reference forms name through a chain.
+                    if let Some(last) = self
+                        .last_chaining_target(target)
+                        .filter(|_| reference_chain && key == "referencedFeature")
+                    {
                         return match last {
                             ChainLink::Ref(name) => Some(name),
                             ChainLink::Id(link_id) => match self.by_id.get(link_id) {
@@ -1104,6 +1251,27 @@ impl<'a> Lifter<'a> {
         Some(kid)
     }
 
+    /// The canonical constructor stores its argument carriers on its result.
+    /// Keep the selector on the constructor while presenting arguments in their
+    /// authored order to both the iterative traversal and expression assembler.
+    fn invocation_relationships(&self, el: El<'a>) -> Vec<El<'a>> {
+        let relationships = self.owned_rels(el);
+        if ty(el) != "ConstructorExpression" {
+            return relationships;
+        }
+        let mut result = Vec::new();
+        for relationship in relationships {
+            if ty(relationship) == "ReturnParameterMembership" {
+                if let Some(feature) = self.first_related(relationship) {
+                    result.extend(self.owned_rels(feature));
+                }
+            } else {
+                result.push(relationship);
+            }
+        }
+        result
+    }
+
     /// Lift a reference property (`{"@id"}` or `{"@ref"}`) into a target.
     fn target(&mut self, holder: El<'a>, key: &str) -> Option<TargetRef> {
         let v = holder.get(key)?;
@@ -1122,12 +1290,32 @@ impl<'a> Lifter<'a> {
             }
         }
         // `importedMembership` is Membership-typed: an in-document
-        // membership names its member element (an alias membership's
-        // `memberElement` carries the canonical target). Library
+        // owning membership names its member element; a named alias names
+        // the Membership in its declaring namespace. Library
         // memberships are not in the document and name themselves through
         // the library name map below.
         if key == "importedMembership" {
             if let Some(&mel) = self.by_id.get(id) {
+                if ty(mel) == "Membership" {
+                    if let Some(alias) =
+                        sval(mel, "memberName").or_else(|| sval(mel, "memberShortName"))
+                    {
+                        if let Some(owner) = mel.get("owningRelatedElement").and_then(ref_id) {
+                            let path = self.qnames.get(owner).cloned().flatten().or_else(|| {
+                                self.by_id
+                                    .get(owner)
+                                    .filter(|e| ty(e) == "Namespace" && self.owner_of(e).is_none())
+                                    .map(|_| Vec::new())
+                            });
+                            if let Some(mut path) = path {
+                                path.push(alias.to_owned());
+                                return Some(TargetRef::Name(qn_global(&path)));
+                            }
+                        }
+                        // Anonymous ancestry can still admit a relative name.
+                        return Some(TargetRef::Name(qn_from_segments(&[alias.to_owned()])));
+                    }
+                }
                 if ty(mel).ends_with("Membership") {
                     if let Some(s) = mel
                         .get("memberElement")
@@ -2109,7 +2297,9 @@ impl<'a> Lifter<'a> {
             // usages isComposite is the derived-by-rule default (the `ref`
             // reconstruction below explains any non-default value).
             is_composite: bval(el, "isComposite") && self.dialect == Dialect::Kerml,
-            is_portion: bval(el, "isPortion"),
+            // `portion` is a KerML keyword. SysML uses `portionKind`;
+            // the document loader retains the original owned Boolean separately.
+            is_portion: bval(el, "isPortion") && self.dialect == Dialect::Kerml,
             // `var` is a KerML feature prefix with no SysML spelling —
             // dropped for `*Usage` metaclasses (some producers mark
             // plain attribute usages `isVariable: true`; printing `var`
@@ -3164,12 +3354,37 @@ impl<'a> Lifter<'a> {
     /// Children in precisely the order the expression assembler consumes
     /// them. Parameter wrappers and type-reference parameters add no AST
     /// depth. An expression body goes through the bounded member lifter.
+    // Full interchange also carries the derived memberElement alias. An owned
+    // expression is syntax to lift, not a name reference to that alias target.
+    fn owned_expression_reference(&self, rel: El<'a>) -> Option<El<'a>> {
+        if ty(rel) != "FeatureMembership" {
+            return None;
+        }
+        let children = rel.get("ownedRelatedElement")?.as_array()?;
+        if children.len() != 1 {
+            return None;
+        }
+        let inner = self.by_id.get(ref_id(&children[0])?).copied()?;
+        if !crate::metaclass::conforms(ty(inner), "Expression")
+            || inner.get("owningRelationship").and_then(ref_id) != Some(id_of(rel))
+            || rel
+                .get("memberElement")
+                .is_some_and(|alias| !alias.is_null() && ref_id(alias) != Some(id_of(inner)))
+        {
+            return None;
+        }
+        Some(inner)
+    }
+
     fn expression_children(&mut self, el: El<'a>) -> Vec<El<'a>> {
         match ty(el) {
             "FeatureReferenceExpression" => {
                 for rel in self.owned_rels(el) {
                     if ty(rel) == "ReturnParameterMembership" {
                         continue;
+                    }
+                    if let Some(inner) = self.owned_expression_reference(rel) {
+                        return vec![inner];
                     }
                     if self.target(rel, "memberElement").is_some() {
                         break;
@@ -3185,9 +3400,14 @@ impl<'a> Lifter<'a> {
             | "CollectExpression"
             | "SelectExpression"
             | "InvocationExpression"
-            | "ConstructorExpression"
             | "OperatorExpression" => self
                 .owned_rels(el)
+                .into_iter()
+                .filter(|rel| ty(rel) == "ParameterMembership")
+                .filter_map(|rel| self.param_expr_el(rel))
+                .collect(),
+            "ConstructorExpression" => self
+                .invocation_relationships(el)
                 .into_iter()
                 .filter(|rel| ty(rel) == "ParameterMembership")
                 .filter_map(|rel| self.param_expr_el(rel))
@@ -3258,6 +3478,9 @@ impl<'a> Lifter<'a> {
                     if ty(rel) == "ReturnParameterMembership" {
                         continue;
                     }
+                    if self.owned_expression_reference(rel).is_some() {
+                        return children.next().flatten();
+                    }
                     if let Some(target) = self.target(rel, "memberElement") {
                         return Some(target_to_expr(target));
                     }
@@ -3321,7 +3544,7 @@ impl<'a> Lifter<'a> {
                 let mut fn_ty = None;
                 let mut fnref = None;
                 let mut args = Vec::new();
-                for rel in self.owned_rels(el) {
+                for rel in self.invocation_relationships(el) {
                     match ty(rel) {
                         // A chained callee (`a.b(x)`) rides an
                         // OwningMembership owning the chain feature.
@@ -3878,6 +4101,116 @@ mod tests {
             matches!(&u.detail, UsageDetail::Connector { ends } if ends.is_empty()),
             "{:?}",
             u.detail
+        );
+    }
+}
+
+#[cfg(test)]
+mod omitted_dialect_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn implied_subtrees_do_not_select_a_dialect_or_become_roots() {
+        // Both a root implied marker and a marker below an implied carrier
+        // with an absent owner are omitted. Child flags are not required.
+        for document in [
+            json!([{"@id":"binding","@type":"BindingConnector","isImplied":true}]),
+            json!([
+                {"@id":"membership","@type":"OwningMembership","isImplied":true,
+                 "owningRelatedElement":{"@id":"outside"},
+                 "ownedRelatedElement":[{"@id":"child"}]},
+                {"@id":"child","@type":"Class","declaredName":"Generated",
+                 "owningRelationship":{"@id":"membership"}}
+            ]),
+        ] {
+            let lifted = from_compact_json(&document).unwrap();
+            assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+            assert_eq!(lifted.unit.dialect, Dialect::Sysml);
+            assert!(lifted.unit.members.is_empty());
+        }
+    }
+
+    #[test]
+    fn authored_markers_and_cross_reference_targets_remain_source() {
+        let document = json!([
+            {"@id":"implied","@type":"Subsetting","isImplied":true,
+             "target":[{"@id":"authored"}],"subsettedFeature":{"@id":"authored"}},
+            {"@id":"authored","@type":"Class","declaredName":"Authored",
+             "owningRelationship":{"@id":"outside"}}
+        ]);
+        assert_eq!(omitted_element_ids(&document), HashSet::from(["implied"]));
+        let lifted = from_compact_json(&document).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        assert_eq!(lifted.unit.dialect, Dialect::Kerml);
+        assert_eq!(lifted.unit.members.len(), 1);
+        assert!(sysmlv2_syntax::print::print_source(&lifted.unit).contains("class Authored"));
+        let authored_binding = json!([{"@id":"binding","@type":"BindingConnector"}]);
+        assert_eq!(
+            from_compact_json(&authored_binding).unwrap().unit.dialect,
+            Dialect::Kerml
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_keep_all_omission_seeds_but_follow_the_last_row() {
+        for (document, expected) in [
+            (
+                json!([
+                    {"@id":"duplicate","@type":"OwningMembership","isImplied":true,
+                     "ownedRelatedElement":[{"@id":"earlier-child"}]},
+                    {"@id":"duplicate","@type":"OwningMembership","isImplied":false,
+                     "ownedRelatedElement":[{"@id":"later-child"}]},
+                    {"@id":"earlier-child","@type":"Package","declaredName":"Kept"},
+                    {"@id":"later-child","@type":"Class","declaredName":"Omitted"}
+                ]),
+                HashSet::from(["duplicate", "later-child"]),
+            ),
+            (
+                json!([
+                    {"@id":"duplicate","@type":"TextualRepresentation",
+                     "language":crate::full::UNRESOLVED_REP_LANGUAGE,
+                     "owningRelationship":{"@id":"recovery-carrier"},
+                     "ownedRelatedElement":[{"@id":"earlier-child"}]},
+                    {"@id":"duplicate","@type":"TextualRepresentation","language":"text",
+                     "ownedRelatedElement":[{"@id":"later-child"}]},
+                    {"@id":"recovery-carrier","@type":"OwningMembership",
+                     "ownedRelatedElement":[{"@id":"duplicate"}]},
+                    {"@id":"earlier-child","@type":"Package","declaredName":"Kept"},
+                    {"@id":"later-child","@type":"Class","declaredName":"Omitted"}
+                ]),
+                HashSet::from(["duplicate", "recovery-carrier", "later-child"]),
+            ),
+        ] {
+            // Seeds retain provenance from every row, but composition follows
+            // the same last-wins identity projection used by the lifter.
+            assert_eq!(omitted_element_ids(&document), expected);
+            let lifted = from_compact_json(&document).unwrap();
+            assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+            assert_eq!(lifted.unit.dialect, Dialect::Sysml);
+            assert_eq!(lifted.unit.members.len(), 1);
+            let source = sysmlv2_syntax::print::print_source(&lifted.unit);
+            assert!(source.contains("package Kept"), "{source}");
+            assert!(!source.contains("Omitted"), "{source}");
+        }
+    }
+
+    #[test]
+    fn omitted_composition_cycles_terminate_and_recovery_carriers_stay_omitted() {
+        let document = json!([
+            {"@id":"a","@type":"OwningMembership","isImplied":true,
+             "ownedRelatedElement":[{"@id":"b"}]},
+            {"@id":"b","@type":"Class","ownedRelationship":[{"@id":"a"}]},
+            {"@id":"note","@type":"TextualRepresentation",
+             "language":crate::full::UNRESOLVED_REP_LANGUAGE,
+             "owningRelationship":{"@id":"annotation"}},
+            {"@id":"annotation","@type":"OwningMembership",
+             "ownedRelatedElement":[{"@id":"note"}],"memberElement":{"@id":"kept"}},
+            {"@id":"kept","@type":"Package","declaredName":"Kept"}
+        ]);
+        assert_eq!(
+            omitted_element_ids(&document),
+            HashSet::from(["a", "b", "note", "annotation"])
         );
     }
 }

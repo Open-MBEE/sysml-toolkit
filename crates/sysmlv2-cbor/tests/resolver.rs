@@ -106,6 +106,12 @@ fn collision_and_version_policies_are_loud() {
     assert_eq!(r.id_of("Pkg::Dup"), None, "collisions never resolve");
     assert!(r.is_collision("Pkg::Dup"));
 
+    v["schemeVersion"] = serde_json::json!(1);
+    let r = StdlibResolver::from_value(&v).unwrap();
+    let err = r.assert_compatible().unwrap_err().to_string();
+    assert!(err.contains("scheme"), "{err}");
+    v["schemeVersion"] = serde_json::json!(sysmlv2_cbor::ID_SCHEME_VERSION);
+
     v["tablesVersion"] = serde_json::json!(9999);
     let r = StdlibResolver::from_value(&v).unwrap();
     let err = r.assert_compatible().unwrap_err().to_string();

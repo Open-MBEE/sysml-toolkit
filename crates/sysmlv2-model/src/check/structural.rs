@@ -97,21 +97,6 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                     "A feature redefining an end must itself be an end",
                 );
             }
-            let from = b.elements[*e]
-                .props
-                .get("direction")
-                .and_then(|v| v.as_str());
-            let to = g
-                .featuring(b, *e)
-                .and_then(|o| g.direction_through(b, o, t));
-            if from.is_some() && to.is_some() && from != to && to != Some("inout") {
-                report(
-                    *e,
-                    qn.span,
-                    "validateRedefinitionDirectionConformance",
-                    "A redefining feature must have a compatible direction",
-                );
-            }
             if g.featuring(b, *e).is_none() && g.featuring(b, t).is_none() {
                 report(
                     *e,
@@ -665,4 +650,40 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
         }
     }
     out
+}
+
+/// Direction conformance shares the same contextual proof as repair proposals.
+pub(super) fn validate_directions(
+    r: &mut ResolvedModel,
+    model: &Model,
+    g: &Facts,
+) -> Vec<(usize, Diagnostic)> {
+    let candidates: Vec<_> =
+        r.b.spec_targets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (e, kind, _, qn))| {
+                if *kind != "Redefinition" {
+                    return None;
+                }
+                let t = r.b.spec_resolved.get(i).copied().flatten()?;
+                let unit = r.b.unit_of_elem(*e);
+                (!model.is_library_unit(unit)).then_some((*e, t, unit, qn.span))
+            })
+            .collect();
+    let mut proof = super::directions::RedefinitionDirections::default();
+    candidates
+        .into_iter()
+        .filter(|&(e, t, _, _)| proof.conformance(&mut r.b, g, e, t) == Some(false))
+        .map(|(_, _, unit, span)| {
+            (
+                unit,
+                super::rule_error(
+                    span,
+                    "validateRedefinitionDirectionConformance",
+                    "A redefining feature must have a compatible direction",
+                ),
+            )
+        })
+        .collect()
 }

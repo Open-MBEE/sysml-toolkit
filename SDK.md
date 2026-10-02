@@ -133,7 +133,7 @@ False
 False
 ```
 
-`element_id(e)` returns the element's interchange id — the same UUID the JSON emitters use. Every derived property of the abstract syntax is reachable by its specification name through `s.derived(e, "ownedFeature")`, `s.derived(e, "owningNamespace")`, `s.derived(e, "name")`, …; `Session.derives(metaclass, name)` says in advance whether a name is computed (`"exact"`, `"passthrough"`, `"not-computed"`) or not a derived property there (`"not-declared"`), and `s.set_closure_policy("closure")` switches the inheritance-aware properties to their definition over the inherited and imported memberships (API.md §3.2a).
+`element_id(e)` returns the element's interchange id — the same UUID the JSON emitters use. Every derived property of the abstract syntax is reachable by its specification name through `s.derived(e, "ownedFeature")`, `s.derived(e, "owningNamespace")`, `s.derived(e, "name")`, …; `Session.derives(metaclass, name)` says in advance whether a name is computed (`"exact"`, `"passthrough"`, `"not-computed"`) or not a derived property there (`"not-declared"`), and `s.set_closure_policy("closure")` extends the inheritance-aware properties over inherited and imported memberships without upgrading their fidelity to exact.
 
 ## 3. Find usages
 
@@ -310,6 +310,8 @@ Refusals are named `sysmlv2.RefusedError`s — an ineligible kind or header, a t
 
 ## 6. Interchange JSON sessions
 
+`property_json(element, name)` reads a specification property using the checked semantic catalog. `to_full_json_strict()` refuses unavailable semantics or unresolved references instead of inserting placeholders. Many valid Type/Usage models are still refused because their derived dependencies are incomplete; these APIs do not certify whole-model validity.
+
 Sessions round-trip through KerML interchange JSON. `to_compact_json()` / `to_full_json()` emit the current state; `from_interchange_json` opens a session from a compact or full element list — including Flexo MMS `{payload, identity}` change records — by lifting it back to text:
 
 ```pycon
@@ -357,7 +359,7 @@ The lift prints every reference as an always-correct `$::`-rooted path. `minimiz
 >>> "part v : $::Rig::Vehicle;" in j.source(0)
 True
 >>> j.minimize_qualifications()
-(4, 1)
+(4, 0)
 >>> "part v : Vehicle;" in j.source(0)
 True
 >>> "part front : Defs::SpareWheel;" in j.source(0)

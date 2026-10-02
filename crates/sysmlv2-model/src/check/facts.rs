@@ -3,8 +3,29 @@
 mod id_index;
 
 use crate::{json::Builder, layered::LayeredVec, metaclass};
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::OnceLock};
 use sysmlv2_syntax::Span;
+
+#[cfg(test)]
+thread_local! {
+    static SPAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ownership steps [`Facts::span`] has taken on the current thread. A
+/// step moves from an element to its owner; resolving every element's
+/// span takes at most one per element.
+#[cfg(test)]
+pub(crate) fn span_steps() -> usize {
+    SPAN_STEPS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_span_step() {
+    SPAN_STEPS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_span_step() {}
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Facts {
@@ -15,8 +36,23 @@ pub(crate) struct Facts {
     contexts: crate::flat::Rows<usize>,
     outgoing: crate::flat::Rows<usize>,
     targets: crate::flat::Rows<(crate::properties::Key, usize)>,
+    /// The first element this analysis added; [`Facts::span`] answers
+    /// from `spans` for it and every later one.
+    #[serde(skip)]
+    span_start: usize,
+    /// The span of each element from `span_start` on, resolved for all
+    /// of them on the first query.
+    #[serde(skip)]
+    spans: OnceLock<Box<[Span]>>,
 }
 impl Facts {
+    pub(super) fn outgoing_relationships(&self, e: usize) -> &[usize] {
+        if e < self.outgoing.len() {
+            &self.outgoing[e]
+        } else {
+            &[]
+        }
+    }
     pub(crate) fn contains_id(&self, id: &uuid::Uuid) -> bool {
         self.ids.get(id).is_some()
     }
@@ -82,7 +118,15 @@ impl Facts {
         for e in b.elements.iter().take(n).skip(start) {
             outgoing.push(e.owned_relationships.to_vec());
         }
-        let mut changed = HashSet::new();
+        // Explicit about may add/remove semantic bases on a library target
+        // without adding a source specialization. Empty values preserve touched
+        // target history, so removals also refresh the prepared direct context.
+        let mut changed: HashSet<usize> = b
+            .metadata_about
+            .keys()
+            .copied()
+            .filter(|&target| target < start)
+            .collect();
         // Read resolved graph edges, including prefix metadata and standalone
         // relationships which do not all have a spec_targets entry.
         for (rel_index, rel) in b.elements.iter().enumerate().take(n).skip(start) {
@@ -95,6 +139,7 @@ impl Facts {
                 "Specialization" => ("specific", "general"),
                 "Conjugation" => ("conjugatedType", "originalType"),
                 "TypeFeaturing" => ("featureOfType", "featuringType"),
+                "FeatureChaining" => ("featureChained", "chainingFeature"),
                 "FeatureInverting" => ("featureInverted", "invertingFeature"),
                 _ => continue,
             };
@@ -135,6 +180,8 @@ impl Facts {
             owner,
             members,
             supers,
+            span_start: start,
+            spans: OnceLock::new(),
         }
     }
     pub(crate) fn freeze(&mut self) {
@@ -195,52 +242,6 @@ impl Facts {
             }
         }
         out
-    }
-    /// Direction as seen through the specializing/typing context. Conjugation
-    /// reverses in/out; conflicting paths leave the fact undecided.
-    pub fn direction_through<'a>(
-        &self,
-        b: &'a Builder,
-        owner: usize,
-        target: usize,
-    ) -> Option<&'a str> {
-        let direction = b.elements[target].props.get("direction")?.as_str()?;
-        let featuring = self.featuring(b, target)?;
-        let mut seen = HashSet::new();
-        let mut stack = vec![(owner, false)];
-        let mut result = None;
-        while let Some((e, flipped)) = stack.pop() {
-            if !seen.insert((e, flipped)) {
-                continue;
-            }
-            if e == featuring {
-                let d = match (direction, flipped) {
-                    ("in", true) => "out",
-                    ("out", true) => "in",
-                    _ => direction,
-                };
-                if result.is_some_and(|old| old != d) {
-                    return None;
-                }
-                result = Some(d);
-            }
-            for &rel in &self.outgoing[e] {
-                for (kind, key, flip) in [
-                    ("FeatureTyping", "type", false),
-                    ("Subclassification", "superclassifier", false),
-                    ("Subsetting", "subsettedFeature", false),
-                    ("Redefinition", "redefinedFeature", false),
-                    ("Conjugation", "originalType", true),
-                ] {
-                    if is(b, rel, kind) {
-                        if let Some(t) = self.target(b, rel, key) {
-                            stack.push((t, flipped ^ flip));
-                        }
-                    }
-                }
-            }
-        }
-        result
     }
     pub fn effective_kind(&self, b: &Builder, e: usize, kind: &str) -> bool {
         let mut seen = HashSet::new();
@@ -434,7 +435,64 @@ impl Facts {
             None
         }
     }
+    /// Where a finding on `e` is reported: its own declaration or member
+    /// span, else the nearest owner's, else nowhere (the default span).
     pub fn span(&self, b: &Builder, e: usize) -> Span {
+        if (self.span_start..self.owner.len()).contains(&e) {
+            let spans = self.spans.get_or_init(|| self.resolve_spans(b));
+            return spans[e - self.span_start];
+        }
+        self.walk_span(b, e)
+    }
+
+    /// [`Facts::span`] for every element from `span_start` on, each
+    /// ownership step taken once: an element without a span of its own
+    /// reports at its owner's, so a resolved owner answers for every
+    /// element below it. Walking from each element separately costs its
+    /// depth each time, which is quadratic in a nesting as deep as a
+    /// lowered operator chain's: four ownership levels per operator.
+    fn resolve_spans(&self, b: &Builder) -> Box<[Span]> {
+        let (start, end) = (self.span_start, self.owner.len());
+        let mut spans: Vec<Option<Span>> = vec![None; end - start];
+        let mut on_path = vec![false; end - start];
+        let mut path = Vec::new();
+        for e in start..end {
+            let mut current = Some(e);
+            let span = loop {
+                let Some(x) = current else {
+                    break Span::default();
+                };
+                if !(start..end).contains(&x) {
+                    // The library prefix owns only library elements, so
+                    // its walk never comes back to the path.
+                    break self.walk_span(b, x);
+                }
+                if let Some(span) = spans[x - start] {
+                    break span;
+                }
+                if on_path[x - start] {
+                    // An ownership cycle with no span anywhere on it.
+                    break Span::default();
+                }
+                if let Some(&span) = b.decl_spans.get(&x).or_else(|| b.member_spans.get(&x)) {
+                    spans[x - start] = Some(span);
+                    break span;
+                }
+                on_path[x - start] = true;
+                path.push(x);
+                note_span_step();
+                current = self.owner[x];
+            };
+            for x in path.drain(..) {
+                spans[x - start] = Some(span);
+                on_path[x - start] = false;
+            }
+        }
+        spans.into_iter().map(Option::unwrap_or_default).collect()
+    }
+
+    /// [`Facts::span`] by walking up from `e` alone.
+    fn walk_span(&self, b: &Builder, e: usize) -> Span {
         let mut current = Some(e);
         let mut seen = HashSet::new();
         while let Some(e) = current {
@@ -444,6 +502,7 @@ impl Facts {
             if let Some(span) = b.decl_spans.get(&e).or_else(|| b.member_spans.get(&e)) {
                 return *span;
             }
+            note_span_step();
             current = self.owner[e];
         }
         Span::default()
@@ -454,4 +513,58 @@ pub(super) fn is(b: &Builder, e: usize, kind: &str) -> bool {
 }
 pub(super) fn flag(b: &Builder, e: usize, key: &str) -> bool {
     b.elements[e].props.get(key).and_then(|x| x.as_bool()) == Some(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Facts;
+    use crate::{json::ResolvedModel, model::Model};
+
+    /// The spans resolved together answer exactly as a walk up from each
+    /// element alone, also where ownership cycles, stops, or leaves the
+    /// elements the analysis added for the library's.
+    #[test]
+    fn resolved_spans_answer_as_the_walk_from_each_element() {
+        let mut base = Model::new();
+        base.add_library_source("lib.kerml", "package L { class A { feature f = 1 + 2; } }");
+        let prepared = base.prepare_library().unwrap();
+        let mut model = Model::new();
+        prepared.install(&mut model).unwrap();
+        model.add_source(
+            "user.sysml",
+            "package P { part def D { attribute x = 1 + 2 * (3 - 4); } \
+             part d : D { attribute :>> x = if true ? 1 else 2; } }",
+        );
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed % bound as u64).unwrap()
+        };
+        for round in 0..64 {
+            let mut facts = Facts::new(&mut r.b);
+            let (start, end) = (facts.span_start, facts.owner.len());
+            assert!(0 < start && start < end, "the library is a prefix");
+            // Rewire owners before the first query: to nothing, to the
+            // element itself, or anywhere, the library included.
+            for _ in 0..round {
+                let e = start + next(end - start);
+                facts.owner[e] = match next(4) {
+                    0 => None,
+                    1 => Some(e),
+                    _ => Some(next(end)),
+                };
+            }
+            for e in 0..end {
+                assert_eq!(
+                    facts.span(&r.b, e),
+                    facts.walk_span(&r.b, e),
+                    "element {e} in round {round}"
+                );
+            }
+        }
+    }
 }

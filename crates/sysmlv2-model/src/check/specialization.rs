@@ -2,7 +2,7 @@
 //! subclassification cycles and duplicates, the metaclass a metadata
 //! feature is typed by, the conformance a redefinition owes its target,
 //! and the binariness a connector inherits through one.
-use super::user_rows;
+use super::multiplicity_domains::DomainRows;
 use crate::{json::ResolvedModel, model::Model};
 use std::collections::{HashMap, HashSet};
 use sysmlv2_syntax::diag::Diagnostic;
@@ -14,16 +14,23 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
     // below skips library owners) and can't participate in a user-visible
     // cycle (no library edge points into a user definition) — skipping
     // them keeps the semantic pass proportional to the user model.
-    let specs = user_rows(&r.b, model, r.b.spec_targets.iter(), |row| row.0);
-    // Resolve every recorded target once.
+    let specs: Vec<_> =
+        r.b.spec_targets
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !model.is_library_unit(r.b.unit_of_elem(row.0)))
+            .map(|(i, row)| (i, row.clone()))
+            .collect();
+    // Pending resolution already applied source identity and header exclusions.
+    // Re-resolving display spellings can select a different element.
     let mut resolved: Vec<(
         usize,
         &'static str,
         usize,
         &sysmlv2_syntax::ast::QualifiedName,
     )> = Vec::new();
-    for (owner, kind, scope, qn) in &specs {
-        if let Some(t) = r.b.resolve(*scope, qn, 0) {
+    for (i, (owner, kind, _, qn)) in &specs {
+        if let Some(t) = r.b.spec_resolved.get(*i).copied().flatten() {
             resolved.push((*owner, kind, t, qn));
         }
     }
@@ -98,7 +105,7 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
     // resolves to any other kind of element is provably wrong (error);
     // unresolved targets stay referential warnings, per checker policy.
     let mut metadata_typing_count: HashMap<usize, usize> = HashMap::new();
-    for (owner, kind, _, _) in &specs {
+    for (_, (owner, kind, _, _)) in &specs {
         if *kind == "FeatureTyping"
             && matches!(r.b.elements[*owner].ty, "MetadataUsage" | "MetadataFeature")
         {
@@ -143,21 +150,8 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         }
     }
 
-    // Numeric bounds of a multiplicity: `[l..u]` directly, `[u]` is
-    // exact (`l = u`) except `[*]`, whose missing lower is 0.
-    let bounds = |r: &mut crate::json::ResolvedModel,
-                  scope: usize,
-                  m: &sysmlv2_syntax::ast::Multiplicity|
-     -> Option<(f64, f64)> {
-        let hi =
-            super::scalar_f64(&crate::eval::evaluate_expr_in(&mut r.b, scope, &m.upper).ok()?)?;
-        let lo = match &m.lower {
-            Some(l) => super::scalar_f64(&crate::eval::evaluate_expr_in(&mut r.b, scope, l).ok()?)?,
-            None if hi.is_infinite() => 0.0,
-            None => hi,
-        };
-        Some((lo, hi))
-    };
+    let domains = DomainRows::new(&r.b);
+    let mut reported_domains = HashSet::new();
 
     // --- redefinition type-compatibility ---
     // A redefining feature's declared types should conform to the
@@ -194,32 +188,43 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
             continue;
         }
         let qn = r.b.spec_targets[i].3.clone();
-        // Multiplicity conformance: when both sides declare
-        // explicit numeric multiplicities, the redefining range must
-        // lie within the redefined one.
-        // Copied out of the table because evaluating the bounds needs
-        // the builder mutably; only the two clauses in play are copied.
-        let declared = |r: &mut crate::json::ResolvedModel, e: usize| {
-            r.b.declared_multiplicity_of(e).map(|(s, m)| (s, m.clone()))
-        };
-        if let (Some((os, om)), Some((ts, tm))) = (declared(r, owner), declared(r, target)) {
-            let span = om.span;
-            if let (Some((olo, ohi)), Some((tlo, thi))) = (bounds(r, os, &om), bounds(r, ts, &tm)) {
-                // A subset may have fewer values; only redefinition must
-                // preserve the lower bound as well as the upper bound.
-                if (kind == "Redefinition" && olo < tlo) || ohi > thi {
-                    out.push((
-                        unit,
-                        Diagnostic::warning(
-                            span,
-                            if kind == "Redefinition" {
-                                format!("redefining multiplicity [{olo}..{ohi}] is not within the redefined feature's [{tlo}..{thi}]")
-                            } else {
-                                format!("subsetting multiplicity upper bound {ohi} exceeds the subsetted feature's upper bound {thi}")
-                            },
-                        ),
-                    ));
-                }
+        // Compare complete, explicitly constrained domains in the same receiver.
+        // A named domain's source span may belong to another file; findings for
+        // body/named constraints belong at this user's specialization site.
+        let span =
+            r.b.declared_multiplicity_of(owner)
+                .map_or(qn.span, |(_, m)| m.span);
+        let comparison = domains.compare(&mut r.b, owner, target);
+        if let Some(scope) = r.b.owner_scope_of(owner) {
+            reported_domains.extend(comparison.reported_rows.iter().map(|&row| (scope, row)));
+        }
+        for (general, reason) in comparison.invalid {
+            let subject = if general {
+                format!("multiplicity constraint from `{}`", qn.to_display_string())
+            } else {
+                "specializing multiplicity".into()
+            };
+            out.push((
+                unit,
+                Diagnostic::error(
+                    qn.span,
+                    format!("{subject} is invalid in this specializing context: {reason}"),
+                ),
+            ));
+        }
+        if let Some((own, general)) = comparison.intervals {
+            if (kind == "Redefinition" && own.lower < general.lower) || own.upper > general.upper {
+                out.push((
+                    unit,
+                    Diagnostic::warning(
+                        span,
+                        if kind == "Redefinition" {
+                            format!("redefining multiplicity [{}..{}] is not within the redefined feature's [{}..{}]", own.lower, own.upper, general.lower, general.upper)
+                        } else {
+                            format!("subsetting multiplicity upper bound {} exceeds the subsetted feature's upper bound {}", own.upper, general.upper)
+                        },
+                    ),
+                ));
             }
         }
         if kind == "Subsetting" {
@@ -249,6 +254,55 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
                             .get("declaredName")
                             .and_then(|v| v.as_str())
                             .unwrap_or("<anonymous>")
+                    ),
+                ),
+            ));
+        }
+    }
+    // An unchanged inherited Feature has no local specialization site. Its
+    // bounds must nevertheless remain valid after receiver value redefinition.
+    // Restrict this pass to non-Feature subclassifying receivers; nested
+    // instance/Feature contexts need an explicit evaluation environment.
+    let mut receivers = HashSet::new();
+    let mut providers = crate::json::provider_completeness::ProviderCompleteness::default();
+    for (receiver, kind, _, qn) in &resolved {
+        if *kind != "Subclassification"
+            || crate::metaclass::conforms(r.b.elements[*receiver].ty, "Feature")
+            || !receivers.insert(*receiver)
+        {
+            continue;
+        }
+        let Some(&scope) = r.b.elem_scope.get(receiver) else {
+            continue;
+        };
+        let mut steps = 0;
+        if !providers.scope(&mut r.b, scope, &mut steps) {
+            continue;
+        }
+        let Some(mut features) = r.b.cardinality_feature_candidates(*receiver, &mut steps) else {
+            continue;
+        };
+        features.retain(|&feature| {
+            r.b.owner_elem(feature) != Some(*receiver)
+                && !crate::metaclass::conforms(r.b.elements[feature].ty, "Multiplicity")
+        });
+        for (row, feature, reason) in
+            domains.inherited_invalid(&mut r.b, scope, &features, &mut steps)
+        {
+            if !reported_domains.insert((scope, row)) {
+                continue;
+            }
+            let name = r.b.elements[feature]
+                .props
+                .get("declaredName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<anonymous>");
+            out.push((
+                r.b.unit_of_elem(*receiver),
+                Diagnostic::error(
+                    qn.span,
+                    format!(
+                        "inherited multiplicity of `{name}` is invalid in this specializing context: {reason}"
                     ),
                 ),
             ));
@@ -342,4 +396,27 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trailing_shorthand_metadata_rows_have_pending_outcomes() {
+        for declaration in ["#M class C;", "class C { @M; }"] {
+            let mut model = Model::new();
+            model.add_source(
+                "test.kerml",
+                &format!("package P {{ metaclass M; {declaration} }}"),
+            );
+            assert!(!model.has_errors());
+            let mut r = ResolvedModel::build(&model);
+            let target = r.resolve_qualified("P::M").unwrap().0;
+            assert_eq!(r.b.spec_targets.len(), 1);
+            assert_eq!(r.b.spec_resolved.len(), 1);
+            assert_eq!(r.b.spec_resolved[0], Some(target));
+            assert!(validate(&mut r, &model).is_empty());
+        }
+    }
 }

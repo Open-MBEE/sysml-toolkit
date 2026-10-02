@@ -22,8 +22,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+pub use sysmlv2_model::json::settled::SettledOutcomes;
 pub use sysmlv2_model::json::{ElementRef, RefSite, ResolvedModel, UnresolvedReference};
-pub use sysmlv2_model::model::Model as ModelHandle;
+pub use sysmlv2_model::model::{GraphFormat, Model as ModelHandle};
 
 use sysmlv2_model::libcache;
 use sysmlv2_model::model::Model;
@@ -584,6 +585,9 @@ pub struct Session {
     /// (RefSite/unit indices include them).
     unit_offset: usize,
     model: Model,
+    // Explicit format-aware entry points enforce JSON shape as well as headers.
+    // Historical legacy entry points retain their foreign-payload recovery.
+    enforce_graph_format: bool,
     resolved: ResolvedModel,
     /// Non-fatal problems from lifting interchange JSON (unknown
     /// constructs, unresolvable references) — empty for text sessions.
@@ -600,6 +604,11 @@ pub struct Session {
     /// Whether the loaded document carried references the lift could only
     /// spell as ids, so emissions must bind them.
     binds_ids: bool,
+    /// New library-name fallback binds only payload-proven sites, never an
+    /// unrelated authored UUID-shaped lexical name.
+    strict_id_bindings: bool,
+    id_reference_values: sysmlv2_model::loader::IdReferenceBindings,
+    id_reference_bindings: sysmlv2_model::loader::IdReferenceBindings,
 }
 
 /// Where a session's standard library comes from: a directory on disk
@@ -631,13 +640,107 @@ impl Library {
         units: Vec<(String, String)>,
         snapshot: Option<Vec<u8>>,
     ) -> Result<Library, SessionError> {
-        let source = Library::Sources {
-            units: std::sync::Arc::new(units),
-            snapshot: snapshot.map(std::sync::Arc::new),
-        };
-        let mut model = Model::new();
-        load_library_into(&mut model, &source)?;
+        Self::prepared_sources_with_format(units, snapshot, GraphFormat::LegacyV2)
+    }
+
+    /// Prepare library sources under the selected lowering/identity contract.
+    pub fn prepared_sources_with_format(
+        units: Vec<(String, String)>,
+        snapshot: Option<Vec<u8>>,
+        format: GraphFormat,
+    ) -> Result<Library, SessionError> {
+        let mut model = Model::with_graph_format(format);
+        for (name, src) in &units {
+            model.add_library_source(name.clone(), src);
+        }
+        // The prepared library keeps the recording it was prepared with, so a
+        // build that must resolve the library together with user units
+        // replays it. Without a usable snapshot (one that decodes for this
+        // graph format; one the preparing build rejects as stale is replaced
+        // the same way), preparing records one.
+        match snapshot
+            .as_deref()
+            .and_then(libcache::LibraryCache::from_bytes)
+            .filter(|cache| cache.graph_format() == format)
+        {
+            Some(cache) => model.set_library_cache(cache),
+            None => model.record_library_cache(),
+        }
         Ok(Library::Prepared(model.prepare_library()?))
+    }
+
+    /// A library decoded from a prepared snapshot
+    /// ([`sysmlv2_model::prepared::PreparedLibrary::to_bytes`]) of exactly
+    /// `units`, in this order: the snapshot is keyed by their content, and one
+    /// made by another toolkit build or from other units is refused, so the
+    /// caller can fall back to [`Self::prepared_sources`]. Decoding skips the
+    /// resolve and keeps no syntax trees. The optional `recording` (the sealed
+    /// resolution snapshot) stays encoded, for the builds that must resolve
+    /// the library together with user units after all.
+    pub fn prepared_snapshot(
+        units: Vec<(String, String)>,
+        snapshot: &[u8],
+        recording: Option<Vec<u8>>,
+    ) -> Result<Library, SessionError> {
+        Self::prepared_snapshot_with_format(units, snapshot, recording, GraphFormat::LegacyV2)
+    }
+
+    /// [`Self::prepared_snapshot`] over a snapshot fed in chunks
+    /// ([`sysmlv2_model::prepared::PreparedLibrary::from_chunks`]): `fill`
+    /// copies the next bytes of the `len`-byte snapshot into the buffer it is
+    /// given, so a host that holds the snapshot elsewhere never copies it
+    /// here whole.
+    pub fn prepared_snapshot_chunks<F: FnMut(&mut [u8]) -> usize>(
+        units: Vec<(String, String)>,
+        len: usize,
+        fill: F,
+        recording: Option<Vec<u8>>,
+    ) -> Result<Library, SessionError> {
+        let key = libcache::hash_units(
+            units
+                .iter()
+                .map(|(name, text)| (name.as_str(), text.as_str())),
+        );
+        let library = sysmlv2_model::prepared::PreparedLibrary::from_chunks(len, fill, key)
+            .filter(|library| library.graph_format() == GraphFormat::LegacyV2)
+            .ok_or_else(|| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the prepared snapshot was made by another toolkit build or from other library units",
+                ))
+            })?;
+        let library = match recording {
+            Some(bytes) => library.with_lazy_recording(bytes),
+            None => library,
+        };
+        Ok(Library::Prepared(std::sync::Arc::new(library)))
+    }
+
+    /// [`Self::prepared_snapshot`] under the selected lowering/identity contract.
+    pub fn prepared_snapshot_with_format(
+        units: Vec<(String, String)>,
+        snapshot: &[u8],
+        recording: Option<Vec<u8>>,
+        format: GraphFormat,
+    ) -> Result<Library, SessionError> {
+        let key = libcache::hash_units(
+            units
+                .iter()
+                .map(|(name, text)| (name.as_str(), text.as_str())),
+        );
+        let library = sysmlv2_model::prepared::PreparedLibrary::from_bytes(snapshot, key)
+            .filter(|library| library.graph_format() == format)
+            .ok_or_else(|| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the prepared snapshot was made by another toolkit build or from other library units",
+                ))
+            })?;
+        let library = match recording {
+            Some(bytes) => library.with_lazy_recording(bytes),
+            None => library,
+        };
+        Ok(Library::Prepared(std::sync::Arc::new(library)))
     }
 
     pub fn dir(path: impl Into<PathBuf>) -> Library {
@@ -1295,6 +1398,16 @@ pub fn check_sources_with_library(
     sources: &[(String, String)],
     lib: Option<&Library>,
 ) -> Result<Vec<CheckFinding>, SessionError> {
+    check_sources_with_graph_format(sources, lib, GraphFormat::LegacyV2)
+}
+
+/// Check sources under the selected lowering/identity contract. Prepared
+/// libraries must use the same format, as for session construction.
+pub fn check_sources_with_graph_format(
+    sources: &[(String, String)],
+    lib: Option<&Library>,
+    format: GraphFormat,
+) -> Result<Vec<CheckFinding>, SessionError> {
     let mut parsed = Vec::new();
     let mut findings = syntax_findings(sources, |source| {
         if lib.is_some() {
@@ -1305,7 +1418,7 @@ pub fn check_sources_with_library(
     // Referential + semantic checks: all cleanly-parsed units as one
     // model against the library.
     if let Some(lib) = lib {
-        let mut model = Model::new();
+        let mut model = Model::with_graph_format(format);
         let cache_path = load_library_into(&mut model, lib)?;
         for source in parsed {
             model.add_parsed_source(source);
@@ -1329,14 +1442,27 @@ pub fn check_sources_with_library(
     Ok(findings)
 }
 
+struct IdBindingMode<'a> {
+    enabled: bool,
+    strict: bool,
+    rebound_sites: Option<&'a [(usize, Span, Uuid)]>,
+}
+
 /// Re-apply a session's explicit ids after a rebuild and bind the
 /// references the lift could only spell as ids.
 fn apply_explicit_ids(
     resolved: &mut ResolvedModel,
     explicit_ids: &mut HashMap<Uuid, (Uuid, &'static str)>,
-    binds_ids: bool,
+    binding: IdBindingMode<'_>,
+    bindings: &mut sysmlv2_model::loader::IdReferenceBindings,
+    values: &mut sysmlv2_model::loader::IdReferenceBindings,
     warnings: &mut Vec<String>,
 ) {
+    let IdBindingMode {
+        enabled: binds_ids,
+        strict: strict_id_bindings,
+        rebound_sites,
+    } = binding;
     if explicit_ids.is_empty() && !binds_ids {
         // A text session: nothing to overlay, and a quoted name that
         // happens to look like an id stays a name.
@@ -1369,7 +1495,16 @@ fn apply_explicit_ids(
     if !binds_ids {
         return;
     }
-    let bound = resolved.bind_id_spelled_references();
+    let bound = if strict_id_bindings {
+        if let Some(sites) = rebound_sites {
+            *bindings = resolved.rekey_id_reference_bindings(sites);
+        }
+        let bound = resolved.bind_payload_id_references(bindings);
+        *values = resolved.payload_id_reference_values(bindings);
+        bound
+    } else {
+        resolved.bind_id_spelled_references_with(bindings)
+    };
     if !bound.is_empty() {
         // The lift's "cannot name reference target" notes for the ids
         // that are now bound no longer apply. A bound id with no element
@@ -1461,13 +1596,21 @@ fn syntax_findings(
 fn rebuild(
     sources: &[(String, String)],
     lib: Option<&Library>,
+    format: GraphFormat,
+    settled: Option<std::sync::Arc<SettledOutcomes>>,
 ) -> Result<(Model, ResolvedModel, usize), SessionError> {
     // Checked before the library loads: the payload emitters key every
     // unit by its name, so a blank one has no place to be laid out.
     if let Some((name, _)) = sources.iter().find(|(name, _)| name.trim().is_empty()) {
         return Err(SessionError::InvalidUnitName(name.clone()));
     }
-    let mut model = Model::new();
+    let mut model = Model::with_graph_format(format);
+    // The outcomes a previous build settled on, for this one to start
+    // from; the outcomes this one settles on are kept for the next.
+    match settled {
+        Some(settled) => model.start_from_settled(settled),
+        None => model.keep_settled_outcomes(),
+    }
     let mut cache_path = None;
     if let Some(lib) = lib {
         cache_path = load_library_into(&mut model, lib)?;
@@ -1585,16 +1728,71 @@ impl Session {
         sources: Vec<(String, String)>,
         lib: Option<Library>,
     ) -> Result<Session, SessionError> {
-        let (model, resolved, unit_offset) = rebuild(&sources, lib.as_ref())?;
+        let mut session =
+            Self::from_sources_with_graph_format(sources, lib, GraphFormat::LegacyV2)?;
+        session.enforce_graph_format = false;
+        Ok(session)
+    }
+
+    /// [`Self::from_sources_with_library`] with resolution started from
+    /// `settled`, the outcomes a previous session settled on (see
+    /// [`Self::settled_outcomes`]): on a prepared library, a unit lowered
+    /// to the references it was lowered to then takes their outcomes and
+    /// is confirmed in one pass when it resolves as it did, and any other
+    /// unit starts unresolved — what a language server rebuilding after an
+    /// edit starts from. The session answers as one built without.
+    pub fn from_sources_settled(
+        sources: Vec<(String, String)>,
+        lib: Option<Library>,
+        settled: Option<std::sync::Arc<SettledOutcomes>>,
+    ) -> Result<Session, SessionError> {
+        let mut session = Self::from_sources_with(sources, lib, GraphFormat::LegacyV2, settled)?;
+        session.enforce_graph_format = false;
+        Ok(session)
+    }
+
+    /// The outcomes this session's build settled on, for a session over
+    /// mostly the same units to start from (see
+    /// [`Self::from_sources_settled`]): `Some` only for a build on a
+    /// prepared library whose resolution ran its redo loop and settled;
+    /// `None` for a joint build, a build that resolved in one pass, or one
+    /// that did not settle. The session's own rebuilds — after an edit,
+    /// after a library load — start from them when there are any.
+    pub fn settled_outcomes(&self) -> Option<std::sync::Arc<SettledOutcomes>> {
+        self.model.settled_outcomes()
+    }
+
+    /// Open sources with an explicit lowering/identity contract. The selection
+    /// survives edits, library reloads and binary snapshots.
+    pub fn from_sources_with_graph_format(
+        sources: Vec<(String, String)>,
+        lib: Option<Library>,
+        format: GraphFormat,
+    ) -> Result<Session, SessionError> {
+        Self::from_sources_with(sources, lib, format, None)
+    }
+
+    /// [`Self::from_sources_with_graph_format`] started from `settled`.
+    fn from_sources_with(
+        sources: Vec<(String, String)>,
+        lib: Option<Library>,
+        format: GraphFormat,
+        settled: Option<std::sync::Arc<SettledOutcomes>>,
+    ) -> Result<Session, SessionError> {
+        let (model, resolved, unit_offset) = rebuild(&sources, lib.as_ref(), format, settled)?;
         Ok(Session {
             sources,
             lib,
             unit_offset,
             model,
+            enforce_graph_format: true,
             resolved,
             warnings: Vec::new(),
             explicit_ids: HashMap::new(),
             binds_ids: false,
+            strict_id_bindings: false,
+            id_reference_values: HashMap::new(),
+            id_reference_bindings: HashMap::new(),
         })
     }
 
@@ -1657,23 +1855,71 @@ impl Session {
         unit_names: &[String],
         indent: Indent,
     ) -> Result<Session, SessionError> {
+        Self::from_interchange_json_impl(
+            unwrap_flexo(value),
+            lib,
+            unit_names,
+            indent,
+            GraphFormat::LegacyV2,
+        )
+    }
+
+    /// Load interchange under an explicitly selected lowering/identity contract.
+    /// JSON carries no contract header; callers must retain this choice with the
+    /// document. Legacy payloads require migration before selecting canonical.
+    pub fn from_interchange_json_with_graph_format(
+        value: &serde_json::Value,
+        lib: Option<&Library>,
+        unit_names: &[String],
+        indent: Indent,
+        format: GraphFormat,
+    ) -> Result<Session, SessionError> {
         let value = unwrap_flexo(value);
+        sysmlv2_model::migration::validate_conditional_graph_format(&value, format).map_err(
+            |message| SessionError::Parse {
+                unit: "<interchange>".into(),
+                diagnostics: vec![Diagnostic::error(Span::default(), message)],
+            },
+        )?;
+        let mut session = Self::from_interchange_json_impl(value, lib, unit_names, indent, format)?;
+        session.enforce_graph_format = true;
+        Ok(session)
+    }
+
+    fn from_interchange_json_impl(
+        value: serde_json::Value,
+        lib: Option<&Library>,
+        unit_names: &[String],
+        indent: Indent,
+        format: GraphFormat,
+    ) -> Result<Session, SessionError> {
         let mut warnings = Vec::new();
         // Library ids are named through the same map the CLI seeds for
         // its JSON → text conversion.
-        let mut names = match lib {
+        let reference_hints = lib.map(|_| sysmlv2_model::loader::id_reference_bindings(&value));
+        let referenced = reference_hints
+            .as_ref()
+            .into_iter()
+            .flat_map(|hints| hints.values().copied())
+            .collect();
+        let (mut names, identity_fallbacks) = match lib {
             Some(l) => {
-                let mut model = Model::new();
+                let mut model = Model::with_graph_format(format);
                 let cache_path = load_library_into(&mut model, l)?;
-                let names = sysmlv2_model::json::library_name_map(&model);
+                let names = sysmlv2_model::json::library_reference_names(&model, &referenced);
                 if let (Some(path), Some(cache)) = (cache_path, model.take_recorded_library_cache())
                 {
                     let _ = cache.save(&path);
                 }
                 names
             }
-            None => Default::default(),
+            None => (HashMap::new(), HashSet::new()),
         };
+        let strict_id_bindings = !identity_fallbacks.is_empty();
+        let mut lift_names = names.clone();
+        for id in &identity_fallbacks {
+            lift_names.remove(id);
+        }
         // split_documents handles multi-root lists; a single-document
         // payload still carries its Flexo name on the root — extract it
         // the same way, since the unit name prefixes every ownership
@@ -1681,19 +1927,20 @@ impl Session {
         let docs: Vec<(Option<String>, serde_json::Value)> =
             sysmlv2_model::lift::split_documents(&value)
                 .unwrap_or_else(|| vec![(single_root_name(&value), value.clone())]);
-        names.extend(sysmlv2_model::lift::document_reference_name_map(&value));
+        let document_names = sysmlv2_model::lift::document_reference_name_map(&value);
+        names.extend(document_names.clone());
+        lift_names.extend(document_names);
         let mut sources = Vec::with_capacity(docs.len());
         for (i, (root_name, doc)) in docs.iter().enumerate() {
             let unit_name = unit_names
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| doc_unit_name(root_name.as_deref(), i));
-            let lifted = sysmlv2_model::lift::from_compact_json_with_names(doc, &names).map_err(
-                |message| SessionError::Parse {
+            let lifted = sysmlv2_model::lift::from_compact_json_with_names(doc, &lift_names)
+                .map_err(|message| SessionError::Parse {
                     unit: unit_name.clone(),
                     diagnostics: vec![Diagnostic::error(Span::default(), message)],
-                },
-            )?;
+                })?;
             warnings.extend(lifted.errors);
             // Lifted doc/comment bodies are dedented (interchange
             // normalization stripped their margins) — re-lay them.
@@ -1709,7 +1956,7 @@ impl Session {
                 ),
             ));
         }
-        let (model, mut resolved, unit_offset) = rebuild(&sources, lib)?;
+        let (model, mut resolved, unit_offset) = rebuild(&sources, lib, format, None)?;
         // Explicit ids: pair the loaded document's elements with the
         // rebuilt model's by ownership path (roots by document order),
         // and keep every id the document carried that the derivation
@@ -1726,16 +1973,37 @@ impl Session {
         let binds_ids = warnings
             .iter()
             .any(|w| w.contains("cannot name reference target"));
-        apply_explicit_ids(&mut resolved, &mut explicit_ids, binds_ids, &mut warnings);
+        let mut id_reference_bindings = if binds_ids {
+            reference_hints.unwrap_or_else(|| sysmlv2_model::loader::id_reference_bindings(&value))
+        } else {
+            HashMap::new()
+        };
+        let mut id_reference_values = HashMap::new();
+        apply_explicit_ids(
+            &mut resolved,
+            &mut explicit_ids,
+            IdBindingMode {
+                enabled: binds_ids,
+                strict: strict_id_bindings,
+                rebound_sites: None,
+            },
+            &mut id_reference_bindings,
+            &mut id_reference_values,
+            &mut warnings,
+        );
         Ok(Session {
             sources,
             lib: lib.cloned(),
             unit_offset,
             model,
+            enforce_graph_format: false,
             resolved,
             warnings,
             explicit_ids,
             binds_ids,
+            strict_id_bindings,
+            id_reference_values,
+            id_reference_bindings,
         })
     }
 
@@ -1752,11 +2020,26 @@ impl Session {
         (v, units)
     }
 
+    // With no lifted identity fallback, every remaining @ref is lexical.
+    // The strict fallback also preserves that distinction through exact slots.
+    // Older payload fallback sessions retain their compatibility interpretation.
+    fn uses_lexical_references(&self) -> bool {
+        self.strict_id_bindings || !self.binds_ids
+    }
+
     fn overlay(&self, v: &mut serde_json::Value) {
         if self.explicit_ids.is_empty() && !self.binds_ids {
             return;
         }
-        sysmlv2_model::loader::overlay_explicit_ids(v, &self.explicit_ids);
+        if self.uses_lexical_references() {
+            sysmlv2_model::loader::overlay_payload_ids(
+                v,
+                &self.explicit_ids,
+                &self.id_reference_values,
+            );
+        } else {
+            sysmlv2_model::loader::overlay_explicit_ids(v, &self.explicit_ids);
+        }
     }
 
     /// Whether the session holds **explicit ids** — ids the loaded
@@ -1789,11 +2072,28 @@ impl Session {
     /// [`Self::load_library`] over any [`Library`] source — in-memory
     /// `(unit name, text)` library units included (the WASM shape).
     pub fn load_library_from(&mut self, lib: Library) -> Result<(), SessionError> {
-        let (model, mut resolved, unit_offset) = rebuild(&self.sources, Some(&lib))?;
+        let (model, mut resolved, unit_offset) = rebuild(
+            &self.sources,
+            Some(&lib),
+            self.model.graph_format(),
+            self.model.settled_outcomes(),
+        )?;
+        let rebound_sites: Vec<_> = self
+            .resolved
+            .bound_id_reference_sites()
+            .into_iter()
+            .filter_map(|(u, s, id)| Some((u.checked_sub(self.unit_offset)? + unit_offset, s, id)))
+            .collect();
         apply_explicit_ids(
             &mut resolved,
             &mut self.explicit_ids,
-            self.binds_ids,
+            IdBindingMode {
+                enabled: self.binds_ids,
+                strict: self.strict_id_bindings,
+                rebound_sites: Some(&rebound_sites),
+            },
+            &mut self.id_reference_bindings,
+            &mut self.id_reference_values,
             &mut self.warnings,
         );
         self.lib = Some(lib);
@@ -1829,7 +2129,17 @@ impl Session {
         // each unit root's element index paired with its source path —
         // so decoders can lay the model back out as its original files.
         let (json, units) = self.compact_json_with_units_overlaid();
-        if self.has_explicit_ids() {
+        if self.model.graph_format() == GraphFormat::CanonicalV3 {
+            if self.has_explicit_ids() {
+                sysmlv2_cbor::to_compact_cbor_explicit_with_format(
+                    &json,
+                    &units,
+                    self.model.graph_format(),
+                )
+            } else {
+                sysmlv2_cbor::to_compact_cbor_with_format(&json, &units, self.model.graph_format())
+            }
+        } else if self.has_explicit_ids() {
             sysmlv2_cbor::to_compact_cbor_with_units_explicit(&json, &units)
         } else {
             sysmlv2_cbor::to_compact_cbor_with_units(&json, &units)
@@ -1861,11 +2171,20 @@ impl Session {
         }
         let names = self.library_id_names();
         let (json, units) = self.compact_json_with_units_overlaid();
-        Ok(sysmlv2_cbor::to_compact_cbor_elided_with_units(
-            &json,
-            &|s| names.get(s).cloned(),
-            &units,
-        )
+        Ok(if self.model.graph_format() == GraphFormat::CanonicalV3 {
+            sysmlv2_cbor::to_compact_cbor_elided_with_format(
+                &json,
+                &|s| names.get(s).cloned(),
+                &units,
+                self.model.graph_format(),
+            )
+        } else {
+            sysmlv2_cbor::to_compact_cbor_elided_with_units(
+                &json,
+                &|s| names.get(s).cloned(),
+                &units,
+            )
+        }
         .expect("session compact form is covered by the codec tables"))
     }
 
@@ -1879,6 +2198,7 @@ impl Session {
         base: &serde_json::Value,
         portable: bool,
     ) -> Result<Vec<u8>, SessionError> {
+        self.check_graph_document(base)?;
         // One emission feeds both the target and its unit table so the
         // indices line up by construction. Unit paths ride strict
         // deltas only — portable result indices are not exact.
@@ -1888,6 +2208,7 @@ impl Session {
             base,
             &target,
             &sysmlv2_cbor::DeltaOptions::new()
+                .with_graph_format(self.model.graph_format())
                 .with_portable(portable)
                 .with_units(units),
         )
@@ -1905,6 +2226,7 @@ impl Session {
         &self,
         base: &serde_json::Value,
     ) -> Result<Vec<u8>, SessionError> {
+        self.check_graph_document(base)?;
         // Same policy as the elided snapshot: an explicit-id session
         // produces no elided form.
         if self.has_explicit_ids() {
@@ -1915,7 +2237,9 @@ impl Session {
         sysmlv2_cbor::delta_compact_cbor_elided(
             base,
             &target,
-            &sysmlv2_cbor::DeltaOptions::new().with_units(units),
+            &sysmlv2_cbor::DeltaOptions::new()
+                .with_graph_format(self.model.graph_format())
+                .with_units(units),
             &|s| names.get(s).cloned(),
         )
         .map_err(SessionError::Cbor)
@@ -1950,8 +2274,30 @@ impl Session {
     /// with their pointed message — apply those with
     /// [`Self::apply_delta_cbor`].
     pub fn decode_cbor(&self, bytes: &[u8]) -> Result<serde_json::Value, SessionError> {
+        self.check_cbor_graph_format(bytes)?;
         let names = self.library_id_names();
-        sysmlv2_cbor::from_cbor_with(bytes, &|s| names.get(s).cloned()).map_err(SessionError::Cbor)
+        let value = sysmlv2_cbor::from_cbor_with(bytes, &|s| names.get(s).cloned())?;
+        self.check_graph_document(&value)?;
+        Ok(value)
+    }
+
+    fn check_graph_document(&self, value: &serde_json::Value) -> Result<(), SessionError> {
+        if !self.enforce_graph_format {
+            return Ok(());
+        }
+        sysmlv2_model::migration::validate_conditional_graph_format(
+            value,
+            self.model.graph_format(),
+        )
+        .map_err(|message| SessionError::Parse {
+            unit: "<interchange>".into(),
+            diagnostics: vec![Diagnostic::error(Span::default(), message)],
+        })
+    }
+
+    fn check_cbor_graph_format(&self, bytes: &[u8]) -> Result<(), SessionError> {
+        sysmlv2_cbor::assert_graph_format(bytes, self.model.graph_format())
+            .map_err(SessionError::Cbor)
     }
 
     /// Apply a delta payload against this session's model, returning
@@ -1983,7 +2329,9 @@ impl Session {
         base: &serde_json::Value,
         lenient: bool,
     ) -> Result<(serde_json::Value, sysmlv2_cbor::ApplyReport), SessionError> {
-        if lenient {
+        self.check_graph_document(base)?;
+        self.check_cbor_graph_format(bytes)?;
+        let result = if lenient {
             sysmlv2_cbor::apply_delta_cbor_lenient(bytes, base).map_err(SessionError::Cbor)
         } else {
             let names = self.library_id_names();
@@ -1992,7 +2340,9 @@ impl Session {
             // returned report always has base_matched.
             sysmlv2_cbor::apply_delta_cbor_report_with(bytes, base, &|s| names.get(s).cloned())
                 .map_err(SessionError::Cbor)
-        }
+        }?;
+        self.check_graph_document(&result.0)?;
+        Ok(result)
     }
 
     /// Open a session over a compact-form CBOR payload — the binary
@@ -2029,10 +2379,15 @@ impl Session {
         indent: Indent,
     ) -> Result<Session, SessionError> {
         let (value, units) = sysmlv2_cbor::from_compact_cbor_units(bytes)?;
+        let format = sysmlv2_cbor::graph_format(bytes)?;
         // Payloads carrying their unit structure restore the model's
         // original file layout: unit-path order is document order.
         let unit_names: Vec<String> = units.into_iter().map(|(_, path)| path).collect();
-        Self::from_interchange_json_indented(&value, lib, &unit_names, indent)
+        if format == GraphFormat::LegacyV2 {
+            Self::from_interchange_json_indented(&value, lib, &unit_names, indent)
+        } else {
+            Self::from_interchange_json_with_graph_format(&value, lib, &unit_names, indent, format)
+        }
     }
 
     /// Emit the session's model as full interchange JSON (derived
@@ -2041,12 +2396,56 @@ impl Session {
         self.to_full_json_with(true)
     }
 
+    /// Full-form export through checked specification-name property reads.
+    /// Refuses unavailable or approximate fields without emitting placeholders.
+    /// Explicit IDs and the session's closure policy are preserved.
+    pub fn to_full_json_strict(
+        &mut self,
+    ) -> Result<serde_json::Value, sysmlv2_model::json::SemanticExportError> {
+        self.resolved.to_full_json_strict()
+    }
+
     /// [`Self::to_full_json`] with unresolved-reference recovery
     /// annotations: when `recover_refs` is set, every reference that
     /// serializes as a dangling id also carries its source spelling, so
     /// a partial model survives emit → lift losslessly (the Flexo
     /// change-record path).
     pub fn to_full_json_with(&self, recover_refs: bool) -> serde_json::Value {
+        if self.uses_lexical_references() {
+            let mut resolved = ResolvedModel::build(&self.model);
+            let mut ids = self.explicit_ids.clone();
+            let mut bindings = self.id_reference_bindings.clone();
+            let mut values = self.id_reference_values.clone();
+            let mut warnings = Vec::new();
+            let sites = self.resolved.bound_id_reference_sites();
+            apply_explicit_ids(
+                &mut resolved,
+                &mut ids,
+                IdBindingMode {
+                    enabled: self.binds_ids,
+                    strict: true,
+                    rebound_sites: Some(&sites),
+                },
+                &mut bindings,
+                &mut values,
+                &mut warnings,
+            );
+            let compact = self.compact_json_overlaid();
+            return sysmlv2_model::full::resolved_compact_to_full_json(
+                &mut resolved,
+                &self.model,
+                compact,
+                sysmlv2_model::full::EmissionPolicy {
+                    unresolved: if recover_refs {
+                        sysmlv2_model::full::UnresolvedReferencePolicy::Preserve
+                    } else {
+                        sysmlv2_model::full::UnresolvedReferencePolicy::LegacyDanglingId
+                    },
+                    closures: Default::default(),
+                },
+            )
+            .expect("the boolean compatibility policies cannot reject");
+        }
         let mut v = sysmlv2_model::full::model_to_full_json_with(&self.model, recover_refs);
         self.overlay(&mut v);
         v
@@ -2082,7 +2481,7 @@ impl Session {
             })
             .collect();
         full_units.sort_by_key(|&(i, _)| i);
-        sysmlv2_cbor::to_full_cbor_with_units(&full, &full_units)
+        sysmlv2_cbor::to_full_cbor_with_format(&full, &full_units, self.model.graph_format())
             .expect("session full form is covered by the codec tables")
     }
 
@@ -2473,18 +2872,66 @@ impl Session {
         // site keeps its original spelling.)
         let sites: Vec<RefSite> = self.resolved.reference_sites().to_vec();
         // Primary sites (qualifier twins share the primary's span),
-        // sorted for chain-adjacency detection. Import targets resolve
-        // under their own rules (not `plain`), but they still respell
-        // safely: the plain resolver picks the candidate heuristically
-        // and the reparse verification below is the actual gate — a
-        // candidate the import rules read differently fails it and the
-        // site keeps its printed spelling.
-        let import_site =
-            |s: &RefSite| matches!(s.kind.as_str(), "importedNamespace" | "importedMembership");
+        // sorted for chain-adjacency detection. An import site's target
+        // names either a *namespace* — a package, via `Pkg::*`
+        // (`kind == "importedNamespace"`, `plain: false`) or `Pkg::**`
+        // (`kind == "importedMembership"`, `plain: true`, distinguished
+        // from a member import below only by the literal `::**` right
+        // after the site's span — the site itself spans just the package
+        // path, so the trailing stars are fixed text the splice never
+        // touches) — or one *specific member*, via `Pkg::member;`
+        // (`kind == "importedMembership"`, naming that one element).
+        //
+        // A namespace import's own target resolves safely: the package it
+        // names is reachable by plain lexical scoping on its own (it's an
+        // ordinarily-nested or top-level member), with no help from the
+        // import being tested, so a shorter candidate for it is never
+        // circular — this is the common, desired case (`$::Pkg::*`
+        // shortens to `Pkg::*`).
+        //
+        // A member import is different: its whole purpose is to make that
+        // one specific last segment resolve bare from its owning scope, so
+        // the generic "does a shorter suffix resolve here" probe always
+        // answers yes for it — via the very import being tested — no
+        // matter how deep the real path is. That produced a nonsensical
+        // self-referential rewrite (`import Pkg::Member;` collapsing to
+        // `import Member;`, which resolves nothing once reparsed) and,
+        // because the reparse-verify pass below bans whichever candidates
+        // shared that reparse batch, it was also silently taking down
+        // unrelated sibling references that only depend on the untouched
+        // import resolving correctly. So a member import's own target is
+        // never a respell candidate; leaving its text alone keeps
+        // `entry.target` intact for every other site, which is all those
+        // sites ever needed.
+        let is_recursive_namespace_import = |s: &RefSite| {
+            s.kind == "importedMembership"
+                && self.sources[s.unit - self.unit_offset]
+                    .1
+                    .get(s.span.end as usize..)
+                    .is_some_and(|rest| rest.starts_with("::**"))
+        };
+        let namespace_import_site =
+            |s: &RefSite| s.kind == "importedNamespace" || is_recursive_namespace_import(s);
+        let member_import_site =
+            |s: &RefSite| s.kind == "importedMembership" && !is_recursive_namespace_import(s);
+        // A feature-chain member (e.g. a flow endpoint like
+        // `a.b.c`) is recorded with `plain: false` (json.rs) precisely
+        // because it isn't independently resolvable — the chain-grouping
+        // pass below is what respells these safely, atomically, as a
+        // whole run. Excluding every non-plain, non-import site here
+        // (as if only `plain`/import sites existed) filtered chain
+        // members out before that pass ever saw them, so the lift's
+        // `$::`-rooted chain spelling (see `lift.rs`) was never
+        // shortened. `chain_root.is_some()` is exactly the marker
+        // json.rs sets for a resolvable chain member, so admit those too.
+        let chain_site = |s: &RefSite| s.chain_root.is_some();
         let mut primaries: Vec<&RefSite> = Vec::new();
         let mut seen: HashSet<(usize, u32, u32)> = HashSet::new();
         for s in &sites {
-            if (!s.plain && !import_site(s)) || s.kind == "qualifier" || s.unit < self.unit_offset {
+            if !s.plain && !chain_site(s) && !namespace_import_site(s) {
+                continue;
+            }
+            if member_import_site(s) || s.kind == "qualifier" || s.unit < self.unit_offset {
                 continue;
             }
             if seen.insert((s.unit, s.span.start, s.span.end)) {
@@ -2637,17 +3084,66 @@ impl Session {
                 out.push_str(&src[cursor..]);
                 new_src.1 = out;
             }
-            let (new_model, mut new_resolved, _off) = rebuild(&new_sources, self.lib.as_ref())
-                .map_err(|e| match e {
-                    SessionError::Parse { unit, diagnostics } => {
-                        TransformError::ReparseFailed { unit, diagnostics }
+            let (new_model, mut new_resolved, _off) = rebuild(
+                &new_sources,
+                self.lib.as_ref(),
+                self.model.graph_format(),
+                self.model.settled_outcomes(),
+            )
+            .map_err(|e| match e {
+                SessionError::Parse { unit, diagnostics } => {
+                    TransformError::ReparseFailed { unit, diagnostics }
+                }
+                // rebuild() reparses text — only Io is reachable here.
+                e => TransformError::ReparseFailed {
+                    unit: "<library>".into(),
+                    diagnostics: vec![Diagnostic::error(Span::default(), e.to_string())],
+                },
+            })?;
+            // Check the same identity-bound graph that would be committed.
+            // Keep overlay changes transactional until all checks succeed.
+            let mut next_ids = self.explicit_ids.clone();
+            let mut next_warnings = self.warnings.clone();
+            let mut next_bindings = self.id_reference_bindings.clone();
+            let mut next_values = self.id_reference_values.clone();
+            let rebound_sites: Vec<_> = self
+                .resolved
+                .bound_id_reference_sites()
+                .into_iter()
+                .filter_map(|(unit, span, id)| {
+                    if active
+                        .iter()
+                        .any(|c| c.unit == unit && c.start < span.end && c.end > span.start)
+                    {
+                        return None;
                     }
-                    // rebuild() reparses text — only Io is reachable here.
-                    e => TransformError::ReparseFailed {
-                        unit: "<library>".into(),
-                        diagnostics: vec![Diagnostic::error(Span::default(), e.to_string())],
-                    },
-                })?;
+                    let delta: i64 = active
+                        .iter()
+                        .filter(|c| c.unit == unit && c.end <= span.start)
+                        .map(|c| c.text.len() as i64 - (c.end - c.start) as i64)
+                        .sum();
+                    Some((
+                        unit,
+                        Span {
+                            start: (span.start as i64 + delta) as u32,
+                            end: (span.end as i64 + delta) as u32,
+                        },
+                        id,
+                    ))
+                })
+                .collect();
+            apply_explicit_ids(
+                &mut new_resolved,
+                &mut next_ids,
+                IdBindingMode {
+                    enabled: self.binds_ids,
+                    strict: self.strict_id_bindings,
+                    rebound_sites: Some(&rebound_sites),
+                },
+                &mut next_bindings,
+                &mut next_values,
+                &mut next_warnings,
+            );
             let post_sites: Vec<RefSite> = new_resolved.reference_sites().to_vec();
             let mut post_by_span: HashMap<(usize, u32, u32), ElementRef> = HashMap::new();
             for s in &post_sites {
@@ -2722,12 +3218,10 @@ impl Session {
             }
             report.respelled = active.len();
             self.sources = new_sources;
-            apply_explicit_ids(
-                &mut new_resolved,
-                &mut self.explicit_ids,
-                self.binds_ids,
-                &mut self.warnings,
-            );
+            self.explicit_ids = next_ids;
+            self.id_reference_bindings = next_bindings;
+            self.id_reference_values = next_values;
+            self.warnings = next_warnings;
             self.model = new_model;
             let policy = self.resolved.closure_policy();
             self.resolved = new_resolved;
@@ -2898,8 +3392,8 @@ pub enum SplitNaming {
 pub struct SplitOptions {
     pub naming: SplitNaming,
     /// Directory (unit-name prefix) for the new units; by default the
-    /// root's unit name without its extension (`models/TMT.sysml` →
-    /// `models/TMT`).
+    /// root's unit name without its extension (`models/Rover.sysml` →
+    /// `models/Rover`).
     pub directory: Option<String>,
     /// Unit names are URIs (an editor's workspace): the new units' file
     /// segments are percent-encoded the way editors spell a path
@@ -3355,6 +3849,10 @@ struct Planner<'s> {
     /// Pre-commit spans whose *contents* are edited or removed — old
     /// sites inside them carry no expectation.
     consumed: Vec<(usize, Span)>,
+    /// Operations explicitly replacing/deleting old reference text release its
+    /// payload identity evidence. Relocations must carry it or refuse instead.
+    released_identity_ranges: Vec<(usize, Span)>,
+    moved_identity_sites: Vec<MovedIdentitySites>,
     /// Reference sites carried inside moved text (`move_member`), to be
     /// re-verified at their post-insert positions.
     moved_expects: Vec<MovedExpects>,
@@ -3386,6 +3884,16 @@ struct Planner<'s> {
 /// after the commit sorts/dedups) plus each site's (offset within the
 /// splice text, length, pre-commit target qualified name; `None` =
 /// only require that it resolves).
+/// Exact byte provenance for unchanged UUID tokens copied by move_member.
+/// Unlike MovedExpects this preserves identity, including anonymous targets.
+struct MovedIdentitySites {
+    source_unit: usize,
+    unit: usize,
+    at: u32,
+    text: String,
+    sites: Vec<(Span, u32, Uuid)>,
+}
+
 struct MovedExpects {
     unit: usize,
     at: u32,
@@ -3400,6 +3908,8 @@ impl<'s> Planner<'s> {
             splices: Vec::new(),
             correspondence: Vec::new(),
             consumed: Vec::new(),
+            released_identity_ranges: Vec::new(),
+            moved_identity_sites: Vec::new(),
             moved_expects: Vec::new(),
             refuse_new_unresolved: false,
             projection_subjects: Vec::new(),
@@ -3679,6 +4189,7 @@ impl<'s> Planner<'s> {
                 .or_else(|| r.member_extent(e))
                 .ok_or(TransformError::NoEditableValue(e))?;
             self.consumed.push((unit, old.span));
+            self.released_identity_ranges.push((unit, old.span));
             self.splices.push(Splice {
                 unit,
                 start: old.span.start,
@@ -3726,6 +4237,7 @@ impl<'s> Planner<'s> {
             [(unit, span)] => {
                 // Replace the written clause in place.
                 self.consumed.push((*unit, *span));
+                self.released_identity_ranges.push((*unit, *span));
                 self.splices.push(Splice {
                     unit: *unit,
                     start: span.start,
@@ -3935,6 +4447,7 @@ impl<'s> Planner<'s> {
         let cut = cut_whole_lines(self.user_src(unit, e)?, extent);
         let (start, end) = (cut.start, cut.end);
         self.consumed.push((unit, cut));
+        self.released_identity_ranges.push((unit, cut));
         self.splices.push(Splice {
             unit,
             start,
@@ -4001,6 +4514,7 @@ impl<'s> Planner<'s> {
         // the old text, and untouched-site verification skips them.
         self.consumed
             .push((unit, Span::new(extent.start, extent.end)));
+        self.released_identity_ranges.push((unit, extent));
         self.splices.push(Splice {
             unit,
             start: extent.start,
@@ -4080,6 +4594,7 @@ impl<'s> Planner<'s> {
             .ok_or(TransformError::AnonymousTarget(to))?;
         let last_len = qn.rsplit("::").next().unwrap_or(&qn).len() as u32;
         self.consumed.push((site.unit, site.span));
+        self.released_identity_ranges.push((site.unit, site.span));
         self.splices.push(Splice {
             unit: site.unit,
             start: site.span.start,
@@ -4102,6 +4617,7 @@ impl<'s> Planner<'s> {
         index: Option<usize>,
     ) -> Result<(), TransformError> {
         let unit_offset = self.session.unit_offset;
+        let strict_identity = self.session.strict_id_bindings;
         let r = self.session.resolved();
         let (unit, extent) = r.member_extent(e).ok_or(TransformError::NoExtent(e))?;
         if unit < unit_offset {
@@ -4164,6 +4680,18 @@ impl<'s> Planner<'s> {
                 .collect()
         };
 
+        let identity_sites: Vec<_> = if strict_identity {
+            r.bound_id_reference_sites()
+                .into_iter()
+                .filter(|&(u, span, _)| {
+                    u == unit && span.start >= extent.start && span.end <= extent.end
+                })
+                .map(|(_, span, id)| (span, span.start - extent.start, id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Excise, with remove's whitespace discipline (no stranding
         // check — the text comes back; verification decides what broke).
         let src = self.user_src(unit, e)?;
@@ -4213,6 +4741,22 @@ impl<'s> Planner<'s> {
                 _ => return Err(TransformError::NoExtent(new_owner)),
             }
         };
+        if !identity_sites.is_empty() {
+            let prefix = ins_text
+                .find(&member_text)
+                .expect("move insertion contains the unchanged member")
+                as u32;
+            self.moved_identity_sites.push(MovedIdentitySites {
+                source_unit: unit,
+                unit: dunit,
+                at: ins_start,
+                text: ins_text.clone(),
+                sites: identity_sites
+                    .into_iter()
+                    .map(|(span, off, id)| (span, off + prefix, id))
+                    .collect(),
+            });
+        }
         if !inner_sites.is_empty() {
             let prefix = ins_text
                 .find(&member_text)
@@ -5058,19 +5602,23 @@ impl<'s> Planner<'s> {
             }
         }
         // Reparse + rebuild (rollback = return before swapping state).
-        let (new_model, mut new_resolved, unit_offset) =
-            rebuild(&new_sources, self.session.lib.as_ref()).map_err(|e| match e {
-                SessionError::Parse { unit, diagnostics } => {
-                    TransformError::ReparseFailed { unit, diagnostics }
-                }
-                // rebuild() reparses text — only Io is reachable here.
-                e => TransformError::ReparseFailed {
-                    unit: "<library>".into(),
-                    diagnostics: vec![Diagnostic::error(Span::default(), e.to_string())],
-                },
-            })?;
+        let (new_model, mut new_resolved, unit_offset) = rebuild(
+            &new_sources,
+            self.session.lib.as_ref(),
+            self.session.model.graph_format(),
+            self.session.model.settled_outcomes(),
+        )
+        .map_err(|e| match e {
+            SessionError::Parse { unit, diagnostics } => {
+                TransformError::ReparseFailed { unit, diagnostics }
+            }
+            // rebuild() reparses text — only Io is reachable here.
+            e => TransformError::ReparseFailed {
+                unit: "<library>".into(),
+                diagnostics: vec![Diagnostic::error(Span::default(), e.to_string())],
+            },
+        })?;
         debug_assert_eq!(unit_offset, self.session.unit_offset);
-
         // Offset mapping per unit: position -> post-commit position, or
         // None inside an edited range. A pure insertion (start == end)
         // sits *between* tokens: a span ending exactly there keeps its
@@ -5089,6 +5637,120 @@ impl<'s> Planner<'s> {
             }
             Some((pos as i64 + delta) as u32)
         };
+        // Resolve lifted identity references before semantic checks. Failed
+        // commits and dry runs must not retire ids or change session warnings.
+        let mut next_ids = self.session.explicit_ids.clone();
+        let mut next_warnings = self.session.warnings.clone();
+        let mut next_bindings = self.session.id_reference_bindings.clone();
+        let mut next_values = self.session.id_reference_values.clone();
+        let old_identity_sites = self.session.resolved.bound_id_reference_sites();
+        let known_identity_targets: HashSet<_> = if self.session.strict_id_bindings {
+            old_identity_sites
+                .iter()
+                .filter_map(|(_, _, id)| {
+                    self.session
+                        .resolved
+                        .element_by_id(&id.to_string())
+                        .map(|_| *id)
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut moved = HashMap::new();
+        if self.session.strict_id_bindings {
+            for carried in &self.moved_identity_sites {
+                let Some(index) = self.splices.iter().position(|splice| {
+                    splice.unit == carried.unit
+                        && splice.start == carried.at
+                        && splice.text == carried.text
+                }) else {
+                    continue;
+                };
+                for &(source, offset, id) in &carried.sites {
+                    let destination = Span::new(
+                        new_positions[index] + offset,
+                        new_positions[index] + offset + source.len(),
+                    );
+                    let key = (carried.source_unit, source.start, source.end, id);
+                    if moved.insert(key, (carried.unit, destination, id)).is_some() {
+                        return Err(TransformError::SemanticIdentity {
+                            broken: vec![format!(
+                                "payload identity reference {id} has ambiguous move provenance"
+                            )],
+                        });
+                    }
+                }
+            }
+        }
+        let mut rebound_sites = Vec::new();
+        for (unit, span, id) in old_identity_sites {
+            if self.session.strict_id_bindings {
+                if self.released_identity_ranges.iter().any(|&(u, range)| {
+                    u == unit && span.start >= range.start && span.end <= range.end
+                }) {
+                    continue;
+                }
+                if let Some(&destination) = moved.get(&(unit, span.start, span.end, id)) {
+                    rebound_sites.push(destination);
+                    continue;
+                }
+                if self.consumed.iter().any(|&(u, range)| {
+                    u == unit && span.start >= range.start && span.end <= range.end
+                }) {
+                    return Err(TransformError::SemanticIdentity {
+                        broken: vec![format!(
+                            "payload identity reference {id} at unit {unit} bytes {}..{} cannot be carried through this relocation",
+                            span.start, span.end
+                        )],
+                    });
+                }
+            }
+            match (shift(unit, span.start, false), shift(unit, span.end, true)) {
+                (Some(start), Some(end)) => rebound_sites.push((unit, Span::new(start, end), id)),
+                _ if self.session.strict_id_bindings => {
+                    return Err(TransformError::SemanticIdentity {
+                        broken: vec![format!(
+                            "payload identity reference {id} was consumed without replacement or move provenance"
+                        )],
+                    });
+                }
+                _ => {}
+            }
+        }
+        apply_explicit_ids(
+            &mut new_resolved,
+            &mut next_ids,
+            IdBindingMode {
+                enabled: self.session.binds_ids,
+                strict: self.session.strict_id_bindings,
+                rebound_sites: Some(&rebound_sites),
+            },
+            &mut next_bindings,
+            &mut next_values,
+            &mut next_warnings,
+        );
+
+        if self.session.strict_id_bindings {
+            let rebound: HashSet<_> = new_resolved
+                .bound_id_reference_sites()
+                .into_iter()
+                .map(|(unit, span, id)| (unit, span.start, span.end, id))
+                .collect();
+            for &(unit, span, id) in &rebound_sites {
+                if !rebound.contains(&(unit, span.start, span.end, id))
+                    || (known_identity_targets.contains(&id)
+                        && new_resolved.element_by_id(&id.to_string()).is_none())
+                {
+                    return Err(TransformError::SemanticIdentity {
+                        broken: vec![format!(
+                            "payload identity reference {id} would lose its target or binding after the edit"
+                        )],
+                    });
+                }
+            }
+        }
+
         let in_consumed = |unit: usize, sp: Span| {
             self.consumed
                 .iter()
@@ -5528,12 +6190,10 @@ impl<'s> Planner<'s> {
         // Success — swap the session to the new state.
         if !dry_run {
             self.session.sources = new_sources;
-            apply_explicit_ids(
-                &mut new_resolved,
-                &mut self.session.explicit_ids,
-                self.session.binds_ids,
-                &mut self.session.warnings,
-            );
+            self.session.explicit_ids = next_ids;
+            self.session.id_reference_bindings = next_bindings;
+            self.session.id_reference_values = next_values;
+            self.session.warnings = next_warnings;
             self.session.model = new_model;
             let policy = self.session.resolved.closure_policy();
             self.session.resolved = new_resolved;

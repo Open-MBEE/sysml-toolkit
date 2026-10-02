@@ -140,6 +140,14 @@ impl StdlibResolver {
     /// Refuse an artifact generated under different codec axes than
     /// this build decodes with — same doctrine as the wire header.
     pub fn assert_compatible(&self) -> Result<(), Error> {
+        self.assert_compatible_with_format(sysmlv2_model::model::GraphFormat::LegacyV2)
+    }
+
+    /// Require the resolver's graph contract to match the consuming model.
+    pub fn assert_compatible_with_format(
+        &self,
+        format: sysmlv2_model::model::GraphFormat,
+    ) -> Result<(), Error> {
         if self.tables_version != crate::tables::CBOR_TABLES_VERSION {
             return Err(Error::of(
                 ErrorKind::UnsupportedVersion,
@@ -150,13 +158,13 @@ impl StdlibResolver {
                 ),
             ));
         }
-        if self.scheme_version != crate::ID_SCHEME_VERSION {
+        if self.scheme_version != format.version() {
             return Err(Error::of(
                 ErrorKind::UnsupportedVersion,
                 format!(
                     "resolver artifact id-scheme version {} unsupported (this build carries {})",
                     self.scheme_version,
-                    crate::ID_SCHEME_VERSION
+                    format.version()
                 ),
             ));
         }

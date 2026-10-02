@@ -588,6 +588,29 @@ fn expose_makes_members_referencable() {
     );
 }
 
+/// The ambient libraries that load with the standard library claim no
+/// generic root names: user packages named `Web` and `Template` are their
+/// own, and references through them resolve.
+#[test]
+fn user_roots_named_web_and_template_are_not_shadowed() {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .expect("library");
+    sysmlv2_parser::ambient::add_to(&mut model);
+    model.add_source(
+        "t.sysml",
+        "package Template {\n    part def Invoice;\n}\npackage Web {\n    part def Storefront;\n}\n\
+         package Uses {\n    part inv : Template::Invoice;\n    part shop : Web::Storefront;\n}\n",
+    );
+    assert!(!model.has_errors(), "test source must parse cleanly");
+    let msgs: Vec<String> = validate_model(&model)
+        .into_iter()
+        .map(|(_, d)| d.message)
+        .collect();
+    assert!(msgs.is_empty(), "{msgs:#?}");
+}
+
 /// Corpus ratchet: referential findings over the full corpus + library.
 /// Visibility enforcement exposes references that previously leaked
 /// through private memberships, and ambiguity is now counted separately
@@ -716,6 +739,12 @@ fn referential_root_shadows_library_root() {
 /// -> (63, 24, 2, 2) once named documentation and comment elements
 /// became members their namespace binds, so `comment about cmt` reaches
 /// a `comment cmt /* … */` sibling.
+/// -> (25, 24, 2, 2) once declared connector ends bind in their owner
+/// scope and nested references retain the connected feature's context.
+/// -> (22, 20, 2, 2) once anonymous reference-only requirement usages stop
+/// colliding with declared requirement names: three requirement-root references
+/// and one nested feature cease to be ambiguous, resolving three downstream
+/// requirement-chain references as well.
 #[test]
 fn corpus_referential_ratchet() {
     let root = sysmlv2_testkit::corpus_root();
@@ -726,7 +755,10 @@ fn corpus_referential_ratchet() {
     let files = sysmlv2_testkit::user_files();
     for f in &files {
         let src = fs::read_to_string(f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     let diags = validate_model(&model);
     let unresolved = diags
@@ -747,7 +779,7 @@ fn corpus_referential_ratchet() {
         .count();
     assert_eq!(
         (unresolved, ambiguous, aliases, cycles),
-        (63, 24, 2, 2),
+        (22, 20, 2, 2),
         "referential ratchet moved — improvements should only lower these"
     );
 }
@@ -981,7 +1013,10 @@ fn corpus_semantic_constraints_clean() {
         .expect("library");
     for f in sysmlv2_testkit::user_files() {
         let src = fs::read_to_string(&f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     let diags = sysmlv2_parser::check::validate_semantics(&model);
     // The single long-standing exception here was a
@@ -1001,8 +1036,8 @@ fn corpus_semantic_constraints_clean() {
     assert_eq!(
         msgs,
         [
-            "Turbojet Stage Analysis.sysml — expression combines incompatible quantity dimensions `L^6` and `Θ`",
-            "VehicleGeometryAndCoordinateFrames.sysml — expression combines incompatible quantity dimensions `1` and `L`",
+            "sysml/src/examples/Analysis Examples/Turbojet Stage Analysis.sysml — expression combines incompatible quantity dimensions `L^6` and `Θ`",
+            "sysml/src/examples/Geometry Examples/VehicleGeometryAndCoordinateFrames.sysml — expression combines incompatible quantity dimensions `1` and `L`",
         ],
         "unexpected semantic findings on the corpus"
     );
@@ -1017,6 +1052,25 @@ fn verdicts(src: &str) -> Vec<(Option<String>, sysmlv2_parser::check::Constraint
         .into_iter()
         .map(|c| (c.name, c.verdict))
         .collect()
+}
+
+#[test]
+fn uncertain_chained_index_constraints_stay_undecided() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let checks = verdicts(
+        "package P {
+            part def A {
+                attribute xs[4] ordered;
+                attribute flag[1];
+                attribute items[0..*] ordered = if flag ? xs else xs;
+            }
+            part def B { attribute items[1] = 99; }
+            part a : A[1]; part b : B[1];
+            assert constraint selected { (a, b).items#(2) == 99 }
+        }",
+    );
+    assert_eq!(checks.len(), 1);
+    assert!(matches!(checks[0].1, Undecided(_)), "{checks:?}");
 }
 
 #[test]
@@ -1083,12 +1137,12 @@ fn defaults_read_through_an_unbound_subject_are_undecided() {
                  part cartridge : Cartridge;
              }
              requirement def FitForService {
-                 subject unit : Filter;
+                 subject unit : Filter[1];
                  require constraint fromDefault { unit.ratedHours >= 250 }
                  require constraint fromFixed { unit.portCount == 6 }
                  require constraint throughChain { unit.cartridge.micron <= 1 }
              }
-             part installed : Filter;
+             part installed : Filter[1];
              assert constraint onAUsage { installed.ratedHours == 40 }
          }",
     );
@@ -1111,7 +1165,7 @@ fn unknown_receivers_do_not_commit_to_type_defaults() {
     let vs = verdicts(
         "package P {
             part def Choice { attribute enabled default = false; }
-            part installed : Choice;
+            part installed : Choice[1];
             attribute externalDefault default = true;
             calc def Identity { in x; return y = x; }
             calc def Read { in x : Choice; return y = x.enabled; }
@@ -1130,7 +1184,7 @@ fn unknown_receivers_do_not_commit_to_type_defaults() {
                 part concrete : Choice = installed;
             }
             requirement def Eligibility {
-                subject unit : Device;
+                subject unit : Device[1];
                 ref part requested : Choice;
                 ref part aliasUnit : Device = unit;
                 require constraint referenceDefault { requested.enabled }
@@ -1200,7 +1254,7 @@ fn unknown_receiver_methods_follow_redefined_defaults() {
                 }}
                 part def Specialized :> Base {{ {declaration} {value}; }}
                 requirement def R {{
-                    subject unit : Specialized;
+                    subject unit : Specialized[1];
                     require constraint direct {{ unit.ready }}
                     require constraint method {{ unit.enabled }}
                 }}
@@ -1228,7 +1282,7 @@ fn unknown_receivers_do_not_taint_imported_concrete_values() {
         "package Globals {
             attribute flag default = true;
             part def Child { attribute flag default = true; }
-            part installed : Child;
+            part installed : Child[1];
         }
         package P {
             part def Device {
@@ -1237,7 +1291,7 @@ fn unknown_receivers_do_not_taint_imported_concrete_values() {
                 attribute nested = installed.flag;
             }
             requirement def R {
-                subject unit : Device;
+                subject unit : Device[1];
                 require constraint scalar { unit.scalar }
                 require constraint nested { unit.nested }
             }
@@ -1261,7 +1315,11 @@ fn corpus_constraint_verdicts_ratchet() {
         .expect("library");
     for f in sysmlv2_testkit::user_files() {
         let src = fs::read_to_string(&f).unwrap();
-        model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+        // Distinct source paths can share a basename; keep their identity seeds distinct.
+        model.add_source(
+            sysmlv2_testkit::relative_source_name(&sysmlv2_testkit::corpus_root(), f.as_path()),
+            &src,
+        );
     }
     let checks = sysmlv2_parser::check::check_constraints(&model);
     let count = |v: fn(&sysmlv2_parser::check::ConstraintVerdict) -> bool| {
@@ -1284,8 +1342,14 @@ fn corpus_constraint_verdicts_ratchet() {
         // fabricated size of 1 emptied the range and made the forAll
         // vacuously true — never-actually-checked constraints now read
         // honestly undecided.
-        (4, 0, 119),
-        "constraint-verdict ratchet moved — violated must stay 0;          satisfied should only grow via evaluator improvements"
+        // 4 → 3 when a scenario's redefined samples inherited [0..*].
+        // Its size-dependent range was previously empty only because
+        // the collection placeholder was miscounted as one sample.
+        // 3 → 1 when subject bindings stopped treating package-owned
+        // collections as singleton receivers. Recovering these verdicts
+        // requires binding/cardinality inference, not a blanket default.
+        (1, 0, 122),
+        "constraint-verdict ratchet moved — violated must stay 0; changes require an explained improvement or soundness correction"
     );
 }
 
@@ -1843,4 +1907,182 @@ fn target_successions_must_be_adjacent_to_their_anchor() {
         2,
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn multiplicity_validation_preserves_exact_large_endpoints() {
+    for (lo, hi) in [
+        ("9007199254740993", "9007199254740992"),
+        (
+            "170141183460469231731687303715884105729",
+            "170141183460469231731687303715884105728",
+        ),
+    ] {
+        let bad = sem_warnings(&format!("part p[{lo}..{hi}];"));
+        assert_eq!(
+            bad,
+            [format!(
+                "Error: multiplicity lower bound {lo} exceeds upper bound {hi}"
+            )]
+        );
+        for range in [
+            format!("{hi}..{lo}"),
+            format!("{lo}..{lo}"),
+            format!("{lo}..*"),
+        ] {
+            let good = sem_warnings(&format!("part p[{range}];"));
+            assert!(good.is_empty(), "{range}: {good:?}");
+        }
+    }
+    let huge = format!("1{}", "0".repeat(400));
+    let bigger = format!("2{}", "0".repeat(400));
+    let bad = sem_warnings(&format!("part p[{bigger}..{huge}];"));
+    assert_eq!(
+        bad,
+        [format!(
+            "Error: multiplicity lower bound {bigger} exceeds upper bound {huge}"
+        )]
+    );
+    assert!(sem_warnings(&format!("part p[{huge}..*];")).is_empty());
+    let negative = sem_warnings(&format!("attribute n = -{huge}; part p[n];"));
+    assert_eq!(negative, ["Error: multiplicity upper bound is negative"]);
+    let tiny = sem_warnings("attribute n = -1e-400; part p[n];");
+    assert!(
+        tiny.iter().any(|m| m.contains("Natural number")),
+        "{tiny:?}"
+    );
+    assert!(tiny.iter().any(|m| m.contains("negative")), "{tiny:?}");
+}
+
+#[test]
+fn multiplicity_conformance_uses_exact_valid_intervals() {
+    for (small, large) in [
+        (
+            "9007199254740992".to_string(),
+            "9007199254740993".to_string(),
+        ),
+        (
+            "170141183460469231731687303715884105728".to_string(),
+            "170141183460469231731687303715884105729".to_string(),
+        ),
+        (
+            format!("1{}", "0".repeat(400)),
+            format!("2{}", "0".repeat(400)),
+        ),
+    ] {
+        for (kind, base, child) in [
+            (":>>", format!("{large}..*"), format!("{small}..*")),
+            (":>>", format!("0..{small}"), format!("0..{large}")),
+            (":>", format!("0..{small}"), format!("0..{large}")),
+            (":>", format!("0..{large}"), "*".into()),
+        ] {
+            let findings = sem_warnings(&format!(
+                "part def A {{ part x[{base}]; }} part def B :> A {{ part y[{child}] {kind} x; }}"
+            ));
+            assert_eq!(findings.len(), 1, "{base} {kind} {child}: {findings:?}");
+            assert!(findings[0].starts_with("Warning:"), "{findings:?}");
+            assert!(findings[0].contains(&large), "{findings:?}");
+        }
+        for (base, child) in [
+            (format!("{large}..*"), format!("0..{small}")),
+            ("*".into(), large),
+        ] {
+            let findings = sem_warnings(&format!(
+                "part def A {{ part x[{base}]; }} part def B :> A {{ part y[{child}] :> x; }}"
+            ));
+            assert!(findings.is_empty(), "{base} :> {child}: {findings:?}");
+        }
+    }
+    for invalid in ["3..2", "1.5", "true", "*..2"] {
+        let findings = sem_warnings(&format!(
+            "part def A {{ part x[1]; }} part def B :> A {{ part y[{invalid}] :>> x; }}"
+        ));
+        assert!(!findings.is_empty());
+        assert!(
+            findings.iter().all(|m| !m.contains("is not within")),
+            "{invalid}: {findings:?}"
+        );
+    }
+    for invalid in ["3..2", "1.5", "true", "*..2"] {
+        let findings = sem_warnings(&format!(
+            "part def A {{ part x[{invalid}]; }} part def B :> A {{ part y[1] :>> x; }}"
+        ));
+        assert!(!findings.is_empty());
+        assert!(
+            findings.iter().all(|m| !m.contains("is not within")),
+            "base {invalid}: {findings:?}"
+        );
+    }
+    let unknown =
+        sem_warnings("attribute n; part def A { part x[1]; } part def B :> A { part y[n] :>> x; }");
+    assert!(unknown.is_empty(), "{unknown:?}");
+}
+
+#[test]
+fn exact_multiplicity_findings_preserve_replay_and_source_provenance() {
+    use std::sync::Arc;
+    use sysmlv2_parser::{
+        check, json::ResolvedModel, libcache::LibraryCache, prepared::PreparedLibrary,
+    };
+    let library = "package Bounds { attribute n = 9007199254740992;
+        part def Base { part x[0..n]; } }";
+    let user = "part bad[9007199254740993..Bounds::n];
+        part def Child :> Bounds::Base { part y[0..9007199254740993] :> x; }";
+    let mut base = Model::new();
+    base.add_library_source("bounds.sysml", library);
+    base.record_library_cache();
+    ResolvedModel::build(&base);
+    let cache =
+        LibraryCache::from_bytes(&base.take_recorded_library_cache().unwrap().to_bytes()).unwrap();
+    let prepared = base.prepare_library().unwrap();
+    let decoded =
+        Arc::new(PreparedLibrary::from_bytes(&prepared.to_bytes(37).unwrap(), 37).unwrap());
+    let mut expected = None;
+    for mode in 0..4 {
+        let mut model = Model::new();
+        match mode {
+            2 => Arc::clone(&prepared).install(&mut model).unwrap(),
+            3 => Arc::clone(&decoded).install(&mut model).unwrap(),
+            _ => {
+                model.add_library_source("bounds.sysml", library);
+                if mode == 1 {
+                    model.set_library_cache(cache.clone());
+                }
+            }
+        }
+        model.add_source("user.sysml", user);
+        assert!(!model.has_errors());
+        let mut r = ResolvedModel::build(&model);
+        for _ in 0..2 {
+            let findings: Vec<_> = check::validate_semantics_with(&mut r, &model)
+                .into_iter()
+                .map(|(unit, d)| {
+                    assert!(!model.is_library_unit(unit));
+                    (
+                        model.unit(unit).name.clone(),
+                        d.span.start,
+                        d.span.end,
+                        format!("{:?}", d.severity),
+                        d.message,
+                    )
+                })
+                .collect();
+            assert_eq!(findings.len(), 2, "{mode}: {findings:?}");
+            assert!(
+                findings[0]
+                    .4
+                    .contains("9007199254740993 exceeds upper bound 9007199254740992")
+            );
+            assert!(
+                findings[1]
+                    .4
+                    .contains("subsetting multiplicity upper bound 9007199254740993")
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&findings, expected, "mode {mode}");
+            } else {
+                expected = Some(findings);
+            }
+        }
+    }
 }

@@ -122,7 +122,7 @@ fn main() {
         user.sort();
         for f in &user {
             let src = fs::read_to_string(f).unwrap();
-            model.add_source(f.file_name().unwrap().to_string_lossy().into_owned(), &src);
+            model.add_source(sysmlv2_testkit::relative_source_name(root, f), &src);
         }
         let _ = sysmlv2_parser::json::model_to_compact_json(&model);
         model_time = model_time.min(t.elapsed().as_secs_f64());

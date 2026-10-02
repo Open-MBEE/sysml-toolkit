@@ -223,10 +223,10 @@
     "diagnostics": [
       {
         "end": 151,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 151
+        "start": 150
       }
     ],
     "status": "diagnostic baseline"
@@ -235,10 +235,10 @@
     "diagnostics": [
       {
         "end": 170,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 170
+        "start": 169
       }
     ],
     "status": "diagnostic baseline"
@@ -246,18 +246,11 @@
   "negative/grammar/g11-assignment-without-target.sysml": {
     "diagnostics": [
       {
-        "end": 178,
-        "message": "expected `:=` in assignment, found `}`",
+        "end": 172,
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 177
-      },
-      {
-        "end": 178,
-        "message": "expected an expression, found `}`",
-        "severity": "Error",
-        "stage": "parse",
-        "start": 177
+        "start": 171
       }
     ],
     "status": "diagnostic baseline"
@@ -381,10 +374,10 @@
     "diagnostics": [
       {
         "end": 182,
-        "message": "missing `;` after filter expression",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 182
+        "start": 181
       }
     ],
     "status": "diagnostic baseline"
@@ -637,10 +630,10 @@
     "diagnostics": [
       {
         "end": 173,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 173
+        "start": 172
       }
     ],
     "status": "diagnostic baseline"
@@ -649,10 +642,10 @@
     "diagnostics": [
       {
         "end": 177,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 177
+        "start": 176
       }
     ],
     "status": "diagnostic baseline"
@@ -661,10 +654,10 @@
     "diagnostics": [
       {
         "end": 169,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 169
+        "start": 168
       }
     ],
     "status": "diagnostic baseline"
@@ -673,10 +666,10 @@
     "diagnostics": [
       {
         "end": 182,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 182
+        "start": 181
       }
     ],
     "status": "diagnostic baseline"
@@ -692,10 +685,10 @@
       },
       {
         "end": 177,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 177
+        "start": 176
       }
     ],
     "status": "diagnostic baseline"
@@ -752,10 +745,10 @@
     "diagnostics": [
       {
         "end": 220,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 220
+        "start": 219
       }
     ],
     "status": "diagnostic baseline"
@@ -776,10 +769,10 @@
     "diagnostics": [
       {
         "end": 168,
-        "message": "missing `;` at end of declaration",
+        "message": "expected a name, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 168
+        "start": 167
       }
     ],
     "status": "diagnostic baseline"
@@ -807,10 +800,10 @@
     "diagnostics": [
       {
         "end": 169,
-        "message": "missing `;` at end of declaration",
+        "message": "expected an expression, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 169
+        "start": 168
       }
     ],
     "status": "diagnostic baseline"
@@ -837,6 +830,13 @@
         "severity": "Error",
         "stage": "parse",
         "start": 219
+      },
+      {
+        "end": 221,
+        "message": "unsupported or unexpected construct at `;`",
+        "severity": "Error",
+        "stage": "parse",
+        "start": 220
       }
     ],
     "status": "diagnostic baseline"
@@ -845,10 +845,10 @@
     "diagnostics": [
       {
         "end": 218,
-        "message": "missing `;` at end of declaration",
+        "message": "expected a name, found `;`",
         "severity": "Error",
         "stage": "parse",
-        "start": 218
+        "start": 217
       }
     ],
     "status": "diagnostic baseline"
@@ -2924,14 +2924,14 @@
       },
       {
         "end": 374,
-        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "message": "Cannot override the non-default value of `S46FeatureValueOverriding::P::a`, bound at negative/semantic/s46-feature-value-overriding.sysml:5:33; the inherited value must be default to allow a new value [validateFeatureValueOverriding]",
         "severity": "Error",
         "stage": "semantics",
         "start": 373
       },
       {
         "end": 431,
-        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "message": "Cannot override the non-default value of `S46FeatureValueOverriding::P::a`, bound at negative/semantic/s46-feature-value-overriding.sysml:5:33; the inherited value must be default to allow a new value [validateFeatureValueOverriding]",
         "severity": "Error",
         "stage": "semantics",
         "start": 430
@@ -4892,7 +4892,7 @@
       },
       {
         "end": 254,
-        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "message": "Cannot override the non-default value of `P::C::a`, bound at probes/validateFeatureValueOverriding.kerml:6:31; the inherited value must be default to allow a new value [validateFeatureValueOverriding]",
         "severity": "Error",
         "stage": "semantics",
         "start": 253
@@ -4918,7 +4918,7 @@
       },
       {
         "end": 234,
-        "message": "Cannot override an inherited binding value; the redefined value must be default [validateFeatureValueOverriding]",
+        "message": "Cannot override the non-default value of `P::D::a`, bound at probes/validateFeatureValueOverriding.sysml:3:88; the inherited value must be default to allow a new value [validateFeatureValueOverriding]",
         "severity": "Error",
         "stage": "semantics",
         "start": 233

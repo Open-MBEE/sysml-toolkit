@@ -2,7 +2,7 @@
 //! element the standard corpus emits, digested per (metaclass, property)
 //! and pinned in `tests/fixtures/full-form-baseline.tsv`.
 //!
-//! The gate that the derived-property port (plan §33) runs under: a
+//! The gate that the derived-property port runs under: a
 //! change to the emitter must leave every (metaclass, property) digest
 //! identical except for the names the change deliberately promotes. A
 //! difference prints the changed pairs, so a promotion is adjudicated

@@ -9,9 +9,10 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
     let mut out = Vec::new();
     // --- invocation arity ---
     // A user-defined calculation invoked with fewer positional arguments
-    // than its declared `in`/`inout` parameters leaves the trailing
-    // parameters unbound — the result can never compute unless they carry
-    // defaults. Named bindings must name a parameter exactly once.
+    // than its `in`/`inout` parameters, its own and those it inherits,
+    // leaves the trailing parameters unbound — the result can never
+    // compute unless they carry defaults. Named bindings must name a
+    // parameter exactly once.
     // Warnings are conservatively scoped: lambda bodies skipped, and both
     // caller and callee must be outside the standard library (KFL
     // functions overload their parameter lists).
@@ -32,17 +33,23 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         if model.is_library_unit(unit) {
             continue;
         }
+        let origin = r.b.set_identity_origin(owner);
         let mut sites = Vec::new();
         collect_invocations(&expr, &mut sites);
         for (qn, args, span) in sites {
             let Some(callee) = r.b.resolve(scope, qn, 0) else {
                 continue;
             };
-            let Some(params) = r.b.in_params.get(&callee).cloned() else {
-                continue;
-            };
             if model.is_library_unit(r.b.unit_of_elem(callee)) {
                 continue; // Library signatures can overload or use variadics.
+            }
+            // The inputs evaluation binds: own, then inherited. A callee
+            // with none is not checked, nor one whose names are ambiguous.
+            let Some(bindings) = r.b.calc_parameter_bindings(callee) else {
+                continue;
+            };
+            if bindings.is_empty() {
+                continue;
             }
             if args.iter().any(|a| a.name.is_some())
                 && !matches!(
@@ -50,10 +57,12 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
                     "CalculationDefinition" | "CalculationUsage" | "Function" | "Expression"
                 )
             {
-                // Requirements/cases also bind implicit subject parameters;
-                // in_params alone is not their complete callable signature.
+                // Requirements/cases also bind the subject their implied
+                // library bases declare; the written heritage alone is not
+                // their complete callable signature.
                 continue;
             }
+            let params: Vec<String> = bindings.iter().map(|p| p.name.clone()).collect();
             let mut bound = HashSet::new();
             let mut positional = 0;
             let mut invalid = false;
@@ -94,16 +103,16 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
             if invalid {
                 continue;
             }
-            let fields = r.b.ctor_fields.get(&callee);
-            let missing: Vec<_> = params
+            // A parameter with a default need not be bound, and one no name
+            // reaches is read by nothing.
+            let missing: Vec<_> = bindings
                 .iter()
-                .filter(|name| {
-                    !bound.contains(*name)
-                        && !fields
-                            .and_then(|fs| fs.iter().find(|(n, _)| n == *name))
-                            .is_some_and(|(_, e)| r.b.values.contains_key(e))
+                .filter(|p| {
+                    !p.name.is_empty()
+                        && !bound.contains(&p.name)
+                        && !r.b.values.contains_key(&p.element.0)
                 })
-                .cloned()
+                .map(|p| p.name.clone())
                 .collect();
             if !missing.is_empty() {
                 out.push((
@@ -121,6 +130,7 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
                 ));
             }
         }
+        r.b.identity_origin_unit = origin;
     }
     out
 }
@@ -144,8 +154,7 @@ fn collect_invocations<'a>(
         | ExprKind::Ref(_)
         | ExprKind::Extent { .. }
         | ExprKind::MetadataAccess { .. }
-        | ExprKind::Body { .. }
-        | ExprKind::BodyTerminator => {}
+        | ExprKind::Body { .. } => {}
         ExprKind::Conditional {
             cond,
             then_branch,
@@ -201,6 +210,46 @@ fn collect_invocations<'a>(
         ExprKind::Sequence(items) => {
             for i in items {
                 collect_invocations(i, out);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{json::ResolvedModel, model::Model};
+
+    #[test]
+    fn inherited_inputs_count_toward_arity() {
+        let declarations = "calc def Diff { in a; in b; return r = a - b; }
+             calc def D3 :> Diff { in x; }
+             calc def D2 :> Diff { in :>> b; }
+             calc def Child :> Diff;";
+        for (call, expected) in [
+            ("D3(10, 3)", None),
+            ("D3(10)", Some("`b` never bound")),
+            ("Child(10, 3)", None),
+            ("Child(10)", Some("`b` never bound")),
+            ("D2(10)", None),
+            ("D2(10, 3)", Some("supplies 2 arguments for 1 parameter")),
+        ] {
+            let mut model = Model::new();
+            model.add_source(
+                "arity.sysml",
+                &format!("package P {{ {declarations} attribute v = {call}; }}"),
+            );
+            assert!(!model.has_errors(), "{call}");
+            let mut r = ResolvedModel::build(&model);
+            let findings: Vec<String> = super::validate(&mut r, &model)
+                .into_iter()
+                .map(|(_, d)| d.message)
+                .collect();
+            match expected {
+                None => assert!(findings.is_empty(), "{call}: {findings:?}"),
+                Some(message) => assert!(
+                    findings.len() == 1 && findings[0].contains(message),
+                    "{call}: {findings:?}"
+                ),
             }
         }
     }

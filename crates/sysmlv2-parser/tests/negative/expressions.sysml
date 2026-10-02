@@ -1,7 +1,7 @@
 // Hazard: expression forms — dangling operators, unclosed groups,
 // negative multiplicity bounds (grammatically literal/reference only).
 package P {
-    attribute a = 1 + ; //~ ERROR missing `;` at end of declaration
+    attribute a = 1 + ; //~ ERROR expected an expression, found `;`
     part def Fine1;
     attribute b = (1, 2; //~ ERROR expected `)`
     part def Fine2;

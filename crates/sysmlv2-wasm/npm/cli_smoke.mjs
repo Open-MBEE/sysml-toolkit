@@ -31,13 +31,20 @@ const wasmPath =
   process.env.SYSMLV2_CLI_WASM ?? join(npmDir, "pkg", "cli", "sysmlv2-cli.wasm");
 
 // Size budget: the artifact is fetched lazily by browsers; growth past
-// this line should be a conscious decision, not drift.
-const SIZE_BUDGET = 4 * 1024 * 1024;
+// this line should be a conscious decision, not drift. Set at 4.5 MiB
+// once checked semantic contracts had taken the compiled binary from
+// 3,549,140 bytes in v0.9.1 to 4,163,555 (1.16 to 1.40 MB gzip, 0.87 to
+// 1.05 MB brotli): about 440 KB of new model semantics and 130 KB of
+// standard-library generics instantiated for it. The build's size
+// optimizer then ships it at 3,664,665 (1.36 MB gzip), 1.05 MB below
+// the line.
+const SIZE_BUDGET = 4.5 * 1024 * 1024;
 const size = statSync(wasmPath).size;
 if (size > SIZE_BUDGET) {
   throw new Error(`cli wasm is ${size} bytes — over the ${SIZE_BUDGET} budget`);
 }
-console.log(`artifact: ${wasmPath} (${(size / 1024 / 1024).toFixed(2)} MB)`);
+const mib = (bytes) => (bytes / 1024 / 1024).toFixed(2);
+console.log(`artifact: ${wasmPath} (${mib(size)} of ${mib(SIZE_BUDGET)} MiB budget)`);
 
 const mod = new WebAssembly.Module(readFileSync(wasmPath));
 const work = mkdtempSync(join(tmpdir(), "sysmlv2-cli-smoke-"));
@@ -84,7 +91,9 @@ function expect(cond, label, r) {
   console.log(`ok: ${label}`);
 }
 
-// The ambient model directory, preopened at /model.
+// The ambient model directory, preopened at /model. Usages a package
+// owns are [0..*] unless declared, so the ones the query and range
+// cases read as single values declare [1].
 const modelDir = join(work, "model");
 mkdirSync(modelDir);
 writeFileSync(
@@ -93,11 +102,11 @@ writeFileSync(
 );
 writeFileSync(
   join(modelDir, "power.sysml"),
-  "package Rover {\n    private import Chassis::*;\n    part base : Frame;\n    attribute payload = 8.5;\n    attribute totalMass = base.mass + payload;\n}\n"
+  "package Rover {\n    private import Chassis::*;\n    part base : Frame[1];\n    attribute payload[1] = 8.5;\n    attribute totalMass[1] = base.mass + payload;\n}\n"
 );
 writeFileSync(
   join(modelDir, "limits.sysml"),
-  "package Limits {\n    attribute def Real;\n    attribute x : Real;\n    assert constraint lo { x >= 1 }\n    assert constraint hi { x <= 5 }\n}\n"
+  "package Limits {\n    attribute def Real;\n    attribute x : Real[1];\n    assert constraint lo { x >= 1 }\n    assert constraint hi { x <= 5 }\n}\n"
 );
 const ambient = {
   env: { SYSMLV2_MODEL_DIR: "/model" },

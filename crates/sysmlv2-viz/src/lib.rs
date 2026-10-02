@@ -48,7 +48,7 @@ mod sequence;
 
 pub use graph::{GraphError, graph};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::str::FromStr;
@@ -428,14 +428,19 @@ impl VizOptions {
     }
 }
 
-/// What a *view usage* directs: the rendering style its `render` member
-/// requests (when it maps onto a PlantUML view) and the diagram roots its
+/// What a *view usage* directs: the rendering style its rendering
+/// requests (when it maps onto a PlantUML view) — its own `render`
+/// member's, else the one it inherits, as
+/// [`ResolvedModel::view_rendering`] reads it — and the diagram roots its
 /// `expose`/`filter` members admit. Exposure reduces to the finest
 /// exposed granularity — an exposed container whose members are also
 /// individually exposed yields the members (so filtered-out siblings
 /// stay off the diagram) — and connector end features and metadata
-/// usages drop (they render through their owners). `None` when the
-/// element is not a view usage.
+/// usages drop (they render through their owners). So does a member the
+/// view reaches only through inheritance: a type's visible members
+/// include the ones it inherits, so exposing `amp : Amp` exposes `Amp`'s
+/// ports too, and they render on `amp`'s own box rather than beside it.
+/// `None` when the element is not a view usage.
 pub fn view_directed(
     r: &mut ResolvedModel,
     view: ElementRef,
@@ -448,20 +453,35 @@ pub fn view_directed(
         Some("asInterconnectionDiagram") => Some(View::Interconnection),
         _ => None,
     };
+    let exposed = r.view_exposed_elements(view);
+    // Only a member no expose reaches through ownership can have arrived
+    // through inheritance; the inheritance walk runs only when one did.
+    let reach = ExposeReach::of(r, view);
+    let unowned: HashSet<ElementRef> = exposed
+        .iter()
+        .copied()
+        .filter(|&x| !reach.owns(r, x))
+        .collect();
+    let inherited = if unowned.is_empty() {
+        HashSet::new()
+    } else {
+        reach.inherited_members(r, &exposed)
+    };
     // Connector end features and metadata usages drop *before* the
     // granularity pass — they render through their owners, and an
     // exposed connector must not read as a container just because its
-    // own ends were enumerated.
-    let exposed: Vec<ElementRef> = r
-        .view_exposed_elements(view)
+    // own ends were enumerated. Inherited members drop there as well, so
+    // a definition the view exposes whole is not taken apart for them.
+    let exposed: Vec<ElementRef> = exposed
         .into_iter()
         .filter(|&x| {
             r.element_type(x) != "MetadataUsage"
                 && r.owning_membership_type(x) != Some("EndFeatureMembership")
+                && !(unowned.contains(&x) && inherited.contains(&x))
         })
         .collect();
-    let set: std::collections::HashSet<ElementRef> = exposed.iter().copied().collect();
-    let mut coarse: std::collections::HashSet<ElementRef> = std::collections::HashSet::new();
+    let set: HashSet<ElementRef> = exposed.iter().copied().collect();
+    let mut coarse: HashSet<ElementRef> = HashSet::new();
     for &x in &exposed {
         let mut cur = r.owner(x);
         while let Some(o) = cur {
@@ -476,6 +496,131 @@ pub fn view_directed(
         .filter(|x| !coarse.contains(x))
         .collect();
     Some((style, roots))
+}
+
+/// How a view's own `expose` relationships reach elements through
+/// ownership. `expose x;` names `x`; `expose x::*;` lists the members
+/// `x` owns; the `::**` forms also list everything owned below those,
+/// and `expose x::**;` names `x` as well. A bracket filter wraps the
+/// import that names the target in a package of its own, owned by the
+/// expose, which the reach reads through.
+#[derive(Default)]
+struct ExposeReach {
+    /// Elements an expose names.
+    named: HashSet<ElementRef>,
+    /// Namespaces whose owned members an expose lists, each with whether
+    /// the listing descends into the namespaces it lists.
+    listed: BTreeMap<ElementRef, bool>,
+}
+
+impl ExposeReach {
+    fn of(r: &mut ResolvedModel, view: ElementRef) -> ExposeReach {
+        let mut reach = ExposeReach::default();
+        for rel in r.owned_relationships(view) {
+            if !matches!(r.element_type(rel), "NamespaceExpose" | "MembershipExpose") {
+                continue;
+            }
+            let Some(mut target) = import_target(r, rel) else {
+                continue;
+            };
+            // A bracket filter's package: the import it holds names the
+            // actual target.
+            if r.owning_membership_type(target.0) == Some("NamespaceExpose") {
+                let inner = r
+                    .owned_relationships(target.0)
+                    .into_iter()
+                    .find_map(|inner| import_target(r, inner));
+                let Some(inner) = inner else {
+                    continue;
+                };
+                target = inner;
+            }
+            let (element, namespace, recursive) = target;
+            if !namespace {
+                reach.named.insert(element);
+            }
+            if namespace || recursive {
+                *reach.listed.entry(element).or_default() |= recursive;
+            }
+        }
+        reach
+    }
+
+    /// Whether an expose reaches `x` through ownership.
+    fn owns(&self, r: &mut ResolvedModel, x: ElementRef) -> bool {
+        if self.named.contains(&x) {
+            return true;
+        }
+        let mut direct = true;
+        let mut cur = r.owner(x);
+        while let Some(o) = cur {
+            if self.listed.get(&o).is_some_and(|&deep| deep || direct) {
+                return true;
+            }
+            direct = false;
+            cur = r.owner(o);
+        }
+        false
+    }
+
+    /// The members inherited by everything the exposure enumerates:
+    /// each listed namespace (a plain `x::*` takes in `x`'s implied
+    /// library heritage too), everything a descending listing owns —
+    /// including what the view's conditions reject, whose admitted
+    /// members stay exposed — and every exposed element, which covers
+    /// namespaces reached through imports.
+    fn inherited_members(
+        &self,
+        r: &mut ResolvedModel,
+        exposed: &[ElementRef],
+    ) -> HashSet<ElementRef> {
+        let mut visits: Vec<(ElementRef, bool)> =
+            self.listed.keys().map(|&ns| (ns, true)).collect();
+        let mut below: Vec<ElementRef> = self
+            .listed
+            .iter()
+            .filter(|&(_, &deep)| deep)
+            .map(|(&ns, _)| ns)
+            .collect();
+        let mut seen: HashSet<ElementRef> = below.iter().copied().collect();
+        while let Some(ns) = below.pop() {
+            for member in r.owned_members(ns) {
+                if seen.insert(member) {
+                    visits.push((member, false));
+                    below.push(member);
+                }
+            }
+        }
+        visits.extend(
+            exposed
+                .iter()
+                .filter(|x| !seen.contains(x))
+                .map(|&x| (x, false)),
+        );
+        let mut members = HashSet::new();
+        for (e, implied) in visits {
+            for membership in r.inherited_memberships(e, implied) {
+                members.extend(r.membership_member(membership));
+            }
+        }
+        members
+    }
+}
+
+/// What an import-family relationship targets — a membership read
+/// through to its member — with whether it lists the target's members
+/// (`::*`) and whether it descends (`::**`).
+fn import_target(r: &mut ResolvedModel, rel: ElementRef) -> Option<(ElementRef, bool, bool)> {
+    let (namespace, key) = match r.element_type(rel) {
+        "NamespaceImport" | "NamespaceExpose" => (true, "importedNamespace"),
+        "MembershipImport" | "MembershipExpose" => (false, "importedMembership"),
+        _ => return None,
+    };
+    let props = r.element_properties(rel);
+    let recursive = props.get("isRecursive").and_then(|v| v.as_bool()) == Some(true);
+    let target = r.element_by_id(props.get(key)?.get("@id")?.as_str()?)?;
+    let target = r.membership_member(target).unwrap_or(target);
+    Some((target, namespace, recursive))
 }
 
 /// Emit the configured view of `root` (or of every top-level user

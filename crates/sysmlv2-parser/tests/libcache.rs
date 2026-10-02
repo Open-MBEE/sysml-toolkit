@@ -180,14 +180,15 @@ fn stale_fingerprint_disables_replay_soundly() {
     let cold = serde_json::to_string(&model_to_compact_json(&model)).unwrap();
     let cache = model.take_recorded_library_cache().unwrap();
 
-    // Flip the fingerprint on disk (offset: 8 magic + 1 + version len) and
-    // re-seal the trailing whole-file checksum, simulating a cache recorded
-    // against different lowering rather than plain corruption.
+    // Flip the fingerprint on disk (offset: 8 magic + 1 + build len + 1
+    // graph format + 1 fixed point) and re-seal the trailing whole-file
+    // checksum, simulating a cache recorded against different lowering
+    // rather than plain corruption.
     let dir = std::env::temp_dir().join(format!("sysmlv2-libcache-fp-{}", std::process::id()));
     let path = dir.join("stdlib.libcache");
     cache.save(&path).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
-    let fp_off = 9 + bytes[8] as usize;
+    let fp_off = 11 + bytes[8] as usize;
     bytes[fp_off] ^= 0xff;
     let body_len = bytes.len() - 8;
     let mut h: u64 = 0xcbf29ce484222325;
@@ -295,9 +296,11 @@ fn header_carries_a_source_fingerprint_beyond_the_crate_version() {
 fn cache_from_another_toolkit_build_is_rejected() {
     fn sealed_empty_cache(build: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"SYSML6LC");
+        buf.extend_from_slice(b"SYSML8LC");
         buf.push(build.len() as u8);
         buf.extend_from_slice(build);
+        buf.push(2); // legacy authored graph format
+        buf.push(1); // the library's own fixed point
         buf.extend_from_slice(&0u64.to_le_bytes()); // pending fingerprint
         for _ in 0..4 {
             buf.extend_from_slice(&0u64.to_le_bytes()); // empty tables
@@ -380,4 +383,256 @@ fn anonymous_redefinition_fanout_survives_library_replay() {
     model.set_library_cache(cache);
     assert_eq!(model_to_compact_json(&model), cold);
     assert!(sysmlv2_parser::check::validate_model(&model).is_empty());
+}
+
+/// xorshift64* — tiny, deterministic, no dependencies.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn pick<'a>(&mut self, choices: &[&'a str]) -> &'a str {
+        choices[(self.next() % choices.len() as u64) as usize]
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// The keywords a generated source spells its definitions and features
+/// with, and the extension of its units.
+struct Dialect {
+    definition: &'static str,
+    feature: &'static str,
+    extension: &'static str,
+}
+
+const SYSML: Dialect = Dialect {
+    definition: "part def",
+    feature: "part",
+    extension: "sysml",
+};
+
+const KERML: Dialect = Dialect {
+    definition: "class",
+    feature: "feature",
+    extension: "kerml",
+};
+
+/// Members of a generated definition: typings, subsettings and
+/// redefinitions of names its bases may or may not supply, nested
+/// definitions, aliases and nested bodies.
+fn generated_members(rng: &mut Rng, d: &Dialect, depth: usize) -> String {
+    let (def, feature) = (d.definition, d.feature);
+    let mut out = String::new();
+    for k in 0..rng.below(5) {
+        out += &match rng.below(9) {
+            0 | 1 => {
+                let ty = rng.pick(&[
+                    "Inner", "Inner2", "X", "K", "T", "Y", "AX", "Q::T", "Other::X", "A",
+                ]);
+                format!("{feature} f{k} : {ty}; ")
+            }
+            2 => format!("{feature} :>> {}; ", rng.pick(&["y", "z", "w"])),
+            3 => format!("{feature} g{k} :> {}; ", rng.pick(&["y", "z", "w"])),
+            4 => match rng.pick(&["Inner", "Inner2", "T", "y"]) {
+                "y" => format!("{feature} y; "),
+                name => format!("{def} {name}; "),
+            },
+            5 if depth < 2 => {
+                let ty = rng.pick(&["Inner", "X", "K", "T"]);
+                format!(
+                    "{feature} h{k} : {ty} {{ {}}} ",
+                    generated_members(rng, d, depth + 1)
+                )
+            }
+            6 => format!("{feature} {}; ", rng.pick(&["y", "z"])),
+            7 => format!("alias Al{k} for {}; ", rng.pick(&["X", "K", "Inner"])),
+            _ => {
+                let redefined = rng.pick(&["y", "z", "w", "v"]);
+                let ty = rng.pick(&["Inner", "Inner2", "T"]);
+                format!("{feature} :>> {redefined} : {ty}; ")
+            }
+        };
+    }
+    out
+}
+
+/// A library whose references miss root names a model may supply: `X`
+/// and `Y` live in a package the library never imports, `Q` usually
+/// nowhere.
+fn generated_library(rng: &mut Rng, d: &Dialect) -> String {
+    let (def, feature) = (d.definition, d.feature);
+    let mut other = String::new();
+    for name in ["X", "Y"] {
+        let base = if rng.below(100) < 40 {
+            format!(" :> {}", rng.pick(&["L::K", "L::A", "Y"]))
+        } else {
+            String::new()
+        };
+        if name == "Y" && base.ends_with('Y') {
+            continue;
+        }
+        other += &format!(
+            "{def} {name}{base} {{ {feature} y; {feature} z; {def} Inner; \
+             {def} Inner2 {{ {feature} w; }} {}}} ",
+            generated_members(rng, d, 1)
+        );
+    }
+    let mut l = String::new();
+    for _ in 0..rng.below(3) {
+        l += rng.pick(&[
+            "import Q::*; ",
+            "private import Q::*; ",
+            "import X::*; ",
+            "private import Other::X; ",
+            "import Q::**; ",
+            "import Q::T; ",
+            "alias AX for X; ",
+        ]);
+    }
+    let names = ["K", "A", "B", "C", "D"];
+    for (i, name) in names.iter().take(2 + rng.below(4)).enumerate() {
+        let mut bases: Vec<&str> = Vec::new();
+        for _ in 0..rng.below(3) {
+            let base = rng.pick(&["X", "Y", "K", "A", "B", "AX", "Q::T", "Other::Y", "T"]);
+            if !names[i..].contains(&base) && !bases.contains(&base) {
+                bases.push(base);
+            }
+        }
+        let spec = if bases.is_empty() {
+            String::new()
+        } else {
+            format!(" :> {}", bases.join(", "))
+        };
+        l += &format!("{def} {name}{spec} {{ {}}} ", generated_members(rng, d, 0));
+    }
+    let q = if rng.below(100) < 20 {
+        format!("package Q {{ {def} T {{ {feature} y; }} }} ")
+    } else {
+        String::new()
+    };
+    format!("package Other {{ {other}}} package L {{ {l}}} {q}")
+}
+
+/// A model that supplies some of the names the library missed, through
+/// root declarations and root imports, and refers into the library.
+fn generated_model(rng: &mut Rng, d: &Dialect) -> String {
+    let (def, feature) = (d.definition, d.feature);
+    let mut out = String::new();
+    for _ in 0..=rng.below(3) {
+        out += &match rng.below(8) {
+            0 => "private import Other::*; ".to_string(),
+            1 => "public import Other::X; ".to_string(),
+            2 => format!("{def} X {{ {feature} y; {feature} z; {def} Inner; {def} Inner2; }} "),
+            3 => format!("package Q {{ {def} T {{ {feature} y; {feature} w; }} {def} Inner; }} "),
+            4 => format!("{def} Inner; "),
+            5 => format!("{def} T {{ {feature} z; }} "),
+            6 => format!("package X {{ {def} Inner; {def} Inner2 {{ {feature} y; }} }} "),
+            _ => format!("{feature} y; "),
+        };
+    }
+    out + &format!(
+        "package P {{ {feature} a : L::A; {feature} k : L::K; {feature} m :> L::K::y; }}"
+    )
+}
+
+/// Differential gate for library resolution recordings and prepared
+/// libraries: over generated libraries and models that supply names the
+/// library missed, a build replaying a recording of the library alone,
+/// one on the library prepared alone, and one on the library prepared
+/// while recording (whose joint builds replay that recording) must equal
+/// a cold build.
+/// Whatever an outcome reads — lookup caches another reference filled,
+/// other references' recorded outcomes, the recorded lookup graph — must
+/// carry the root misses behind it, or the replay keeps a stale outcome;
+/// and whether resolution runs its later passes must not depend on
+/// whether the library resolves alone. Each seed generates one pair per
+/// dialect. Deeper runs:
+/// `REPLAY_FUZZ_ITERS=100000 cargo test --release --test libcache`.
+#[test]
+fn replayed_generated_libraries_match_cold_builds() {
+    let iters: u64 = std::env::var("REPLAY_FUZZ_ITERS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(500);
+    let mut checked = 0;
+    for seed in 1..=iters {
+        for (d, stream) in [(&SYSML, 0), (&KERML, 0x5EED)] {
+            let mut rng = Rng((seed ^ stream).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let library = generated_library(&mut rng, d);
+            let user = generated_model(&mut rng, d);
+            let (library_unit, user_unit) = (
+                format!("lib.{}", d.extension),
+                format!("user.{}", d.extension),
+            );
+            let mut cold = Model::new();
+            let parsed = cold
+                .add_library_source(&library_unit, &library)
+                .diagnostics
+                .is_empty()
+                && cold.add_source(&user_unit, &user).diagnostics.is_empty();
+            if !parsed {
+                continue;
+            }
+            let mut recorder = Model::new();
+            recorder.add_library_source(&library_unit, &library);
+            recorder.record_library_cache();
+            let _ = library_to_compact_json(&recorder);
+            let recording = recorder.take_recorded_library_cache().unwrap();
+            let mut replay = Model::new();
+            replay.add_library_source(&library_unit, &library);
+            replay.set_library_cache(LibraryCache::from_bytes(&recording.to_bytes()).unwrap());
+            replay.add_source(&user_unit, &user);
+            let mut alone = Model::new();
+            alone.add_library_source(&library_unit, &library);
+            let mut prepared = Model::new();
+            alone
+                .prepare_library()
+                .unwrap()
+                .install(&mut prepared)
+                .unwrap();
+            prepared.add_source(&user_unit, &user);
+            let mut recording_alone = Model::new();
+            recording_alone.add_library_source(&library_unit, &library);
+            recording_alone.record_library_cache();
+            let mut replaying = Model::new();
+            recording_alone
+                .prepare_library()
+                .unwrap()
+                .install(&mut replaying)
+                .unwrap();
+            replaying.add_source(&user_unit, &user);
+            for (build, model) in [
+                ("replayed", &replay),
+                ("prepared", &prepared),
+                ("prepared-and-replaying", &replaying),
+            ] {
+                for (graph, of) in [
+                    (
+                        "user",
+                        model_to_compact_json as fn(&Model) -> serde_json::Value,
+                    ),
+                    ("library", library_to_compact_json),
+                ] {
+                    assert!(
+                        of(model) == of(&cold),
+                        "{} seed {seed}: the {build} {graph} graph diverged from a cold build\n\
+                         library: {library}\nmodel: {user}",
+                        d.extension
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > iters, "most generated sources parse");
 }

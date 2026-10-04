@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.10.2
+
+### Fixed
+
+- A feature with no value of its own takes the value of a feature it subsets when the two must be equal: it has at least one value and the subsetted feature at most one. `subject :>> crawler :> tinycrawler;` in an analysis performed once (`[1]`) now reads `tinycrawler`, so the analysis result evaluates as it does with `= tinycrawler`. A subsetting feature that says more than the subsetted one, with members of its own or a type the subsetted feature does not have, keeps its own reading.
+
+## v0.10.1
+
+### Added
+
+- Satisfaction claims are verified as a whole. Each `satisfy R by x;` gets one verdict, positioned on its statement: in `sysmlv2 verify` output (with the constraints behind a claim that is not satisfied listed under it), in the WebAssembly `verify` report's `satisfactions`, as a language-server code lens, and from Rust `check::satisfaction_claims`. A requirement's assumptions imply its required constraints and the requirements it composes, so a claim whose assumption fails holds vacuously, and a claim is undecided only when the known verdicts do not settle it. `not satisfy` inverts the verdict, and a requirement with no constraint to evaluate leaves its claim undecided.
+- Rust `check::constraint_checks` returns the ordinary constraint verdicts over an already resolved model.
+
+### Changed
+
+- Quantity values evaluate sooner in models built on a prepared library. Preparing the standard library now records the dimensions of its quantity types and the expansions of its units (it had looked for the measurement unit type in the wrong package and recorded none), builds on the prepared library keep those records through every resolution pass, and an evaluation in progress reuses a unit's expansion unless a feature that expansion reads is being evaluated or overridden. On a model that imports the quantity libraries, the first inlay hint after an edit takes about a fifth less time and the first hover about a third less; preparing the standard library from its sources takes about 0.4 s longer.
+- Hover, inlay hints, and code lenses answer sooner after an edit to a model built on a prepared library. A session derives the implied specializations and positional redefinitions of its own elements only, on top of those its prepared library derives once for its own; the language server's inlay hints and code lenses and WebAssembly `Session.verify` verify the session's resolved model instead of resolving the model again; and the typing, membership, and element-by-id indexes extend the prepared library's instead of covering every element again. On a model that imports the quantity libraries, the first hover or inlay hint after an edit takes a few milliseconds instead of a few hundred. An evaluation that ran out of steps deriving those relationships for the whole model may now complete.
+- Inlay hints and code lenses answer sooner on models with satisfaction claims or calculations. A claim's subjects are read from the memberships of its requirement's types, and whether a calculation runs statements is answered through the specialization index, instead of scanning every element or every specialization, the standard library's included, on every verification. On a model that imports the quantity libraries, this takes about a third off the first inlay hint after an edit.
+- Sessions on a prepared library build, check and plan sooner after an edit. The semantic checks pass over the library's elements and specialization rows without testing them; a session keeps the library's part of its lookup tables (per-scope lookup caches, relationship owners, specializations and multiplicities by element, chain redefinitions) instead of rebuilding it over the library's rows; its positional planning reads what the library's planning derived for the library's types instead of planning them again; and the inherited memberships of the library's scopes are read from the library's own build. On a model that imports the quantity libraries, a session builds in half the time, the WebAssembly `Session.check` takes about a third of the time, and the language server's first hover and first inlay hint after an edit about a third.
+- `sysmlv2 verify` reports each satisfaction claim once, at its `satisfy` statement, instead of once per constraint at the requirement's constraint; the tally counts claims. A plain `constraint` member of a requirement is no longer part of the requirement's satisfaction (its `require` and `assume` members, assertions and nested requirements are).
+
+### Fixed
+
+- An unnamed usage that only references another feature (`satisfy R by x;`, `assert c;`) no longer answers a simple name. Two claims on a requirement declared in an enclosing namespace each resolve `R` to the requirement instead of to each other; a qualified path still reaches such a usage through the spelling it references.
+- A claim that declares its own requirement (`satisfy requirement : R by x;`) is checked against `R`'s constraints; it was skipped.
+- A valued redefinition of a feature chain (`attribute :>> chassis.mass = 2.5 [kg];`) supplies its value when the chain is read through the redefining part: directly, inside an inherited formula such as `totalMass = chassis.mass`, and from parts that specialize it.
+
+### Upgrade notes
+
+- `sysmlv2 verify` reports each satisfaction claim on one line at its `satisfy` statement (`SatisfyRequirementUsage, satisfies R by x`) instead of one `satisfies R` line per constraint at the requirement's constraint. The constraints behind a claim that is not satisfied follow it on indented lines that the tally does not count, so the tally counts each claim once. The WebAssembly `verify` report's `summary` now counts claims alongside constraints. Tools that read claim verdicts should read the claim lines, or the report's `satisfactions`.
+- A plain `constraint` member of a requirement no longer takes part in a claim's satisfaction, so a claim that failed only on one of them may now be satisfied or undecided. Declare the member `require constraint` (or `assume constraint` for a precondition) to keep it in the check.
+- Rust `VerifyReport` gains a `satisfactions` field, and `SatisfactionInfo` gains `unit`, `span`, `by`, `negated` and `nodes`. Code that constructs these structs or destructures them exhaustively needs updating.
+
 ## v0.10.0
 
 ### Added

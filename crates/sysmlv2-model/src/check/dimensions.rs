@@ -278,13 +278,13 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
     let mut sites: Vec<_> =
         r.b.values
             .iter()
-            .filter(|(e, _)| !model.is_library_unit(r.b.unit_of_elem(**e)))
+            .filter(|(e, _)| super::user_owned(&r.b, model, **e))
             .map(|(&e, (s, x))| (e, *s, x.clone()))
             .collect();
     sites.extend(
         r.b.result_exprs
             .iter()
-            .filter(|row| !model.is_library_unit(r.b.unit_of_elem(row.0)))
+            .filter(|row| super::user_owned(&r.b, model, row.0))
             .cloned(),
     );
     sites.sort_by_key(|(e, _, x)| (*e, x.span.start));

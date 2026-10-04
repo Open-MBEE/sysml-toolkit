@@ -71,6 +71,12 @@ fn charge(steps: &mut usize, amount: usize) -> Option<()> {
 }
 
 impl RuntimeFrameProof {
+    /// Whether its proofs answer as a fresh one's would (see
+    /// [`ProviderCompleteness::current`]).
+    pub(crate) fn current(&self, b: &Builder) -> bool {
+        self.providers.current(b)
+    }
+
     /// Whether an existing visible activation remains eligible when entering
     /// a model declaration. `None` means incomplete evidence or exhausted
     /// budget and must be propagated as unsupported. Hidden frames stay hidden.

@@ -1170,7 +1170,7 @@ mod tests {
         let mut r = fixture(&source);
         full(&mut r);
         let e = r.resolve_qualified("e").unwrap();
-        r.by_id.clear();
+        r.by_id = std::sync::Arc::default();
         r.by_id_built_for = usize::MAX;
         let mut row = CheckedRow {
             steps: crate::eval::MAX_STEPS - 10,

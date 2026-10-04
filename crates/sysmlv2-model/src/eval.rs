@@ -54,8 +54,8 @@ mod report;
 pub use report::{EvaluationDependency, EvaluationReport, InheritedDefaultFailure};
 
 use crate::json::{
-    Builder, CallableBody, CallableResult, ElementRef, ResolvedModel, RuntimeFrame,
-    RuntimeFrameProof, ScopeRef, Tri,
+    Builder, CallableBody, CallableResult, ChainRedefinitions, ElementRef, ResolvedModel,
+    RuntimeFrame, RuntimeFrameProof, ScopeRef, Tri,
 };
 
 /// Owner-context library collections per member metaclass — the
@@ -852,6 +852,7 @@ pub(crate) fn evaluate_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Resul
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -887,6 +888,7 @@ pub(crate) fn evaluate_expr_with(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides,
         unbound_receiver: None,
         lib_frames: 0,
@@ -917,6 +919,7 @@ pub(crate) fn unit_of_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Result
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -949,6 +952,7 @@ pub(crate) fn evaluate_query_in(b: &mut Builder, scope: usize, e: &Expr) -> Resu
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -989,6 +993,7 @@ fn evaluate_query_with_env(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1018,6 +1023,7 @@ pub(crate) fn effective_cardinality(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1098,6 +1104,7 @@ fn checked_multiplicity_evaluator(b: &mut Builder, steps: usize) -> Evaluator<'_
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1145,6 +1152,7 @@ pub(crate) fn evaluate_multiplicity_bound(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1179,6 +1187,7 @@ pub(crate) fn evaluate_feature(model: &mut ResolvedModel, e: ElementRef) -> Resu
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1207,6 +1216,7 @@ fn evaluate_report_with(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1256,6 +1266,7 @@ pub(crate) fn evaluate_chain_of(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1264,11 +1275,16 @@ pub(crate) fn evaluate_chain_of(
         allocated: 0,
         query: false,
     };
-    let mut v = ev.feature_value(root.0)?;
-    for m in members {
-        v = ev.chain_into(v, m)?;
+    let v = ev.feature_value(root.0)?;
+    let index = ev.b.chain_redefinitions();
+    if index.is_empty() {
+        let mut v = v;
+        for m in members {
+            v = ev.chain_into(v, m)?;
+        }
+        return Ok(v);
     }
-    Ok(v)
+    ev.walk_chain(&index, Vec::new(), vec![Some(root.0)], v, members)
 }
 
 /// Charge recursive value traversal before cloning or comparing chain values.
@@ -1321,6 +1337,7 @@ pub(crate) fn evaluate_value_chain(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1360,6 +1377,7 @@ pub(crate) fn evaluate_member_of(
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -1434,6 +1452,46 @@ struct EnvironmentBinding {
     value: Value,
 }
 
+/// The root reference of a chain of names (`a.b.c`), its members pushed
+/// onto `members` in order; `None` for any other shape.
+fn name_path<'e>(e: &'e Expr, members: &mut Vec<&'e QualifiedName>) -> Option<&'e Expr> {
+    match &e.kind {
+        ExprKind::Ref(_) => Some(e),
+        ExprKind::ChainStep {
+            target,
+            member: TargetRef::Name(member),
+        } => {
+            let root = name_path(target, members)?;
+            members.push(member);
+            Some(root)
+        }
+        _ => None,
+    }
+}
+
+/// Record the element `value` stands for as an instance whose chain
+/// redefinitions start at step `next` of a chain walk.
+fn instance_context(value: &Value, next: usize, contexts: &mut Vec<(usize, usize)>) {
+    if let Value::Element(ElementRef(e))
+    | Value::Unbound(ElementRef(e))
+    | Value::UnboundMember(ElementRef(e)) = value
+    {
+        contexts.push((*e, next));
+    }
+}
+
+/// The features a unit expansion asked the value of while it was being
+/// memoized, and the most features it had in evaluation at once — its
+/// [`crate::semantic_memo::UnitFootprint`]. `opaque` marks an expansion that
+/// reused a memoized one without a footprint, so it gets none either.
+#[derive(Default)]
+struct UnitTrace {
+    active: bool,
+    opaque: bool,
+    features: Vec<usize>,
+    deepest: usize,
+}
+
 struct Evaluator<'m> {
     b: &'m mut Builder,
     /// Lambda- and calculation-parameter bindings, innermost last.
@@ -1460,6 +1518,9 @@ struct Evaluator<'m> {
     /// by identity in this featuring context. None means ordinary evaluation.
     cardinality_context: Option<CardinalityContext>,
     cardinality_providers: crate::json::provider_completeness::ProviderCompleteness,
+    /// What the unit expansion being memoized has read of the evaluation so
+    /// far (see [`Self::expanded_unit`]); idle otherwise.
+    unit_trace: UnitTrace,
     /// Depth of library-owned calculation bodies on the call stack.
     /// Inside them, unbound features keep the closed [`Value::Element`]
     /// convention (library functions legitimately count and compare
@@ -1574,11 +1635,14 @@ impl Evaluator<'_> {
     }
 
     fn feature_value_in(&mut self, e: usize, ctx: Option<usize>) -> Result_ {
+        if self.unit_trace.active {
+            self.unit_trace.features.push(e);
+        }
         // Reading a local/output directly must not bypass the refusal at
         // invocation: its initializer need not be its value after execution.
         let mut owner = self.b.owner_elem(e);
         while let Some(o) = owner {
-            if self.b.calculation_requires_execution(o) {
+            if self.b.indexed_calculation_requires_execution(o) {
                 return Err(EvalError::Unsupported(
                     "calculation body requires statement execution".into(),
                 ));
@@ -1601,7 +1665,12 @@ impl Evaluator<'_> {
             // unbound (the element itself) as before.
             None => match (self.inherited_default(e), self.b.owner_scope_of(e)) {
                 (Some((origin, expr)), Some(s)) => (s, expr, true, origin),
-                _ => return Ok(self.placeholder(e)),
+                _ => {
+                    return Ok(match self.singleton_subset_value(e, ctx) {
+                        Some(value) => value,
+                        None => self.placeholder(e),
+                    });
+                }
             },
         };
         if (inherited || self.b.default_values.contains(&e)) && self.receiver_member(e).is_some() {
@@ -1682,6 +1751,9 @@ impl Evaluator<'_> {
             }
             return Err(error);
         }
+        if self.unit_trace.active {
+            self.unit_trace.deepest = self.unit_trace.deepest.max(self.in_progress.len());
+        }
         let declaration = self.b.values.get(&origin).map(|(s, _)| *s).unwrap_or(scope);
         let hidden = match self.mask_frames(declaration, scope) {
             Ok(hidden) => hidden,
@@ -1710,6 +1782,63 @@ impl Evaluator<'_> {
             }
             result => result,
         }
+    }
+
+    /// The value of a feature with none of its own, read from a feature it
+    /// subsets when the two cannot differ: the feature has at least one
+    /// value and the subsetted feature at most one, and every value of a
+    /// subsetting feature is one of the subsetted feature's (`subject :>>
+    /// crawler :> tinycrawler;` under singletons is `crawler = tinycrawler`).
+    /// The written spelling is read as an authored value expression would
+    /// be, in the featuring receiver when one applies. Only explicit,
+    /// name-written subsettings of user features count; anything this
+    /// cannot settle keeps the placeholder.
+    fn singleton_subset_value(&mut self, e: usize, ctx: Option<usize>) -> Option<Value> {
+        if e < self.b.lib_boundary || self.cardinality_context.is_some() {
+            return None;
+        }
+        let targets = self.b.written_subsetting_targets(e);
+        if targets.is_empty() {
+            return None;
+        }
+        // Both features name one value, but a value reads its members
+        // through one feature. A subsetting feature that says more than the
+        // subsetted one, with members of its own or a type the subsetted
+        // feature does not conform to, keeps its own reading.
+        if !self.b.owned_member_elems(e, true).is_empty() || self.unbound_cardinality(e)?.0 < 1 {
+            return None;
+        }
+        let types = self.b.direct_typing_elems(e);
+        let mut written = None;
+        for (target, scope, qn) in targets {
+            if !matches!(self.unbound_cardinality(target), Some((_, Some(upper))) if upper <= 1) {
+                continue;
+            }
+            if types.iter().all(|&t| self.b.indexed_conforms(target, t)) {
+                written = Some((scope, qn));
+                break;
+            }
+        }
+        let (scope, qn) = written?;
+        // Subsettings that close a cycle settle nothing; the scope key is
+        // one no real evaluation scope uses.
+        let key = (e, usize::MAX);
+        if !self.in_progress.insert(key) {
+            return None;
+        }
+        let value = match self.value_scopes.select_builder_at(
+            self.b,
+            e,
+            scope,
+            ctx.or(Some(scope)),
+            &mut self.steps,
+        ) {
+            crate::json::ValueScopeDecision::Lexical(scope)
+            | crate::json::ValueScopeDecision::Receiver(scope) => self.reference(scope.0, &qn).ok(),
+            crate::json::ValueScopeDecision::Unsupported => None,
+        };
+        self.in_progress.remove(&key);
+        value
     }
 
     /// The nearest `default` value expression on the redefinition-target
@@ -2838,8 +2967,152 @@ impl Evaluator<'_> {
         let TargetRef::Name(member) = member else {
             return Err(EvalError::Unsupported("chained chain member".into()));
         };
+        // A featuring instance may redefine a chain of names as a whole
+        // (`attribute :>> chassis.mass = 2.5 [kg];`): walk such a chain a
+        // step at a time so the redefinition stands in for the steps it
+        // covers.
+        if self.cardinality_context.is_none() {
+            let mut members = Vec::new();
+            if let Some(root) = name_path(target, &mut members) {
+                let index = self.b.chain_redefinitions();
+                if !index.is_empty() {
+                    members.push(member);
+                    return self.chain_path(&index, scope, root, &members);
+                }
+            }
+        }
         let target = self.expr(scope, target)?;
         self.chain_into(target, member)
+    }
+
+    /// [`Self::chain_step`] over a chain of names, `root` then `members`.
+    /// The owner through which the root's simple name reached it is the
+    /// first instance whose chain redefinitions may cover the steps.
+    fn chain_path(
+        &mut self,
+        index: &ChainRedefinitions,
+        scope: usize,
+        root: &Expr,
+        members: &[&QualifiedName],
+    ) -> Result_ {
+        let mut contexts = Vec::new();
+        let mut root_elem = None;
+        if let ExprKind::Ref(qn) = &root.kind {
+            root_elem = self.b.resolve(scope, qn, 0);
+            if let (Some(elem), [name], false) = (root_elem, qn.segments.as_slice(), qn.is_global) {
+                if let Some(owner) = self.featuring_owner(scope, elem, name) {
+                    contexts.push((owner, 0));
+                }
+            }
+        }
+        let value = self.expr(scope, root)?;
+        self.walk_chain(index, contexts, vec![root_elem], value, members)
+    }
+
+    /// Take the chain steps `members` from `value`, the value of the element
+    /// `steps[0]`. Each of `contexts` — an instance, and the index of the
+    /// step its chains start at — and every element a step reaches may
+    /// redefine the steps from there to the current one as a whole; the
+    /// first such redefinition stands in for the current step.
+    fn walk_chain(
+        &mut self,
+        index: &ChainRedefinitions,
+        mut contexts: Vec<(usize, usize)>,
+        mut steps: Vec<Option<usize>>,
+        mut value: Value,
+        members: &[&QualifiedName],
+    ) -> Result_ {
+        instance_context(&value, steps.len(), &mut contexts);
+        for member in members {
+            steps.push(self.member_hit(&value, member));
+            value = match self.chain_redefinition(index, &contexts, &steps) {
+                Some((feature, instance)) => {
+                    let context = self.b.elem_scope.get(&instance).copied();
+                    self.feature_value_in(feature, context)?
+                }
+                None => self.chain_into(value, member)?,
+            };
+            instance_context(&value, steps.len(), &mut contexts);
+        }
+        Ok(value)
+    }
+
+    /// The element a chain step from `value` reaches through `member`,
+    /// resolved as [`Self::chain_into`] resolves it.
+    fn member_hit(&mut self, value: &Value, member: &QualifiedName) -> Option<usize> {
+        let (Value::Element(ElementRef(e))
+        | Value::Unbound(ElementRef(e))
+        | Value::UnboundMember(ElementRef(e))) = value
+        else {
+            return None;
+        };
+        let sub = self.b.elem_scope.get(e).copied();
+        self.b.resolve_rest(*e, sub, &member.segments, 0)
+    }
+
+    /// The nearest owner around `scope` that has `root` as its member
+    /// `name`: the instance a simple name reached `root` through.
+    fn featuring_owner(&mut self, scope: usize, root: usize, name: &Name) -> Option<usize> {
+        let mut current = Some(scope);
+        for _ in 0..MAX_CALL_DEPTH {
+            let s = current?;
+            if let Some(owner) = self.b.scope_owner(s) {
+                let sub = self.b.elem_scope.get(&owner).copied();
+                if self
+                    .b
+                    .resolve_rest(owner, sub, std::slice::from_ref(name), 0)
+                    == Some(root)
+                {
+                    return Some(owner);
+                }
+            }
+            current = self.b.scope_parent(s);
+        }
+        None
+    }
+
+    /// A valued chain redefinition covering the steps from some context's
+    /// start through the last step, with the instance it covers them for.
+    /// Contexts are tried in order; an instance's own redefinitions come
+    /// before those of its explicit heritage, nearest first. A step matches
+    /// a link it is, specializes, or is specialized by.
+    fn chain_redefinition(
+        &mut self,
+        index: &ChainRedefinitions,
+        contexts: &[(usize, usize)],
+        steps: &[Option<usize>],
+    ) -> Option<(usize, usize)> {
+        for &(instance, start) in contexts {
+            let Some(covered) = steps
+                .get(start..)
+                .filter(|covered| covered.len() >= 2)
+                .and_then(|covered| covered.iter().copied().collect::<Option<Vec<usize>>>())
+            else {
+                continue;
+            };
+            let mut queue = std::collections::VecDeque::from([instance]);
+            let mut seen = HashSet::from([instance]);
+            while let Some(owner) = queue.pop_front() {
+                for (feature, links) in index.get(&owner).into_iter().flatten() {
+                    if links.len() == covered.len()
+                        && links.iter().zip(&covered).all(|(&link, &step)| {
+                            self.b.indexed_conforms(step, link)
+                                || self.b.indexed_conforms(link, step)
+                        })
+                    {
+                        return Some((*feature, instance));
+                    }
+                }
+                if seen.len() < MAX_CALL_DEPTH {
+                    for general in self.b.explicit_supertype_elems(owner) {
+                        if seen.insert(general) {
+                            queue.push_back(general);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Materialize only a collection whose members are available. A
@@ -3149,6 +3422,9 @@ impl Evaluator<'_> {
             && !self.query
             && self.call_depth == 0;
         if !cacheable {
+            if let Some(reused) = self.reused_unit(scope, elem, &name, depth) {
+                return reused;
+            }
             return self.expanded_unit_uncached(scope, elem, name, depth);
         }
         let key = (
@@ -3159,11 +3435,30 @@ impl Evaluator<'_> {
         );
         if let Some(hit) = self.b.semantic_memo.units.get(&key).cloned() {
             self.b.used_imports.extend(hit.imports);
-            return hit.value;
+            self.trace_reuse(hit.value.footprint.as_ref());
+            return (hit.value.dims, hit.value.scale);
         }
         let imports = std::mem::take(&mut self.b.used_imports);
         let failure_epoch = self.inherited_failure_epoch;
-        let value = self.expanded_unit_uncached(scope, elem, name, depth);
+        // Note what the expansion reads, for reuse in the middle of another
+        // evaluation, when nothing but the graph can steer it.
+        let traced = !self.unit_trace.active && self.footprint_context();
+        if traced {
+            self.unit_trace.active = true;
+        }
+        let (dims, scale) = self.expanded_unit_uncached(scope, elem, name, depth);
+        let footprint = traced
+            .then(|| std::mem::take(&mut self.unit_trace))
+            .filter(|trace| !trace.opaque && self.footprint_context())
+            .map(|trace| {
+                let mut features = trace.features;
+                features.sort_unstable();
+                features.dedup();
+                crate::semantic_memo::UnitFootprint {
+                    features: features.into(),
+                    depth: trace.deepest,
+                }
+            });
         // A cached conversion must not hide a suppressed default failure from
         // a later report. Apply the same admission in legacy/report modes so
         // observing diagnostics does not change semantic budget consumption.
@@ -3171,13 +3466,99 @@ impl Evaluator<'_> {
             self.b.semantic_memo.units.insert(
                 key,
                 crate::semantic_memo::Proven {
-                    value: value.clone(),
+                    value: crate::semantic_memo::UnitExpansion {
+                        dims: dims.clone(),
+                        scale: scale.clone(),
+                        footprint,
+                    },
                     imports: self.b.used_imports.iter().copied().collect(),
                 },
             );
         }
         self.b.used_imports.extend(imports);
-        value
+        (dims, scale)
+    }
+
+    /// Whether an expansion started now reads nothing of the evaluation in
+    /// progress except the features in evaluation (the cycle guard) and the
+    /// value overrides — what its footprint records. No argument bindings
+    /// or call frames, no library frame, no member of an instance-less
+    /// receiver, no bound formula or bound in evaluation, not the query
+    /// dialect, no identity-spelled names (whose targets depend on the
+    /// source unit resolving them), and proof caches that answer as fresh
+    /// ones would. The features it evaluates set their own scopes, frames
+    /// and identity origin.
+    fn footprint_context(&self) -> bool {
+        self.b.semantic_ready
+            && self.env.is_empty()
+            && self.call_frames.is_empty()
+            && self.call_depth == 0
+            && self.lib_frames == 0
+            && !self.query
+            && self.unbound_receiver.is_none()
+            && self.cardinality_context.is_none()
+            && self.cardinality_in_progress.is_empty()
+            && !self.b.has_id_spelled_targets()
+            && self.value_scopes.current(self.b)
+            && self.frame_proofs.current(self.b)
+            && self.cardinality_providers.current(self.b)
+    }
+
+    /// A memoized expansion reused while features are in evaluation or
+    /// overridden. Expanding again here would read only the graph, the same
+    /// as the memoized expansion did, unless this evaluation steers it: one
+    /// of the features it asked for is in evaluation (the cycle guard cuts
+    /// it off) or overridden, or the stack in evaluation would reach the
+    /// nesting cap of a bound formula. Its footprint rules those out.
+    fn reused_unit(
+        &mut self,
+        scope: usize,
+        elem: usize,
+        name: &str,
+        depth: u32,
+    ) -> Option<(Vec<Dim>, Rational)> {
+        if depth != 0 || !self.footprint_context() {
+            return None;
+        }
+        let key = (
+            self.b.owner_scope_of(elem).unwrap_or(scope),
+            elem,
+            name.to_owned(),
+            unit_spelling_expansion(),
+        );
+        let hit = self.b.semantic_memo.units.get(&key)?;
+        let footprint = hit.value.footprint.as_ref()?;
+        let steers = |e: &usize| footprint.features.binary_search(e).is_ok();
+        if self.in_progress.len() + footprint.depth >= MAX_CALL_DEPTH
+            || self.in_progress.iter().any(|(e, _)| steers(e))
+            || self.overrides.keys().any(steers)
+        {
+            return None;
+        }
+        let hit = hit.clone();
+        self.b.used_imports.extend(hit.imports);
+        self.trace_reuse(hit.value.footprint.as_ref());
+        Some((hit.value.dims, hit.value.scale))
+    }
+
+    /// Add a reused expansion's footprint to the expansion being noted, if
+    /// any; a reuse without one leaves that expansion without one too.
+    fn trace_reuse(&mut self, footprint: Option<&crate::semantic_memo::UnitFootprint>) {
+        if !self.unit_trace.active {
+            return;
+        }
+        match footprint {
+            Some(footprint) => {
+                self.unit_trace
+                    .features
+                    .extend_from_slice(&footprint.features);
+                self.unit_trace.deepest = self
+                    .unit_trace
+                    .deepest
+                    .max(self.in_progress.len() + footprint.depth);
+            }
+            None => self.unit_trace.opaque = true,
+        }
     }
     fn expanded_unit_uncached(
         &mut self,
@@ -3861,7 +4242,7 @@ impl Evaluator<'_> {
         elem: usize,
         args: Vec<(Option<String>, Value)>,
     ) -> Result_ {
-        if self.b.calculation_requires_execution(elem) {
+        if self.b.indexed_calculation_requires_execution(elem) {
             return Err(EvalError::Unsupported(
                 "calculation body requires statement execution".into(),
             ));
@@ -5522,6 +5903,7 @@ pub(crate) fn prepare_unit(b: &mut Builder, elem: usize) {
         cardinality_in_progress: HashSet::new(),
         cardinality_context: None,
         cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
         overrides: HashMap::new(),
         unbound_receiver: None,
         lib_frames: 0,
@@ -5612,6 +5994,7 @@ mod memo_tests {
             cardinality_in_progress: HashSet::new(),
             cardinality_context: None,
             cardinality_providers: Default::default(),
+            unit_trace: Default::default(),
             overrides: HashMap::new(),
             unbound_receiver: None,
             lib_frames: 0,
@@ -5661,6 +6044,248 @@ mod memo_tests {
         ev.expanded_unit(scope, elem, "m/s".into(), 0);
         assert_eq!(ev.b.semantic_memo.units.iter().count(), 0);
     }
+
+    fn plain_evaluator(b: &mut Builder) -> Evaluator<'_> {
+        Evaluator {
+            b,
+            env: Vec::new(),
+            lexical_scope: None,
+            value_scopes: Default::default(),
+            frame_proofs: Default::default(),
+            report: None,
+            inherited_failure_epoch: 0,
+            call_frames: Vec::new(),
+            in_progress: HashSet::new(),
+            cardinality_in_progress: HashSet::new(),
+            cardinality_context: None,
+            cardinality_providers: Default::default(),
+            unit_trace: Default::default(),
+            overrides: HashMap::new(),
+            unbound_receiver: None,
+            lib_frames: 0,
+            call_depth: 0,
+            steps: 0,
+            allocated: 0,
+            query: false,
+        }
+    }
+
+    #[test]
+    fn unit_expansions_inside_evaluations_reuse_the_memo_unless_steered() {
+        let mut library = crate::model::Model::new();
+        library.add_library_source(
+            "units.sysml",
+            "package MeasurementReferences {
+                attribute def MeasurementUnit { attribute unitConversion : UnitConversion[0..1]; }
+                attribute def UnitConversion { attribute referenceUnit : MeasurementUnit; attribute conversionFactor; }
+            }
+            package U {
+                private import MeasurementReferences::*;
+                attribute <m> metre : MeasurementUnit;
+                attribute <km> kilometre : MeasurementUnit {
+                    :>> unitConversion : UnitConversion { :>> referenceUnit = m; :>> conversionFactor = 1000; }
+                }
+            }",
+        );
+        let prepared = library.prepare_library().unwrap();
+        let mut model = crate::model::Model::new();
+        prepared.install(&mut model).unwrap();
+        model.add_source(
+            "p.sysml",
+            "package P { private import U::*; attribute d = 2 [km]; }",
+        );
+        let mut r = ResolvedModel::build(&model);
+        let km = r.resolve_qualified("U::kilometre").unwrap().0;
+        let factor = r
+            .resolve_qualified("U::kilometre::unitConversion::conversionFactor")
+            .unwrap()
+            .0;
+        let d = r.resolve_qualified("P::d").unwrap();
+        let scope = r.b.owner_scope_of(km).unwrap();
+        let key = (scope, km, "km".to_owned(), unit_spelling_expansion());
+        let entry = r.b.semantic_memo.units.get(&key).cloned().unwrap();
+        let footprint = entry.value.footprint.clone().unwrap();
+        assert!(footprint.features.contains(&factor));
+        let scale = |v: Result_| match v {
+            Ok(Value::Quantity(_, unit)) => unit.scale,
+            other => panic!("expected a quantity, got {other:?}"),
+        };
+        assert_eq!(scale(r.evaluate(d)), Rational::from_integer(1000));
+        // A planted scale shows where `[km]` comes from: inside the value of
+        // `d`, with `d` in evaluation, the memoized expansion is reused.
+        let mut planted = entry.clone();
+        planted.value.scale = Rational::from_integer(7);
+        r.b.semantic_memo.units.insert(key.clone(), planted);
+        assert_eq!(scale(r.evaluate(d)), Rational::from_integer(7));
+        let mut ev = plain_evaluator(&mut r.b);
+        let expand = |ev: &mut Evaluator| ev.expanded_unit(scope, km, "km".into(), 0).1;
+        ev.in_progress.insert((d.0, scope));
+        ev.overrides.insert(d.0, Value::Integer(1));
+        assert_eq!(expand(&mut ev), Rational::from_integer(7));
+        // An override of a feature the expansion read steers it.
+        ev.overrides.insert(factor, Value::Integer(3));
+        assert_eq!(expand(&mut ev), Rational::from_integer(3));
+        ev.overrides.remove(&factor);
+        // So does that feature being in evaluation (the cycle guard), or a
+        // stack deep enough to reach the nesting cap.
+        ev.in_progress.insert((factor, 0));
+        assert_eq!(expand(&mut ev), Rational::from_integer(1000));
+        ev.in_progress.remove(&(factor, 0));
+        for filler in 0..MAX_CALL_DEPTH - footprint.depth {
+            ev.in_progress.insert((usize::MAX - filler, 0));
+        }
+        assert_eq!(expand(&mut ev), Rational::from_integer(1000));
+        ev.in_progress.retain(|&(e, _)| e == d.0);
+        assert_eq!(expand(&mut ev), Rational::from_integer(7));
+        // Contexts the footprint does not describe expand again.
+        ev.unbound_receiver = Some(d.0);
+        assert_eq!(expand(&mut ev), Rational::from_integer(1000));
+        ev.unbound_receiver = None;
+        ev.lib_frames = 1;
+        assert_eq!(expand(&mut ev), Rational::from_integer(1000));
+        ev.lib_frames = 0;
+        ev.call_frames
+            .push(RuntimeFrame::lambda(None, ScopeRef(scope)));
+        assert_eq!(expand(&mut ev), Rational::from_integer(1000));
+        ev.call_frames.clear();
+        ev.cardinality_in_progress
+            .insert((0, None, CardinalityDomain::Type));
+        assert_eq!(expand(&mut ev), Rational::from_integer(1000));
+        ev.cardinality_in_progress.clear();
+        assert_eq!(expand(&mut ev), Rational::from_integer(7));
+        // A memoized expansion without a footprint is reused only where
+        // nothing is in evaluation, as before.
+        let mut opaque = entry;
+        opaque.value.scale = Rational::from_integer(7);
+        opaque.value.footprint = None;
+        ev.b.semantic_memo.units.insert(key, opaque);
+        assert_eq!(expand(&mut ev), Rational::from_integer(1000));
+        ev.in_progress.clear();
+        ev.overrides.clear();
+        assert_eq!(expand(&mut ev), Rational::from_integer(7));
+    }
+
+    #[test]
+    fn noted_footprints_include_reused_expansions_and_refuse_steered_ones() {
+        let mut model = crate::model::Model::new();
+        model.add_source(
+            "units.sysml",
+            "package MeasurementReferences {
+                attribute def MeasurementUnit { attribute unitConversion : UnitConversion[0..1]; }
+                attribute def UnitConversion { attribute referenceUnit : MeasurementUnit; attribute conversionFactor; }
+            }
+            package U {
+                private import MeasurementReferences::*;
+                attribute <m> metre : MeasurementUnit;
+                attribute <km> kilometre : MeasurementUnit {
+                    :>> unitConversion : UnitConversion { :>> referenceUnit = m; :>> conversionFactor = 1000; }
+                }
+                attribute <Mm> megametre : MeasurementUnit {
+                    :>> unitConversion : UnitConversion { :>> referenceUnit = m; :>> conversionFactor = 1 [km] / 1 [m] * 1000; }
+                }
+            }",
+        );
+        let mut r = ResolvedModel::build(&model);
+        let km = r.resolve_qualified("U::kilometre").unwrap().0;
+        let mm = r.resolve_qualified("U::megametre").unwrap().0;
+        let km_factor = r
+            .resolve_qualified("U::kilometre::unitConversion::conversionFactor")
+            .unwrap()
+            .0;
+        let scope = r.b.owner_scope_of(km).unwrap();
+        let mut ev = plain_evaluator(&mut r.b);
+        // `km` is memoized first; `Mm`'s conversion factor reuses it from
+        // inside a feature evaluation, so `Mm`'s footprint takes in `km`'s.
+        assert_eq!(
+            ev.expanded_unit(scope, km, "km".into(), 0).1,
+            Rational::from_integer(1000)
+        );
+        assert_eq!(
+            ev.expanded_unit(scope, mm, "Mm".into(), 0).1,
+            Rational::from_integer(1_000_000)
+        );
+        let footprint = |ev: &Evaluator, elem: usize, name: &str| {
+            ev.b.semantic_memo
+                .units
+                .get(&(scope, elem, name.to_owned(), unit_spelling_expansion()))
+                .and_then(|entry| entry.value.footprint.clone())
+                .unwrap()
+        };
+        let mm_footprint = footprint(&ev, mm, "Mm");
+        assert!(mm_footprint.features.contains(&km_factor));
+        assert!(mm_footprint.depth > footprint(&ev, km, "km").depth);
+        // Steered by an override, `Mm` expands again and reads it.
+        ev.overrides.insert(km_factor, Value::Integer(2));
+        assert_eq!(
+            ev.expanded_unit(scope, mm, "Mm".into(), 0).1,
+            Rational::from_integer(2000)
+        );
+        ev.overrides.clear();
+        // An expansion noted under a context its footprint cannot describe
+        // gets none.
+        ev.b.semantic_memo.units = Default::default();
+        ev.unbound_receiver = Some(km);
+        ev.expanded_unit(scope, km, "km".into(), 0);
+        ev.unbound_receiver = None;
+        let entry =
+            ev.b.semantic_memo
+                .units
+                .get(&(scope, km, "km".to_owned(), unit_spelling_expansion()))
+                .cloned()
+                .unwrap();
+        assert!(entry.value.footprint.is_none());
+    }
+
+    #[test]
+    fn standard_library_units_expand_alike_inside_evaluations() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec-refs/SysML-v2-Release/sysml.library");
+        if !path.exists() {
+            return;
+        }
+        let mut library = crate::model::Model::new();
+        library.load_library_dir(&path).unwrap();
+        let prepared = library.prepare_library().unwrap();
+        let mut model = crate::model::Model::new();
+        prepared.install(&mut model).unwrap();
+        model.add_source(
+            "p.sysml",
+            "package P { private import SI::*; attribute x = 1 [kg]; }",
+        );
+        let mut r = ResolvedModel::build(&model);
+        let x = r.resolve_qualified("P::x").unwrap().0;
+        let mass = r.resolve_qualified("ISQ::MassValue").unwrap();
+        assert!(r.quantity_dims_of_type(mass).is_some());
+        assert!(
+            r.b.semantic_memo
+                .types
+                .get(&(mass.0, unit_spelling_expansion()))
+                .is_some(),
+            "preparation measured the library's quantity types"
+        );
+        let entries: Vec<_> =
+            r.b.semantic_memo
+                .units
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.value.clone()))
+                .collect();
+        assert!(entries.len() > 500, "{} library units", entries.len());
+        // Expand every library unit again with another feature in evaluation
+        // and nothing memoized to reuse — what an evaluation in progress
+        // computed before it could reuse memoized expansions.
+        let mut ev = plain_evaluator(&mut r.b);
+        ev.b.semantic_memo.units = Default::default();
+        ev.in_progress.insert((x, 0));
+        for ((scope, elem, name, _), expansion) in entries {
+            assert!(expansion.footprint.is_some(), "{name}");
+            assert_eq!(
+                ev.expanded_unit(scope, elem, name.clone(), 0),
+                (expansion.dims, expansion.scale),
+                "{name}"
+            );
+        }
+        assert_eq!(ev.b.semantic_memo.units.iter().count(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -5694,6 +6319,7 @@ mod parameter_environment_tests {
             cardinality_in_progress: HashSet::new(),
             cardinality_context: None,
             cardinality_providers: Default::default(),
+            unit_trace: Default::default(),
             overrides: HashMap::new(),
             unbound_receiver: None,
             lib_frames: 0,

@@ -36,15 +36,20 @@ impl Builder {
         self.metadata_associations_incomplete = snapshot.incomplete;
         self.metadata_association_generation = Some(std::sync::Arc::new(()));
         self.reset_lookup_caches();
-        self.semantic_memo = Default::default();
     }
-    /// The frozen library prefix of the recorded lookup graph reads the
-    /// metadata of library owners only, so it outlives a change confined
-    /// to user rows — every reference-resolution pass restores metadata.
+    /// The frozen library prefix of the recorded lookup graph and the frozen
+    /// library results of the semantic memo read the metadata of library
+    /// owners only, so they outlive a change confined to user rows — every
+    /// reference-resolution pass restores metadata. Results over user rows
+    /// are dropped either way. (A user relationship that reaches a library
+    /// row drops the library results once the build completes.)
     fn retain_library_prefix_for(&mut self, next: &LayeredMap<usize, Vec<usize>>) {
         let boundary = self.lib_boundary;
-        if !self.metadata_of.agrees_on(next, |&owner| owner < boundary) {
+        if self.metadata_of.agrees_on(next, |&owner| owner < boundary) {
+            self.semantic_memo.clear_local();
+        } else {
             self.recorded_lookup_prefix = None;
+            self.semantic_memo = Default::default();
         }
     }
     /// Called only between complete reference-resolution passes or at an
@@ -120,7 +125,6 @@ impl Builder {
         self.metadata_association_generation = Some(std::sync::Arc::new(()));
         // Element rows need not change when this semantic input changes.
         self.reset_lookup_caches();
-        self.semantic_memo = Default::default();
         true
     }
 }
@@ -163,6 +167,58 @@ mod tests {
             assert!(r.b.lib_boundary > 0, "built on the prepared library");
             assert_eq!(r.b.recorded_lookup_prefix.is_some(), kept, "{source}");
         }
+    }
+    /// The frozen library results of the semantic memo survive those
+    /// restores the same way; results over user rows do not.
+    #[test]
+    fn replay_keeps_library_semantic_results_unless_library_metadata_changes() {
+        let mut base = Model::new();
+        base.add_library_source(
+            "lib.kerml",
+            "standard library package MeasurementReferences { datatype MeasurementUnit; } \
+             standard library package L { metaclass Mark; datatype D; \
+             class A { feature x; } class B :> A { feature redefines x; } \
+             feature m : MeasurementReferences::MeasurementUnit; }",
+        );
+        let prepared = base.prepare_library().unwrap();
+        assert!(prepared.builder.semantic_memo.units.iter().next().is_some());
+        for (source, kept) in [
+            ("class C :> L::B { feature redefines x; }", true),
+            (
+                "class C :> L::B { feature redefines x; } @L::Mark about L::A;",
+                false,
+            ),
+        ] {
+            let mut model = Model::new();
+            std::sync::Arc::clone(&prepared)
+                .install(&mut model)
+                .unwrap();
+            assert!(
+                model
+                    .add_source("user.kerml", source)
+                    .diagnostics
+                    .is_empty()
+            );
+            let r = ResolvedModel::build(&model);
+            assert!(r.b.lib_boundary > 0, "built on the prepared library");
+            let memo = &r.b.semantic_memo;
+            assert_eq!(memo.units.iter().next().is_some(), kept, "{source}");
+            assert_eq!(memo.types.iter().next().is_some(), kept, "{source}");
+        }
+        // A restore drops the results over user rows and keeps the library's.
+        let mut model = Model::new();
+        prepared.install(&mut model).unwrap();
+        model.add_source("user.kerml", "datatype E;");
+        let mut r = ResolvedModel::build(&model);
+        let user = r.resolve_qualified("E").unwrap();
+        r.quantity_dims_of_type(user);
+        let key = (user.0, crate::eval::unit_spelling_expansion());
+        assert!(r.b.semantic_memo.types.get(&key).is_some());
+        let library = r.b.semantic_memo.types.iter().count() - 1;
+        let snapshot = r.b.metadata_snapshot();
+        r.b.restore_metadata_snapshot(&snapshot);
+        assert!(r.b.semantic_memo.types.get(&key).is_none());
+        assert_eq!(r.b.semantic_memo.types.iter().count(), library);
     }
     fn fixture() -> (ResolvedModel, usize, usize, usize) {
         let mut model = Model::new();

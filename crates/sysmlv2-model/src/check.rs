@@ -270,6 +270,13 @@ fn root_kind_word(metaclass: &str) -> &'static str {
     }
 }
 
+/// Whether element `e` belongs to a user unit. A build lowers its library
+/// units before any user unit, so every element below the library boundary
+/// is a library one: those are answered without locating their unit.
+pub(crate) fn user_owned(b: &crate::json::Builder, model: &crate::model::Model, e: usize) -> bool {
+    e >= b.lib_boundary && !model.is_library_unit(b.unit_of_elem(e))
+}
+
 /// The rows of a builder table that user elements own, copied once so a
 /// pass can evaluate against `&mut r.b` while walking them. Library rows
 /// never produce findings; skipping them by reference leaves the shared
@@ -281,7 +288,7 @@ pub(crate) fn user_rows<'a, T: Clone + 'a>(
     owner: impl Fn(&T) -> usize,
 ) -> Vec<T> {
     rows.into_iter()
-        .filter(|row| !model.is_library_unit(b.unit_of_elem(owner(row))))
+        .filter(|row| user_owned(b, model, owner(row)))
         .cloned()
         .collect()
 }
@@ -329,7 +336,7 @@ pub(crate) fn user_entries<'a, V: Clone + 'a>(
 ) -> Vec<(usize, V)> {
     entries
         .into_iter()
-        .filter(|(&e, _)| !model.is_library_unit(b.unit_of_elem(e)))
+        .filter(|(&e, _)| user_owned(b, model, e))
         .map(|(&e, v)| (e, v.clone()))
         .collect()
 }
@@ -410,18 +417,20 @@ pub fn validate_semantics_with(
     out
 }
 
-/// Collect every feature reference of an expression, in source order:
-/// the `Ref` leaves. Lambda bodies are not entered (their references
+/// Collect the feature references of an expression, in source order: the
+/// `Ref` leaves and, with `chains`, every name chain (`a.b.c`) whole in
+/// place of its root. Lambda bodies are not entered (their references
 /// bind through runtime parameters), and a bracket's unit expression is
 /// skipped (`[m]` names a measurement unit, not a model feature a
 /// diagnostic should evaluate).
 fn collect_feature_refs<'a>(
     e: &'a sysmlv2_syntax::ast::Expr,
-    out: &mut Vec<&'a sysmlv2_syntax::ast::QualifiedName>,
+    chains: bool,
+    out: &mut Vec<&'a sysmlv2_syntax::ast::Expr>,
 ) {
     use sysmlv2_syntax::ast::{ArrowArgs, ExprKind};
     match &e.kind {
-        ExprKind::Ref(qn) => out.push(qn),
+        ExprKind::Ref(_) => out.push(e),
         ExprKind::Literal(_)
         | ExprKind::Null
         | ExprKind::Extent { .. }
@@ -432,47 +441,71 @@ fn collect_feature_refs<'a>(
             then_branch,
             else_branch,
         } => {
-            collect_feature_refs(cond, out);
-            collect_feature_refs(then_branch, out);
-            collect_feature_refs(else_branch, out);
+            collect_feature_refs(cond, chains, out);
+            collect_feature_refs(then_branch, chains, out);
+            collect_feature_refs(else_branch, chains, out);
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            collect_feature_refs(lhs, out);
-            collect_feature_refs(rhs, out);
+            collect_feature_refs(lhs, chains, out);
+            collect_feature_refs(rhs, chains, out);
         }
-        ExprKind::Unary { operand, .. } => collect_feature_refs(operand, out),
+        ExprKind::Unary { operand, .. } => collect_feature_refs(operand, chains, out),
         ExprKind::Classification { operand, .. } => {
             if let Some(o) = operand {
-                collect_feature_refs(o, out);
+                collect_feature_refs(o, chains, out);
             }
         }
-        ExprKind::ChainStep { target, .. } => collect_feature_refs(target, out),
-        ExprKind::Index { target, index } => {
-            collect_feature_refs(target, out);
-            collect_feature_refs(index, out);
+        ExprKind::ChainStep { target, .. } => {
+            if chains && name_chain(e).is_some() {
+                out.push(e);
+            } else {
+                collect_feature_refs(target, chains, out);
+            }
         }
-        ExprKind::Bracket { target, .. } => collect_feature_refs(target, out),
+        ExprKind::Index { target, index } => {
+            collect_feature_refs(target, chains, out);
+            collect_feature_refs(index, chains, out);
+        }
+        ExprKind::Bracket { target, .. } => collect_feature_refs(target, chains, out),
         ExprKind::Arrow { target, args, .. } => {
-            collect_feature_refs(target, out);
+            collect_feature_refs(target, chains, out);
             if let ArrowArgs::List(list) = args {
                 for a in list {
-                    collect_feature_refs(&a.value, out);
+                    collect_feature_refs(&a.value, chains, out);
                 }
             }
         }
         ExprKind::Collect { target, .. } | ExprKind::Select { target, .. } => {
-            collect_feature_refs(target, out)
+            collect_feature_refs(target, chains, out)
         }
         ExprKind::Invocation { args, .. } | ExprKind::Constructor { args, .. } => {
             for a in args {
-                collect_feature_refs(&a.value, out);
+                collect_feature_refs(&a.value, chains, out);
             }
         }
         ExprKind::Sequence(items) => {
             for i in items {
-                collect_feature_refs(i, out);
+                collect_feature_refs(i, chains, out);
             }
         }
+    }
+}
+
+/// The spelling of a reference or of a chain of names (`a.b.c`); `None`
+/// for any other expression.
+fn name_chain(e: &sysmlv2_syntax::ast::Expr) -> Option<String> {
+    use sysmlv2_syntax::ast::{ExprKind, TargetRef};
+    match &e.kind {
+        ExprKind::Ref(qn) => Some(qn.to_display_string()),
+        ExprKind::ChainStep {
+            target,
+            member: TargetRef::Name(member),
+        } => Some(format!(
+            "{}.{}",
+            name_chain(target)?,
+            member.to_display_string()
+        )),
+        _ => None,
     }
 }
 
@@ -502,27 +535,44 @@ pub fn constraint_bindings(
     r: &mut crate::json::ResolvedModel,
     c: &crate::json::ConstraintInfo,
 ) -> Vec<ConstraintBinding> {
+    feature_bindings(r, c, None)
+}
+
+/// [`constraint_bindings`], or with a satisfaction claim's subject binding
+/// seeded. A bound claim also reports each name chain whole
+/// (`vehicle.mass = 950 [kg]`): its root is the satisfying feature itself,
+/// which has no value worth showing.
+fn feature_bindings(
+    r: &mut crate::json::ResolvedModel,
+    c: &crate::json::ConstraintInfo,
+    overrides: Option<&std::collections::HashMap<usize, crate::eval::Value>>,
+) -> Vec<ConstraintBinding> {
     let mut refs = Vec::new();
-    collect_feature_refs(&c.expr, &mut refs);
+    collect_feature_refs(&c.expr, overrides.is_some(), &mut refs);
     let mut out: Vec<ConstraintBinding> = Vec::new();
-    for qn in refs {
-        let feature = qn.to_display_string();
+    for probe in refs {
+        let Some(feature) = name_chain(probe) else {
+            continue;
+        };
         if out.iter().any(|b| b.feature == feature) {
             continue;
         }
-        let site = r
-            .resolve_in(c.scope, qn)
-            .and_then(|e| r.declaration_site(e));
-        let probe = sysmlv2_syntax::ast::Expr {
-            kind: sysmlv2_syntax::ast::ExprKind::Ref(qn.clone()),
-            span: qn.span,
+        let site = match &probe.kind {
+            sysmlv2_syntax::ast::ExprKind::Ref(qn) => r
+                .resolve_in(c.scope, qn)
+                .and_then(|e| r.declaration_site(e)),
+            _ => None,
+        };
+        let value = match overrides {
+            Some(overrides) => r.evaluate_in_with(c.scope, probe, overrides),
+            None => r.evaluate_in(c.scope, probe),
         };
         // An unvalued feature evaluates to itself as a bare element,
         // which renders opaquely (`<element>`) — that is the unbound
         // case for diagnostic purposes, not a value worth showing. A
         // reference *through* an unbound feature is undetermined for the
         // same reason and renders just as opaquely (`<indeterminate>`).
-        let value = match r.evaluate_in(c.scope, &probe) {
+        let value = match value {
             Ok(
                 crate::eval::Value::Element(_)
                 | crate::eval::Value::Unbound(_)
@@ -586,15 +636,24 @@ pub struct ConstraintCheck {
 /// the expression) are not yet checked — a featuring-context increment.
 pub fn check_constraints(model: &crate::model::Model) -> Vec<ConstraintCheck> {
     let mut r = crate::json::ResolvedModel::build(model);
+    let mut out = constraint_checks(model, &mut r);
+    out.extend(satisfaction_checks(model, &mut r));
+    out
+}
+
+/// The ordinary verdicts of [`check_constraints`] — every user constraint,
+/// requirement and invariant body, unbound — over an already resolved
+/// model. Satisfaction claims are [`satisfaction_claims`].
+pub fn constraint_checks(
+    model: &crate::model::Model,
+    r: &mut crate::json::ResolvedModel,
+) -> Vec<ConstraintCheck> {
     let mut out = Vec::new();
-    for c in r.constraints() {
-        if model.is_library_unit(c.unit) {
-            continue;
-        }
-        let verdict = constraint_verdict(&mut r, &c);
+    for c in r.constraints_where(|unit| !model.is_library_unit(unit)) {
+        let verdict = constraint_verdict(r, &c);
         let bindings = match verdict {
             ConstraintVerdict::Satisfied => Vec::new(),
-            _ => constraint_bindings(&mut r, &c),
+            _ => constraint_bindings(r, &c),
         };
         out.push(ConstraintCheck {
             unit: c.unit,
@@ -607,7 +666,6 @@ pub fn check_constraints(model: &crate::model::Model) -> Vec<ConstraintCheck> {
             context: None,
         });
     }
-    out.extend(satisfaction_checks(model, &mut r));
     out
 }
 
@@ -629,35 +687,214 @@ pub fn satisfaction_checks(
             if model.is_library_unit(c.unit) {
                 continue;
             }
-            let verdict = match r.evaluate_in_with(c.scope, &c.expr, &s.overrides) {
-                Ok(crate::eval::Value::Boolean(b)) => {
-                    if b != c.negated {
-                        ConstraintVerdict::Satisfied
-                    } else {
-                        ConstraintVerdict::Violated
-                    }
-                }
-                Ok(crate::eval::Value::Indeterminate) => ConstraintVerdict::Undecided(
-                    "result is indeterminate over unbound features".to_string(),
-                ),
-                Ok(other) => {
-                    ConstraintVerdict::Undecided(format!("result is not a boolean: {other}"))
-                }
-                Err(e) => ConstraintVerdict::Undecided(e.to_string()),
-            };
             out.push(ConstraintCheck {
                 unit: c.unit,
                 span: c.span,
                 name: c.name.clone(),
                 element_type: c.element_type,
                 asserted: true,
-                verdict,
+                verdict: bound_verdict(r, c, &s.overrides),
                 bindings: Vec::new(),
                 context: s.context.clone(),
             });
         }
     }
     out
+}
+
+/// The verdict of `c` with a satisfaction claim's subject binding seeded.
+fn bound_verdict(
+    r: &mut crate::json::ResolvedModel,
+    c: &crate::json::ConstraintInfo,
+    overrides: &std::collections::HashMap<usize, crate::eval::Value>,
+) -> ConstraintVerdict {
+    match r.evaluate_in_with(c.scope, &c.expr, overrides) {
+        Ok(crate::eval::Value::Boolean(b)) => {
+            if b != c.negated {
+                ConstraintVerdict::Satisfied
+            } else {
+                ConstraintVerdict::Violated
+            }
+        }
+        Ok(crate::eval::Value::Indeterminate) => ConstraintVerdict::Undecided(
+            "result is indeterminate over unbound features".to_string(),
+        ),
+        Ok(other) => ConstraintVerdict::Undecided(format!("result is not a boolean: {other}")),
+        Err(e) => ConstraintVerdict::Undecided(e.to_string()),
+    }
+}
+
+/// One satisfaction claim (`satisfy R by x;`) checked as a whole: `R`'s
+/// constraints evaluate with its subjects bound to `x`, and their verdicts
+/// combine the way a requirement check does. Each check's assumptions
+/// imply its required constraints and the requirements it composes, in
+/// three-valued logic: a claim is undecided only when what is known does
+/// not settle it.
+#[derive(Clone, Debug)]
+pub struct SatisfactionClaim {
+    /// Index into [`crate::model::Model::units`] of the `satisfy`
+    /// statement.
+    pub unit: usize,
+    /// Source extent of the `satisfy` statement, keyword through its `;`
+    /// or body.
+    pub span: sysmlv2_syntax::span::Span,
+    /// Qualified name of the satisfied requirement, as
+    /// [`ConstraintCheck::context`] carries it.
+    pub requirement: Option<String>,
+    /// The satisfying feature as written after `by`.
+    pub by: String,
+    /// `not satisfy R by x;`: the verdict is on `x` *not* satisfying `R`.
+    pub negated: bool,
+    /// The claim's verdict.
+    pub verdict: ConstraintVerdict,
+    /// Satisfied only because an assumption does not hold.
+    pub vacuous: bool,
+    /// The verdicts the claim combines, in source order, each under the
+    /// subject binding and, unless satisfied, with the feature values
+    /// behind it.
+    pub constraints: Vec<ClaimConstraint>,
+}
+
+/// One constraint verdict a [`SatisfactionClaim`] combines.
+#[derive(Clone, Debug)]
+pub struct ClaimConstraint {
+    /// The constraint's own verdict under the subject binding, its
+    /// `context` naming the satisfied requirement.
+    pub check: ConstraintCheck,
+    /// An `assume` constraint: when it fails, its check holds vacuously.
+    pub assumed: bool,
+}
+
+/// Every satisfaction claim of the user units, checked as a whole (see
+/// [`SatisfactionClaim`]), in model order.
+pub fn satisfaction_claims(
+    model: &crate::model::Model,
+    r: &mut crate::json::ResolvedModel,
+) -> Vec<SatisfactionClaim> {
+    use crate::json::SatisfactionRole;
+    let mut out = Vec::new();
+    for s in r.satisfactions() {
+        if model.is_library_unit(s.unit) {
+            continue;
+        }
+        let mut constraints = Vec::with_capacity(s.constraints.len());
+        for (i, c) in s.constraints.iter().enumerate() {
+            let verdict = bound_verdict(r, c, &s.overrides);
+            let bindings = match verdict {
+                ConstraintVerdict::Satisfied => Vec::new(),
+                _ => feature_bindings(r, c, Some(&s.overrides)),
+            };
+            let assumed = s
+                .nodes
+                .iter()
+                .flat_map(|n| &n.constraints)
+                .any(|&(j, role)| j == i && role == SatisfactionRole::Assumed);
+            constraints.push(ClaimConstraint {
+                check: ConstraintCheck {
+                    unit: c.unit,
+                    span: c.span,
+                    name: c.name.clone(),
+                    element_type: c.element_type,
+                    asserted: true,
+                    verdict,
+                    bindings,
+                    context: s.context.clone(),
+                },
+                assumed,
+            });
+        }
+        let (verdict, vacuous) = claim_verdict(&s.nodes, &constraints, s.negated);
+        out.push(SatisfactionClaim {
+            unit: s.unit,
+            span: s.span,
+            requirement: s.context,
+            by: s.by,
+            negated: s.negated,
+            verdict,
+            vacuous,
+            constraints,
+        });
+    }
+    out
+}
+
+/// A claim's verdict from its constraints' (see [`SatisfactionClaim`]), and
+/// whether it holds only because an assumption fails. A requirement with
+/// nothing to evaluate leaves its claim undecided rather than vacuously
+/// satisfied.
+fn claim_verdict(
+    nodes: &[crate::json::SatisfactionNode],
+    constraints: &[ClaimConstraint],
+    negated: bool,
+) -> (ConstraintVerdict, bool) {
+    if constraints.is_empty() || nodes.is_empty() {
+        return (
+            ConstraintVerdict::Undecided("the requirement has no constraint to evaluate".into()),
+            false,
+        );
+    }
+    let (truth, vacuous) = check_truth(nodes, 0, constraints, 0);
+    match truth.map(|t| t != negated) {
+        Some(true) => (ConstraintVerdict::Satisfied, vacuous && !negated),
+        Some(false) => (ConstraintVerdict::Violated, false),
+        None => {
+            let why = constraints
+                .iter()
+                .find_map(|c| match &c.check.verdict {
+                    ConstraintVerdict::Undecided(why) => Some(why.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "a constraint is undecided".into());
+            (ConstraintVerdict::Undecided(why), false)
+        }
+    }
+}
+
+/// The three-valued truth of the check `at` — `None` when unknown — and
+/// whether it holds only because an assumption fails.
+fn check_truth(
+    nodes: &[crate::json::SatisfactionNode],
+    at: usize,
+    constraints: &[ClaimConstraint],
+    depth: usize,
+) -> (Option<bool>, bool) {
+    use crate::json::SatisfactionRole;
+    // Kleene conjunction: one false part decides, otherwise any unknown
+    // part leaves the whole unknown.
+    fn and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+        match (a, b) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        }
+    }
+    // The walk builds a tree; the bound only guards a malformed one.
+    if depth > nodes.len() {
+        return (None, false);
+    }
+    let (mut assumed, mut required) = (Some(true), Some(true));
+    let mut fold = |role: SatisfactionRole, truth: Option<bool>| match role {
+        SatisfactionRole::Assumed => assumed = and(assumed, truth),
+        SatisfactionRole::Required => required = and(required, truth),
+    };
+    for &(i, role) in &nodes[at].constraints {
+        let truth = match constraints[i].check.verdict {
+            ConstraintVerdict::Satisfied => Some(true),
+            ConstraintVerdict::Violated => Some(false),
+            ConstraintVerdict::Undecided(_) => None,
+        };
+        fold(role, truth);
+    }
+    for &(child, role) in &nodes[at].children {
+        fold(role, check_truth(nodes, child, constraints, depth + 1).0);
+    }
+    // The assumptions imply the required parts.
+    match (assumed, required) {
+        (Some(false), required) => (Some(true), required != Some(true)),
+        (_, Some(true)) => (Some(true), false),
+        (Some(true), Some(false)) => (Some(false), false),
+        _ => (None, false),
+    }
 }
 
 /// Evaluate one enumerated constraint to its verdict (shared by
@@ -733,6 +970,46 @@ mod tests {
         warm.add_source("user.kerml", USER);
         assert!(ResolvedModel::build(&warm).b.library_facts.is_some());
         assert_eq!(findings(&warm), cold_findings);
+    }
+
+    /// The validators pass over the elements below the library boundary
+    /// without locating their units: every explicit element below it
+    /// belongs to a library unit and every later one to a user unit, in a
+    /// build that lowers the library with the model — whatever order the
+    /// units were added in — and in a build on a prepared library.
+    #[test]
+    fn library_units_own_exactly_the_elements_below_the_boundary() {
+        const MORE: &str = "package W { feature c :> L::m; class D :> L::B; }";
+        let mut cold = Model::new();
+        cold.add_source("user.kerml", USER);
+        cold.add_library_source("lib.kerml", LIBRARY);
+        cold.add_source("more.kerml", MORE);
+        let mut base = Model::new();
+        base.add_library_source("lib.kerml", LIBRARY);
+        let prepared = base.prepare_library().unwrap();
+        let mut warm = Model::new();
+        prepared.install(&mut warm).unwrap();
+        warm.add_source("user.kerml", USER);
+        warm.add_source("more.kerml", MORE);
+        for (label, model) in [("cold", &cold), ("warm", &warm)] {
+            let r = ResolvedModel::build(model);
+            assert!(r.b.lib_boundary > 0, "{label}");
+            assert!(r.b.explicit_len() > r.b.lib_boundary, "{label}");
+            for e in 0..r.b.explicit_len() {
+                assert_eq!(
+                    e < r.b.lib_boundary,
+                    model.is_library_unit(r.b.unit_of_elem(e)),
+                    "{label}: element {e} of {}",
+                    r.b.explicit_len()
+                );
+            }
+        }
+        // The two number their units differently; the findings agree.
+        let messages = |model: &Model| -> Vec<String> {
+            findings(model).into_iter().map(|(_, m)| m).collect()
+        };
+        assert_eq!(messages(&warm), messages(&cold));
+        assert!(!messages(&cold).is_empty());
     }
 
     /// Reporting spans cost at most one ownership step per element,

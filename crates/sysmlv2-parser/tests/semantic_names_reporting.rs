@@ -129,6 +129,61 @@ fn unnamed_satisfy_locators_do_not_collide_in_recursive_imports() {
 }
 
 #[test]
+fn sibling_satisfy_claims_reference_the_requirement_they_name() {
+    let mut m = Model::new();
+    assert!(
+        m.add_source(
+            "claims.sysml",
+            "package P {
+        part def Thing;
+        requirement def Spec { subject s : Thing; }
+        part ctx {
+            requirement req : Spec;
+            part a : Thing;
+            part b : Thing;
+            part inner {
+                satisfy req by a;
+                satisfy req by b;
+                part probe :> req;
+            }
+        }
+    }"
+        )
+        .diagnostics
+        .is_empty()
+    );
+    let mut r = ResolvedModel::build(&m);
+    let req = r.resolve_qualified("P::ctx::req").unwrap();
+    let req_id = r.element_id(req).to_string();
+    let claims: Vec<_> = r
+        .user_elements()
+        .filter(|&e| r.element_type(e) == "SatisfyRequirementUsage")
+        .collect();
+    assert_eq!(claims.len(), 2);
+    // Neither claim names `req`, so neither answers the other's lookup.
+    for claim in &claims {
+        let rel = r
+            .owned_relationships(*claim)
+            .into_iter()
+            .find(|&e| r.element_type(e) == "ReferenceSubsetting")
+            .unwrap();
+        assert_eq!(
+            r.element_properties(rel)["referencedFeature"]["@id"],
+            req_id
+        );
+    }
+    // Any other lexical reference in that body reaches the requirement too.
+    let probe = r.resolve_qualified("P::ctx::inner::probe").unwrap();
+    let rel = r
+        .owned_relationships(probe)
+        .into_iter()
+        .find(|&e| r.element_type(e) == "Subsetting")
+        .unwrap();
+    assert_eq!(r.element_properties(rel)["subsettedFeature"]["@id"], req_id);
+    assert!(r.unresolved_references().is_empty());
+}
+
+#[test]
 fn semantic_lookup_checks_short_names_aliases_and_unresolved_redefinitions() {
     let mut m = Model::new();
     assert!(

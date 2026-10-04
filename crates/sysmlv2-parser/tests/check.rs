@@ -1760,6 +1760,307 @@ fn satisfaction_claims_expand_to_bound_verdicts() {
     );
 }
 
+/// Lib-gated: a claim that declares its own requirement (`satisfy
+/// requirement : R by x;`) has no reference to follow: it is itself the
+/// satisfied requirement, so `R`'s constraints evaluate with its subject
+/// bound to `x`, under the claim's own redefinitions. It is labelled by its
+/// name when it has one, else by `R`.
+#[test]
+fn declared_satisfaction_claims_expand_to_bound_verdicts() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source(
+        "declared.sysml",
+        "package Load {
+            private import ISQ::*;
+            private import SI::*;
+            part def Crate { attribute mass : MassValue; }
+            requirement def Limit {
+                subject c : Crate;
+                attribute cap : MassValue;
+                require constraint { c.mass <= cap }
+            }
+            requirement def SmallLimit :> Limit { attribute :>> cap = 10 [kg]; }
+            part light : Crate { attribute :>> mass = 4 [kg]; }
+            part heavy : Crate { attribute :>> mass = 40 [kg]; }
+            part site {
+                satisfy requirement : SmallLimit by light;
+                satisfy requirement heavyCheck : SmallLimit by heavy;
+                satisfy requirement : Limit by heavy { attribute :>> cap = 50 [kg]; }
+            }
+        }",
+    );
+    assert!(!model.has_errors());
+    let checks = sysmlv2_parser::check::check_constraints(&model);
+    let bound: Vec<_> = checks
+        .iter()
+        .filter_map(|c| Some((c.context.as_deref()?, c.verdict.clone())))
+        .collect();
+    assert_eq!(
+        bound,
+        [
+            ("Load::SmallLimit", Satisfied),
+            ("Load::site::heavyCheck", Violated),
+            ("Load::Limit", Satisfied),
+        ]
+    );
+}
+
+/// Lib-gated: a satisfaction claim is checked as a whole, and its verdict
+/// belongs to the `satisfy` statement. Requirement checks combine as the
+/// library's `RequirementCheck` does — the assumptions imply the required
+/// constraints — so a claim whose assumption fails holds vacuously, and a
+/// plain constraint member is no part of the check. `not satisfy` inverts
+/// the verdict, unknown values leave a claim undecided, and so does a
+/// requirement with nothing to evaluate. A claim that declares its own
+/// requirement (`satisfy requirement : R by x;`) is checked like one that
+/// references it.
+#[test]
+fn satisfaction_claims_carry_one_verdict_on_the_satisfy_statement() {
+    use sysmlv2_parser::check::ConstraintVerdict::{self, *};
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let src = "package Freight {
+            private import ISQ::*;
+            private import SI::*;
+            part def Wagon {
+                attribute tare : MassValue;
+                attribute cargo : MassValue;
+            }
+            requirement def MassCap {
+                subject w : Wagon;
+                attribute cap : MassValue;
+                assume constraint { w.cargo > 0 [kg] }
+                require constraint { w.tare + w.cargo <= cap }
+                constraint heavy { w.tare > 10000 [kg] }
+            }
+            requirement def Prose { subject w : Wagon; }
+            requirement laden : MassCap { attribute :>> cap = 1000 [kg]; }
+            requirement empty : MassCap { attribute :>> cap = 900 [kg]; }
+            requirement prose : Prose;
+            part loaded : Wagon {
+                attribute :>> tare = 800 [kg];
+                attribute :>> cargo = 150 [kg];
+            }
+            part unloaded : Wagon {
+                attribute :>> tare = 950 [kg];
+                attribute :>> cargo = 0 [kg];
+            }
+            part unknown : Wagon;
+            part claims {
+                satisfy laden by loaded;
+                satisfy empty by loaded;
+                not satisfy empty by loaded;
+                satisfy empty by unloaded;
+                satisfy laden by unknown;
+                satisfy prose by loaded;
+                satisfy requirement : MassCap by loaded { attribute :>> cap = 1000 [kg]; }
+            }
+        }";
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source("claims.sysml", src);
+    assert!(!model.has_errors());
+    let mut r = sysmlv2_parser::json::ResolvedModel::build(&model);
+    let claims = sysmlv2_parser::check::satisfaction_claims(&model, &mut r);
+    let got: Vec<(&str, ConstraintVerdict, bool)> = claims
+        .iter()
+        .map(|c| {
+            (
+                &src[c.span.start as usize..c.span.end as usize],
+                c.verdict.clone(),
+                c.vacuous,
+            )
+        })
+        .collect();
+    let undecided = |why: &str| Undecided(why.to_string());
+    assert_eq!(
+        got,
+        [
+            ("satisfy laden by loaded;", Satisfied, false),
+            ("satisfy empty by loaded;", Violated, false),
+            ("not satisfy empty by loaded;", Satisfied, false),
+            ("satisfy empty by unloaded;", Satisfied, true),
+            (
+                "satisfy laden by unknown;",
+                undecided("result is indeterminate over unbound features"),
+                false
+            ),
+            (
+                "satisfy prose by loaded;",
+                undecided("the requirement has no constraint to evaluate"),
+                false
+            ),
+            (
+                "satisfy requirement : MassCap by loaded { attribute :>> cap = 1000 [kg]; }",
+                Satisfied,
+                false
+            ),
+        ]
+    );
+    assert_eq!(claims[1].requirement.as_deref(), Some("Freight::empty"));
+    assert_eq!(claims[1].by, "loaded");
+    assert!(claims[2].negated);
+    assert_eq!(claims[6].requirement.as_deref(), Some("Freight::MassCap"));
+    // The assumption and the requirement, never the plain `heavy` member;
+    // the failed requirement reports the values behind it.
+    let parts: Vec<(bool, ConstraintVerdict)> = claims[1]
+        .constraints
+        .iter()
+        .map(|c| (c.assumed, c.check.verdict.clone()))
+        .collect();
+    assert_eq!(parts, [(true, Satisfied), (false, Violated)]);
+    let values: Vec<(String, Option<String>)> = claims[1].constraints[1]
+        .check
+        .bindings
+        .iter()
+        .map(|b| (b.feature.clone(), b.value.clone()))
+        .collect();
+    assert_eq!(
+        values,
+        [
+            ("w.tare".to_string(), Some("800 [kg]".to_string())),
+            ("w.cargo".to_string(), Some("150 [kg]".to_string())),
+            ("cap".to_string(), Some("900 [kg]".to_string())),
+        ]
+    );
+}
+
+/// Lib-gated: a claim on a part whose mass comes from an analysis performed
+/// once decides even when the analysis subject is written as a subsetting
+/// (`subject :>> rover :> small;`): under singletons the subject is the
+/// part, so the analysis result, and the claim, evaluate.
+#[test]
+fn satisfaction_claims_read_analysis_results_through_singleton_subjects() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source(
+        "rovers.sysml",
+        "package Rovers {
+            private import ISQ::*;
+            private import SI::*;
+            part def Rover { attribute mass : MassValue; }
+            requirement def Light {
+                subject rover : Rover;
+                require constraint { rover.mass < 1 [kg] }
+            }
+            analysis def MassAnalysis {
+                subject rover : Rover;
+                return result : MassValue = rover.mass;
+            }
+            part def Site {
+                part small : Rover { attribute :>> mass = 0.4 [kg]; }
+                part big : Rover { attribute :>> mass = 3 [kg]; }
+                analysis smallMass[1] : MassAnalysis { subject :>> rover :> small; }
+                analysis bigMass[1] : MassAnalysis { subject :>> rover :> big; }
+                part smallAnalyzed : Rover { attribute :>> mass = smallMass.result; }
+                part bigAnalyzed : Rover { attribute :>> mass = bigMass.result; }
+                requirement light : Light;
+                satisfy light by smallAnalyzed;
+                satisfy light by bigAnalyzed;
+            }
+        }",
+    );
+    assert!(!model.has_errors());
+    let mut r = sysmlv2_parser::json::ResolvedModel::build(&model);
+    let claims = sysmlv2_parser::check::satisfaction_claims(&model, &mut r);
+    let got: Vec<_> = claims
+        .iter()
+        .map(|c| (c.by.as_str(), c.verdict.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        [("smallAnalyzed", Satisfied), ("bigAnalyzed", Violated)]
+    );
+}
+
+/// Lib-gated: a claim on a requirement that composes others (`require r {
+/// in w = unit; }`) fails when any composed check fails.
+#[test]
+fn satisfaction_claims_combine_composed_requirements() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source(
+        "freight.sysml",
+        "package Freight {
+            private import ISQ::*;
+            private import SI::*;
+            part def Wagon {
+                attribute tare : MassValue;
+                attribute cargo : MassValue;
+            }
+            part wagon1 : Wagon {
+                attribute :>> tare = 800 [kg];
+                attribute :>> cargo = 150 [kg];
+                satisfy wagonSpec by wagon1;
+                satisfy ladenSpec by wagon1;
+            }
+            requirement wagonSpec {
+                subject unit : Wagon;
+                require ladenLimit { in w = unit; }
+                require emptyLimit { in w = unit; }
+            }
+            requirement ladenSpec {
+                subject unit : Wagon;
+                require ladenLimit { in w = unit; }
+            }
+            requirement def WagonMassCap {
+                subject w : Wagon;
+                attribute actual : MassValue = w.tare + w.cargo;
+                attribute cap : MassValue;
+                require constraint { actual <= cap }
+            }
+            requirement ladenLimit : WagonMassCap {
+                attribute :>> cap = 1000 [kg];
+            }
+            requirement emptyLimit : WagonMassCap {
+                attribute :>> cap = 900 [kg];
+            }
+        }",
+    );
+    assert!(!model.has_errors());
+    let mut r = sysmlv2_parser::json::ResolvedModel::build(&model);
+    let claims = sysmlv2_parser::check::satisfaction_claims(&model, &mut r);
+    let got: Vec<_> = claims
+        .iter()
+        .map(|c| {
+            (
+                c.requirement.as_deref(),
+                c.verdict.clone(),
+                c.constraints.len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (Some("Freight::wagonSpec"), Violated, 2),
+            (Some("Freight::ladenSpec"), Satisfied, 1),
+        ]
+    );
+}
+
 /// A connector with more than two ends must not specialize a *binary*
 /// connector (typing, subsetting, or redefinition): the two-end shape
 /// implies the binary library base, so the n-ary usage contradicts it.

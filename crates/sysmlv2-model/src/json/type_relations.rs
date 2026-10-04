@@ -1567,6 +1567,25 @@ impl Builder {
     pub(super) fn checked_chain_bases(
         &mut self,
         boundary: usize,
+        steps: Option<&mut usize>,
+    ) -> Option<std::sync::Arc<FeatureChainBases>> {
+        let chained = self
+            .elements
+            .iter()
+            .take(boundary)
+            .any(|e| conforms(e.ty, "FeatureChaining"));
+        self.checked_chain_bases_from(0, boundary, chained, steps)
+    }
+
+    /// [`Self::checked_chain_bases`] of the features from row `start` on, for
+    /// rows below `boundary` that hold a chaining exactly when `chained` does:
+    /// a build extending a prepared library's plans reads the library's own
+    /// features' chain bases from them.
+    pub(super) fn checked_chain_bases_from(
+        &mut self,
+        start: usize,
+        boundary: usize,
+        chained: bool,
         mut steps: Option<&mut usize>,
     ) -> Option<std::sync::Arc<FeatureChainBases>> {
         fn budget(steps: &mut Option<&mut usize>, amount: usize) -> Option<()> {
@@ -1575,14 +1594,9 @@ impl Builder {
             }
             Some(())
         }
-        budget(&mut steps, boundary)?;
+        budget(&mut steps, boundary.saturating_sub(start))?;
         let mut result = FeatureChainBases::default();
-        if !self
-            .elements
-            .iter()
-            .take(boundary)
-            .any(|e| conforms(e.ty, "FeatureChaining"))
-        {
+        if !chained {
             return Some(std::sync::Arc::new(result));
         }
         let mut local = 0;
@@ -1597,14 +1611,14 @@ impl Builder {
             // The legacy unbounded planner must not panic when its bounded
             // identity reader cannot certify an unusually large/malformed graph.
             // Preserve qualification for every potentially affected Feature.
-            for feature in 0..boundary {
+            for feature in start..boundary {
                 if conforms(self.elements[feature].ty, "Feature") {
                     result.incomplete.insert(feature);
                 }
             }
             return Some(std::sync::Arc::new(result));
         };
-        for feature in 0..boundary {
+        for feature in start..boundary {
             budget(&mut steps, 1)?;
             if !conforms(self.elements[feature].ty, "Feature") {
                 continue;

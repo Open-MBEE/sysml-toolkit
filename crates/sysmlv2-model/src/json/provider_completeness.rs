@@ -39,6 +39,14 @@ pub(crate) struct ProviderCompleteness {
 }
 
 impl ProviderCompleteness {
+    /// Whether this cache has observed no publication but the builder's
+    /// current one: once the graph is republished it refuses every scope.
+    pub(crate) fn current(&self, b: &Builder) -> bool {
+        self.publication
+            .as_ref()
+            .is_none_or(|seen| seen.same_as(&b.publication.revision()))
+    }
+
     pub(super) fn reset_with_budget(&mut self, steps: &mut usize) -> Option<()> {
         if !self.invalidate_known(steps) {
             return None;

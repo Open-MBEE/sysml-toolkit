@@ -11,22 +11,11 @@ pub(super) struct Interval {
 
 /// Index range syntax once per validation pass; memoized values remain local to
 /// a comparison because its specializing receiver is part of the interpretation.
-pub(super) struct DomainRows(HashMap<usize, usize>);
+pub(super) struct DomainRows(crate::layered::LayeredMap<usize, usize>);
 
 impl DomainRows {
     pub(super) fn new(b: &Builder) -> Self {
-        let mut rows = HashMap::new();
-        for (i, (owner, _, _)) in b.multiplicities.iter().enumerate() {
-            let range = if conforms(b.elements[*owner].ty, "Multiplicity") {
-                Some(*owner)
-            } else {
-                b.local_multiplicity(*owner).flatten()
-            };
-            if let Some(range) = range {
-                rows.insert(range, i);
-            }
-        }
-        Self(rows)
+        Self(b.multiplicity_range_rows())
     }
 
     pub(super) fn compare(&self, b: &mut Builder, owner: usize, target: usize) -> Comparison {

@@ -47,25 +47,66 @@ pub(super) struct StoredStructure {
     pub(super) metadata_annotation_targets: HashSet<usize>,
     pub(super) metadata_annotation_sources: HashMap<usize, Vec<usize>>,
     pub(super) annotations_incomplete: bool,
+    /// The kept scan of the frozen rows this structure's scan extended
+    /// (`None` when every row was scanned here): the projections read its
+    /// projections for those rows and project only the rows after them.
+    prefix: Option<Arc<PrefixStructure>>,
 }
 /// Inverse Feature.typing and Feature.subsetting, independent of carrier.
 /// Suffix rows remain subject to the shared semantic carrier certificate.
 #[derive(Default)]
 pub(super) struct StoredTyping {
-    pub(super) relationships: HashMap<usize, Vec<usize>>,
+    pub(super) relationships: TypingSources,
     pub(super) sources_incomplete: bool,
+}
+
+/// The typing and subsetting relationships by source feature. A projection
+/// that extends the frozen rows' own holds only the later rows' entries: those
+/// rows name only later features as sources (else every row is projected, see
+/// [`StoredStructure::typing`]), so a frozen feature's entry is the frozen
+/// projection's.
+#[derive(Default)]
+pub(super) struct TypingSources {
+    own: HashMap<usize, Vec<usize>>,
+    frozen: Option<Arc<StoredTyping>>,
+}
+impl TypingSources {
+    pub(super) fn get(&self, feature: &usize) -> Option<&Vec<usize>> {
+        self.own
+            .get(feature)
+            .or_else(|| self.frozen.as_ref()?.relationships.get(feature))
+    }
+}
+#[cfg(test)]
+impl std::ops::Index<&usize> for TypingSources {
+    type Output = Vec<usize>;
+    fn index(&self, feature: &usize) -> &Vec<usize> {
+        self.get(feature).expect("a typed feature")
+    }
 }
 
 /// Inverse ownership contradictions for authored Membership domains. This is
 /// structural row evidence, not a new semantic graph or family certificate.
+/// Domains that extend the frozen rows' own keep theirs beside the owners the
+/// later rows contradict.
 #[derive(Default)]
 pub(super) struct MembershipDomains {
     bad_owners: HashSet<usize>,
+    frozen: Option<Arc<MembershipDomains>>,
     unlocalized: bool,
 }
 impl MembershipDomains {
+    /// Whether every membership claim names a row.
+    pub(super) fn localized(&self) -> bool {
+        !self.unlocalized
+    }
     pub(super) fn owner_complete(&self, owner: usize) -> bool {
-        !self.unlocalized && !self.bad_owners.contains(&owner)
+        !self.unlocalized
+            && !self.bad_owners.contains(&owner)
+            && self
+                .frozen
+                .as_ref()
+                .is_none_or(|frozen| !frozen.bad_owners.contains(&owner))
     }
 }
 
@@ -300,6 +341,24 @@ impl Scanned {
 pub(crate) struct PrefixStructure {
     base: Arc<Vec<super::Elem>>,
     scanned: Scanned,
+    /// The frozen rows' typing and membership projections, made by the first
+    /// structure that reads one and shared by every structure extending this
+    /// scan (`None` past the budget, or where the frozen ids are not unique).
+    typing: OnceLock<Option<FrozenTyping>>,
+    memberships: OnceLock<Option<FrozenMemberships>>,
+}
+/// A projection of the frozen rows, with the budget it charged: a structure
+/// reading it charges that again, so its budget reads as a whole projection's.
+struct FrozenTyping {
+    typing: Arc<StoredTyping>,
+    steps: usize,
+}
+struct FrozenMemberships {
+    domains: Arc<MembershipDomains>,
+    steps: usize,
+    /// The owned relationships of every frozen row, which a whole projection
+    /// visits when a later membership row has several carriers.
+    owner_relationships: usize,
 }
 impl PrefixStructure {
     /// A frozen table's rows are all authored: implied relationships are
@@ -314,7 +373,70 @@ impl PrefixStructure {
         Some(Self {
             base: Arc::clone(b.elements.base_arc()),
             scanned,
+            typing: OnceLock::new(),
+            memberships: OnceLock::new(),
         })
+    }
+
+    /// The number of frozen rows.
+    fn rows(&self) -> usize {
+        self.base.len()
+    }
+
+    /// The frozen rows' typing projection; `b` shares them.
+    fn typing(&self, b: &Builder) -> Option<&FrozenTyping> {
+        self.typing
+            .get_or_init(|| {
+                let mut steps = 0;
+                let scanned = &self.scanned;
+                let (own, sources_incomplete) = project_typing(
+                    b,
+                    &scanned.carriers,
+                    &scanned.ids,
+                    &scanned.typing_rows,
+                    0,
+                    &mut steps,
+                )??;
+                Some(FrozenTyping {
+                    typing: Arc::new(StoredTyping {
+                        relationships: TypingSources { own, frozen: None },
+                        sources_incomplete,
+                    }),
+                    steps,
+                })
+            })
+            .as_ref()
+    }
+
+    /// The frozen rows' membership domains; `b` shares them.
+    fn memberships(&self, b: &Builder) -> Option<&FrozenMemberships> {
+        self.memberships
+            .get_or_init(|| {
+                let scanned = &self.scanned;
+                if !scanned.ids_unique {
+                    return None;
+                }
+                let mut steps = 0;
+                let domains = project_memberships(
+                    b,
+                    &scanned.carriers,
+                    &scanned.ids,
+                    &scanned.membership_rows,
+                    0..self.rows(),
+                    scanned.multiple_membership_carriers,
+                    &mut steps,
+                )??;
+                Some(FrozenMemberships {
+                    domains: Arc::new(domains),
+                    steps,
+                    owner_relationships: self
+                        .base
+                        .iter()
+                        .map(|row| row.owned_relationships.len())
+                        .sum(),
+                })
+            })
+            .as_ref()
     }
 }
 
@@ -332,6 +454,329 @@ fn note_prefix_reuse() {
 }
 #[cfg(not(test))]
 fn note_prefix_reuse() {}
+
+/// The membership domains of `membership_rows` (authored membership rows) and
+/// of the rows in `rows`, read as children and — when some membership row has
+/// several carriers — as owners. `Some(None)` when a row of `rows` names a
+/// relationship before `rows.start` as its owning membership: that
+/// relationship's claims are gathered by the projection of the earlier rows.
+fn project_memberships(
+    b: &Builder,
+    carriers: &[Carrier],
+    ids: &crate::layered::IdMap<Uuid, usize>,
+    membership_rows: &[usize],
+    rows: std::ops::Range<usize>,
+    multiple_membership_carriers: bool,
+    steps: &mut usize,
+) -> Option<Option<MembershipDomains>> {
+    charge(steps, membership_rows.len())?;
+    let mut domains = MembershipDomains::default();
+    let mut claims: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut bad_relations = HashSet::new();
+    for &relationship in membership_rows {
+        let row = &b.elements[relationship];
+        let actual = match carriers[relationship] {
+            Carrier::Unique(owner) => Some(owner),
+            Carrier::Missing => None,
+            Carrier::Invalid => {
+                bad_relations.insert(relationship);
+                None
+            }
+        };
+        let mut owners = HashSet::new();
+        if let Some(owner) = actual {
+            owners.insert(owner);
+        }
+        let mut claim = |value: &crate::properties::Atom| match value
+            .as_reference()
+            .and_then(|id| ids.get(&id).copied())
+        {
+            Some(owner) => {
+                owners.insert(owner);
+                if actual != Some(owner) {
+                    bad_relations.insert(relationship);
+                }
+            }
+            None => {
+                if !value.is_null() {
+                    domains.unlocalized = true;
+                }
+                if actual.is_some() {
+                    bad_relations.insert(relationship);
+                }
+            }
+        };
+        for key in [
+            "owningRelatedElement",
+            "membershipOwningNamespace",
+            "owningType",
+            "featureWithValue",
+        ] {
+            if key == "featureWithValue" && !conforms(row.ty, "FeatureValue") {
+                continue;
+            }
+            if key == "owningType" && !conforms(row.ty, "FeatureMembership") {
+                continue;
+            }
+            charge(steps, 1)?;
+            if let Some(value) = row.props.get(key) {
+                claim(value);
+            }
+        }
+        let mut malformed_array = false;
+        for key in ["source", "relatedElement"] {
+            charge(steps, 1)?;
+            if let Some(value) = row.props.get(key) {
+                if let Some(values) = value.as_array() {
+                    let count = if key == "source" {
+                        values.len()
+                    } else {
+                        usize::from(!values.is_empty())
+                    };
+                    charge(steps, count)?;
+                    for value in values.iter().take(count) {
+                        claim(value);
+                    }
+                } else {
+                    malformed_array = true;
+                }
+            }
+        }
+        if malformed_array {
+            domains.unlocalized = true;
+            bad_relations.insert(relationship);
+        }
+        claims.insert(relationship, owners);
+    }
+    // Invalid raw carrier cardinality still identifies every actual owner;
+    // localize those contradictions instead of poisoning unrelated domains.
+    if multiple_membership_carriers {
+        charge(steps, rows.len())?;
+        for owner in rows.clone() {
+            let relationships = &b.elements[owner].owned_relationships;
+            charge(steps, relationships.len())?;
+            for &relationship in relationships {
+                if carriers.get(relationship) == Some(&Carrier::Invalid)
+                    && b.elements
+                        .get(relationship)
+                        .is_some_and(|r| conforms(r.ty, "Membership"))
+                {
+                    claims.entry(relationship).or_default().insert(owner);
+                }
+            }
+        }
+    }
+    // The child side is independent evidence: an omitted extra child can
+    // claim a perfectly listed singleton Membership and defeat uniqueness.
+    charge(steps, rows.len())?;
+    for child in rows.clone() {
+        let row = &b.elements[child];
+        let mut relationships = HashSet::new();
+        if let Some(relationship) = row.owning_relationship {
+            if b.elements.get(relationship).is_none() {
+                domains.unlocalized = true;
+            }
+            if b.elements
+                .get(relationship)
+                .is_some_and(|r| conforms(r.ty, "Membership"))
+            {
+                relationships.insert(relationship);
+            }
+        }
+        for key in [
+            "owningRelationship",
+            "owningMembership",
+            "owningFeatureMembership",
+            "owningParameterMembership",
+        ] {
+            if matches!(key, "owningFeatureMembership" | "owningParameterMembership")
+                && !conforms(row.ty, "Feature")
+            {
+                continue;
+            }
+            charge(steps, 1)?;
+            if let Some(value) = row.props.get(key) {
+                if value.is_null() {
+                    continue;
+                }
+                match value.as_reference().and_then(|id| ids.get(&id).copied()) {
+                    Some(relationship) if conforms(b.elements[relationship].ty, "Membership") => {
+                        relationships.insert(relationship);
+                    }
+                    Some(_) if key == "owningRelationship" => {}
+                    _ => domains.unlocalized = true,
+                }
+            }
+        }
+        if conforms(row.ty, "Feature") {
+            if let Some(value) = row.props.get("owningType") {
+                charge(steps, 1)?;
+                let claimed = value.as_reference().and_then(|id| ids.get(&id).copied());
+                let actual = row.owning_relationship.and_then(|relationship| {
+                    let membership = b.elements.get(relationship)?;
+                    if !conforms(membership.ty, "FeatureMembership") {
+                        return None;
+                    }
+                    match carriers.get(relationship)? {
+                        Carrier::Unique(owner) => Some(*owner),
+                        _ => None,
+                    }
+                });
+                if claimed.is_none() && !value.is_null() {
+                    domains.unlocalized = true;
+                }
+                if claimed != actual {
+                    if let Some(owner) = claimed {
+                        domains.bad_owners.insert(owner);
+                    }
+                    if let Some(owner) = actual {
+                        domains.bad_owners.insert(owner);
+                    }
+                }
+            }
+        }
+        if relationships
+            .iter()
+            .any(|&relationship| relationship < rows.start)
+        {
+            return Some(None);
+        }
+        for relationship in relationships {
+            charge(steps, 1)?;
+            let membership = &b.elements[relationship];
+            if !conforms(membership.ty, "OwningMembership")
+                || membership.children.as_ref() != [child]
+                || row.owning_relationship != Some(relationship)
+            {
+                bad_relations.insert(relationship);
+            }
+            if conforms(membership.ty, "FeatureMembership") {
+                if let Some(value) = row.props.get("owningType") {
+                    charge(steps, 1)?;
+                    let owner = value.as_reference().and_then(|id| ids.get(&id).copied());
+                    let actual = match carriers[relationship] {
+                        Carrier::Unique(owner) => Some(owner),
+                        _ => None,
+                    };
+                    if owner != actual {
+                        bad_relations.insert(relationship);
+                        if let Some(owner) = owner {
+                            claims.entry(relationship).or_default().insert(owner);
+                        } else if !value.is_null() {
+                            domains.unlocalized = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    charge(steps, bad_relations.len())?;
+    for relationship in bad_relations {
+        if let Some(owners) = claims.get(&relationship) {
+            charge(steps, owners.len())?;
+            domains.bad_owners.extend(owners.iter().copied());
+        } else {
+            domains.unlocalized = true;
+        }
+    }
+    Some(Some(domains))
+}
+
+/// Typing and subsetting relationships by source feature, and whether some
+/// relationship's source is missing or contradictory.
+type TypingProjection = (HashMap<usize, Vec<usize>>, bool);
+
+/// The typing and subsetting rows `rows` by source feature, and whether some
+/// row's source is missing or contradictory. Feature.type reads inverse
+/// associations, including standalone rows and generated result subsettings;
+/// this is a projection of the same stored identities and carriers, never an
+/// independent semantic graph. `Some(None)` when a row names a feature before
+/// `floor` as its source: that feature's entry is the earlier rows'.
+fn project_typing(
+    b: &Builder,
+    carriers: &[Carrier],
+    ids: &crate::layered::IdMap<Uuid, usize>,
+    rows: &[usize],
+    floor: usize,
+    steps: &mut usize,
+) -> Option<Option<TypingProjection>> {
+    charge(steps, rows.len())?;
+    let mut typing_relationships: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut typing_sources_incomplete = false;
+    for &relationship in rows {
+        let element = &b.elements[relationship];
+        let mut source_id = None;
+        let mut invalid = false;
+        for key in [
+            "specific",
+            "typedFeature",
+            "subsettingFeature",
+            "redefiningFeature",
+            "referencingFeature",
+            "crossingFeature",
+        ] {
+            if let Some(value) = element.props.get(key) {
+                match value.as_reference() {
+                    Some(id) if source_id.is_none_or(|old| old == id) => source_id = Some(id),
+                    _ => invalid = true,
+                }
+            }
+        }
+        let source = source_id.and_then(|id| ids.get(&id).copied()).or_else(|| {
+            if source_id.is_some() || invalid {
+                return None;
+            }
+            match carriers[relationship] {
+                Carrier::Unique(owner) if conforms(b.elements[owner].ty, "Feature") => Some(owner),
+                _ => None,
+            }
+        });
+        // Contradictory generic source/relatedElement evidence may name
+        // another feature; it cannot be charged only to the scalar source.
+        for (key, length) in [("source", 1usize), ("relatedElement", 2usize)] {
+            if let Some(value) = element.props.get(key) {
+                match value.as_array() {
+                    Some(values) => {
+                        charge(steps, values.len())?;
+                        if values.len() != length
+                            || source.is_none_or(|source| {
+                                values[0].as_reference() != Some(b.elements[source].id)
+                            })
+                        {
+                            invalid = true;
+                        }
+                    }
+                    None => invalid = true,
+                }
+            }
+        }
+        if source_id.is_none()
+            && element
+                .props
+                .get("owningRelatedElement")
+                .is_some_and(|value| {
+                    value.as_reference() != source.map(|source| b.elements[source].id)
+                })
+        {
+            invalid = true;
+        }
+        if invalid || source.is_none_or(|source| !conforms(b.elements[source].ty, "Feature")) {
+            // Missing/contradictory sources cannot be attributed to an
+            // arbitrary local feature, so completeness is globally unknown.
+            typing_sources_incomplete = true;
+            continue;
+        }
+        let source = source.unwrap();
+        if source < floor {
+            return Some(None);
+        }
+        typing_relationships
+            .entry(source)
+            .or_default()
+            .push(relationship);
+    }
+    Some(Some((typing_relationships, typing_sources_incomplete)))
+}
 
 /// Scan the rows `start..end` into `scanned`. The rows before `start` must
 /// be scanned already: an annotation's ends are read through the carriers
@@ -674,6 +1119,13 @@ impl StoredStructure {
     /// backlink. Forward enumeration alone cannot prove a result/input unique.
     /// This index depends only on this raw row revision; generated ownership is
     /// checked by the existing semantic overlay at the consumer boundary.
+    ///
+    /// A structure that extended the kept scan of the frozen rows extends their
+    /// kept domains with its own rows, charging the budget the frozen rows'
+    /// projection charged again, so the budget reads as a whole projection's.
+    /// A row of its own naming a frozen relationship as its owning membership
+    /// would read that relationship's claims, which only a whole projection
+    /// gathers together: such a structure projects every row.
     pub(super) fn membership_domains(
         &self,
         b: &Builder,
@@ -686,219 +1138,55 @@ impl StoredStructure {
         if let Some(domains) = self.memberships.get() {
             return Some(Arc::clone(domains));
         }
-        charge(steps, self.membership_rows.len())?;
-        let mut domains = MembershipDomains::default();
-        let mut claims: HashMap<usize, HashSet<usize>> = HashMap::new();
-        let mut bad_relations = HashSet::new();
-        for &relationship in &self.membership_rows {
-            let row = &b.elements[relationship];
-            let actual = match self.carriers[relationship] {
-                Carrier::Unique(owner) => Some(owner),
-                Carrier::Missing => None,
-                Carrier::Invalid => {
-                    bad_relations.insert(relationship);
-                    None
+        let whole = |steps: &mut usize| {
+            project_memberships(
+                b,
+                &self.carriers,
+                &self.ids,
+                &self.membership_rows,
+                0..self.authored_end,
+                self.multiple_membership_carriers,
+                steps,
+            )
+            .map(|domains| domains.expect("a whole projection claims no earlier row"))
+        };
+        let domains = match self.prefix.as_ref().and_then(|prefix| {
+            prefix
+                .memberships(b)
+                .map(|frozen| (prefix.rows(), &prefix.scanned, frozen))
+        }) {
+            Some((floor, frozen_scan, frozen)) => {
+                let before = *steps;
+                charge(steps, frozen.steps)?;
+                // A whole projection visits every owner when any membership
+                // row has several carriers; the frozen rows' projection did
+                // only when one of theirs had.
+                if self.multiple_membership_carriers && !frozen_scan.multiple_membership_carriers {
+                    charge(steps, floor.saturating_add(frozen.owner_relationships))?;
                 }
-            };
-            let mut owners = HashSet::new();
-            if let Some(owner) = actual {
-                owners.insert(owner);
-            }
-            let mut claim = |value: &crate::properties::Atom| match value
-                .as_reference()
-                .and_then(|id| self.ids.get(&id).copied())
-            {
-                Some(owner) => {
-                    owners.insert(owner);
-                    if actual != Some(owner) {
-                        bad_relations.insert(relationship);
-                    }
-                }
-                None => {
-                    if !value.is_null() {
-                        domains.unlocalized = true;
-                    }
-                    if actual.is_some() {
-                        bad_relations.insert(relationship);
-                    }
-                }
-            };
-            for key in [
-                "owningRelatedElement",
-                "membershipOwningNamespace",
-                "owningType",
-                "featureWithValue",
-            ] {
-                if key == "featureWithValue" && !conforms(row.ty, "FeatureValue") {
-                    continue;
-                }
-                if key == "owningType" && !conforms(row.ty, "FeatureMembership") {
-                    continue;
-                }
-                charge(steps, 1)?;
-                if let Some(value) = row.props.get(key) {
-                    claim(value);
-                }
-            }
-            let mut malformed_array = false;
-            for key in ["source", "relatedElement"] {
-                charge(steps, 1)?;
-                if let Some(value) = row.props.get(key) {
-                    if let Some(values) = value.as_array() {
-                        let count = if key == "source" {
-                            values.len()
-                        } else {
-                            usize::from(!values.is_empty())
-                        };
-                        charge(steps, count)?;
-                        for value in values.iter().take(count) {
-                            claim(value);
-                        }
-                    } else {
-                        malformed_array = true;
+                let start = self.membership_rows.partition_point(|&r| r < floor);
+                match project_memberships(
+                    b,
+                    &self.carriers,
+                    &self.ids,
+                    &self.membership_rows[start..],
+                    floor..self.authored_end,
+                    self.multiple_membership_carriers,
+                    steps,
+                )? {
+                    Some(own) => MembershipDomains {
+                        bad_owners: own.bad_owners,
+                        unlocalized: own.unlocalized || frozen.domains.unlocalized,
+                        frozen: Some(Arc::clone(&frozen.domains)),
+                    },
+                    None => {
+                        *steps = before;
+                        whole(steps)?
                     }
                 }
             }
-            if malformed_array {
-                domains.unlocalized = true;
-                bad_relations.insert(relationship);
-            }
-            claims.insert(relationship, owners);
-        }
-        // Invalid raw carrier cardinality still identifies every actual owner;
-        // localize those contradictions instead of poisoning unrelated domains.
-        if self.multiple_membership_carriers {
-            charge(steps, self.authored_end)?;
-            for owner in 0..self.authored_end {
-                let relationships = &b.elements[owner].owned_relationships;
-                charge(steps, relationships.len())?;
-                for &relationship in relationships {
-                    if self.carriers.get(relationship) == Some(&Carrier::Invalid)
-                        && b.elements
-                            .get(relationship)
-                            .is_some_and(|r| conforms(r.ty, "Membership"))
-                    {
-                        claims.entry(relationship).or_default().insert(owner);
-                    }
-                }
-            }
-        }
-        // The child side is independent evidence: an omitted extra child can
-        // claim a perfectly listed singleton Membership and defeat uniqueness.
-        charge(steps, self.authored_end)?;
-        for child in 0..self.authored_end {
-            let row = &b.elements[child];
-            let mut relationships = HashSet::new();
-            if let Some(relationship) = row.owning_relationship {
-                if b.elements.get(relationship).is_none() {
-                    domains.unlocalized = true;
-                }
-                if b.elements
-                    .get(relationship)
-                    .is_some_and(|r| conforms(r.ty, "Membership"))
-                {
-                    relationships.insert(relationship);
-                }
-            }
-            for key in [
-                "owningRelationship",
-                "owningMembership",
-                "owningFeatureMembership",
-                "owningParameterMembership",
-            ] {
-                if matches!(key, "owningFeatureMembership" | "owningParameterMembership")
-                    && !conforms(row.ty, "Feature")
-                {
-                    continue;
-                }
-                charge(steps, 1)?;
-                if let Some(value) = row.props.get(key) {
-                    if value.is_null() {
-                        continue;
-                    }
-                    match value
-                        .as_reference()
-                        .and_then(|id| self.ids.get(&id).copied())
-                    {
-                        Some(relationship)
-                            if conforms(b.elements[relationship].ty, "Membership") =>
-                        {
-                            relationships.insert(relationship);
-                        }
-                        Some(_) if key == "owningRelationship" => {}
-                        _ => domains.unlocalized = true,
-                    }
-                }
-            }
-            if conforms(row.ty, "Feature") {
-                if let Some(value) = row.props.get("owningType") {
-                    charge(steps, 1)?;
-                    let claimed = value
-                        .as_reference()
-                        .and_then(|id| self.ids.get(&id).copied());
-                    let actual = row.owning_relationship.and_then(|relationship| {
-                        let membership = b.elements.get(relationship)?;
-                        if !conforms(membership.ty, "FeatureMembership") {
-                            return None;
-                        }
-                        match self.carriers.get(relationship)? {
-                            Carrier::Unique(owner) => Some(*owner),
-                            _ => None,
-                        }
-                    });
-                    if claimed.is_none() && !value.is_null() {
-                        domains.unlocalized = true;
-                    }
-                    if claimed != actual {
-                        if let Some(owner) = claimed {
-                            domains.bad_owners.insert(owner);
-                        }
-                        if let Some(owner) = actual {
-                            domains.bad_owners.insert(owner);
-                        }
-                    }
-                }
-            }
-            for relationship in relationships {
-                charge(steps, 1)?;
-                let membership = &b.elements[relationship];
-                if !conforms(membership.ty, "OwningMembership")
-                    || membership.children.as_ref() != [child]
-                    || row.owning_relationship != Some(relationship)
-                {
-                    bad_relations.insert(relationship);
-                }
-                if conforms(membership.ty, "FeatureMembership") {
-                    if let Some(value) = row.props.get("owningType") {
-                        charge(steps, 1)?;
-                        let owner = value
-                            .as_reference()
-                            .and_then(|id| self.ids.get(&id).copied());
-                        let actual = match self.carriers[relationship] {
-                            Carrier::Unique(owner) => Some(owner),
-                            _ => None,
-                        };
-                        if owner != actual {
-                            bad_relations.insert(relationship);
-                            if let Some(owner) = owner {
-                                claims.entry(relationship).or_default().insert(owner);
-                            } else if !value.is_null() {
-                                domains.unlocalized = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        charge(steps, bad_relations.len())?;
-        for relationship in bad_relations {
-            if let Some(owners) = claims.get(&relationship) {
-                charge(steps, owners.len())?;
-                domains.bad_owners.extend(owners.iter().copied());
-            } else {
-                domains.unlocalized = true;
-            }
-        }
+            None => whole(steps)?,
+        };
         let domains = Arc::new(domains);
         let _ = self.memberships.set(Arc::clone(&domains));
         Some(domains)
@@ -906,6 +1194,12 @@ impl StoredStructure {
 
     /// Actual amortized work for a new projection. The legacy get() logical
     /// charge is unchanged, including after this optional projection is built.
+    ///
+    /// A structure that extended the kept scan of the frozen rows projects only
+    /// its own rows and reads a frozen feature's entry from the frozen rows'
+    /// kept projection, charging the budget that projection charged again. A
+    /// row of its own naming a frozen feature as its source would add to that
+    /// feature's entry: such a structure projects every row.
     pub(super) fn typing(&self, b: &Builder, steps: &mut usize) -> Option<Arc<StoredTyping>> {
         charge(steps, 1)?;
         if !self.is_current(b) {
@@ -914,93 +1208,87 @@ impl StoredStructure {
         if let Some(typing) = self.typing.get() {
             return Some(Arc::clone(typing));
         }
-        // Feature.type reads inverse associations, including standalone rows
-        // and generated result subsettings. This is a projection of the same
-        // stored identities/carriers, never an independent semantic graph.
-        charge(steps, self.typing_rows.len())?;
-        let mut typing_relationships: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut typing_sources_incomplete = false;
-        for &relationship in &self.typing_rows {
-            let element = &b.elements[relationship];
-            let mut source_id = None;
-            let mut invalid = false;
-            for key in [
-                "specific",
-                "typedFeature",
-                "subsettingFeature",
-                "redefiningFeature",
-                "referencingFeature",
-                "crossingFeature",
-            ] {
-                if let Some(value) = element.props.get(key) {
-                    match value.as_reference() {
-                        Some(id) if source_id.is_none_or(|old| old == id) => source_id = Some(id),
-                        _ => invalid = true,
+        let whole = |steps: &mut usize| {
+            let (own, sources_incomplete) =
+                project_typing(b, &self.carriers, &self.ids, &self.typing_rows, 0, steps)?
+                    .expect("a whole projection names no earlier source");
+            Some(StoredTyping {
+                relationships: TypingSources { own, frozen: None },
+                sources_incomplete,
+            })
+        };
+        let typing = match self
+            .prefix
+            .as_ref()
+            .and_then(|prefix| prefix.typing(b).map(|frozen| (prefix.rows(), frozen)))
+        {
+            Some((floor, frozen)) => {
+                let before = *steps;
+                charge(steps, frozen.steps)?;
+                let start = self.typing_rows.partition_point(|&r| r < floor);
+                match project_typing(
+                    b,
+                    &self.carriers,
+                    &self.ids,
+                    &self.typing_rows[start..],
+                    floor,
+                    steps,
+                )? {
+                    Some((own, sources_incomplete)) => StoredTyping {
+                        relationships: TypingSources {
+                            own,
+                            frozen: Some(Arc::clone(&frozen.typing)),
+                        },
+                        sources_incomplete: sources_incomplete || frozen.typing.sources_incomplete,
+                    },
+                    None => {
+                        *steps = before;
+                        whole(steps)?
                     }
                 }
             }
-            let source = source_id
-                .and_then(|id| self.ids.get(&id).copied())
-                .or_else(|| {
-                    if source_id.is_some() || invalid {
-                        return None;
-                    }
-                    match self.carriers[relationship] {
-                        Carrier::Unique(owner) if conforms(b.elements[owner].ty, "Feature") => {
-                            Some(owner)
-                        }
-                        _ => None,
-                    }
-                });
-            // Contradictory generic source/relatedElement evidence may name
-            // another feature; it cannot be charged only to the scalar source.
-            for (key, length) in [("source", 1usize), ("relatedElement", 2usize)] {
-                if let Some(value) = element.props.get(key) {
-                    match value.as_array() {
-                        Some(values) => {
-                            charge(steps, values.len())?;
-                            if values.len() != length
-                                || source.is_none_or(|source| {
-                                    values[0].as_reference() != Some(b.elements[source].id)
-                                })
-                            {
-                                invalid = true;
-                            }
-                        }
-                        None => invalid = true,
-                    }
-                }
-            }
-            if source_id.is_none()
-                && element
-                    .props
-                    .get("owningRelatedElement")
-                    .is_some_and(|value| {
-                        value.as_reference() != source.map(|source| b.elements[source].id)
-                    })
-            {
-                invalid = true;
-            }
-            if invalid || source.is_none_or(|source| !conforms(b.elements[source].ty, "Feature")) {
-                // Missing/contradictory sources cannot be attributed to an
-                // arbitrary local feature, so completeness is globally unknown.
-                typing_sources_incomplete = true;
-                continue;
-            }
-            typing_relationships
-                .entry(source.unwrap())
-                .or_default()
-                .push(relationship);
-        }
+            None => whole(steps)?,
+        };
         charge(steps, 0)?;
-        let typing = Arc::new(StoredTyping {
-            relationships: typing_relationships,
-            sources_incomplete: typing_sources_incomplete,
-        });
+        let typing = Arc::new(typing);
         // A concurrent structural reader could win publication; either value
         // describes this same immutable row epoch. No proof facts are cached.
         let _ = self.typing.set(Arc::clone(&typing));
         Some(Arc::clone(self.typing.get().unwrap()))
+    }
+
+    /// Whether this structure extends the kept scan of the `floor` frozen rows
+    /// and its own authored rows leave what the projections hold for the
+    /// frozen rows as the frozen rows' own projections give it: no typing row
+    /// of its own names a frozen feature as its source, and none of its own
+    /// rows contradicts a frozen owner's memberships. Materialized implied
+    /// relationships name library types as their sources by design; they are
+    /// not authored, and the planners do not read them.
+    pub(super) fn extends_frozen_rows(
+        &self,
+        b: &Builder,
+        floor: usize,
+        steps: &mut usize,
+    ) -> Option<bool> {
+        let Some(prefix) = &self.prefix else {
+            return Some(false);
+        };
+        if prefix.rows() != floor {
+            return Some(false);
+        }
+        let own = self.typing_rows.partition_point(|&r| r < floor)
+            ..self.typing_rows.partition_point(|&r| r < self.authored_end);
+        let authored = &self.typing_rows[own];
+        if project_typing(b, &self.carriers, &self.ids, authored, floor, steps)?.is_none() {
+            return Some(false);
+        }
+        if self.ids_unique {
+            let domains = self.membership_domains(b, steps)?;
+            if domains.frozen.is_none() || domains.bad_owners.iter().any(|&owner| owner < floor) {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     pub(super) fn is_current(&self, b: &Builder) -> bool {
@@ -1053,7 +1341,7 @@ impl StoredStructure {
             charge(steps, n)?;
         }
         let authored_end = b.implied_from.unwrap_or(n);
-        let scanned = Self::scanned(b, authored_end, steps)?;
+        let (scanned, prefix) = Self::scanned(b, authored_end, steps)?;
         let stored = Arc::new(Self {
             revision: Some(b.elements.observe_revision()),
             authored_end,
@@ -1077,6 +1365,7 @@ impl StoredStructure {
             metadata_annotation_targets: scanned.metadata_annotation_targets,
             metadata_annotation_sources: scanned.metadata_annotation_sources,
             annotations_incomplete: scanned.annotations_incomplete,
+            prefix,
         });
         b.id_index = Some(Arc::clone(&stored.ids));
         b.id_index_built_for = n;
@@ -1090,14 +1379,18 @@ impl StoredStructure {
     /// after the frozen ones every time. A table without frozen rows, with
     /// one written since, or with a later row claiming a frozen row or an
     /// id a frozen reference named (see [`PrefixStructure`]) is scanned
-    /// whole.
-    fn scanned(b: &mut Builder, authored_end: usize, steps: &mut usize) -> Option<Scanned> {
+    /// whole. With the scan, the kept scan it extended (`None` when whole).
+    fn scanned(
+        b: &mut Builder,
+        authored_end: usize,
+        steps: &mut usize,
+    ) -> Option<(Scanned, Option<Arc<PrefixStructure>>)> {
         let n = b.elements.len();
         let base_len = b.elements.base_len();
         let whole = |b: &Builder, steps: &mut usize| {
             let mut scanned = Scanned::new(n);
             scan(b, &mut scanned, 0, n, authored_end, steps)?;
-            Some(scanned)
+            Some((scanned, None))
         };
         if base_len == 0 || !b.elements.base_untouched() || authored_end < base_len {
             return whole(b, steps);
@@ -1131,7 +1424,7 @@ impl StoredStructure {
         if reused {
             note_prefix_reuse();
         }
-        Some(scanned)
+        Some((scanned, Some(prefix)))
     }
 
     /// The scan of a table's frozen rows, for its freeze to keep: `None`
@@ -2330,5 +2623,179 @@ mod prefix_tests {
         let before = prefix_reuses();
         StoredStructure::get(&mut r.b, &mut 0).unwrap();
         assert_eq!(prefix_reuses(), before + 1);
+    }
+    /// Typed and subsetting features and memberships on both sides of the
+    /// frozen rows, and a user feature typed by a library type.
+    const TYPED_LIBRARY: &str =
+        "class T; class A { feature x : T; feature y :> x; } class S { feature w : A; }";
+    const TYPED_USER: &str =
+        "package U { class C :> A { feature z : T; feature :>> x; } feature v : S; }";
+
+    fn typed_fixture() -> (Arc<PreparedLibrary>, ResolvedModel) {
+        let mut base = Model::new();
+        let parsed = base.add_library_source("lib.kerml", TYPED_LIBRARY);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let library = base.prepare_library().unwrap();
+        let mut model = Model::new();
+        Arc::clone(&library).install(&mut model).unwrap();
+        let parsed = model.add_source("user.kerml", TYPED_USER);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let r = ResolvedModel::build(&model);
+        assert!(r.b.library_facts.is_some(), "built on the prepared library");
+        (library, r)
+    }
+
+    /// The typing projection and membership domains of `layered` (with the
+    /// budget each charged) equal those of `whole`, row by row.
+    fn assert_same_projections(
+        layered: (&StoredStructure, &Builder),
+        whole: (&StoredStructure, &Builder),
+    ) {
+        let (mut layered_steps, mut whole_steps) = (0, 0);
+        let lt = layered.0.typing(layered.1, &mut layered_steps).unwrap();
+        let wt = whole.0.typing(whole.1, &mut whole_steps).unwrap();
+        assert_eq!(layered_steps, whole_steps, "typing budget");
+        assert_eq!(lt.sources_incomplete, wt.sources_incomplete);
+        let n = whole.1.elements.len();
+        for e in 0..n {
+            assert_eq!(lt.relationships.get(&e), wt.relationships.get(&e), "{e}");
+        }
+        let (mut layered_steps, mut whole_steps) = (0, 0);
+        let ld = layered.0.membership_domains(layered.1, &mut layered_steps);
+        let wd = whole.0.membership_domains(whole.1, &mut whole_steps);
+        assert_eq!(layered_steps, whole_steps, "membership budget");
+        let (ld, wd) = (ld.unwrap(), wd.unwrap());
+        assert_eq!(ld.unlocalized, wd.unlocalized);
+        for e in 0..n {
+            assert_eq!(ld.owner_complete(e), wd.owner_complete(e), "{e}");
+        }
+    }
+
+    #[test]
+    fn projections_extend_the_frozen_rows_projections_and_equal_whole_ones() {
+        let (library, mut r) = typed_fixture();
+        r.b.stored_structure = None;
+        let layered = StoredStructure::get(&mut r.b, &mut 0).unwrap();
+        assert!(layered.prefix.is_some(), "the scan extended the kept one");
+        let (_, mut w) = typed_fixture();
+        let (whole, _) = scanned_whole(&mut w.b);
+        assert!(whole.prefix.is_none());
+        assert_same_projections((&layered, &r.b), (&whole, &w.b));
+        let typing = layered.typing(&r.b, &mut 0).unwrap();
+        assert!(typing.relationships.frozen.is_some(), "extended, not whole");
+        let domains = layered.membership_domains(&r.b, &mut 0).unwrap();
+        assert!(domains.frozen.is_some(), "extended, not whole");
+        let x = r.resolve_qualified("A::x").unwrap().0;
+        let z = r.resolve_qualified("U::C::z").unwrap().0;
+        assert!(x < r.b.lib_boundary && z >= r.b.lib_boundary);
+        assert_eq!(typing.relationships[&x].len(), 1);
+        assert_eq!(typing.relationships[&z].len(), 1);
+
+        // A second build on the library shares the frozen projections.
+        let mut model = Model::new();
+        Arc::clone(&library).install(&mut model).unwrap();
+        model.add_source("user.kerml", TYPED_USER);
+        let mut second = ResolvedModel::build(&model);
+        let other = StoredStructure::for_query(&mut second.b, &mut 0).unwrap();
+        let shared = other.typing(&second.b, &mut 0).unwrap();
+        assert!(Arc::ptr_eq(
+            shared.relationships.frozen.as_ref().unwrap(),
+            typing.relationships.frozen.as_ref().unwrap()
+        ));
+        let shared = other.membership_domains(&second.b, &mut 0).unwrap();
+        assert!(Arc::ptr_eq(
+            shared.frozen.as_ref().unwrap(),
+            domains.frozen.as_ref().unwrap()
+        ));
+    }
+
+    /// A user typing row naming a library feature as its source — which no
+    /// text makes — adds to that feature's entry: the projection is whole.
+    #[test]
+    fn a_row_typing_a_frozen_feature_projects_whole() {
+        let retarget = |r: &mut ResolvedModel| {
+            let x = r.resolve_qualified("A::x").unwrap().0;
+            let z = r.resolve_qualified("U::C::z").unwrap().0;
+            let typing = r.b.elements[z]
+                .owned_relationships
+                .iter()
+                .copied()
+                .find(|&rel| r.b.elements[rel].ty == "FeatureTyping")
+                .unwrap();
+            let id = r.b.elements[x].id;
+            r.b.elements[typing]
+                .props
+                .insert("typedFeature", crate::properties::Atom::reference(id));
+            (x, typing)
+        };
+        let (_, mut r) = typed_fixture();
+        let (x, typing) = retarget(&mut r);
+        r.b.stored_structure = None;
+        let layered = StoredStructure::get(&mut r.b, &mut 0).unwrap();
+        assert!(layered.prefix.is_some());
+        let (_, mut w) = typed_fixture();
+        retarget(&mut w);
+        let (whole, _) = scanned_whole(&mut w.b);
+        assert_same_projections((&layered, &r.b), (&whole, &w.b));
+        let projected = layered.typing(&r.b, &mut 0).unwrap();
+        assert!(projected.relationships.frozen.is_none(), "projected whole");
+        assert!(projected.relationships[&x].contains(&typing));
+    }
+
+    /// A user feature naming a library membership as the membership that
+    /// owns it — no text makes one either — reads that membership's claims:
+    /// the domains are projected whole.
+    #[test]
+    fn a_row_owned_through_a_frozen_membership_projects_whole() {
+        let reparent = |r: &mut ResolvedModel| {
+            let x = r.resolve_qualified("A::x").unwrap().0;
+            let z = r.resolve_qualified("U::C::z").unwrap().0;
+            let membership = r.b.elements[x].owning_relationship.unwrap();
+            let id = r.b.elements[membership].id;
+            r.b.elements[z]
+                .props
+                .insert("owningMembership", crate::properties::Atom::reference(id));
+        };
+        let (_, mut r) = typed_fixture();
+        reparent(&mut r);
+        r.b.stored_structure = None;
+        let layered = StoredStructure::get(&mut r.b, &mut 0).unwrap();
+        assert!(layered.prefix.is_some());
+        let (_, mut w) = typed_fixture();
+        reparent(&mut w);
+        let (whole, _) = scanned_whole(&mut w.b);
+        assert_same_projections((&layered, &r.b), (&whole, &w.b));
+        let domains = layered.membership_domains(&r.b, &mut 0).unwrap();
+        assert!(domains.frozen.is_none(), "projected whole");
+    }
+
+    /// A user membership row with two carriers makes a whole projection visit
+    /// every owner, the frozen ones included: the extended projection charges
+    /// what that visit charges.
+    #[test]
+    fn a_later_membership_with_two_carriers_charges_the_frozen_owners() {
+        let share = |r: &mut ResolvedModel| {
+            let c = r.resolve_qualified("U::C").unwrap().0;
+            let v = r.resolve_qualified("U::v").unwrap().0;
+            let membership = r.b.elements[c]
+                .owned_relationships
+                .iter()
+                .copied()
+                .find(|&rel| crate::metaclass::conforms(r.b.elements[rel].ty, "Membership"))
+                .unwrap();
+            r.b.elements[v].owned_relationships.push(membership);
+        };
+        let (_, mut r) = typed_fixture();
+        share(&mut r);
+        r.b.stored_structure = None;
+        let layered = StoredStructure::get(&mut r.b, &mut 0).unwrap();
+        assert!(layered.prefix.is_some());
+        assert!(layered.multiple_membership_carriers);
+        let (_, mut w) = typed_fixture();
+        share(&mut w);
+        let (whole, _) = scanned_whole(&mut w.b);
+        assert_same_projections((&layered, &r.b), (&whole, &w.b));
+        let domains = layered.membership_domains(&r.b, &mut 0).unwrap();
+        assert!(domains.frozen.is_some(), "extended");
     }
 }

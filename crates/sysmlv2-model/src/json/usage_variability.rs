@@ -482,7 +482,7 @@ mod tests {
         }
         let mut r = fixture("part def P :> Occurrences::Occurrence {ref x :> Base::things;}");
         let x = r.resolve_qualified("P::x").unwrap();
-        r.by_id.clear();
+        r.by_id = std::sync::Arc::default();
         r.by_id_built_for = usize::MAX;
         assert_eq!(
             r.usage_variability_report_with_budget(x, crate::eval::MAX_STEPS - 2)

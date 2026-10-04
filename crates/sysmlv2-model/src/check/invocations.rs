@@ -19,13 +19,13 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
     let mut value_exprs: Vec<(usize, usize, sysmlv2_syntax::ast::Expr)> =
         r.b.values
             .iter()
-            .filter(|(o, _)| !model.is_library_unit(r.b.unit_of_elem(**o)))
+            .filter(|(o, _)| super::user_owned(&r.b, model, **o))
             .map(|(o, (s, e))| (*o, *s, e.clone()))
             .collect();
     value_exprs.extend(
         r.b.result_exprs
             .iter()
-            .filter(|row| !model.is_library_unit(r.b.unit_of_elem(row.0)))
+            .filter(|row| super::user_owned(&r.b, model, row.0))
             .cloned(),
     );
     for (owner, scope, expr) in value_exprs {

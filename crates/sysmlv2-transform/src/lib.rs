@@ -2577,6 +2577,14 @@ impl Session {
         &self.resolved
     }
 
+    /// The resolved model together with the model it was built from, for
+    /// passes that take both (constraint verification) and should run on
+    /// this session's graph, reusing what its queries already derived,
+    /// instead of resolving the model again.
+    pub fn resolved_with_model(&mut self) -> (&mut ResolvedModel, &sysmlv2_model::model::Model) {
+        (&mut self.resolved, &self.model)
+    }
+
     /// The session's built model — read-only access for consumers that
     /// drive analysis passes over it (constraint verification, interval
     /// propagation) without re-lowering the sources.

@@ -121,7 +121,7 @@ impl ResolvedModel {
     /// inherits none. `None` when no result is declared, or the callee's
     /// body requires statement execution.
     pub fn callable_body(&mut self, callee: ElementRef) -> Option<CallableBody> {
-        if self.b.calculation_requires_execution(callee.0) {
+        if self.b.indexed_calculation_requires_execution(callee.0) {
             return None;
         }
         self.b.callable_body(callee.0)

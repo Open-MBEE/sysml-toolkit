@@ -19,7 +19,9 @@ pub(super) fn validate(
     let mut incoming = vec![0; n];
     let mut outgoing = vec![0; n];
     let mut edges = Vec::new();
-    for e in 0..n {
+    // A library succession joins library features only, so the counts it
+    // would add are never read: the walks start at the library boundary.
+    for e in r.b.lib_boundary..n {
         if !is(&r.b, e, "Succession") {
             continue;
         }
@@ -112,7 +114,7 @@ pub(super) fn validate(
             }
         }
     }
-    for e in 0..n {
+    for e in r.b.lib_boundary..n {
         let unit = r.b.unit_of_elem(e);
         if model.is_library_unit(unit) {
             continue;

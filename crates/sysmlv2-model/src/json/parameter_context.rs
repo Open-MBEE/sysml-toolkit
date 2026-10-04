@@ -333,7 +333,7 @@ mod tests {
             RuntimeParameterSelection::Unsupported,
         );
         model.b.ensure_spec_index();
-        let index = model.b.spec_index.as_ref().unwrap()[&q.0][0];
+        let index = model.b.spec_index.as_ref().unwrap().get(&q.0).unwrap()[0];
         let saved = model.b.spec_resolved[index];
         model.b.spec_resolved[index] = None;
         assert_eq!(

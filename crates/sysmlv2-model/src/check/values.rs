@@ -15,7 +15,7 @@ pub(super) fn validate(
     // End features that a connector claims, indexed once for the walk.
     let connected: std::collections::HashSet<usize> =
         r.b.connector_ends.iter().map(|(_, end, _)| *end).collect();
-    for e in 0..r.b.explicit_len() {
+    for e in r.b.lib_boundary..r.b.explicit_len() {
         let unit = r.b.unit_of_elem(e);
         if model.is_library_unit(unit) {
             continue;
@@ -147,7 +147,7 @@ pub(super) fn validate(
         .metadata_of
         .iter()
         .flat_map(|(&annotated, metas)| metas.iter().copied().map(move |meta| (annotated, meta)))
-        .filter(|&(_, meta)| !model.is_library_unit(r.b.unit_of_elem(meta)))
+        .filter(|&(_, meta)| super::user_owned(&r.b, model, meta))
         .collect();
     for (annotated, meta) in associations {
         let unit = r.b.unit_of_elem(meta);

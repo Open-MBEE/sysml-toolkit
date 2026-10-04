@@ -830,6 +830,58 @@ fn verify_reports_verdicts_and_narrowed_ranges() {
 }
 
 #[test]
+fn verify_reports_one_verdict_per_satisfaction_claim() {
+    // Each claim is positioned over its whole `satisfy` statement and
+    // carries the constraint verdicts it combines, evaluated with the
+    // requirement's subject bound to the satisfying part.
+    let src = "package P {\n\
+               \x20   part def Thing { attribute m; }\n\
+               \x20   requirement def Cap {\n\
+               \x20       subject t : Thing;\n\
+               \x20       require constraint { t.m <= 5 }\n\
+               \x20   }\n\
+               \x20   requirement cap : Cap;\n\
+               \x20   part small : Thing { attribute :>> m = 3; }\n\
+               \x20   part big : Thing { attribute :>> m = 9; }\n\
+               \x20   part site {\n\
+               \x20       satisfy cap by small;\n\
+               \x20       satisfy cap by big;\n\
+               \x20   }\n\
+               }\n";
+    let mut s = Session::from_sources(&sources(&[("t.sysml", src)])).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&s.verify(None).unwrap()).unwrap();
+    let claims = report["satisfactions"].as_array().unwrap();
+    assert_eq!(claims.len(), 2);
+    let small = &claims[0];
+    assert_eq!(small["status"], "satisfied");
+    assert_eq!(small["detail"], "satisfied");
+    assert_eq!(small["requirement"], "P::cap");
+    assert_eq!(small["by"], "small");
+    assert_eq!(small["negated"], false);
+    assert_eq!(small["unitName"], "t.sysml");
+    assert_eq!((&small["line"], &small["col"]), (&11.into(), &9.into()));
+    assert_eq!(
+        (&small["endLine"], &small["endCol"]),
+        (&11.into(), &30.into())
+    );
+    let big = &claims[1];
+    assert_eq!(big["status"], "violated");
+    assert_eq!(big["line"], 12);
+    let parts = big["constraints"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["status"], "violated");
+    assert_eq!(parts[0]["assumed"], false);
+    assert_eq!(parts[0]["detail"], "VIOLATED (with t.m = 9)");
+    assert_eq!(parts[0]["line"], 5);
+    assert_eq!(parts[0]["bindings"][0]["feature"], "t.m");
+    assert_eq!(parts[0]["bindings"][0]["value"], "9");
+    // The unbound original stays undecided; each claim counts once.
+    assert_eq!(report["summary"]["satisfied"], 1);
+    assert_eq!(report["summary"]["violated"], 1);
+    assert_eq!(report["summary"]["undecided"], 1);
+}
+
+#[test]
 fn lint_reports_configurable_findings_with_positions_and_fixes() {
     // A dead calc input (unused-parameter, default warn, deleting fix)
     // and a snake_case definition (naming-convention, default warn) —

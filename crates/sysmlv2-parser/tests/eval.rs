@@ -412,6 +412,165 @@ fn featuring_context_redefinition() {
     );
 }
 
+/// A feature with no value of its own takes the value of a feature it
+/// subsets when the two cannot differ: it has at least one value and the
+/// subsetted feature at most one, so its one value is the subsetted
+/// feature's. A multiplicity read from the subsetted feature counts. The
+/// feature's own value still wins, and so does its own reading when it says
+/// more than the subsetted feature (members of its own, a narrower type);
+/// an optional subsetting feature, or a collection-valued subsetted one,
+/// stays unknown; a receiver's redefinition of the subsetted feature is
+/// read through the receiver; and a subsetting cycle settles nothing.
+#[test]
+fn singleton_subsettings_take_the_subsetted_value() {
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package T {
+             part def Crawler { attribute m; }
+             part def Racer :> Crawler { attribute speed = 3; }
+             part def Ctx {
+                 part tiny : Crawler { attribute :>> m = 4; }
+                 part crowd : Crawler[0..*];
+                 part other : Crawler { attribute :>> m = 9; }
+                 part single[1] :> tiny;
+                 part implied :> tiny;
+                 part optional[0..1] :> tiny;
+                 part fromCrowd[1] :> crowd;
+                 part pinned[1] :> tiny = other;
+                 part bodied[1] :> tiny { attribute :>> m = 6; }
+                 part narrower[1] : Racer :> tiny;
+                 part ping[1] :> pong;
+                 part pong[1] :> ping;
+             }
+             part ctx : Ctx[1];
+             part special : Ctx[1] { part :>> tiny { attribute :>> m = 7; } }
+             attribute rSingle = ctx.single.m;
+             attribute rImplied = ctx.implied.m;
+             attribute rOptional = ctx.optional.m;
+             attribute rFromCrowd = ctx.fromCrowd.m;
+             attribute rPinned = ctx.pinned.m;
+             attribute rBodied = ctx.bodied.m;
+             attribute rNarrower = ctx.narrower.speed;
+             attribute rCycle = ctx.ping.m;
+             attribute rSpecial = special.single.m;
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let mut eval = |name: &str| {
+        let e = r.resolve_qualified(&format!("T::{name}")).unwrap();
+        r.evaluate(e)
+    };
+    assert_eq!(eval("rSingle"), Ok(Value::Integer(4)));
+    assert_eq!(eval("rImplied"), Ok(Value::Integer(4)));
+    assert_eq!(eval("rPinned"), Ok(Value::Integer(9)));
+    assert_eq!(eval("rBodied"), Ok(Value::Integer(6)));
+    assert_eq!(eval("rNarrower"), Ok(Value::Integer(3)));
+    assert_eq!(eval("rSpecial"), Ok(Value::Integer(7)));
+    for name in ["rOptional", "rFromCrowd", "rCycle"] {
+        let value = eval(name);
+        assert!(
+            !matches!(value, Ok(Value::Integer(_))),
+            "{name} must stay unknown: {value:?}"
+        );
+    }
+}
+
+/// An analysis performed once whose subject subsets a single part reads that
+/// part: under singletons `subject :>> c :> tiny;` is `c = tiny`, so the
+/// result evaluates. Without `[1]` the analysis usage stands for any number
+/// of performances, and its result stays unknown.
+#[test]
+fn analysis_results_read_a_singleton_subsetted_subject() {
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+             part def Crawler { attribute m; }
+             analysis def MassAnalysis {
+                 subject c : Crawler;
+                 return result = c.m;
+             }
+             part def Ctx {
+                 part tiny : Crawler { attribute :>> m = 4; }
+                 analysis once[1] : MassAnalysis { subject :>> c :> tiny; }
+                 analysis any : MassAnalysis { subject :>> c :> tiny; }
+                 attribute viaOnce = once.result;
+                 attribute viaAny = any.result;
+             }
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let once = r.resolve_qualified("P::Ctx::viaOnce").unwrap();
+    assert_eq!(r.evaluate(once), Ok(Value::Integer(4)));
+    let any = r.resolve_qualified("P::Ctx::viaAny").unwrap();
+    assert_eq!(r.evaluate(any), Ok(Value::Indeterminate));
+}
+
+/// A featuring instance may redefine a chain of names as a whole
+/// (`attribute :>> chassis.mass = 25;`). Reading the chain through that
+/// instance takes the redefinition's value — directly, inside an
+/// inherited formula, from a specialization of the instance, and from a
+/// navigation-site chain — while the definition and the other instances
+/// keep their own values.
+#[test]
+fn chain_redefinitions_supply_the_chained_feature_value() {
+    use sysmlv2_parser::ast::{Name, QualifiedName};
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package T {
+             part def Chassis { attribute mass; }
+             part def Crawler {
+                 part chassis : Chassis { attribute :>> mass default 1; }
+                 attribute vehicleMass = chassis.mass;
+             }
+             part plain : Crawler[1];
+             part nested : Crawler[1] { part :>> chassis { attribute :>> mass = 4; } }
+             part chained : Crawler[1] { attribute :>> chassis.mass = 25; }
+             part special[1] :> chained;
+             attribute direct = chained.chassis.mass;
+             attribute rolled = chained.vehicleMass;
+         }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    for (name, expected) in [
+        ("T::Crawler::vehicleMass", 1),
+        ("T::plain::vehicleMass", 1),
+        ("T::nested::vehicleMass", 4),
+        ("T::chained::vehicleMass", 25),
+        ("T::special::vehicleMass", 25),
+    ] {
+        assert_eq!(
+            r.evaluate_qualified(name),
+            Ok(Value::Integer(expected)),
+            "{name}"
+        );
+    }
+    for name in ["T::direct", "T::rolled"] {
+        let e = r.resolve_qualified(name).unwrap();
+        assert_eq!(r.evaluate(e), Ok(Value::Integer(25)), "{name}");
+    }
+    let member = |value: &str| QualifiedName {
+        is_global: false,
+        segments: vec![Name {
+            value: value.into(),
+            span: Default::default(),
+        }],
+        span: Default::default(),
+    };
+    for (root, expected) in [("T::chained", 25), ("T::plain", 1)] {
+        let root = r.resolve_qualified(root).unwrap();
+        assert_eq!(
+            r.evaluate_chain(root, &[&member("chassis"), &member("mass")]),
+            Ok(Value::Integer(expected))
+        );
+    }
+}
+
 /// A chain step landing on an overriding usage (`part :>> c : N;`) must
 /// resolve the next member through the override's declared type as well
 /// as the redefinition target's: `d` is inherited both ways (the original

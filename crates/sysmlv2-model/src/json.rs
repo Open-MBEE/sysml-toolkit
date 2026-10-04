@@ -36,6 +36,8 @@ mod dynamic_invocations;
 mod generated_defaults;
 mod implied;
 mod import_memberships;
+mod library_plans;
+pub(crate) use library_plans::{LibraryEnumTypes, LibraryPlans};
 mod local_featuring;
 mod membership_evidence;
 mod membership_projection;
@@ -448,6 +450,18 @@ fn top_level_shadowing(model: &crate::model::Model) -> bool {
     }
 }
 
+/// The owning element of each relationship row of `b` (the rows' own
+/// ownership; a materialized suffix's view is not read).
+pub(crate) fn relationship_owners(b: &Builder) -> Vec<Option<usize>> {
+    let mut owners = vec![None; b.elements.len()];
+    for (i, element) in b.elements.iter().enumerate() {
+        for &r in &element.owned_relationships {
+            owners[r] = Some(i);
+        }
+    }
+    owners
+}
+
 pub(crate) fn top_level_names<'a>(
     units: impl Iterator<Item = &'a crate::model::ModelUnit>,
 ) -> HashSet<String> {
@@ -675,6 +689,11 @@ fn bind_atom(atom: &mut crate::properties::Atom, bound: &mut HashSet<Uuid>) {
 /// later `::**` one that also descends into `Q`'s members.
 type ImportVisit = (usize, u8, bool, Vec<(usize, usize)>);
 
+/// Valued chain redefinitions by owning type: (redefining feature, resolved
+/// chain links) — see [`Builder::chain_redefinitions`].
+pub(crate) type ChainRedefinitions =
+    Arc<crate::layered::LayeredMap<usize, Vec<(usize, Vec<usize>)>>>;
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Builder {
     pub(crate) graph_format: crate::model::GraphFormat,
@@ -746,13 +765,17 @@ pub(crate) struct Builder {
     /// Per-scope cache of resolved namespace-import target scopes (with the
     /// recursive flag and the import's bracket-filter indices).
     #[serde(skip)]
-    import_cache: Vec<Option<Arc<Vec<ImportedScope>>>>,
+    import_cache: crate::layered::ScopeTable<Option<Arc<Vec<ImportedScope>>>>,
     /// Per scope and access, the sub-scopes a recursive import walks: the
     /// scopes its admitted named members open, sorted. Lookups through a
     /// recursive import visit them for every name; the lists are the scope
     /// tables', fixed for a pass.
     #[serde(skip)]
     recursive_subs: crate::layered::IdMap<(usize, u8), Arc<[usize]>>,
+    /// [`Self::chain_redefinitions`], with the element count it was built
+    /// for.
+    #[serde(skip)]
+    chain_redefinitions: Option<(usize, ChainRedefinitions)>,
     /// Import relationships a lookup actually resolved a name through
     /// (admitted hits only) — the unused-import check's evidence.
     pub(crate) used_imports: crate::layered::IdSet<usize>,
@@ -779,17 +802,32 @@ pub(crate) struct Builder {
     pub(crate) user_imports: Vec<UserImport>,
     /// Per-scope cache of resolved specialization-base scopes.
     #[serde(skip)]
-    base_cache: Vec<Option<(Vec<usize>, usize)>>,
+    base_cache: crate::layered::ScopeTable<Option<(Vec<usize>, usize)>>,
     /// Rule-required positional edges, keyed by stable element indices.
     #[serde(skip)]
     positional_redefinitions: Option<positional::PositionalRedefinitions>,
     /// Private recursion guard; never stands in for completed evidence.
     #[serde(skip)]
     positional_planning: bool,
+    /// Whether [`Self::positional_redefinitions`] extends the prepared
+    /// library's plan (see [`Self::plan_positional_on_library`]): the
+    /// library's types then have the redefinitions the library gives them.
+    #[serde(skip)]
+    positional_from_library: bool,
     /// Library/variation requirements reused by positional planning and
     /// materialization. External name-table overrides bypass this cache.
     #[serde(skip)]
     supported_implied: Option<Arc<implied::SupportedImpliedSpecializations>>,
+    /// The prepared library this build stands on: the planners extend its
+    /// own rows' plans with this build's rows instead of planning every row
+    /// (see [`library_plans`]). `None` for a library's own build and a
+    /// joint one.
+    #[serde(skip)]
+    pub(crate) prepared_from: Option<Arc<crate::prepared::PreparedLibrary>>,
+    /// Whether the planners extend [`Self::prepared_from`]'s plans, decided
+    /// once per state of the rows (see [`Builder::library_plans`]).
+    #[serde(skip)]
+    library_plans_decided: Option<library_plans::LibraryPlansDecided>,
     /// Caller-supplied library-name overrides used by positional planning
     /// before the implied relationship view is materialized.
     #[serde(skip)]
@@ -812,9 +850,9 @@ pub(crate) struct Builder {
     /// their own filters without re-walking the graph. The six slots separate
     /// three visibility levels for compatibility and semantic-name queries.
     #[serde(skip)]
-    visit_stamp: Vec<[u64; 6]>,
+    visit_stamp: crate::layered::ScopeTable<[u64; 6]>,
     #[serde(skip)]
-    visit_result: Vec<[Option<LookupResult>; 6]>,
+    visit_result: crate::layered::ScopeTable<[Option<LookupResult>; 6]>,
     /// The active lookup query number (one per (start scope, name) chase).
     #[serde(skip)]
     query_stamp: u64,
@@ -898,12 +936,17 @@ pub(crate) struct Builder {
     fill_frames: Vec<Vec<String>>,
     /// Root misses behind each scope's `base_cache` entry.
     #[serde(skip)]
-    base_misses: Vec<FillMisses>,
+    base_misses: crate::layered::ScopeTable<FillMisses>,
     /// Root misses behind each scope's `import_cache` entry — the
     /// resolution of every namespace import target of the scope, which
     /// also yields its `import_targets` entries.
     #[serde(skip)]
-    import_misses: Vec<FillMisses>,
+    import_misses: crate::layered::ScopeTable<FillMisses>,
+    /// The scopes of the prepared library the build stands on: the
+    /// per-scope lookup caches keep their rows sparse (see
+    /// [`crate::layered::ScopeTable`]).
+    #[serde(skip)]
+    scope_floor: usize,
     /// Root misses behind the `semantic_metadata` memo.
     #[serde(skip)]
     semantic_metadata_misses: FillMisses,
@@ -1034,7 +1077,7 @@ pub(crate) struct Builder {
     /// explicit_supertypes`] and the evaluator's classification
     /// operators).
     #[serde(skip)]
-    pub(crate) spec_index: Option<HashMap<usize, Vec<usize>>>,
+    pub(crate) spec_index: Option<crate::layered::LayeredMap<usize, Vec<usize>>>,
     /// Lazily built interchange-id → element index map (the inverse of
     /// id assignment) — resolves id-valued relationship properties like
     /// `referencedFeature` without a [`ResolvedModel`] at hand. Rebuilt
@@ -1074,7 +1117,7 @@ pub(crate) struct Builder {
     /// library-inclusive, so the scan it replaces was proportional to
     /// the library on every lookup.
     #[serde(skip)]
-    mult_index: Option<(usize, HashMap<usize, usize>)>,
+    mult_index: Option<(usize, crate::layered::LayeredMap<usize, usize>)>,
     /// First non-library element index (libraries build first) — the
     /// `boundary` of [`Self::build_model`], kept for library-ownership
     /// tests.
@@ -1723,7 +1766,9 @@ impl Builder {
                 && !top_level_shadowing(model)
                 && !library.builder.user_completes_library(model)
             {
-                return self.build_on_library(model, &library.builder);
+                let boundary = self.build_on_library(model, &library.builder);
+                self.prepared_from = Some(Arc::clone(library));
+                return boundary;
             }
             // A prepared library's own recording stands in for the prepared
             // graph this build cannot reuse.
@@ -2049,18 +2094,24 @@ impl Builder {
         facts
     }
 
+    /// Empty per-scope lookup caches, one row per scope.
+    fn reset_scope_tables(&mut self) {
+        use crate::layered::ScopeTable;
+        let (floor, n) = (self.scope_floor, self.scopes.len());
+        self.import_cache = ScopeTable::new(floor, n);
+        self.base_cache = ScopeTable::new(floor, n);
+        self.import_misses = ScopeTable::new(floor, n);
+        self.base_misses = ScopeTable::new(floor, n);
+        self.visit_stamp = ScopeTable::new(floor, n);
+        self.visit_result = ScopeTable::new(floor, n);
+    }
+
     pub(crate) fn reset_lookup_caches(&mut self) {
         self.parameter_signatures = None;
-        let n = self.scopes.len();
-        self.import_cache = vec![None; n];
+        self.reset_scope_tables();
         self.recursive_subs.clear();
-        self.base_cache = vec![None; n];
-        self.import_misses = vec![FillMisses::None; n];
-        self.base_misses = vec![FillMisses::None; n];
         self.semantic_metadata_misses = FillMisses::None;
         self.fill_frames.clear();
-        self.visit_stamp = vec![[0; 6]; n];
-        self.visit_result = vec![[None; 6]; n];
         self.query_stamp = 0;
         self.import_targets.clear();
         self.recorded_lookup_graph = None;
@@ -2117,8 +2168,10 @@ impl Builder {
         // each one starts from a copy of this builder.
         self.spec_misses.clear();
         self.ref_misses.clear();
-        self.base_misses = Vec::new();
-        self.import_misses = Vec::new();
+        // Every build on these rows reads few of their scopes: their
+        // per-scope caches keep the rows of these sparse.
+        self.scope_floor = self.scopes.len();
+        self.reset_scope_tables();
         self.elements.freeze();
         // the frozen rows' structural scan, shared by every build on them
         self.prefix_structure = structural_index::StoredStructure::prefix_of(self);
@@ -6609,21 +6662,96 @@ impl Builder {
     pub(crate) fn declared_multiplicity_of(&mut self, e: usize) -> Option<(usize, &Multiplicity)> {
         let rows = self.multiplicities.len();
         if self.mult_index.as_ref().is_none_or(|(n, _)| *n != rows) {
-            let mut map = HashMap::with_capacity(rows);
-            for (i, (owner, _, _)) in self.multiplicities.iter().enumerate() {
-                // A named/body range's numeric domain is not a declaration of
-                // that Multiplicity Feature's own cardinality.
-                if crate::metaclass::conforms(self.elements[*owner].ty, "Multiplicity") {
-                    continue;
-                }
-                // First row wins, as the scan this replaces did.
-                map.entry(*owner).or_insert(i);
-            }
+            let (mut map, from) = match self.library_multiplicity_rows() {
+                Some(prepared) => (
+                    crate::layered::LayeredMap::over(Arc::clone(
+                        prepared.library_declared_multiplicities(),
+                    )),
+                    self.multiplicities.base_len(),
+                ),
+                None => (crate::layered::LayeredMap::default(), 0),
+            };
+            self.index_declared_multiplicities(from..rows, &mut map);
             self.mult_index = Some((rows, map));
         }
         let i = *self.mult_index.as_ref().unwrap().1.get(&e)?;
         let (_, scope, mult) = &self.multiplicities[i];
         Some((*scope, mult))
+    }
+
+    /// The prepared library this build stands on, while the build's element
+    /// and multiplicity rows below its own are the library's frozen rows:
+    /// the library's indexes of those rows then index them here too.
+    pub(crate) fn library_multiplicity_rows(
+        &self,
+    ) -> Option<&Arc<crate::prepared::PreparedLibrary>> {
+        self.prepared_from.as_ref().filter(|prepared| {
+            self.elements.base_untouched()
+                && Arc::ptr_eq(
+                    self.elements.base_arc(),
+                    prepared.builder.elements.base_arc(),
+                )
+                && self.multiplicities.base_untouched()
+                && Arc::ptr_eq(
+                    self.multiplicities.base_arc(),
+                    prepared.builder.multiplicities.base_arc(),
+                )
+        })
+    }
+
+    /// Index the multiplicity rows `rows` by the element whose own
+    /// multiplicity each declares into `index`, the first row winning.
+    pub(crate) fn index_declared_multiplicities(
+        &self,
+        rows: std::ops::Range<usize>,
+        index: &mut crate::layered::LayeredMap<usize, usize>,
+    ) {
+        for i in rows {
+            let owner = self.multiplicities[i].0;
+            // A named/body range's numeric domain is not a declaration of
+            // that Multiplicity Feature's own cardinality.
+            if crate::metaclass::conforms(self.elements[owner].ty, "Multiplicity") {
+                continue;
+            }
+            index.entry(owner).or_insert(i);
+        }
+    }
+
+    /// The multiplicity rows by the range each constrains, the last row
+    /// winning: a build on a prepared library indexes its own rows over the
+    /// library's index.
+    pub(crate) fn multiplicity_range_rows(&self) -> crate::layered::LayeredMap<usize, usize> {
+        let (mut rows, from) = match self.library_multiplicity_rows() {
+            Some(prepared) => (
+                crate::layered::LayeredMap::over(Arc::clone(
+                    prepared.library_multiplicity_ranges(),
+                )),
+                self.multiplicities.base_len(),
+            ),
+            None => (crate::layered::LayeredMap::default(), 0),
+        };
+        self.index_multiplicity_ranges(from..self.multiplicities.len(), &mut rows);
+        rows
+    }
+
+    /// Index the multiplicity rows `rows` by the multiplicity range each
+    /// constrains into `index`, the last row winning.
+    pub(crate) fn index_multiplicity_ranges(
+        &self,
+        rows: std::ops::Range<usize>,
+        index: &mut crate::layered::LayeredMap<usize, usize>,
+    ) {
+        for i in rows {
+            let owner = self.multiplicities[i].0;
+            let range = if crate::metaclass::conforms(self.elements[owner].ty, "Multiplicity") {
+                Some(owner)
+            } else {
+                self.local_multiplicity(owner).flatten()
+            };
+            if let Some(range) = range {
+                index.insert(range, i);
+            }
+        }
     }
 
     /// Does `e` declare a multiplicity of its own?
@@ -7045,6 +7173,13 @@ impl Builder {
         previous
     }
 
+    /// Whether any name resolves by the identity it spells, which makes
+    /// resolution depend on the identity origin.
+    #[inline]
+    pub(crate) fn has_id_spelled_targets(&self) -> bool {
+        !self.id_spelled_targets.is_empty()
+    }
+
     /// An identity carried through textual lifting is tied to its source
     /// site, not to its spelling: a different site can legitimately use
     /// that UUID as an ordinary declared name.
@@ -7151,7 +7286,13 @@ impl Builder {
         let mut current = Some(if qn.is_global { 0 } else { scope });
         let stamp = self.next_stamp();
         while let Some(s) = current {
-            match self.lookup_at(s, &first, depth, stamp, LookupAccess::All) {
+            // The first segment is a lexical name, so it sees semantic names
+            // only. An unnamed usage that merely spells its referenced
+            // feature (`satisfy R by x;`, `assert c;`) has no name of its
+            // own, and must not stand in for `R` when a sibling's reference
+            // looks `R` up in an enclosing scope. Qualified member steps
+            // still reach such a usage through that spelling.
+            match self.lookup_at_with_names(s, &first, depth, stamp, LookupAccess::All, true) {
                 hit @ LookupResult::Found(elem, sub_scope, _) => {
                     if qn.segments.len() == 1 {
                         return hit;
@@ -7240,6 +7381,114 @@ impl Builder {
             self.note_root_miss(name);
         }
         hit
+    }
+
+    /// Every valued redefinition of a feature chain (`attribute :>> a.b =
+    /// v;`), keyed by the type that owns the redefining feature: (the
+    /// redefining feature, the chain's resolved links). Evaluation reads it
+    /// whenever a chain of names walks through such an owner; it is built
+    /// on first use, for the elements present then.
+    pub(crate) fn chain_redefinitions(&mut self) -> ChainRedefinitions {
+        if let Some((built_for, index)) = &self.chain_redefinitions {
+            if *built_for == self.elements.len() {
+                return Arc::clone(index);
+            }
+        }
+        // A build whose rows, values and body scopes below its own are its
+        // prepared library's, and none of whose own rows takes a library
+        // row's id, finds for the library's features what the library finds
+        // alone: it indexes only its own over the library's index.
+        let (mut index, features) = match self.library_chain_redefinitions() {
+            Some(library) => (
+                crate::layered::LayeredMap::over(library),
+                self.values.local_iter().map(|(&f, _)| f).collect(),
+            ),
+            None => (
+                crate::layered::LayeredMap::default(),
+                self.values.iter().map(|(&f, _)| f).collect(),
+            ),
+        };
+        self.index_chain_redefinitions(features, &mut index);
+        let index = Arc::new(index);
+        self.chain_redefinitions = Some((self.elements.len(), Arc::clone(&index)));
+        index
+    }
+
+    /// The prepared library's valued chain redefinitions, when this build
+    /// finds for the library's features what the library finds alone (see
+    /// [`Self::chain_redefinitions`]).
+    fn library_chain_redefinitions(&mut self) -> Option<crate::prepared::ChainIndex> {
+        let prepared = self.prepared_from.clone()?;
+        let library = &prepared.builder;
+        let boundary = self.lib_boundary;
+        let shared = self.elements.base_untouched()
+            && Arc::ptr_eq(self.elements.base_arc(), library.elements.base_arc())
+            && boundary == self.elements.base_len()
+            && Arc::ptr_eq(self.values.base_arc(), library.values.base_arc())
+            && !self.values.local_iter().any(|(&f, _)| f < boundary)
+            && Arc::ptr_eq(self.elem_scope.base_arc(), library.elem_scope.base_arc())
+            && !self.elem_scope.local_iter().any(|(&e, _)| e < boundary);
+        if !shared {
+            return None;
+        }
+        let ids = self.prefix_ids.as_ref()?;
+        if (boundary..self.elements.len()).any(|e| ids.contains_key(&self.elements[e].id)) {
+            return None;
+        }
+        Some(Arc::clone(prepared.library_chain_redefinitions()))
+    }
+
+    /// Index the valued chain redefinitions of `features` by the type that
+    /// owns each redefining feature into `index`, after the entries it holds.
+    pub(crate) fn index_chain_redefinitions(
+        &mut self,
+        features: Vec<usize>,
+        index: &mut crate::layered::LayeredMap<usize, Vec<(usize, Vec<usize>)>>,
+    ) {
+        for feature in features {
+            let redefinitions: Vec<usize> = self.elements[feature]
+                .owned_relationships
+                .iter()
+                .copied()
+                .filter(|&r| self.elements[r].ty == "Redefinition")
+                .collect();
+            for redefinition in redefinitions {
+                // A chain target is the anonymous feature the redefinition
+                // owns, one FeatureChaining per link.
+                let Some(&chain) = self.elements[redefinition].children.first() else {
+                    continue;
+                };
+                let chainings: Vec<usize> = self.elements[chain]
+                    .owned_relationships
+                    .iter()
+                    .copied()
+                    .filter(|&r| self.elements[r].ty == "FeatureChaining")
+                    .collect();
+                if chainings.len() < 2 {
+                    continue;
+                }
+                let total = chainings.len();
+                let mut links = Vec::with_capacity(total);
+                for chaining in chainings {
+                    let Some(link) = self.elements[chaining]
+                        .props
+                        .get("chainingFeature")
+                        .and_then(|v| v.as_reference())
+                        .and_then(|id| self.element_index_of_uuid(id))
+                    else {
+                        break;
+                    };
+                    links.push(link);
+                }
+                // Every link must have resolved.
+                if links.len() != total {
+                    continue;
+                }
+                if let Some(owner) = self.owner_elem(feature) {
+                    index.entry(owner).or_default().push((feature, links));
+                }
+            }
+        }
     }
 
     // Kept out of line: `lookup_at` recurses deeply through imports and
@@ -7547,11 +7796,16 @@ impl Builder {
     }
 
     /// Whether evaluating this calculation would require running statements,
-    /// including a body inherited through typing or specialization.
+    /// including a body inherited through typing or specialization. Walks
+    /// the specialization index when one has been built since lowering
+    /// settled the table, else scans the table.
     pub(crate) fn calculation_requires_execution(&self, elem: usize) -> bool {
         if self.executable_calculations.is_empty() {
             return false;
         }
+        // Lowering can still append entries, which an index built from a
+        // partial table would miss.
+        let index = self.spec_index.as_ref().filter(|_| self.semantic_ready);
         let mut stack = vec![elem];
         let mut seen = HashSet::new();
         while let Some(e) = stack.pop() {
@@ -7561,13 +7815,35 @@ impl Builder {
             if self.executable_calculations.contains(&e) {
                 return true;
             }
-            for (i, (owner, _, _, _)) in self.spec_targets.iter().enumerate() {
-                if *owner == e {
-                    stack.extend(self.spec_resolved.get(i).copied().flatten());
+            // Every entry is one of the four kinds the index keeps, listed
+            // per owner in table order: both branches push the same targets
+            // in the same order.
+            match index {
+                Some(index) => {
+                    for &i in index.get(&e).into_iter().flatten() {
+                        stack.extend(self.spec_resolved.get(i).copied().flatten());
+                    }
+                }
+                None => {
+                    for (i, (owner, _, _, _)) in self.spec_targets.iter().enumerate() {
+                        if *owner == e {
+                            stack.extend(self.spec_resolved.get(i).copied().flatten());
+                        }
+                    }
                 }
             }
         }
         false
+    }
+
+    /// [`Self::calculation_requires_execution`], building the
+    /// specialization index first once lowering has settled the table —
+    /// for callers that may mutate the builder.
+    pub(crate) fn indexed_calculation_requires_execution(&mut self, elem: usize) -> bool {
+        if self.semantic_ready && !self.executable_calculations.is_empty() {
+            self.ensure_spec_index();
+        }
+        self.calculation_requires_execution(elem)
     }
 
     /// Is `sup` reachable from `sub` through *recorded* explicit
@@ -7663,6 +7939,11 @@ impl Builder {
     /// The element owning scope `s` (the type whose body it is), if any.
     pub(crate) fn scope_owner(&self, s: usize) -> Option<usize> {
         self.scopes[s].owner
+    }
+
+    /// The scope lexically enclosing `s`.
+    pub(crate) fn scope_parent(&self, s: usize) -> Option<usize> {
+        self.scopes[s].parent
     }
 
     /// The resolved explicit specialization targets of `e` spelled with
@@ -8749,6 +9030,11 @@ impl Builder {
         if let Some(hit) = self.inherited_cache.get(&(s, include_implied)) {
             return Arc::clone(hit);
         }
+        if let Some(shared) = self.library_inherited_bindings(s, include_implied) {
+            self.inherited_cache
+                .insert((s, include_implied), Arc::clone(&shared));
+            return shared;
+        }
         // Enumeration resolves bases and import targets the way lookup
         // does; that must not count as a use of the model's imports.
         // (Its lookups may also add root-miss guard entries, which only
@@ -8808,6 +9094,15 @@ impl Builder {
         while let Some((scope, exiting)) = pending.pop() {
             if self.inherited_cache.contains_key(&(scope, include_implied)) {
                 continue;
+            }
+            // A library base's memberships as the library's own build gives
+            // them; a cut-short or incomplete one is walked here as before.
+            if scope != s && !exiting {
+                if let Some(shared) = self.library_inherited_bindings(scope, include_implied) {
+                    self.inherited_cache
+                        .insert((scope, include_implied), shared);
+                    continue;
+                }
             }
             if exiting {
                 state.insert(scope, 2);
@@ -9840,18 +10135,44 @@ impl Builder {
 
     /// Build the owner → specialization-entry index once. Reading the
     /// index never resolves anything — safe to call from inside a lookup.
+    /// A build whose specialization rows below its own are its prepared
+    /// library's frozen rows indexes only its own over the library's index.
     fn ensure_spec_index(&mut self) {
         if self.spec_index.is_none() {
-            let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
-            for (i, (owner, kind, _, _)) in self.spec_targets.iter().enumerate() {
-                if matches!(
-                    *kind,
-                    "FeatureTyping" | "Subclassification" | "Subsetting" | "Redefinition"
-                ) {
-                    map.entry(*owner).or_default().push(i);
-                }
+            let library = self.prepared_from.as_ref().filter(|prepared| {
+                self.spec_targets.base_untouched()
+                    && Arc::ptr_eq(
+                        self.spec_targets.base_arc(),
+                        prepared.builder.spec_targets.base_arc(),
+                    )
+            });
+            let (mut index, from) = match library {
+                Some(prepared) => (
+                    crate::layered::LayeredMap::over(Arc::clone(prepared.library_spec_index())),
+                    self.spec_targets.base_len(),
+                ),
+                None => (crate::layered::LayeredMap::default(), 0),
+            };
+            self.index_spec_rows(from..self.spec_targets.len(), &mut index);
+            self.spec_index = Some(index);
+        }
+    }
+
+    /// Index the explicit typing and specialization rows `rows` of
+    /// `spec_targets` by owner into `index`, after the entries it holds.
+    pub(crate) fn index_spec_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        index: &mut crate::layered::LayeredMap<usize, Vec<usize>>,
+    ) {
+        for i in rows {
+            let (owner, kind, _, _) = &self.spec_targets[i];
+            if matches!(
+                *kind,
+                "FeatureTyping" | "Subclassification" | "Subsetting" | "Redefinition"
+            ) {
+                index.entry(*owner).or_default().push(i);
             }
-            self.spec_index = Some(map);
         }
     }
 
@@ -9972,6 +10293,37 @@ impl Builder {
                     if t != e && !out.contains(&t) {
                         out.push(t);
                     }
+                }
+            }
+        }
+        out
+    }
+
+    /// The element's explicit `Subsetting`s written as names (`:> a`), each
+    /// as (resolved target, scope its spelling resolves from, spelling), from
+    /// the builder's recorded pending outcomes. Reference subsettings,
+    /// redefinitions and chain-written targets are not among them.
+    pub(crate) fn written_subsetting_targets(
+        &mut self,
+        e: usize,
+    ) -> Vec<(usize, usize, QualifiedName)> {
+        self.ensure_spec_index();
+        let indices = self
+            .spec_index
+            .as_ref()
+            .and_then(|m| m.get(&e))
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for i in indices {
+            if self.spec_targets[i].1 != "Subsetting" {
+                continue;
+            }
+            self.note_spec_misses([i]);
+            if let Some(t) = self.spec_resolved.get(i).copied().flatten() {
+                if t != e {
+                    let (_, _, scope, qn) = &self.spec_targets[i];
+                    out.push((t, *scope, qn.clone()));
                 }
             }
         }
@@ -11090,6 +11442,29 @@ pub enum BodyFlowMember {
     Initial(Option<ElementRef>, Option<String>),
 }
 
+/// How a constraint or a nested requirement bears on the requirement
+/// check that composes it. A requirement check holds when its assumed
+/// constraints imply its required ones (the library `RequirementCheck`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SatisfactionRole {
+    /// Must hold: a `require` member, a nested requirement, an assertion.
+    Required,
+    /// An `assume` member: when it is false, the check holds vacuously.
+    Assumed,
+}
+
+/// One requirement check within a satisfaction claim: the satisfied
+/// requirement itself (the first of [`SatisfactionInfo::nodes`]) or a
+/// requirement it composes (`require r;`, a nested requirement usage).
+#[derive(Clone, Debug, Default)]
+pub struct SatisfactionNode {
+    /// The check's own constraints, as indices into
+    /// [`SatisfactionInfo::constraints`].
+    pub constraints: Vec<(usize, SatisfactionRole)>,
+    /// The checks it composes, as indices into [`SatisfactionInfo::nodes`].
+    pub children: Vec<(usize, SatisfactionRole)>,
+}
+
 /// One `satisfy R by x;` claim expanded to the constraint verdicts it
 /// implies: every constraint reachable through R's requirement
 /// composition, evaluated with R's subjects bound to the satisfaction
@@ -11097,12 +11472,26 @@ pub enum BodyFlowMember {
 pub struct SatisfactionInfo {
     /// The SatisfyRequirementUsage element.
     pub satisfy: ElementRef,
+    /// Index into [`crate::model::Model::units`] of the `satisfy`
+    /// statement.
+    pub unit: usize,
+    /// Source extent of the `satisfy` statement, keyword through its `;`
+    /// or body.
+    pub span: Span,
+    /// The satisfying feature as written after `by`.
+    pub by: String,
+    /// `not satisfy R by x;`: the claim is that `x` does not satisfy `R`.
+    pub negated: bool,
     /// Qualified name of the satisfied requirement — the context label
-    /// verdict reports carry.
+    /// verdict reports carry. An unnamed claim that declares its own
+    /// requirement (`satisfy requirement : R by x;`) is labelled by `R`.
     pub context: Option<String>,
     /// The constraints the claim implies, ready for verdict evaluation
-    /// with [`ResolvedModel::evaluate_in_with`].
+    /// with [`ResolvedModel::evaluate_in_with`], in source order.
     pub constraints: Vec<ConstraintInfo>,
+    /// The requirement checks the constraints belong to, the satisfied
+    /// requirement first: how their verdicts combine into the claim's.
+    pub nodes: Vec<SatisfactionNode>,
     /// Subject bindings: every subject parameter in the satisfied
     /// requirement's explicit closure → the satisfaction target.
     pub overrides: std::collections::HashMap<usize, crate::eval::Value>,
@@ -11116,13 +11505,14 @@ pub struct ResolvedModel {
     semantic_publication_seen: publication::Revision,
     /// Relationship index → owning element, built lazily by
     /// [`Self::element_qualified_name`] (empty until first use).
-    rel_owner: Vec<Option<usize>>,
+    rel_owner: crate::layered::LayeredVec<Option<usize>>,
     /// Membership index → owned member element, built lazily by
     /// [`Self::membership_member`] (empty until first use).
     rel_member: Vec<Option<usize>>,
     /// Interchange `@id` → element index, built lazily by the connector /
-    /// transition accessors (empty until first use).
-    by_id: HashMap<Uuid, usize>,
+    /// transition accessors (empty until first use): the builder's own index
+    /// while no two rows share an id.
+    by_id: Arc<crate::layered::IdMap<Uuid, usize>>,
     /// Element count `by_id` was built for. Compared instead of the map's
     /// own length: duplicate ids (an id-scheme collision between
     /// same-named units) make the map smaller than the element list, and
@@ -11169,6 +11559,39 @@ pub struct ResolvedModel {
     /// target, built lazily by [`Self::redefiners`] (`None` until first
     /// use).
     pub(crate) redefiner_index: Option<HashMap<usize, Vec<usize>>>,
+}
+
+/// The enumeration and variation entries of `pairs` (element, body scope):
+/// an `EnumerationDefinition`, or any element whose body binds variants, with
+/// the variants it binds (enum literals and variation variants are both owned
+/// through a `VariantMembership`), sorted and deduplicated. Unordered.
+fn enum_entries<'a>(
+    b: &Builder,
+    pairs: impl Iterator<Item = (&'a usize, &'a usize)>,
+) -> Vec<(usize, Vec<usize>)> {
+    let is_variant = |e: usize| {
+        b.elements[e]
+            .owning_relationship
+            .map(|r| b.elements[r].ty == "VariantMembership")
+            .unwrap_or(false)
+    };
+    let mut out = Vec::new();
+    for (&elem, &scope) in pairs {
+        let enum_def = b.elements[elem].ty == "EnumerationDefinition";
+        let mut lits: Vec<usize> = b.scopes[scope]
+            .names
+            .values()
+            .flatten()
+            .map(|binding| binding.elem)
+            .filter(|&e| is_variant(e))
+            .collect();
+        lits.sort_unstable();
+        lits.dedup();
+        if enum_def || !lits.is_empty() {
+            out.push((elem, lits));
+        }
+    }
+    out
 }
 
 /// The lazily-built quantity-type index of a resolved model (see
@@ -11280,9 +11703,9 @@ impl ResolvedModel {
         ResolvedModel {
             b,
             semantic_publication_seen,
-            rel_owner: Vec::new(),
+            rel_owner: Default::default(),
             rel_member: Vec::new(),
-            by_id: HashMap::new(),
+            by_id: Arc::default(),
             by_id_built_for: usize::MAX,
             unit_meta: (0..model.unit_count())
                 .map(|i| {
@@ -11841,10 +12264,29 @@ impl ResolvedModel {
     /// owner's row.
     fn ensure_rel_owner(&mut self) {
         self.sync_semantic_publication();
-        if self.rel_owner.len() != self.b.elements.len() {
-            let mut map = vec![None; self.b.elements.len()];
-            for (i, el) in self.b.elements.iter().enumerate() {
-                for &r in &el.owned_relationships {
+        let n = self.b.elements.len();
+        if self.rel_owner.len() != n {
+            // A build whose rows below its own are its prepared library's
+            // frozen rows reads their relationships' owners from the
+            // library's table.
+            let library = self.b.prepared_from.as_ref().filter(|prepared| {
+                self.b.elements.base_untouched()
+                    && Arc::ptr_eq(
+                        self.b.elements.base_arc(),
+                        prepared.builder.elements.base_arc(),
+                    )
+            });
+            let (mut map, from) = match library {
+                Some(prepared) => {
+                    let owners = Arc::clone(prepared.library_rel_owners());
+                    let from = owners.len();
+                    (crate::layered::LayeredVec::over(owners), from)
+                }
+                None => (crate::layered::LayeredVec::default(), 0),
+            };
+            map.resize(n, None);
+            for i in from..n {
+                for &r in &self.b.elements[i].owned_relationships {
                     map[r] = Some(i);
                 }
             }
@@ -13217,6 +13659,13 @@ impl ResolvedModel {
     /// Every constraint/requirement/invariant element carrying its own
     /// trailing result expression, in (unit, source-position) order.
     pub fn constraints(&mut self) -> Vec<ConstraintInfo> {
+        self.constraints_where(|_| true)
+    }
+
+    /// [`Self::constraints`] whose [`ConstraintInfo::unit`] `keep` admits, in
+    /// the same order, without building the others: a caller that reads only
+    /// the user units' constraints leaves the library's alone.
+    pub fn constraints_where(&mut self, keep: impl Fn(usize) -> bool) -> Vec<ConstraintInfo> {
         let mut out = Vec::new();
         for (owner, scope, expr) in &self.b.result_exprs {
             let ty = self.b.elements[*owner].ty;
@@ -13230,6 +13679,10 @@ impl ResolvedModel {
                     | "RequirementDefinition"
                     | "Invariant"
             ) {
+                continue;
+            }
+            let unit = self.b.unit_of_elem(*owner);
+            if !keep(unit) {
                 continue;
             }
             let negated = self.b.elements[*owner]
@@ -13248,7 +13701,7 @@ impl ResolvedModel {
                 .map(str::to_string);
             out.push(ConstraintInfo {
                 element: ElementRef(*owner),
-                unit: self.b.unit_of_elem(*owner),
+                unit,
                 span: expr.span,
                 name,
                 element_type: ty,
@@ -13264,21 +13717,21 @@ impl ResolvedModel {
         // closure, evaluated in its own body scope — the featuring context
         // where the definition's parameters resolve to the assert's
         // redefining features.
-        let own: std::collections::HashSet<usize> =
-            self.b.result_exprs.iter().map(|(o, _, _)| *o).collect();
-        let bodies: HashMap<usize, Expr> = self
+        // Each owner's last result expression, by position: an expression is
+        // copied only once an assert takes it.
+        let bodies: HashMap<usize, usize> = self
             .b
             .result_exprs
             .iter()
-            .map(|(o, _, e)| (*o, e.clone()))
+            .enumerate()
+            .map(|(i, (o, _, _))| (*o, i))
             .collect();
-        let asserts: Vec<usize> = (0..self.b.elements.len())
+        let asserts: Vec<usize> = (self.b.lib_boundary..self.b.elements.len())
             .filter(|&e| {
                 matches!(
                     self.b.elements[e].ty,
                     "AssertConstraintUsage" | "SatisfyRequirementUsage" | "Invariant"
-                ) && !own.contains(&e)
-                    && self.b.lib_boundary <= e
+                ) && !bodies.contains_key(&e)
             })
             .collect();
         for a in asserts {
@@ -13289,15 +13742,15 @@ impl ResolvedModel {
             let mut queue: std::collections::VecDeque<usize> =
                 self.b.explicit_supertype_elems(a).into();
             let mut seen: std::collections::HashSet<usize> = queue.iter().copied().collect();
-            let mut found: Option<(usize, Expr)> = None;
+            let mut found: Option<(usize, usize)> = None;
             let mut steps = 0;
             while let Some(t) = queue.pop_front() {
                 steps += 1;
                 if steps > 256 {
                     break;
                 }
-                if let Some(expr) = bodies.get(&t) {
-                    found = Some((t, expr.clone()));
+                if let Some(&i) = bodies.get(&t) {
+                    found = Some((t, i));
                     break;
                 }
                 for s in self.b.explicit_supertype_elems(t) {
@@ -13306,7 +13759,12 @@ impl ResolvedModel {
                     }
                 }
             }
-            let Some((def, expr)) = found else { continue };
+            let Some((def, i)) = found else { continue };
+            let unit = self.b.unit_of_elem(def);
+            if !keep(unit) {
+                continue;
+            }
+            let expr = self.b.result_exprs[i].2.clone();
             let negated = self.b.elements[a]
                 .props
                 .get("isNegated")
@@ -13322,7 +13780,7 @@ impl ResolvedModel {
                 // Attribution follows the body's text (the definition's
                 // unit and span); the verdict's featuring context is the
                 // assert's.
-                unit: self.b.unit_of_elem(def),
+                unit,
                 span: expr.span,
                 name,
                 element_type: self.b.elements[a].ty,
@@ -13361,9 +13819,22 @@ impl ResolvedModel {
             .collect();
         let mut out = Vec::new();
         for (sat, scope, by) in claims {
-            let Some(req) = self.rel_prop_target(sat, "ReferenceSubsetting", "referencedFeature")
-            else {
-                continue;
+            // `satisfy R by x;` references the requirement it satisfies. A
+            // claim that declares its own requirement instead
+            // (`satisfy requirement : R by x;`) has no reference and is
+            // itself the satisfied requirement (SysML `assertedConstraint`).
+            // A reference that did not resolve leaves nothing to evaluate.
+            let references = self.b.elements[sat]
+                .owned_relationships
+                .iter()
+                .any(|&r| self.b.elements[r].ty == "ReferenceSubsetting");
+            let req = if references {
+                match self.rel_prop_target(sat, "ReferenceSubsetting", "referencedFeature") {
+                    Some(req) => req,
+                    None => continue,
+                }
+            } else {
+                sat
             };
             let bound = match &by {
                 TargetRef::Name(qn) => self.b.resolve(scope, qn, 0),
@@ -13385,15 +13856,70 @@ impl ResolvedModel {
                 }
             }
             let mut constraints = Vec::new();
+            let mut nodes = vec![SatisfactionNode::default()];
             let mut seen: std::collections::HashSet<(usize, usize)> =
                 std::collections::HashSet::new();
             let entry_scope = self.b.elem_scope.get(&req).copied().unwrap_or(scope);
-            self.collect_satisfaction_constraints(req, entry_scope, &mut seen, &mut constraints, 0);
-            constraints.sort_by_key(|c| (c.unit, c.span.start));
+            self.collect_satisfaction_constraints(
+                req,
+                entry_scope,
+                &mut seen,
+                (&mut constraints, &mut nodes, 0),
+                0,
+            );
+            // Source order, with the nodes' indices following the moves.
+            let mut order: Vec<usize> = (0..constraints.len()).collect();
+            order.sort_by_key(|&i| (constraints[i].unit, constraints[i].span.start));
+            let mut moved = vec![0; order.len()];
+            for (to, &from) in order.iter().enumerate() {
+                moved[from] = to;
+            }
+            let mut slots: Vec<Option<ConstraintInfo>> =
+                constraints.into_iter().map(Some).collect();
+            let constraints: Vec<ConstraintInfo> =
+                order.iter().filter_map(|&i| slots[i].take()).collect();
+            for node in &mut nodes {
+                for (i, _) in &mut node.constraints {
+                    *i = moved[*i];
+                }
+            }
+            // An unnamed declared claim is labelled by its requirement type.
+            let context = self.element_qualified_name(ElementRef(req)).or_else(|| {
+                self.rel_prop_target(req, "FeatureTyping", "type")
+                    .and_then(|t| self.element_qualified_name(ElementRef(t)))
+            });
+            let by_span = match &by {
+                TargetRef::Name(qn) => qn.span,
+                TargetRef::Chain(links) => match (links.first(), links.last()) {
+                    (Some(first), Some(last)) => Span {
+                        start: first.span.start,
+                        end: last.span.end,
+                    },
+                    _ => Span::default(),
+                },
+            };
+            let by_spelling = match &by {
+                TargetRef::Name(qn) => qn.to_display_string(),
+                TargetRef::Chain(links) => links
+                    .iter()
+                    .map(|l| l.to_display_string())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            };
+            let negated = self.b.elements[sat]
+                .props
+                .get("isNegated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             out.push(SatisfactionInfo {
                 satisfy: ElementRef(sat),
-                context: self.element_qualified_name(ElementRef(req)),
+                unit: self.b.unit_of_elem(sat),
+                span: self.b.member_spans.get(&sat).copied().unwrap_or(by_span),
+                by: by_spelling,
+                negated,
+                context,
                 constraints,
+                nodes,
                 overrides,
             });
         }
@@ -13416,37 +13942,63 @@ impl ResolvedModel {
         out
     }
 
-    /// Elements owned by `e` through memberships of the given metaclass.
+    /// Elements owned by `e` through memberships of the given metaclass,
+    /// in element order. Reads the memberships' owned elements instead of
+    /// every row; an element counts only when its own owning relationship
+    /// is one of those memberships.
     fn members_under(&self, e: usize, rel_ty: &str) -> Vec<usize> {
-        let rels: std::collections::HashSet<usize> = self.b.elements[e]
+        let rels: Vec<usize> = self.b.elements[e]
             .owned_relationships
             .iter()
             .copied()
             .filter(|&r| self.b.elements[r].ty == rel_ty)
             .collect();
-        if rels.is_empty() {
-            return Vec::new();
-        }
-        self.b
-            .elements
+        let mut members: Vec<usize> = rels
             .iter()
-            .enumerate()
-            .filter(|(_, el)| el.owning_relationship.is_some_and(|r| rels.contains(&r)))
-            .map(|(i, _)| i)
-            .collect()
+            .flat_map(|&r| self.b.elements[r].children.iter().copied())
+            .filter(|&m| {
+                self.b.elements[m]
+                    .owning_relationship
+                    .is_some_and(|r| rels.contains(&r))
+            })
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
+
+    /// How requirement member `m` bears on its owner's check: `assume`
+    /// members are assumptions; `require` members, assertions and nested
+    /// requirements are required. A plain constraint member is not part of
+    /// the check and answers `None`.
+    fn satisfaction_role(&self, m: usize) -> Option<SatisfactionRole> {
+        if let Some(rel) = self.b.elements[m].owning_relationship {
+            let rel = &self.b.elements[rel];
+            if crate::metaclass::conforms(rel.ty, "RequirementConstraintMembership") {
+                return Some(match rel.props.get("kind").and_then(|v| v.as_str()) {
+                    Some("assumption") => SatisfactionRole::Assumed,
+                    _ => SatisfactionRole::Required,
+                });
+            }
+        }
+        matches!(
+            self.b.elements[m].ty,
+            "AssertConstraintUsage" | "RequirementUsage" | "SatisfyRequirementUsage"
+        )
+        .then_some(SatisfactionRole::Required)
     }
 
     /// Walk one requirement node for [`Self::satisfactions`]: constraints
     /// on the node and its explicit closure evaluate in `eval_scope` (the
-    /// most-derived usage body on the path); nested requirement members
-    /// and reference-subsetted requirements recurse with their own body
-    /// scope.
+    /// most-derived usage body on the path) and join the check `at`;
+    /// nested requirement members and reference-subsetted requirements
+    /// become checks of their own, walked with their own body scope.
     fn collect_satisfaction_constraints(
         &mut self,
         node: usize,
         eval_scope: usize,
         seen: &mut std::collections::HashSet<(usize, usize)>,
-        out: &mut Vec<ConstraintInfo>,
+        (out, nodes, at): (&mut Vec<ConstraintInfo>, &mut Vec<SatisfactionNode>, usize),
         depth: usize,
     ) {
         // Keyed on (element, evaluation scope): the same definition-owned
@@ -13458,6 +14010,9 @@ impl ResolvedModel {
         for t in self.explicit_closure(node) {
             for m in self.owned_membership_members(t) {
                 let ty = self.b.elements[m].ty;
+                let Some(role) = self.satisfaction_role(m) else {
+                    continue;
+                };
                 match ty {
                     "ConstraintUsage" | "AssertConstraintUsage" => {
                         // A constraint member owned by the entered node
@@ -13490,6 +14045,7 @@ impl ResolvedModel {
                                 .get("declaredName")
                                 .and_then(|v| v.as_str())
                                 .map(str::to_string);
+                            nodes[at].constraints.push((out.len(), role));
                             out.push(ConstraintInfo {
                                 element: ElementRef(m),
                                 unit: self.b.unit_of_elem(def),
@@ -13510,21 +14066,33 @@ impl ResolvedModel {
                             // the member's body as the evaluation context
                             // (its `in` bindings feed the target's
                             // parameters).
+                            let child = nodes.len();
+                            nodes.push(SatisfactionNode::default());
+                            nodes[at].children.push((child, role));
                             self.collect_satisfaction_constraints(
                                 target,
                                 m_scope,
                                 seen,
-                                out,
+                                (&mut *out, &mut *nodes, child),
                                 depth + 1,
                             );
                         }
                     }
                     "RequirementUsage" | "SatisfyRequirementUsage" => {
                         let m_scope = self.b.elem_scope.get(&m).copied().unwrap_or(eval_scope);
+                        let child = nodes.len();
+                        nodes.push(SatisfactionNode::default());
+                        nodes[at].children.push((child, role));
                         // The nested member's own body (bindings,
                         // redefinitions) is the freshest context for
                         // everything reached through it.
-                        self.collect_satisfaction_constraints(m, m_scope, seen, out, depth + 1);
+                        self.collect_satisfaction_constraints(
+                            m,
+                            m_scope,
+                            seen,
+                            (&mut *out, &mut *nodes, child),
+                            depth + 1,
+                        );
                         if let Some(target) =
                             self.rel_prop_target(m, "ReferenceSubsetting", "referencedFeature")
                         {
@@ -13532,7 +14100,7 @@ impl ResolvedModel {
                                 target,
                                 m_scope,
                                 seen,
-                                out,
+                                (&mut *out, &mut *nodes, child),
                                 depth + 1,
                             );
                         }
@@ -14034,32 +14602,43 @@ impl ResolvedModel {
     /// owners with their `variant` members (a variation's variants are
     /// its closed set of legal choices, so both solve as finite sorts).
     pub fn enum_types(&self) -> Vec<(ElementRef, Vec<ElementRef>)> {
-        let is_variant = |e: usize| {
-            self.b.elements[e]
-                .owning_relationship
-                .map(|r| self.b.elements[r].ty == "VariantMembership")
-                .unwrap_or(false)
-        };
-        let mut out = Vec::new();
-        for (&elem, &scope) in &self.b.elem_scope {
-            let enum_def = self.b.elements[elem].ty == "EnumerationDefinition";
-            // Enum literals and variation variants are both owned via
-            // `VariantMembership` since the enum-body metaclass fix.
-            let mut lits: Vec<usize> = self.b.scopes[scope]
-                .names
-                .values()
-                .flatten()
-                .map(|binding| binding.elem)
-                .filter(|&e| is_variant(e))
-                .collect();
-            lits.sort_unstable();
-            lits.dedup();
-            if enum_def || !lits.is_empty() {
-                out.push((ElementRef(elem), lits.into_iter().map(ElementRef).collect()));
+        // A build on a prepared library takes the library's own entries from
+        // it, while the library rows and the library's body scopes are as
+        // the library left them, and computes its own body scopes' entries.
+        let library = self.b.prepared_from.as_ref().filter(|prepared| {
+            self.b.elements.base_untouched()
+                && Arc::ptr_eq(
+                    self.b.elements.base_arc(),
+                    prepared.builder.elements.base_arc(),
+                )
+                && Arc::ptr_eq(
+                    self.b.elem_scope.base_arc(),
+                    prepared.builder.elem_scope.base_arc(),
+                )
+        });
+        let mut out: Vec<(usize, Vec<usize>)> = match library.map(|p| p.library_enum_types()) {
+            Some(library)
+                if self
+                    .b
+                    .scopes
+                    .written_rows()
+                    .all(|scope| !library.scopes.contains(&scope)) =>
+            {
+                let mut out: Vec<_> = library
+                    .entries
+                    .iter()
+                    .filter(|(elem, _)| !self.b.elem_scope.local_contains_key(elem))
+                    .cloned()
+                    .collect();
+                out.extend(enum_entries(&self.b, self.b.elem_scope.local_iter()));
+                out
             }
-        }
-        out.sort_by_key(|(e, _)| e.0);
-        out
+            _ => enum_entries(&self.b, self.b.elem_scope.iter()),
+        };
+        out.sort_by_key(|(e, _)| *e);
+        out.into_iter()
+            .map(|(e, lits)| (ElementRef(e), lits.into_iter().map(ElementRef).collect()))
+            .collect()
     }
 
     /// The metaclass of `e`'s owning membership (`ActorMembership`,
@@ -14334,13 +14913,26 @@ impl ResolvedModel {
         self.sync_semantic_publication();
         if self.by_id_built_for != self.b.elements.len() {
             self.by_id_built_for = self.b.elements.len();
-            self.by_id = self
+            // While no two rows share an id the builder's index is this table,
+            // made from the frozen rows' kept table and this build's own rows.
+            let unique = self.b.literal_identities_unique(None) == Some(true);
+            let n = self.b.elements.len();
+            let index = self
                 .b
-                .elements
-                .iter()
-                .enumerate()
-                .map(|(i, el)| (el.id, i))
-                .collect();
+                .id_index
+                .as_ref()
+                .filter(|_| unique && self.b.id_index_built_for == n);
+            self.by_id = match index {
+                Some(index) => Arc::clone(index),
+                None => Arc::new(
+                    self.b
+                        .elements
+                        .iter()
+                        .enumerate()
+                        .map(|(i, el)| (el.id, i))
+                        .collect(),
+                ),
+            };
         }
     }
 
@@ -14713,6 +15305,9 @@ mod replay_dependencies_tests;
 
 #[cfg(test)]
 mod identity_tables_tests;
+
+#[cfg(test)]
+mod indexed_reads_tests;
 
 /// Persist element headers and their variable-length lists as separate tables.
 /// A decoded library shares each table's contiguous backing storage.

@@ -666,6 +666,46 @@ fn code_lenses_carry_verify_verdicts() {
     client.shutdown();
 }
 
+#[test]
+fn code_lenses_carry_satisfaction_claim_verdicts() {
+    let mut client = Client::start();
+    let u = uri("claims.sysml");
+    client.open(
+        &u,
+        "package P {\n    part def Thing { attribute m; }\n    requirement def Cap {\n        subject t : Thing;\n        require constraint { t.m <= 5 }\n    }\n    requirement cap : Cap;\n    part small : Thing { attribute :>> m = 3; }\n    part big : Thing { attribute :>> m = 9; }\n    part site {\n        satisfy cap by small;\n        satisfy cap by big;\n    }\n}\n",
+    );
+    let lenses: Option<Vec<lsp_types::CodeLens>> =
+        client.request_ok::<CodeLensRequest>(CodeLensParams {
+            text_document: TextDocumentIdentifier { uri: u },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        });
+    let titles: Vec<(u32, String)> = lenses
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l.range.start.line,
+                l.command.as_ref().unwrap().title.clone(),
+            )
+        })
+        .collect();
+    // Each claim's lens sits on its `satisfy` statement.
+    assert!(
+        titles
+            .iter()
+            .any(|(line, t)| *line == 10 && t == "✓ satisfied"),
+        "{titles:?}"
+    );
+    assert!(
+        titles
+            .iter()
+            .any(|(line, t)| *line == 11 && t == "✗ VIOLATED (with t.m = 9)"),
+        "{titles:?}"
+    );
+    client.shutdown();
+}
+
 /// A definition named by a reserved word completes as source: the
 /// label is the raw name, the insert text and the auto-import path
 /// quote it.

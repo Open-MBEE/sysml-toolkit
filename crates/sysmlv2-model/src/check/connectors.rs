@@ -53,7 +53,7 @@ pub(super) fn validate(
         for &(connector, end_elem, span) in
             r.b.connector_ends
                 .iter()
-                .filter(|row| !model.is_library_unit(r.b.unit_of_elem(row.0)))
+                .filter(|row| super::user_owned(&r.b, model, row.0))
         {
             per_connector
                 .entry(connector)

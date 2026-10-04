@@ -6,7 +6,8 @@ use super::membership_projection::{reset_scratch_map, reset_scratch_set};
 use super::{
     Builder,
     membership_projection::{
-        Membership as PositionalMembership, MembershipFacts, Node, Reachability, Reduction, charge,
+        ExportedOver, Membership as PositionalMembership, MembershipFacts, Node, Reachability,
+        Reduction, charge,
     },
 };
 use crate::metaclass::conforms;
@@ -16,6 +17,28 @@ use std::collections::{HashMap, HashSet};
 pub(super) struct PositionalRedefinitions {
     pub targets: HashMap<usize, Vec<usize>>,
     pub incomplete: HashSet<usize>,
+}
+
+/// The direct bases a positional planning reads, by type: a table of them, or
+/// a build's own over its prepared library's ([`OverLibrary`]).
+pub(super) trait DirectBases {
+    fn get(&self, e: &usize) -> Option<&Vec<usize>>;
+}
+impl DirectBases for HashMap<usize, Vec<usize>> {
+    fn get(&self, e: &usize) -> Option<&Vec<usize>> {
+        HashMap::get(self, e)
+    }
+}
+/// A build's own types' direct bases over its library's: the two tables name
+/// disjoint types.
+pub(super) struct OverLibrary<'a> {
+    pub own: &'a HashMap<usize, Vec<usize>>,
+    pub library: &'a HashMap<usize, Vec<usize>>,
+}
+impl DirectBases for OverLibrary<'_> {
+    fn get(&self, e: &usize) -> Option<&Vec<usize>> {
+        self.own.get(e).or_else(|| self.library.get(e))
+    }
 }
 
 /// Raw stored-row inputs shared only by the static/dynamic planning transaction.
@@ -32,6 +55,45 @@ pub(super) struct PositionalWorkspace {
     owned: HashMap<usize, (Vec<usize>, Option<Vec<PositionalMembership>>)>,
     unresolved: HashMap<usize, bool>,
     reduction: Option<CompleteReduction>,
+    /// When set, the types a planning reached are recorded here.
+    reached: Option<Vec<usize>>,
+    /// The plans of the prepared library a planning extends: the types the
+    /// library's planning reached are not planned again, their derivations
+    /// read from there.
+    library: Option<std::sync::Arc<super::LibraryPlans>>,
+    /// When set, a planning leaves what it derived for each type here.
+    planned: Option<PlannedTypes>,
+}
+
+/// The positional roles of a type's effective features: its ends, its
+/// results and its other parameters, each in effective order.
+#[derive(Clone)]
+pub(super) struct Roles {
+    ends: Vec<usize>,
+    results: Vec<usize>,
+    parameters: Vec<usize>,
+}
+
+/// What a planning derived for every type it completed — its effective
+/// features, their roles, its exported memberships — and the redefinitions
+/// it read and added. A prepared library's planning keeps these, and a build
+/// on the library plans only its own types over them
+/// (see [`Builder::plan_positional_on_library`]).
+#[derive(Default)]
+pub(super) struct PlannedTypes {
+    effective: HashMap<usize, Vec<usize>>,
+    roles: HashMap<usize, Roles>,
+    exported: HashMap<usize, Vec<PositionalMembership>>,
+    redefinitions: HashMap<usize, Vec<usize>>,
+}
+#[cfg(test)]
+impl PlannedTypes {
+    /// Whether the planning kept what it derived for type `e`.
+    pub(super) fn has(&self, e: usize) -> bool {
+        self.effective.contains_key(&e)
+            && self.roles.contains_key(&e)
+            && self.exported.contains_key(&e)
+    }
 }
 /// Recorded bootstrap edges indexed only for one planner invocation. These
 /// vectors can change without a stored-row revision, so this proof input must
@@ -92,7 +154,7 @@ struct ImportProof {
 }
 struct ImportSourceContext<'a> {
     owner: usize,
-    bases: &'a HashMap<usize, Vec<usize>>,
+    bases: &'a dyn DirectBases,
     incomplete: &'a HashSet<usize>,
     ordinary_only: bool,
     allow_prerequisites: bool,
@@ -201,11 +263,12 @@ impl Builder {
         // Base resolution can inspect inheritance while resolving semantic
         // metadata. Never recursively start another planner from that lookup.
         self.positional_redefinitions = Some(Default::default());
+        self.positional_from_library = false;
         let used = self.used_imports.clone();
         let walks = std::mem::take(&mut self.query_imports);
         let previous_static = std::mem::replace(&mut self.static_planning, true);
         self.positional_planning = true;
-        let plan = self.plan_positional_redefinitions();
+        let (plan, from_library) = self.plan_positional_redefinitions();
         self.positional_planning = false;
         self.static_planning = previous_static;
         self.used_imports = used;
@@ -213,6 +276,7 @@ impl Builder {
         self.inherited_cache.clear();
         self.inherited_by_heritage.clear();
         self.positional_redefinitions = Some(plan);
+        self.positional_from_library = from_library;
     }
 
     /// Prepare a complete positional table within the caller's allowance.
@@ -255,6 +319,9 @@ impl Builder {
         let previous_static = std::mem::replace(&mut self.static_planning, true);
         self.positional_planning = true;
         let plan = (|| {
+            if let Some(plan) = self.plan_positional_extending_library(Some(&mut *steps))? {
+                return Some((plan, true));
+            }
             let (bases, incomplete) =
                 self.positional_direct_bases_with_budget(Some(&mut *steps))?;
             self.plan_positional_redefinitions_with_bases_and_budget(
@@ -262,21 +329,171 @@ impl Builder {
                 &incomplete,
                 Some(&mut *steps),
             )
+            .map(|plan| (plan, false))
         })();
         self.positional_planning = false;
         self.static_planning = previous_static;
-        let Some(plan) = plan else {
+        let Some((plan, from_library)) = plan else {
             return false;
         };
         self.inherited_cache.clear();
         self.inherited_by_heritage.clear();
         self.positional_redefinitions = Some(plan);
+        self.positional_from_library = from_library;
         true
     }
 
-    fn plan_positional_redefinitions(&mut self) -> PositionalRedefinitions {
+    /// The positional plan, and whether it extends the prepared library's.
+    fn plan_positional_redefinitions(&mut self) -> (PositionalRedefinitions, bool) {
+        if let Some(Some(plan)) = self.plan_positional_extending_library(None) {
+            return (plan, true);
+        }
         let (direct_bases, incomplete) = self.positional_direct_bases();
-        self.plan_positional_redefinitions_with_bases(&direct_bases, &incomplete)
+        (
+            self.plan_positional_redefinitions_with_bases(&direct_bases, &incomplete),
+            false,
+        )
+    }
+
+    /// The positional plan of a build extending its prepared library's plans
+    /// (see [`Self::plan_positional_on_library`]), its own types' direct bases
+    /// read over the library's: `Some(None)` when the build does not extend
+    /// them or must plan every row after all, `None` past the budget.
+    fn plan_positional_extending_library(
+        &mut self,
+        mut steps: Option<&mut usize>,
+    ) -> Option<Option<PositionalRedefinitions>> {
+        if !self.external_implied_names.is_empty() {
+            return Some(None);
+        }
+        let Some(library) = self.library_plans(steps.as_deref_mut())? else {
+            return Some(None);
+        };
+        let plan = self.plan_extending_library(&library, steps.as_deref_mut())?;
+        let (own, own_incomplete) =
+            self.own_positional_direct_bases(&library, &plan, steps.as_deref_mut())?;
+        let mut incomplete = library.bases_incomplete.clone();
+        incomplete.extend(own_incomplete);
+        let bases = OverLibrary {
+            own: &own,
+            library: &library.bases,
+        };
+        self.plan_positional_on_library(&library, &bases, &incomplete, steps)
+    }
+
+    /// Plan every type's positional redefinitions, with the types the planning
+    /// reached and what it derived for each: a prepared library's own plan
+    /// (see [`super::LibraryPlans`]).
+    pub(super) fn plan_positional_reaching(
+        &mut self,
+        direct_bases: &dyn DirectBases,
+        incomplete: &HashSet<usize>,
+    ) -> (PositionalRedefinitions, HashSet<usize>, PlannedTypes) {
+        let mut workspace = PositionalWorkspace::one_shot();
+        workspace.reached = Some(Vec::new());
+        workspace.planned = Some(PlannedTypes::default());
+        let plan = self
+            .plan_positional_redefinitions_with_workspace(
+                direct_bases,
+                incomplete,
+                None,
+                &mut workspace,
+            )
+            .expect("unbounded positional construction cannot exhaust its budget");
+        let reached = workspace.reached.unwrap_or_default().into_iter().collect();
+        (plan, reached, workspace.planned.unwrap_or_default())
+    }
+
+    /// The positional redefinitions of a build that extends its prepared
+    /// library's plans: the types its own rows hold that pair a feature by
+    /// position (the roots a plan of every row starts from after the
+    /// library's), planned with the library types they reach, over the
+    /// library's own plan.
+    ///
+    /// What the planning derives for a type reads its bases' derivations and
+    /// its own rows only, except which type of a cycle of bases is left
+    /// incomplete, which depends on where the walk entered the cycle: a plan
+    /// of every row walks the library's types from the library's roots before
+    /// this build's. A library type this planning reaches that the library's
+    /// planning reached too must therefore come out as it did there, complete
+    /// or not, with the same redefinitions; otherwise (`Some(None)`) the
+    /// caller plans every row.
+    pub(super) fn plan_positional_on_library(
+        &mut self,
+        library: &std::sync::Arc<super::LibraryPlans>,
+        direct_bases: &dyn DirectBases,
+        incomplete: &HashSet<usize>,
+        mut steps: Option<&mut usize>,
+    ) -> Option<Option<PositionalRedefinitions>> {
+        let floor = library.rows;
+        let end = self.explicit_len();
+        charge(&mut steps, end - floor)?;
+        let mut roots = Vec::new();
+        for e in floor..end {
+            if !conforms(self.elements[e].ty, "Type") {
+                continue;
+            }
+            let mut found = false;
+            for &rel in &self.elements[e].owned_relationships {
+                charge(&mut steps, 1)?;
+                if !super::is_feature_membership(self.elements[rel].ty) {
+                    continue;
+                }
+                for &f in &self.elements[rel].children {
+                    charge(&mut steps, 1)?;
+                    if self.positional_is_end(f) || self.is_parameter(f) {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            if found {
+                roots.push(e);
+            }
+        }
+        let mut workspace = PositionalWorkspace::one_shot();
+        workspace.reached = Some(Vec::new());
+        workspace.library = Some(std::sync::Arc::clone(library));
+        let plan = self.plan_positional_with_result_query(
+            direct_bases,
+            incomplete,
+            steps.as_deref_mut(),
+            Some(&roots),
+            None,
+            &mut workspace,
+        )?;
+        let reached = workspace.reached.unwrap_or_default();
+        charge(&mut steps, reached.len().saturating_add(plan.targets.len()))?;
+        let planned = &library.positional;
+        for e in reached {
+            if e < floor
+                && library.reached.contains(&e)
+                && plan.incomplete.contains(&e) != planned.incomplete.contains(&e)
+            {
+                return Some(None);
+            }
+        }
+        for (source, targets) in &plan.targets {
+            if *source < floor
+                && planned
+                    .targets
+                    .get(source)
+                    .is_some_and(|planned| planned != targets)
+            {
+                return Some(None);
+            }
+        }
+        let mut merged = planned.clone();
+        charge(
+            &mut steps,
+            merged.targets.len().saturating_add(merged.incomplete.len()),
+        )?;
+        merged.targets.extend(plan.targets);
+        merged.incomplete.extend(plan.incomplete);
+        Some(Some(merged))
     }
 
     /// Pure planning over an already admitted direct-base projection. Does not
@@ -286,7 +503,7 @@ impl Builder {
     /// admission precedes this internal seam; it is not an interchange reader.
     pub(super) fn plan_positional_redefinitions_with_bases(
         &mut self,
-        direct_bases: &HashMap<usize, Vec<usize>>,
+        direct_bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
     ) -> PositionalRedefinitions {
         self.plan_positional_redefinitions_with_bases_and_budget(direct_bases, incomplete, None)
@@ -297,7 +514,7 @@ impl Builder {
     /// None discards the whole local plan; no partial targets/cache is published.
     pub(super) fn plan_positional_redefinitions_with_bases_and_budget(
         &mut self,
-        direct_bases: &HashMap<usize, Vec<usize>>,
+        direct_bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         steps: Option<&mut usize>,
     ) -> Option<PositionalRedefinitions> {
@@ -311,7 +528,7 @@ impl Builder {
 
     pub(super) fn plan_positional_redefinitions_with_workspace(
         &mut self,
-        direct_bases: &HashMap<usize, Vec<usize>>,
+        direct_bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         steps: Option<&mut usize>,
         workspace: &mut PositionalWorkspace,
@@ -331,7 +548,7 @@ impl Builder {
     pub(super) fn plan_checked_positional(
         &mut self,
         nodes: &HashMap<usize, Node>,
-        bases: &HashMap<usize, Vec<usize>>,
+        bases: &dyn DirectBases,
         import_owners: &HashSet<usize>,
         steps: &mut usize,
     ) -> Option<PositionalRedefinitions> {
@@ -442,7 +659,7 @@ impl Builder {
     /// library-role certificate; this is not a whole result-family capability.
     pub(super) fn plan_unique_result_candidates(
         &mut self,
-        direct_bases: &HashMap<usize, Vec<usize>>,
+        direct_bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         roots: &[usize],
         steps: &mut usize,
@@ -462,7 +679,7 @@ impl Builder {
 
     fn plan_positional_with_result_query(
         &mut self,
-        direct_bases: &HashMap<usize, Vec<usize>>,
+        direct_bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         mut steps: Option<&mut usize>,
         selected_roots: Option<&[usize]>,
@@ -523,9 +740,15 @@ impl Builder {
         let mut prerequisites = HashMap::new();
         charge(&mut steps, roots.len())?;
         let mut todo = roots.clone();
+        // A planning extending its prepared library's reads what the
+        // library's planning derived for every type that planning reached.
+        let library = workspace.library.clone();
+        let seeded = |e: &usize| library.as_ref().is_some_and(|l| l.reached.contains(e));
+        let empty = PlannedTypes::default();
+        let planned = library.as_ref().map_or(&empty, |l| &l.planned);
         while let Some(e) = todo.pop() {
             charge(&mut steps, 1)?;
-            if nodes.contains_key(&e) {
+            if nodes.contains_key(&e) || seeded(&e) {
                 continue;
             }
             charge(
@@ -582,6 +805,9 @@ impl Builder {
             );
         }
 
+        if let Some(reached) = workspace.reached.as_mut() {
+            reached.extend(nodes.keys().copied());
+        }
         // Iterative postorder avoids a native-stack dependency on model depth.
         // Cyclic bases have no well-founded positional ordering; do not guess.
         let mut state = HashMap::new();
@@ -591,6 +817,11 @@ impl Builder {
             targets: HashMap::new(),
             incomplete: incomplete.clone(),
         };
+        if let Some(library) = &library {
+            charge(&mut steps, library.positional.incomplete.len())?;
+            plan.incomplete
+                .extend(library.positional.incomplete.iter().copied());
+        }
         // Checked callers already hold this exact unique-identity snapshot.
         // Reuse its index rather than re-scanning every row for each small
         // positional closure. The fallback preserves compatibility planning
@@ -659,6 +890,10 @@ impl Builder {
                     state.insert(e, 2);
                     order.push(e);
                 } else {
+                    // planned by the library: complete or not, it is done
+                    if seeded(&e) {
+                        continue;
+                    }
                     match state.get(&e) {
                         Some(1) => {
                             plan.incomplete.insert(e);
@@ -679,8 +914,12 @@ impl Builder {
             }
         }
 
+        // The library's rows' redefinitions, the positional ones its planning
+        // added included, are in its final graph (`planned.redefinitions`).
         let mut redefinitions = HashMap::new();
-        for (i, &(e, kind, _, _)) in self.spec_targets.iter().enumerate() {
+        let from = library.as_ref().map_or(0, |l| l.spec_rows);
+        for i in from..self.spec_targets.len() {
+            let (e, kind, _, _) = self.spec_targets[i];
             charge(&mut steps, 1)?;
             if kind == "Redefinition" {
                 if let Some(target) = self.spec_resolved.get(i).copied().flatten() {
@@ -721,11 +960,6 @@ impl Builder {
             None
         };
         let mut effective: HashMap<usize, Vec<usize>> = HashMap::new();
-        struct Roles {
-            ends: Vec<usize>,
-            results: Vec<usize>,
-            parameters: Vec<usize>,
-        }
         let mut roles: HashMap<usize, Roles> = HashMap::new();
         let mut exported: HashMap<usize, Vec<PositionalMembership>> = HashMap::new();
         let mut traversal = if selected_roots.is_some() {
@@ -746,17 +980,18 @@ impl Builder {
             if !node.memberships_complete {
                 plan.incomplete.insert(e);
             }
-            if node
-                .bases
-                .iter()
-                .any(|b| plan.incomplete.contains(b) || !effective.contains_key(b))
-            {
+            if node.bases.iter().any(|b| {
+                plan.incomplete.contains(b)
+                    || !(effective.contains_key(b) || planned.effective.contains_key(b))
+            }) {
                 plan.incomplete.insert(e);
             }
             if let Some(required) = prerequisites.get(&e) {
                 charge(&mut steps, required.len())?;
                 if required.iter().any(|dependency| {
-                    plan.incomplete.contains(dependency) || !effective.contains_key(dependency)
+                    plan.incomplete.contains(dependency)
+                        || !(effective.contains_key(dependency)
+                            || planned.effective.contains_key(dependency))
                 }) {
                     plan.incomplete.insert(e);
                 }
@@ -809,7 +1044,7 @@ impl Builder {
             if subject_family(self.elements[e].ty).is_some() {
                 for base in &node.bases {
                     charge(&mut steps, 1)?;
-                    charge_sort(&mut steps, effective[base].len())?;
+                    charge_sort(&mut steps, effective_of(&effective, planned, base).len())?;
                 }
             }
             let subject_bases: Vec<_> = if let Some(family) = subject_family(self.elements[e].ty) {
@@ -817,7 +1052,7 @@ impl Builder {
                     .iter()
                     .filter(|&&base| subject_family(self.elements[base].ty) == Some(family))
                     .map(|&base| {
-                        let mut subjects: Vec<_> = effective[&base]
+                        let mut subjects: Vec<_> = effective_of(&effective, planned, &base)
                             .iter()
                             .copied()
                             .filter(|&f| is_subject(f))
@@ -847,6 +1082,7 @@ impl Builder {
                             source,
                             target,
                             &mut redefinitions,
+                            &planned.redefinitions,
                             &mut plan.targets,
                             &mut traversal,
                             &mut steps,
@@ -856,7 +1092,10 @@ impl Builder {
             }
             for &base in &node.bases {
                 charge(&mut steps, 1)?;
-                let base_roles = &roles[&base];
+                let base_roles = roles
+                    .get(&base)
+                    .or_else(|| planned.roles.get(&base))
+                    .expect("a complete base has roles");
                 charge(&mut steps, ends.len().min(base_roles.ends.len()))?;
                 let base_ends = base_roles.ends.iter().copied();
                 for (&source, target) in ends.iter().zip(base_ends) {
@@ -864,6 +1103,7 @@ impl Builder {
                         source,
                         target,
                         &mut redefinitions,
+                        &planned.redefinitions,
                         &mut plan.targets,
                         &mut traversal,
                         &mut steps,
@@ -913,6 +1153,7 @@ impl Builder {
                                 source,
                                 target,
                                 &mut redefinitions,
+                                &planned.redefinitions,
                                 &mut plan.targets,
                                 &mut traversal,
                                 &mut steps,
@@ -932,6 +1173,7 @@ impl Builder {
                             results[0],
                             base_results[0],
                             &mut redefinitions,
+                            &planned.redefinitions,
                             &mut plan.targets,
                             &mut traversal,
                             &mut steps,
@@ -941,8 +1183,14 @@ impl Builder {
             }
             let (features, surviving) = projection.reduce(
                 node,
-                &exported,
-                &redefinitions,
+                &ExportedOver {
+                    own: &exported,
+                    library: &planned.exported,
+                },
+                &OverLibrary {
+                    own: &redefinitions,
+                    library: &planned.redefinitions,
+                },
                 &mut traversal,
                 &CompatibilityMembershipFacts(self),
                 &mut steps,
@@ -1020,6 +1268,14 @@ impl Builder {
                 result: plan.clone(),
             });
         }
+        if let Some(out) = workspace.planned.as_mut() {
+            *out = PlannedTypes {
+                effective,
+                roles,
+                exported,
+                redefinitions,
+            };
+        }
         Some(plan)
     }
 
@@ -1051,7 +1307,7 @@ impl Builder {
     fn positional_imports(
         &mut self,
         owner: usize,
-        bases: &HashMap<usize, Vec<usize>>,
+        bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         steps: &mut Option<&mut usize>,
         proof: &mut ImportProof,
@@ -1430,7 +1686,7 @@ impl Builder {
         &mut self,
         raw: &super::structural_index::StoredStructure,
         root: usize,
-        bases: &HashMap<usize, Vec<usize>>,
+        bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         steps: &mut usize,
         proof: &mut ImportProof,
@@ -1567,7 +1823,7 @@ impl Builder {
     fn positional_leaf_imports(
         &mut self,
         owner: usize,
-        bases: &HashMap<usize, Vec<usize>>,
+        bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         steps: &mut Option<&mut usize>,
     ) -> Option<(Vec<PositionalMembership>, Vec<PositionalMembership>)> {
@@ -1668,7 +1924,7 @@ impl Builder {
     fn positional_import_leaf(
         &self,
         owner: usize,
-        bases: &HashMap<usize, Vec<usize>>,
+        bases: &dyn DirectBases,
         incomplete: &HashSet<usize>,
         steps: &mut Option<&mut usize>,
     ) -> Option<bool> {
@@ -1803,20 +2059,42 @@ fn acyclic_redefinition_closure(
     Some(())
 }
 
+/// Add `source → target` to `graph` (read over `library`'s, whose list a
+/// source's own starts from) unless it is already implied.
 fn add_edge(
     source: usize,
     target: usize,
     graph: &mut HashMap<usize, Vec<usize>>,
+    library: &HashMap<usize, Vec<usize>>,
     added: &mut HashMap<usize, Vec<usize>>,
     traversal: &mut Reachability,
     steps: &mut Option<&mut usize>,
 ) -> Option<()> {
-    if !traversal.reaches_budget(source, target, graph, steps)? {
+    let over = OverLibrary {
+        own: graph,
+        library,
+    };
+    if !traversal.reaches_budget(source, target, &over, steps)? {
         charge(steps, 1)?;
-        graph.entry(source).or_default().push(target);
+        graph
+            .entry(source)
+            .or_insert_with(|| library.get(&source).cloned().unwrap_or_default())
+            .push(target);
         added.entry(source).or_default().push(target);
     }
     Some(())
+}
+
+/// A complete type's effective features: planned here, or by the library.
+fn effective_of<'a>(
+    effective: &'a HashMap<usize, Vec<usize>>,
+    planned: &'a PlannedTypes,
+    e: &usize,
+) -> &'a Vec<usize> {
+    effective
+        .get(e)
+        .or_else(|| planned.effective.get(e))
+        .expect("a complete base has effective features")
 }
 
 fn charge_sort(steps: &mut Option<&mut usize>, size: usize) -> Option<()> {
@@ -2163,7 +2441,7 @@ mod tests {
         model.add_source("positional.kerml", "function Base {in a; return b;} function Child specializes Base {in x; return y;} feature call=Child(1);");
         assert!(!model.has_errors());
         let mut r = super::super::ResolvedModel::build(&model);
-        let expected = r.b.plan_positional_redefinitions();
+        let (expected, _) = r.b.plan_positional_redefinitions();
         let (bases, incomplete) = r.b.positional_direct_bases();
         let retained = r.b.supported_implied.clone().unwrap();
         let actual =

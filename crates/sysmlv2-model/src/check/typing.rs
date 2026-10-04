@@ -78,7 +78,7 @@ fn typing_groups(r: &ResolvedModel, model: Option<&Model>) -> Vec<TypingGroup> {
             continue;
         }
         let library = match model {
-            Some(model) => model.is_library_unit(r.b.unit_of_elem(*owner)),
+            Some(model) => !super::user_owned(&r.b, model, *owner),
             None => *owner < r.b.lib_boundary,
         };
         if library {

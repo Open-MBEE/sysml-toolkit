@@ -316,6 +316,50 @@ fn unit_line_index<'a>(
         .or_insert_with(|| LineIndex::new(session.source(unit).unwrap_or("")))
 }
 
+/// A verdict's feature bindings as the verify report spells them: `{feature,
+/// value?, unitName?, line?, col?}`. A declaration in a library unit has
+/// no position (library sources are not held).
+fn bindings_json(
+    bindings: &[sysmlv2_model::check::ConstraintBinding],
+    session: &TSession,
+    names: &HashMap<usize, String>,
+    indexes: &mut HashMap<usize, LineIndex>,
+) -> Vec<serde_json::Value> {
+    bindings
+        .iter()
+        .map(|b| {
+            let pos = b
+                .site
+                .filter(|(unit, _)| session.source(*unit).is_some())
+                .map(|(unit, span)| {
+                    let lc = unit_line_index(indexes, session, unit).line_col(span.start);
+                    (unit, lc)
+                });
+            json!({
+                "feature": b.feature,
+                "value": b.value,
+                "unitName": pos.and_then(|(u, _)| names.get(&u)),
+                "line": pos.map(|(_, lc)| lc.line),
+                "col": pos.map(|(_, lc)| lc.col),
+            })
+        })
+        .collect()
+}
+
+/// The CLI's "why" suffix on a violated verdict line: the evaluated values
+/// of its bound references (`VIOLATED (with reserveKg = 0.10)`).
+fn with_values(detail: String, bindings: &[sysmlv2_model::check::ConstraintBinding]) -> String {
+    let vals: Vec<String> = bindings
+        .iter()
+        .filter_map(|b| b.value.as_ref().map(|v| format!("{} = {v}", b.feature)))
+        .collect();
+    if vals.is_empty() {
+        detail
+    } else {
+        format!("{detail} (with {})", vals.join(", "))
+    }
+}
+
 /// One edit-batch operation as JSON (the `edit` method takes an array):
 /// `{op: "rename", target, newName}` · `{op: "setFeatureValue", target,
 /// expr}` · `{op: "setFeatureType", target, type}` (replace the written
@@ -1960,7 +2004,16 @@ impl Session {
     /// evaluations and declaration positions (`{feature, value?,
     /// unitName?, line?, col?}`, empty for satisfied constraints);
     /// `features` = the free features the propagation term references
-    /// (the keys into `ranges`).
+    /// (the keys into `ranges`). `satisfactions` holds one verdict per
+    /// `satisfy R by x;` claim, decided at the evaluation tier with R's
+    /// subjects bound to `x`: `{unit, unitName, requirement, by, negated,
+    /// line, col, endLine, endCol, status, vacuous, detail, constraints}`,
+    /// positioned over the whole `satisfy` statement; `vacuous` = satisfied
+    /// only because an assumption does not hold; `constraints` = the
+    /// verdicts it combines, `{unit, unitName, name, elementType, assumed,
+    /// line, col, endLine, endCol, status, detail, bindings}` (bindings
+    /// evaluated under the subject binding, chains like `x.mass` whole).
+    /// The summary counts claims alongside constraints.
     // The export boundary converts an optional string only when owned.
     #[allow(clippy::needless_pass_by_value)]
     pub fn verify(&mut self, opts_json: Option<String>) -> Result<String, String> {
@@ -1976,8 +2029,11 @@ impl Session {
                 .max_iters
                 .unwrap_or_else(|| PropagateConfig::default().max_iters),
         };
-        // `None` solver = the solverless pipeline; it cannot fail.
-        let report = sysmlv2_solve::verify_constraints(self.inner.model(), None, &cfg)
+        // `None` solver = the solverless pipeline; it cannot fail. It runs on
+        // the session's own resolved graph, reusing what earlier queries
+        // derived instead of resolving the model again.
+        let (resolved, model) = self.inner.resolved_with_model();
+        let report = sysmlv2_solve::verify_constraints_with(resolved, model, None, &cfg)
             .map_err(|e| e.to_string())?;
 
         let names: std::collections::HashMap<usize, String> = self
@@ -2018,39 +2074,9 @@ impl Session {
                 // The CLI's "why" suffix: evaluated values of the bound
                 // references under a violated verdict.
                 if status == "violated" {
-                    let vals: Vec<String> = c
-                        .bindings
-                        .iter()
-                        .filter_map(|b| b.value.as_ref().map(|v| format!("{} = {v}", b.feature)))
-                        .collect();
-                    if !vals.is_empty() {
-                        detail = format!("{detail} (with {})", vals.join(", "));
-                    }
+                    detail = with_values(detail, &c.bindings);
                 }
-                let bindings: Vec<serde_json::Value> = c
-                    .bindings
-                    .iter()
-                    .map(|b| {
-                        // Declaration site → position, when the feature
-                        // lives in a user unit (library sources are not
-                        // held, so library declarations carry no position).
-                        let pos = b
-                            .site
-                            .filter(|(unit, _)| inner.source(*unit).is_some())
-                            .map(|(unit, span)| {
-                                let lc =
-                                    unit_line_index(&mut indexes, inner, unit).line_col(span.start);
-                                (unit, lc)
-                            });
-                        json!({
-                            "feature": b.feature,
-                            "value": b.value,
-                            "unitName": pos.and_then(|(u, _)| names.get(&u)),
-                            "line": pos.map(|(_, lc)| lc.line),
-                            "col": pos.map(|(_, lc)| lc.col),
-                        })
-                    })
-                    .collect();
+                let bindings = bindings_json(&c.bindings, inner, &names, &mut indexes);
                 let li = unit_line_index(&mut indexes, inner, c.unit);
                 let start = li.line_col(c.span.start);
                 let end = li.line_col(c.span.end);
@@ -2085,9 +2111,68 @@ impl Session {
                 })
             })
             .collect();
+        let mut satisfactions: Vec<serde_json::Value> = Vec::new();
+        for claim in &report.satisfactions {
+            let (status, detail) = match &claim.verdict {
+                ConstraintVerdict::Satisfied if claim.vacuous => (
+                    "satisfied",
+                    "satisfied (an assumption does not hold)".to_string(),
+                ),
+                verdict => verify_status(verdict, None),
+            };
+            match status {
+                "satisfied" => sat += 1,
+                "violated" => vio += 1,
+                _ => und += 1,
+            }
+            let mut constraints: Vec<serde_json::Value> = Vec::new();
+            for c in &claim.constraints {
+                let (status, mut detail) = verify_status(&c.check.verdict, None);
+                if status == "violated" {
+                    detail = with_values(detail, &c.check.bindings);
+                }
+                let li = unit_line_index(&mut indexes, inner, c.check.unit);
+                let (start, end) = (
+                    li.line_col(c.check.span.start),
+                    li.line_col(c.check.span.end),
+                );
+                constraints.push(json!({
+                    "unit": c.check.unit,
+                    "unitName": names.get(&c.check.unit),
+                    "name": c.check.name,
+                    "elementType": c.check.element_type,
+                    "assumed": c.assumed,
+                    "line": start.line,
+                    "col": start.col,
+                    "endLine": end.line,
+                    "endCol": end.col,
+                    "status": status,
+                    "detail": detail,
+                    "bindings": bindings_json(&c.check.bindings, inner, &names, &mut indexes),
+                }));
+            }
+            let li = unit_line_index(&mut indexes, inner, claim.unit);
+            let (start, end) = (li.line_col(claim.span.start), li.line_col(claim.span.end));
+            satisfactions.push(json!({
+                "unit": claim.unit,
+                "unitName": names.get(&claim.unit),
+                "requirement": claim.requirement,
+                "by": claim.by,
+                "negated": claim.negated,
+                "line": start.line,
+                "col": start.col,
+                "endLine": end.line,
+                "endCol": end.col,
+                "status": status,
+                "vacuous": claim.vacuous,
+                "detail": detail,
+                "constraints": constraints,
+            }));
+        }
         Ok(json!({
             "constraints": constraints,
             "ranges": ranges,
+            "satisfactions": satisfactions,
             "summary": {"satisfied": sat, "violated": vio, "undecided": und},
         })
         .to_string())

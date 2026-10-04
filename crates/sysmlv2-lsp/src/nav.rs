@@ -3811,6 +3811,27 @@ impl Nav {
         out
     }
 
+    /// Run the solverless verify pass over the current strict session, once
+    /// per build, on the session's own resolved graph: what its queries
+    /// already derived (the positional redefinitions of every type, the
+    /// implied specializations) serves the pass too.
+    fn ensure_verify(&mut self) {
+        if self.verify.is_some() {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let (resolved, model) = session.resolved_with_model();
+        self.verify = sysmlv2_solve::verify_constraints_with(
+            resolved,
+            model,
+            None,
+            &sysmlv2_solve::PropagateConfig::default(),
+        )
+        .ok();
+    }
+
     /// Inlay hints: evaluated feature values (`= 42` after a
     /// non-literal value expression the evaluator settles) and
     /// propagated ranges (`∈ [10, +∞] [m]` after the declared name of a
@@ -3920,14 +3941,7 @@ impl Nav {
 
         // Propagated ranges: the cached solverless verify pass; hints go
         // after the declared name of each narrowed feature here.
-        if self.verify.is_none() {
-            self.verify = sysmlv2_solve::verify_constraints(
-                self.session.as_ref().expect("session built above").model(),
-                None,
-                &sysmlv2_solve::PropagateConfig::default(),
-            )
-            .ok();
-        }
+        self.ensure_verify();
         let session = self.session.as_mut().expect("session built above");
         if let Some(report) = self.verify.clone() {
             for r in report.ranges.iter().filter(|r| r.narrowed).take(200) {
@@ -3991,7 +4005,8 @@ impl Nav {
 
     /// Code lenses: every constraint/requirement/invariant body in
     /// the document carries its verify verdict inline — evaluation first,
-    /// then interval propagation (solverless; Z3 stays a CLI concern).
+    /// then interval propagation (solverless; Z3 stays a CLI concern) —
+    /// and every `satisfy` statement its claim's verdict.
     pub fn code_lenses(
         &mut self,
         docs: &BTreeMap<Uri, Document>,
@@ -4010,19 +4025,12 @@ impl Nav {
             return Vec::new();
         };
         let _ = session; // built the model; the cached report answers
-        if self.verify.is_none() {
-            self.verify = sysmlv2_solve::verify_constraints(
-                self.session.as_ref().expect("session built above").model(),
-                None,
-                &sysmlv2_solve::PropagateConfig::default(),
-            )
-            .ok();
-        }
+        self.ensure_verify();
         let Some(report) = self.verify.clone() else {
             return Vec::new();
         };
         let mapper = Mapper::new(&doc_text, enc);
-        report
+        let mut lenses: Vec<lsp_types::CodeLens> = report
             .constraints
             .iter()
             .filter(|c| c.unit == unit)
@@ -4063,7 +4071,43 @@ impl Nav {
                     data: None,
                 }
             })
-            .collect()
+            .collect();
+        // A satisfaction claim carries one verdict on its `satisfy`
+        // statement: the requirement's constraints with its subjects bound
+        // to the satisfying feature.
+        for claim in report.satisfactions.iter().filter(|c| c.unit == unit) {
+            let title = match &claim.verdict {
+                ConstraintVerdict::Satisfied if claim.vacuous => {
+                    "✓ satisfied (an assumption does not hold)".to_string()
+                }
+                ConstraintVerdict::Satisfied => "✓ satisfied".to_string(),
+                ConstraintVerdict::Violated => {
+                    let vals: Vec<String> = claim
+                        .constraints
+                        .iter()
+                        .filter(|c| c.check.verdict == ConstraintVerdict::Violated)
+                        .flat_map(|c| &c.check.bindings)
+                        .filter_map(|b| b.value.as_ref().map(|v| format!("{} = {v}", b.feature)))
+                        .collect();
+                    if vals.is_empty() {
+                        "✗ VIOLATED".to_string()
+                    } else {
+                        format!("✗ VIOLATED (with {})", vals.join(", "))
+                    }
+                }
+                ConstraintVerdict::Undecided(why) => format!("undecided ({why})"),
+            };
+            lenses.push(lsp_types::CodeLens {
+                range: mapper.range(claim.span),
+                command: Some(lsp_types::Command {
+                    title,
+                    command: String::new(),
+                    arguments: None,
+                }),
+                data: None,
+            });
+        }
+        lenses
     }
 
     // Static shims: `element_at` needs `&mut Session` while `self`

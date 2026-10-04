@@ -38,7 +38,10 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 pub use sysmlv2_model::check::ConstraintBinding;
-use sysmlv2_model::check::{ConstraintVerdict, constraint_bindings, constraint_verdict};
+use sysmlv2_model::check::{
+    ConstraintVerdict, SatisfactionClaim, constraint_bindings, constraint_verdict,
+    satisfaction_claims,
+};
 use sysmlv2_model::json::ResolvedModel;
 use sysmlv2_model::model::Model;
 use term::RenderCtx;
@@ -239,10 +242,7 @@ fn solve_resolved(
 ) -> Result<Vec<SolvedConstraint>, SolveError> {
     let tables = translate::EnumTables::build(r);
     let mut out = Vec::new();
-    for c in r.constraints() {
-        if model.is_library_unit(c.unit) {
-            continue;
-        }
+    for c in r.constraints_where(|unit| !model.is_library_unit(unit)) {
         let verdict = constraint_verdict(r, &c);
         let solve = match &verdict {
             ConstraintVerdict::Undecided(_) => Some(solve_one(r, &tables, &c, cfg, None)),
@@ -422,10 +422,7 @@ fn user_constraints(
     r: &mut ResolvedModel,
     model: &Model,
 ) -> Vec<sysmlv2_model::json::ConstraintInfo> {
-    r.constraints()
-        .into_iter()
-        .filter(|c| !model.is_library_unit(c.unit))
-        .collect()
+    r.constraints_where(|unit| !model.is_library_unit(unit))
 }
 
 /// Whether a propagation outcome settled the constraint on its own (so no
@@ -641,8 +638,8 @@ pub struct VerifiedConstraint {
     pub features: Vec<String>,
 }
 
-/// The whole model verified in one pass: per-constraint verdicts and the
-/// narrowed feature ranges.
+/// The whole model verified in one pass: per-constraint verdicts, the
+/// narrowed feature ranges, and the satisfaction claims.
 #[derive(Clone, Debug)]
 pub struct VerifyReport {
     /// One entry per non-library constraint, in model order.
@@ -650,6 +647,11 @@ pub struct VerifyReport {
     /// Narrowed feature domains, in first-encountered order (see
     /// [`Propagation::ranges`]).
     pub ranges: Vec<FeatureRange>,
+    /// One entry per user `satisfy R by x;` claim, in model order, decided
+    /// at the evaluation tier: the requirement's constraints evaluate with
+    /// its subjects bound (propagation and solving see the unbound
+    /// originals among [`Self::constraints`]).
+    pub satisfactions: Vec<SatisfactionClaim>,
 }
 
 /// The full verification pipeline. Interval propagation runs first over
@@ -729,6 +731,7 @@ fn verify_resolved(
     Ok(VerifyReport {
         constraints,
         ranges,
+        satisfactions: satisfaction_claims(model, r),
     })
 }
 

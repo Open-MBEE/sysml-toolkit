@@ -1057,11 +1057,11 @@ $ echo $?
 1
 ```
 
-Verdicts are deliberately cautious: a comparison involving an *unbound* feature is undecided, never a false `false` — which keeps the corpus at **0 violated** (ratcheted by `tests/check.rs`). A type default read through an unbound parameter or featured reference — a requirement's `subject` or `ref part`, an actor, a calculation input — is undecided because the instance bound later may override it. A fixed literal still decides; a fixed formula decides only when its inputs are known. This uncertainty survives aliases, conditionals, nested members and calculation calls, while concrete receivers still read their defaults. The same discipline covers cardinality: `size(xs)` over an unbound feature answers only what the declared multiplicity proves (an exact `[3]` answers 3, `[1..*]` settles `notEmpty`, anything else stays undecided). Propagation keeps unknown receiver members free; nested unknown receiver paths stay outside the supported fragment rather than conflating distinct instances.
+Verdicts are deliberately cautious: a comparison involving an *unbound* feature is undecided, never a false `false` — which keeps the corpus at **0 violated** (ratcheted by `tests/check.rs`). A type default read through an unbound parameter or featured reference — a requirement's `subject` or `ref part`, an actor, a calculation input — is undecided because the instance bound later may override it. A fixed literal still decides; a fixed formula decides only when its inputs are known. This uncertainty survives aliases, conditionals, nested members and calculation calls, while concrete receivers still read their defaults. The same discipline covers cardinality: `size(xs)` over an unbound feature answers only what the declared multiplicity proves (an exact `[3]` answers 3, `[1..*]` settles `notEmpty`, anything else stays undecided). Propagation keeps unknown receiver members free; nested unknown receiver paths stay outside the supported fragment rather than conflating distinct instances. A feature with no value of its own reads the value of a feature it subsets when the two must be equal: it has at least one value and the subsetted feature at most one, so `subject :>> crawler :> tinycrawler;` reads `tinycrawler` when both are single-valued. It keeps its own reading when it says more than the subsetted feature, with members of its own or a type the subsetted feature does not have. An action, calculation or analysis usage written without a multiplicity stands for any number of performances, so a result read through it stays undecided until it declares `[1]`.
 
 ### Satisfaction claims — subject-bound verdicts
 
-A `satisfy R by x;` member claims that `x` satisfies requirement `R` — so `verify` binds `R`'s subject to `x` and evaluates every constraint reachable through the requirement's composition: nested `require` references with their parameter bindings, bodies inherited from requirement definitions, and assumption constraints. The bound verdicts carry a `satisfies …` context; the unbound originals keep their honest undecideds:
+A `satisfy R by x;` member claims that `x` satisfies requirement `R` — so `verify` binds `R`'s subject to `x` and evaluates every constraint reachable through the requirement's composition: nested `require` references with their parameter bindings, bodies inherited from requirement definitions, and assumption constraints. The claim gets one verdict, reported at the `satisfy` statement. The verdicts combine the way a requirement check does: each requirement's `assume` constraints imply its `require` constraints and the requirements it composes. A false assumption therefore satisfies the claim vacuously, and a claim stays undecided only when the known verdicts do not settle it. A plain `constraint` member of a requirement is not part of the check, `not satisfy R by x;` inverts the verdict, and `satisfy requirement : R by x;`, which declares its own requirement, is checked like a reference to one. When a claim is not satisfied, the constraints behind it follow, indented, with the values that decided them. The unbound originals keep their honest undecideds:
 
 ```sysml
 package Freight {
@@ -1104,16 +1104,14 @@ package Freight {
 $ $sysmlv2 verify freight.sysml --lib sysml.library
 freight.sysml:21:30  <anonymous> (ConstraintUsage): undecided (result is indeterminate over unbound features)
 freight.sysml:26:29  <anonymous> (ConstraintUsage): undecided (result is indeterminate over unbound features)
-freight.sysml:21:30  <anonymous> (ConstraintUsage, satisfies Freight::wagonSpec): satisfied
-freight.sysml:21:30  <anonymous> (ConstraintUsage, satisfies Freight::wagonSpec): VIOLATED
-freight.sysml:26:29  <anonymous> (ConstraintUsage, satisfies Freight::wagonSpec): satisfied
-freight.sysml:26:29  <anonymous> (ConstraintUsage, satisfies Freight::wagonSpec): satisfied
-3 satisfied, 1 violated, 2 undecided
+freight.sysml:11:9  <anonymous> (SatisfyRequirementUsage, satisfies Freight::wagonSpec by wagon1): VIOLATED
+  freight.sysml:21:30  <anonymous> (ConstraintUsage): VIOLATED (with actual = 950 [kg], cap = 900 [kg])
+0 satisfied, 1 violated, 2 undecided
 $ echo $?
 1
 ```
 
-The wagon's 950 kg is inside the 1000 kg laden cap (satisfied) but over the 900 kg empty cap — the claim is genuinely false, and `verify` says so with exit 1. The `massActual <= massReqd` body evaluates once per requirement branch, each under its own redefinitions.
+The wagon's 950 kg is inside the 1000 kg laden cap but over the 900 kg empty cap. The claim is genuinely false, and `verify` says so with exit 1. The `actual <= cap` body evaluates once per requirement branch, each under its own redefinitions, and the cargo assumption holds in both, so only the empty-cap branch is listed under the claim. Claims are decided at the evaluation tier under every option; `--ranges` and `--solve` work on the unbound originals.
 
 ### `--ranges` — interval propagation (no solver)
 

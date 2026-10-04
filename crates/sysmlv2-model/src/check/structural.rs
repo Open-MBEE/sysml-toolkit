@@ -36,8 +36,13 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
             out.push((unit, super::rule_error(span, rule, msg)));
         }
     };
+    // Every finding below is on the specializing element, so a library
+    // one's rows are passed over before any test.
     for (i, (e, kind, _, qn)) in b.spec_targets.iter().enumerate() {
-        if !matches!(*kind, "Subclassification" | "Subsetting") || !is(b, *e, "Classifier") {
+        if *e < b.lib_boundary
+            || !matches!(*kind, "Subclassification" | "Subsetting")
+            || !is(b, *e, "Classifier")
+        {
             continue;
         }
         let Some(t) = b.spec_resolved.get(i).copied().flatten() else {
@@ -74,6 +79,9 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
         }
     }
     for (i, (e, kind, _, qn)) in b.spec_targets.iter().enumerate() {
+        if *e < b.lib_boundary {
+            continue;
+        }
         let Some(t) = b.spec_resolved.get(i).copied().flatten() else {
             continue;
         };
@@ -132,7 +140,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
     // Owners of result expressions, indexed once for the per-type walk.
     let result_owners: std::collections::HashSet<usize> =
         b.result_exprs.iter().map(|(o, _, _)| *o).collect();
-    for e in 0..b.explicit_len() {
+    for e in b.lib_boundary..b.explicit_len() {
         if model.is_library_unit(b.unit_of_elem(e)) {
             continue;
         }
@@ -663,7 +671,7 @@ pub(super) fn validate_directions(
             .iter()
             .enumerate()
             .filter_map(|(i, (e, kind, _, qn))| {
-                if *kind != "Redefinition" {
+                if *kind != "Redefinition" || *e < r.b.lib_boundary {
                     return None;
                 }
                 let t = r.b.spec_resolved.get(i).copied().flatten()?;

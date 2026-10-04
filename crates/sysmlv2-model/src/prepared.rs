@@ -119,7 +119,8 @@ impl LibraryUnits {
 // 12: calculations no longer keep their declared input names apart.
 // 13: scopes carry the spellings of every redefinition their owner writes.
 // 14: retain those complete QualifiedNames, including qualification and source spans.
-const MAGIC: &[u8] = b"SYSML-PREPARED-14\n";
+// 15: memoized unit expansions carry the features they read.
+const MAGIC: &[u8] = b"SYSML-PREPARED-15\n";
 
 /// The records a snapshot carries, in order.
 #[derive(Deserialize)]
@@ -147,7 +148,39 @@ pub struct PreparedLibrary {
     /// decode it on first need; installing arms the model's lazy slot with it.
     #[serde(skip)]
     pub(crate) lazy_recording: Option<Arc<[u8]>>,
+    /// The implied-specialization and positional plans of the library's own
+    /// rows, made by the first build on it that plans, for every build on it
+    /// to extend with its own rows (`None` when they cannot be made).
+    #[serde(skip)]
+    plans: std::sync::OnceLock<Option<Arc<crate::json::LibraryPlans>>>,
+    /// The library's enumeration and variation definitions, made on first
+    /// read (see [`crate::json::ResolvedModel::enum_types`]).
+    #[serde(skip)]
+    enum_types: std::sync::OnceLock<crate::json::LibraryEnumTypes>,
+    /// The owner of each of the library's relationships and its
+    /// specialization rows by owner, made on first read: a build that left
+    /// the library's rows as they are tables only its own over them.
+    #[serde(skip)]
+    rel_owners: std::sync::OnceLock<Arc<Vec<Option<usize>>>>,
+    #[serde(skip)]
+    spec_index: std::sync::OnceLock<Arc<crate::layered::IdMap<usize, Vec<usize>>>>,
+    /// The library's valued chain redefinitions by owning type (see
+    /// [`crate::json::Builder::chain_redefinitions`]), made on first read.
+    #[serde(skip)]
+    chain_redefinitions: std::sync::OnceLock<ChainIndex>,
+    /// The library's multiplicity rows by the element whose own
+    /// multiplicity each declares, and by the range each constrains.
+    #[serde(skip)]
+    declared_multiplicities: std::sync::OnceLock<RowIndex>,
+    #[serde(skip)]
+    multiplicity_ranges: std::sync::OnceLock<RowIndex>,
 }
+
+/// Rows of a library table by element.
+type RowIndex = Arc<crate::layered::IdMap<usize, usize>>;
+
+/// Valued chain redefinitions by owning type: (redefining feature, links).
+pub(crate) type ChainIndex = Arc<crate::layered::IdMap<usize, Vec<(usize, Vec<usize>)>>>;
 impl PreparedLibrary {
     /// Original unit names and text in library order, without loading syntax trees.
     pub fn sources(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
@@ -200,7 +233,86 @@ impl PreparedLibrary {
             root_names: crate::json::top_level_names(model.units().iter()),
             recording: model.library_recording(),
             lazy_recording: None,
+            plans: std::sync::OnceLock::new(),
+            enum_types: std::sync::OnceLock::new(),
+            rel_owners: std::sync::OnceLock::new(),
+            spec_index: std::sync::OnceLock::new(),
+            chain_redefinitions: std::sync::OnceLock::new(),
+            declared_multiplicities: std::sync::OnceLock::new(),
+            multiplicity_ranges: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The library's enumeration and variation definitions, made on first call.
+    pub(crate) fn library_enum_types(&self) -> &crate::json::LibraryEnumTypes {
+        self.enum_types
+            .get_or_init(|| crate::json::LibraryEnumTypes::of(&self.builder))
+    }
+
+    /// The owning element of each of the library's relationships, made on
+    /// first call.
+    pub(crate) fn library_rel_owners(&self) -> &Arc<Vec<Option<usize>>> {
+        self.rel_owners
+            .get_or_init(|| Arc::new(crate::json::relationship_owners(&self.builder)))
+    }
+
+    /// The library's frozen specialization rows by owner (see
+    /// [`crate::json::Builder::spec_index`]), made on first call.
+    pub(crate) fn library_spec_index(&self) -> &Arc<crate::layered::IdMap<usize, Vec<usize>>> {
+        self.spec_index.get_or_init(|| {
+            let mut index = crate::layered::LayeredMap::default();
+            self.builder
+                .index_spec_rows(0..self.builder.spec_targets.base_len(), &mut index);
+            index.freeze();
+            Arc::clone(index.base_arc())
+        })
+    }
+
+    /// The library's valued chain redefinitions by owning type, made on
+    /// first call, on a copy of the library's build.
+    pub(crate) fn library_chain_redefinitions(&self) -> &ChainIndex {
+        self.chain_redefinitions.get_or_init(|| {
+            let mut b = self.builder.clone();
+            let features = b.values.iter().map(|(&f, _)| f).collect();
+            let mut index = crate::layered::LayeredMap::default();
+            b.index_chain_redefinitions(features, &mut index);
+            index.freeze();
+            Arc::clone(index.base_arc())
+        })
+    }
+
+    /// The library's frozen multiplicity rows by the element whose own
+    /// multiplicity each declares, made on first call.
+    pub(crate) fn library_declared_multiplicities(&self) -> &RowIndex {
+        self.declared_multiplicities.get_or_init(|| {
+            let mut index = crate::layered::LayeredMap::default();
+            self.builder.index_declared_multiplicities(
+                0..self.builder.multiplicities.base_len(),
+                &mut index,
+            );
+            index.freeze();
+            Arc::clone(index.base_arc())
+        })
+    }
+
+    /// The library's frozen multiplicity rows by the range each
+    /// constrains, made on first call.
+    pub(crate) fn library_multiplicity_ranges(&self) -> &RowIndex {
+        self.multiplicity_ranges.get_or_init(|| {
+            let mut index = crate::layered::LayeredMap::default();
+            self.builder
+                .index_multiplicity_ranges(0..self.builder.multiplicities.base_len(), &mut index);
+            index.freeze();
+            Arc::clone(index.base_arc())
+        })
+    }
+
+    /// The plans of the library's own rows that builds on it extend (see
+    /// [`crate::json::LibraryPlans`]), made on first call.
+    pub(crate) fn library_plans(self: &Arc<Self>) -> Option<Arc<crate::json::LibraryPlans>> {
+        self.plans
+            .get_or_init(|| crate::json::LibraryPlans::plan(self).map(Arc::new))
+            .clone()
     }
 
     /// The resolution recording a source-prepared handle keeps, encoded
@@ -299,6 +411,13 @@ impl PreparedLibrary {
             root_names: wire.root_names,
             recording: None,
             lazy_recording: None,
+            plans: std::sync::OnceLock::new(),
+            enum_types: std::sync::OnceLock::new(),
+            rel_owners: std::sync::OnceLock::new(),
+            spec_index: std::sync::OnceLock::new(),
+            chain_redefinitions: std::sync::OnceLock::new(),
+            declared_multiplicities: std::sync::OnceLock::new(),
+            multiplicity_ranges: std::sync::OnceLock::new(),
         };
         result.builder.reset_lookup_caches();
         if result.units.sources.iter().any(|u| !u.is_library)
@@ -779,7 +898,7 @@ mod tests {
         let mut base = Model::new();
         base.add_library_source(
             "lib.kerml",
-            "package Quantities { datatype MeasurementUnit; } package L { datatype A; datatype B; feature f : A; }",
+            "package MeasurementReferences { datatype MeasurementUnit; } package L { datatype A; datatype B; feature f : A; }",
         );
         let prepared = base.prepare_library().unwrap();
         assert!(prepared.builder.semantic_memo.types.iter().next().is_some());

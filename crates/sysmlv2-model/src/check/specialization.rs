@@ -18,7 +18,7 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         r.b.spec_targets
             .iter()
             .enumerate()
-            .filter(|(_, row)| !model.is_library_unit(r.b.unit_of_elem(row.0)))
+            .filter(|(_, row)| super::user_owned(&r.b, model, row.0))
             .map(|(i, row)| (i, row.clone()))
             .collect();
     // Pending resolution already applied source identity and header exclusions.
@@ -170,13 +170,11 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
             let t = &r.b.spec_targets[i];
             (t.0, t.1)
         };
-        if !matches!(kind, "Redefinition" | "Subsetting") {
+        if !matches!(kind, "Redefinition" | "Subsetting") || !super::user_owned(&r.b, model, owner)
+        {
             continue;
         }
         let unit = r.b.unit_of_elem(owner);
-        if model.is_library_unit(unit) {
-            continue;
-        }
         // The builder's pending pass already resolved this target with the
         // owner excluded (`:>> x` names the *inherited* feature) — read the
         // recorded outcome instead of re-resolving, which self-hits and

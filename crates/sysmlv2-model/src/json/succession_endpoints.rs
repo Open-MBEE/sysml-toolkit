@@ -11,12 +11,23 @@ fn charge(steps: &mut usize, amount: usize) -> Option<()> {
 /// Missing shorthand ends are resolved from the ordered owning Memberships.
 /// No source rows are changed, and the static publisher owns the new identities.
 pub(super) fn endpoints(b: &mut Builder, steps: &mut usize) -> Option<Vec<(usize, usize)>> {
+    endpoints_from(b, 0, steps)
+}
+
+/// [`endpoints`] of the successions from row `start` on: a build extending a
+/// prepared library's plans reads the library's own successions' endpoints
+/// from them.
+pub(super) fn endpoints_from(
+    b: &mut Builder,
+    start: usize,
+    steps: &mut usize,
+) -> Option<Vec<(usize, usize)>> {
     let limit = b.explicit_len();
     // Gather the small succession slice once. Scanning the whole graph again
     // after proving existence wastes the cold query's shared work allowance.
-    charge(steps, limit)?;
+    charge(steps, limit.saturating_sub(start))?;
     let mut successions = Vec::new();
-    for i in 0..limit {
+    for i in start..limit {
         if b.elements[i].ty == "SuccessionAsUsage" {
             charge(steps, 1)?;
             successions.push(i);

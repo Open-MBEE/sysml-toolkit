@@ -199,6 +199,77 @@ fn verify_ranges_narrows_and_attributes_verdicts() {
 }
 
 #[test]
+fn verify_reports_one_verdict_per_satisfaction_claim() {
+    // Each claim's verdict sits on its `satisfy` statement, the same in
+    // both stages; the constraints behind a failed claim follow it,
+    // indented, with the values that decided them.
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-claims-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("claims.sysml");
+    fs::write(
+        &input,
+        "package Load {\n\
+         \x20   private import ISQ::*;\n\
+         \x20   private import SI::*;\n\
+         \x20   part def Crate { attribute mass : MassValue; }\n\
+         \x20   requirement def Limit {\n\
+         \x20       subject c : Crate;\n\
+         \x20       attribute cap : MassValue;\n\
+         \x20       require constraint { c.mass <= cap }\n\
+         \x20   }\n\
+         \x20   requirement small : Limit { attribute :>> cap = 10 [kg]; }\n\
+         \x20   part light : Crate { attribute :>> mass = 4 [kg]; }\n\
+         \x20   part heavy : Crate { attribute :>> mass = 40 [kg]; }\n\
+         \x20   part site {\n\
+         \x20       satisfy small by light;\n\
+         \x20       satisfy small by heavy;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    for stage in [&[][..], &["--ranges"][..]] {
+        let mut args = vec![
+            "verify",
+            input.to_str().unwrap(),
+            "--lib",
+            lib.to_str().unwrap(),
+        ];
+        args.extend_from_slice(stage);
+        let out = sysmlv2_env(&args, &[("SYSMLV2_LIB_CACHE", "off")]);
+        let text = stdout(&out);
+        assert!(
+            text.contains(
+                "claims.sysml:14:9  <anonymous> (SatisfyRequirementUsage, satisfies Load::small by light): satisfied\n"
+            ),
+            "{stage:?}:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "claims.sysml:15:9  <anonymous> (SatisfyRequirementUsage, satisfies Load::small by heavy): VIOLATED\n  "
+            ),
+            "{stage:?}:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "claims.sysml:8:30  <anonymous> (ConstraintUsage): VIOLATED (with c.mass = 40 [kg], cap = 10 [kg])\n"
+            ),
+            "{stage:?}:\n{text}"
+        );
+        // The unbound original, plus one verdict per claim.
+        assert!(
+            text.contains("1 satisfied, 1 violated, 1 undecided"),
+            "{stage:?}:\n{text}"
+        );
+        assert!(!out.status.success());
+    }
+}
+
+#[test]
 fn check_reports_rustc_style_diagnostics() {
     let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-check-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();

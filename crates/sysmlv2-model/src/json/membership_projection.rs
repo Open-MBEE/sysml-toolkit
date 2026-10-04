@@ -28,6 +28,26 @@ pub(super) trait MembershipFacts {
     fn is_protected(&self, relationship: usize) -> bool;
 }
 
+/// The memberships each type exports, by type.
+pub(super) trait Exported {
+    fn exported(&self, e: &usize) -> Option<&Vec<Membership>>;
+}
+impl Exported for HashMap<usize, Vec<Membership>> {
+    fn exported(&self, e: &usize) -> Option<&Vec<Membership>> {
+        self.get(e)
+    }
+}
+/// A planning's own exported memberships over its prepared library's.
+pub(super) struct ExportedOver<'a> {
+    pub own: &'a HashMap<usize, Vec<Membership>>,
+    pub library: &'a HashMap<usize, Vec<Membership>>,
+}
+impl Exported for ExportedOver<'_> {
+    fn exported(&self, e: &usize) -> Option<&Vec<Membership>> {
+        self.own.get(e).or_else(|| self.library.get(e))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Reduction {
     seen: HashSet<usize>,
@@ -40,16 +60,19 @@ impl Reduction {
     pub(super) fn inheritable(
         &mut self,
         node: &Node,
-        exported: &HashMap<usize, Vec<Membership>>,
+        exported: &dyn Exported,
         steps: &mut Option<&mut usize>,
     ) -> Option<Vec<Membership>> {
         let mut inherited = Vec::new();
         reset_scratch_set(&mut self.seen);
         for &base in &node.bases {
+            let exported = exported
+                .exported(&base)
+                .expect("a complete base exports its memberships");
             // Admission belongs to the contributing membership or import,
             // including import-all contributions of private members.
-            charge(steps, exported[&base].len().saturating_add(1))?;
-            for &membership in &exported[&base] {
+            charge(steps, exported.len().saturating_add(1))?;
+            for &membership in exported {
                 if self.seen.insert(membership.relationship) {
                     inherited.push(membership);
                 }
@@ -60,8 +83,8 @@ impl Reduction {
     pub(super) fn reduce(
         &mut self,
         node: &Node,
-        exported: &HashMap<usize, Vec<Membership>>,
-        redefinitions: &HashMap<usize, Vec<usize>>,
+        exported: &dyn Exported,
+        redefinitions: &dyn super::positional::DirectBases,
         traversal: &mut Reachability,
         facts: &impl MembershipFacts,
         steps: &mut Option<&mut usize>,
@@ -265,7 +288,7 @@ impl Reachability {
         &mut self,
         source: usize,
         target: usize,
-        graph: &HashMap<usize, Vec<usize>>,
+        graph: &dyn super::positional::DirectBases,
         steps: &mut Option<&mut usize>,
     ) -> Option<bool> {
         charge(steps, 1)?;
@@ -294,7 +317,7 @@ impl Reachability {
     pub(super) fn reachable_budget(
         &mut self,
         source: usize,
-        graph: &HashMap<usize, Vec<usize>>,
+        graph: &dyn super::positional::DirectBases,
         steps: &mut Option<&mut usize>,
     ) -> Option<&[usize]> {
         charge(steps, 1)?;

@@ -46,7 +46,7 @@ fn spelling_expansion_disabled_keeps_spellings_opaque() {
     );
     set_unit_spelling_expansion(true);
     let mut library = Model::new();
-    library.add_library_source("units.sysml", "package Quantities { attribute def MeasurementUnit; } package T { attribute m : Quantities::MeasurementUnit; attribute s : Quantities::MeasurementUnit; attribute <'m/s'> speed : Quantities::MeasurementUnit; }");
+    library.add_library_source("units.sysml", "package MeasurementReferences { attribute def MeasurementUnit; } package T { attribute m : MeasurementReferences::MeasurementUnit; attribute s : MeasurementReferences::MeasurementUnit; attribute <'m/s'> speed : MeasurementReferences::MeasurementUnit; }");
     let prepared = library.prepare_library().unwrap();
     let mut model = Model::new();
     prepared.install(&mut model).unwrap();

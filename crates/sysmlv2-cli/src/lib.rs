@@ -713,8 +713,11 @@ enum Command {
                             invariant body that carries its own trailing\n\
                             result expression: satisfied / violated /\n\
                             undecided (with the reason — unbound features,\n\
-                            unsupported constructs). Exit 1 if any\n\
-                            constraint is violated.\n\n\
+                            unsupported constructs). Each `satisfy R by x;`\n\
+                            claim gets one verdict at its statement: R's\n\
+                            constraints with its subject bound to x, its\n\
+                            assumptions implying its requirements. Exit 1 if\n\
+                            any constraint or claim is violated.\n\n\
                             With --ranges, interval propagation narrows every\n\
                             unbound feature to a finite range and upgrades\n\
                             verdicts (satisfied/VIOLATED/unsatisfiable) with\n\
@@ -2918,9 +2921,10 @@ fn with_bindings(
 }
 
 /// Run the requested verification stage over `model` and write per-
-/// constraint verdicts (plus narrowed ranges under `--ranges`) to `out`.
-/// `Ok` carries the verdict — `true` iff some constraint is violated;
-/// `Err` is the status of a run that stopped early.
+/// constraint verdicts, one verdict per satisfaction claim, and the
+/// narrowed ranges under `--ranges` to `out`. `Ok` carries the verdict —
+/// `true` iff some constraint or claim is violated; `Err` is the status of
+/// a run that stopped early.
 #[cfg(feature = "solve")]
 fn verify_and_report(
     out: &mut dyn Write,
@@ -2931,31 +2935,36 @@ fn verify_and_report(
     solve: bool,
     z3: Option<PathBuf>,
 ) -> Result<bool, ExitCode> {
+    use sysmlv2_parser::check::ConstraintVerdict;
     use sysmlv2_solve::{PropagateConfig, SolverConfig};
     let indexes: Vec<LineIndex> = sources.iter().map(|(_, src)| LineIndex::new(src)).collect();
     let (mut sat, mut vio, mut und) = (0usize, 0usize, 0usize);
 
+    // One verdict line; a nested line (a constraint behind a claim's
+    // verdict) is indented and not counted again.
     let mut print_one = |unit: usize,
                          start: u32,
                          name: &Option<String>,
                          etype: &str,
                          context: Option<&str>,
                          line: String,
-                         cat: VerdictCat|
+                         cat: VerdictCat,
+                         nested: bool|
      -> Result<(), ExitCode> {
-        match cat {
-            VerdictCat::Sat => sat += 1,
-            VerdictCat::Vio => vio += 1,
-            VerdictCat::Und => und += 1,
+        if !nested {
+            match cat {
+                VerdictCat::Sat => sat += 1,
+                VerdictCat::Vio => vio += 1,
+                VerdictCat::Und => und += 1,
+            }
         }
         let (path, _) = &sources[unit - boundary];
         let pos = indexes[unit - boundary].line_col(start);
-        let ctx = context
-            .map(|c| format!(", satisfies {c}"))
-            .unwrap_or_default();
+        let ctx = context.map(|c| format!(", {c}")).unwrap_or_default();
         stdout_result(writeln!(
             out,
-            "{}:{}:{}  {} ({}{}): {}",
+            "{}{}:{}:{}  {} ({}{}): {}",
+            if nested { "  " } else { "" },
             path.display(),
             pos.line,
             pos.col,
@@ -2969,9 +2978,10 @@ fn verify_and_report(
     // Ranges to print once the verdicts are out (only under --ranges).
     let mut narrowed: Vec<sysmlv2_solve::FeatureRange> = Vec::new();
 
-    if !ranges && !solve {
+    let claims = if !ranges && !solve {
         // Plain evaluation stage — no propagation, no solver.
-        for c in sysmlv2_parser::check::check_constraints(model) {
+        let mut rm = sysmlv2_parser::json::ResolvedModel::build(model);
+        for c in sysmlv2_parser::check::constraint_checks(model, &mut rm) {
             let (line, cat) = verdict_line(&c.verdict, None, None);
             let line = with_bindings(line, &cat, &c.bindings);
             print_one(
@@ -2979,11 +2989,13 @@ fn verify_and_report(
                 c.span.start,
                 &c.name,
                 c.element_type,
-                c.context.as_deref(),
+                None,
                 line,
                 cat,
+                false,
             )?;
         }
+        sysmlv2_parser::check::satisfaction_claims(model, &mut rm)
     } else {
         let cfg = SolverConfig {
             z3_path: z3,
@@ -3011,26 +3023,66 @@ fn verify_and_report(
                 None,
                 line,
                 cat,
-            )?;
-        }
-        // Satisfaction claims expand to subject-bound verdicts at the
-        // evaluation tier (propagation/solving see the unbound
-        // originals above).
-        let mut rm = sysmlv2_parser::json::ResolvedModel::build(model);
-        for c in sysmlv2_parser::check::satisfaction_checks(model, &mut rm) {
-            let (line, cat) = verdict_line(&c.verdict, None, None);
-            print_one(
-                c.unit,
-                c.span.start,
-                &c.name,
-                c.element_type,
-                c.context.as_deref(),
-                line,
-                cat,
+                false,
             )?;
         }
         if ranges {
             narrowed = report.ranges.into_iter().filter(|r| r.narrowed).collect();
+        }
+        report.satisfactions
+    };
+
+    // Each satisfaction claim decides at the evaluation tier, on the
+    // `satisfy` statement; propagation and solving see only the unbound
+    // originals above. The constraints behind a claim that is not plainly
+    // satisfied follow it, with the values that decided them.
+    for claim in &claims {
+        let (line, cat) = match &claim.verdict {
+            ConstraintVerdict::Satisfied if claim.vacuous => (
+                "satisfied (an assumption does not hold)".to_string(),
+                VerdictCat::Sat,
+            ),
+            verdict => verdict_line(verdict, None, None),
+        };
+        let context = format!(
+            "{} {} by {}",
+            if claim.negated {
+                "does not satisfy"
+            } else {
+                "satisfies"
+            },
+            claim.requirement.as_deref().unwrap_or("<requirement>"),
+            claim.by
+        );
+        print_one(
+            claim.unit,
+            claim.span.start,
+            &None,
+            "SatisfyRequirementUsage",
+            Some(&context),
+            line,
+            cat,
+            false,
+        )?;
+        if matches!(claim.verdict, ConstraintVerdict::Satisfied) && !claim.vacuous {
+            continue;
+        }
+        for c in &claim.constraints {
+            if matches!(c.check.verdict, ConstraintVerdict::Satisfied) {
+                continue;
+            }
+            let (line, cat) = verdict_line(&c.check.verdict, None, None);
+            let line = with_bindings(line, &cat, &c.check.bindings);
+            print_one(
+                c.check.unit,
+                c.check.span.start,
+                &c.check.name,
+                c.check.element_type,
+                c.assumed.then_some("assumption"),
+                line,
+                cat,
+                true,
+            )?;
         }
     }
 

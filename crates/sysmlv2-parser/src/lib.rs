@@ -28,9 +28,9 @@ pub mod check {
 
     #[cfg(feature = "json")]
     pub use sysmlv2_model::check::{
-        ConstraintBinding, ConstraintCheck, ConstraintVerdict,
-        IMPLEMENTED_NORMATIVE_SEMANTIC_RULES, check_constraints, constraint_bindings,
-        satisfaction_checks, validate_model, validate_model_with, validate_semantics,
-        validate_semantics_with,
+        ClaimConstraint, ConstraintBinding, ConstraintCheck, ConstraintVerdict,
+        IMPLEMENTED_NORMATIVE_SEMANTIC_RULES, SatisfactionClaim, check_constraints,
+        constraint_bindings, constraint_checks, satisfaction_checks, satisfaction_claims,
+        validate_model, validate_model_with, validate_semantics, validate_semantics_with,
     };
 }

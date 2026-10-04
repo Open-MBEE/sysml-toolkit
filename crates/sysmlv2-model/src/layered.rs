@@ -162,6 +162,13 @@ impl<T> LayeredVec<T> {
     pub(crate) fn base_untouched(&self) -> bool {
         self.changed.is_empty()
     }
+    /// The frozen rows written since the freeze.
+    pub(crate) fn written_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.changed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| row.is_some().then_some(i))
+    }
     pub fn get(&self, i: usize) -> Option<&T> {
         (i < self.len()).then(|| &self[i])
     }
@@ -211,6 +218,15 @@ impl<T> LayeredVec<T> {
             self.tail.clear();
         }
         self.changed.clear();
+    }
+}
+impl<T> LayeredVec<T> {
+    /// A table over the frozen rows `base`, with no rows of its own yet.
+    pub(crate) fn over(base: Arc<Vec<T>>) -> Self {
+        Self {
+            base,
+            ..Self::default()
+        }
     }
 }
 impl<T> From<Vec<T>> for LayeredVec<T> {
@@ -304,6 +320,10 @@ impl<K: Eq + std::hash::Hash, V> LayeredMap<K, V> {
     pub fn insert(&mut self, key: K, value: V) {
         self.local.insert(key, value);
     }
+    /// Drop the private rows; the frozen table stays.
+    pub fn clear_local(&mut self) {
+        self.local.clear();
+    }
     pub fn freeze(&mut self)
     where
         K: Clone,
@@ -355,6 +375,32 @@ impl<'de, K: Deserialize<'de> + Eq + std::hash::Hash, V: Deserialize<'de>> Deser
 }
 
 impl<K: Eq + std::hash::Hash, V> LayeredMap<K, V> {
+    /// A table over the frozen table `base`, with no rows of its own yet.
+    pub(crate) fn over(base: Arc<IdMap<K, V>>) -> Self {
+        Self {
+            base,
+            local: IdMap::default(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.base.is_empty() && self.local.is_empty()
+    }
+    /// The shared frozen table, overlaid or not.
+    pub(crate) fn base_arc(&self) -> &Arc<IdMap<K, V>> {
+        &self.base
+    }
+    /// The private table's rows: those written over the frozen table.
+    pub(crate) fn local_iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.local.iter()
+    }
+    pub(crate) fn local_contains_key(&self, k: &K) -> bool {
+        self.local.contains_key(k)
+    }
+    /// The capacity of the private table: what dropping this table frees
+    /// (the frozen one is shared).
+    pub(crate) fn local_capacity(&self) -> usize {
+        self.local.capacity()
+    }
     /// The frozen table, while no local row overlays it.
     pub(crate) fn frozen_arc(&self) -> Option<&Arc<IdMap<K, V>>> {
         self.local.is_empty().then_some(&self.base)
@@ -409,6 +455,78 @@ impl<'a, K: Eq + std::hash::Hash, V> IntoIterator for &'a LayeredMap<K, V> {
     type IntoIter = Box<dyn Iterator<Item = Self::Item> + 'a>;
     fn into_iter(self) -> Self::IntoIter {
         Box::new(self.iter())
+    }
+}
+
+/// A row per scope, the rows below `floor` — a prepared library's scopes,
+/// under a build on it — kept only once written: a build reads few of the
+/// library's scopes, and a row for each of them cost every build the
+/// library's size. A row never written reads as the default.
+#[derive(Clone, Default)]
+pub(crate) struct ScopeTable<T> {
+    floor: usize,
+    sparse: IdMap<usize, T>,
+    dense: Vec<T>,
+    unwritten: T,
+}
+impl<T: Clone + Default> ScopeTable<T> {
+    /// `n` default rows, those below `floor` kept sparse.
+    pub(crate) fn new(floor: usize, n: usize) -> Self {
+        let floor = floor.min(n);
+        Self {
+            floor,
+            sparse: IdMap::default(),
+            dense: vec![T::default(); n - floor],
+            unwritten: T::default(),
+        }
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.floor + self.dense.len()
+    }
+    pub(crate) fn push(&mut self, value: T) {
+        self.dense.push(value);
+    }
+    pub(crate) fn get(&self, s: usize) -> Option<&T> {
+        if s < self.floor {
+            Some(self.sparse.get(&s).unwrap_or(&self.unwritten))
+        } else {
+            self.dense.get(s - self.floor)
+        }
+    }
+    /// Grow to `n` rows, the new ones `value`.
+    pub(crate) fn resize(&mut self, n: usize, value: T) {
+        if n > self.len() {
+            self.dense.resize(n - self.floor, value);
+        }
+    }
+    /// Every row `value`.
+    #[cfg(test)]
+    pub(crate) fn fill(&mut self, value: T) {
+        self.sparse.clear();
+        self.dense.fill(value.clone());
+        self.unwritten = value;
+    }
+}
+impl<T> Index<usize> for ScopeTable<T> {
+    type Output = T;
+    fn index(&self, s: usize) -> &T {
+        if s < self.floor {
+            self.sparse.get(&s).unwrap_or(&self.unwritten)
+        } else {
+            &self.dense[s - self.floor]
+        }
+    }
+}
+impl<T: Clone> IndexMut<usize> for ScopeTable<T> {
+    fn index_mut(&mut self, s: usize) -> &mut T {
+        if s < self.floor {
+            let Self {
+                sparse, unwritten, ..
+            } = self;
+            sparse.entry(s).or_insert_with(|| unwritten.clone())
+        } else {
+            &mut self.dense[s - self.floor]
+        }
     }
 }
 impl<'a, T> IntoIterator for &'a LayeredVec<T> {

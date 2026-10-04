@@ -622,7 +622,7 @@ fn segments_qn(segments: Vec<String>) -> QualifiedName {
 impl ResolvedModel {
     pub(crate) fn prepare_quantity_memo(&mut self) {
         let imports = self.b.used_imports.clone();
-        let unit_type = self.resolve_qualified("Quantities::MeasurementUnit");
+        let unit_type = self.resolve_qualified("MeasurementReferences::MeasurementUnit");
         if let Some(unit_type) = unit_type {
             for e in 0..self.b.elements.len() {
                 if crate::metaclass::conforms(self.b.elements[e].ty, "DataType") {

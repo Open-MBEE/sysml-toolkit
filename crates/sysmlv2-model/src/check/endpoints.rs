@@ -6,7 +6,8 @@ use sysmlv2_syntax::diag::Diagnostic;
 
 pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usize, Diagnostic)> {
     let mut out = Vec::new();
-    for (e, relation) in r.b.elements.iter().enumerate().take(r.b.explicit_len()) {
+    for e in r.b.lib_boundary..r.b.explicit_len() {
+        let relation = &r.b.elements[e];
         let unit = r.b.unit_of_elem(e);
         if model.is_library_unit(unit) {
             continue;

@@ -66,7 +66,7 @@ pub(super) fn validate(
     let mut out = Vec::new();
     let mut errors = Vec::new();
     let mut bindings: Vec<(usize, Span, Vec<usize>, Vec<usize>)> = Vec::new();
-    for e in 0..r.b.explicit_len() {
+    for e in r.b.lib_boundary..r.b.explicit_len() {
         let b = &r.b;
         let unit = b.unit_of_elem(e);
         if model.is_library_unit(unit) {
@@ -272,7 +272,7 @@ pub(super) fn validate(
             }
         }
     }
-    for end in 0..r.b.explicit_len() {
+    for end in r.b.lib_boundary..r.b.explicit_len() {
         let b = &r.b;
         let unit = b.unit_of_elem(end);
         if model.is_library_unit(unit) || !is(b, end, "FlowEnd") {

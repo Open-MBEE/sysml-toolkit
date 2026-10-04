@@ -29,7 +29,7 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
     let value_sites: Vec<(usize, usize, sysmlv2_syntax::ast::Expr)> =
         r.b.values
             .iter()
-            .filter(|(o, _)| !model.is_library_unit(r.b.unit_of_elem(**o)))
+            .filter(|(o, _)| super::user_owned(&r.b, model, **o))
             .map(|(o, (s, e))| (*o, *s, e.clone()))
             .collect();
     for (owner, scope, expr) in value_sites {

@@ -33,6 +33,12 @@ pub struct ValueScopeResolver {
 }
 
 impl ValueScopeResolver {
+    /// Whether its proofs answer as a fresh resolver's would (see
+    /// [`ProviderCompleteness::current`]).
+    pub(crate) fn current(&self, b: &Builder) -> bool {
+        self.providers.current(b)
+    }
+
     /// Select a scope using query-local proofs. Do not retain this resolver
     /// across mutations of model declarations or identity bindings.
     pub fn select(
@@ -61,6 +67,25 @@ impl ValueScopeResolver {
             .unwrap_or(ValueScopeDecision::Unsupported)
     }
 
+    /// [`Self::select_builder`] for a value `element` reads through a
+    /// relationship rather than an authored expression: `lexical` is the
+    /// scope its written spelling resolves from.
+    pub(crate) fn select_builder_at(
+        &mut self,
+        b: &mut Builder,
+        element: usize,
+        lexical: usize,
+        receiver: Option<usize>,
+        steps: &mut usize,
+    ) -> ValueScopeDecision {
+        (|| {
+            charge(steps, 1)?;
+            b.elements.get(element)?;
+            self.select_from(b, element, lexical, receiver, steps)
+        })()
+        .unwrap_or(ValueScopeDecision::Unsupported)
+    }
+
     fn select_inner(
         &mut self,
         b: &mut Builder,
@@ -71,6 +96,17 @@ impl ValueScopeResolver {
         charge(steps, 1)?;
         b.elements.get(element)?;
         let lexical = b.values.get(&element)?.0;
+        self.select_from(b, element, lexical, receiver, steps)
+    }
+
+    fn select_from(
+        &mut self,
+        b: &mut Builder,
+        element: usize,
+        lexical: usize,
+        receiver: Option<usize>,
+        steps: &mut usize,
+    ) -> Option<ValueScopeDecision> {
         b.scopes.get(lexical)?;
         let Some(receiver) = receiver else {
             return Some(ValueScopeDecision::Lexical(ScopeRef(lexical)));

@@ -5,6 +5,7 @@ use super::{
     type_relations,
 };
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 /// A supplied argument and the exact public feature it directly redefines.
@@ -421,15 +422,15 @@ impl super::Builder {
                 let row = &self.elements[rel];
                 // Extra owned features, conjugation or value-affecting metadata
                 // require a broader provider; do not silently drop them.
-                if conforms(row.ty, "FeatureMembership")
-                    || conforms(row.ty, "Conjugation")
-                    || (rel < self.explicit_len()
-                        && conforms(row.ty, "Specialization")
-                        && !conforms(row.ty, "Redefinition"))
+                if is_a!(row, "FeatureMembership")
+                    || is_a!(row, "Conjugation")
+                    || (self.is_authored(rel)
+                        && is_a!(row, "Specialization")
+                        && !is_a!(row, "Redefinition"))
                 {
                     return Err(UnsupportedConfiguration);
                 }
-                if !conforms(row.ty, "Redefinition") {
+                if !is_a!(row, "Redefinition") {
                     continue;
                 }
                 if target.is_some() {
@@ -462,7 +463,7 @@ impl super::Builder {
                     return Err(UnmappedArgument);
                 }
                 if implied {
-                    if rel < self.explicit_len()
+                    if self.is_authored(rel)
                         || public_features.get(position) != Some(&ElementRef(mapped_input))
                         || !self.semantic_ownership.as_ref().is_some_and(|view| {
                             view.matches_suffix(self)
@@ -485,7 +486,7 @@ impl super::Builder {
                     {
                         return Err(IncompleteProvider);
                     }
-                } else if rel >= self.explicit_len() {
+                } else if !self.is_authored(rel) {
                     return Err(InvalidRelationship);
                 }
                 target = Some(mapped_input);
@@ -558,7 +559,7 @@ pub(super) fn owned_result(
         {
             return None;
         }
-        if !conforms(b.elements[relationship].ty, "FeatureMembership") {
+        if !is_a!(b.elements[relationship], "FeatureMembership") {
             continue;
         }
         if b.elements[relationship].ty != "ReturnParameterMembership" || result.is_some() {
@@ -1116,7 +1117,7 @@ mod tests {
                 .bindings
                 .first()
             {
-                r.b.elements[binding.value.0].ty = "CalculationUsage";
+                r.b.elements[binding.value.0].set_ty("CalculationUsage");
                 assert_eq!(
                     r.model_level_evaluability(expression).classification,
                     NotEvaluable

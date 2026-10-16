@@ -21,12 +21,14 @@
 //!       "alternatives": [ <fix>, … ]
 //!     }
 //!   ],
-//!   "summary": { "errors", "warnings", "infos", "hints" }
+//!   "summary": { "errors", "warnings", "infos", "hints", "suppressed" }
 //! }
 //! ```
 //!
 //! Findings without a location (a `lint-config` complaint) carry null
-//! for `unit`, `unitName` and every position. Positions are computed
+//! for `unit`, `unitName` and every position. `suppressed` counts the
+//! lint findings directives in the units' text hid (0 for `check`,
+//! which has none). Positions are computed
 //! from the unit's source text, indexed on first use, so a report over
 //! many clean units never scans them.
 
@@ -127,6 +129,7 @@ pub struct Report {
     warnings: usize,
     infos: usize,
     hints: usize,
+    suppressed: usize,
 }
 
 impl Report {
@@ -207,6 +210,12 @@ impl Report {
         (self.errors, self.warnings, self.infos, self.hints)
     }
 
+    /// How many lint findings suppression directives hid
+    /// (`Outcome::suppressed`); the summary reports it.
+    pub fn set_suppressed(&mut self, n: usize) {
+        self.suppressed = n;
+    }
+
     /// The report document: `{"findings": […], "summary": {…}}`.
     #[must_use]
     pub fn into_value(self) -> Value {
@@ -217,6 +226,7 @@ impl Report {
                 "warnings": self.warnings,
                 "infos": self.infos,
                 "hints": self.hints,
+                "suppressed": self.suppressed,
             },
         })
     }
@@ -350,7 +360,7 @@ mod tests {
         assert_eq!(f["fix"]["edits"][0]["unitName"], "m.sysml");
         assert_eq!(
             v["summary"],
-            json!({"errors": 0, "warnings": 1, "infos": 0, "hints": 0})
+            json!({"errors": 0, "warnings": 1, "infos": 0, "hints": 0, "suppressed": 0})
         );
     }
 

@@ -4,8 +4,11 @@ use super::{
     Builder, dynamic_invocations::Refusal, semantic_ownership, structural_index::StoredStructure,
     type_relations,
 };
+use crate::layered::{IdMap, IdSet};
 use crate::metaclass::conforms;
-use std::collections::{HashMap, HashSet};
+use crate::metaclass::is_a;
+#[cfg(test)]
+use std::collections::HashMap;
 
 fn charge(steps: &mut usize, n: usize) -> Result<(), Refusal> {
     *steps = steps.saturating_add(n);
@@ -73,7 +76,7 @@ fn relationships(b: &Builder, owner: usize, steps: &mut usize) -> Result<Vec<usi
     let rows = semantic_ownership::owned_relationships(b, owner).ok_or(Refusal::Incomplete)?;
     charge(steps, rows.len())?;
     let rows: Vec<_> = rows.iter().collect();
-    let mut seen = HashSet::new();
+    let mut seen = IdSet::default();
     if rows.iter().any(|&r| !seen.insert(r)) {
         return Err(Refusal::Incomplete);
     }
@@ -87,17 +90,17 @@ fn membership(
     steps: &mut usize,
 ) -> Result<usize, Refusal> {
     let row = b.elements.get(rel).ok_or(Refusal::Incomplete)?;
-    if !conforms(row.ty, "OwningMembership") || row.owning_relationship.is_some() {
+    if !is_a!(row, "OwningMembership") || row.owning_relationship.is_some() {
         return Err(Refusal::Incomplete);
     }
     let child = super::membership_evidence::member(b, raw, owner, rel, steps)
         .ok_or_else(|| incomplete(steps))?;
-    if child >= b.explicit_len()
+    if !b.is_authored(child)
         || row
             .props
             .get("visibility")
             .is_some_and(|v| !matches!(v.as_str(), Some("public" | "protected" | "private")))
-        || conforms(row.ty, "FeatureMembership") && !conforms(b.elements[child].ty, "Feature")
+        || is_a!(row, "FeatureMembership") && !is_a!(b.elements[child], "Feature")
     {
         return Err(Refusal::Incomplete);
     }
@@ -165,7 +168,7 @@ fn dependency_slice(
     raw: &StoredStructure,
     roots: &[usize],
     steps: &mut usize,
-) -> Result<HashMap<usize, Vec<usize>>, Refusal> {
+) -> Result<IdMap<usize, Vec<usize>>, Refusal> {
     let domains = raw
         .membership_domains(b, steps)
         .ok_or_else(|| incomplete(steps))?;
@@ -173,7 +176,7 @@ fn dependency_slice(
     if inverse.sources_incomplete {
         return Err(Refusal::Incomplete);
     }
-    let mut bases = HashMap::new();
+    let mut bases = IdMap::default();
     let mut todo = roots.to_vec();
     let mut features = Vec::new();
     while let Some(owner) = todo.pop() {
@@ -182,7 +185,7 @@ fn dependency_slice(
             continue;
         }
         if !domains.owner_complete(owner)
-            || owner >= b.explicit_len()
+            || !b.is_authored(owner)
             || !matches!(
                 b.elements[owner].ty,
                 "Classifier"
@@ -238,19 +241,19 @@ fn dependency_slice(
         let mut direct = Vec::new();
         for rel in relationships(b, owner, steps)? {
             let row = b.elements.get(rel).ok_or(Refusal::Incomplete)?;
-            if conforms(row.ty, "Conjugation")
-                || conforms(row.ty, "FeatureChaining")
-                || (conforms(row.ty, "Import")
+            if is_a!(row, "Conjugation")
+                || is_a!(row, "FeatureChaining")
+                || (is_a!(row, "Import")
                     && row.props.get("visibility").and_then(|v| v.as_str()) != Some("private"))
             {
                 return Err(Refusal::Incomplete);
             }
-            if conforms(row.ty, "Membership") {
+            if is_a!(row, "Membership") {
                 let child = membership(b, raw, owner, rel, steps)?;
-                if conforms(b.elements[child].ty, "Feature") {
+                if is_a!(b.elements[child], "Feature") {
                     features.push(child);
                 }
-            } else if conforms(row.ty, "Specialization") {
+            } else if is_a!(row, "Specialization") {
                 let target = specialization(b, raw, owner, rel, steps)?;
                 charge(steps, direct.len() + 1)?;
                 if !direct.contains(&target) {
@@ -263,8 +266,8 @@ fn dependency_slice(
     }
     // Validate every stored redefinition closure that the common positional
     // shadowing algorithm may consume, including targets outside the base slice.
-    let mut seen = HashSet::new();
-    let mut redefinitions = HashMap::new();
+    let mut seen = IdSet::default();
+    let mut redefinitions = IdMap::default();
     while let Some(feature) = features.pop() {
         charge(steps, 1)?;
         if !seen.insert(feature) {
@@ -279,9 +282,9 @@ fn dependency_slice(
         {
             return Err(Refusal::Incomplete);
         }
-        let mut actual = HashSet::new();
+        let mut actual = IdSet::default();
         for rel in relationships(b, feature, steps)? {
-            if conforms(b.elements[rel].ty, "Redefinition") && rel < b.explicit_len() {
+            if is_a!(b.elements[rel], "Redefinition") && b.is_authored(rel) {
                 let target = specialization(b, raw, feature, rel, steps)?;
                 actual.insert(target);
                 features.push(target);
@@ -289,7 +292,7 @@ fn dependency_slice(
         }
         for &rel in inverse.relationships.get(&feature).into_iter().flatten() {
             charge(steps, 1)?;
-            if rel < b.explicit_len() && conforms(b.elements[rel].ty, "Redefinition") {
+            if b.is_authored(rel) && is_a!(b.elements[rel], "Redefinition") {
                 let target = specialization(b, raw, feature, rel, steps)?;
                 if !actual.contains(&target) {
                     return Err(Refusal::Incomplete);
@@ -305,8 +308,8 @@ fn dependency_slice(
     Ok(bases)
 }
 
-fn acyclic(graph: &HashMap<usize, Vec<usize>>, steps: &mut usize) -> Result<(), Refusal> {
-    let mut state = HashMap::new();
+fn acyclic(graph: &IdMap<usize, Vec<usize>>, steps: &mut usize) -> Result<(), Refusal> {
+    let mut state = IdMap::default();
     for &root in graph.keys() {
         let mut todo = vec![(root, false)];
         while let Some((owner, exit)) = todo.pop() {
@@ -357,7 +360,7 @@ pub(super) fn canonical_witness(
             Err(_) => continue,
         };
         let candidates = b
-            .plan_unique_result_candidates(&bases, &HashSet::new(), &[root], steps)
+            .plan_unique_result_candidates(&bases, &IdSet::default(), &[root], steps)
             .ok_or_else(|| incomplete(steps))?;
         if candidates.get(&root) == Some(&result) {
             admitted.push(root);
@@ -368,8 +371,8 @@ pub(super) fn canonical_witness(
 
 #[derive(Default)]
 pub(super) struct Evidence {
-    pub sources: HashSet<usize>,
-    pub relationships: HashSet<usize>,
+    pub sources: IdSet<usize>,
+    pub relationships: IdSet<usize>,
 }
 pub(super) struct Plan {
     from: usize,
@@ -398,7 +401,7 @@ pub(super) fn prepare(
     let raw = StoredStructure::for_query(b, steps).ok_or_else(|| incomplete(steps))?;
     let metadata = b.metadata_association_generation.clone();
     let (bases, target) = canonical_witness(b, steps)?;
-    let mut ids = HashSet::new();
+    let mut ids = IdSet::default();
     for row in rows {
         if raw.element_for_uuid(b, row.id).is_some() || !ids.insert(row.id) {
             return Err(Refusal::Collision);
@@ -419,7 +422,7 @@ pub(super) fn prepare(
         }
         let mut proven = false;
         for relation in relationships(b, role.anchor, steps)? {
-            if !conforms(b.elements[relation].ty, "Specialization") {
+            if !is_a!(b.elements[relation], "Specialization") {
                 continue;
             }
             match specialization(b, &raw, role.anchor, relation, steps) {
@@ -463,6 +466,7 @@ pub(super) fn prepare(
         }
         plan.rows.push(super::Elem {
             ty: "Redefinition",
+            meta: crate::metaclass::meta_of("Redefinition"),
             id,
             path: String::new(),
             path_parent: None,
@@ -487,7 +491,7 @@ impl Plan {
         self,
         rows: &mut Vec<super::Elem>,
         ownership: &mut semantic_ownership::SemanticOwnership,
-        graph: &mut HashMap<uuid::Uuid, Vec<uuid::Uuid>>,
+        graph: &mut crate::id_graph::IdGraph,
     ) -> Evidence {
         assert_eq!(rows.len(), self.before);
         for (owner, relationships) in self.replacements {

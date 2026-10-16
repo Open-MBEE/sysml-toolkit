@@ -1011,7 +1011,7 @@ fn constructors() {
                     attribute val;
                     attribute precision = \"day\";
                 }";
-    // Positional args bind the value-less fields in declaration order;
+    // Positional args bind the public features in declaration order;
     // equality is structural; chain steps read bound fields.
     assert_eq!(
         eval_with(defs, "new Date(\"1969-07-20\") == new Date(\"1969-07-20\")"),
@@ -1040,14 +1040,15 @@ fn constructors() {
         ),
         Ok(Value::Boolean(false))
     );
-    // Errors stay clean: unknown field, too many args, unbound field.
+    // Errors stay clean: unknown field, an argument landing on a feature
+    // whose value is not a default (`precision = "day"`), unbound field.
     assert!(matches!(
         eval_with(defs, "new Date(moment = \"x\")"),
         Err(EvalError::Unresolved(_))
     ));
     assert!(matches!(
         eval_with(defs, "new Date(\"a\", \"b\")"),
-        Err(EvalError::Type(_))
+        Err(EvalError::Type(m)) if m.contains("cannot override the non-default value of `precision`")
     ));
     assert!(matches!(
         eval_with(defs, "new Date().val"),
@@ -1058,6 +1059,76 @@ fn constructors() {
         eval("new Missing(1)"),
         Err(EvalError::Unresolved(_))
     ));
+}
+
+#[test]
+fn constructor_arguments_bind_the_public_feature_sequence() {
+    // The sequence is the type's own public features in declaration
+    // order, then the inherited ones a nearer feature does not redefine
+    // or hide; a feature already carrying a value keeps its position, so
+    // a default is positionally overridable and a bound value is not.
+    let defs = "attribute def Stamp {
+                    attribute val;
+                    attribute precision default \"day\";
+                    private attribute hidden;
+                    attribute zone;
+                }
+                attribute def Local :> Stamp {
+                    attribute :>> zone = \"here\";
+                    attribute offset;
+                }";
+    assert_eq!(
+        eval_with(defs, "new Stamp(\"x\", \"month\").precision"),
+        Ok(Value::String("month".into()))
+    );
+    assert_eq!(
+        eval_with(defs, "new Stamp(\"x\", \"month\", \"Z\").zone"),
+        Ok(Value::String("Z".into()))
+    );
+    assert!(matches!(
+        eval_with(defs, "new Stamp(\"x\").precision"),
+        Err(EvalError::Type(m)) if m.contains("is not bound")
+    ));
+    assert!(matches!(
+        eval_with(defs, "new Stamp(\"x\", \"month\", \"Z\", 4)"),
+        Err(EvalError::Type(m)) if m.contains("too many constructor arguments")
+    ));
+    // `Local`: its own `zone` (bound) and `offset`, then `val` and
+    // `precision` from `Stamp` — `zone` is redefined, `hidden` private.
+    assert_eq!(
+        eval_with(defs, "new Local(offset = 2, val = \"x\").offset"),
+        Ok(Value::Integer(2))
+    );
+    assert!(matches!(
+        eval_with(defs, "new Local(\"UTC\")"),
+        Err(EvalError::Type(m)) if m.contains("cannot override the non-default value of `zone`")
+    ));
+    assert_eq!(
+        eval_with(defs, "new Local(zone = \"UTC\")").map(|_| ()),
+        Err(EvalError::Type(
+            "constructor field `zone` cannot override the non-default value of `zone`".into()
+        ))
+    );
+    // An inherited defaulted field is positionally bindable too; a
+    // short-name-only feature is bound and read by that name; a feature
+    // nothing can name (an invariant) takes no argument.
+    let more = "attribute def Sub :> Stamp { attribute extra; }
+                attribute def Short { attribute <s>; attribute a; }
+                attribute def Checked { attribute items[*]; assert constraint { true } }";
+    let defs = format!("{defs} {more}");
+    assert_eq!(
+        eval_with(&defs, "new Sub(9, \"x\", \"month\").precision"),
+        Ok(Value::String("month".into()))
+    );
+    assert_eq!(eval_with(&defs, "new Short(1).s"), Ok(Value::Integer(1)));
+    assert!(matches!(
+        eval_with(&defs, "new Checked(1, 2)"),
+        Err(EvalError::Type(m)) if m.contains("that nothing can name")
+    ));
+    assert_eq!(
+        eval_with(&defs, "new Checked((1, 2)).items"),
+        Ok(Value::Sequence(vec![Value::Integer(1), Value::Integer(2)]))
+    );
 }
 
 #[test]

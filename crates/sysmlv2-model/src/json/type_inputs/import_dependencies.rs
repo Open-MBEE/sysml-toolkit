@@ -102,9 +102,13 @@ fn imported_positional_owner_in_contribution_ancestry_keeps_the_ordered_proof() 
                     .unwrap_or_else(|e| panic!("{format:?} early_foreign={early_foreign}: {e:?}"));
             assert!(proof.inherited.is_empty());
             assert_eq!(proof.required_positional.get(&a), Some(&vec![b]));
-            assert!(
-                !proof.required_positional.contains_key(&g),
-                "suppressed ancestor ends do not create a Grand positional target"
+            // The ancestor end `a` reaches Grand through its owning Membership
+            // and the imported alias; neither removes the other, so it is the
+            // one inherited end Grand's first end redefines by position.
+            assert_eq!(
+                proof.required_positional.get(&g),
+                Some(&vec![a]),
+                "the inherited end is the positional target of Grand's first end"
             );
         }
     }

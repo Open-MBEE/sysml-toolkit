@@ -145,33 +145,51 @@ fn prepared_cache_rejects_stale_corrupt_and_truncated_data() {
         "adding libraries invalidates the prepared prefix"
     );
 }
-/// The snapshot's integrity trailer must be a hash fixed by this crate,
-/// not one a toolchain is free to change between releases: a changed hash
+/// The snapshot's part checksums must be a hash fixed by this crate, not
+/// one a toolchain is free to change between releases: a changed hash
 /// would reject every snapshot on disk with no version to explain it.
-/// Recomputing it here independently pins that.
+/// Recomputing each part's checksum here independently pins that.
 #[test]
 fn prepared_snapshot_trailer_is_a_fixed_hash() {
     use sysmlv2_parser::libcache::TOOLKIT_BUILD;
+    // The string table, the nine records and the hosts' part, each a part
+    // of its own.
+    const PARTS: usize = 11;
     let mut model = Model::new();
     model.add_library_source("l.sysml", "package L { attribute x = 1.25; }");
     let bytes = model.prepare_library().unwrap().to_bytes(19).unwrap();
-    // Header: magic, the build identity, a newline, the content key, the
-    // trailer, then the payload the trailer covers.
-    let payload_at = bytes
+    // Header: magic, the build identity, a newline, the content key, then
+    // the part table — each part's length and checksum — and the payload,
+    // the parts one after the other.
+    let table_at = bytes
         .windows(TOOLKIT_BUILD.len())
         .position(|w| w == TOOLKIT_BUILD.as_bytes())
         .expect("the snapshot names the build that wrote it")
         + TOOLKIT_BUILD.len()
         + 1
-        + 16;
-    let recorded = u64::from_le_bytes(bytes[payload_at - 8..payload_at].try_into().unwrap());
-    // FNV-1a, 64-bit — the hash the resolution cache writes too.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in &bytes[payload_at..] {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
+        + 8;
+    let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let mut start = table_at + PARTS * 16;
+    for part in 0..PARTS {
+        let len = usize::try_from(word(table_at + part * 16)).unwrap();
+        let recorded = word(table_at + part * 16 + 8);
+        // FNV-1a, 64-bit, folded eight bytes at a time with the tail byte
+        // by byte — the hash the resolution cache writes too.
+        let payload = &bytes[start..start + len];
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let (chunks, tail) = payload.as_chunks::<8>();
+        for chunk in chunks {
+            hash ^= u64::from_le_bytes(*chunk);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        for &byte in tail {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        assert_eq!(recorded, hash, "part {part}");
+        start += len;
     }
-    assert_eq!(recorded, hash);
+    assert_eq!(start, bytes.len(), "the parts are the whole payload");
 }
 
 #[test]
@@ -287,10 +305,35 @@ fn prepared_evaluation_preserves_units_calls_and_redefined_values() {
     }
     let cold_x = a.resolve_qualified("U::A::x").unwrap();
     let warm_x = b.resolve_qualified("U::A::x").unwrap();
-    assert_eq!(
-        format!("{:?}", a.references_to(cold_x)),
-        format!("{:?}", b.references_to(warm_x))
-    );
+    // Row handles are a build's own: a prepared library's rows end with its
+    // own materialized relationships, so a build on it numbers its rows
+    // further on. The sites must name the same elements.
+    let sites = |r: &ResolvedModel, x| -> Vec<String> {
+        let id = |e| r.element_id(e).to_string();
+        r.references_to(x)
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} {:?} {:?} {} {} {:?} {:?} {} {} {:?} {:?}",
+                    s.unit,
+                    s.span,
+                    s.name_span,
+                    id(s.target),
+                    s.kind,
+                    s.scope,
+                    s.exclude.map(id),
+                    s.plain,
+                    id(s.owner),
+                    s.chain_root.map(id),
+                    s.via_imports
+                        .iter()
+                        .map(|&(e, access)| (id(e), format!("{access:?}")))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect()
+    };
+    assert_eq!(sites(&a, cold_x), sites(&b, warm_x));
 }
 
 #[test]

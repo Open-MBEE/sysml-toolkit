@@ -257,6 +257,36 @@ fn check_dry_runs_the_full_pipeline_without_committing() {
 }
 
 #[test]
+fn set_feature_type_adds_after_a_redefined_chain() {
+    // `:>> chassis.mass` names its target as a chain, which no written
+    // specialization span covers: the type goes after the chain's last
+    // link, not after a chain inside the value.
+    let src = "package P {
+    attribute def Mass;
+    part def Chassis { attribute mass : Mass; attribute twin : Mass; }
+    part def Crawler { part chassis : Chassis; }
+    part med : Crawler {
+        attribute :>> chassis.mass = chassis.twin;
+        attribute :>> chassis.twin;
+    }
+}
+";
+    let mut s = session(src);
+    let med = s.resolved().resolve_qualified("P::med").unwrap();
+    let rows = s.resolved().owned_members(med);
+    let mut edit = s.edit();
+    edit.set_feature_type(rows[0], "Mass");
+    edit.set_feature_type(rows[1], "Mass");
+    edit.commit().expect("commit");
+    let out = text(&s);
+    assert!(
+        out.contains("attribute :>> chassis.mass : Mass = chassis.twin;"),
+        "{out}"
+    );
+    assert!(out.contains("attribute :>> chassis.twin : Mass;"), "{out}");
+}
+
+#[test]
 fn set_feature_type_replaces_and_adds_in_place() {
     let src = "package P {
     attribute def A;
@@ -2238,4 +2268,282 @@ fn split_plan_spells_uri_units_as_the_editor_does() {
         plan.entries[0].unit,
         "file:///w/models/r/a-b-c-%C3%A9.sysml"
     );
+}
+
+#[test]
+fn set_redefined_feature_and_remove_feature_value() {
+    // A retarget respells the first written target in place — a name or a
+    // chain — and removing a value takes its operator (and `default`)
+    // with it; both in one batch with a value change.
+    let src = "package P {
+    attribute def Mass;
+    part def Chassis { attribute mass : Mass; attribute twin : Mass default 1; }
+    part def Crawler { part chassis : Chassis; attribute total : Mass; }
+    part med : Crawler {
+        attribute :>> chassis.mass = 2;
+        attribute :>> total default = 3;
+        attribute :>> chassis.twin := 4;
+        attribute x : Mass = 5 { doc /* = 5 */ }
+    }
+}
+";
+    let mut s = session(src);
+    let med = s.resolved().resolve_qualified("P::med").unwrap();
+    let rows = s.resolved().owned_members(med);
+    let mut edit = s.edit();
+    edit.set_redefined_feature(rows[0], "chassis.twin");
+    edit.set_feature_value(rows[0], "6");
+    edit.set_redefined_feature(rows[1], "chassis.mass");
+    edit.remove_feature_value(rows[1]);
+    edit.remove_feature_value(rows[2]);
+    edit.remove_feature_value(rows[3]);
+    edit.commit().expect("commit");
+    let out = text(&s);
+    assert!(out.contains("attribute :>> chassis.twin = 6;"), "{out}");
+    assert!(out.contains("attribute :>> chassis.mass;"), "{out}");
+    assert!(out.contains("attribute :>> chassis.twin;"), "{out}");
+    assert!(
+        out.contains("attribute x : Mass { doc /* = 5 */ }"),
+        "{out}"
+    );
+    // a target that is no name or chain (or more than one member's worth of text), and a row that redefines
+    // nothing, are refused
+    let med = s.resolved().resolve_qualified("P::med").unwrap();
+    let rows = s.resolved().owned_members(med);
+    for bad in [
+        "a b",
+        "a; attribute b",
+        "",
+        "a.b {",
+        "a = 3",
+        "a : Mass",
+        "a :>> b",
+        "a :> b",
+        "a [1]",
+        "a, b",
+    ] {
+        let mut edit = s.edit();
+        edit.set_redefined_feature(rows[0], bad);
+        assert!(edit.commit().is_err(), "{bad}");
+    }
+    let mut edit = s.edit();
+    edit.set_redefined_feature(rows[3], "total");
+    assert!(edit.commit().is_err());
+    let mut edit = s.edit();
+    edit.remove_feature_value(rows[3]);
+    assert!(edit.commit().is_err());
+}
+
+#[test]
+fn set_redefined_feature_takes_the_redefinition_not_another_chain() {
+    // A subsetting chain written ahead of the redefinition is not the
+    // target; a row with a subsetting chain and no redefinition has none.
+    let src = "package P {
+    attribute def Mass;
+    part def Chassis { attribute mass : Mass; attribute twin : Mass; }
+    part def Crawler { part chassis : Chassis; attribute total : Mass; }
+    part med : Crawler {
+        attribute a :> chassis.twin :>> total;
+        attribute b :> chassis.twin;
+        attribute :>> chassis . mass = // note
+            3;
+        attribute d : Mass default := 4;
+        attribute e : Mass := (5) { doc /* kept */ }
+    }
+}
+";
+    let mut s = session(src);
+    let med = s.resolved().resolve_qualified("P::med").unwrap();
+    let rows = s.resolved().owned_members(med);
+    let mut edit = s.edit();
+    edit.set_redefined_feature(rows[0], "chassis.mass");
+    edit.set_redefined_feature(rows[2], "chassis.twin");
+    edit.remove_feature_value(rows[2]);
+    edit.remove_feature_value(rows[3]);
+    edit.remove_feature_value(rows[4]);
+    edit.commit().expect("commit");
+    let out = text(&s);
+    assert!(
+        out.contains("attribute a :> chassis.twin :>> chassis.mass;"),
+        "{out}"
+    );
+    assert!(out.contains("attribute :>> chassis.twin;"), "{out}");
+    assert!(out.contains("attribute d : Mass;"), "{out}");
+    assert!(
+        out.contains("attribute e : Mass { doc /* kept */ }"),
+        "{out}"
+    );
+    let med = s.resolved().resolve_qualified("P::med").unwrap();
+    let rows = s.resolved().owned_members(med);
+    let mut edit = s.edit();
+    edit.set_redefined_feature(rows[1], "total");
+    assert!(edit.commit().is_err());
+}
+
+#[test]
+fn set_feature_value_goes_ahead_of_a_body() {
+    let src = "package P {
+    part def V {
+        attribute x [1] {
+            doc /* keep this body */
+        }
+        attribute y { doc /* d */ }
+    }
+}
+";
+    let mut s = session(src);
+    let x = s.resolved().resolve_qualified("P::V::x").unwrap();
+    let y = s.resolved().resolve_qualified("P::V::y").unwrap();
+    let mut edit = s.edit();
+    edit.set_feature_value(x, "3");
+    edit.set_feature_value(y, "4");
+    edit.commit().expect("commit");
+    let out = text(&s);
+    assert!(
+        out.contains("attribute x [1] = 3 {\n            doc /* keep this body */\n        }"),
+        "{out}"
+    );
+    assert!(out.contains("attribute y = 4 { doc /* d */ }"), "{out}");
+
+    // a note between the declaration and its body, or its `;`, keeps the value out of the note
+    let src = "package P {
+    part def V {
+        attribute x // x
+        { doc /* d */ }
+        attribute y // y
+        ;
+    }
+}
+";
+    let mut s = session(src);
+    let x = s.resolved().resolve_qualified("P::V::x").unwrap();
+    let y = s.resolved().resolve_qualified("P::V::y").unwrap();
+    let mut edit = s.edit();
+    edit.set_feature_value(x, "3");
+    edit.set_feature_value(y, "4");
+    edit.commit().expect("commit");
+    let out = text(&s);
+    assert!(
+        out.contains("attribute x = 3 // x\n        { doc /* d */ }"),
+        "{out}"
+    );
+    assert!(out.contains("attribute y = 4 // y\n        ;"), "{out}");
+}
+
+/// The comment and documentation members of `owner`, in written order.
+fn annotations(s: &mut Session, owner: &str) -> Vec<sysmlv2_transform::ElementRef> {
+    let owner = s.resolved().resolve_qualified(owner).unwrap();
+    let members = s.resolved().owned_members(owner);
+    members
+        .into_iter()
+        .filter(|&m| matches!(s.resolved().element_type(m), "Comment" | "Documentation"))
+        .collect()
+}
+
+#[test]
+fn set_comment_body_rewrites_only_the_body_token() {
+    // The keyword, the name, the `about` list, the locale and a note
+    // ahead of the body stay as written; one line goes inline, several
+    // as a guttered block under the line the body opens on.
+    let src = "package P {
+    part def A {
+        doc /* old doc */
+        attribute x;
+    }
+    comment c about A, A::x locale \"en\" // why
+        /* old
+         * comment */
+    /* bare */
+    part q { doc
+        /*
+         * two
+         * lines
+         */
+    }
+}
+";
+    let mut s = session(src);
+    let a = annotations(&mut s, "P::A");
+    let p = annotations(&mut s, "P");
+    let q = annotations(&mut s, "P::q");
+    assert_eq!((a.len(), p.len(), q.len()), (1, 2, 1));
+    let mut edit = s.edit();
+    edit.set_comment_body(
+        a[0],
+        "Check the bulb rating\nagainst the battery.\n\n  indented",
+    );
+    edit.set_comment_body(p[0], "  one line  ");
+    edit.set_comment_body(p[1], "");
+    edit.set_comment_body(q[0], "*starred*");
+    edit.commit().expect("commit");
+    assert_eq!(
+        text(&s),
+        "package P {
+    part def A {
+        doc /*
+         * Check the bulb rating
+         * against the battery.
+         *
+         *   indented
+         */
+        attribute x;
+    }
+    comment c about A, A::x locale \"en\" // why
+        /* one line */
+    /* */
+    part q { doc
+        /*
+         * *starred*
+         */
+    }
+}
+"
+    );
+    assert_eq!(s.resolved().unresolved_count(), 0);
+    // what a reader sees reads back as what was set
+    let shown: Vec<String> = annotations(&mut s, "P::A")
+        .into_iter()
+        .chain(annotations(&mut s, "P"))
+        .chain(annotations(&mut s, "P::q"))
+        .map(|e| {
+            let (_, extent) = s.resolved().member_extent(e).unwrap();
+            let src = text(&s);
+            let token = &src[extent.start as usize..extent.end as usize];
+            let body = &token[token.rfind("/*").unwrap() + 2..token.len() - 2];
+            sysmlv2_model::json::doc_display_text(body)
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "Check the bulb rating\nagainst the battery.\n\n  indented",
+            "one line",
+            "",
+            "*starred*"
+        ]
+    );
+}
+
+#[test]
+fn set_comment_body_refuses_what_it_cannot_write() {
+    let src = "package P {
+    part def A { doc /* d */ attribute x; }
+}
+";
+    let mut s = session(src);
+    let doc = annotations(&mut s, "P::A")[0];
+    let x = s.resolved().resolve_qualified("P::A::x").unwrap();
+    let mut edit = s.edit();
+    edit.set_comment_body(doc, "a */ b");
+    assert!(matches!(
+        edit.commit(),
+        Err(TransformError::InvalidCommentBody { .. })
+    ));
+    let mut edit = s.edit();
+    edit.set_comment_body(x, "not a comment");
+    assert!(matches!(
+        edit.commit(),
+        Err(TransformError::NoCommentBody(_))
+    ));
+    assert_eq!(text(&s), src);
 }

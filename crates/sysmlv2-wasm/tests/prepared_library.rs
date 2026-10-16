@@ -275,7 +275,8 @@ fn snapshot_handles_match_source_handles_and_refuse_other_units() {
             }
             _ => unreachable!(),
         };
-    let decoded = PreparedLibrary::from_snapshot(snapshot.clone(), &library, recording).unwrap();
+    let decoded =
+        PreparedLibrary::from_snapshot(snapshot.clone(), &library, recording, None).unwrap();
     let prepared = PreparedLibrary::new(&library, None).unwrap();
     let mut a = Session::from_sources_with_prepared_library(&users, &decoded).unwrap();
     let mut b = Session::from_sources_with_prepared_library(&users, &prepared).unwrap();
@@ -284,19 +285,55 @@ fn snapshot_handles_match_source_handles_and_refuse_other_units() {
     assert_eq!(a.units(), b.units());
     let other = sources(&[("lib.sysml", "package L { part def A; }")]);
     assert!(
-        PreparedLibrary::from_snapshot(snapshot.clone(), &other, None).is_err(),
+        PreparedLibrary::from_snapshot(snapshot.clone(), &other, None, None).is_err(),
         "other units"
     );
     assert!(
-        PreparedLibrary::from_snapshot(snapshot[..snapshot.len() / 2].to_vec(), &library, None)
-            .is_err(),
+        PreparedLibrary::from_snapshot(
+            snapshot[..snapshot.len() / 2].to_vec(),
+            &library,
+            None,
+            None
+        )
+        .is_err(),
         "truncated"
     );
+    // The last byte is the hosts' part's: refused whether it is kept or
+    // dropped.
     let mut corrupt = snapshot;
     let last = corrupt.len() - 1;
     corrupt[last] ^= 0xff;
-    assert!(
-        PreparedLibrary::from_snapshot(corrupt, &library, None).is_err(),
-        "corrupt"
+    for keep in [None, Some(false), Some(true)] {
+        assert!(
+            PreparedLibrary::from_snapshot(corrupt.clone(), &library, None, keep).is_err(),
+            "corrupt"
+        );
+    }
+}
+
+/// Find usages on a prepared library answers as on its sources: the
+/// library declaration under the library uri, positioned in the
+/// library's text, and the model's references to it.
+#[test]
+fn references_on_a_prepared_library_answer_like_its_sources() {
+    let library = sources(&[(
+        "Mini Lib/MiniLib.sysml",
+        "package MiniLib {\n    part def Widget;\n}\n",
+    )]);
+    let users = sources(&[("m.sysml", "package P {\n    part g : MiniLib::Widget;\n}\n")]);
+    let prepared = PreparedLibrary::new(&library, None).unwrap();
+    let mut warm = Session::from_sources_with_prepared_library(&users, &prepared).unwrap();
+    let mut cold = Session::from_sources_with_library(&users, Some(library), None).unwrap();
+    let answer = warm.references("MiniLib::Widget").unwrap();
+    assert_eq!(answer, cold.references("MiniLib::Widget").unwrap());
+    let report: serde_json::Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(
+        report["declaration"],
+        serde_json::json!({"unit": "sysmlv2-lib:/Mini%20Lib/MiniLib.sysml", "line": 2,
+            "col": 14, "endLine": 2, "endCol": 20, "site": "name"})
     );
+    let refs = report["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0]["unit"], "m.sysml");
+    assert_eq!(refs[0]["owner"]["qualifiedName"], "P::g");
 }

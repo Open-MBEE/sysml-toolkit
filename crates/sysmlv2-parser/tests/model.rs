@@ -1467,7 +1467,7 @@ fn inherited_members_imports_and_redefinition_siblings() {
         "y and x both removed by the intersection condition, got {leftover:?}"
     );
 
-    // (4) A Feature's owning membership and alias suppress each other.
+    // (4) A Feature's owning membership and an alias of it are both inherited.
     // If the original membership is private, the public alias alone inherits
     // and remains navigable to that same Feature.
     for visibility in ["", "private"] {
@@ -1484,19 +1484,16 @@ fn inherited_members_imports_and_redefinition_siblings() {
         let mut r = ResolvedModel::build(&model);
         let sub = r.resolve_qualified("P::Sub").unwrap();
         let memberships = r.inherited_memberships(sub, false);
+        let mass = r.resolve_qualified("P::Base::mass").unwrap();
         if visibility.is_empty() {
-            assert!(
-                memberships.is_empty(),
-                "distinct memberships mutually suppress"
-            );
+            assert_eq!(memberships.len(), 2, "both Memberships of mass inherit");
         } else {
             assert_eq!(memberships.len(), 1);
-            let alias = memberships[0];
-            assert!(r.membership_is_alias(alias));
-            assert_eq!(r.membership_member_name(alias).as_deref(), Some("m"));
-            let mass = r.resolve_qualified("P::Base::mass").unwrap();
-            assert_eq!(r.membership_member(alias), Some(mass));
         }
+        let alias = *memberships.last().unwrap();
+        assert!(r.membership_is_alias(alias));
+        assert_eq!(r.membership_member_name(alias).as_deref(), Some("m"));
+        assert_eq!(r.membership_member(alias), Some(mass));
     }
 }
 
@@ -1537,8 +1534,8 @@ fn inherited_members_import_policy_composition() {
         "nested [@Safety] filter must hold through the re-export: {names:?}"
     );
 
-    // (2) Imported alias and owning memberships of one Feature suppress
-    // each other; a public alias of an excluded private member inherits alone.
+    // (2) Imported alias and owning memberships of one Feature both inherit;
+    // a public alias of an excluded private member inherits alone.
     for visibility in ["", "private"] {
         let mut model = Model::new();
         model.add_source(
@@ -1554,19 +1551,16 @@ fn inherited_members_import_policy_composition() {
         let mut r = ResolvedModel::build(&model);
         let sub = r.resolve_qualified("P::Sub").unwrap();
         let memberships = r.inherited_memberships(sub, false);
+        let x = r.resolve_qualified("P::Lib::x").unwrap();
         if visibility.is_empty() {
-            assert!(
-                memberships.is_empty(),
-                "distinct memberships mutually suppress"
-            );
+            assert_eq!(memberships.len(), 2, "both Memberships of x inherit");
         } else {
             assert_eq!(memberships.len(), 1);
-            let alias = memberships[0];
-            assert!(r.membership_is_alias(alias));
-            assert_eq!(r.membership_member_name(alias).as_deref(), Some("a"));
-            let x = r.resolve_qualified("P::Lib::x").unwrap();
-            assert_eq!(r.membership_member(alias), Some(x));
         }
+        let alias = *memberships.last().unwrap();
+        assert!(r.membership_is_alias(alias));
+        assert_eq!(r.membership_member_name(alias).as_deref(), Some("a"));
+        assert_eq!(r.membership_member(alias), Some(x));
     }
 
     // (3) Redefiners of unrelated heritage branches never suppress one

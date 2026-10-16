@@ -148,7 +148,7 @@ fn canonical_foreign_end_prerequisites_preserve_actual_library_order_and_replay(
                     assert_eq!(direct_edges[0].1, a_id);
                     assert!(
                         alias_edges.is_empty(),
-                        "alias suppression cannot create a positional slot"
+                        "an alias Membership is no positional slot of its own"
                     );
                     assert_eq!(sibling_edges.len(), 1, "early={early_foreign} mode={mode}");
                     assert_eq!(

@@ -8,8 +8,9 @@ use super::{
     structural_index::StoredStructure,
     type_relations::{self, TypeRelations},
 };
+use crate::layered::{IdMap, IdSet};
 use crate::metaclass::conforms;
-use std::collections::{HashMap, HashSet};
+use crate::metaclass::is_a;
 
 /// Why a complete ordered Type projection could not be certified. Errors never mean
 /// an empty input list. Additional supported domains may be added over time.
@@ -55,7 +56,7 @@ fn relationships(
         .ok_or(TypeInputIssue::InvalidRelationship)?;
     charge(steps, rows.len())?;
     let rows: Vec<_> = rows.iter().collect();
-    let mut seen = HashSet::new();
+    let mut seen = IdSet::default();
     if rows.iter().any(|r| !seen.insert(*r)) {
         return Err(TypeInputIssue::InvalidRelationship);
     }
@@ -121,10 +122,10 @@ fn ordinary_usage_member(
 struct Facts<'a>(&'a Builder);
 impl MembershipFacts for Facts<'_> {
     fn is_feature(&self, e: usize) -> bool {
-        conforms(self.0.elements[e].ty, "Feature")
+        is_a!(self.0.elements[e], "Feature")
     }
     fn is_feature_membership(&self, r: usize) -> bool {
-        conforms(self.0.elements[r].ty, "FeatureMembership")
+        is_a!(self.0.elements[r], "FeatureMembership")
     }
     fn is_protected(&self, r: usize) -> bool {
         self.0.elements[r]
@@ -136,10 +137,10 @@ impl MembershipFacts for Facts<'_> {
 }
 /// Every dependency is visited once; active marks distinguish cycles from diamonds.
 fn order(
-    graph: &HashMap<usize, Vec<usize>>,
+    graph: &IdMap<usize, Vec<usize>>,
     steps: &mut usize,
 ) -> Result<Vec<usize>, TypeInputIssue> {
-    let mut state = HashMap::new();
+    let mut state = IdMap::default();
     let mut ordered = Vec::new();
     for &root in graph.keys() {
         let mut todo = vec![(root, false)];
@@ -216,9 +217,9 @@ impl ResolvedModel {
                     let features = sequence.features;
                     charge(&mut steps, features.len())?;
                     Ok(features.into_iter().find(|f| {
-                        self.b.elements[f.0].owning_relationship.is_some_and(|m| {
-                            conforms(self.b.elements[m].ty, "ReturnParameterMembership")
-                        })
+                        self.b.elements[f.0]
+                            .owning_relationship
+                            .is_some_and(|m| is_a!(self.b.elements[m], "ReturnParameterMembership"))
                     }))
                 })
         };
@@ -327,13 +328,13 @@ impl super::Builder {
         }
         let stamp = Stamp::capture_builder(self);
         let b = &mut *self;
-        let mut nodes = HashMap::new();
-        let mut bases = HashMap::new();
+        let mut nodes = IdMap::default();
+        let mut bases = IdMap::default();
         let mut features = Vec::new();
         let mut owned_memberships = Vec::new();
         let mut root_import = false;
-        let mut visible_import_owners = HashSet::new();
-        let mut imported_features = HashSet::new();
+        let mut visible_import_owners = IdSet::default();
+        let mut imported_features = IdSet::default();
         let mut todo = vec![receiver];
         while let Some(owner) = todo.pop() {
             charge(steps, 1)?;
@@ -344,7 +345,7 @@ impl super::Builder {
                 .elements
                 .get(owner)
                 .ok_or(TypeInputIssue::InvalidElement)?;
-            if !super::type_features::supported_root(element.ty) || owner >= b.explicit_len() {
+            if !super::type_features::supported_root(element.ty) || !b.is_authored(owner) {
                 return Err(TypeInputIssue::UnsupportedConfiguration);
             }
             if element.ty == "Feature"
@@ -391,7 +392,7 @@ impl super::Builder {
                 {
                     return Err(TypeInputIssue::InvalidRelationship);
                 }
-                if conforms(b.elements[rel].ty, "Import") {
+                if is_a!(b.elements[rel], "Import") {
                     super::import_memberships::checked_import_target(b, &raw, owner, rel, steps)
                         .ok_or(TypeInputIssue::InvalidRelationship)?;
                     if b.elements[rel]
@@ -404,7 +405,7 @@ impl super::Builder {
                     root_import |= owner == receiver;
                 }
                 let row = &b.elements[rel];
-                if !conforms(row.ty, "Membership") {
+                if !is_a!(row, "Membership") {
                     continue;
                 }
                 let member = membership_evidence::member(b, &raw, owner, rel, steps)
@@ -423,13 +424,13 @@ impl super::Builder {
                 if owner == receiver {
                     owned_memberships.push(membership);
                 }
-                if conforms(row.ty, "FeatureMembership") {
-                    if !conforms(b.elements[member].ty, "Feature") {
+                if is_a!(row, "FeatureMembership") {
+                    if !is_a!(b.elements[member], "Feature") {
                         return Err(TypeInputIssue::InvalidRelationship);
                     }
                     node.owned.push(member);
                 }
-                if conforms(b.elements[member].ty, "Feature") {
+                if is_a!(b.elements[member], "Feature") {
                     features.push(member);
                 }
                 if visibility != "private" {
@@ -447,7 +448,7 @@ impl super::Builder {
                 .map_err(|_| TypeInputIssue::IncompleteProvider)?;
                 charge(steps, public.len().saturating_add(protected.len()))?;
                 for membership in public.iter().chain(&protected) {
-                    if conforms(b.elements[membership.member].ty, "Feature") {
+                    if is_a!(b.elements[membership.member], "Feature") {
                         features.push(membership.member);
                         imported_features.insert(membership.member);
                         // External owning Types are proof dependencies, never extra
@@ -466,9 +467,9 @@ impl super::Builder {
             nodes.insert(owner, node);
         }
         let ordered = order(&bases, steps)?;
-        let mut redefinitions = HashMap::new();
-        let mut authored = HashMap::new();
-        let mut feature_owners = HashMap::new();
+        let mut redefinitions = IdMap::default();
+        let mut authored = IdMap::default();
+        let mut feature_owners = IdMap::default();
         while let Some(feature) = features.pop() {
             charge(steps, 1)?;
             if redefinitions.contains_key(&feature) {
@@ -478,8 +479,8 @@ impl super::Builder {
                 .elements
                 .get(feature)
                 .ok_or(TypeInputIssue::InvalidElement)?;
-            if !conforms(row.ty, "Feature")
-                || (conforms(row.ty, "Usage")
+            if !is_a!(row, "Feature")
+                || (is_a!(row, "Usage")
                     && !ordinary_usage_member(b, &raw, feature, steps)
                     && !matches!(
                         row.ty,
@@ -489,7 +490,7 @@ impl super::Builder {
                             | "ItemUsage"
                             | "PartUsage"
                     ))
-                || conforms(row.ty, "InvocationExpression")
+                || is_a!(row, "InvocationExpression")
                 || raw.bad_bases.contains(&feature)
                 || raw.metadata_annotation_targets.contains(&feature)
                 || b.metadata_of.get(&feature).is_some_and(|m| !m.is_empty())
@@ -599,7 +600,7 @@ impl super::Builder {
                 return Err(TypeInputIssue::InvalidRelationship);
             }
             let owned = relationships(b, feature, steps)?;
-            let mut actual = HashSet::new();
+            let mut actual = IdSet::default();
             let mut targets = Vec::new();
             let mut authored_targets = Vec::new();
             for rel in owned.into_iter().chain(
@@ -611,7 +612,7 @@ impl super::Builder {
                     .copied(),
             ) {
                 charge(steps, 1)?;
-                if !conforms(b.elements[rel].ty, "Redefinition") || !actual.insert(rel) {
+                if !is_a!(b.elements[rel], "Redefinition") || !actual.insert(rel) {
                     continue;
                 }
                 if !b.static_chain_row_current(rel) || !b.result_redefinition_row_current(rel) {
@@ -637,7 +638,7 @@ impl super::Builder {
                 )
                 .ok_or(TypeInputIssue::InvalidRelationship)?;
                 targets.push(target);
-                if rel < b.explicit_len() {
+                if b.is_authored(rel) {
                     authored_targets.push(target);
                 }
             }
@@ -653,7 +654,7 @@ impl super::Builder {
             }
             authored.insert(feature, authored_targets);
             charge(steps, targets.len().saturating_mul(2))?;
-            let mut seen = HashSet::new();
+            let mut seen = IdSet::default();
             targets.retain(|t| seen.insert(*t));
             features.extend(targets.iter().copied());
             redefinitions.insert(feature, targets);
@@ -681,7 +682,7 @@ impl super::Builder {
                         .saturating_add(node.protected_imports.len()),
                 )?;
                 for membership in node.public_imports.iter().chain(&node.protected_imports) {
-                    if !conforms(b.elements[membership.member].ty, "Feature") {
+                    if !is_a!(b.elements[membership.member], "Feature") {
                         continue;
                     }
                     let reached = closure
@@ -739,7 +740,7 @@ impl super::Builder {
         // Excluding implied supertypes changes only inheritance selection.
         // Redefinition suppression still uses the complete semantic certificate.
         let ordered = if exclude_implied {
-            let mut explicit_bases = HashMap::new();
+            let mut explicit_bases = IdMap::default();
             for (&owner, node) in &mut nodes {
                 charge(steps, 1)?;
                 let direct = relations
@@ -762,7 +763,7 @@ impl super::Builder {
         // qualified, so path-specific excludingSelf adds no additional cuts.
         if let Some(excluded) = excluded_types {
             charge(steps, excluded.len())?;
-            let excluded: HashSet<_> = excluded.iter().copied().collect();
+            let excluded: IdSet<_> = excluded.iter().copied().collect();
             for node in nodes.values_mut() {
                 charge(steps, node.bases.len())?;
                 node.bases.retain(|base| !excluded.contains(base));
@@ -788,7 +789,7 @@ impl super::Builder {
         }
         let mut reduction = Reduction::default();
         let mut reachability = Reachability::sparse();
-        let mut exported = HashMap::new();
+        let mut exported = IdMap::default();
         let mut inherited = Vec::new();
         let mut inheritable = Vec::new();
         for owner in ordered {
@@ -952,7 +953,7 @@ mod tests {
             let import = *r.b.elements[a]
                 .owned_relationships
                 .iter()
-                .find(|&&rel| conforms(r.b.elements[rel].ty, "Import"))
+                .find(|&&rel| is_a!(r.b.elements[rel], "Import"))
                 .unwrap();
             let wrong = r.b.elements[a].id.to_string();
             r.b.set(import, "importedElement", serde_json::json!({"@id":wrong}));
@@ -1100,7 +1101,7 @@ mod tests {
         let import = *r.b.elements[q]
             .owned_relationships
             .iter()
-            .find(|&&rel| conforms(r.b.elements[rel].ty, "Import"))
+            .find(|&&rel| is_a!(r.b.elements[rel], "Import"))
             .unwrap();
         let wrong = r.b.elements[a].id.to_string();
         r.b.set(import, "importedElement", serde_json::json!({"@id":wrong}));
@@ -1324,7 +1325,7 @@ mod tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&rel| conforms(r.b.elements[rel].ty, "Import"))
+            .find(|&rel| is_a!(r.b.elements[rel], "Import"))
             .unwrap();
         r.b.elements[q]
             .owned_relationships
@@ -1345,7 +1346,7 @@ mod tests {
                 .owned_relationships
                 .iter()
                 .copied()
-                .find(|&rel| conforms(r.b.elements[rel].ty, "Import"))
+                .find(|&rel| is_a!(r.b.elements[rel], "Import"))
                 .unwrap();
             let position = r.b.elements[a]
                 .owned_relationships
@@ -1436,7 +1437,7 @@ mod tests {
             .make_mut()
             .retain(|(key, _)| key.name() != "direction");
         assert_eq!(r.type_input_report(f).inputs, Ok(vec![]));
-        r.b.elements[membership].ty = "ParameterMembership";
+        r.b.elements[membership].set_ty("ParameterMembership");
         assert_eq!(r.type_input_report(f).inputs, Ok(vec![a]));
         r.b.elements[a.0]
             .props

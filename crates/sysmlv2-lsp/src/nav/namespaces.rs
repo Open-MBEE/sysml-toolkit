@@ -109,7 +109,7 @@ fn work(slot: usize, n: usize) {
 }
 
 /// What an import brings into its namespace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum Reach {
     /// `import T;` — the one member `T` names.
     Member,
@@ -133,7 +133,7 @@ pub(crate) enum Access {
 }
 
 /// One import statement, as a table records it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct ImportRecord {
     /// The importing namespace's qualified path (`""`: the root).
     pub owner: String,
@@ -188,7 +188,7 @@ impl ImportRecord {
 }
 
 /// What a walk over the units records besides their symbols.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Links {
     pub imports: Vec<ImportRecord>,
     /// What each declaration specializes, as written (see

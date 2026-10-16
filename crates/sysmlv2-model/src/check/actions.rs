@@ -1,8 +1,9 @@
 //! Static action/state graph checks. No scheduling or behavioral execution.
 use super::{
     expressions,
-    facts::{Facts, flag, is},
+    facts::{Facts, flag},
 };
+use crate::metaclass::is_a;
 use crate::{
     json::{ElementRef, ResolvedModel},
     model::Model,
@@ -22,7 +23,7 @@ pub(super) fn validate(
     // A library succession joins library features only, so the counts it
     // would add are never read: the walks start at the library boundary.
     for e in r.b.lib_boundary..n {
-        if !is(&r.b, e, "Succession") {
+        if !is_a!(r.b.elements[e], "Succession") {
             continue;
         }
         let ends: Vec<_> = g.members[e]
@@ -37,7 +38,7 @@ pub(super) fn validate(
         let z = g.feature_target(&r.b, *to);
         let a = if a == *from {
             g.owner[e]
-                .filter(|&p| is(&r.b, p, "TransitionUsage"))
+                .filter(|&p| is_a!(r.b.elements[p], "TransitionUsage"))
                 .and_then(|p| {
                     g.relations(&r.b, p, "Membership", "memberElement")
                         .first()
@@ -53,7 +54,7 @@ pub(super) fn validate(
                 edges.push((e, a, z, *from, *to));
             }
         }
-        if let Some(t) = g.owner[e].filter(|&p| is(&r.b, p, "TransitionUsage")) {
+        if let Some(t) = g.owner[e].filter(|&p| is_a!(r.b.elements[p], "TransitionUsage")) {
             let unit = r.b.unit_of_elem(t);
             if !model.is_library_unit(unit) && z != *to && !g.effective_kind(&r.b, z, "ActionUsage")
             {
@@ -77,22 +78,26 @@ pub(super) fn validate(
             (
                 to,
                 (1.0, 1.0),
-                is(&r.b, z, "ControlNode").then_some("validateControlNodeIncomingSuccessions"),
+                is_a!(r.b.elements[z], "ControlNode")
+                    .then_some("validateControlNodeIncomingSuccessions"),
             ),
             (
                 from,
                 (1.0, 1.0),
-                is(&r.b, a, "ControlNode").then_some("validateControlNodeOutgoingSuccessions"),
+                is_a!(r.b.elements[a], "ControlNode")
+                    .then_some("validateControlNodeOutgoingSuccessions"),
             ),
             (
                 from,
                 (0.0, 1.0),
-                is(&r.b, z, "MergeNode").then_some("validateMergeNodeIncomingSuccessions"),
+                is_a!(r.b.elements[z], "MergeNode")
+                    .then_some("validateMergeNodeIncomingSuccessions"),
             ),
             (
                 to,
                 (0.0, 1.0),
-                is(&r.b, a, "DecisionNode").then_some("validateDecisionNodeOutgoingSuccessions"),
+                is_a!(r.b.elements[a], "DecisionNode")
+                    .then_some("validateDecisionNodeOutgoingSuccessions"),
             ),
         ] {
             if let Some(rule) = rule {
@@ -122,19 +127,19 @@ pub(super) fn validate(
         let span = g.span(&r.b, e);
         for (bad, rule) in [
             (
-                is(&r.b, e, "ForkNode") && incoming[e] > 1,
+                is_a!(r.b.elements[e], "ForkNode") && incoming[e] > 1,
                 "validateForkNodeIncomingSuccessions",
             ),
             (
-                is(&r.b, e, "DecisionNode") && incoming[e] > 1,
+                is_a!(r.b.elements[e], "DecisionNode") && incoming[e] > 1,
                 "validateDecisionNodeIncomingSuccessions",
             ),
             (
-                is(&r.b, e, "JoinNode") && outgoing[e] > 1,
+                is_a!(r.b.elements[e], "JoinNode") && outgoing[e] > 1,
                 "validateJoinNodeOutgoingSuccessions",
             ),
             (
-                is(&r.b, e, "MergeNode") && outgoing[e] > 1,
+                is_a!(r.b.elements[e], "MergeNode") && outgoing[e] > 1,
                 "validateMergeNodeOutgoingSuccessions",
             ),
         ] {
@@ -156,9 +161,9 @@ pub(super) fn validate(
                 ));
             }
         }
-        if is(&r.b, e, "TransitionUsage") {
+        if is_a!(r.b.elements[e], "TransitionUsage") {
             let triggered = r.b.elements[e].owned_relationships.iter().any(|&rel| {
-                is(&r.b, rel, "TransitionFeatureMembership")
+                is_a!(r.b.elements[rel], "TransitionFeatureMembership")
                     && r.b.elements[rel].props.get("kind").and_then(|x| x.as_str())
                         == Some("trigger")
             });
@@ -183,10 +188,10 @@ pub(super) fn validate(
             .filter(|&m| {
                 r.b.elements[m]
                     .owning_relationship
-                    .is_some_and(|rel| is(&r.b, rel, "ParameterMembership"))
+                    .is_some_and(|rel| is_a!(r.b.elements[rel], "ParameterMembership"))
             })
             .collect();
-        if is(&r.b, e, "AssignmentActionUsage") {
+        if is_a!(r.b.elements[e], "AssignmentActionUsage") {
             if let Some((scope, expr)) = params
                 .first()
                 .and_then(|p| r.b.contract_exprs.get(p))
@@ -196,7 +201,7 @@ pub(super) fn validate(
                 let target = expressions::referent(&mut r.b, scope, &expr);
                 r.b.identity_origin_unit = origin;
                 if let Some(t) = target {
-                    let rule = if !is(&r.b, t, "Feature") {
+                    let rule = if !is_a!(r.b.elements[t], "Feature") {
                         Some((
                             "validateAssignmentActionUsageReferent",
                             "An assignment must refer to a feature",
@@ -215,10 +220,10 @@ pub(super) fn validate(
                 }
             }
         }
-        if is(&r.b, e, "SendActionUsage") {
+        if is_a!(r.b.elements[e], "SendActionUsage") {
             let needs_payload = r.b.elements[e].owning_relationship.is_some_and(|rel| {
-                is(&r.b, rel, "StateSubactionMembership")
-                    || is(&r.b, rel, "TransitionFeatureMembership")
+                is_a!(r.b.elements[rel], "StateSubactionMembership")
+                    || is_a!(r.b.elements[rel], "TransitionFeatureMembership")
             });
             if needs_payload
                 && params
@@ -247,7 +252,7 @@ pub(super) fn validate(
                 }
             }
         }
-        if is(&r.b, e, "TriggerInvocationExpression") {
+        if is_a!(r.b.elements[e], "TriggerInvocationExpression") {
             let kind = r.b.elements[e]
                 .props
                 .get("kind")

@@ -5,6 +5,7 @@ use super::{
     type_relations,
 };
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 /// A supplied argument and the exact input it directly redefines.
@@ -279,10 +280,10 @@ impl super::Builder {
                 let row = &self.elements[rel];
                 // Extra owned features, conjugation or value-affecting metadata
                 // require a broader provider; do not silently drop them.
-                if conforms(row.ty, "FeatureMembership") || conforms(row.ty, "Conjugation") {
+                if is_a!(row, "FeatureMembership") || is_a!(row, "Conjugation") {
                     return Err(UnsupportedConfiguration);
                 }
-                if !conforms(row.ty, "Redefinition") {
+                if !is_a!(row, "Redefinition") {
                     continue;
                 }
                 if target.is_some() {
@@ -318,7 +319,7 @@ impl super::Builder {
                     // Generic parameter ordinals include output parameters. An
                     // input-only position cannot repair a declined shared plan.
                     // Source flags alone never admit a purported implied edge.
-                    if rel < self.explicit_len()
+                    if self.is_authored(rel)
                         || inputs.get(position) != Some(&ElementRef(mapped_input))
                         || !self.semantic_ownership.as_ref().is_some_and(|view| {
                             view.matches_suffix(self)
@@ -343,7 +344,7 @@ impl super::Builder {
                     if targets.as_slice() != [mapped_input] {
                         return Err(UnsupportedConfiguration);
                     }
-                } else if rel >= self.explicit_len() {
+                } else if !self.is_authored(rel) {
                     return Err(InvalidRelationship);
                 }
                 target = Some(mapped_input);
@@ -491,26 +492,24 @@ fn direct_designated_member(
         }
         let relation = &b.elements[relationship];
         let visibility = match relation.props.get("visibility") {
-            None if conforms(relation.ty, "Import") => "private",
+            None if is_a!(relation, "Import") => "private",
             None => "public",
             Some(value) => value.as_str()?,
         };
         if !matches!(visibility, "private" | "protected" | "public") {
             return None;
         }
-        if conforms(relation.ty, "Import") {
+        if is_a!(relation, "Import") {
             super::import_memberships::checked_import_target(b, raw, owner, relationship, steps)?;
             if !external || visibility == "public" {
                 return None;
             }
             continue;
         }
-        if matches!(relation.ty, "ElementFilterMembership")
-            || conforms(relation.ty, "Specialization")
-        {
+        if matches!(relation.ty, "ElementFilterMembership") || is_a!(relation, "Specialization") {
             return None;
         }
-        if !conforms(relation.ty, "Membership") {
+        if !is_a!(relation, "Membership") {
             continue;
         }
         let member = membership_evidence::member(b, raw, owner, relationship, steps)?;
@@ -519,7 +518,7 @@ fn direct_designated_member(
         }
         // Restrict names to literal declaration names; effective names and
         // alias providers retain explicit qualification, never false absence.
-        if !conforms(relation.ty, "OwningMembership")
+        if !is_a!(relation, "OwningMembership")
             || raw.metadata_annotation_targets.contains(&member)
             || b.metadata_of.get(&member).is_some_and(|v| !v.is_empty())
         {
@@ -536,7 +535,7 @@ fn direct_designated_member(
                 matches |= value == name;
             }
         }
-        if !named && conforms(row.ty, "Feature") {
+        if !named && is_a!(row, "Feature") {
             return None;
         }
         if matches && result.replace(member).is_some() {
@@ -593,8 +592,8 @@ mod tests {
             .iter()
             .copied()
             .find(|&row| {
-                conforms(r.b.elements[row].ty, "Membership")
-                    && !conforms(r.b.elements[row].ty, "FeatureMembership")
+                is_a!(r.b.elements[row], "Membership")
+                    && !is_a!(r.b.elements[row], "FeatureMembership")
             })
             .unwrap();
         r.b.elements[callee]
@@ -689,7 +688,7 @@ mod tests {
         // Serialized imports may omit the normative default-private flag.
         for index in 0..r.b.elements.len() {
             let row = &mut r.b.elements[index];
-            if conforms(row.ty, "Import") {
+            if is_a!(row, "Import") {
                 let old = row.props.to_json();
                 row.props = crate::properties::Properties::new();
                 for (key, value) in old {

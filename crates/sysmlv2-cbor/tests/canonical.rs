@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::PathBuf;
 use sysmlv2_cbor::{
-    canonicalize_compact, from_compact_cbor, graph_normalize, graph_normalize_compact,
-    state_digest, to_compact_cbor,
+    canonicalize_compact, from_compact_cbor, graph_normalize, graph_normalize_as_spelled,
+    graph_normalize_compact, graph_normalize_compact_as_spelled, state_digest, to_compact_cbor,
 };
 
 fn goldens() -> Vec<(String, Value)> {
@@ -277,6 +277,143 @@ fn graph_normal_and_canonical_collapse_the_corpus_into_one_cell() {
             .unwrap_or_else(|e| panic!("{name}: graph_normalize elided: {e}"));
         assert_eq!(from_wire, normal, "{name}: wire elision collapses too");
     }
+}
+
+/// The document a JSON round trip through JavaScript prints: a float
+/// with no fraction loses its `.0` (`JSON.stringify(150.0)` is `150`),
+/// up to the magnitude where it would print an exponent instead.
+fn printed_by_javascript(v: &Value) -> Value {
+    match v {
+        Value::Array(a) => Value::Array(a.iter().map(printed_by_javascript).collect()),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, v)| (k.clone(), printed_by_javascript(v)))
+                .collect(),
+        ),
+        Value::Number(n) if n.is_f64() => {
+            let x = n.as_f64().unwrap();
+            if x.fract() != 0.0 || x.abs() >= 1e21 {
+                v.clone()
+            } else if x < 0.0 {
+                json!(x as i64)
+            } else {
+                json!(x as u64)
+            }
+        }
+        _ => v.clone(),
+    }
+}
+
+#[test]
+fn graph_normal_spells_a_literal_number_by_its_value_type() {
+    let literal = |ty: &str, value: Value| json!([{"@type": ty, "@id": "64126415-ee0c-539b-86b6-247ae20f892b", "value": value}]);
+    let value = |doc: Value| graph_normalize(&doc).unwrap()[0]["value"].clone();
+    let rational = |v| value(literal("LiteralRational", v));
+    let integer = |v| value(literal("LiteralInteger", v));
+
+    // A real written as an integer is the float the kernel emits.
+    for (written, spelled) in [
+        (json!(150), json!(150.0)),
+        (json!(-3), json!(-3.0)),
+        (json!(0), json!(0.0)),
+        (json!(10_000_000_000_000_000_000u64), json!(1e19)),
+    ] {
+        assert_eq!(
+            rational(written.clone()),
+            spelled,
+            "a real written {written}"
+        );
+        assert!(rational(written).is_f64());
+    }
+    // An integer written as a float is the integer.
+    for (written, spelled) in [
+        (json!(150.0), json!(150)),
+        (json!(1.5e2), json!(150)),
+        (json!(-2.0), json!(-2)),
+        (json!(1e19), json!(10_000_000_000_000_000_000u64)),
+    ] {
+        assert_eq!(
+            integer(written.clone()),
+            spelled,
+            "an integer written {written}"
+        );
+    }
+    // Spelled so already, not held exactly by the other spelling, or
+    // not a number: as written.
+    for (ty, written) in [
+        ("LiteralRational", json!(2.5)),
+        ("LiteralRational", json!(9_007_199_254_740_993u64)),
+        ("LiteralRational", json!(i64::MIN + 1)),
+        ("LiteralRational", json!("0.10000000000000000001")),
+        ("LiteralInteger", json!(7)),
+        ("LiteralInteger", json!(2.5)),
+        ("LiteralInteger", json!(1e300)),
+        ("LiteralInteger", json!("123456789012345678901234567890")),
+    ] {
+        assert_eq!(
+            value(literal(ty, written.clone())),
+            written,
+            "{ty} written {written}"
+        );
+    }
+
+    // Every spelling of one value is one graph-normal document and one
+    // digest; the as-spelled normalization keeps the spelling, as
+    // graph normalization did before.
+    let kernel = literal("LiteralRational", json!(150.0));
+    let printed = literal("LiteralRational", json!(150));
+    assert_eq!(
+        graph_normalize(&printed).unwrap(),
+        graph_normalize(&kernel).unwrap()
+    );
+    assert_eq!(
+        graph_normalize_compact(&printed.to_string()).unwrap(),
+        graph_normalize_compact(&kernel.to_string()).unwrap()
+    );
+    assert_eq!(
+        state_digest(&graph_normalize(&printed).unwrap()).unwrap(),
+        state_digest(&graph_normalize(&kernel).unwrap()).unwrap()
+    );
+    assert_eq!(
+        graph_normalize_as_spelled(&printed).unwrap()[0]["value"],
+        json!(150)
+    );
+    assert_eq!(
+        graph_normalize_compact_as_spelled(&kernel.to_string()).unwrap(),
+        graph_normalize_compact(&kernel.to_string()).unwrap()
+    );
+    assert_ne!(
+        state_digest(&graph_normalize_as_spelled(&printed).unwrap()).unwrap(),
+        state_digest(&graph_normalize(&printed).unwrap()).unwrap(),
+        "an integer spelling digests apart where it is kept"
+    );
+}
+
+#[test]
+fn graph_normal_reads_the_corpus_as_before_and_its_printed_twin_alike() {
+    // Over the golden corpus, as the kernel spells it: the respelling
+    // changes nothing, so every digest recorded over a kernel document
+    // stands. Printed through JavaScript, each document graph-normalizes
+    // to its kernel spelling's document all the same.
+    let mut respelled = 0usize;
+    for (name, v) in goldens() {
+        let normal = graph_normalize(&v).unwrap();
+        assert_eq!(
+            graph_normalize_as_spelled(&v).unwrap(),
+            normal,
+            "{name}: a kernel document normalizes as before"
+        );
+        let printed = printed_by_javascript(&v);
+        if printed != v {
+            respelled += 1;
+        }
+        assert_eq!(
+            graph_normalize(&printed).unwrap(),
+            normal,
+            "{name}: its printed twin normalizes alike"
+        );
+    }
+    assert!(respelled > 0, "the corpus has whole reals to respell");
 }
 
 #[test]

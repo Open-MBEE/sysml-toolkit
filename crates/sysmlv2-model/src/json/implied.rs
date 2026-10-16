@@ -40,10 +40,13 @@
 //! variable, end and portion constraints add separate obligations.
 
 use super::{Builder, Elem, ElementRef, ResolvedModel, implicit_def_bases, implicit_usage_bases};
+use crate::flat::ListsByRow;
+use crate::layered::{IdMap, IdSet};
 use crate::lift::{def_kind_of, usage_kind_of};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use sysmlv2_syntax::ast::Dialect;
 use uuid::Uuid;
@@ -59,12 +62,16 @@ type ImpliedBases = (
     &'static [&'static str],
 );
 
-type SpecializationGraph = HashMap<Uuid, Vec<Uuid>>;
-type StaticPlannerBases = (HashMap<usize, Vec<usize>>, HashSet<usize>);
+type SpecializationGraph = crate::id_graph::IdMap<Uuid, Vec<Uuid>>;
+type StaticPlannerBases = (IdMap<usize, Vec<usize>>, IdSet<usize>);
+/// The direct bases a static prefix keeps: a build's own rows' over the
+/// frozen table its prepared library's plans give, and the types whose bases
+/// are incomplete.
+type PlannedBases = (crate::layered::LayeredMap<usize, Vec<usize>>, IdSet<usize>);
 
-type PlannedEdge = (&'static str, &'static str, &'static str, Uuid);
+pub(super) type PlannedEdge = (&'static str, &'static str, &'static str, Uuid);
 
-pub(super) type RetainedTypings = HashMap<usize, Vec<(&'static str, Uuid)>>;
+pub(super) type RetainedTypings = IdMap<usize, Vec<(&'static str, Uuid)>>;
 
 /// The immutable supported library/variation plan. The positional graph and
 /// materialized relationship graph share this calculation, but own any later
@@ -74,8 +81,8 @@ pub(super) struct SupportedImpliedSpecializations {
     /// The final specialization graph and the retained targets by owner. A
     /// prepared library's plan keeps both frozen, and a plan extending it adds
     /// a build's own entries over them (see [`super::LibraryPlans`]).
-    graph: crate::layered::LayeredMap<Uuid, Vec<Uuid>>,
-    by_owner: crate::layered::LayeredMap<usize, Vec<Uuid>>,
+    graph: crate::id_graph::IdGraph,
+    by_owner: RetainedByOwner,
     typing_by_owner: OnceLock<Arc<RetainedTypings>>,
     library_configuration: bool,
     expression_targets: HashMap<&'static str, Uuid>,
@@ -86,61 +93,198 @@ pub(super) struct SupportedImpliedSpecializations {
     source_names: crate::layered::Revision,
 }
 
+/// A plan's retained targets by owner row: a build's own owners' over the
+/// lists of the prepared library's plan, which are laid out by row once
+/// the plan is frozen (see [`ListsByRow`]) and shared by the plans that
+/// extend it. A frozen list is never empty — an owner has a list for a
+/// target it retained — so an empty one is a row of another table the
+/// lists are laid out on (see [`Self::lay_on`]) that has none here.
+#[derive(Clone, Default)]
+struct RetainedByOwner {
+    frozen: Arc<ListsByRow<Uuid>>,
+    own: IdMap<usize, Vec<Uuid>>,
+}
+
+impl RetainedByOwner {
+    fn get(&self, owner: usize) -> Option<&[Uuid]> {
+        match self.own.get(&owner) {
+            Some(targets) => Some(targets),
+            None => self.frozen.get(owner).filter(|targets| !targets.is_empty()),
+        }
+    }
+    /// Retain `target` for `owner`, after the targets it has.
+    fn push(&mut self, owner: usize, target: Uuid) {
+        let frozen = &self.frozen;
+        self.own
+            .entry(owner)
+            .or_insert_with(|| frozen.get(owner).map(<[Uuid]>::to_vec).unwrap_or_default())
+            .push(target);
+    }
+    /// Every owner's targets: the frozen lists no own list replaces, by
+    /// row, then the own lists.
+    fn iter(&self) -> impl Iterator<Item = (usize, &[Uuid])> {
+        self.frozen
+            .iter()
+            .filter(|(owner, targets)| !targets.is_empty() && !self.own.contains_key(owner))
+            .chain(
+                self.own
+                    .iter()
+                    .map(|(&owner, targets)| (owner, targets.as_slice())),
+            )
+    }
+    /// The capacity of the own lists: what dropping this table frees (the
+    /// frozen lists are shared).
+    fn local_capacity(&self) -> usize {
+        self.own.capacity()
+    }
+    /// Lay every list out by row, frozen.
+    fn freeze(&mut self) {
+        if self.own.is_empty() {
+            return;
+        }
+        let lists: IdMap<usize, Vec<Uuid>> = self
+            .iter()
+            .map(|(owner, targets)| (owner, targets.to_vec()))
+            .collect();
+        let rows = lists
+            .keys()
+            .map(|&owner| owner + 1)
+            .max()
+            .unwrap_or(0)
+            .max(self.frozen.rows());
+        self.frozen = Arc::new(ListsByRow::from_map(rows, &lists));
+        self.own = IdMap::default();
+    }
+    /// Lay the frozen lists out on `other`'s rows, sharing its ranks, when
+    /// every owner is a row with a list there and no own list lies over
+    /// them.
+    fn lay_on<U>(&mut self, other: &ListsByRow<U>) {
+        if !self.own.is_empty() {
+            return;
+        }
+        if let Some(laid) = self.frozen.laid_on(other) {
+            self.frozen = Arc::new(laid);
+        }
+    }
+}
+
+impl FromIterator<(usize, Vec<Uuid>)> for RetainedByOwner {
+    fn from_iter<I: IntoIterator<Item = (usize, Vec<Uuid>)>>(iter: I) -> Self {
+        Self {
+            frozen: Arc::default(),
+            own: iter.into_iter().collect(),
+        }
+    }
+}
+
+/// A relationship as a planned edge spells it: the kind, the source role
+/// and the target role.
+type Spelling = (&'static str, &'static str, &'static str);
+
 /// A plan's candidate edges with whether each was retained, in the order a
 /// plan of every row lists them: the kinds' and variants' requirements, then
 /// the succession endpoints'. A plan extending a prepared library's lists the
 /// library plan's before its own in each part, without copying them.
+///
+/// The own candidates are held in columns — an owner row, a spelling's
+/// index and a target each — rather than as the planner's rows of owner and
+/// edge: a library's plan holds eighty thousand of them, and a row of three
+/// string slices and a padded tuple is three times a column entry's width.
 pub(super) struct Candidates {
     library: Option<Arc<SupportedImpliedSpecializations>>,
-    own: Vec<(usize, PlannedEdge)>,
+    /// Each own candidate's owner row.
+    owners: Vec<u32>,
+    /// Each own candidate's relationship, as an index into `spellings`.
+    spelled: Vec<u8>,
+    /// Each own candidate's target.
+    targets: Vec<Uuid>,
+    /// The distinct spellings the own candidates use, in order of first use.
+    spellings: Vec<Spelling>,
     /// The own candidates before this index are the kinds' and variants'
     /// requirements, the rest the succession endpoints'.
     kinds: usize,
     retained: Vec<bool>,
 }
 
-type Candidate<'a> = (&'a (usize, PlannedEdge), bool);
-
-fn zip_part<'a>(
-    candidates: &'a [(usize, PlannedEdge)],
-    retained: &'a [bool],
-) -> impl Iterator<Item = Candidate<'a>> + 'a {
-    candidates.iter().zip(retained.iter().copied())
-}
+/// A candidate edge as a plan lists it — its owner row and its edge — and
+/// whether it was retained.
+type Candidate = ((usize, PlannedEdge), bool);
 
 impl Candidates {
-    /// Every candidate, with whether it was retained, in the plan's order.
-    pub(super) fn iter(&self) -> impl Iterator<Item = Candidate<'_>> + '_ {
-        let (library, retained, kinds): (&[(usize, PlannedEdge)], &[bool], usize) =
-            match &self.library {
-                Some(plan) => (
-                    &plan.candidates.own,
-                    &plan.candidates.retained,
-                    plan.candidates.kinds,
-                ),
-                None => (&[], &[], 0),
+    /// The plan's own candidates `own`, the first `kinds` of them the kinds'
+    /// and variants' requirements, with `retained` saying which of them the
+    /// minimizer kept, over `library`'s when the plan extends a prepared
+    /// library's.
+    fn new(
+        library: Option<Arc<SupportedImpliedSpecializations>>,
+        own: Vec<(usize, PlannedEdge)>,
+        kinds: usize,
+        retained: Vec<bool>,
+    ) -> Self {
+        debug_assert_eq!(own.len(), retained.len());
+        let mut spellings: Vec<Spelling> = Vec::new();
+        let mut owners = Vec::with_capacity(own.len());
+        let mut spelled = Vec::with_capacity(own.len());
+        let mut targets = Vec::with_capacity(own.len());
+        for (owner, (kind, source, target_role, target)) in own {
+            let spelling = (kind, source, target_role);
+            let index = match spellings.iter().position(|known| *known == spelling) {
+                Some(index) => index,
+                None => {
+                    spellings.push(spelling);
+                    spellings.len() - 1
+                }
             };
-        zip_part(&library[..kinds], &retained[..kinds])
-            .chain(self.own_kinds())
-            .chain(zip_part(&library[kinds..], &retained[kinds..]))
-            .chain(zip_part(
-                &self.own[self.kinds..],
-                &self.retained[self.kinds..],
-            ))
+            // Neither bound is reached: no build holds 2^32 rows, and the
+            // planner spells only the four relationships of
+            // `SPELLED_RELATIONSHIPS` (a fifth spelling still fits the byte;
+            // the table's own length bounds the wire form). A stop here is
+            // preferred to a column holding a wrong owner or spelling.
+            owners.push(u32::try_from(owner).expect("a row index fits the owner column"));
+            spelled.push(u8::try_from(index).expect("the planner spells few relationships"));
+            targets.push(target);
+        }
+        Self {
+            library,
+            owners,
+            spelled,
+            targets,
+            spellings,
+            kinds,
+            retained,
+        }
     }
-    fn own_kinds(&self) -> impl Iterator<Item = Candidate<'_>> + '_ {
-        zip_part(&self.own[..self.kinds], &self.retained[..self.kinds])
+    /// The own candidates `range`, each with whether it was retained.
+    fn part(&self, range: std::ops::Range<usize>) -> impl Iterator<Item = Candidate> + '_ {
+        range.map(move |i| {
+            let (kind, source, target_role) = self.spellings[usize::from(self.spelled[i])];
+            let edge = (kind, source, target_role, self.targets[i]);
+            ((self.owners[i] as usize, edge), self.retained[i])
+        })
+    }
+    /// Every candidate, with whether it was retained, in the plan's order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = Candidate> + '_ {
+        // (with no library plan beneath, the library's parts are empty
+        // ranges of this plan's own columns)
+        let library = self.library.as_deref().map(|plan| &plan.candidates);
+        let (kinds, end) = library.map_or((0, 0), |c| (c.kinds, c.owners.len()));
+        let library = library.unwrap_or(self);
+        library
+            .part(0..kinds)
+            .chain(self.part(0..self.kinds))
+            .chain(library.part(kinds..end))
+            .chain(self.part(self.kinds..self.owners.len()))
     }
     /// The plan's own candidates (a library plan's are not), in order.
-    pub(super) fn own(&self) -> impl Iterator<Item = Candidate<'_>> + '_ {
-        zip_part(&self.own, &self.retained)
+    pub(super) fn own(&self) -> impl Iterator<Item = Candidate> + '_ {
+        self.part(0..self.owners.len())
     }
     pub(super) fn len(&self) -> usize {
-        self.own.len()
+        self.owners.len()
             + self
                 .library
                 .as_ref()
-                .map_or(0, |plan| plan.candidates.own.len())
+                .map_or(0, |plan| plan.candidates.owners.len())
     }
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
@@ -156,6 +300,263 @@ impl Candidates {
     }
 }
 
+/// A prepared library's own materialized rows (its elements' static implied
+/// relationships, made once when it was prepared), as a build on the
+/// library reads them: they lie in the frozen prefix from
+/// `Builder::lib_implied_from`, owned through the prefix ownership view,
+/// and the build materializes its own rows after them. Owned results stay a
+/// build's own: a build on the library materializes its library's
+/// expressions' results with its own, as a build from source does.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct PrefixImplied {
+    /// The specialization edges the library's materialized rows add to the
+    /// planned graph — its static implied relationships and positional
+    /// redefinitions — from the owner's id to the target's, in row order.
+    pub(super) edges: Vec<(Uuid, Uuid)>,
+    /// The rows these edges change in the planned graph (see
+    /// [`Self::graph_over`]), made by the first build that materializes over
+    /// a plan's frozen graph and shared by every build over that graph. Not
+    /// serialized: a decoded library's builds make their own.
+    #[serde(skip)]
+    graph: Arc<std::sync::Mutex<Option<PrefixOverlay>>>,
+    /// The materialized rows as the fixed recipes a build from source hands
+    /// its dynamic planner (see [`Builder::prefix_static_candidates`]), made
+    /// by the first build that plans and shared by every build on the
+    /// library while its frozen rows are unwritten.
+    #[serde(skip)]
+    candidates: std::sync::OnceLock<Arc<Vec<(usize, PlannedEdge)>>>,
+}
+
+/// The rows a prefix's edges change in a plan's frozen specialization graph,
+/// kept by the frozen graph's identity: the frozen graph with the edges in
+/// it is these rows over it. Most of the edges are in the frozen graph
+/// already (the plan retained them), so the rows are few.
+struct PrefixOverlay {
+    base: Arc<crate::id_graph::Frozen>,
+    rows: Arc<crate::id_graph::Overlay>,
+    /// The edges' distinct sources, sorted, for the rows a build's own plan
+    /// lays over the frozen graph: few of those rows are a source's.
+    sources: Arc<Vec<Uuid>>,
+}
+
+impl PrefixImplied {
+    /// The rows this prefix's edges change in the frozen graph `base`, and
+    /// the edges' sources: made once per frozen graph and shared.
+    fn graph_over(
+        &self,
+        base: &Arc<crate::id_graph::Frozen>,
+    ) -> (Arc<crate::id_graph::Overlay>, Arc<Vec<Uuid>>) {
+        let mut cell = self.graph.lock().unwrap();
+        if let Some(kept) = cell.as_ref().filter(|kept| Arc::ptr_eq(&kept.base, base)) {
+            return (Arc::clone(&kept.rows), Arc::clone(&kept.sources));
+        }
+        // A row takes an edge's target once, after the targets it has: a
+        // row the edges add nothing to stays the frozen graph's.
+        let mut rows = SpecializationGraph::default();
+        for &(source, target) in &self.edges {
+            let present = rows
+                .get(&source)
+                .map(Vec::as_slice)
+                .or_else(|| base.get(&source))
+                .is_some_and(|targets| targets.contains(&target));
+            if !present {
+                rows.entry(source)
+                    .or_insert_with(|| base.get(&source).map(<[Uuid]>::to_vec).unwrap_or_default())
+                    .push(target);
+            }
+        }
+        let mut sources: Vec<Uuid> = self.edges.iter().map(|&(source, _)| source).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        let rows = Arc::new(crate::id_graph::Overlay::new(base, rows));
+        let sources = Arc::new(sources);
+        *cell = Some(PrefixOverlay {
+            base: Arc::clone(base),
+            rows: Arc::clone(&rows),
+            sources: Arc::clone(&sources),
+        });
+        (rows, sources)
+    }
+
+    /// The targets of this prefix's edges from `source`, each once, in the
+    /// edges' order.
+    fn targets_from(&self, source: Uuid) -> Vec<Uuid> {
+        let mut targets = Vec::new();
+        for &(from, target) in &self.edges {
+            if from == source && !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        targets
+    }
+}
+
+impl Builder {
+    /// The first row a build materializes static implied relationships
+    /// for: past the library's rows when the library carries its own
+    /// materialized rows (they lie in the prefix), else every source row.
+    pub(super) fn own_rows_start(&self) -> usize {
+        if self.prefix_implied.is_some() {
+            self.lib_boundary
+        } else {
+            0
+        }
+    }
+
+    /// Make this library-only build's materialized rows the prepared
+    /// library's own: the rows stay as the last of the frozen prefix, its
+    /// ownership view becomes the prefix view every build on the library
+    /// layers over, and the build-side state that produced them is
+    /// cleared, so that the frozen builder reads as unmaterialized to the
+    /// builds that start from it. Nothing changes when the build
+    /// materialized nothing.
+    /// The prepared library's own materialized rows as the fixed recipes a
+    /// build from source hands its dynamic planner (the library's static
+    /// implied relationships come first among them there): owner and edge,
+    /// in row order; empty without such rows.
+    pub(super) fn prefix_static_candidates(&self) -> Arc<Vec<(usize, PlannedEdge)>> {
+        let (Some(prefix), Some(view)) = (&self.prefix_implied, &self.prefix_ownership) else {
+            return Arc::default();
+        };
+        let make = || {
+            // A static recipe writes its source and its target only.
+            const KEYS: [(&str, &str); 7] = [
+                ("subclassifier", "superclassifier"),
+                ("typedFeature", "type"),
+                ("subsettingFeature", "subsettedFeature"),
+                ("redefiningFeature", "redefinedFeature"),
+                ("referencingFeature", "referencedFeature"),
+                ("crossingFeature", "crossedFeature"),
+                ("specific", "general"),
+            ];
+            let mut out = Vec::new();
+            for i in self.lib_implied_from..self.lib_boundary {
+                let row = &self.elements[i];
+                if !is_a!(row, "Specialization") {
+                    continue;
+                }
+                let Some(owner) = view.generated_relationship_owner(i) else {
+                    continue;
+                };
+                let Some(&(source_key, target_key)) = KEYS
+                    .iter()
+                    .find(|(source, _)| row.props.get(source).is_some())
+                else {
+                    continue;
+                };
+                let Some(target) = row.props.get(target_key).and_then(|v| v.as_reference()) else {
+                    continue;
+                };
+                out.push((owner, (row.ty, source_key, target_key, target)));
+            }
+            Arc::new(out)
+        };
+        if self.elements.base_untouched() {
+            Arc::clone(prefix.candidates.get_or_init(make))
+        } else {
+            make()
+        }
+    }
+
+    /// The specialization edges the prepared library's own materialized
+    /// rows add to the planned graph, from the owner's id to the target's,
+    /// as the rows give them now.
+    fn prefix_edges_now(&self) -> Vec<(Uuid, Uuid)> {
+        let Some(view) = &self.prefix_ownership else {
+            return Vec::new();
+        };
+        prefix_edges(self, view, self.lib_implied_from, self.lib_boundary)
+    }
+
+    pub(crate) fn seal_prefix_semantics(&mut self) {
+        let Some(from) = self.implied_from.take() else {
+            return;
+        };
+        let table = self
+            .implied
+            .take()
+            .expect("materialized rows have their table");
+        let view = self
+            .semantic_ownership
+            .take()
+            .expect("materialized rows have their ownership view");
+        let edges = prefix_edges(self, &view, from, self.elements.len());
+        self.lib_implied_from = from;
+        self.lib_boundary = self.elements.len();
+        // The kept lookup graph was built over the source rows: it covers
+        // the materialized rows too, so that the snapshot's graph fits the
+        // rows it is read for, and the rows are found by id.
+        if let Some(mut graph) = self.recorded_lookup_graph.take() {
+            graph.cover_rows(self, from);
+            self.recorded_lookup_graph = Some(graph);
+        }
+        self.prefix_ownership = Some(Arc::new(
+            Arc::try_unwrap(view).unwrap_or_else(|arc| (*arc).clone()),
+        ));
+        debug_assert_eq!(
+            table.owned_results_from,
+            self.elements.len(),
+            "a prefix materializes its static rows only"
+        );
+        self.prefix_implied = Some(Arc::new(PrefixImplied {
+            edges,
+            graph: Default::default(),
+            candidates: Default::default(),
+        }));
+        self.prefix_static_only = false;
+        self.dynamic_graph = None;
+        self.supported_implied = None;
+        self.positional_redefinitions = None;
+        self.library_plans_decided = None;
+        self.stored_structure = None;
+        self.id_index = None;
+        self.publication = super::publication::Control::default();
+        self.semantic_ready = false;
+    }
+}
+
+/// The specialization edges of the materialized rows `from..to`, owned
+/// through `view`: from the owner's id to the target's, in row order.
+fn prefix_edges(
+    b: &Builder,
+    view: &super::semantic_ownership::SemanticOwnership,
+    from: usize,
+    to: usize,
+) -> Vec<(Uuid, Uuid)> {
+    let mut edges = Vec::new();
+    for i in from..to {
+        let row = &b.elements[i];
+        if !is_a!(row, "Specialization") {
+            continue;
+        }
+        let (Some(target), Some(owner)) = (
+            specialization_target(row),
+            view.generated_relationship_owner(i),
+        ) else {
+            continue;
+        };
+        edges.push((b.elements[owner].id, target));
+    }
+    edges
+}
+
+impl ResolvedModel {
+    /// Materialize this library-only build's implied relationships and
+    /// owned results and seal them into the prefix a prepared library
+    /// keeps (see [`Builder::seal_prefix_semantics`]). Publication is left
+    /// suppressed, as a prepared library's build keeps it.
+    pub(crate) fn materialize_prefix_semantics(&mut self) {
+        self.b.publication.enable();
+        // The static implied relationships only: owned results stay a
+        // build's own (the planners' witnesses read a library expression as
+        // a build from source has it while it plans: without a result).
+        self.b.prefix_static_only = true;
+        self.ensure_implied();
+        self.b.seal_prefix_semantics();
+        self.b.publication.suppress();
+    }
+}
+
 /// The materialized implied relationships: their owners, and each
 /// owner's list in order.
 #[derive(Clone)]
@@ -165,11 +566,12 @@ pub(super) struct ImpliedTable {
     /// New owned-result nodes start after the stable old implied families.
     pub(super) owned_results_from: usize,
     pub(super) owned_results_state: OwnedResultState,
-    /// Known explicit and retained implied specialization targets.
-    specializations: SpecializationGraph,
+    /// Known explicit and retained implied specialization targets: a
+    /// build's own over the frozen table its library's plans give.
+    specializations: crate::id_graph::IdGraph,
     static_authority: Arc<SupportedImpliedSpecializations>,
     static_rows: crate::layered::Revision,
-    static_owners: HashSet<usize>,
+    static_owners: IdSet<usize>,
 }
 
 pub(super) fn specialization_target(relation: &Elem) -> Option<Uuid> {
@@ -356,31 +758,301 @@ fn reverse_rank_order(
 
 impl SupportedImpliedSpecializations {
     /// This plan with its final graph and retained targets frozen: a prepared
-    /// library's own, which the plans extending it share.
+    /// library's own, which the plans extending it share. Its retained
+    /// flags, grown by the planner's pushes, are cut to their length: a
+    /// frozen plan gains none.
     fn into_frozen(mut self) -> Self {
         self.graph.freeze();
         self.by_owner.freeze();
+        self.candidates.retained.shrink_to_fit();
         self
+    }
+
+    /// Lay the retained targets by owner out on `rows`'s rows, sharing its
+    /// ranks, when every owner is a row with a list there: a library's
+    /// direct bases have a list on every owner of a retained target.
+    pub(super) fn lay_owners_on<U>(&mut self, rows: &ListsByRow<U>) {
+        self.by_owner.lay_on(rows);
+    }
+
+    /// The wire form of a library's own plan — one with no plan beneath it,
+    /// in the library configuration, every edge of which the planner spells
+    /// — as a snapshot carries it (see [`super::LibraryPlansWire`]); `None`
+    /// for any other plan. The expression targets are not carried: they are
+    /// derived again from the library's names when the plan is read back.
+    /// The maps are written sorted by key, so the same plan is written the
+    /// same way every time.
+    pub(super) fn to_wire(&self) -> Option<ImpliedWire> {
+        if self.candidates.library.is_some() || !self.library_configuration {
+            return None;
+        }
+        // (each of the plan's spellings as the wire indexes it, once)
+        let spelled = self
+            .candidates
+            .spellings
+            .iter()
+            .map(|&(kind, source, target)| spelled_relationship_index(kind, source, target))
+            .collect::<Option<Vec<u8>>>()?;
+        Some(ImpliedWire {
+            candidates: CandidateColumns {
+                owners: crate::bulk::Ints(
+                    self.candidates
+                        .owners
+                        .iter()
+                        .map(|&owner| owner as usize)
+                        .collect(),
+                ),
+                spelled: crate::bulk::Bytes(
+                    self.candidates
+                        .spelled
+                        .iter()
+                        .map(|&index| spelled[usize::from(index)])
+                        .collect(),
+                ),
+                ids: crate::bulk::Ids(self.candidates.targets.clone()),
+            },
+            kinds: self.candidates.kinds,
+            retained: self.candidates.retained.clone().into(),
+            graph: sorted_by_key(self.graph.iter().map(|(k, v)| (*k, v.to_vec()))).into(),
+            by_owner: sorted_by_key(self.by_owner.iter().map(|(k, v)| (k, v.to_vec()))).into(),
+            library_configuration: self.library_configuration,
+            chain_targets: sorted_by_key(self.chain_bases.targets.iter().map(|(&f, &b)| (f, b)))
+                .into(),
+            chain_incomplete: crate::bulk::Ints(sorted(
+                self.chain_bases.incomplete.iter().copied(),
+            )),
+        })
+    }
+
+    /// A library's own plan read back from its wire form, for the `row_count`
+    /// rows at revision `rows` and the names at revision `names`, with the
+    /// expression targets `expression_targets` derived from those names,
+    /// and the retained targets by owner laid out on `owner_rows`'s rows
+    /// (see [`Self::lay_owners_on`]).
+    /// `None` when the wire names a relationship the planner does not spell,
+    /// a row the library does not have, a configuration other than the
+    /// library's, or disagrees with itself.
+    pub(super) fn from_wire<U>(
+        wire: ImpliedWire,
+        row_count: usize,
+        rows: crate::layered::Revision,
+        names: crate::layered::Revision,
+        expression_targets: HashMap<&'static str, Uuid>,
+        owner_rows: &ListsByRow<U>,
+    ) -> Option<Self> {
+        let (owners, spelled, targets) = wire.candidates.into_columns()?;
+        let retained = wire.retained.into_flags()?;
+        let (graph_keys, graph_lengths, graph_targets) = wire.graph.into_columns()?;
+        let (owner_keys, owner_lengths, owner_targets) = wire.by_owner.into_columns()?;
+        let chain_targets = wire.chain_targets.into_pairs()?;
+        let chain_incomplete = wire.chain_incomplete.0;
+        let in_range = |i: usize| i < row_count;
+        if retained.len() != owners.len()
+            || wire.kinds > owners.len()
+            || !wire.library_configuration
+            || !owners.iter().all(|&owner| in_range(owner))
+            || !spelled
+                .iter()
+                .all(|&index| usize::from(index) < SPELLED_RELATIONSHIPS.len())
+            || !owner_keys.iter().all(|&owner| in_range(owner))
+            || !chain_targets
+                .iter()
+                .all(|&(f, b)| in_range(f) && in_range(b))
+            || !chain_incomplete.iter().all(|&f| in_range(f))
+        {
+            return None;
+        }
+        // The wire's spelled and target columns are the plan's as they are;
+        // its owners narrow to the owner column.
+        let owners = owners
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<Result<Vec<u32>, _>>()
+            .ok()?;
+        Some(
+            Self {
+                candidates: Candidates {
+                    library: None,
+                    owners,
+                    spelled,
+                    targets,
+                    spellings: SPELLED_RELATIONSHIPS.to_vec(),
+                    kinds: wire.kinds,
+                    retained,
+                },
+                graph: crate::id_graph::IdGraph::frozen(crate::id_graph::Frozen::from_columns(
+                    &graph_keys,
+                    &graph_lengths,
+                    graph_targets,
+                )?),
+                by_owner: RetainedByOwner {
+                    // (the wire's lists are written by ascending owner, each
+                    // a row with direct bases in a library's own plans: else
+                    // they are laid out over the rows alone)
+                    frozen: Arc::new(
+                        if owner_keys.iter().all(|&owner| owner_rows.contains(owner)) {
+                            ListsByRow::from_sorted_on(
+                                owner_rows,
+                                &owner_keys,
+                                &owner_lengths,
+                                owner_targets,
+                            )?
+                        } else {
+                            ListsByRow::from_sorted(
+                                row_count,
+                                &owner_keys,
+                                &owner_lengths,
+                                owner_targets,
+                            )?
+                        },
+                    ),
+                    own: IdMap::default(),
+                },
+                typing_by_owner: OnceLock::new(),
+                library_configuration: wire.library_configuration,
+                expression_targets,
+                chain_bases: Arc::new(super::type_relations::FeatureChainBases {
+                    targets: chain_targets.into_iter().collect(),
+                    incomplete: chain_incomplete.into_iter().collect(),
+                }),
+                source_rows: std::sync::Mutex::new(rows),
+                source_names: names,
+            }
+            .into_frozen(),
+        )
+    }
+}
+
+/// The relationships the implied planner spells — kind, source role, target
+/// role — in the order a candidate edge's wire form indexes them.
+const SPELLED_RELATIONSHIPS: [(&str, &str, &str); 4] = [
+    ("Subclassification", "subclassifier", "superclassifier"),
+    ("Subsetting", "subsettingFeature", "subsettedFeature"),
+    (
+        "ReferenceSubsetting",
+        "subsettingFeature",
+        "referencedFeature",
+    ),
+    ("FeatureTyping", "typedFeature", "type"),
+];
+
+/// The index of a spelled relationship in [`SPELLED_RELATIONSHIPS`]; `None`
+/// for a relationship the table does not list, which no wire carries.
+fn spelled_relationship_index(kind: &str, source: &str, target: &str) -> Option<u8> {
+    SPELLED_RELATIONSHIPS
+        .iter()
+        .position(|&(k, s, t)| k == kind && s == source && t == target)
+        .map(|i| u8::try_from(i).expect("a four-entry table"))
+}
+
+/// The entries of a map as a vector sorted by key.
+pub(super) fn sorted_by_key<K: Ord, V>(entries: impl Iterator<Item = (K, V)>) -> Vec<(K, V)> {
+    let mut entries: Vec<(K, V)> = entries.collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// The elements of a set as a sorted vector.
+pub(super) fn sorted<T: Ord>(elements: impl Iterator<Item = T>) -> Vec<T> {
+    let mut elements: Vec<T> = elements.collect();
+    elements.sort_unstable();
+    elements
+}
+
+/// A library's own implied plan as a snapshot carries it. A candidate edge
+/// is its owner, its index in [`SPELLED_RELATIONSHIPS`] and its target.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ImpliedWire {
+    pub(super) candidates: CandidateColumns,
+    pub(super) kinds: usize,
+    pub(super) retained: crate::bulk::Flags,
+    pub(super) graph: crate::bulk::IdLists,
+    pub(super) by_owner: crate::bulk::IndexIdLists,
+    pub(super) library_configuration: bool,
+    pub(super) chain_targets: crate::bulk::Pairs,
+    pub(super) chain_incomplete: crate::bulk::Ints,
+}
+
+/// The candidate edges as columns: the owners, the spelled-relationship
+/// indices, the target ids.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct CandidateColumns {
+    pub(super) owners: crate::bulk::Ints,
+    pub(super) spelled: crate::bulk::Bytes,
+    pub(super) ids: crate::bulk::Ids,
+}
+impl CandidateColumns {
+    /// The columns, each of the candidates' length; `None` for columns of
+    /// unequal length.
+    fn into_columns(self) -> Option<(Vec<usize>, Vec<u8>, Vec<Uuid>)> {
+        if self.owners.0.len() != self.spelled.0.len() || self.owners.0.len() != self.ids.0.len() {
+            return None;
+        }
+        Some((self.owners.0, self.spelled.0, self.ids.0))
     }
 }
 
 #[cfg(test)]
-fn same_map<K: Eq + std::hash::Hash, V: PartialEq>(
-    a: &crate::layered::LayeredMap<K, V>,
-    b: &crate::layered::LayeredMap<K, V>,
-) -> bool {
+fn same_graph(a: &crate::id_graph::IdGraph, b: &crate::id_graph::IdGraph) -> bool {
     a.iter().count() == b.iter().count() && a.iter().all(|(k, v)| b.get(k) == Some(v))
 }
 
 #[cfg(test)]
 impl SupportedImpliedSpecializations {
+    /// Drop this plan a member at a time, naming each to `note` once it is
+    /// gone, for the tests that measure what each holds.
+    pub(super) fn drop_members(self, note: &mut dyn FnMut(&str)) {
+        let Self {
+            candidates,
+            graph,
+            by_owner,
+            typing_by_owner,
+            library_configuration: _,
+            expression_targets,
+            chain_bases,
+            source_rows,
+            source_names,
+        } = self;
+        println!(
+            "  candidates {} (kinds {}), graph {} keys / {} targets, by_owner {} keys / {} targets",
+            candidates.owners.len(),
+            candidates.kinds,
+            graph.iter().count(),
+            graph.iter().map(|(_, v)| v.len()).sum::<usize>(),
+            by_owner.iter().count(),
+            by_owner.iter().map(|(_, v)| v.len()).sum::<usize>(),
+        );
+        drop(candidates);
+        note("candidates");
+        drop(graph);
+        note("graph");
+        drop(by_owner);
+        note("by_owner");
+        drop(typing_by_owner);
+        note("typing_by_owner");
+        drop(expression_targets);
+        note("expression_targets");
+        drop(chain_bases);
+        note("chain_bases");
+        drop((source_rows, source_names));
+        note("revisions");
+    }
+}
+
+#[cfg(test)]
+impl SupportedImpliedSpecializations {
+    /// Whether the plan has no candidate edge of its own.
+    pub(super) fn is_empty(&self) -> bool {
+        self.candidates.owners.is_empty()
+    }
+
     /// The first field in which two plans differ, the memo and the row
     /// revisions aside.
     pub(super) fn difference(&self, other: &Self) -> Option<String> {
         let first =
             |what: &str, a: String, b: String| (a != b).then(|| format!("{what}: {a} != {b}"));
         let listed = |plan: &Self| -> Vec<(usize, PlannedEdge)> {
-            plan.candidates.iter().map(|(c, _)| *c).collect()
+            plan.candidates.iter().map(|(c, _)| c).collect()
         };
         let (mine, theirs) = (listed(self), listed(other));
         if mine != theirs {
@@ -410,8 +1082,16 @@ impl SupportedImpliedSpecializations {
                 format!("retained differs at {at:?}: {:?}", at.map(|at| mine[at]))
             })
         })
-        .or_else(|| (!same_map(&self.graph, &other.graph)).then(|| "final graph".to_string()))
-        .or_else(|| (!same_map(&self.by_owner, &other.by_owner)).then(|| "by owner".to_string()))
+        .or_else(|| (!same_graph(&self.graph, &other.graph)).then(|| "final graph".to_string()))
+        .or_else(|| {
+            let lists = |plan: &Self| -> IdMap<usize, Vec<Uuid>> {
+                plan.by_owner
+                    .iter()
+                    .map(|(owner, targets)| (owner, targets.to_vec()))
+                    .collect()
+            };
+            (lists(self) != lists(other)).then(|| "by owner".to_string())
+        })
         .or_else(|| {
             (self.chain_bases.targets != other.chain_bases.targets
                 || self.chain_bases.incomplete != other.chain_bases.incomplete)
@@ -526,16 +1206,7 @@ impl Builder {
         for name in self.external_implied_names.keys() {
             planning_charge(&mut Some(&mut *steps), name.len())?;
         }
-        let names = self
-            .lib_qnames
-            .iter()
-            .map(|(id, parts)| (parts.join("::"), *id))
-            .chain(
-                self.external_implied_names
-                    .iter()
-                    .map(|(name, id)| (name.clone(), *id)),
-            )
-            .collect();
+        let names = self.implied_names();
         let prefix = self.static_specialization_prefix(
             &names,
             self.external_implied_names.is_empty(),
@@ -580,26 +1251,122 @@ impl Builder {
         // Retire the old compatibility graph only after charged reconstruction.
         planning_charge(
             &mut Some(&mut *steps),
-            self.implied.as_ref()?.specializations.capacity(),
+            self.implied.as_ref()?.specializations.local_capacity(),
         )?;
         let rows = self.elements.observe_revision();
         if let Some(table) = &mut self.implied {
             table.static_authority = plan;
             table.static_rows = rows;
-            table.specializations = graph;
+            table.specializations = graph.into();
         }
         Some(())
     }
 
     /// Structural owners, including memberships without a name or body scope.
+    /// The frozen rows' part is shared by every build on them (a frozen
+    /// row's relationships are frozen rows): a build on a prepared library
+    /// reads the library's own table of its relationships' owners, which it
+    /// keeps for every build on it; a build cut to the library's source rows
+    /// (the one its plans are made on) makes the part once in the cell it
+    /// shares. This build's rows follow. The library's table owns its
+    /// materialized rows where a scan of the frozen rows' own relationships
+    /// finds no owner, and no planner reads a materialized row's owner: a
+    /// materialized row names its source in its properties, and an
+    /// element's owning membership is an authored row.
     fn specialization_relation_owners(&self) -> Vec<Option<usize>> {
-        let mut owners = vec![None; self.elements.len()];
-        for (owner, element) in self.elements.iter().enumerate() {
-            for &relationship in &element.owned_relationships {
+        fn scan(elements: &super::Elem, owners: &mut [Option<usize>], owner: usize) {
+            for &relationship in &elements.owned_relationships {
                 owners[relationship] = Some(owner);
             }
         }
+        let frozen = self.elements.base_len();
+        if !self.elements.base_untouched() {
+            // A frozen row written since the freeze: no shared part.
+            let mut owners = vec![None; self.elements.len()];
+            for (owner, element) in self.elements.iter().enumerate() {
+                scan(element, &mut owners, owner);
+            }
+            return owners;
+        }
+        let library = self.prepared_from.as_ref().filter(|prepared| {
+            Arc::ptr_eq(
+                self.elements.base_arc(),
+                prepared.builder.elements.base_arc(),
+            ) && prepared.builder.elements.len() == frozen
+        });
+        let shared = match library {
+            Some(prepared) => Arc::clone(prepared.library_rel_owners()),
+            None => Arc::clone(self.prefix_relation_owners.get_or_init(|| {
+                let mut owners = vec![None; frozen];
+                for (owner, element) in self.elements.iter().enumerate().take(frozen) {
+                    scan(element, &mut owners, owner);
+                }
+                Arc::new(owners)
+            })),
+        };
+        let mut owners = vec![None; self.elements.len()];
+        // The shared part serves the rows it was made of: a build over the
+        // frozen rows cut to their source rows shares the cell with no
+        // other.
+        let from = if shared.len() == frozen {
+            owners[..frozen].copy_from_slice(&shared);
+            frozen
+        } else {
+            0
+        };
+        for (owner, element) in self.elements.iter().enumerate().skip(from) {
+            scan(element, &mut owners, owner);
+        }
         owners
+    }
+
+    /// The names implied relationships are planned by: the library's
+    /// qualified names by name, then a build's own library units' and its
+    /// external names (the later entry of a name winning). The frozen rows'
+    /// part is made once and shared by every build on them; a build with
+    /// names of its own takes a copy with them added.
+    pub(super) fn implied_names(&self) -> Arc<HashMap<String, Uuid>> {
+        if !self.lib_qnames.base_untouched() {
+            // A library name written since the freeze (an identity override):
+            // the shared part no longer describes these rows.
+            return Arc::new(
+                self.lib_qnames
+                    .iter()
+                    .map(|(id, segments)| (segments.join("::"), *id))
+                    .chain(
+                        self.external_implied_names
+                            .iter()
+                            .map(|(name, id)| (name.clone(), *id)),
+                    )
+                    .collect(),
+            );
+        }
+        let frozen = self.lib_qnames.base_len();
+        let shared = self.prefix_implied_names.get_or_init(|| {
+            Arc::new(
+                self.lib_qnames
+                    .iter()
+                    .take(frozen)
+                    .map(|(id, segments)| (segments.join("::"), *id))
+                    .collect(),
+            )
+        });
+        if self.lib_qnames.len() == frozen && self.external_implied_names.is_empty() {
+            return Arc::clone(shared);
+        }
+        let mut names = HashMap::clone(shared);
+        names.extend(
+            self.lib_qnames
+                .iter()
+                .skip(frozen)
+                .map(|(id, segments)| (segments.join("::"), *id)),
+        );
+        names.extend(
+            self.external_implied_names
+                .iter()
+                .map(|(name, id)| (name.clone(), *id)),
+        );
+        Arc::new(names)
     }
 
     /// The library bases each of `requirement_candidates` (types and variant
@@ -639,7 +1406,7 @@ impl Builder {
                 planning_charge(&mut steps, 1 + self.elements[i].owned_relationships.len())?;
                 let mut required = self.required_implied_plan(i, names, expression_targets, owners);
                 if let Some((raw, typing)) = &typing_structure {
-                    if conforms(self.elements[i].ty, "Feature")
+                    if is_a!(self.elements[i], "Feature")
                         && (self.graph_format == crate::model::GraphFormat::CanonicalV3
                             || self.elements[i]
                                 .props
@@ -690,6 +1457,20 @@ impl Builder {
         &mut self,
         names: &HashMap<String, Uuid>,
         use_library_cache: bool,
+        steps: Option<&mut usize>,
+    ) -> Option<Arc<SupportedImpliedSpecializations>> {
+        let previous = std::mem::replace(&mut self.implied_planning, true);
+        let plan = self.supported_implied_specializations_planning(names, use_library_cache, steps);
+        self.implied_planning = previous;
+        plan
+    }
+
+    /// [`Self::supported_implied_specializations_with_budget`] with the
+    /// planner flagged as running.
+    fn supported_implied_specializations_planning(
+        &mut self,
+        names: &HashMap<String, Uuid>,
+        use_library_cache: bool,
         mut steps: Option<&mut usize>,
     ) -> Option<Arc<SupportedImpliedSpecializations>> {
         self.refresh_supported_chain_evidence(steps.as_deref_mut())?;
@@ -717,8 +1498,8 @@ impl Builder {
             // All kind-based requirements belong to Types. Variant ownership
             // is an independent recipe, so retain even a non-Type variant row.
             // Collect during the already charged complete ownership scan.
-            if i < self.explicit_len()
-                && (conforms(element.ty, "Type")
+            if self.is_authored(i)
+                && (is_a!(element, "Type")
                     || element.owning_relationship.is_some_and(|membership| {
                         self.elements
                             .get(membership)
@@ -765,20 +1546,15 @@ impl Builder {
             &chain_bases,
             steps.as_deref_mut(),
         )?;
-        let mut by_owner = crate::layered::LayeredMap::<usize, Vec<Uuid>>::default();
+        let mut by_owner = RetainedByOwner::default();
         for (i, &(owner, edge)) in candidates.iter().enumerate() {
             planning_charge(&mut steps, 1)?;
             if retained[i] {
-                by_owner.entry(owner).or_default().push(edge.3);
+                by_owner.push(owner, edge.3);
             }
         }
         let plan = Arc::new(SupportedImpliedSpecializations {
-            candidates: Candidates {
-                library: None,
-                own: candidates,
-                kinds: kind_candidates,
-                retained,
-            },
+            candidates: Candidates::new(None, candidates, kind_candidates, retained),
             graph: graph.into_iter().collect(),
             by_owner,
             typing_by_owner: OnceLock::new(),
@@ -817,7 +1593,7 @@ impl Builder {
         for i in floor..end {
             let element = &self.elements[i];
             planning_charge(&mut steps, element.owned_relationships.len())?;
-            if conforms(element.ty, "Type")
+            if is_a!(element, "Type")
                 || element.owning_relationship.is_some_and(|membership| {
                     self.elements
                         .get(membership)
@@ -873,7 +1649,7 @@ impl Builder {
         for (i, &(owner, edge)) in candidates.iter().enumerate() {
             planning_charge(&mut steps, 1)?;
             if retained[i] {
-                by_owner.entry(owner).or_default().push(edge.3);
+                by_owner.push(owner, edge.3);
             }
         }
         let mut chain_bases = super::type_relations::FeatureChainBases {
@@ -883,12 +1659,12 @@ impl Builder {
         chain_bases.targets.extend(&chains.targets);
         chain_bases.incomplete.extend(&chains.incomplete);
         Some(Some(Arc::new(SupportedImpliedSpecializations {
-            candidates: Candidates {
-                library: Some(Arc::clone(plan)),
-                own: candidates,
-                kinds: kind_candidates,
+            candidates: Candidates::new(
+                Some(Arc::clone(plan)),
+                candidates,
+                kind_candidates,
                 retained,
-            },
+            ),
             graph: final_graph,
             by_owner,
             typing_by_owner: OnceLock::new(),
@@ -933,11 +1709,11 @@ impl Builder {
         explicit_len: usize,
         rel_owner: &[Option<usize>],
         chains: &super::type_relations::FeatureChainBases,
-        library: &crate::layered::LayeredMap<Uuid, Vec<Uuid>>,
+        library: &crate::id_graph::IdGraph,
         mut steps: Option<&mut usize>,
     ) -> Option<(Vec<bool>, SpecializationGraph)> {
         planning_charge(&mut steps, 1)?;
-        let mut graph: HashMap<Uuid, Vec<(Uuid, Option<usize>)>> = HashMap::new();
+        let mut graph: IdMap<Uuid, Vec<(Uuid, Option<usize>)>> = IdMap::default();
         for (r, relation) in self
             .elements
             .iter()
@@ -946,7 +1722,7 @@ impl Builder {
             .skip(floor)
         {
             planning_charge(&mut steps, 1)?;
-            if !conforms(relation.ty, "Specialization") {
+            if !is_a!(relation, "Specialization") {
                 continue;
             }
             let source = [
@@ -983,7 +1759,7 @@ impl Builder {
                 .or_default()
                 .push((self.elements[target].id, None));
         }
-        let mut visited = HashSet::new();
+        let mut visited = IdSet::default();
         let mut postorder = Vec::new();
         let mut todo = Vec::new();
         for &(owner, _) in candidates {
@@ -1011,7 +1787,7 @@ impl Builder {
             }
         }
         planning_charge(&mut steps, postorder.len())?;
-        let rank: HashMap<_, _> = postorder
+        let rank: IdMap<_, _> = postorder
             .into_iter()
             .enumerate()
             .map(|(rank, id)| (id, rank))
@@ -1024,7 +1800,7 @@ impl Builder {
         )?;
         planning_charge(&mut steps, candidates.len())?;
         let mut retained = vec![true; candidates.len()];
-        let mut seen = HashSet::new();
+        let mut seen = IdSet::default();
         let mut stack = Vec::new();
         for index in order {
             planning_charge(&mut steps, 1)?;
@@ -1073,7 +1849,7 @@ impl Builder {
             }
             retained[index] = !reaches;
         }
-        let mut final_graph = HashMap::new();
+        let mut final_graph = SpecializationGraph::default();
         for (source, edges) in graph {
             planning_charge(&mut steps, 1)?;
             let mut targets = Vec::new();
@@ -1101,11 +1877,80 @@ impl Builder {
         steps: Option<&mut usize>,
     ) -> Option<StaticPlannerBases> {
         let (own, own_incomplete) = self.own_positional_direct_bases(library, plan, steps)?;
-        let mut bases = library.bases.clone();
+        let mut bases = library.bases.to_map();
         bases.extend(own);
         let mut incomplete = library.bases_incomplete.clone();
         incomplete.extend(own_incomplete);
         Some((bases, incomplete))
+    }
+
+    /// The direct bases `plan` gives, as the static prefix keeps them: a
+    /// build that extends its prepared library's plans lays its own rows'
+    /// over the library's shared table (what
+    /// [`Self::positional_direct_bases_on_library`] joins into one), else
+    /// every row's are its own.
+    fn planned_direct_bases(
+        &mut self,
+        plan: &SupportedImpliedSpecializations,
+    ) -> Option<PlannedBases> {
+        if plan.library_configuration {
+            if let Some(library) = self.library_plans(None)? {
+                let (own, own_incomplete) =
+                    self.own_positional_direct_bases(&library, plan, None)?;
+                let mut bases = crate::layered::LayeredMap::over(library.bases_table());
+                for (owner, targets) in own {
+                    bases.insert(owner, targets);
+                }
+                let mut incomplete = library.bases_incomplete.clone();
+                incomplete.extend(own_incomplete);
+                return Some((bases, incomplete));
+            }
+        }
+        let (bases, incomplete) = self.positional_direct_bases_from_static_plan(plan, None)?;
+        Some((bases.into(), incomplete))
+    }
+
+    /// The specialization graph a materialization starts from: `plan`'s,
+    /// with the prepared library's own materialized edges in it. The rows
+    /// the edges change in the frozen graph the plan extends are made once,
+    /// shared by every build over it, and lie over it (see
+    /// [`PrefixImplied::graph_over`]); the plan's own rows lie over those,
+    /// each with the edges of its source.
+    fn planned_specializations(
+        &self,
+        plan: &SupportedImpliedSpecializations,
+    ) -> crate::id_graph::IdGraph {
+        let Some(prefix) = &self.prefix_implied else {
+            return plan.graph.clone();
+        };
+        if !self.elements.base_untouched() {
+            // A frozen row written since the freeze (an identity override
+            // remaps the rows' ids): the prefix's edges as its rows give
+            // them now, merged into a graph of this build's own.
+            let mut graph = plan.graph.clone();
+            for (source, target) in self.prefix_edges_now() {
+                let targets = graph.entry(source).or_default();
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+            return graph;
+        }
+        let frozen = plan.graph.frozen_arc();
+        let (rows, sources) = prefix.graph_over(frozen);
+        let mut graph = crate::id_graph::IdGraph::overlaid(Arc::clone(frozen), rows);
+        for (&source, targets) in plan.graph.local_iter() {
+            let mut targets = targets.clone();
+            if sources.binary_search(&source).is_ok() {
+                for target in prefix.targets_from(source) {
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+            }
+            graph.insert(source, targets);
+        }
+        graph
     }
 
     /// The direct bases of this build's own types, and those of its own types
@@ -1121,9 +1966,9 @@ impl Builder {
         let floor = library.rows;
         let end = self.explicit_len();
         planning_charge(&mut steps, end - floor)?;
-        let mut bases = HashMap::new();
-        let mut incomplete = HashSet::new();
-        let push = |bases: &mut HashMap<usize, Vec<usize>>,
+        let mut bases = IdMap::default();
+        let mut incomplete = IdSet::default();
+        let push = |bases: &mut IdMap<usize, Vec<usize>>,
                     steps: &mut Option<&mut usize>,
                     owner: usize,
                     target: usize| {
@@ -1138,7 +1983,7 @@ impl Builder {
             planning_charge(&mut steps, self.elements[owner].owned_relationships.len())?;
             for k in 0..self.elements[owner].owned_relationships.len() {
                 let relationship = self.elements[owner].owned_relationships[k];
-                if !conforms(self.elements[relationship].ty, "Specialization") {
+                if !is_a!(self.elements[relationship], "Specialization") {
                     continue;
                 }
                 let target = specialization_target(&self.elements[relationship])
@@ -1151,7 +1996,7 @@ impl Builder {
         }
         // A library plan's candidates are its own rows': the build's own
         // plan lists the build's rows'.
-        for (&(owner, edge), retained) in plan.candidates.own() {
+        for ((owner, edge), retained) in plan.candidates.own() {
             if owner < floor {
                 continue;
             }
@@ -1215,16 +2060,7 @@ impl Builder {
                     &mut Some(&mut *steps),
                     self.lib_qnames.len() + self.external_implied_names.len(),
                 )?;
-                let names = self
-                    .lib_qnames
-                    .iter()
-                    .map(|(id, segments)| (segments.join("::"), *id))
-                    .chain(
-                        self.external_implied_names
-                            .iter()
-                            .map(|(name, id)| (name.clone(), *id)),
-                    )
-                    .collect();
+                let names = self.implied_names();
                 self.supported_implied_specializations_with_budget(
                     &names,
                     library_configuration,
@@ -1237,8 +2073,8 @@ impl Builder {
             return Some(Arc::clone(typing));
         }
         planning_charge(&mut Some(&mut *steps), plan.candidates.len())?;
-        let mut typing = RetainedTypings::new();
-        for (&(owner, edge), retained) in plan.candidates.iter() {
+        let mut typing = RetainedTypings::default();
+        for ((owner, edge), retained) in plan.candidates.iter() {
             if retained && (conforms(edge.0, "FeatureTyping") || conforms(edge.0, "Subsetting")) {
                 typing.entry(owner).or_default().push((edge.0, edge.3));
             }
@@ -1285,7 +2121,7 @@ impl Builder {
             }
         }
         let owner = self.elements.get(element)?;
-        if !conforms(owner.ty, "Type") {
+        if !is_a!(owner, "Type") {
             return None;
         }
         planning_charge(&mut budget, owner.owned_relationships.len())?;
@@ -1296,7 +2132,7 @@ impl Builder {
             .filter(|&r| {
                 self.elements
                     .get(r)
-                    .is_some_and(|e| conforms(e.ty, "Conjugation"))
+                    .is_some_and(|e| is_a!(e, "Conjugation"))
             })
             .collect();
         if self.id_index.is_none() || self.id_index_built_for != self.elements.len() {
@@ -1319,7 +2155,7 @@ impl Builder {
         let mut targets = Vec::new();
         for relationship in relationships {
             let relation = self.elements.get(relationship)?;
-            if !conforms(relation.ty, "Specialization")
+            if !is_a!(relation, "Specialization")
                 || (!include_implied
                     && relation.props.get("isImplied").and_then(|v| v.as_bool()) == Some(true))
             {
@@ -1384,16 +2220,7 @@ impl Builder {
                     &mut budget,
                     self.lib_qnames.len() + self.external_implied_names.len(),
                 )?;
-                let names = self
-                    .lib_qnames
-                    .iter()
-                    .map(|(id, segments)| (segments.join("::"), *id))
-                    .chain(
-                        self.external_implied_names
-                            .iter()
-                            .map(|(name, id)| (name.clone(), *id)),
-                    )
-                    .collect();
+                let names = self.implied_names();
                 self.supported_implied_specializations_with_budget(
                     &names,
                     library_configuration,
@@ -1401,7 +2228,7 @@ impl Builder {
                 )?
             }
         };
-        for &id in plan.by_owner.get(&element).into_iter().flatten() {
+        for &id in plan.by_owner.get(element).into_iter().flatten() {
             planning_charge(&mut budget, 1 + targets.len())?;
             let target = self.element_index_of_uuid(id)?;
             if !conforms(self.elements.get(target)?.ty, "Type") {
@@ -1441,7 +2268,7 @@ impl Builder {
         Some(targets)
     }
 
-    fn expression_target_names(
+    pub(super) fn expression_target_names(
         &mut self,
         names: &HashMap<String, Uuid>,
         budget: &mut Option<&mut usize>,
@@ -1644,9 +2471,7 @@ impl Builder {
     /// deliberately excludes name-lookup convenience heritage and standalone
     /// specializations owned elsewhere. Retained implied requirements come from
     /// exactly the same plan used by the materialized relationship view.
-    pub(super) fn positional_direct_bases(
-        &mut self,
-    ) -> (HashMap<usize, Vec<usize>>, HashSet<usize>) {
+    pub(super) fn positional_direct_bases(&mut self) -> (IdMap<usize, Vec<usize>>, IdSet<usize>) {
         self.positional_direct_bases_with_budget(None)
             .expect("unbounded base planning cannot exhaust")
     }
@@ -1690,16 +2515,7 @@ impl Builder {
         for name in self.external_implied_names.keys() {
             planning_charge(&mut steps, name.len())?;
         }
-        let names = self
-            .lib_qnames
-            .iter()
-            .map(|(id, segments)| (segments.join("::"), *id))
-            .chain(
-                self.external_implied_names
-                    .iter()
-                    .map(|(name, id)| (name.clone(), *id)),
-            )
-            .collect();
+        let names = self.implied_names();
         let plan = self.supported_implied_specializations_with_budget(
             &names,
             self.external_implied_names.is_empty(),
@@ -1745,15 +2561,15 @@ impl Builder {
 
     /// The library configuration's names and implied plan of every row,
     /// planned whole, with its shared tables frozen: a prepared library's own
-    /// (see [`super::LibraryPlans`]). The plan is taken from this builder.
+    /// (see [`super::LibraryPlans`]). The plan is taken from this builder;
+    /// the names are the table every build on the library shares.
     pub(super) fn library_rows_implied(
         &mut self,
-    ) -> (HashMap<String, Uuid>, Arc<SupportedImpliedSpecializations>) {
-        let names = self
-            .lib_qnames
-            .iter()
-            .map(|(id, segments)| (segments.join("::"), *id))
-            .collect();
+    ) -> (
+        Arc<HashMap<String, Uuid>>,
+        Arc<SupportedImpliedSpecializations>,
+    ) {
+        let names = self.implied_names();
         let plan = self.supported_implied_specializations(&names, true);
         self.supported_implied = None;
         // Held once here; a plan held elsewhere too is shared unfrozen.
@@ -1768,22 +2584,36 @@ impl Builder {
         mut steps: Option<&mut usize>,
     ) -> Option<StaticPlannerBases> {
         planning_charge(&mut steps, self.explicit_len())?;
-        let by_id: HashMap<_, _> = self
-            .elements
-            .iter()
-            .take(self.explicit_len())
-            .enumerate()
-            .map(|(i, element)| (element.id, i))
+        // The authored rows by id, a later row winning: this build's own
+        // under the frozen rows' shared map (a materialized row's id names
+        // no authored row), else every authored row's.
+        let own_from = self
+            .prefix_ids
+            .as_ref()
+            .filter(|_| self.elements.base_untouched())
+            .map_or(0, |_| self.lib_boundary);
+        let own_by_id: HashMap<Uuid, usize> = (own_from..self.explicit_len())
+            .map(|i| (self.elements[i].id, i))
             .collect();
-        let mut incomplete = HashSet::new();
-        let mut bases: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (owner, element) in self.elements.iter().take(self.explicit_len()).enumerate() {
+        let by_id = |id: &Uuid| {
+            own_by_id.get(id).copied().or_else(|| {
+                self.prefix_ids
+                    .as_ref()
+                    .filter(|_| own_from > 0)?
+                    .get(id)
+                    .copied()
+                    .filter(|&i| self.is_authored(i))
+            })
+        };
+        let mut incomplete = IdSet::default();
+        let mut bases: IdMap<usize, Vec<usize>> = IdMap::default();
+        for owner in self.authored_rows() {
+            let element = &self.elements[owner];
             planning_charge(&mut steps, element.owned_relationships.len())?;
             for &relationship in &element.owned_relationships {
                 let relation = &self.elements[relationship];
-                if conforms(relation.ty, "Specialization") {
-                    if let Some(target) =
-                        specialization_target(relation).and_then(|id| by_id.get(&id).copied())
+                if is_a!(relation, "Specialization") {
+                    if let Some(target) = specialization_target(relation).and_then(|id| by_id(&id))
                     {
                         let targets = bases.entry(owner).or_default();
                         planning_charge(&mut steps, targets.len().saturating_add(1))?;
@@ -1794,10 +2624,10 @@ impl Builder {
                 }
             }
         }
-        for (&(owner, edge), retained) in plan.candidates.iter() {
+        for ((owner, edge), retained) in plan.candidates.iter() {
             planning_charge(&mut steps, 1)?;
             if retained {
-                if let Some(&target) = by_id.get(&edge.3) {
+                if let Some(target) = by_id(&edge.3) {
                     let targets = bases.entry(owner).or_default();
                     planning_charge(&mut steps, targets.len().saturating_add(1))?;
                     if !targets.contains(&target) {
@@ -1881,7 +2711,7 @@ impl Builder {
                                     | "PartUsage"
                             )
                         {
-                            let owner_types = if conforms(self.elements[owner].ty, "Feature") {
+                            let owner_types = if is_a!(self.elements[owner], "Feature") {
                                 // A missing witness contributes no guessed owner
                                 // type. Metaclass-specific conditions remain
                                 // independent of these existential witnesses.
@@ -1960,7 +2790,7 @@ impl Builder {
             planning_charge(budget, 1)?;
             // A dynamic suffix cannot become a new input to its immutable
             // static prefix. Generated typings need their own producer proof.
-            if relationship >= self.explicit_len()
+            if !self.is_authored(relationship)
                 || !conforms(self.elements.get(relationship)?.ty, "FeatureTyping")
             {
                 continue;
@@ -1992,7 +2822,7 @@ impl Builder {
             let target = target?;
             planning_charge(budget, TYPED_FEATURE_BASES.len())?;
             for (needed, (kind, _)) in required.iter_mut().zip(TYPED_FEATURE_BASES) {
-                *needed |= conforms(self.elements[target].ty, kind);
+                *needed |= self.elements[target].conforms(kind);
             }
         }
         Some(required)
@@ -2245,6 +3075,7 @@ impl Builder {
 impl ResolvedModel {
     /// Materialize the implied relationships on first demand.
     pub(super) fn ensure_implied(&mut self) {
+        self.implied_deferred = false;
         let status = self.b.ensure_semantic_graph();
         assert_eq!(
             status,
@@ -2254,6 +3085,16 @@ impl ResolvedModel {
         self.sync_semantic_publication();
         self.ensure_by_id();
         self.ensure_rel_owner();
+    }
+
+    /// Make the implied relationships when a derived read deferred them (see
+    /// `implied_deferred`): before an operation that acts on them differently
+    /// once they are made, so it finds them as it would have had that read
+    /// made them.
+    pub(super) fn make_deferred_implied(&mut self) {
+        if self.implied_deferred {
+            self.ensure_implied();
+        }
     }
 
     /// References and IDs can be patched after lazy materialization. Rebuild
@@ -2283,7 +3124,7 @@ impl ResolvedModel {
         }
         let target = self.b.elements[ancestor.0].id;
         let mut stack = vec![self.b.elements[e.0].id];
-        let mut seen = HashSet::new();
+        let mut seen = IdSet::default();
         while let Some(at) = stack.pop() {
             if at == target {
                 return true;
@@ -2338,11 +3179,17 @@ impl ResolvedModel {
 
     /// Whether `e` is a materialized implied relationship.
     pub fn is_implied(&self, e: ElementRef) -> bool {
-        self.b
+        (self
+            .b
             .semantic_ownership
             .as_ref()
             .is_some_and(|view| view.contains(e.0))
-            && conforms(self.b.elements[e.0].ty, "Relationship")
+            || self
+                .b
+                .prefix_ownership
+                .as_ref()
+                .is_some_and(|prefix| prefix.contains(e.0)))
+            && is_a!(self.b.elements[e.0], "Relationship")
     }
 }
 
@@ -2474,14 +3321,14 @@ mod value_context_tests {
         let specialization = *r.b.elements[y]
             .owned_relationships
             .iter()
-            .find(|&&rel| conforms(r.b.elements[rel].ty, "Specialization"))
+            .find(|&&rel| is_a!(r.b.elements[rel], "Specialization"))
             .unwrap();
         r.b.elements[x].owned_relationships.push(specialization);
         assert_eq!(r.b.value_context_bases(x, &mut 0), Some(vec![a]));
         let relation = *r.b.elements[x]
             .owned_relationships
             .iter()
-            .find(|&&rel| conforms(r.b.elements[rel].ty, "Conjugation"))
+            .find(|&&rel| is_a!(r.b.elements[rel], "Conjugation"))
             .unwrap();
         r.b.elements[x].owned_relationships.push(relation);
         assert_eq!(r.b.value_context_bases(x, &mut 0), None);
@@ -2646,7 +3493,7 @@ mod invocation_static_tests {
                 !plan
                     .candidates
                     .iter()
-                    .any(|((owner, _), _)| *owner == expression)
+                    .any(|((owner, _), _)| owner == expression)
             );
         }
     }
@@ -2671,7 +3518,7 @@ mod invocation_static_tests {
             let actual: Vec<_> = plan
                 .candidates
                 .iter()
-                .filter_map(|((owner, edge), _)| (*owner == expression).then_some(edge.3))
+                .filter_map(|((owner, edge), _)| (owner == expression).then_some(edge.3))
                 .collect();
             // Losing the Expression role does not remove the independent
             // Step and Feature requirements. Duplicate identity still makes
@@ -2697,7 +3544,7 @@ mod invocation_static_tests {
 /// A work-limited attempt retries only after binding invalidates this state.
 /// Attempted is NOT a conformance claim: only view.result(e) proves an admitted
 /// subtree. Unknown/malformed/colliding expressions have no positive entry.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum OwnedResultState {
     Pending,
     Attempted,
@@ -2748,11 +3595,11 @@ impl ResolvedModel {
                             .elements
                             .get(result.membership)
                             .is_some_and(|membership| {
-                                conforms(membership.ty, "ReturnParameterMembership")
+                                is_a!(membership, "ReturnParameterMembership")
                                     && *membership.children == [result.feature]
                             })
                         && self.b.elements.get(result.feature).is_some_and(|feature| {
-                            conforms(feature.ty, "Feature")
+                            is_a!(feature, "Feature")
                                 && feature.owning_relationship == Some(result.membership)
                         })
                 })
@@ -2964,7 +3811,7 @@ mod constructor_static_tests {
                 !plan
                     .candidates
                     .iter()
-                    .any(|((owner, _), _)| *owner == expression)
+                    .any(|((owner, _), _)| owner == expression)
             );
         }
     }
@@ -2993,7 +3840,7 @@ mod constructor_static_tests {
             let actual: Vec<_> = plan
                 .candidates
                 .iter()
-                .filter_map(|((owner, edge), _)| (*owner == expression).then_some(edge.3))
+                .filter_map(|((owner, edge), _)| (owner == expression).then_some(edge.3))
                 .collect();
             let expected = if duplicate_uuid {
                 vec![]
@@ -3298,7 +4145,7 @@ mod expression_static_tests {
             let actual: Vec<_> = plan
                 .candidates
                 .iter()
-                .filter_map(|((owner, edge), _)| (*owner == expression.0).then_some(edge.3))
+                .filter_map(|((owner, edge), _)| (owner == expression.0).then_some(edge.3))
                 .collect();
             assert_eq!(
                 actual,
@@ -3354,7 +4201,7 @@ mod expression_static_tests {
                     r.b.elements[other.0].id = r.element_id(target);
                 }
                 4 => {
-                    r.b.elements[target.0].ty = "Feature";
+                    r.b.elements[target.0].set_ty("Feature");
                 }
                 5 => {
                     configuration.insert(
@@ -3374,7 +4221,7 @@ mod expression_static_tests {
             let actual: Vec<_> = plan
                 .candidates
                 .iter()
-                .filter_map(|((owner, edge), _)| (*owner == expression.0).then_some(edge.3))
+                .filter_map(|((owner, edge), _)| (owner == expression.0).then_some(edge.3))
                 .collect();
             assert_eq!(
                 actual,
@@ -3481,7 +4328,7 @@ mod expression_fixed_role_tests {
     fn retained_targets(plan: &SupportedImpliedSpecializations, owner: usize) -> Vec<Uuid> {
         plan.candidates
             .iter()
-            .filter_map(|((at, edge), retained)| (*at == owner && retained).then_some(edge.3))
+            .filter_map(|((at, edge), retained)| (at == owner && retained).then_some(edge.3))
             .collect()
     }
     fn generic_literal(r: &mut ResolvedModel) -> ElementRef {
@@ -3495,7 +4342,7 @@ mod expression_fixed_role_tests {
                 .0;
         // Generic LiteralExpression has no dedicated textual production. Use
         // a model-level fixture to exercise its inherited static obligation.
-        r.b.elements[i].ty = "LiteralExpression";
+        r.b.elements[i].set_ty("LiteralExpression");
         let kept = r.b.elements[i].props.to_json();
         r.b.elements[i].props = crate::properties::Properties::new();
         for (key, value) in kept {
@@ -3651,7 +4498,7 @@ mod expression_fixed_role_tests {
                 "flag case {i}"
             );
             if i >= 3 {
-                assert!(!plan.candidates.iter().any(|((at, edge), _)| *at == owner.0
+                assert!(!plan.candidates.iter().any(|((at, edge), _)| at == owner.0
                     && [r.element_id(yes), r.element_id(no)].contains(&edge.3)));
             }
         }
@@ -3720,10 +4567,10 @@ mod expression_fixed_role_tests {
                         ));
                     }
                     3 => {
-                        r.b.elements[target.0].ty = "Class";
+                        r.b.elements[target.0].set_ty("Class");
                     }
-                    4 => r.b.elements[target.0].ty = "Feature",
-                    5 => r.b.elements[target.0].ty = "Step",
+                    4 => r.b.elements[target.0].set_ty("Feature"),
+                    5 => r.b.elements[target.0].set_ty("Step"),
                     _ => unreachable!(),
                 }
                 r.b.id_index = None;
@@ -3738,7 +4585,7 @@ mod expression_fixed_role_tests {
                     !plan
                         .candidates
                         .iter()
-                        .any(|((at, edge), _)| *at == owner.0 && edge.3 == r.element_id(target)),
+                        .any(|((at, edge), _)| at == owner.0 && edge.3 == r.element_id(target)),
                     "untrusted narrower role survived"
                 );
             }
@@ -3757,7 +4604,7 @@ mod expression_fixed_role_tests {
         r.b.id_index = None;
         r.b.supported_implied = None;
         let plan = r.b.supported_implied_specializations(&names(&r), true);
-        assert!(!plan.candidates.iter().any(|((at, _), _)| *at == owner.0));
+        assert!(!plan.candidates.iter().any(|((at, _), _)| at == owner.0));
         for ty in [
             "LiteralBoolean",
             "LiteralInteger",
@@ -3828,13 +4675,13 @@ mod sysml_assertion_role_tests {
     fn candidates(plan: &SupportedImpliedSpecializations, owner: usize) -> Vec<Uuid> {
         plan.candidates
             .iter()
-            .filter_map(|((at, edge), _)| (*at == owner).then_some(edge.3))
+            .filter_map(|((at, edge), _)| (at == owner).then_some(edge.3))
             .collect()
     }
     fn retained(plan: &SupportedImpliedSpecializations, owner: usize) -> Vec<Uuid> {
         plan.candidates
             .iter()
-            .filter_map(|((at, edge), retained)| (*at == owner && retained).then_some(edge.3))
+            .filter_map(|((at, edge), retained)| (at == owner && retained).then_some(edge.3))
             .collect()
     }
     #[test]
@@ -4009,10 +4856,10 @@ mod sysml_assertion_role_tests {
                         ));
                     }
                     3 => {
-                        r.b.elements[target.0].ty = "Feature";
+                        r.b.elements[target.0].set_ty("Feature");
                     }
                     4 => {
-                        r.b.elements[target.0].ty = "Class";
+                        r.b.elements[target.0].set_ty("Class");
                     }
                     _ => unreachable!(),
                 }
@@ -4228,17 +5075,9 @@ impl Builder {
         }
         let owners = self.semantic_relationship_owners();
         let from = self.elements.len();
-        let lib_by_name: HashMap<String, Uuid> = self
-            .lib_qnames
-            .iter()
-            .map(|(id, segments)| (segments.join("::"), *id))
-            .chain(
-                self.external_implied_names
-                    .iter()
-                    .map(|(name, id)| (name.clone(), *id)),
-            )
-            .collect();
-        let mut ownership = super::semantic_ownership::SemanticOwnership::new(from);
+        let lib_by_name = self.implied_names();
+        let mut ownership =
+            super::semantic_ownership::SemanticOwnership::new(from, self.prefix_ownership.clone());
         // Capture a newly computed positional authority together with the
         // recipes below, rather than certifying an older compatibility cache.
         self.positional_redefinitions = None;
@@ -4247,14 +5086,13 @@ impl Builder {
             &lib_by_name,
             self.external_implied_names.is_empty(),
         );
-        let mut specializations: SpecializationGraph = plan
-            .graph
-            .iter()
-            .map(|(&source, targets)| (source, targets.clone()))
-            .collect();
+        let mut specializations = self.planned_specializations(&plan);
+        // A build on a library that carries its own materialized rows
+        // materializes its own rows only: the library's lie in the prefix.
+        let own_from = self.own_rows_start();
         let mut planned = Vec::new();
-        for (&(owner, edge), retained) in plan.candidates.iter() {
-            if retained {
+        for ((owner, edge), retained) in plan.candidates.iter() {
+            if retained && owner >= own_from {
                 let legacy_slot = (owner >= self.lib_boundary)
                     .then(|| {
                         self.legacy_implied_plan_with_owners(owner, &lib_by_name, &owners)
@@ -4265,17 +5103,16 @@ impl Builder {
                 planned.push((owner, edge, legacy_slot));
             }
         }
-        let mut positional: Vec<_> = self
-            .positional_redefinitions
-            .as_ref()
-            .unwrap()
+        let positional_plan = self.positional_redefinitions.as_ref().unwrap();
+        let mut positional: Vec<(usize, &Vec<usize>)> = positional_plan
             .targets
             .iter()
-            .map(|(&source, targets)| (source, targets.clone()))
+            .filter(|(&source, _)| source >= own_from)
+            .map(|(&source, targets)| (source, targets))
             .collect();
         positional.sort_by_key(|(source, _)| *source);
         for (source, targets) in positional {
-            for target in targets {
+            for &target in targets {
                 let target_id = self.elements[target].id;
                 planned.push((
                     source,
@@ -4298,7 +5135,7 @@ impl Builder {
         // current static authority; no second whole-model positional run is
         // needed before checking the rows we are about to append.
         let (planner_bases, planner_incomplete) = self
-            .positional_direct_bases_from_static_plan(&plan, None)
+            .planned_direct_bases(&plan)
             .expect("unbounded static base capture");
         let static_prefix = Arc::new(super::semantic_batch::StaticPrefix {
             authored_end: from,
@@ -4314,7 +5151,7 @@ impl Builder {
             planner_incomplete,
             specializations: specializations.clone(),
         });
-        let mut static_owners = HashSet::new();
+        let mut static_owners = IdSet::default();
         for row in &static_prefix.rows {
             let i = row.owner;
             static_owners.insert(i);
@@ -4324,6 +5161,7 @@ impl Builder {
             props.insert(row.target_key, json!({ "@id": row.target.to_string() }));
             self.elements.push(Elem {
                 ty: row.kind,
+                meta: crate::metaclass::meta_of(row.kind),
                 id: row.id,
                 path: String::new(),
                 path_parent: None,
@@ -4351,6 +5189,10 @@ impl Builder {
             static_rows: self.elements.observe_revision(),
             static_owners,
         });
+        if self.prefix_static_only {
+            self.publication.published();
+            return;
+        }
         let before = self.publication.revision();
         self.materialize_owned_results(Some(static_prefix));
         if before.same_as(&self.publication.revision()) {
@@ -4383,10 +5225,10 @@ impl Builder {
         };
         let plans = plans.unwrap_or_default();
         let mut dynamic_steps = plans.len().saturating_mul(11);
-        let mut reserved: HashSet<_> = if dynamic_steps <= crate::eval::MAX_STEPS {
+        let mut reserved: IdSet<_> = if dynamic_steps <= crate::eval::MAX_STEPS {
             plans.iter().flat_map(|plan| plan.ids()).collect()
         } else {
-            HashSet::new()
+            IdSet::default()
         };
         let mut default_steps = 0;
         let default_plans =
@@ -4480,7 +5322,7 @@ impl Builder {
         let local = if local_steps > crate::eval::MAX_STEPS {
             Err(super::dynamic_invocations::Refusal::WorkLimit)
         } else if local_roles.is_empty() {
-            Ok(HashSet::new())
+            Ok(IdSet::default())
         } else {
             super::local_featuring::prepare(self, &rows, &local_roles, &mut local_steps).map(
                 |plan| {
@@ -4593,7 +5435,7 @@ impl Builder {
         let owners = self.semantic_relationship_owners();
         let (_, graph) = self.required_specialization_edges(&[], self.elements.len(), &owners);
         if let Some(table) = self.implied.as_mut() {
-            table.specializations = graph;
+            table.specializations = graph.into();
         }
     }
     /// The former plan, used only to preserve identifiers for relationships
@@ -4739,7 +5581,7 @@ mod central_publication_tests {
         r.ensure_implied();
         let count = r.b.elements.len();
         let revision = r.b.publication.revision();
-        r.redefiner_index = Some(HashMap::new());
+        r.redefiner_index = Some(IdMap::default());
         r.import_truncated.insert((0, true), true);
         r.b.discard_semantic_result_tail();
         assert_eq!(
@@ -4789,10 +5631,18 @@ impl Builder {
         if fixed > candidates.len() {
             return None;
         }
-        let mut graph: HashMap<Uuid, Vec<(Uuid, Option<usize>)>> = HashMap::new();
+        let mut graph: IdMap<Uuid, Vec<(Uuid, Option<usize>)>> = IdMap::default();
+        // A planner reads the source rows' edges: a prepared library's own
+        // materialized rows are the plan's output, not its input (the dynamic
+        // planner takes them as fixed recipes, see
+        // `Builder::prefix_static_candidates`). A caller outside planning
+        // that asks for every row (a recertification, a refresh) reads the
+        // materialized rows' edges, the library's among them, as a build
+        // from source would.
+        let every_row = explicit_len == self.elements.len() && !self.planning();
         for (r, relation) in self.elements.iter().take(explicit_len).enumerate() {
             planning_charge(&mut steps, 1)?;
-            if !conforms(relation.ty, "Specialization") {
+            if !is_a!(relation, "Specialization") || (!every_row && !self.is_authored(r)) {
                 continue;
             }
             let source = [
@@ -4833,7 +5683,7 @@ impl Builder {
         // chain, each candidate can then find the next ancestor's still-live
         // base edge immediately instead of repeatedly walking to the root.
         // Reverse DFS postorder also handles cycles without recursion.
-        let mut visited = HashSet::new();
+        let mut visited = IdSet::default();
         let mut postorder = Vec::new();
         let mut todo = Vec::new();
         for &(owner, _) in candidates {
@@ -4864,7 +5714,7 @@ impl Builder {
             }
         }
         planning_charge(&mut steps, postorder.len())?;
-        let rank: HashMap<_, _> = postorder
+        let rank: IdMap<_, _> = postorder
             .into_iter()
             .enumerate()
             .map(|(rank, id)| (id, rank))
@@ -4881,7 +5731,7 @@ impl Builder {
         )?;
         planning_charge(&mut steps, candidates.len())?;
         let mut retained = vec![true; candidates.len()];
-        let mut seen = HashSet::new();
+        let mut seen = IdSet::default();
         let mut stack = Vec::new();
         for index in order {
             planning_charge(&mut steps, 1)?;
@@ -4923,7 +5773,7 @@ impl Builder {
             }
             retained[index] = !reaches;
         }
-        let mut final_graph = HashMap::new();
+        let mut final_graph = SpecializationGraph::default();
         for (source, edges) in graph {
             planning_charge(&mut steps, 1)?;
             let mut targets = Vec::new();
@@ -4981,10 +5831,13 @@ impl Builder {
             planning_charge(&mut steps, element.owned_relationships.len())?;
         }
         let owners = self.specialization_relation_owners();
+        // A build on a library that carries its own materialized rows has
+        // its own rows' recipes only, as it materializes them.
+        let own_from = self.own_rows_start();
         let mut rows = Vec::new();
-        for (&(owner, edge), retained) in required.candidates.iter() {
+        for ((owner, edge), retained) in required.candidates.iter() {
             planning_charge(&mut steps, 1)?;
-            if !retained {
+            if !retained || owner < own_from {
                 continue;
             }
             let legacy_slot = if owner >= self.lib_boundary {
@@ -5007,7 +5860,12 @@ impl Builder {
                 (usize::BITS - positional.targets.len().max(1).leading_zeros()) as usize + 1,
             ),
         )?;
-        let mut sources: Vec<_> = positional.targets.keys().copied().collect();
+        let mut sources: Vec<_> = positional
+            .targets
+            .keys()
+            .copied()
+            .filter(|&source| source >= own_from)
+            .collect();
         sources.sort_unstable();
         for source in sources {
             let targets = &positional.targets[&source];
@@ -5026,10 +5884,11 @@ impl Builder {
                 ));
             }
         }
-        let mut specializations = HashMap::new();
-        for (&source, targets) in &required.graph {
+        // The plan's own rows over its frozen graph: the own rows are
+        // charged, the frozen graph is shared.
+        let mut specializations = required.graph.clone();
+        for (_, targets) in specializations.local_iter() {
             planning_charge(&mut steps, targets.len().saturating_add(1))?;
-            specializations.insert(source, targets.clone());
         }
         for row in &rows {
             planning_charge(&mut steps, 1)?;
@@ -5043,7 +5902,7 @@ impl Builder {
             authored_end: self.explicit_len(),
             rows,
             positional: Arc::new(positional),
-            planner_bases: direct_bases,
+            planner_bases: direct_bases.into(),
             planner_incomplete: incomplete_bases,
             chain_bases: Arc::clone(&required.chain_bases),
             specializations,
@@ -5416,7 +6275,7 @@ mod partial_expression_role_tests {
     fn retained(plan: &SupportedImpliedSpecializations, owner: usize) -> Vec<Uuid> {
         plan.candidates
             .iter()
-            .filter_map(|((at, edge), retained)| (*at == owner && retained).then_some(edge.3))
+            .filter_map(|((at, edge), retained)| (at == owner && retained).then_some(edge.3))
             .collect()
     }
 
@@ -5516,7 +6375,7 @@ mod partial_expression_role_tests {
             let owner = expression(&r, "LiteralInteger");
             // Planning depends on metaclass, not literal value. This exercises
             // abstract-syntax kinds without pretending they share text syntax.
-            r.b.elements[owner.0].ty = ty;
+            r.b.elements[owner.0].set_ty(ty);
             let configuration = names(&r);
             let plan = r.b.supported_implied_specializations(&configuration, true);
             let mut expected = vec![configuration[expression_implied_base(ty).unwrap()]];
@@ -5527,7 +6386,7 @@ mod partial_expression_role_tests {
             let actual: Vec<_> = plan
                 .candidates
                 .iter()
-                .filter_map(|((at, edge), _)| (*at == owner.0).then_some(edge.3))
+                .filter_map(|((at, edge), _)| (at == owner.0).then_some(edge.3))
                 .collect();
             assert_eq!(
                 actual, expected,
@@ -5572,13 +6431,13 @@ mod partial_expression_role_tests {
                         configuration.remove(role);
                     }
                     1 => {
-                        r.b.elements[target.0].ty = "Class";
+                        r.b.elements[target.0].set_ty("Class");
                     }
                     2 => {
-                        r.b.elements[target.0].ty = "Feature";
+                        r.b.elements[target.0].set_ty("Feature");
                     }
                     3 => {
-                        r.b.elements[target.0].ty = "Step";
+                        r.b.elements[target.0].set_ty("Step");
                     }
                     4 => {
                         let other = r.resolve_qualified("Performances::other").unwrap();
@@ -5605,7 +6464,7 @@ mod partial_expression_role_tests {
                     !plan
                         .candidates
                         .iter()
-                        .any(|((at, edge), _)| *at == owner.0 && edge.3 == r.element_id(target))
+                        .any(|((at, edge), _)| at == owner.0 && edge.3 == r.element_id(target))
                 );
                 assert!(!plan.expression_targets.contains_key(role));
             }
@@ -5644,7 +6503,7 @@ mod generic_feature_tests {
         let plan = r.b.supported_implied_specializations(&names(r), true);
         plan.candidates
             .iter()
-            .filter_map(|((e, edge), _)| (*e == owner).then_some(edge.3))
+            .filter_map(|((e, edge), _)| (e == owner).then_some(edge.3))
             .collect()
     }
     #[test]
@@ -5677,7 +6536,7 @@ mod generic_feature_tests {
                 0 => {
                     configuration.remove(FEATURE_BASE);
                 }
-                1 => r.b.elements[target.0].ty = "Class",
+                1 => r.b.elements[target.0].set_ty("Class"),
                 2 => {
                     let other = r.resolve_qualified("Base::narrow").unwrap();
                     r.b.lib_qnames
@@ -5701,7 +6560,7 @@ mod generic_feature_tests {
                 !plan.expression_targets.contains_key(FEATURE_BASE),
                 "mode {mode}"
             );
-            assert!(!plan.candidates.iter().any(|((owner, _), _)| *owner == e.0));
+            assert!(!plan.candidates.iter().any(|((owner, _), _)| owner == e.0));
         }
     }
     #[test]
@@ -5868,8 +6727,14 @@ mod checked_chain_base_tests {
             r.b.static_specialization_prefix(&HashMap::new(), true, Some(&mut 0))
                 .unwrap();
         assert_eq!(prefix.chain_bases.targets[&chain], last);
-        assert!(prefix.planner_bases[&chain].contains(&last));
-        assert!(prefix.specializations[&r.b.elements[chain].id].contains(&r.b.elements[last].id));
+        assert!(prefix.planner_bases.get(&chain).unwrap().contains(&last));
+        assert!(
+            prefix
+                .specializations
+                .get(&r.b.elements[chain].id)
+                .unwrap()
+                .contains(&r.b.elements[last].id)
+        );
         assert!(prefix.positional.targets[&q].contains(&p));
         let supers = super::super::type_relations::TypeRelations::default()
             .checked_supertypes(&mut r.b, chain, true, &mut 0)
@@ -5881,7 +6746,7 @@ mod checked_chain_base_tests {
             super::super::dynamic_invocations::prepare(
                 &mut r.b,
                 prefix,
-                &HashSet::new(),
+                &IdSet::default(),
                 None,
                 &mut 0
             ),
@@ -6346,7 +7211,7 @@ mod owned_typing_requirement_tests {
         let plan = r.b.supported_implied_specializations(&names(r), true);
         plan.candidates
             .iter()
-            .filter_map(|((source, edge), _)| (*source == owner).then_some(edge.3))
+            .filter_map(|((source, edge), _)| (source == owner).then_some(edge.3))
             .collect()
     }
     fn typing(r: &ResolvedModel, owner: usize) -> usize {
@@ -6528,7 +7393,7 @@ mod owned_typing_requirement_tests {
                     0 => {
                         configuration.remove(role_name);
                     }
-                    1 => r.b.elements[role.0].ty = "Class",
+                    1 => r.b.elements[role.0].set_ty("Class"),
                     2 => r.b.lib_qnames.push((
                         r.element_id(other),
                         role_name.split("::").map(str::to_owned).collect(),
@@ -6570,7 +7435,7 @@ mod owned_typing_requirement_tests {
         assert!(
             plan.candidates
                 .iter()
-                .any(|((source, edge), _)| *source == object.0 && edge.3 == r.element_id(role))
+                .any(|((source, edge), _)| source == object.0 && edge.3 == r.element_id(role))
         );
         assert!(!r.b.physical_static_authority_current());
     }
@@ -6599,6 +7464,86 @@ mod binary_role_tests {
         interface iu { end port a; end port b; }
         ref decoy;";
 
+    /// Attribute and enumeration definitions specialize `Base::DataValue` and
+    /// their usages subset `Base::dataValues` — the elements the SysML
+    /// `Attributes` aliases name — as a usage written against the alias does;
+    /// a base named by its alias would not be found among the library's
+    /// element names, and the usages would fall back to `Base::things`.
+    #[test]
+    fn attribute_and_enumeration_kinds_specialize_the_data_value_bases() {
+        const BASE: &str = "standard library package Base { abstract classifier Anything; abstract datatype DataValue :> Anything; abstract feature things : Anything; abstract feature dataValues : DataValue :> things; }";
+        const ATTRIBUTES: &str = "standard library package Attributes { alias AttributeValue for Base::DataValue; alias attributeValues for Base::dataValues; }";
+        const USER: &str = "package P { attribute def AD; enum def Color { enum red; } attribute a; part def D { attribute b : AD; } attribute w :> Attributes::attributeValues; }";
+        for format in [GraphFormat::LegacyV2, GraphFormat::CanonicalV3] {
+            let mut model = Model::with_graph_format(format);
+            model.add_library_source("Base.kerml", BASE);
+            model.add_library_source("Attributes.sysml", ATTRIBUTES);
+            model.add_source("user.sysml", USER);
+            assert!(!model.has_errors());
+            let mut r = ResolvedModel::build(&model);
+            let id_of = |r: &mut ResolvedModel, name: &str| {
+                let e = r.resolve_qualified(name).unwrap();
+                r.element_id(e)
+            };
+            let data_value = id_of(&mut r, "Base::DataValue");
+            let data_values = id_of(&mut r, "Base::dataValues");
+            let things = id_of(&mut r, "Base::things");
+            let targets = |r: &mut ResolvedModel, name: &str, kind: &str, key: &str| -> Vec<Uuid> {
+                let e = r.resolve_qualified(name).unwrap();
+                r.implied_relationships(e)
+                    .into_iter()
+                    .filter(|&rel| r.element_type(rel) == kind)
+                    .filter_map(|rel| {
+                        r.element_properties(rel)
+                            .get(key)?
+                            .get("@id")?
+                            .as_str()?
+                            .parse()
+                            .ok()
+                    })
+                    .collect()
+            };
+            for name in ["P::AD", "P::Color"] {
+                let bases = targets(&mut r, name, "Subclassification", "superclassifier");
+                assert_eq!(
+                    bases,
+                    vec![data_value],
+                    "{name} specializes Base::DataValue"
+                );
+            }
+            for name in ["P::Color::red", "P::a", "P::D::b"] {
+                let bases = targets(&mut r, name, "Subsetting", "subsettedFeature");
+                assert!(
+                    bases.contains(&data_values),
+                    "{name} subsets Base::dataValues: {bases:?}"
+                );
+                assert!(
+                    !bases.contains(&things),
+                    "{name} does not fall back to Base::things"
+                );
+            }
+            // A usage written against the alias reaches the same element.
+            let w = r.resolve_qualified("P::w").unwrap();
+            let explicit: Vec<Uuid> = r
+                .d_owned_relationships(w)
+                .into_iter()
+                .filter(|&rel| !r.is_implied(rel) && r.element_type(rel) == "Subsetting")
+                .filter_map(|rel| {
+                    r.element_properties(rel)
+                        .get("subsettedFeature")?
+                        .get("@id")?
+                        .as_str()?
+                        .parse()
+                        .ok()
+                })
+                .collect();
+            assert_eq!(explicit, vec![data_values]);
+            assert!(
+                targets(&mut r, "P::w", "Subsetting", "subsettedFeature").is_empty(),
+                "the explicit subsetting through the alias needs no implied one"
+            );
+        }
+    }
     #[test]
     fn binary_roles_require_canonical_loaded_identity_and_kind() {
         for format in [GraphFormat::LegacyV2, GraphFormat::CanonicalV3] {
@@ -6644,7 +7589,7 @@ mod binary_role_tests {
                             r.b.elements[decoy.0].id = target_id;
                         }
                         5 => {
-                            r.b.elements[target.0].ty = "Feature";
+                            r.b.elements[target.0].set_ty("Feature");
                         }
                         6 => {
                             names.insert(
@@ -6666,7 +7611,7 @@ mod binary_role_tests {
                     assert_eq!(
                         plan.candidates
                             .iter()
-                            .any(|((source, edge), _)| *source == receiver.0 && edge.3 == target_id),
+                            .any(|((source, edge), _)| source == receiver.0 && edge.3 == target_id),
                         mode == 0,
                         "{owner} mode {mode}"
                     );
@@ -6681,5 +7626,308 @@ mod binary_role_tests {
                 }
             }
         }
+    }
+}
+
+/// Timings of what the specialization graph and the retained targets by
+/// owner serve, over a 28-unit model on the standard library's snapshot read
+/// back: the plan a build makes on the library's, the materialization, and
+/// the reads themselves. Printed, not asserted: run with
+/// `cargo test --release -p sysmlv2-model --lib graph_reads_timing -- --ignored --nocapture --test-threads=1`.
+#[cfg(test)]
+mod graph_reads_timing {
+    use super::*;
+    use crate::{json::ElementRef, model::Model, prepared::PreparedLibrary};
+    use std::{path::Path, time::Instant};
+
+    /// Run `step` `reps` times, printing the median and the range in ms.
+    fn time(label: &str, reps: usize, mut step: impl FnMut() -> usize) {
+        let mut took = Vec::with_capacity(reps);
+        let mut out = 0;
+        for _ in 0..reps {
+            let clock = Instant::now();
+            out = std::hint::black_box(step());
+            took.push(clock.elapsed().as_secs_f64() * 1e3);
+        }
+        took.sort_by(f64::total_cmp);
+        println!(
+            "{label:<32} {:>9.3} ms  [{:.3}..{:.3}]  ({out})",
+            took[reps / 2],
+            took[0],
+            took[reps - 1]
+        );
+    }
+
+    fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().is_some_and(|e| e == "sysml") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "prints timings over the standard library and a 28-unit model"]
+    fn graph_reads_timing() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec-refs");
+        let mut files = Vec::new();
+        collect(&root.join("apollo-11-sysml-v2"), &mut files);
+        let library = root.join("SysML-v2-Release/sysml.library");
+        if files.is_empty() || !library.exists() {
+            return;
+        }
+        files.sort();
+        let bytes = {
+            let mut model = Model::new();
+            model.load_library_dir(&library).unwrap();
+            let prepared = model.prepare_library().unwrap();
+            prepared.make_plans();
+            prepared.to_bytes(7).unwrap()
+        };
+        let decoded = Arc::new(PreparedLibrary::from_bytes(&bytes, 7).unwrap());
+        let mut model = Model::new();
+        Arc::clone(&decoded).install(&mut model).unwrap();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            model.add_source(file.display().to_string(), &text);
+        }
+        println!("{} units", files.len());
+        time("build", 5, || ResolvedModel::build(&model).b.elements.len());
+        time("build + materialize", 5, || {
+            let mut r = ResolvedModel::build(&model);
+            r.ensure_implied();
+            r.b.elements.len()
+        });
+        let mut r = ResolvedModel::build(&model);
+        let names = r.b.implied_names();
+        time("plan on the library's", 9, || {
+            r.b.supported_implied = None;
+            r.b.supported_implied_specializations(&names, true)
+                .candidates
+                .len()
+        });
+        let mut r = ResolvedModel::build(&model);
+        r.ensure_implied();
+        let ids: Vec<Uuid> = r.b.elements.iter().map(|e| e.id).collect();
+        let rows = r.b.elements.len();
+        let plan = Arc::clone(r.b.supported_implied.as_ref().unwrap());
+        let graph = &r.b.implied.as_ref().unwrap().specializations;
+        time("materialized graph reads x20", 9, || {
+            let mut n = 0;
+            for _ in 0..20 {
+                for id in &ids {
+                    n += graph.get(id).map_or(0, <[Uuid]>::len);
+                }
+            }
+            n
+        });
+        time("planned graph reads x20", 9, || {
+            let mut n = 0;
+            for _ in 0..20 {
+                for id in &ids {
+                    n += plan.graph.get(id).map_or(0, <[Uuid]>::len);
+                }
+            }
+            n
+        });
+        time("by-owner reads x20", 9, || {
+            let mut n = 0;
+            for _ in 0..20 {
+                for owner in 0..rows {
+                    n += plan.by_owner.get(owner).map_or(0, |targets| targets.len());
+                }
+            }
+            n
+        });
+        let ancestors: Vec<ElementRef> = [
+            "Base::Anything",
+            "Occurrences::Occurrence",
+            "Items::Item",
+            "Parts::Part",
+            "Ports::Port",
+            "Actions::Action",
+            "Performances::Performance",
+            "Base::DataValue",
+        ]
+        .iter()
+        .filter_map(|name| r.resolve_qualified(name))
+        .collect();
+        let types: Vec<usize> = (r.b.lib_boundary..r.b.explicit_len())
+            .filter(|&e| is_a!(r.b.elements[e], "Type"))
+            .collect();
+        time("conformance with implied", 5, || {
+            let mut n = 0;
+            for &e in &types {
+                for &ancestor in &ancestors {
+                    n += usize::from(r.conforms_with_implied(ElementRef(e), ancestor));
+                }
+            }
+            n
+        });
+    }
+}
+
+#[cfg(test)]
+mod prefix_overlay_tests {
+    use super::*;
+    use crate::{model::Model, prepared::PreparedLibrary};
+    use std::path::Path;
+
+    fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().is_some_and(|e| e == "sysml") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A build on the standard library's snapshot read back reads, for every
+    /// row of the plans' frozen graph and every source of the library's own
+    /// materialized edges, the frozen row with those edges' targets after
+    /// it in order, each once: the rows the edges change lie over the
+    /// frozen graph and every other row reads through to it.
+    #[test]
+    fn a_build_on_a_decoded_library_reads_the_librarys_materialized_edges_over_its_plans_graph() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec-refs");
+        let library = root.join("SysML-v2-Release/sysml.library");
+        if !library.exists() {
+            return;
+        }
+        let bytes = {
+            let mut model = Model::new();
+            model.load_library_dir(&library).unwrap();
+            let prepared = model.prepare_library().unwrap();
+            prepared.make_plans();
+            prepared.to_bytes(7).unwrap()
+        };
+        let decoded = Arc::new(PreparedLibrary::from_bytes(&bytes, 7).unwrap());
+        let mut model = Model::new();
+        Arc::clone(&decoded).install(&mut model).unwrap();
+        // the 28-unit model where the corpus is checked out, else a small one
+        let mut files = Vec::new();
+        collect(&root.join("apollo-11-sysml-v2"), &mut files);
+        files.sort();
+        if files.is_empty() {
+            model.add_source("v.sysml", "package V { part def A; part a : A; }");
+        }
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            model.add_source(file.display().to_string(), &text);
+        }
+        let mut r = ResolvedModel::build(&model);
+        r.ensure_implied();
+        let prefix = Arc::clone(r.b.prefix_implied.as_ref().expect("a library's own rows"));
+        let plan = Arc::clone(r.b.supported_implied.as_ref().unwrap());
+        let frozen = plan.graph.frozen_arc();
+        let table = r.b.implied.as_ref().unwrap();
+        let own: IdSet<Uuid> = table
+            .specializations
+            .local_iter()
+            .map(|(k, _)| *k)
+            .collect();
+        let mut keys: Vec<Uuid> = frozen.iter().map(|(k, _)| *k).collect();
+        keys.extend(prefix.edges.iter().map(|&(source, _)| source));
+        keys.sort_unstable();
+        keys.dedup();
+        // (no row of the build's own is a library row's: every library row
+        // is read through the shared layers)
+        assert!(keys.iter().all(|k| !own.contains(k)));
+        let mut changed = 0;
+        for key in &keys {
+            let mut expected: Vec<Uuid> = frozen.get(key).map(<[Uuid]>::to_vec).unwrap_or_default();
+            for &(source, target) in &prefix.edges {
+                if source == *key && !expected.contains(&target) {
+                    expected.push(target);
+                }
+            }
+            changed += usize::from(frozen.get(key) != Some(expected.as_slice()));
+            let read = table.specializations.get(key);
+            assert_eq!(read.unwrap_or_default(), expected.as_slice(), "row {key}");
+            assert_eq!(
+                read.is_some(),
+                frozen.get(key).is_some() || !expected.is_empty()
+            );
+        }
+        assert!(
+            changed > 1000,
+            "{changed} rows changed by the library's edges"
+        );
+    }
+
+    /// A wire plan's retained targets lie on the direct bases' rows, sharing
+    /// their ranks, when every owner has bases; an owner without them lays
+    /// the targets out over the rows alone, and they read the same.
+    #[test]
+    fn a_wire_owner_without_bases_lays_the_retained_targets_over_the_rows() {
+        let target = Uuid::from_u128(9);
+        let wire = |owner: usize| ImpliedWire {
+            candidates: CandidateColumns {
+                owners: crate::bulk::Ints(Vec::new()),
+                spelled: crate::bulk::Bytes(Vec::new()),
+                ids: crate::bulk::Ids(Vec::new()),
+            },
+            kinds: 0,
+            retained: Vec::<bool>::new().into(),
+            graph: Vec::<(Uuid, Vec<Uuid>)>::new().into(),
+            by_owner: vec![(owner, vec![target])].into(),
+            library_configuration: true,
+            chain_targets: Vec::<(usize, usize)>::new().into(),
+            chain_incomplete: crate::bulk::Ints(Vec::new()),
+        };
+        let bases = ListsByRow::from_sorted(5, &[1, 3], &[1, 1], vec![0usize, 0]).unwrap();
+        let read = |owner: usize| {
+            SupportedImpliedSpecializations::from_wire(
+                wire(owner),
+                5,
+                crate::layered::Revision::default(),
+                crate::layered::Revision::default(),
+                HashMap::new(),
+                &bases,
+            )
+            .unwrap()
+        };
+        let laid = read(3);
+        assert_eq!(laid.by_owner.get(3), Some(&[target][..]));
+        assert_eq!(laid.by_owner.get(1), None, "a bases row with no target");
+        assert_eq!(laid.by_owner.frozen.rows(), 5);
+        assert!(
+            ListsByRow::from_sorted(5, &[1, 3], &[0, 1], vec![target])
+                .unwrap()
+                .laid_on(&bases)
+                .is_some_and(|shared| shared == *laid.by_owner.frozen)
+        );
+        let alone = read(2);
+        assert_eq!(alone.by_owner.get(2), Some(&[target][..]));
+        assert_eq!(alone.by_owner.get(1), None);
+        assert_eq!(alone.by_owner.get(3), None);
+        assert_eq!(
+            *alone.by_owner.frozen,
+            ListsByRow::from_sorted(5, &[2], &[1], vec![target]).unwrap(),
+            "laid out over the rows alone"
+        );
+        assert!(
+            SupportedImpliedSpecializations::from_wire(
+                wire(5),
+                5,
+                crate::layered::Revision::default(),
+                crate::layered::Revision::default(),
+                HashMap::new(),
+                &bases,
+            )
+            .is_none(),
+            "an owner past the rows"
+        );
     }
 }

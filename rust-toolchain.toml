@@ -2,5 +2,5 @@
 # file, so a formatting or lint change in a newer release cannot flip a
 # gate without a deliberate bump here.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]

@@ -1,5 +1,6 @@
 //! Static expression contracts, independent of whether values can be evaluated.
-use super::facts::{Facts, is};
+use super::facts::Facts;
+use crate::metaclass::is_a;
 use crate::{json::ResolvedModel, model::Model};
 use std::collections::HashSet;
 use sysmlv2_syntax::{
@@ -128,7 +129,7 @@ pub(super) fn types(
                     .filter(|&m| {
                         b.elements[m]
                             .owning_relationship
-                            .is_some_and(|rel| is(b, rel, "ReturnParameterMembership"))
+                            .is_some_and(|rel| is_a!(b.elements[rel], "ReturnParameterMembership"))
                     })
                     .flat_map(|m| g.typed(b, m))
                     .collect();
@@ -261,11 +262,16 @@ pub(super) fn model_level(
         } => all(vec![operand]),
         ExprKind::Ref(qn) => {
             let e = b.resolve(scope, qn, 0)?;
-            if !is(b, e, "Feature") || is(b, e, "MetadataFeature") || is(b, e, "EnumerationUsage") {
+            if !is_a!(b.elements[e], "Feature")
+                || is_a!(b.elements[e], "MetadataFeature")
+                || is_a!(b.elements[e], "EnumerationUsage")
+            {
                 return Some(true);
             }
             if let Some(o) = g.featuring(b, e) {
-                return Some(is(b, o, "Metaclass") || is(b, o, "MetadataFeature"));
+                return Some(
+                    is_a!(b.elements[o], "Metaclass") || is_a!(b.elements[o], "MetadataFeature"),
+                );
             }
             let (s, value) = b.values.get(&e)?.clone();
             let origin = b.set_identity_origin(e);
@@ -341,7 +347,7 @@ pub(super) fn validate(
             match &expr.kind {
                 ExprKind::ChainStep { .. } => {
                     if let Some(t) = referent(&mut r.b, scope, expr) {
-                        if !is(&r.b, t, "Feature") {
+                        if !is_a!(r.b.elements[t], "Feature") {
                             report(
                                 "validateFeatureChainExpressionFeatureConformance",
                                 "A feature-chain expression must select a feature",
@@ -370,7 +376,7 @@ pub(super) fn validate(
                 }
                 ExprKind::Ref(name) => {
                     if let Some(t) = r.b.resolve(scope, name, 0) {
-                        if !is(&r.b, t, "Feature") {
+                        if !is_a!(r.b.elements[t], "Feature") {
                             report(
                                 "validateFeatureReferenceExpressionReferentIsFeature",
                                 "A feature reference expression must name a feature",
@@ -381,7 +387,7 @@ pub(super) fn validate(
                 ExprKind::Constructor { ty, args } => {
                     if let TargetRef::Name(name) = &**ty {
                         if let Some(t) = r.b.resolve(scope, name, 0) {
-                            if !is(&r.b, t, "Type") {
+                            if !is_a!(r.b.elements[t], "Type") {
                                 report(
                                     "validateInstantiationExpressionInstantiatedType",
                                     "A constructor must instantiate a type",
@@ -403,10 +409,13 @@ pub(super) fn validate(
                 }
                 ExprKind::Invocation { ty, .. } => {
                     if let Some(t) = ty.as_name().and_then(|name| r.b.resolve(scope, name, 0)) {
-                        if !is(&r.b, t, "Behavior")
-                            && !is(&r.b, t, "Step")
-                            && (!is(&r.b, t, "Feature") || !g.typed(&r.b, t).is_empty())
-                            && !g.typed(&r.b, t).iter().any(|&t| is(&r.b, t, "Behavior"))
+                        if !is_a!(r.b.elements[t], "Behavior")
+                            && !is_a!(r.b.elements[t], "Step")
+                            && (!is_a!(r.b.elements[t], "Feature") || !g.typed(&r.b, t).is_empty())
+                            && !g
+                                .typed(&r.b, t)
+                                .iter()
+                                .any(|&t| is_a!(r.b.elements[t], "Behavior"))
                         {
                             report(
                                 "validateInvocationExpressionInstantiatedType",

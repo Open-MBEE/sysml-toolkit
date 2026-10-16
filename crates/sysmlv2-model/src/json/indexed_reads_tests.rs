@@ -2,6 +2,7 @@
 //! specialization index — answer what a scan of the whole table answers.
 
 use super::ResolvedModel;
+use crate::metaclass::is_a;
 use crate::model::Model;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -194,6 +195,7 @@ fn corpus_workspaces_read_owned_members_and_executing_calculations_like_a_scan()
             model.add_source(name.clone(), text);
         }
         let mut r = ResolvedModel::build(&model);
+        assert_rows_carry_their_index(&r);
         assert_ownership_pairs(&r, label);
         members += assert_members_like_a_scan(&r, label);
         // The library's rows are the same in every build: walk them once.
@@ -251,4 +253,334 @@ fn an_unsettled_table_is_scanned() {
     assert!(r.b.indexed_calculation_requires_execution(quarter));
     assert!(!r.b.indexed_calculation_requires_execution(plain));
     assert!(r.b.spec_index.is_some());
+}
+
+/// The conformance reader answers from a memo of each element's closure under
+/// the typing and specialization rows, and the memo follows the rows: a
+/// resolved target written after it was built starts a new one.
+#[test]
+fn indexed_conformance_is_memoized_per_closure_and_follows_the_resolved_targets() {
+    let mut model = Model::new();
+    let parsed = model.add_source(
+        "closure.kerml",
+        "classifier A; classifier B specializes A; classifier C specializes B; classifier D;",
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    let (a, b, c, d) = (
+        r.resolve_qualified("A").unwrap().0,
+        r.resolve_qualified("B").unwrap().0,
+        r.resolve_qualified("C").unwrap().0,
+        r.resolve_qualified("D").unwrap().0,
+    );
+    assert!(r.b.indexed_conforms(c, a));
+    assert!(r.b.indexed_conforms(c, b));
+    assert!(r.b.indexed_conforms(c, c));
+    assert!(!r.b.indexed_conforms(c, d));
+    assert!(!r.b.indexed_conforms(a, c));
+    let memo = r.b.spec_memo.as_ref().expect("built by the first question");
+    assert_eq!(memo.closures.get(&c).map(|closure| closure.len()), Some(3));
+    assert!(
+        memo.closures.contains_key(&a),
+        "the reverse question walked A's closure"
+    );
+    // Cutting B's specialization of A changes C's closure once the memo
+    // sees the new resolved-target revision.
+    let row = (0..r.b.spec_targets.len())
+        .find(|&i| r.b.spec_targets[i].0 == b && r.b.spec_targets[i].1 == "Subclassification")
+        .expect("B specializes A is a subclassification row");
+    assert_eq!(r.b.spec_resolved[row], Some(a));
+    r.b.spec_resolved[row] = None;
+    assert!(
+        !r.b.indexed_conforms(c, a),
+        "the memo was restarted for the new revision"
+    );
+    assert!(r.b.indexed_conforms(c, b));
+    r.b.spec_resolved[row] = Some(a);
+    assert!(r.b.indexed_conforms(c, a));
+}
+
+/// The shared redefinition-target reader lists what the direct reader lists,
+/// in its order, and follows a written target like the closure memo.
+#[test]
+fn shared_redefinition_targets_match_the_direct_reader() {
+    let mut model = Model::new();
+    let parsed = model.add_source(
+        "redefinitions.kerml",
+        "classifier A { feature x; feature y; } classifier B specializes A { feature :>> x; feature z :>> y; }",
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    let bx = r.resolve_qualified("B::x").unwrap().0;
+    let z = r.resolve_qualified("B::z").unwrap().0;
+    let ay = r.resolve_qualified("A::y").unwrap().0;
+    for e in [bx, z, ay] {
+        let direct = r.b.indexed_redefinition_targets(e);
+        let shared = r.b.indexed_redefinition_targets_shared(e);
+        assert_eq!(&shared[..], &direct[..], "element {e}");
+        let again = r.b.indexed_redefinition_targets_shared(e);
+        assert!(
+            Arc::ptr_eq(&shared, &again),
+            "the second answer is the memoized one"
+        );
+    }
+    assert_eq!(&r.b.indexed_redefinition_targets_shared(z)[..], &[ay]);
+    let row = (0..r.b.spec_targets.len())
+        .find(|&i| r.b.spec_targets[i].0 == z && r.b.spec_targets[i].1 == "Redefinition")
+        .expect("z redefines y");
+    r.b.spec_resolved[row] = None;
+    assert!(r.b.indexed_redefinition_targets_shared(z).is_empty());
+    r.b.spec_resolved[row] = Some(ay);
+    assert_eq!(&r.b.indexed_redefinition_targets_shared(z)[..], &[ay]);
+}
+
+/// A specialization row written, a rebuilt index and the lookup-cache reset
+/// all start the memo over; cycles and self-loops answer as the recorded
+/// walk does.
+#[test]
+fn the_specialization_memo_follows_the_rows_and_agrees_with_the_recorded_walk() {
+    let mut model = Model::new();
+    let parsed = model.add_source(
+        "cycles.kerml",
+        "classifier A specializes B; classifier B specializes A; classifier S specializes S; classifier T specializes A;",
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut r = ResolvedModel::build(&model);
+    let elements: Vec<usize> = ["A", "B", "S", "T"]
+        .iter()
+        .map(|name| r.resolve_qualified(name).unwrap().0)
+        .collect();
+    let mut read = Vec::new();
+    for &sub in &elements {
+        for &sup in &elements {
+            let recorded = r.b.recorded_conforms(sub, sup, &mut read);
+            assert_eq!(
+                r.b.indexed_conforms(sub, sup),
+                recorded,
+                "{sub} conforms {sup}"
+            );
+        }
+    }
+    let (a, t) = (elements[0], elements[3]);
+    assert!(r.b.spec_memo.is_some());
+    // A row written through the table moves its revision: the memo restarts.
+    let row = (0..r.b.spec_targets.len())
+        .find(|&i| r.b.spec_targets[i].0 == t)
+        .expect("T specializes A");
+    let written = r.b.spec_targets[row].clone();
+    r.b.spec_targets[row] = written;
+    assert!(r.b.indexed_conforms(t, a));
+    let memo = r.b.spec_memo.as_ref().unwrap();
+    assert_eq!(
+        memo.closures.len(),
+        1,
+        "only the question asked since the write"
+    );
+    // A rebuilt index and the lookup-cache reset drop it.
+    r.b.spec_index = None;
+    assert!(r.b.indexed_conforms(t, a));
+    assert_eq!(r.b.spec_memo.as_ref().unwrap().closures.len(), 1);
+    r.b.reset_lookup_caches();
+    assert!(r.b.spec_memo.is_none());
+}
+
+/// A member listed under both its names hides, and is hidden, the same way
+/// whichever of its name groups the implicit-redefinition step meets first.
+/// In the diamond `C :> B, D`, `A::a` reaches `C` unreduced through `D`;
+/// `B::a` (short name `s`) hides it, and `C::s` hides `B::a`, so `C`
+/// inherits neither — also when the `s` group is decided before the `a` one.
+#[test]
+fn implicit_redefinition_does_not_depend_on_the_order_of_name_groups() {
+    for source in [
+        "part def A { part a; } part def B :> A { part <s> a; } part def D :> A; part def C :> B, D { part s; }",
+        "part def A { part a; } part def B :> A { part <s> a; } part def D :> A; part def C :> D, B { part s; part other; }",
+    ] {
+        let mut model = Model::new();
+        let parsed = model.add_source("two-keys.sysml", source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut r = ResolvedModel::build(&model);
+        let c = r.resolve_qualified("C").unwrap().0;
+        let scope = *r.b.elem_scope.get(&c).unwrap();
+        let aa = r.resolve_qualified("A::a").unwrap().0;
+        let ba = r.resolve_qualified("B::a").unwrap().0;
+        for include_implied in [false, true] {
+            let bindings = r.b.inherited_bindings(scope, include_implied);
+            let members: Vec<usize> = bindings.members.iter().map(|&(m, _)| m).collect();
+            assert!(!members.contains(&aa), "A::a is hidden by B::a ({source})");
+            assert!(!members.contains(&ba), "B::a is hidden by C::s ({source})");
+        }
+    }
+}
+
+/// The implicit same-name redefinitions a projection decides are the same
+/// whether a group is walked pair by pair or owner by owner: a type whose
+/// bases own many same-named usages — unrelated owners, owners whose types
+/// strictly conform, and an owner that redefines by position — hides the
+/// same members and records the same pairs either way, and the collisions
+/// reported do not change.
+#[test]
+fn implicit_redefinitions_are_the_same_pair_by_pair_and_owner_by_owner() {
+    let mut source = String::from(
+        "package P { part def Base { part p; } part def Mid :> Base { part p; } part def Leaf :> Mid { part p; } ",
+    );
+    for i in 0..12 {
+        source.push_str(&format!("part def U{i} {{ part p; attribute a; }} "));
+    }
+    source.push_str("part def All :> Leaf");
+    for i in 0..12 {
+        source.push_str(&format!(", U{i}"));
+    }
+    source.push_str(" { part q; } part def Also :> Mid, U0, U1 { part p; } }");
+    let outcome = |limit: usize| {
+        crate::json::with_pairwise_group_limit(limit, || {
+            let mut model = Model::new();
+            model.add_source("m.sysml", &source);
+            let mut r = ResolvedModel::build(&model);
+            let mut projections = Vec::new();
+            for name in ["P::All", "P::Also", "P::Leaf"] {
+                let e = r.resolve_qualified(name).expect(name).0;
+                let scope = r.b.elem_scope.get(&e).copied().expect("a body");
+                let bindings = r.b.inherited_bindings(scope, true);
+                let mut members: Vec<usize> = bindings.members.iter().map(|&(m, _)| m).collect();
+                members.sort_unstable();
+                let mut pairs = bindings.implicit_redefinitions.clone();
+                pairs.sort_unstable();
+                projections.push((members, pairs));
+            }
+            let collisions: Vec<String> = crate::check::validate_semantics(&model)
+                .into_iter()
+                .map(|(_, d)| d.message)
+                .filter(|m| m.contains("inherited"))
+                .collect();
+            (projections, collisions)
+        })
+    };
+    let (pairwise, owners) = (outcome(usize::MAX), outcome(0));
+    assert_eq!(pairwise, owners);
+    assert!(
+        pairwise.0.iter().any(|(_, pairs)| !pairs.is_empty()),
+        "some member is hidden by a same-named usage of a conforming owner"
+    );
+}
+
+/// A large same-name group costs the owner walk fewer steps than the
+/// pairwise one: under a budget the pairwise walk exhausts on, the owner
+/// walk completes with the pairs the unbudgeted reduction decides.
+#[test]
+fn the_owner_walk_completes_under_a_budget_the_pairwise_walk_exhausts() {
+    let mut source = String::from("package P { part def Mid { part p; } ");
+    for i in 0..40 {
+        source.push_str(&format!("part def U{i} :> Mid {{ part p; }} "));
+    }
+    source.push_str("part def All :> Mid");
+    for i in 0..40 {
+        source.push_str(&format!(", U{i}"));
+    }
+    source.push_str(" { part q; } }");
+    let mut model = Model::new();
+    model.add_source("m.sysml", &source);
+    let mut r = ResolvedModel::build(&model);
+    let all = r.resolve_qualified("P::All").expect("All").0;
+    // The unreduced candidates: every base's `p` membership.
+    let memberships: Vec<usize> = (0..40)
+        .map(|i| format!("P::U{i}::p"))
+        .chain(std::iter::once("P::Mid::p".to_string()))
+        .map(|name| {
+            let e = r.resolve_qualified(&name).expect(&name).0;
+            r.b.elements[e].owning_relationship.expect("a membership")
+        })
+        .collect();
+    let candidates = || crate::json::MembershipProjection {
+        membership_order: memberships.clone(),
+        truncated: false,
+        incomplete: false,
+        implicit_redefinitions: Vec::new(),
+    };
+    let reduce = |r: &mut ResolvedModel, limit: usize, steps: Option<&mut usize>| {
+        crate::json::with_pairwise_group_limit(limit, || {
+            let reduced =
+                r.b.reduce_membership_projection(Some(all), false, candidates(), steps);
+            let mut pairs = reduced.implicit_redefinitions;
+            pairs.sort_unstable();
+            (reduced.incomplete, reduced.membership_order, pairs)
+        })
+    };
+    let (_, expected_order, expected_pairs) = reduce(&mut r, usize::MAX, None);
+    assert_eq!(expected_pairs.len(), 40, "every U{{i}}::p hides Mid::p");
+    // What the owner walk charges, then a budget just wide enough for it.
+    let mut used = 0;
+    let (incomplete, order, pairs) = reduce(&mut r, 0, Some(&mut used));
+    assert!(!incomplete && order == expected_order && pairs == expected_pairs);
+    let budget = crate::eval::MAX_STEPS - used - 1;
+    let mut steps = budget;
+    let (incomplete, _, _) = reduce(&mut r, usize::MAX, Some(&mut steps));
+    assert!(incomplete, "the pairwise walk exhausts the budget");
+    let mut steps = budget;
+    let (incomplete, order, pairs) = reduce(&mut r, 0, Some(&mut steps));
+    assert!(!incomplete, "the owner walk completes");
+    assert_eq!((order, pairs), (expected_order, expected_pairs));
+}
+
+/// The protected-access test reads the kept base closures and answers as
+/// the walk over the bases did, for every pair of scopes of a model with
+/// specialization cycles, a self-specialization and nested types.
+#[test]
+fn protected_access_reads_the_base_closures_as_the_walk_answered() {
+    let mut model = crate::model::Model::new();
+    model.add_source(
+        "m.sysml",
+        "package P { part def A :> B { protected part x : D; } part def B :> A; part def C :> A { part y : D; } part def D :> D; part def E { part def F :> C { part z : D; } part def G :> F, B; } part def H; }",
+    );
+    let mut r = crate::json::ResolvedModel::build(&model);
+    let scopes = r.b.scopes.len();
+    for origin in 0..scopes {
+        for target in 0..scopes {
+            let walked = r.b.scope_can_access_protected_walked(origin, target);
+            assert_eq!(
+                r.b.scope_can_access_protected(origin, target),
+                walked,
+                "{origin} → {target}"
+            );
+        }
+    }
+}
+
+/// Every row's cached metaclass index is its metaclass's: the literals set
+/// both, and a row retyped later — a chain member's membership, a
+/// conjugated port's typing — is retyped through `set_ty`.
+#[test]
+fn every_row_carries_its_metaclass_index() {
+    let mut model = Model::new();
+    model.add_source(
+        "m.sysml",
+        "package P { port def Q { attribute v; } part def A { port p : Q; port c : ~Q; attribute a; } part def B { part x : A; part y : A { port :>> p; attribute :>> a; } attribute z = x.a; } requirement def R; part def S { part sub; } part s : S; satisfy requirement r : R by s.sub; }",
+    );
+    let r = ResolvedModel::build(&model);
+    assert_rows_carry_their_index(&r);
+    // The satisfaction's subject is a chain: the membership its feature
+    // reference expression owns, made as a `Membership`, is retyped
+    // `OwningMembership` — the row above checked that its index followed.
+    assert!(
+        (0..r.b.elements.len())
+            .filter(|&e| r.b.elements[e].ty == "FeatureReferenceExpression")
+            .any(|fre| {
+                r.b.elements[fre]
+                    .owned_relationships
+                    .iter()
+                    .any(|&rel| is_a!(r.b.elements[rel], "OwningMembership"))
+            }),
+        "a chain subject's membership is an OwningMembership"
+    );
+}
+
+fn assert_rows_carry_their_index(r: &ResolvedModel) {
+    for e in 0..r.b.elements.len() {
+        let row = &r.b.elements[e];
+        assert_eq!(
+            row.meta,
+            crate::metaclass::meta_of(row.ty),
+            "row {e} typed {}",
+            row.ty
+        );
+    }
 }

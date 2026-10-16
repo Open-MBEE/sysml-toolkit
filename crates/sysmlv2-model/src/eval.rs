@@ -27,9 +27,11 @@
 //! number), and different *dimensions* never mix.
 //!
 //! Constructors (`new T(…)`) build [`Value::Instance`] data values:
-//! positional arguments bind the type's own value-less data usages in
-//! declaration order, named arguments bind by name, equality is
-//! structural, and chain steps read the bound fields.
+//! positional arguments bind the type's public features in order (its
+//! own in declaration order, then the inherited ones — the sequence the
+//! semantic check binds), named arguments bind by name, a feature with a
+//! non-default value cannot be rebound, equality is structural, and chain
+//! steps read the bound fields.
 //!
 //! Classification (`istype`/`hastype`/`as`) evaluates with open-world
 //! discipline: declared-conformance hits are definite, misses on model
@@ -57,6 +59,7 @@ use crate::json::{
     Builder, CallableBody, CallableResult, ChainRedefinitions, ElementRef, ResolvedModel,
     RuntimeFrame, RuntimeFrameProof, ScopeRef, Tri,
 };
+use crate::metaclass::is_a;
 
 /// Owner-context library collections per member metaclass — the
 /// systems library's counterpart rows of SysML 8.4.2 Table 32 (the
@@ -722,15 +725,23 @@ impl Value {
     /// instead of a fraction. For glanceable surfaces such as editor
     /// hints; `Display` stays exact and re-parseable.
     pub fn to_approx_string(&self) -> String {
+        self.to_string_with(&crate::numfmt::NumberFormat::approx())
+    }
+
+    /// `Display`, with every rational that has no terminating decimal
+    /// expansion written in `format` — inside quantities, instances and
+    /// sequences too. [`NumberFormat::exact`](crate::numfmt::NumberFormat::exact)
+    /// gives exactly `Display`.
+    pub fn to_string_with(&self, format: &crate::numfmt::NumberFormat) -> String {
         match self {
-            Value::Rational(r) => r.to_approx_string(),
-            Value::Quantity(n, u) => format!("{} [{}]", n.to_approx_string(), u.display),
+            Value::Rational(r) => format.render(r),
+            Value::Quantity(n, u) => format!("{} [{}]", n.to_string_with(format), u.display),
             Value::Instance {
                 ty_name, fields, ..
             } => {
                 let fields = fields
                     .iter()
-                    .map(|(name, v)| format!("{name} = {}", v.to_approx_string()))
+                    .map(|(name, v)| format!("{name} = {}", v.to_string_with(format)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{ty_name}({fields})")
@@ -738,7 +749,7 @@ impl Value {
             Value::Sequence(s) if !s.is_empty() => {
                 let items = s
                     .iter()
-                    .map(Value::to_approx_string)
+                    .map(|v| v.to_string_with(format))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({items})")
@@ -1976,14 +1987,12 @@ impl Evaluator<'_> {
                 let members = self.b.owned_member_elems(e, false);
                 let count = members
                     .iter()
-                    .take_while(|&&m| {
-                        crate::metaclass::conforms(self.b.elements[m].ty, "Expression")
-                    })
+                    .take_while(|&&m| is_a!(self.b.elements[m], "Expression"))
                     .count();
                 if !(1..=2).contains(&count)
                     || members[count..]
                         .iter()
-                        .any(|&m| crate::metaclass::conforms(self.b.elements[m].ty, "Expression"))
+                        .any(|&m| is_a!(self.b.elements[m], "Expression"))
                 {
                     return None;
                 }
@@ -2005,7 +2014,7 @@ impl Evaluator<'_> {
                     continue;
                 }
                 let rel = &self.b.elements[r];
-                if !crate::metaclass::conforms(rel.ty, "Specialization") {
+                if !is_a!(rel, "Specialization") {
                     continue;
                 }
                 let property = match rel.ty {
@@ -2175,8 +2184,7 @@ impl Evaluator<'_> {
         context: Option<usize>,
     ) -> Option<(usize, bool)> {
         let owner = self.b.owner_elem(original);
-        if owner.is_none_or(|owner| !crate::metaclass::conforms(self.b.elements[owner].ty, "Type"))
-        {
+        if owner.is_none_or(|owner| !is_a!(self.b.elements[owner], "Type")) {
             // Root and package references keep their lexical identity, but the value
             // expression still evaluates on the same target. A dependency may
             // refer back to a member that the receiver redefines.
@@ -2185,7 +2193,7 @@ impl Evaluator<'_> {
         }
         let owner = owner?;
         let receiver = context.and_then(|s| self.b.scope_owner(s))?;
-        if !crate::metaclass::conforms(self.b.elements[receiver].ty, "Type") {
+        if !is_a!(self.b.elements[receiver], "Type") {
             return None;
         }
         let scope = *self.b.elem_scope.get(&receiver)?;
@@ -2861,9 +2869,17 @@ impl Evaluator<'_> {
         false
     }
 
-    /// `new T(args)` — instantiate `T`, binding arguments to its owned
-    /// data usages: positionally to the value-less ones in declaration
-    /// order, or by name.
+    /// `new T(args)` — instantiate `T`, binding each argument to one public
+    /// feature of `T`: a positional argument the feature at its position in
+    /// `T`'s constructor sequence (`T`'s own features in declaration order,
+    /// then the inherited ones — the sequence `check` binds), a named
+    /// argument the feature of that name. A feature whose own value, or
+    /// that of a feature it redefines, is not a default cannot be rebound:
+    /// the model is invalid, and the semantic check says so. A feature
+    /// nothing can name (an invariant, a result expression) takes no
+    /// argument either. An argument past the features of the type and its
+    /// written generals would land on a feature of an implied library
+    /// base, which this instance model does not carry.
     fn construct(&mut self, scope: usize, ty: &TargetRef, args: &[Arg]) -> Result_ {
         let TargetRef::Name(qn) = ty else {
             return Err(EvalError::Unsupported("chained constructor type".into()));
@@ -2881,78 +2897,49 @@ impl Evaluator<'_> {
             let name = a.name.as_ref().map(|n| n.to_display_string());
             values.push((name, self.expr(scope, &a.value)?));
         }
-        let is_data = |b: &Builder, e: usize| {
-            // Plain `Feature` covers KerML datatype fields
-            // (`Collections::KeyValuePair`'s `key`/`val`).
-            matches!(
-                b.elements[e].ty,
-                "AttributeUsage" | "ReferenceUsage" | "ItemUsage" | "PartUsage" | "Feature"
-            )
-        };
-        let own_fields = |b: &Builder, owner: usize| -> Vec<(String, usize)> {
-            b.ctor_fields
-                .get(&owner)
-                .map(|fs| fs.iter().filter(|(_, e)| is_data(b, *e)).cloned().collect())
-                .unwrap_or_default()
-        };
-        // A type's own fields, then those it *inherits* and does not
-        // redeclare (breadth-first over the explicit specialization
-        // closure, cycle-guarded). Inherited slots come last so every
-        // positional binding a type's own declaration already had keeps
-        // its position. Without this a library collection could not be
-        // constructed at all: `List`/`Array`/`Set`/`Bag` declare no
-        // members of their own — their `elements` is inherited from
-        // `Collection` — unlike `Map`/`OrderedSet`, which redeclare it.
-        let mut declared: Vec<(String, usize)> = own_fields(self.b, elem);
-        let mut seen_types = HashSet::from([elem]);
-        let mut queue = std::collections::VecDeque::from([elem]);
-        while let Some(t) = queue.pop_front() {
-            for base in self.b.explicit_supertype_elems(t) {
-                if !seen_types.insert(base) {
-                    continue;
-                }
-                queue.push_back(base);
-                for (name, e) in own_fields(self.b, base) {
-                    if !declared.iter().any(|(n, _)| *n == name) {
-                        declared.push((name, e));
-                    }
-                }
-            }
-        }
-        // Positional arguments fill the fields that carry no value of
-        // their own, in declaration order.
-        let mut open = declared
-            .iter()
-            .filter(|(_, e)| !self.b.values.contains_key(e));
+        let sequence = self.b.constructor_feature_sequence(elem);
         let mut fields = Vec::with_capacity(values.len());
         let mut bound = HashSet::new();
+        let mut positional = 0usize;
         for (name, v) in values {
-            match name {
-                Some(n) => {
-                    if !declared.iter().any(|(f, _)| *f == n) {
+            let (field, feature) = match name {
+                Some(n) => match sequence.iter().find(|(f, _)| *f == n) {
+                    Some((f, e)) => (f.clone(), *e),
+                    None => {
                         return Err(EvalError::Unresolved(format!("field `{n}` of `{ty_name}`")));
                     }
-                    if !bound.insert(n.clone()) {
-                        return Err(EvalError::Type(format!(
-                            "constructor field `{n}` is bound more than once"
-                        )));
-                    }
-                    fields.push((n, v));
-                }
+                },
                 None => {
-                    let Some((f, _)) = open.next() else {
-                        return Err(EvalError::Type(format!(
-                            "too many constructor arguments for `{ty_name}`"
-                        )));
-                    };
-                    if !bound.insert(f.clone()) {
-                        return Err(EvalError::Type(format!(
-                            "constructor field `{f}` is bound more than once"
-                        )));
+                    let at = positional;
+                    positional += 1;
+                    match sequence.get(at) {
+                        Some((f, e)) => (f.clone(), *e),
+                        None => {
+                            return Err(EvalError::Type(format!(
+                                "too many constructor arguments for `{ty_name}`"
+                            )));
+                        }
                     }
-                    fields.push((f.clone(), v));
                 }
+            };
+            if field.is_empty() {
+                return Err(EvalError::Type(format!(
+                    "positional argument {positional} binds a feature of `{ty_name}` that \
+                     nothing can name"
+                )));
             }
+            if !bound.insert(feature) {
+                return Err(EvalError::Type(format!(
+                    "constructor field `{field}` is bound more than once"
+                )));
+            }
+            if let Some(valued) = self.b.non_default_binding(feature) {
+                let valued = self.b.id_name(valued).unwrap_or_else(|| field.clone());
+                return Err(EvalError::Type(format!(
+                    "constructor field `{field}` cannot override the non-default value of `{valued}`"
+                )));
+            }
+            fields.push((field, v));
         }
         Ok(Value::Instance {
             ty: ElementRef(elem),
@@ -5943,15 +5930,15 @@ mod memo_tests {
             let members = r.b.owned_member_elems(m, false);
             match mutation {
                 // Bound expressions must be a contiguous prefix, at most two.
-                0 => r.b.elements[members[0]].ty = "Feature",
-                1 => r.b.elements[members[2]].ty = "LiteralInteger",
+                0 => r.b.elements[members[0]].set_ty("Feature"),
+                1 => r.b.elements[members[2]].set_ty("LiteralInteger"),
                 // Unsupported or unresolved added constraints cannot be ignored.
                 _ => {
                     let named = r.resolve_qualified("P::named::m").unwrap().0;
                     let rel = r.b.elements[named].owned_relationships[0];
                     r.b.elements[m].owned_relationships.push(rel);
                     if mutation == 2 {
-                        r.b.elements[rel].ty = "Subclassification";
+                        r.b.elements[rel].set_ty("Subclassification");
                     } else if mutation == 3 {
                         r.b.elements[rel].props.insert(
                             "subsettedFeature",

@@ -79,6 +79,68 @@ pub(crate) fn reference_path_name(spelling: &str) -> &str {
     spelling.rsplit("::").next().unwrap_or(spelling)
 }
 
+/// A compact element array as the id derivation reads it: `n` elements
+/// at positions `0..n`, each with its metaclass, its id, the positions
+/// its two ownership lists name, the names it declares and the
+/// references the naming rule follows. [`derive_ids`] reads a
+/// [`Value`] array through it; an encoder that holds the elements some
+/// other way implements it, and [`derive_ids_of`] runs the derivation
+/// over them without the array being made. An implementation seam, not
+/// an API: the slot numbering, the property-name keys and the shape each
+/// method answers are the derivation's own.
+#[doc(hidden)]
+pub trait IdGraph {
+    /// The number of elements.
+    fn len(&self) -> usize;
+
+    /// Whether there are no elements.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Element `i`'s `@id` as a UUID, or [`IdError::InvalidId`].
+    fn uuid(&self, i: usize) -> Result<Uuid, IdError>;
+
+    /// Element `i`'s `@type`.
+    fn ty(&self, i: usize) -> &str;
+
+    /// The positions element `i`'s `ownedRelationship` (`slot` 0) or
+    /// `ownedRelatedElement` (`slot` 1) list names, in list order,
+    /// targets outside the payload left out.
+    fn owned(&self, i: usize, slot: usize) -> &[usize];
+
+    /// Element `i`'s `declaredName`, else its `declaredShortName`.
+    fn declared_name(&self, i: usize) -> Option<&str>;
+
+    /// Element `i`'s `memberName`, else its `memberShortName`.
+    fn member_name(&self, i: usize) -> Option<&str>;
+
+    /// The position of the element `i`'s `owningRelationship` names,
+    /// when it is in the payload.
+    fn owning_relationship(&self, i: usize) -> Option<usize>;
+
+    /// What element `i`'s `redefinedFeature` or `referencedFeature`
+    /// (`key`) names: a `@ref` is symbolic, a `@id` names an element in
+    /// the payload or outside it, and anything else names nothing.
+    fn feature_reference(&self, i: usize, key: &str) -> Option<Target<'_>>;
+
+    /// The element `i`'s `chainingFeature` names by `@id`, in the
+    /// payload or outside it; never [`Target::Symbolic`].
+    fn chaining_feature(&self, i: usize) -> Option<Target<'_>>;
+}
+
+/// What a reference property of an [`IdGraph`] names.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target<'a> {
+    /// A `@ref`, as spelled.
+    Symbolic(&'a str),
+    /// An element of the payload, by position.
+    Local(usize),
+    /// An element outside the payload, by its `@id` text.
+    External(&'a str),
+}
+
 /// Per element of `compact` (payload order): the graph-derived id, or
 /// `None` where the scheme assigns rather than derives (document
 /// roots) or the element is unreachable from any root. `external_name`
@@ -89,7 +151,16 @@ pub fn derive_ids(
     compact: &Value,
     external_name: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<Option<Uuid>>, IdError> {
-    Ok(walk(compact, external_name, None, Paths::Discard)?.0)
+    derive_ids_of(&ValueGraph::new(compact)?, external_name)
+}
+
+/// [`derive_ids`] of the elements `graph` holds, however it holds them.
+#[doc(hidden)]
+pub fn derive_ids_of(
+    graph: &impl IdGraph,
+    external_name: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<Option<Uuid>>, IdError> {
+    Ok(walk(graph, external_name, None, Paths::Discard)?.0)
 }
 
 /// Per element of `compact` (payload order): the ownership path that
@@ -103,7 +174,7 @@ pub fn segment_paths(
     compact: &Value,
     external_name: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<Option<(usize, String)>>, IdError> {
-    Ok(walk(compact, external_name, None, Paths::Keep)?.1)
+    Ok(walk(&ValueGraph::new(compact)?, external_name, None, Paths::Keep)?.1)
 }
 
 /// Compute the **final** id of every element of a payload whose `@id`
@@ -117,7 +188,8 @@ pub fn assign_ids(
     exceptions: &HashMap<usize, Uuid>,
     external_name: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<Uuid>, IdError> {
-    let derived = walk(compact, external_name, Some(exceptions), Paths::Discard)?.0;
+    let graph = ValueGraph::new(compact)?;
+    let derived = walk(&graph, external_name, Some(exceptions), Paths::Discard)?.0;
     derived
         .into_iter()
         .enumerate()
@@ -181,74 +253,156 @@ impl Trail {
     }
 }
 
+/// A [`Value`] element array as an [`IdGraph`]: the elements borrowed,
+/// indexed by `@id` text, with both ownership lists resolved once — the
+/// name fixpoint reads the relationship list of every element on every
+/// pass, and the walk reads both again.
+struct ValueGraph<'a> {
+    elems: &'a [Value],
+    index: HashMap<&'a str, usize>,
+    owned: [Vec<Vec<usize>>; 2],
+}
+
+impl<'a> ValueGraph<'a> {
+    /// `compact` as a graph, or why it is not an element array.
+    fn new(compact: &'a Value) -> Result<Self, IdError> {
+        let elems = compact.as_array().ok_or(IdError::NotAnElementArray)?;
+        let n = elems.len();
+        let mut index: HashMap<&str, usize> = HashMap::with_capacity(n);
+        for (i, e) in elems.iter().enumerate() {
+            let o = e.as_object().ok_or(IdError::NotAnObject(i))?;
+            let id = o
+                .get("@id")
+                .and_then(Value::as_str)
+                .ok_or(IdError::MissingId(i))?;
+            o.get("@type")
+                .and_then(Value::as_str)
+                .ok_or(IdError::MissingType(i))?;
+            index.insert(id, i);
+        }
+        // A reference list property → in-payload target indices, in order.
+        let targets = |i: usize, key: &str| -> Vec<usize> {
+            match elems[i].get(key) {
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.get("@id").and_then(Value::as_str))
+                    .filter_map(|s| index.get(s).copied())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let owned = [
+            (0..n).map(|i| targets(i, "ownedRelationship")).collect(),
+            (0..n).map(|i| targets(i, "ownedRelatedElement")).collect(),
+        ];
+        Ok(Self {
+            elems,
+            index,
+            owned,
+        })
+    }
+
+    fn obj(&self, i: usize) -> &'a serde_json::Map<String, Value> {
+        self.elems[i].as_object().expect("checked at construction")
+    }
+
+    fn id_str(&self, i: usize) -> &'a str {
+        self.obj(i).get("@id").and_then(Value::as_str).unwrap()
+    }
+
+    /// The element an `@id` text names, in the payload or outside it.
+    fn named(&self, id: &'a str) -> Target<'a> {
+        match self.index.get(id) {
+            Some(&t) => Target::Local(t),
+            None => Target::External(id),
+        }
+    }
+}
+
+impl IdGraph for ValueGraph<'_> {
+    fn len(&self) -> usize {
+        self.elems.len()
+    }
+
+    fn uuid(&self, i: usize) -> Result<Uuid, IdError> {
+        Uuid::parse_str(self.id_str(i)).map_err(|_| IdError::InvalidId(self.id_str(i).to_string()))
+    }
+
+    fn ty(&self, i: usize) -> &str {
+        self.obj(i)
+            .get("@type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+
+    fn owned(&self, i: usize, slot: usize) -> &[usize] {
+        &self.owned[slot][i]
+    }
+
+    fn declared_name(&self, i: usize) -> Option<&str> {
+        let o = self.obj(i);
+        o.get("declaredName")
+            .and_then(Value::as_str)
+            .or_else(|| o.get("declaredShortName").and_then(Value::as_str))
+    }
+
+    fn member_name(&self, i: usize) -> Option<&str> {
+        let o = self.obj(i);
+        o.get("memberName")
+            .and_then(Value::as_str)
+            .or_else(|| o.get("memberShortName").and_then(Value::as_str))
+    }
+
+    fn owning_relationship(&self, i: usize) -> Option<usize> {
+        self.obj(i)
+            .get("owningRelationship")
+            .and_then(|v| v.get("@id"))
+            .and_then(Value::as_str)
+            .and_then(|id| self.index.get(id).copied())
+    }
+
+    fn feature_reference(&self, i: usize, key: &str) -> Option<Target<'_>> {
+        let target = self.obj(i).get(key)?;
+        if let Some(s) = target.get("@ref").and_then(Value::as_str) {
+            return Some(Target::Symbolic(s));
+        }
+        Some(self.named(target.get("@id").and_then(Value::as_str)?))
+    }
+
+    fn chaining_feature(&self, i: usize) -> Option<Target<'_>> {
+        Some(self.named(self.obj(i).get("chainingFeature")?.get("@id")?.as_str()?))
+    }
+}
+
 fn walk(
-    compact: &Value,
+    g: &impl IdGraph,
     external_name: &dyn Fn(&str) -> Option<String>,
     finals: Option<&HashMap<usize, Uuid>>,
     keep_paths: Paths,
 ) -> Result<(Vec<Option<Uuid>>, SegmentPaths), IdError> {
-    let elems = compact.as_array().ok_or(IdError::NotAnElementArray)?;
-    let n = elems.len();
-    let obj = |i: usize| elems[i].as_object().expect("checked below");
-    let mut index: HashMap<&str, usize> = HashMap::with_capacity(n);
-    for (i, e) in elems.iter().enumerate() {
-        let o = e.as_object().ok_or(IdError::NotAnObject(i))?;
-        let id = o
-            .get("@id")
-            .and_then(Value::as_str)
-            .ok_or(IdError::MissingId(i))?;
-        o.get("@type")
-            .and_then(Value::as_str)
-            .ok_or(IdError::MissingType(i))?;
-        index.insert(id, i);
-    }
-    let ty = |i: usize| obj(i).get("@type").and_then(Value::as_str).unwrap_or("");
-    let id_str = |i: usize| obj(i).get("@id").and_then(Value::as_str).unwrap();
-    // A reference list property → in-payload target indices, in order.
-    let targets = |i: usize, key: &str| -> Vec<usize> {
-        match obj(i).get(key) {
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(|v| v.get("@id").and_then(Value::as_str))
-                .filter_map(|s| index.get(s).copied())
-                .collect(),
-            _ => Vec::new(),
-        }
-    };
-    // Both ownership lists, resolved once: the name fixpoint below reads
-    // the relationship list of every element on every pass, and the walk
-    // reads both again.
-    let owned_rels: Vec<Vec<usize>> = (0..n).map(|i| targets(i, "ownedRelationship")).collect();
-    let owned_elems: Vec<Vec<usize>> = (0..n).map(|i| targets(i, "ownedRelatedElement")).collect();
+    let n = g.len();
+    let ty = |i: usize| g.ty(i);
+    let owned_rels = |i: usize| g.owned(i, 0);
+    let owned_elems = |i: usize| g.owned(i, 1);
 
     // Names: declared, else the graph-effective fixpoint. This is the
     // id-segment reading of the one naming rule — see
     // `full::effective_name_of` for the rule and its other
     // implementations; a change to one belongs in all of them.
-    let declared = |i: usize| -> Option<String> {
-        let o = obj(i);
-        o.get("declaredName")
-            .and_then(Value::as_str)
-            .or_else(|| o.get("declaredShortName").and_then(Value::as_str))
-            .map(str::to_owned)
-    };
-    let mut names: Vec<Option<String>> = (0..n).map(declared).collect();
+    let mut names: Vec<Option<String>> = (0..n)
+        .map(|i| g.declared_name(i).map(str::to_owned))
+        .collect();
     let effective = |i: usize, names: &[Option<String>]| -> Option<String> {
-        let membership = obj(i)
-            .get("owningRelationship")
-            .and_then(|v| v.get("@id"))
-            .and_then(Value::as_str)
-            .and_then(|id| index.get(id))
-            .map(|&r| ty(r));
+        let membership = g.owning_relationship(i).map(ty);
         let named_reference = crate::json::naming::reference_names_feature(ty(i), membership)
             .then(|| {
-                owned_rels[i]
+                owned_rels(i)
                     .iter()
                     .copied()
                     .find(|&r| ty(r) == "ReferenceSubsetting")
             })
             .flatten();
-        for &r in &owned_rels[i] {
+        for &r in owned_rels(i) {
             if named_reference.is_some() && Some(r) != named_reference {
                 continue;
             }
@@ -257,31 +411,27 @@ fn walk(
                 "ReferenceSubsetting" => "referencedFeature",
                 _ => continue,
             };
-            let target = obj(r).get(key)?;
-            if let Some(s) = target.get("@ref").and_then(Value::as_str) {
-                return Some(reference_path_name(s).to_string());
-            }
-            let s = target.get("@id").and_then(Value::as_str)?;
-            return match index.get(s) {
-                Some(&t) => {
+            return match g.feature_reference(r, key)? {
+                Target::Symbolic(s) => Some(reference_path_name(s).to_string()),
+                Target::Local(t) => {
                     if key == "referencedFeature"
                         && crate::json::naming::reference_names_feature_target(ty(i), membership)
                     {
-                        if let Some(&last) = owned_rels[t]
+                        if let Some(&last) = owned_rels(t)
                             .iter()
                             .rev()
                             .find(|&&r| ty(r) == "FeatureChaining")
                         {
-                            let id = obj(last).get("chainingFeature")?.get("@id")?.as_str()?;
-                            return match index.get(id) {
-                                Some(&t) => names[t].clone(),
-                                None => external_name(id),
+                            return match g.chaining_feature(last)? {
+                                Target::Local(t) => names[t].clone(),
+                                Target::External(id) => external_name(id),
+                                Target::Symbolic(_) => None,
                             };
                         }
                     }
                     names[t].clone()
                 }
-                None => external_name(s),
+                Target::External(s) => external_name(s),
             };
         }
         None
@@ -305,10 +455,10 @@ fn walk(
     // Roots: elements owned by nothing in the payload.
     let mut owned: vec::BitSet = vec::BitSet::new(n);
     for i in 0..n {
-        for &r in &owned_rels[i] {
+        for &r in owned_rels(i) {
             owned.set(r);
         }
-        for &k in &owned_elems[i] {
+        for &k in owned_elems(i) {
             owned.set(k);
         }
     }
@@ -325,9 +475,7 @@ fn walk(
                 .copied()
                 .or(derived[k])
                 .ok_or(IdError::NoIdentity(k)),
-            None => {
-                Uuid::parse_str(id_str(k)).map_err(|_| IdError::InvalidId(id_str(k).to_string()))
-            }
+            None => g.uuid(k),
         }
     };
     let mut paths = Trail::new(n, keep_paths);
@@ -343,8 +491,8 @@ fn walk(
         visited.set(owner);
         let owner_ns = final_of(owner, &derived)?;
         let mut used: HashSet<String> = HashSet::new();
-        for (i, &rel) in owned_rels[owner].iter().enumerate() {
-            let kids = &owned_elems[rel];
+        for (i, &rel) in owned_rels(owner).iter().enumerate() {
+            let kids = owned_elems(rel);
             let membership = ty(rel).ends_with("Membership");
             // This structural role cannot reuse a legacy argument's r1/e0
             // identity or acquire the instantiated type's effective name.
@@ -386,12 +534,7 @@ fn walk(
             }
             let mut seg = format!("r{i}");
             if kids.is_empty() && ty(rel) == "Membership" {
-                let o = obj(rel);
-                if let Some(name) = o
-                    .get("memberName")
-                    .and_then(Value::as_str)
-                    .or_else(|| o.get("memberShortName").and_then(Value::as_str))
-                {
+                if let Some(name) = g.member_name(rel) {
                     let named = format!("::{}", escape_name(name));
                     if used.insert(named.clone()) {
                         seg = named;

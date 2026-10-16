@@ -1,11 +1,13 @@
 //! Ambient libraries: SysML libraries compiled into the toolkit and added
 //! to every model that loads a library (`--lib`, a session library, the
 //! browser bundle), so models can reference them without naming the
-//! files. There is one: `TransformMeta`, the metadata vocabulary that
-//! generated elements and their provenance records are annotated with.
-//! Its source of truth is `local-packages/TransformMeta.sysml` at the
-//! repository root (see `local-packages/README.md`); this module is its
-//! build-time mirror.
+//! files. There are two: `TransformMeta`, the metadata vocabulary that
+//! generated elements and their provenance records are annotated with,
+//! and `StringPatterns`, the `Pattern` metadata naming the lexical form
+//! of a string-encoded attribute definition, applied to the standard
+//! library's ISO 8601 date-time encoding. Their sources of truth are the
+//! files under `local-packages/` at the repository root (see
+//! `local-packages/README.md`); this module is their build-time mirror.
 //!
 //! Interim mechanism: once the SysML package manager can install these
 //! as published library packages, project installation provides them
@@ -15,10 +17,16 @@
 use crate::model::Model;
 
 /// `(unit name, source text)` in load order.
-pub const LIBRARIES: &[(&str, &str)] = &[(
-    "local-packages/TransformMeta.sysml",
-    include_str!("../../../local-packages/TransformMeta.sysml"),
-)];
+pub const LIBRARIES: &[(&str, &str)] = &[
+    (
+        "local-packages/TransformMeta.sysml",
+        include_str!("../../../local-packages/TransformMeta.sysml"),
+    ),
+    (
+        "local-packages/StringPatterns.sysml",
+        include_str!("../../../local-packages/StringPatterns.sysml"),
+    ),
+];
 
 /// Are the ambient libraries enabled? `SYSMLV2_AMBIENT=off` keeps them
 /// out — to check an edited copy as a candidate without its built-in
@@ -90,7 +98,13 @@ mod tests {
     #[test]
     fn ambient_sources_parse_and_are_stable() {
         let names: Vec<&str> = LIBRARIES.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["local-packages/TransformMeta.sysml"]);
+        assert_eq!(
+            names,
+            [
+                "local-packages/TransformMeta.sysml",
+                "local-packages/StringPatterns.sysml"
+            ]
+        );
         for (name, text) in LIBRARIES {
             assert!(name.starts_with("local-packages/"), "{name}");
             assert!(

@@ -35,6 +35,7 @@
 
 use super::{ElementRef, ResolvedModel};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use crate::properties::Atom;
 
 /// SysML reference forms whose naming rule uses the referenced feature's
@@ -401,7 +402,7 @@ impl ResolvedModel {
         // The document root namespace is unnamed; reaching it (or any
         // unowned element) ends the walk.
         while let Some(rel) = self.b.elements[cur].owning_relationship {
-            if !conforms(self.b.elements[rel].ty, "Membership") {
+            if !is_a!(self.b.elements[rel], "Membership") {
                 return None;
             }
             let seg = self

@@ -1,7 +1,7 @@
 //! Local constancy obligations over owned flags and checked Usage variability.
 //! Canonical textual completion shares the checked Usage variability evidence.
 use super::{ElementRef, ResolvedModel, UsageVariabilityIssue, structural_index::StoredStructure};
-use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 
 /// Why the local constancy obligations cannot be certified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +111,7 @@ impl ResolvedModel {
         let Some(row) = self.b.elements.get(feature.0) else {
             return EndConstancyReport::refused(InvalidElement, steps);
         };
-        let usage = conforms(row.ty, "Usage");
+        let usage = is_a!(row, "Usage");
         if row.ty != "Feature" && !usage {
             return EndConstancyReport::refused(UnsupportedConfiguration, steps);
         }

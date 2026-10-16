@@ -1,12 +1,13 @@
 //! Checked multiplicity constraints and collection questions over shared evidence.
 use super::{
-    Builder, ElementRef, ResolvedModel, membership_evidence,
+    Builder, ElementRef, LookupResult, QualifiedName, ResolvedModel, membership_evidence,
     semantic::certified_types::Stamp,
     semantic_ownership,
     structural_index::StoredStructure,
     type_relations::{self, TypeRelations},
 };
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -192,7 +193,7 @@ impl ResolvedModel {
                 .b
                 .elements
                 .get(receiver.0)
-                .is_some_and(|e| conforms(e.ty, "Type"))
+                .is_some_and(|e| is_a!(e, "Type"))
             {
                 return Err(CardinalityIssue::InvalidElement);
             }
@@ -319,7 +320,7 @@ impl Reader<'_> {
             .ok_or(CardinalityIssue::InvalidRelationship)?;
         charge(self.steps, relationships.len())?;
         let mut result = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         for relationship in relationships.iter() {
             if !seen.insert(relationship) {
                 return Err(CardinalityIssue::InvalidRelationship);
@@ -328,11 +329,11 @@ impl Reader<'_> {
                 .elements
                 .get(relationship)
                 .ok_or(CardinalityIssue::InvalidRelationship)?;
-            if conforms(relation.ty, "Membership") {
+            if is_a!(relation, "Membership") {
                 let member =
                     membership_evidence::member(b, &self.raw, owner, relationship, self.steps)
                         .ok_or(CardinalityIssue::InvalidRelationship)?;
-                if conforms(relation.ty, "OwningMembership") {
+                if is_a!(relation, "OwningMembership") {
                     result.push(member);
                 }
             }
@@ -357,7 +358,7 @@ impl Reader<'_> {
         let owned: Vec<_> = self
             .members(b, owner)?
             .into_iter()
-            .filter(|&e| conforms(b.elements[e].ty, "Multiplicity"))
+            .filter(|&e| is_a!(b.elements[e], "Multiplicity"))
             .collect();
         if owned.len() > 1 {
             return Err(CardinalityIssue::InvalidRelationship);
@@ -371,7 +372,7 @@ impl Reader<'_> {
                 .relations
                 .complete_direct_bases(b, owner, self.steps)
                 .ok_or(CardinalityIssue::IncompleteProvider)?;
-            let mut seen = HashSet::new();
+            let mut seen = crate::layered::IdSet::default();
             for base in bases {
                 for domain in self.constraints(b, base, depth + 1)? {
                     charge(self.steps, 1)?;
@@ -401,7 +402,7 @@ impl Reader<'_> {
             semantic_ownership::checked_relationship_carrier(b, &self.raw, membership, self.steps)
                 .flatten()
                 .ok_or(CardinalityIssue::InvalidRelationship)?;
-        if !conforms(b.elements[membership].ty, "FeatureMembership")
+        if !is_a!(b.elements[membership], "FeatureMembership")
             || membership_evidence::member(b, &self.raw, owner, membership, self.steps)
                 != Some(feature)
             || self.raw.metadata_annotation_targets.contains(&owner)
@@ -431,9 +432,7 @@ impl Reader<'_> {
         // The generated static suffix is not an authored declaration, and an
         // authored isImplied flag cannot impersonate that provenance.
         for &relationship in relationships {
-            if relationship < b.explicit_len()
-                && conforms(b.elements[relationship].ty, "Subsetting")
-            {
+            if b.is_authored(relationship) && is_a!(b.elements[relationship], "Subsetting") {
                 return Ok(false);
             }
         }
@@ -449,7 +448,7 @@ impl Reader<'_> {
         if depth >= 64 || !self.domains.insert(owner) {
             return Err(CardinalityIssue::CyclicDependency);
         }
-        if !conforms(b.elements[owner].ty, "Multiplicity") {
+        if !is_a!(b.elements[owner], "Multiplicity") {
             return Err(CardinalityIssue::InvalidRelationship);
         }
         let members = self.members(b, owner)?;
@@ -457,12 +456,12 @@ impl Reader<'_> {
             let bounds: Vec<_> = members
                 .iter()
                 .copied()
-                .take_while(|&member| conforms(b.elements[member].ty, "Expression"))
+                .take_while(|&member| is_a!(b.elements[member], "Expression"))
                 .collect();
             if !(1..=2).contains(&bounds.len())
                 || members[bounds.len()..]
                     .iter()
-                    .any(|&member| conforms(b.elements[member].ty, "Expression"))
+                    .any(|&member| is_a!(b.elements[member], "Expression"))
             {
                 return Err(CardinalityIssue::InvalidRelationship);
             }
@@ -494,7 +493,7 @@ impl Reader<'_> {
             }
         }
         for member in members {
-            if conforms(b.elements[member].ty, "Expression") {
+            if is_a!(b.elements[member], "Expression") {
                 match b.elements[member].ty {
                     "LiteralInteger" | "LiteralInfinity" => {
                         // Literal syntax has no payload relationships; imported
@@ -520,7 +519,7 @@ impl Reader<'_> {
             .ok_or(CardinalityIssue::InvalidRelationship)?;
         charge(self.steps, relationships.len())?;
         let relationships: Vec<_> = relationships.iter().collect();
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         for relationship in relationships {
             if !seen.insert(relationship) {
                 return Err(CardinalityIssue::InvalidRelationship);
@@ -561,7 +560,7 @@ impl Reader<'_> {
                 self.steps,
             )
             .ok_or(CardinalityIssue::InvalidRelationship)?;
-            if conforms(b.elements[target].ty, "Multiplicity") {
+            if is_a!(b.elements[target], "Multiplicity") {
                 self.validate_domain(b, target, depth + 1)?;
             } else if kind == "Subsetting"
                 && self.relations.library_role(b, "Base::things", self.steps) == Some(target)
@@ -587,6 +586,109 @@ impl Reader<'_> {
 }
 
 impl Builder {
+    /// Whether the heritage of `scope` — its base scopes, the implied
+    /// ones included, and what those import, as far as the inherited
+    /// memberships are gathered from — can reach a scope in `scopes`, or
+    /// an alias or membership import standing for one of `features`. A
+    /// scope on the way that imports recursively counts as reaching. A
+    /// scope found to reach none is kept in `memo` with every scope
+    /// passed on the way, which reaches no more than it; a scope found to
+    /// reach one is kept alone.
+    pub(crate) fn heritage_reaches_any(
+        &mut self,
+        scope: usize,
+        scopes: &crate::layered::IdSet<usize>,
+        features: &crate::layered::IdSet<usize>,
+        memo: &mut crate::layered::IdMap<usize, bool>,
+    ) -> bool {
+        if let Some(&known) = memo.get(&scope) {
+            return known;
+        }
+        let mut seen: crate::layered::IdSet<usize> = Default::default();
+        let mut stack = vec![scope];
+        let mut reaches = false;
+        while let Some(s) = stack.pop() {
+            if !seen.insert(s) {
+                continue;
+            }
+            match memo.get(&s) {
+                Some(true) => {
+                    reaches = true;
+                    break;
+                }
+                Some(false) => continue,
+                None => {}
+            }
+            if scopes.contains(&s) || self.scope_stands_for_any(s, features) {
+                reaches = true;
+                break;
+            }
+            stack.extend(self.base_scopes_split(s).0);
+            stack.extend(self.import_scopes(s).iter().map(|entry| entry.scope));
+        }
+        if reaches {
+            memo.insert(scope, true);
+        } else {
+            for s in seen {
+                memo.insert(s, false);
+            }
+        }
+        reaches
+    }
+
+    /// Whether a membership of scope `s` other than an owned one — an
+    /// alias, a membership import — stands for one of `features`, or
+    /// could (a recursive import). An unresolved one stands for nothing:
+    /// the enumeration adds nothing for it.
+    fn scope_stands_for_any(&mut self, s: usize, features: &crate::layered::IdSet<usize>) -> bool {
+        if features.is_empty() {
+            return self.scopes[s].imports.iter().any(|import| import.recursive);
+        }
+        let aliases: Vec<usize> = self.scopes[s]
+            .aliases
+            .iter()
+            .map(|(_, _, rel)| *rel)
+            .collect();
+        for rel in aliases {
+            if self
+                .reference_target(rel, "memberElement")
+                .is_some_and(|member| features.contains(&member))
+            {
+                return true;
+            }
+        }
+        // A membership import is resolved as the enumeration resolves it,
+        // by name from the scope; the lookups are no use of the imports.
+        let imports: Vec<(QualifiedName, bool)> = self.scopes[s]
+            .member_imports
+            .iter()
+            .map(|import| (import.target.clone(), import.is_import_all))
+            .collect();
+        if !imports.is_empty() {
+            let used = std::mem::take(&mut self.used_imports);
+            let walks = std::mem::take(&mut self.query_imports);
+            let stands = imports.into_iter().any(|(target, import_all)| {
+                matches!(
+                    self.resolve_result(s, &target, 0, import_all),
+                    LookupResult::Found(member, _, _) if features.contains(&member)
+                )
+            });
+            self.used_imports = used;
+            self.query_imports = walks;
+            if stands {
+                return true;
+            }
+        }
+        self.scopes[s].imports.iter().any(|import| import.recursive)
+    }
+
+    /// The element the reference property `key` of row `e` names, when
+    /// it is resolved to a row.
+    fn reference_target(&mut self, e: usize, key: &str) -> Option<usize> {
+        let id = self.elements[e].props.get(key)?.as_reference()?;
+        self.element_index_of_uuid(id)
+    }
+
     /// Preserve the compatibility candidate order, but certify every membership
     /// and its inverse domain before it can establish absence of a redefinition.
     pub(crate) fn cardinality_feature_candidates(
@@ -615,9 +717,9 @@ impl Builder {
             .chain(inherited.membership_order.iter().copied())
             .collect();
         let mut out = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         for relationship in relationships {
-            if !super::is_feature_membership(self.elements.get(relationship)?.ty) {
+            if !is_a!(self.elements.get(relationship)?, "FeatureMembership") {
                 continue;
             }
             let owner =
@@ -626,7 +728,7 @@ impl Builder {
                 return None;
             }
             let member = membership_evidence::member(self, &raw, owner, relationship, steps)?;
-            if !conforms(self.elements[member].ty, "Feature") {
+            if !is_a!(self.elements[member], "Feature") {
                 return None;
             }
             if seen.insert(member) {
@@ -664,12 +766,11 @@ impl Builder {
         let authored_owned_subsets = own
             .iter()
             .filter(|&relationship| {
-                relationship < self.explicit_len()
-                    && conforms(self.elements[relationship].ty, "Subsetting")
+                self.is_authored(relationship) && is_a!(self.elements[relationship], "Subsetting")
             })
             .count();
         let relationships: Vec<_> = own.iter().chain(incoming.iter().copied()).collect();
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         let mut targets = Vec::new();
         for relationship in relationships {
             if !seen.insert(relationship) {
@@ -838,7 +939,7 @@ fn certified_operators(
                 // Type member instead has a complete receiver/redefinition proof.
                 if r.b
                     .owner_elem(target)
-                    .is_none_or(|owner| !conforms(r.b.elements[owner].ty, "Type"))
+                    .is_none_or(|owner| !is_a!(r.b.elements[owner], "Type"))
                 {
                     require_model_level_value(r, expression, steps)?;
                 } else {
@@ -847,7 +948,7 @@ fn certified_operators(
                         .ok_or(CardinalityIssue::IncompleteProvider)?;
                     // Active behavior inputs need an invocation/frame environment;
                     // a declaration default cannot stand in for supplied arguments.
-                    if conforms(r.b.elements[receiver].ty, "Behavior") {
+                    if is_a!(r.b.elements[receiver], "Behavior") {
                         return Err(CardinalityIssue::UnsupportedBound);
                     }
                     if contextual_features.is_none() {
@@ -961,7 +1062,7 @@ fn certify_reference_domain(
         {
             return Err(CardinalityIssue::StaleEvidence);
         }
-        if conforms(b.elements[relationship].ty, "Membership") {
+        if is_a!(b.elements[relationship], "Membership") {
             membership_evidence::member(b, raw, expression, relationship, steps)
                 .ok_or(CardinalityIssue::InvalidRelationship)?;
         }

@@ -87,7 +87,7 @@ fn qualified_alias_paths_retain_import_walks() {
 }
 
 #[test]
-fn pure_alias_chains_keep_membership_suppression() {
+fn pure_alias_chains_inherit_every_membership_of_the_feature() {
     for aliases in [
         "feature x; alias ax for x; alias bx for ax;",
         "feature <x> x; alias ax for x; alias bx for ax;",
@@ -96,11 +96,15 @@ fn pure_alias_chains_keep_membership_suppression() {
     ] {
         let library = format!("class Base {{ {aliases} }} class Child specializes Base;");
         for mut r in models(&library, "feature useAlias references Child::bx;") {
+            let x = r.resolve_qualified("Base::x").unwrap();
             for name in ["Child::ax", "Child::bx"] {
-                assert_eq!(r.resolve_qualified(name), None, "{name} in {aliases}");
+                assert_eq!(r.resolve_qualified(name), Some(x), "{name} in {aliases}");
             }
+            // The aliases inherit, and the owning Membership with them unless
+            // it is private.
             let child = r.resolve_qualified("Child").unwrap();
-            assert!(r.inherited_memberships(child, false).is_empty());
+            let inherited = if aliases.starts_with("private") { 2 } else { 3 };
+            assert_eq!(r.inherited_memberships(child, false).len(), inherited);
             let selected = r.resolve_qualified("useAlias").unwrap();
             let relation = r
                 .owned_relationships(selected)
@@ -108,8 +112,8 @@ fn pure_alias_chains_keep_membership_suppression() {
                 .find(|&e| r.element_type(e) == "ReferenceSubsetting")
                 .unwrap();
             assert_eq!(
-                r.element_properties(relation)["referencedFeature"]["@ref"],
-                "Child::bx"
+                r.element_properties(relation)["referencedFeature"]["@id"],
+                r.element_id(x).to_string()
             );
         }
     }
@@ -123,14 +127,15 @@ fn unrelated_ancestor_imports_do_not_disqualify_local_aliases() {
             class Child specializes Base;
         }";
     for mut r in models(library, "feature useAlias references P::Child::ax;") {
-        assert_eq!(r.resolve_qualified("P::Child::x"), None);
-        assert_eq!(r.resolve_qualified("P::Child::ax"), None);
-        assert_eq!(r.resolve_qualified("P::Child::bx"), None);
+        let x = r.resolve_qualified("P::Base::x").unwrap();
+        for name in ["P::Child::x", "P::Child::ax", "P::Child::bx"] {
+            assert_eq!(r.resolve_qualified(name), Some(x), "{name}");
+        }
     }
 }
 
 #[test]
-fn aliases_to_inherited_and_effective_bindings_remain_filtered() {
+fn aliases_to_inherited_and_effective_bindings_resolve_in_subtypes() {
     for member in ["", "feature redefines x;"] {
         let library = format!(
             "class A {{ feature x; }} class B specializes A {{ {member} }}
@@ -138,15 +143,15 @@ fn aliases_to_inherited_and_effective_bindings_remain_filtered() {
             class Child specializes Base;"
         );
         for mut r in models(&library, "feature useAlias references Child::ax;") {
-            assert!(r.resolve_qualified("B::x").is_some());
-            assert_eq!(r.resolve_qualified("Child::ax"), None);
-            assert_eq!(r.resolve_qualified("Child::bx"), None);
+            let x = r.resolve_qualified("B::x").unwrap();
+            assert_eq!(r.resolve_qualified("Child::ax"), Some(x), "{member}");
+            assert_eq!(r.resolve_qualified("Child::bx"), Some(x), "{member}");
         }
     }
 }
 
 #[test]
-fn alias_certificates_use_filtered_multiple_inheritance() {
+fn alias_certificates_use_multiple_inheritance() {
     let library = "class A { feature x; }
         class B specializes A { feature x redefines x; }
         class Combined specializes A, B;
@@ -155,19 +160,20 @@ fn alias_certificates_use_filtered_multiple_inheritance() {
     for mut r in models(library, "feature useAlias references Child::ax;") {
         let x = r.resolve_qualified("B::x").unwrap();
         assert_eq!(r.resolve_qualified("Combined::x"), Some(x));
-        assert_eq!(r.resolve_qualified("Child::ax"), None);
-        assert_eq!(r.resolve_qualified("Child::bx"), None);
+        assert_eq!(r.resolve_qualified("Child::ax"), Some(x));
+        assert_eq!(r.resolve_qualified("Child::bx"), Some(x));
     }
 }
 
 #[test]
-fn qualified_protected_alias_targets_keep_inherited_membership_filtering() {
+fn qualified_protected_alias_targets_inherit() {
     let library = "class A { protected feature x; }
         class Base specializes A { alias ax for A::x; alias bx for A::x; }
         class Child specializes Base;";
     for mut r in models(library, "feature useAlias references Child::ax;") {
-        assert!(r.resolve_qualified("Base::ax").is_some());
-        assert_eq!(r.resolve_qualified("Child::ax"), None);
-        assert_eq!(r.resolve_qualified("Child::bx"), None);
+        let x = r.resolve_qualified("A::x").unwrap();
+        assert_eq!(r.resolve_qualified("Base::ax"), Some(x));
+        assert_eq!(r.resolve_qualified("Child::ax"), Some(x));
+        assert_eq!(r.resolve_qualified("Child::bx"), Some(x));
     }
 }

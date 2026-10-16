@@ -1,6 +1,6 @@
 //! Lexical succession endpoints, projected into the shared implied graph.
 use super::{Builder, membership_evidence, structural_index::StoredStructure};
-use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, hash_map::Entry};
 
 fn charge(steps: &mut usize, amount: usize) -> Option<()> {
@@ -27,7 +27,7 @@ pub(super) fn endpoints_from(
     // after proving existence wastes the cold query's shared work allowance.
     charge(steps, limit.saturating_sub(start))?;
     let mut successions = Vec::new();
-    for i in start..limit {
+    for i in (start..limit).filter(|&i| b.is_authored(i)) {
         if b.elements[i].ty == "SuccessionAsUsage" {
             charge(steps, 1)?;
             successions.push(i);
@@ -70,7 +70,7 @@ pub(super) fn endpoints_from(
                     complete = false;
                     break;
                 };
-                if !conforms(relation.ty, "Membership") {
+                if !is_a!(relation, "Membership") {
                     continue;
                 }
                 if let Some(member) = membership_evidence::member(b, &raw, owner, rel, steps) {
@@ -92,8 +92,8 @@ pub(super) fn endpoints_from(
                 if explicit_transition {
                     for &(rel, member) in &members {
                         charge(steps, 1)?;
-                        if conforms(b.elements[rel].ty, "FeatureMembership")
-                            || !conforms(b.elements[member].ty, "Feature")
+                        if is_a!(b.elements[rel], "FeatureMembership")
+                            || !is_a!(b.elements[member], "Feature")
                         {
                             continue;
                         }
@@ -114,15 +114,15 @@ pub(super) fn endpoints_from(
                 let transition_source = (explicit_transition && !chained_source)
                     .then(|| {
                         members.iter().find_map(|&(rel, member)| {
-                            (!conforms(b.elements[rel].ty, "FeatureMembership")
-                                && conforms(b.elements[member].ty, "ActionUsage"))
+                            (!is_a!(b.elements[rel], "FeatureMembership")
+                                && is_a!(b.elements[member], "ActionUsage"))
                             .then_some(member)
                         })
                     })
                     .flatten();
                 let occurrence = |rel: usize, member: usize| {
-                    conforms(b.elements[rel].ty, "FeatureMembership")
-                        && conforms(b.elements[member].ty, "OccurrenceUsage")
+                    is_a!(b.elements[rel], "FeatureMembership")
+                        && is_a!(b.elements[member], "OccurrenceUsage")
                 };
                 let mut previous = None;
                 for &(rel, member) in &members {
@@ -195,14 +195,14 @@ pub(super) fn endpoints_from(
             }
             // An unknown row or authored specialization prevents inventing
             // a replacement endpoint, including an existing reference subset.
-            if b.elements[end].owned_relationships.iter().any(|&r| {
-                b.elements
-                    .get(r)
-                    .is_none_or(|r| conforms(r.ty, "Specialization"))
-            }) {
+            if b.elements[end]
+                .owned_relationships
+                .iter()
+                .any(|&r| b.elements.get(r).is_none_or(|r| is_a!(r, "Specialization")))
+            {
                 continue;
             }
-            if conforms(b.elements[end].ty, "Feature") && end != target {
+            if is_a!(b.elements[end], "Feature") && end != target {
                 out.push((end, target));
             }
         }

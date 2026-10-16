@@ -1,6 +1,7 @@
 //! Shared conformance policy for validation and proposed redefinition repairs.
-use super::facts::{Facts, is};
+use super::facts::Facts;
 use crate::json::{Builder, DirectionFact, DirectionProof, authored_direction};
+use crate::metaclass::is_a;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -67,14 +68,14 @@ impl OwnershipProof {
         steps: &mut usize,
     ) -> Option<Option<usize>> {
         let feature = b.elements.get(e)?;
-        if !is(b, e, "Feature") {
+        if !is_a!(b.elements[e], "Feature") {
             return None;
         }
         let Some(rel) = feature.owning_relationship else {
             return Some(None);
         };
         b.elements.get(rel)?;
-        if !is(b, rel, "OwningMembership") {
+        if !is_a!(b.elements[rel], "OwningMembership") {
             return None;
         }
         let membership = b.elements.get(rel)?;
@@ -107,8 +108,8 @@ impl OwnershipProof {
                 return None;
             }
         }
-        if is(b, rel, "FeatureMembership") {
-            is(b, owner, "Type").then_some(Some(owner))
+        if is_a!(b.elements[rel], "FeatureMembership") {
+            is_a!(b.elements[owner], "Type").then_some(Some(owner))
         } else {
             Some(None)
         }
@@ -148,7 +149,7 @@ impl RedefinitionDirections {
         // and action/link exclusions. The static occurrence heuristic is not
         // an identity proof. Unknown variability must satisfy both the owner-
         // only and all-featuring interpretations before a repair is offered.
-        let variable = if is(b, element, "Usage") {
+        let variable = if is_a!(b.elements[element], "Usage") {
             if owner == Some(None)
                 || b.elements[element]
                     .props
@@ -179,10 +180,10 @@ impl RedefinitionDirections {
                 return None;
             }
             for &rel in relations {
-                if is(b, rel, "FeatureChaining") {
+                if is_a!(b.elements[rel], "FeatureChaining") {
                     // Its first feature contributes further featuring contexts.
                     complete = false;
-                } else if is(b, rel, "TypeFeaturing") {
+                } else if is_a!(b.elements[rel], "TypeFeaturing") {
                     let relation = &b.elements[rel];
                     if relation
                         .props
@@ -193,7 +194,7 @@ impl RedefinitionDirections {
                         continue;
                     }
                     match g.target(b, rel, "featuringType") {
-                        Some(t) if is(b, t, "Type") => {
+                        Some(t) if is_a!(b.elements[t], "Type") => {
                             if seen_contexts.insert(t) {
                                 contexts.push(t);
                             }
@@ -217,7 +218,11 @@ impl RedefinitionDirections {
                         if *steps > crate::eval::MAX_STEPS {
                             return None;
                         }
-                        Some(relationships.iter().any(|&r| is(b, r, "FeatureChaining")))
+                        Some(
+                            relationships
+                                .iter()
+                                .any(|&r| is_a!(b.elements[r], "FeatureChaining")),
+                        )
                     },
                     &mut self.steps,
                 )
@@ -393,7 +398,7 @@ mod tests {
         for e in [good_owner, bad_owner] {
             // Graph-level SysML Usage: textual SysML does not admit the KerML
             // `featured by` spelling, but TypeFeaturing is a metamodel relation.
-            r.b.elements[e].ty = "ActionUsage";
+            r.b.elements[e].set_ty("ActionUsage");
             r.b.elements[e].props.insert("isComposite", json!(true));
         }
         let g = Facts::new(&mut r.b);

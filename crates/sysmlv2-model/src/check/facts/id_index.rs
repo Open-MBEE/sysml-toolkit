@@ -1,7 +1,8 @@
 //! Sorted immutable identity table with private additions. Snapshot reads check
 //! ordering once and query the stored rows without rehashing library identities.
+use crate::layered::IdMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use uuid::Uuid;
 
 // Restrict a lookup to one of 4096 ordered UUID-prefix ranges. This keeps
@@ -21,10 +22,41 @@ fn offsets(rows: &[(Uuid, usize)]) -> Vec<usize> {
     }
     offsets
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[serde(from = "TableWire")]
 struct Table {
     rows: Vec<(Uuid, usize)>,
     offsets: Vec<usize>,
+}
+impl Serialize for Table {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        TableWire::from(self).serialize(s)
+    }
+}
+/// The table as columns the snapshot carries in bulk.
+#[derive(Serialize, Deserialize)]
+struct TableWire {
+    ids: crate::bulk::Ids,
+    indices: crate::bulk::Ints,
+    offsets: crate::bulk::Ints,
+}
+impl From<&Table> for TableWire {
+    fn from(t: &Table) -> Self {
+        Self {
+            ids: crate::bulk::Ids(t.rows.iter().map(|r| r.0).collect()),
+            indices: crate::bulk::Ints(t.rows.iter().map(|r| r.1).collect()),
+            offsets: crate::bulk::Ints(t.offsets.clone()),
+        }
+    }
+}
+impl From<TableWire> for Table {
+    fn from(w: TableWire) -> Self {
+        let rows = w.ids.0.into_iter().zip(w.indices.0).collect();
+        Self {
+            rows,
+            offsets: w.offsets.0,
+        }
+    }
 }
 impl Table {
     fn new(rows: Vec<(Uuid, usize)>) -> Self {
@@ -43,7 +75,7 @@ impl Default for Table {
 #[derive(Clone, Default)]
 pub(super) struct IdIndex {
     base: Arc<Table>,
-    local: HashMap<Uuid, usize>,
+    local: IdMap<Uuid, usize>,
 }
 impl IdIndex {
     pub(super) fn get(&self, id: &Uuid) -> Option<&usize> {
@@ -105,7 +137,7 @@ impl<'de> Deserialize<'de> for IdIndex {
         }
         Ok(Self {
             base: Arc::new(table),
-            local: HashMap::new(),
+            local: IdMap::default(),
         })
     }
 }

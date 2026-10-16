@@ -33,10 +33,8 @@
 //! inherited name stays unreported here. The enumerations this pass asks
 //! for stay memoized on the builder, so a long-lived host pays for them
 //! once and its later inherited-member queries reuse them.
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashSet},
-};
+use crate::metaclass::is_a;
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use crate::{
     json::{Builder, ElementRef, ResolvedModel},
@@ -95,11 +93,9 @@ fn prop_str<'a>(b: &'a Builder, e: usize, key: &str) -> Option<&'a str> {
 /// target — and, when it differs, its declared short name (both bind in
 /// the same name space).
 fn declared_keys(b: &Builder, e: usize) -> impl Iterator<Item = Cow<'_, str>> {
-    let name: Option<Cow<str>> = match prop_str(b, e, "declaredName") {
-        Some(n) => Some(Cow::Borrowed(n)),
-        None => b.effective_name(e).map(Cow::Owned),
-    };
-    let short = prop_str(b, e, "declaredShortName")
+    let (declared, short) = b.elements[e].props.declared_names();
+    let name = declared.or(short).map(Cow::Borrowed);
+    let short = short
         .filter(|s| name.as_deref() != Some(*s))
         .map(Cow::Borrowed);
     name.into_iter().chain(short)
@@ -148,7 +144,22 @@ fn implicitly_redefines(b: &Builder, e: usize) -> bool {
         return true;
     }
     b.owner_elem(e)
-        .is_some_and(|o| conforms(b.elements[o].ty, "MetadataFeature"))
+        .is_some_and(|o| is_a!(b.elements[o], "MetadataFeature"))
+}
+
+/// [`implicitly_redefines`] with a memo across one check: the question is
+/// asked about the same inherited members for every type that inherits them.
+fn implicitly_redefines_memo(
+    b: &Builder,
+    e: usize,
+    memo: &mut crate::layered::IdMap<usize, bool>,
+) -> bool {
+    if let Some(&answer) = memo.get(&e) {
+        return answer;
+    }
+    let answer = implicitly_redefines(b, e);
+    memo.insert(e, answer);
+    answer
 }
 
 /// Whether `e`, an owned member of `owner`, redefines the inherited member
@@ -158,19 +169,25 @@ fn implicitly_redefines(b: &Builder, e: usize) -> bool {
 /// and its reuse of the name `b` is the collision the rule reports. The
 /// other implied kinds ([`implicitly_redefines`]) carry their role's one
 /// inherited member.
-fn implicitly_redefines_member(b: &mut Builder, owner: usize, e: usize, hidden: usize) -> bool {
+fn implicitly_redefines_member(
+    b: &mut Builder,
+    owner: usize,
+    e: usize,
+    hidden: usize,
+    memo: &mut crate::layered::IdMap<usize, bool>,
+) -> bool {
     if !b.redefines_by_position(e) {
-        return implicitly_redefines(b, e);
+        return implicitly_redefines_memo(b, e, memo);
     }
-    let mut closure: HashSet<usize> = HashSet::new();
-    let mut stack = b.indexed_redefinition_targets(e);
+    let mut closure: crate::layered::IdSet<usize> = Default::default();
+    let mut stack = b.indexed_redefinition_targets_shared(e).to_vec();
     stack.extend(b.positional_redefinition_targets(e, owner));
     while let Some(t) = stack.pop() {
         if t == hidden {
             return true;
         }
         if closure.insert(t) {
-            stack.extend(b.indexed_redefinition_targets(t));
+            stack.extend(b.indexed_redefinition_targets_shared(t).iter().copied());
             if let Some(o) = b.owner_elem(t) {
                 stack.extend(b.positional_redefinition_targets(t, o));
             }
@@ -190,12 +207,12 @@ fn explicitly_specializes(b: &mut Builder, reuser: usize, hidden: usize) -> bool
 
 /// Everything `e` transitively redefines (KerML `allRedefinedFeaturesOf`
 /// without `e` itself).
-fn redefinition_closure(b: &mut Builder, e: usize) -> HashSet<usize> {
-    let mut closure = HashSet::new();
-    let mut stack = b.indexed_redefinition_targets(e);
+fn redefinition_closure(b: &mut Builder, e: usize) -> crate::layered::IdSet<usize> {
+    let mut closure = crate::layered::IdSet::default();
+    let mut stack = b.indexed_redefinition_targets_shared(e).to_vec();
     while let Some(t) = stack.pop() {
         if closure.insert(t) {
-            stack.extend(b.indexed_redefinition_targets(t));
+            stack.extend(b.indexed_redefinition_targets_shared(t).iter().copied());
         }
     }
     closure
@@ -206,7 +223,7 @@ fn redefinition_closure(b: &mut Builder, e: usize) -> HashSet<usize> {
 /// member whose redefinition closure meets that feature (KerML
 /// `removeRedefinedFeatures`, second condition), so nothing below it does
 /// either.
-fn removes_at(b: &mut Builder, scope: usize, closure: &HashSet<usize>) -> bool {
+fn removes_at(b: &mut Builder, scope: usize, closure: &crate::layered::IdSet<usize>) -> bool {
     let Some(owner) = b.scope_owner(scope) else {
         return false;
     };
@@ -224,9 +241,10 @@ fn heritage_reaches(
     b: &mut Builder,
     scope: usize,
     target: usize,
-    closure: &HashSet<usize>,
+    closure: &crate::layered::IdSet<usize>,
 ) -> bool {
-    let mut seen: HashSet<usize> = HashSet::from([scope]);
+    let mut seen: crate::layered::IdSet<usize> = Default::default();
+    seen.insert(scope);
     let mut stack = vec![scope];
     while let Some(s) = stack.pop() {
         for base in b.base_scopes_split(s).0 {
@@ -321,7 +339,7 @@ fn redefinition_target(
     directions: &mut super::directions::RedefinitionDirections,
 ) -> Option<String> {
     let b = &r.b;
-    if !conforms(b.elements[element].ty, "Feature") || !conforms(b.elements[hidden].ty, "Feature") {
+    if !is_a!(b.elements[element], "Feature") || !is_a!(b.elements[hidden], "Feature") {
         return None;
     }
     if b.elements[hidden]
@@ -390,24 +408,83 @@ fn span_of(b: &Builder, e: usize) -> Option<Span> {
 }
 
 pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diagnostic)> {
-    collisions(r)
+    let all = r.b.lib_boundary..r.b.explicit_len();
+    validate_in(r, model, all)
+}
+
+/// [`validate`] for the user elements in `rows`.
+pub(super) fn validate_in(
+    r: &mut ResolvedModel,
+    model: &Model,
+    rows: std::ops::Range<usize>,
+) -> Vec<(usize, Diagnostic)> {
+    collisions_in(r, rows)
         .into_iter()
         .filter(|c| !model.is_library_unit(c.unit))
         .map(|c| (c.unit, super::rule_warning(c.span, RULE, &c.message)))
         .collect()
 }
 
+/// Whether an inherited pair under one name is no collision: the one
+/// explicitly specializes the other, or a nearer level removed one of them.
+/// A recorded pair is `(dropped, shadowing)`; a by-name pair may be either
+/// way round, so both orientations are tried.
+fn cleared_pair(r: &mut ResolvedModel, scope: usize, a: usize, b2: usize, oriented: bool) -> bool {
+    explicitly_specializes(&mut r.b, b2, a)
+        || removed_at_nearer_level(&mut r.b, scope, a, b2)
+        || (!oriented
+            && (explicitly_specializes(&mut r.b, a, b2)
+                || removed_at_nearer_level(&mut r.b, scope, b2, a)))
+}
+
 /// Every inherited-name collision among the user elements, in element
 /// order — owned-member collisions of a type first, then the names it
 /// inherits twice, each in name order.
+/// The inherited-twice collisions of one reduction of inherited members
+/// (one `Arc` of them, shared by every type with the same heritage whose
+/// own features leave it alone): the names of the inherited members, hashed,
+/// and the pairs the scan reports, in report order with their declaring
+/// pair's names. A type whose owned members' names meet none of the
+/// inherited names reports the same pairs, at its own span.
+struct SharedScan {
+    names: crate::layered::IdSet<u64>,
+    pairs: Vec<(String, usize, usize, String, String)>,
+}
+
+/// FNV-1a over a name, for [`SharedScan::names`]; a chance collision only
+/// makes a type scan for itself.
+fn name_hash(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
+    let all = r.b.lib_boundary..r.b.explicit_len();
+    collisions_in(r, all)
+}
+
+/// [`collisions`] among the user elements in `rows`.
+fn collisions_in(
+    r: &mut ResolvedModel,
+    rows: std::ops::Range<usize>,
+) -> Vec<InheritedNameCollision> {
     let mut out = Vec::new();
+    // `None` while one type with the reduction has been seen: hashing the
+    // inherited names pays only when a second type with it comes.
+    let mut shared: crate::layered::IdMap<usize, Option<Arc<SharedScan>>> = Default::default();
     let mut direction_facts = None;
     let mut directions = super::directions::RedefinitionDirections::default();
+    // Whether a member redefines by implication is a property of the member
+    // alone, asked for every type that inherits it.
+    let mut implicit: crate::layered::IdMap<usize, bool> = Default::default();
     let lib_boundary = r.b.lib_boundary;
-    for e in lib_boundary..r.b.explicit_len() {
+    for e in rows {
         let unit = r.b.unit_of_elem(e);
-        if !conforms(r.b.elements[e].ty, "Type") {
+        if !is_a!(r.b.elements[e], "Type") {
             continue;
         }
         let Some(&scope) = r.b.elem_scope.get(&e) else {
@@ -418,7 +495,69 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
             continue;
         }
         let owned = r.b.owned_member_elems(e, false);
-        let owned_set: HashSet<usize> = owned.iter().copied().collect();
+        // The reduction's scan, when another type with it scanned already
+        // and this type's owned names meet none of the inherited ones.
+        let shared_key = Arc::as_ptr(&bindings) as usize;
+        let seen = shared.get(&shared_key).cloned();
+        let scan = seen.clone().flatten();
+        // The owned names matter only once a second type with the reduction
+        // is seen (the first only marks the reduction seen).
+        let owned_hashes: Vec<u64> = if seen.is_some() {
+            owned
+                .iter()
+                .flat_map(|&o| {
+                    declared_keys(&r.b, o)
+                        .map(|k| name_hash(&k))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let disjoint_from =
+            |scan: &SharedScan| owned_hashes.iter().all(|h| !scan.names.contains(h));
+        if let Some(scan) = scan.as_deref().filter(|scan| disjoint_from(scan)) {
+            if let Some(span) = span_of(&r.b, e) {
+                for (name, _, _, na, nb) in &scan.pairs {
+                    out.push(InheritedNameCollision {
+                        element: ElementRef(e),
+                        hidden: None,
+                        name: name.clone(),
+                        unit,
+                        span,
+                        message: format!(
+                            "`{name}` is inherited from both `{na}` and `{nb}` — the two member \
+                             names are indistinguishable"
+                        ),
+                        redefinition_target: None,
+                    });
+                }
+            }
+            continue;
+        }
+        if seen.is_none() {
+            shared.insert(shared_key, None);
+        }
+        // Whether this type's scan can be kept for the others with its
+        // reduction: its owned names meet no inherited name (so nothing it
+        // owns hides or shadows one), and the reduction is a kept one.
+        let inherited_hashes: Option<crate::layered::IdSet<u64>> =
+            (seen.is_some() && scan.is_none() && Arc::strong_count(&bindings) > 1).then(|| {
+                bindings
+                    .members
+                    .iter()
+                    .flat_map(|&(m, _)| {
+                        declared_keys(&r.b, m)
+                            .map(|k| name_hash(&k))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            });
+        let keep_scan = inherited_hashes
+            .as_ref()
+            .is_some_and(|names| owned_hashes.iter().all(|h| !names.contains(h)));
+        let mut found_pairs: Vec<(String, usize, usize, String, String)> = Vec::new();
+        let owned_set: crate::layered::IdSet<usize> = owned.iter().copied().collect();
 
         // Candidate pairs, gathered under one immutable borrow of the
         // builder. Only names some *user* element declares can collide
@@ -429,13 +568,21 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
         // and the hidden one — so the hidden one's simple name resolves
         // to it once the redefining feature is set aside)`.
         let mut hidden: Vec<(usize, usize, Cow<str>, bool)> = Vec::new();
-        // Shape 2: `(member, member, key, from the implicit-redefinition
-        // record)` — both inherited; a recorded pair is oriented
-        // `(dropped, shadowing)`, a by-name pair is not oriented.
-        let mut pairs: Vec<(usize, usize, Cow<str>, bool)> = Vec::new();
+        // Shape 2: `(member, member)` under a key — both inherited. A
+        // recorded pair is oriented `(dropped, shadowing)`; a by-name pair
+        // is not, and is found below, lazily, in the order the report
+        // reads them: a key's candidates in the members' order, owned
+        // members left out (a pair never includes one), and only keys
+        // that can yield a pair at all (one with a user member and one
+        // that does not redefine by implication) — a view exposing
+        // thousands of metadata bodies inherits as many same-named
+        // features that all redefine by implication, and pairing them
+        // would cost millions of tests for no report.
+        let mut recorded: BTreeMap<Cow<str>, Vec<(usize, usize)>> = BTreeMap::new();
+        let mut candidates: BTreeMap<Cow<str>, Vec<usize>> = BTreeMap::new();
         {
             let b = &r.b;
-            let mut user_names: HashSet<Cow<str>> = HashSet::new();
+            let mut user_names: crate::layered::IdSet<Cow<str>> = Default::default();
             for &o in &owned {
                 user_names.extend(declared_keys(b, o));
             }
@@ -474,12 +621,12 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
                     hidden.push((dropped, shadowing, key, simple));
                 } else if !owned_set.contains(&dropped)
                     && shadowing >= lib_boundary
-                    && !implicitly_redefines(b, shadowing)
+                    && !implicitly_redefines_memo(b, shadowing, &mut implicit)
                 {
                     // A library-written same-name usage is one of the
                     // implied redefinitions (result parameters, ends),
                     // spelled in units the reference validator accepts.
-                    pairs.push((dropped, shadowing, key, true));
+                    recorded.entry(key).or_default().push((dropped, shadowing));
                 }
             }
             for &o in &owned {
@@ -496,52 +643,53 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
                 }
             }
             for (key, ms) in &by_name {
-                for (i, &a) in ms.iter().enumerate() {
-                    for &b2 in &ms[i + 1..] {
-                        // Two inherited ends (or parameters) of one name from
-                        // unrelated bases are both positionally redefined by
-                        // the type's own ends (parameters) — `interface : I
-                        // connect a to b` inherits `source` from
-                        // `BinaryInterface` and from `I`, and its two spelled
-                        // ends redefine both. A pair of library members is not
-                        // reported either: a conforming model inherits none
-                        // (the library's own redefinitions see to that), and a
-                        // non-conforming one (`individual def X :> anAttributeDef`,
-                        // whose `self` then arrives from both `DataValue` and
-                        // `Occurrence`) already carries the specialization or
-                        // typing error the pair would only echo.
-                        if a != b2
-                            && (a >= lib_boundary || b2 >= lib_boundary)
-                            && !owned_set.contains(&a)
-                            && !owned_set.contains(&b2)
-                            && overlapping(b, a, b2)
-                            && !(implicitly_redefines(b, a) && implicitly_redefines(b, b2))
-                        {
-                            pairs.push((a, b2, key.clone(), false));
-                        }
-                    }
+                let members: Vec<usize> = ms
+                    .iter()
+                    .copied()
+                    .filter(|m| !owned_set.contains(m))
+                    .collect();
+                if members.len() < 2
+                    || !members.iter().any(|&m| m >= lib_boundary)
+                    || members
+                        .iter()
+                        .all(|&m| implicitly_redefines_memo(b, m, &mut implicit))
+                {
+                    continue;
                 }
+                candidates.insert(key.clone(), members);
             }
         }
-        if hidden.is_empty() && pairs.is_empty() {
+        if hidden.is_empty() && recorded.is_empty() && candidates.is_empty() {
+            if keep_scan {
+                shared.insert(
+                    shared_key,
+                    Some(Arc::new(SharedScan {
+                        names: inherited_hashes.unwrap_or_default(),
+                        pairs: Vec::new(),
+                    })),
+                );
+            }
             continue;
         }
         let hidden: Vec<(usize, usize, String, bool)> = hidden
             .into_iter()
             .map(|(m, o, k, simple)| (m, o, k.into_owned(), simple))
             .collect();
-        let mut pairs: Vec<(usize, usize, String, bool)> = pairs
+        let recorded: BTreeMap<String, Vec<(usize, usize)>> = recorded
             .into_iter()
-            .map(|(a, b2, k, oriented)| (a, b2, k.into_owned(), oriented))
+            .map(|(k, pairs)| (k.into_owned(), pairs))
             .collect();
-        pairs.sort_by(|x, y| x.2.cmp(&y.2));
+        let candidates: BTreeMap<String, Vec<usize>> = candidates
+            .into_iter()
+            .map(|(k, members)| (k.into_owned(), members))
+            .collect();
         // One report per (namespace, name): the owned shape first, then
         // the inherited one, both in name order.
-        let mut reported: HashSet<String> = HashSet::new();
+        let mut reported: crate::layered::IdSet<String> = Default::default();
 
         let mut by_owned: BTreeMap<(String, usize), (Vec<usize>, bool)> = BTreeMap::new();
         for (m, o, key, simple) in hidden {
-            if !implicitly_redefines_member(&mut r.b, e, o, m)
+            if !implicitly_redefines_member(&mut r.b, e, o, m, &mut implicit)
                 && !explicitly_specializes(&mut r.b, o, m)
             {
                 let entry = by_owned.entry((key, o)).or_insert((Vec::new(), simple));
@@ -578,13 +726,12 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
                         }
                 });
             let redefinition_target = if one_chain {
-                let facts =
-                    direction_facts.get_or_insert_with(|| super::facts::Facts::new(&mut r.b));
-                redefinition_target(r, o, near, simple && ms.len() == 1, facts, &mut directions)
+                let facts = Arc::clone(direction_facts.get_or_insert_with(|| r.b.facts()));
+                redefinition_target(r, o, near, simple && ms.len() == 1, &facts, &mut directions)
             } else {
                 None
             };
-            let hint = if !conforms(r.b.elements[o].ty, "Feature") {
+            let hint = if !is_a!(r.b.elements[o], "Feature") {
                 "rename it"
             } else if redefinition_target.is_some() {
                 "redefine it (`:>>`) or rename it"
@@ -607,24 +754,53 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
         let Some(span) = span_of(&r.b, e) else {
             continue;
         };
-        for (a, b2, name, oriented) in pairs {
-            if reported.contains(&name) {
+        let keys: std::collections::BTreeSet<&String> =
+            recorded.keys().chain(candidates.keys()).collect();
+        for name in keys {
+            if reported.contains(name) {
                 continue;
             }
-            // A recorded pair is `(dropped, shadowing)`; a by-name pair
-            // may be either way round, so both orientations are tried.
-            let cleared = explicitly_specializes(&mut r.b, b2, a)
-                || removed_at_nearer_level(&mut r.b, scope, a, b2)
-                || (!oriented
-                    && (explicitly_specializes(&mut r.b, a, b2)
-                        || removed_at_nearer_level(&mut r.b, scope, b2, a)));
-            if cleared {
-                continue;
+            // The first pair the report keeps: a recorded one first, then
+            // the by-name candidates in order, each tried as the report
+            // reads it.
+            let mut found = None;
+            for &(a, b2) in recorded.get(name).into_iter().flatten() {
+                if !cleared_pair(r, scope, a, b2, true) {
+                    found = Some((a, b2));
+                    break;
+                }
             }
+            if found.is_none() {
+                if let Some(members) = candidates.get(name) {
+                    'search: for (i, &a) in members.iter().enumerate() {
+                        for &b2 in &members[i + 1..] {
+                            let qualifies = {
+                                let b = &r.b;
+                                a != b2
+                                    && (a >= lib_boundary || b2 >= lib_boundary)
+                                    && overlapping(b, a, b2)
+                                    && !(implicitly_redefines_memo(b, a, &mut implicit)
+                                        && implicitly_redefines_memo(b, b2, &mut implicit))
+                            };
+                            if qualifies && !cleared_pair(r, scope, a, b2, false) {
+                                found = Some((a, b2));
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+            let Some((a, b2)) = found else {
+                continue;
+            };
+            let name = name.clone();
             reported.insert(name.clone());
             let (mut na, mut nb) = declaring_pair(r, a, b2);
             if na > nb {
                 std::mem::swap(&mut na, &mut nb);
+            }
+            if keep_scan {
+                found_pairs.push((name.clone(), a, b2, na.clone(), nb.clone()));
             }
             out.push(InheritedNameCollision {
                 element: ElementRef(e),
@@ -638,6 +814,15 @@ pub fn collisions(r: &mut ResolvedModel) -> Vec<InheritedNameCollision> {
                 ),
                 redefinition_target: None,
             });
+        }
+        if keep_scan {
+            shared.insert(
+                shared_key,
+                Some(Arc::new(SharedScan {
+                    names: inherited_hashes.unwrap_or_default(),
+                    pairs: found_pairs,
+                })),
+            );
         }
     }
     out

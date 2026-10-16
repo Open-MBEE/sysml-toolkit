@@ -146,3 +146,83 @@ fn checking_reused_parses_matches_syntax_plus_independent_session() {
     assert!(sysmlv2_transform::check_sources_with_library(&[], Some(&missing)).is_err());
     assert!(sysmlv2_transform::check_sources_with_library(&sources[..1], Some(&missing)).is_err());
 }
+
+/// A session built over units parsed ahead of it is the session built
+/// over their texts: the same graph, findings and settled outcomes, on a
+/// prepared library and on none, started from settled outcomes or not.
+#[test]
+fn a_session_over_parsed_units_is_the_session_over_their_texts() {
+    let sources: Vec<(String, String)> = vec![
+        ("types.KerML".into(), "package K { class C; }".into()),
+        (
+            "user.sysml".into(),
+            "// café\r\npackage U { import K::*; import Library::*; part p : C; part b : Base; \
+             part missing : Unknown; attribute x = 2 * 3; }"
+                .into(),
+        ),
+        ("empty.sysml".into(), "".into()),
+    ];
+    let parse = |sources: &[(String, String)]| -> Vec<ParsedSource> {
+        sources
+            .iter()
+            .map(|(name, text)| ParsedSource::new(name.as_str(), text))
+            .collect()
+    };
+    let library = Library::prepared_sources(
+        vec![(
+            "lib.sysml".into(),
+            "package Library { part def Base; }".into(),
+        )],
+        None,
+    )
+    .unwrap();
+    let answers = |mut session: Session| {
+        (
+            session.to_compact_json(),
+            signature(session.check_findings()),
+            session.settled_outcomes().is_some(),
+        )
+    };
+    for library in [None, Some(library)] {
+        let first = Session::from_sources_settled(sources.clone(), library.clone(), None).unwrap();
+        let settled = first.settled_outcomes();
+        for settled in [None, settled] {
+            let expected = answers(
+                Session::from_sources_settled(sources.clone(), library.clone(), settled.clone())
+                    .unwrap(),
+            );
+            let actual = answers(
+                Session::from_parsed_settled(
+                    sources.clone(),
+                    parse(&sources),
+                    library.clone(),
+                    settled,
+                )
+                .unwrap(),
+            );
+            assert_eq!(actual, expected);
+        }
+    }
+    // A unit that does not parse refuses the session as its text does.
+    let broken = vec![(
+        "broken.sysml".to_string(),
+        "package B { part p : ; }".to_string(),
+    )];
+    let Err(expected) = Session::from_sources_settled(broken.clone(), None, None) else {
+        panic!("a unit that does not parse builds no session");
+    };
+    let Err(actual) = Session::from_parsed_settled(broken.clone(), parse(&broken), None, None)
+    else {
+        panic!("a unit that does not parse builds no session");
+    };
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+}
+
+/// Parsed units that are not the sources' own are refused outright.
+#[test]
+#[should_panic(expected = "parsed units must be the sources' units")]
+fn parsed_units_must_be_the_sources_units() {
+    let sources = vec![("a.sysml".to_string(), "package A;".to_string())];
+    let parsed = vec![ParsedSource::new("b.sysml", "package A;")];
+    let _ = Session::from_parsed_settled(sources, parsed, None, None);
+}

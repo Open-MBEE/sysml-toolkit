@@ -66,9 +66,11 @@ pub mod tokens;
 mod units;
 mod worker;
 
+pub use nav::ship_library_table;
 pub use outline::{document_symbols, spell_name, spell_symbols};
 pub use position::{Encoding, Mapper};
 pub use push::PushServer;
+pub use worker::library_uri;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -76,10 +78,37 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// `library`: standard-library directory for the model tier (hover,
 /// definition, references, rename resolve against it when given).
 pub fn run_stdio(library: Option<std::path::PathBuf>) -> Result<(), Error> {
+    run_stdio_with_number_format(library, sysmlv2_parser::numfmt::NumberFormat::exact())
+}
+
+/// [`run_stdio`] whose value hints, hover values and range hints write
+/// non-terminating rationals in `number_format` unless the client's
+/// `initializationOptions.numberFormat` says otherwise — the command
+/// line's `lsp --number-format`, for editors that cannot send
+/// initialization options.
+pub fn run_stdio_with_number_format(
+    library: Option<std::path::PathBuf>,
+    number_format: sysmlv2_parser::numfmt::NumberFormat,
+) -> Result<(), Error> {
     let (connection, io_threads) = Connection::stdio();
-    run_with_library(connection, library)?;
+    run_with_number_format(connection, library, number_format)?;
     io_threads.join()?;
     Ok(())
+}
+
+/// [`run_with_library`] with a default number format, as
+/// [`run_stdio_with_number_format`].
+pub fn run_with_number_format(
+    connection: Connection,
+    library: Option<std::path::PathBuf>,
+    number_format: sysmlv2_parser::numfmt::NumberFormat,
+) -> Result<(), Error> {
+    serve(
+        connection,
+        library,
+        std::time::Duration::from_millis(300),
+        number_format,
+    )
 }
 
 /// Serve LSP over any transport (the test harness uses
@@ -109,6 +138,20 @@ pub fn run_with_options(
     library: Option<std::path::PathBuf>,
     debounce: std::time::Duration,
 ) -> Result<(), Error> {
+    serve(
+        connection,
+        library,
+        debounce,
+        sysmlv2_parser::numfmt::NumberFormat::exact(),
+    )
+}
+
+fn serve(
+    connection: Connection,
+    library: Option<std::path::PathBuf>,
+    debounce: std::time::Duration,
+    number_format: sysmlv2_parser::numfmt::NumberFormat,
+) -> Result<(), Error> {
     let (init_id, init_params) = connection.initialize_start()?;
     let init: InitializeParams = serde_json::from_value(init_params)?;
     let encoding = negotiate_encoding(&init);
@@ -128,14 +171,28 @@ pub fn run_with_options(
         }),
     };
     connection.initialize_finish(init_id, serde_json::to_value(result)?)?;
-    let worker = worker::Worker::spawn(
-        connection.sender.clone(),
-        library.clone(),
-        encoding,
-        debounce,
-    );
+    let publishes_diagnostics = publish_diagnostics(&init).unwrap_or(true);
+    // The workspace tier computes diagnostics and nothing else.
+    let worker = if publishes_diagnostics {
+        worker::Worker::spawn(
+            connection.sender.clone(),
+            library.clone(),
+            encoding,
+            debounce,
+        )
+    } else {
+        worker::Worker::disabled()
+    };
     let mut nav = nav::Nav::new(library, root.clone());
     nav.set_hide_redundant_value_hints(hide_redundant_value_hints(&init).unwrap_or(true));
+    nav.set_number_format(number_format);
+    match crate::number_format(&init) {
+        Some(Ok(format)) => nav.set_number_format(format),
+        Some(Err(err)) => {
+            let _ = connection.sender.send(number_format_refused(&err));
+        }
+        None => {}
+    }
     nav.set_infer_unit_types(infer_unit_types(&init).unwrap_or(true));
     nav.set_snippet_completions(snippet_completions(&init));
     nav.set_insert_replace_completions(insert_replace_completions(&init));
@@ -149,6 +206,7 @@ pub fn run_with_options(
         worker,
         root,
         reported: HashSet::new(),
+        publishes_diagnostics,
     };
     sysmlv2_parser::parser::on_parsing_stack(
         "sysmlv2-lsp",
@@ -178,6 +236,44 @@ fn say_the_stack_was_refused(client: &crossbeam_channel::Sender<Message>, err: &
     )));
 }
 
+/// `initializationOptions.numberFormat`: how evaluated-value inlay
+/// hints, hover values and range hints write a rational without a
+/// terminating decimal expansion — a
+/// [`NumberFormat`](sysmlv2_parser::numfmt::NumberFormat) spec such as
+/// `"overline"` or `"unicode,mixed=false"`. `None` when the client sent
+/// none or `null` (the server's default stands — exact unless the host
+/// chose another); an error when the value
+/// is not a spec the toolkit reads.
+pub(crate) fn number_format(
+    init: &InitializeParams,
+) -> Option<Result<sysmlv2_parser::numfmt::NumberFormat, String>> {
+    let value = init
+        .initialization_options
+        .as_ref()
+        .and_then(|o| o.get("numberFormat"))
+        .filter(|v| !v.is_null())?;
+    Some(
+        value
+            .as_str()
+            .ok_or_else(|| "expected a spec string".to_string())
+            .and_then(sysmlv2_parser::numfmt::NumberFormat::parse),
+    )
+}
+
+/// The warning for an `initializationOptions.numberFormat` the server
+/// could not use: the setting is ignored and hints keep the default. A
+/// shown message rather than a log line — it is a user setting, and a
+/// silently ignored one reads as a feature that does not work.
+pub(crate) fn number_format_refused(err: &str) -> Message {
+    Message::Notification(Notification::new(
+        lsp_types::notification::ShowMessage::METHOD.to_string(),
+        lsp_types::ShowMessageParams {
+            typ: lsp_types::MessageType::WARNING,
+            message: format!("sysmlv2: number format ignored: {err}"),
+        },
+    ))
+}
+
 /// `initializationOptions.hideRedundantValueHints`: suppress
 /// evaluated-value inlay hints that restate the declared expression
 /// verbatim. `None` when the client sent no verdict (the default is
@@ -186,6 +282,24 @@ pub(crate) fn hide_redundant_value_hints(init: &InitializeParams) -> Option<bool
     init.initialization_options
         .as_ref()
         .and_then(|o| o.get("hideRedundantValueHints"))
+        .and_then(|v| v.as_bool())
+}
+
+/// `initializationOptions.publishDiagnostics`: whether the server
+/// publishes diagnostics at all. A client that shows none — that takes
+/// its findings from elsewhere — sends `false`, and the server then
+/// neither parses and validates a document per change to publish its
+/// syntax-tier findings nor clears them on close, and the stdio server
+/// starts no workspace tier. The quick fixes that answer a diagnostic
+/// (an unresolved reference's import, an unused import's removal) are
+/// still offered for the diagnostics a code-action request carries, so
+/// such a client sees them only for diagnostics of its own that match
+/// the server's. `None` when the client sent no verdict (the default is
+/// `true`).
+pub(crate) fn publish_diagnostics(init: &InitializeParams) -> Option<bool> {
+    init.initialization_options
+        .as_ref()
+        .and_then(|o| o.get("publishDiagnostics"))
         .and_then(|v| v.as_bool())
 }
 
@@ -437,6 +551,8 @@ pub(crate) struct Server {
     /// recurs per keystroke is announced once (see
     /// [`Server::show_message_once`]).
     pub(crate) reported: HashSet<String>,
+    /// Whether diagnostics are published (see [`publish_diagnostics`]).
+    pub(crate) publishes_diagnostics: bool,
 }
 
 impl Server {
@@ -644,9 +760,12 @@ impl Server {
             }
             InlayHintRequest::METHOD => {
                 let (id, p): (_, lsp_types::InlayHintParams) = cast(req)?;
-                let hints = self
-                    .nav
-                    .inlay_hints(&self.docs, &p.text_document.uri, self.encoding);
+                let hints = self.nav.inlay_hints(
+                    &self.docs,
+                    &p.text_document.uri,
+                    Some(p.range),
+                    self.encoding,
+                );
                 Response::new_ok(id, Some(hints))
             }
             CodeLensRequest::METHOD => {
@@ -728,7 +847,9 @@ impl Server {
                     text: p.text_document.text.into(),
                     version: p.text_document.version,
                 };
-                self.publish_diagnostics(&p.text_document.uri, &doc)?;
+                if self.publishes_diagnostics {
+                    self.publish_diagnostics(&p.text_document.uri, &doc)?;
+                }
                 self.docs.insert(p.text_document.uri, doc);
                 self.schedule_workspace();
             }
@@ -745,7 +866,9 @@ impl Server {
                     text: change.text.into(),
                     version: p.text_document.version,
                 };
-                self.publish_diagnostics(&p.text_document.uri, &doc)?;
+                if self.publishes_diagnostics {
+                    self.publish_diagnostics(&p.text_document.uri, &doc)?;
+                }
                 self.docs.insert(p.text_document.uri, doc);
                 self.schedule_workspace();
             }
@@ -756,7 +879,9 @@ impl Server {
                 };
                 self.docs.remove(&p.text_document.uri);
                 // Clear the document's diagnostics from the editor.
-                self.send_diagnostics(&p.text_document.uri, Vec::new(), None)?;
+                if self.publishes_diagnostics {
+                    self.send_diagnostics(&p.text_document.uri, Vec::new(), None)?;
+                }
                 self.schedule_workspace();
             }
             #[cfg(test)]
@@ -1144,6 +1269,10 @@ impl Server {
         };
         let mut rule_wide_offered: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // One line directive per rule and line: two findings of one
+        // rule on a line would otherwise offer the same note twice.
+        let mut directive_offered: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
         for d in &lint_diags {
             let Some(lsp_types::NumberOrString::String(code)) = &d.code else {
                 continue;
@@ -1183,6 +1312,11 @@ impl Server {
             if fixed && rule_wide_offered.insert(code.clone()) {
                 self.rule_wide_fix_actions(uri, d, code, out);
             }
+            if directive_offered.insert((code.clone(), d.range.start.line)) {
+                if let Some(action) = self.suppress_action(uri, d, code) {
+                    out.push(action);
+                }
+            }
         }
         if wants_fix_all {
             // Each fix whole or not at all: a fix that touches another
@@ -1206,6 +1340,70 @@ impl Server {
                 ));
             }
         }
+    }
+
+    /// "Disable `<rule>` for this line": a `// sysmlint-disable-next-line
+    /// <rule>` note above the finding's line, at that line's
+    /// indentation — or the rule appended to such a note already there.
+    /// Never preferred and never part of an aggregate: a directive is a
+    /// decision, not a repair. Nothing for the pseudo-rules, or when the
+    /// note above lists the rule already.
+    #[allow(clippy::mutable_key_type)] // see the note on `mod nav`
+    fn suppress_action(
+        &self,
+        uri: &Uri,
+        d: &lsp_types::Diagnostic,
+        code: &str,
+    ) -> Option<lsp_types::CodeActionOrCommand> {
+        if code == "lint-config" || code == "lint-directive" {
+            return None;
+        }
+        let text = &self.docs.get(uri)?.text;
+        let lines: Vec<&str> = text.lines().collect();
+        let line = d.range.start.line;
+        let target = lines.get(line as usize)?;
+        let above = line
+            .checked_sub(1)
+            .and_then(|l| lines.get(l as usize))
+            .and_then(|prev| sysmlv2_lint::directive::next_line_directive_rules(prev));
+        let edit = match above {
+            Some((rules, _)) if rules.contains(&code) => return None,
+            Some((rules, at)) => {
+                let mapper = Mapper::new(text, self.encoding);
+                let start = mapper.offset(lsp_types::Position::new(line - 1, 0));
+                let pos = mapper.position(start + crate::position::offset32(at));
+                TextEdit {
+                    range: lsp_types::Range::new(pos, pos),
+                    new_text: if rules.is_empty() {
+                        format!(" {code}")
+                    } else {
+                        format!(", {code}")
+                    },
+                }
+            }
+            None => {
+                let indent = &target[..target.len() - target.trim_start().len()];
+                let pos = lsp_types::Position::new(line, 0);
+                TextEdit {
+                    range: lsp_types::Range::new(pos, pos),
+                    new_text: format!(
+                        "{indent}{}\n",
+                        sysmlv2_lint::directive::next_line_directive(code)
+                    ),
+                }
+            }
+        };
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), vec![edit]);
+        Some(quick_fix(
+            format!("Disable `{code}` for this line"),
+            d,
+            lsp_types::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            },
+            false,
+        ))
     }
 
     /// Beside a finding's own fix: every finding of its rule at once,

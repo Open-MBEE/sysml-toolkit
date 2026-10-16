@@ -592,13 +592,11 @@ impl Rational {
     /// when the expansion terminates, otherwise the shortest spelling of
     /// the nearest double marked as approximate (`≈0.3333333333333333`).
     /// For surfaces that favour a glanceable number over a re-parseable
-    /// one; [`fmt::Display`] stays exact.
+    /// one; [`fmt::Display`] stays exact. Other spellings:
+    /// [`crate::numfmt::NumberFormat`].
     #[must_use]
     pub fn to_approx_string(&self) -> String {
-        match self.to_decimal_string() {
-            Some(s) => s,
-            None => format!("≈{}", self.to_f64()),
-        }
+        crate::numfmt::NumberFormat::approx().render(self)
     }
 
     /// Whether printing this value as a JSON number literal loses

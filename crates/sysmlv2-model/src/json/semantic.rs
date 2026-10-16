@@ -123,7 +123,27 @@ impl ResolvedModel {
     /// compatibility values remain available through [`Self::derived`].
     /// Other external UUIDs are preserved; their target type cannot be verified locally.
     pub fn property(&mut self, e: ElementRef, name: &str) -> Result<Value, PropertyError> {
-        self.property_with_row(e, name, &mut CheckedRow::default())
+        let mut row = self.take_checked_row();
+        let result = self.property_with_row(e, name, &mut row);
+        self.checked_row = row;
+        result
+    }
+
+    /// The kept checked row, begun for one public read. The row keeps the
+    /// certificates of the receivers read so far — a receiver's complete
+    /// type report, type features and variability verdict, stamped against
+    /// the model — so the several type-dependent properties of one element,
+    /// or one of them read again, certify once; a read at another model
+    /// state makes them again. The work allowance starts over with each
+    /// read, as it did when every read had a row of its own. A public read
+    /// made from within a read (the conjugated port definition's owned
+    /// read inside `portDefinition`) finds the default row left behind and
+    /// is overwritten when the outer read puts its row back, which costs it
+    /// its certificates and nothing else.
+    fn take_checked_row(&mut self) -> CheckedRow {
+        let mut row = std::mem::take(&mut self.checked_row);
+        row.begin();
+        row
     }
 
     fn property_with_row(
@@ -356,7 +376,10 @@ impl ResolvedModel {
         e: ElementRef,
         name: &str,
     ) -> Result<DerivedValue, PropertyError> {
-        self.derived_exact_with_row(e, name, &mut CheckedRow::default())
+        let mut row = self.take_checked_row();
+        let result = self.derived_exact_with_row(e, name, &mut row);
+        self.checked_row = row;
+        result
     }
 
     fn derived_exact_with_row(

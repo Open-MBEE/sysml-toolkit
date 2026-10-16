@@ -253,3 +253,208 @@ fn minimal_spelling_prefers_shortest_resolvable_suffix() {
     let ty = s.resolved().resolve_qualified("P::Grade").expect("enum");
     assert_eq!(s.minimal_spelling(ctx, ty).as_deref(), Some("Grade"));
 }
+
+/// A member import (`import Pkg::Member;`) is respelled by *unrooting* the
+/// lift's `$::`, never by re-deriving the path from the target element's
+/// qualified name. Two properties fall out, and both matter:
+///
+/// - the root goes, so the text matches what an author would write;
+/// - the final segment is preserved verbatim, so an `alias` import keeps
+///   naming the alias Membership. An element can have several memberships,
+///   and the element's own qualified name spells only one of them — the
+///   re-derived path would silently re-point the import, which is a model
+///   change wearing a respelling's clothes.
+#[test]
+fn member_imports_unroot_without_changing_which_membership_they_name() {
+    for (label, src, want) in [
+        (
+            "plain member import",
+            "package Lib {\n\
+             \x20   part def Widget;\n\
+             }\n\
+             package P {\n\
+             \x20   private import Lib::Widget;\n\
+             \x20   part a : Widget;\n\
+             }\n",
+            "private import Lib::Widget;",
+        ),
+        (
+            "aliased member import",
+            "package Defs {\n\
+             \x20   part def Vehicle;\n\
+             \x20   alias Car for Vehicle;\n\
+             }\n\
+             package Uses {\n\
+             \x20   private import Defs::Car;\n\
+             \x20   part v : Car;\n\
+             }\n",
+            "private import Defs::Car;",
+        ),
+    ] {
+        // Through the lift, which is what introduces the `$::` root.
+        let json = session(src).to_compact_json();
+        let mut lifted =
+            Session::from_interchange_json(&json).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        let before = lifted.to_compact_json();
+        lifted.minimize_qualifications().expect("minimize");
+        let text = lifted.source(0).unwrap();
+
+        assert!(
+            text.contains(want),
+            "{label}: expected `{want}`, got:\n{text}"
+        );
+        assert!(
+            !text.contains("$::"),
+            "{label}: the global root should be gone:\n{text}"
+        );
+        // The decisive one: respelling must not move the model.
+        assert_eq!(
+            lifted.to_compact_json(),
+            before,
+            "{label}: minimize changed the emitted interchange JSON"
+        );
+    }
+}
+
+/// The member-import rule is *shortest resolvable suffix of at least two
+/// segments*, which is more than unrooting: the leading segment may resolve
+/// by lexical scoping or through a sibling import of the same namespace
+/// (the reference implementation consults both). On authored text that is
+/// usually the spelling the author wrote. A written path of one segment
+/// keeps its single candidate, so a root-level member import unroots too.
+#[test]
+fn member_imports_shorten_to_the_shortest_resolvable_suffix() {
+    for (label, src, want) in [
+        (
+            "leading segment is a sibling package of an enclosing namespace",
+            "package A {\n\
+             \x20   package B {\n\
+             \x20       part def C;\n\
+             \x20   }\n\
+             \x20   package P {\n\
+             \x20       private import A::B::C;\n\
+             \x20       part x : C;\n\
+             \x20   }\n\
+             }\n",
+            "private import B::C;",
+        ),
+        (
+            "leading segment is visible through a sibling import",
+            "package A {\n\
+             \x20   package B {\n\
+             \x20       part def C;\n\
+             \x20   }\n\
+             }\n\
+             package P {\n\
+             \x20   private import A::*;\n\
+             \x20   private import A::B::C;\n\
+             \x20   part x : C;\n\
+             }\n",
+            "private import B::C;",
+        ),
+        (
+            "one-segment written path",
+            "package Lib {\n\
+             \x20   part def Widget;\n\
+             }\n\
+             package P {\n\
+             \x20   private import Lib;\n\
+             \x20   part a : Lib::Widget;\n\
+             }\n",
+            "private import Lib;",
+        ),
+    ] {
+        let json = session(src).to_compact_json();
+        let mut lifted =
+            Session::from_interchange_json(&json).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        let before = lifted.to_compact_json();
+        lifted.minimize_qualifications().expect("minimize");
+        let text = lifted.source(0).unwrap();
+
+        assert!(
+            text.contains(want),
+            "{label}: expected `{want}`, got:\n{text}"
+        );
+        assert!(
+            !text.contains("$::"),
+            "{label}: the global root should be gone:\n{text}"
+        );
+        assert_eq!(
+            lifted.to_compact_json(),
+            before,
+            "{label}: minimize changed the emitted interchange JSON"
+        );
+    }
+}
+
+/// The floor and the fallbacks: a member import never collapses to its
+/// last segment alone, keeps its full written path when no shorter suffix
+/// resolves from the site, and keeps the `$::` root when even the full
+/// path would resolve to something else there.
+#[test]
+fn member_imports_keep_their_qualification_when_a_shorter_suffix_does_not_resolve() {
+    for (label, src, want, forbidden) in [
+        (
+            "nested target: the full written path, unrooted",
+            "package Outer {\n\
+             \x20   package Lib {\n\
+             \x20       part def Widget;\n\
+             \x20   }\n\
+             }\n\
+             package P {\n\
+             \x20   private import Outer::Lib::Widget;\n\
+             \x20   part a : Widget;\n\
+             }\n",
+            "private import Outer::Lib::Widget;",
+            "import Lib::Widget;",
+        ),
+        (
+            "never the last segment alone",
+            "package Lib {\n\
+             \x20   part def Widget;\n\
+             }\n\
+             package P {\n\
+             \x20   private import Lib::Widget;\n\
+             \x20   part a : Widget;\n\
+             }\n",
+            "private import Lib::Widget;",
+            "import Widget;",
+        ),
+        (
+            "shadowed leading segment: the root stays",
+            "package Outer {\n\
+             \x20   package Lib {\n\
+             \x20       part def Widget;\n\
+             \x20   }\n\
+             }\n\
+             package P {\n\
+             \x20   part def Outer;\n\
+             \x20   private import $::Outer::Lib::Widget;\n\
+             \x20   part a : Widget;\n\
+             }\n",
+            "private import $::Outer::Lib::Widget;",
+            "import Outer::Lib::Widget;",
+        ),
+    ] {
+        let json = session(src).to_compact_json();
+        let mut lifted =
+            Session::from_interchange_json(&json).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        let before = lifted.to_compact_json();
+        lifted.minimize_qualifications().expect("minimize");
+        let text = lifted.source(0).unwrap();
+
+        assert!(
+            text.contains(want),
+            "{label}: expected `{want}`, got:\n{text}"
+        );
+        assert!(
+            !text.contains(forbidden),
+            "{label}: must not respell to `{forbidden}`:\n{text}"
+        );
+        assert_eq!(
+            lifted.to_compact_json(),
+            before,
+            "{label}: minimize changed the emitted interchange JSON"
+        );
+    }
+}

@@ -20,6 +20,7 @@
 
 use std::cmp::Ordering;
 
+use sysmlv2_model::numfmt::NumberFormat;
 use sysmlv2_model::rational::Rational;
 
 use crate::term::{EnumSort, Op, Sort, Term};
@@ -1356,15 +1357,12 @@ pub(crate) fn init_dom(sort: Sort, enum_sizes: &[usize]) -> Dom {
     }
 }
 
-/// Render a real endpoint: exact (a terminating decimal or a reduced
-/// fraction) or, with `approx`, a non-terminating fraction as a marked
-/// approximate decimal for glanceable surfaces.
-fn fmt_ext(x: &Ext, approx: bool) -> String {
+/// Render a real endpoint, a non-terminating one in `format`.
+fn fmt_ext(x: &Ext, format: &NumberFormat) -> String {
     match x {
         Ext::PosInf => "+∞".into(),
         Ext::NegInf => "−∞".into(),
-        Ext::Fin(r) if approx => r.to_approx_string(),
-        Ext::Fin(r) => r.to_string(),
+        Ext::Fin(r) => format.render(r),
     }
 }
 
@@ -1378,14 +1376,14 @@ fn fmt_i(x: i128) -> String {
     }
 }
 
-/// Render a domain as a closed range or set, for `--ranges` output
-/// (`approx = false`, exact endpoints) and for editor hints (`approx =
-/// true`, non-terminating endpoints as approximate decimals). Enum
+/// Render a domain as a closed range or set, non-terminating real
+/// endpoints in `format` (exact for [`crate::FeatureRange::range`], the
+/// configured format for [`crate::FeatureRange::range_approx`]). Enum
 /// literals use their model-facing names.
-pub(crate) fn fmt_dom(d: &Dom, enums: &[EnumSort], approx: bool) -> String {
+pub(crate) fn fmt_dom(d: &Dom, enums: &[EnumSort], format: &NumberFormat) -> String {
     match d {
         Dom::R(v) if v.is_empty() => "∅".into(),
-        Dom::R(v) => format!("[{}, {}]", fmt_ext(&v.lo, approx), fmt_ext(&v.hi, approx)),
+        Dom::R(v) => format!("[{}, {}]", fmt_ext(&v.lo, format), fmt_ext(&v.hi, format)),
         Dom::I(v) if v.is_empty() => "∅".into(),
         Dom::I(v) => format!("[{}, {}]", fmt_i(v.lo), fmt_i(v.hi)),
         Dom::B(Tri::True) => "{true}".into(),
@@ -1659,8 +1657,11 @@ mod tests {
         ];
         let (doms, unsat) = drive(vec![Dom::R(Ival::top())], &facts, 100);
         assert!(!unsat);
-        assert_eq!(fmt_dom(&doms[0], &[], false), "[0.8, 1.1]");
-        assert_eq!(fmt_dom(&doms[0], &[], true), "[0.8, 1.1]");
+        assert_eq!(fmt_dom(&doms[0], &[], &NumberFormat::exact()), "[0.8, 1.1]");
+        assert_eq!(
+            fmt_dom(&doms[0], &[], &NumberFormat::approx()),
+            "[0.8, 1.1]"
+        );
         // Bounds derived through arithmetic stay exact too: y = x + 0.2.
         let y = Term::Var(1);
         let facts = vec![
@@ -1676,7 +1677,7 @@ mod tests {
         ];
         let (doms, unsat) = drive(vec![Dom::R(Ival::top()), Dom::R(Ival::top())], &facts, 100);
         assert!(!unsat);
-        assert_eq!(fmt_dom(&doms[1], &[], false), "[1, 1.3]");
+        assert_eq!(fmt_dom(&doms[1], &[], &NumberFormat::exact()), "[1, 1.3]");
         // A non-terminating bound prints as a fraction exactly and as a
         // marked decimal for hints.
         let facts = vec![Term::App(
@@ -1690,8 +1691,11 @@ mod tests {
             ],
         )];
         let (doms, _) = drive(vec![Dom::R(Ival::top())], &facts, 100);
-        assert_eq!(fmt_dom(&doms[0], &[], false), "[1/3, +∞]");
-        assert_eq!(fmt_dom(&doms[0], &[], true), "[≈0.3333333333333333, +∞]");
+        assert_eq!(fmt_dom(&doms[0], &[], &NumberFormat::exact()), "[1/3, +∞]");
+        assert_eq!(
+            fmt_dom(&doms[0], &[], &NumberFormat::approx()),
+            "[≈0.3333333333333333, +∞]"
+        );
         // Equality against an exact sum is decided exactly: 0.1 + 0.2
         // is 0.3, so demanding both is satisfiable.
         let facts = vec![
@@ -1709,7 +1713,7 @@ mod tests {
         ];
         let (doms, unsat) = drive(vec![Dom::R(Ival::top())], &facts, 100);
         assert!(!unsat, "{doms:?}");
-        assert_eq!(fmt_dom(&doms[0], &[], false), "[0.3, 0.3]");
+        assert_eq!(fmt_dom(&doms[0], &[], &NumberFormat::exact()), "[0.3, 0.3]");
     }
 
     #[test]
@@ -1723,16 +1727,16 @@ mod tests {
         let le = |k: &str| Term::App(Op::Le, vec![x.clone(), Term::RealLit(dec(k))]);
         let (doms, unsat) = drive(vec![Dom::R(Ival::top())], &[ge("10"), ge("12")], 100);
         assert!(!unsat);
-        assert_eq!(fmt_dom(&doms[0], &[], false), "[12, +∞]");
+        assert_eq!(fmt_dom(&doms[0], &[], &NumberFormat::exact()), "[12, +∞]");
         let (doms, unsat) = drive(vec![Dom::R(Ival::top())], &[le("10"), le("8")], 100);
         assert!(!unsat);
-        assert_eq!(fmt_dom(&doms[0], &[], false), "[−∞, 8]");
+        assert_eq!(fmt_dom(&doms[0], &[], &NumberFormat::exact()), "[−∞, 8]");
         // A large second bound on a half-line already open at zero, then
         // a weaker third one that the tightened domain settles.
         let facts = [ge("0"), ge("1000"), ge("500")];
         let (doms, unsat) = drive(vec![Dom::R(Ival::top())], &facts, 100);
         assert!(!unsat);
-        assert_eq!(fmt_dom(&doms[0], &[], false), "[1000, +∞]");
+        assert_eq!(fmt_dom(&doms[0], &[], &NumberFormat::exact()), "[1000, +∞]");
         assert_eq!(eval_term(&facts[2], &doms), Dom::B(Tri::True));
     }
 
@@ -1751,12 +1755,15 @@ mod tests {
         let start = std::time::Instant::now();
         let whole = eval_term(&chain, &doms);
         // Σ [i, i+1] for i in 0..=30.
-        assert_eq!(fmt_dom(&whole, &[], false), "[465, 496]");
+        assert_eq!(fmt_dom(&whole, &[], &NumberFormat::exact()), "[465, 496]");
         doms.push(Dom::R(Ival::top()));
         let facts = vec![Term::App(Op::Eq, vec![Term::Var(31), chain])];
         let (doms, unsat) = drive(doms, &facts, 100);
         assert!(!unsat);
-        assert_eq!(fmt_dom(&doms[31], &[], false), "[465, 496]");
+        assert_eq!(
+            fmt_dom(&doms[31], &[], &NumberFormat::exact()),
+            "[465, 496]"
+        );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(1),
             "deep chain took {:?}",

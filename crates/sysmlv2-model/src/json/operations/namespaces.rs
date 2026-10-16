@@ -3,6 +3,7 @@
 //! Filtered visibility and general metadata predicates
 //! remain explicitly qualified.
 use super::{OperationArgumentIssue, OperationError, OperationExecutionSignature};
+use crate::metaclass::is_a;
 use crate::{
     json::{
         DerivedValue, ElementRef, PropertyError, Reference, ResolvedModel, membership_evidence,
@@ -137,7 +138,7 @@ fn visibility(r: &ResolvedModel, relationship: usize) -> Option<&'static str> {
 }
 fn visibility_builder(b: &crate::json::Builder, relationship: usize) -> Option<&'static str> {
     match b.elements[relationship].props.get("visibility") {
-        None => Some(if conforms(b.elements[relationship].ty, "Import") {
+        None => Some(if is_a!(b.elements[relationship], "Import") {
             "private"
         } else {
             "public"
@@ -183,7 +184,7 @@ pub(in crate::json) fn memberships_builder(
         {
             return Err(incomplete());
         }
-        if !conforms(b.elements[relationship].ty, "Membership") {
+        if !is_a!(b.elements[relationship], "Membership") {
             continue;
         }
         let member = membership_evidence::member(b, raw, owner, relationship, steps)
@@ -204,7 +205,7 @@ fn member_names(
 ) -> Result<Vec<String>, OperationError> {
     let incomplete = || OperationError::Incomplete { effective };
     charge(steps, 4, effective)?;
-    let owned = conforms(r.b.elements[membership.relationship].ty, "OwningMembership");
+    let owned = is_a!(r.b.elements[membership.relationship], "OwningMembership");
     let mut names = Vec::new();
     let source = &r.b.elements[if owned {
         membership.member
@@ -265,7 +266,7 @@ fn with_stable_evidence<T>(
     if r.b.positional_planning {
         return Err(incomplete());
     }
-    if conforms(r.b.elements[receiver.0].ty, "Type")
+    if is_a!(r.b.elements[receiver.0], "Type")
         && !r.b.ensure_positional_redefinitions_with_budget(steps)
     {
         return Err(incomplete());
@@ -673,10 +674,10 @@ mod tests {
         assert!(invoke(&mut r, "Q", "importedMemberships_Namespace", &[empty()]).is_err());
         assert!(r.b.stored_structure.as_ref().unwrap().has_authored_import);
         // Same-size row edits must invalidate the immutable presence fact.
-        r.b.elements[import].ty = "Dependency";
+        r.b.elements[import].set_ty("Dependency");
         assert!(invoke(&mut r, "P", "importedMemberships_Namespace", &[empty()]).is_ok());
         assert!(!r.b.stored_structure.as_ref().unwrap().has_authored_import);
-        r.b.elements[import].ty = original_type;
+        r.b.elements[import].set_ty(original_type);
         assert!(invoke(&mut r, "P", "importedMemberships_Namespace", &[empty()]).is_ok());
         assert!(invoke(&mut r, "Q", "importedMemberships_Namespace", &[empty()]).is_err());
     }

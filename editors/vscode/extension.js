@@ -8,13 +8,15 @@ const { LanguageClient } = require("vscode-languageclient/node");
 let client;
 
 function activate() {
-  const command = workspace.getConfiguration("sysmlv2").get("serverPath", "sysmlv2");
+  const config = workspace.getConfiguration("sysmlv2");
+  const command = config.get("serverPath", "sysmlv2");
   client = new LanguageClient(
     "sysmlv2",
     "sysmlv2 language server",
     { command, args: ["lsp"] },
     {
       documentSelector: [{ language: "sysml" }, { language: "kerml" }],
+      initializationOptions: { numberFormat: config.get("numberFormat", "exact") },
     }
   );
   client.start();

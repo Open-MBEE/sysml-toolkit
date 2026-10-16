@@ -323,8 +323,11 @@ fn contextual_named_domains_keep_receiver_identity() {
                 ("B::Other::fixed", Some((9, Some(9)))),
                 ("B::Child::viaAlias", Some((6, Some(6)))),
                 ("B::Child::viaShort", Some((6, Some(6)))),
-                ("B::Shadow::slots", None),
-                ("B::Shadow::viaAlias", None),
+                // Shadow's own `n` and `'bound alias'` redefine nothing: the
+                // domains keep A::Base::n, inherited beside them with its alias,
+                // and its value.
+                ("B::Shadow::slots", Some((4, Some(4)))),
+                ("B::Shadow::viaAlias", Some((4, Some(4)))),
                 ("B::Formula::slots", Some((5, Some(5)))),
             ] {
                 bounds(&mut r, name, expected);

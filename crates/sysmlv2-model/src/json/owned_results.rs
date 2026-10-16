@@ -8,6 +8,7 @@
 use super::{
     Builder, Elem, semantic_ownership::SemanticOwnership, structural_index::StoredStructure,
 };
+use crate::layered::IdSet;
 use crate::properties::Properties;
 use serde_json::json;
 use std::collections::HashSet;
@@ -56,10 +57,16 @@ pub(super) fn plan_reference_results(
     if !raw.ids_unique {
         return Some(plans);
     }
-    let from = b.explicit_len();
-    charge(steps, from)?;
+    // Every source row's expressions, the library's among them: a prepared
+    // library keeps its static rows only, and a build on it materializes
+    // the library's expressions' results with its own. The charge counts the
+    // source rows, as for a build from source.
+    charge(
+        steps,
+        b.explicit_len() - (b.lib_boundary - b.lib_implied_from),
+    )?;
     let mut assigned_ids = HashSet::new();
-    for expression in 0..from {
+    for expression in b.authored_rows() {
         if b.elements[expression].ty != "FeatureReferenceExpression" {
             continue;
         }
@@ -215,6 +222,7 @@ pub(super) fn stage_owned_result(
     let rows = [
         Elem {
             ty: "ReturnParameterMembership",
+            meta: crate::metaclass::meta_of("ReturnParameterMembership"),
             id: plan.membership_id,
             path: String::new(),
             path_parent: None,
@@ -225,6 +233,7 @@ pub(super) fn stage_owned_result(
         },
         Elem {
             ty: "Feature",
+            meta: crate::metaclass::meta_of("Feature"),
             id: plan.result_id,
             path: String::new(),
             path_parent: None,
@@ -235,6 +244,7 @@ pub(super) fn stage_owned_result(
         },
         Elem {
             ty: plan.relationship_type,
+            meta: crate::metaclass::meta_of(plan.relationship_type),
             id: plan.specialization_id,
             path: String::new(),
             path_parent: None,
@@ -334,6 +344,7 @@ fn stage_binding(
                 owned_relationships: Vec<usize>,
                 props: Properties| Elem {
         ty,
+        meta: crate::metaclass::meta_of(ty),
         id,
         path: String::new(),
         path_parent: None,
@@ -432,7 +443,7 @@ impl ConstructorDefaultPlan {
 /// redefinition provider. Incomplete constructors contribute no partial family.
 pub(super) fn plan_constructor_defaults(
     b: &mut Builder,
-    reserved: &HashSet<Uuid>,
+    reserved: &IdSet<Uuid>,
     steps: &mut usize,
 ) -> Option<Vec<ConstructorDefaultPlan>> {
     if b.graph_format != crate::model::GraphFormat::CanonicalV3 {
@@ -442,7 +453,7 @@ pub(super) fn plan_constructor_defaults(
     let mut plans = Vec::new();
     charge(steps, reserved.len())?;
     let mut assigned = reserved.clone();
-    for expression in 0..b.explicit_len() {
+    for expression in b.authored_rows() {
         charge(steps, 1)?;
         if b.elements[expression].ty != "ConstructorExpression" {
             continue;
@@ -565,7 +576,7 @@ pub(super) fn constructor_default_present(
             format!("{owner_id}/implied/defaultBinding/{valuation_id}").as_bytes(),
         );
         let binding = raw.element_for_uuid(b, binding_id)?;
-        if b.elements[binding].ty != "BindingConnector" || binding < b.explicit_len() {
+        if b.elements[binding].ty != "BindingConnector" || b.is_authored(binding) {
             return None;
         }
         let membership = b.elements[binding].owning_relationship?;
@@ -673,7 +684,7 @@ mod tests {
         let membership = r.b.elements[expression].owned_relationships[0];
         assert_eq!(r.b.elements[membership].ty, "Membership");
         for bad_kind in ["OwningMembership", "FeatureMembership"] {
-            r.b.elements[membership].ty = bad_kind;
+            r.b.elements[membership].set_ty(bad_kind);
             let plans = plan_reference_results(&mut r.b, &mut 0).unwrap();
             assert!(!plans.iter().any(|p| p.expression == expression));
         }

@@ -133,7 +133,7 @@ fn parameter_prerequisite_role_damage_and_budget_are_retryable() {
         r.b.checked_type_membership_operation(child, &[], &[], true, &mut 0)
             .is_ok()
     );
-    r.b.elements[membership].ty = "ParameterMembership";
+    r.b.elements[membership].set_ty("ParameterMembership");
     r.b.elements[selected]
         .props
         .entries
@@ -165,7 +165,7 @@ fn parameter_prerequisite_role_damage_and_budget_are_retryable() {
         r.b.checked_type_membership_operation(child, &[], &[], true, &mut 0)
             .is_ok()
     );
-    r.b.elements[membership].ty = "SubjectMembership";
+    r.b.elements[membership].set_ty("SubjectMembership");
     assert!(
         r.b.checked_type_membership_operation(child, &[], &[], true, &mut 0)
             .is_err()

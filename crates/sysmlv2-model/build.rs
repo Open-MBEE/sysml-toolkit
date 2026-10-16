@@ -26,9 +26,14 @@ fn main() {
         collect(&dir, &mut files);
         files.sort();
         for file in &files {
+            // (a file gone or unreadable since the walk — a dangling link —
+            // is left out)
+            let Ok(bytes) = std::fs::read(file) else {
+                continue;
+            };
             let rel = file.strip_prefix(&dir).unwrap();
             hash.update(rel.to_string_lossy().as_bytes());
-            hash.update(&std::fs::read(file).unwrap());
+            hash.update(&bytes);
         }
     }
     println!(
@@ -37,9 +42,20 @@ fn main() {
     );
 }
 
+/// Every file under `dir`, but for what an editor keeps beside a source
+/// while it is open — a `.#name` lock, a `.swp` swap file, a `name~`
+/// backup — and an entry that cannot be read.
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".#") || name.ends_with(".swp") || name.ends_with('~') {
+            continue;
+        }
+        let path = entry.path();
         if path.is_dir() {
             collect(&path, out);
         } else {
@@ -48,7 +64,8 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// FNV-1a, 64-bit — mirrors `libcache::Fnv` (a build script cannot use
+/// FNV-1a, 64-bit, byte by byte — the form `libcache::Fnv` folds eight
+/// bytes at a time; the two are never compared (a build script cannot use
 /// the crate it builds).
 struct Fnv(u64);
 

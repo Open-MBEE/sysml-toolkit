@@ -1,9 +1,7 @@
 //! Qualified public views of the one checked Feature.type projection.
 use super::{Incomplete, adapter::RepositoryTyping};
-use crate::{
-    json::{ElementRef, ResolvedModel},
-    metaclass::conforms,
-};
+use crate::json::{ElementRef, ResolvedModel};
+use crate::metaclass::is_a;
 
 /// Why a checked type-family property is unavailable. An error is not an empty
 /// collection or proof of absence. This set may grow as coverage is expanded.
@@ -107,7 +105,7 @@ impl ResolvedModel {
                 initial_steps,
             );
         };
-        if !conforms(element.ty, "Feature") {
+        if !is_a!(element, "Feature") {
             return FeatureTypeReport::unavailable(
                 FeatureTypeIssue::InvalidElement,
                 false,
@@ -115,8 +113,8 @@ impl ResolvedModel {
                 initial_steps,
             );
         }
-        let step = conforms(element.ty, "Step");
-        let expression = conforms(element.ty, "Expression");
+        let step = is_a!(element, "Step");
+        let expression = is_a!(element, "Expression");
         if initial_steps > crate::eval::MAX_STEPS {
             return FeatureTypeReport::unavailable(
                 FeatureTypeIssue::WorkLimit,

@@ -9,6 +9,7 @@ use crate::json::{
     type_relations::{CompositionOwner, RelationFact, TypeRelations, endpoint_with_carrier},
 };
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -214,7 +215,7 @@ impl<'a> RepositoryTyping<'a> {
     ) -> Result<(Vec<usize>, Vec<usize>), Incomplete> {
         let mut owner_types = None;
         let element = &self.builder.elements[feature];
-        if conforms(element.ty, "OccurrenceUsage")
+        if is_a!(element, "OccurrenceUsage")
             && element.props.get("isComposite").and_then(|v| v.as_bool()) == Some(true)
         {
             let owner = self
@@ -222,7 +223,7 @@ impl<'a> RepositoryTyping<'a> {
                 .owning_type(self.builder, feature, steps)
                 .ok_or(Incomplete::InvalidRelationship)?;
             if let Some(owner) =
-                owner.filter(|&owner| conforms(self.builder.elements[owner].ty, "Feature"))
+                owner.filter(|&owner| is_a!(self.builder.elements[owner], "Feature"))
             {
                 charge(steps, 1)?;
                 let certificate = if let Some(certificate) = self.contextual_owners.get(&owner) {
@@ -240,11 +241,11 @@ impl<'a> RepositoryTyping<'a> {
                         object: projection
                             .candidates
                             .iter()
-                            .any(|&ty| conforms(self.builder.elements[ty].ty, "Structure")),
+                            .any(|&ty| is_a!(self.builder.elements[ty], "Structure")),
                         occurrence: projection
                             .candidates
                             .iter()
-                            .any(|&ty| conforms(self.builder.elements[ty].ty, "Class")),
+                            .any(|&ty| is_a!(self.builder.elements[ty], "Class")),
                     };
                     self.contextual_owners.insert(owner, certificate);
                     certificate
@@ -323,13 +324,13 @@ impl Evidence for RepositoryTyping<'_> {
             }
         }
         if let Some(original) = original {
-            if conforms(self.builder.elements[original].ty, "Feature") {
+            if is_a!(self.builder.elements[original], "Feature") {
                 features.push(original);
             }
         } else {
             let mut last = None;
             for &relationship in &owned {
-                if !conforms(self.builder.elements[relationship].ty, "FeatureChaining") {
+                if !is_a!(self.builder.elements[relationship], "FeatureChaining") {
                     continue;
                 }
                 let carrier = self.carrier(relationship, steps)?;
@@ -421,7 +422,7 @@ impl Evidence for RepositoryTyping<'_> {
                         .builder
                         .elements
                         .get(target)
-                        .is_some_and(|e| conforms(e.ty, "Feature"))
+                        .is_some_and(|e| is_a!(e, "Feature"))
                     {
                         graph_issue.get_or_insert(Incomplete::InvalidElement);
                     } else {
@@ -463,13 +464,13 @@ impl Evidence for RepositoryTyping<'_> {
         self.builder
             .elements
             .get(element)
-            .is_some_and(|e| conforms(e.ty, "Behavior"))
+            .is_some_and(|e| is_a!(e, "Behavior"))
     }
     fn is_function(&self, element: usize) -> bool {
         self.builder
             .elements
             .get(element)
-            .is_some_and(|e| conforms(e.ty, "Function"))
+            .is_some_and(|e| is_a!(e, "Function"))
     }
 }
 #[cfg(test)]

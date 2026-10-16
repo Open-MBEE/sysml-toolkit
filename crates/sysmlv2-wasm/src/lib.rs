@@ -20,12 +20,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
+use sysmlv2_lsp::{Encoding, Mapper, library_uri};
 use sysmlv2_model::check::ConstraintVerdict;
 use sysmlv2_model::eval::Value as EvalValue;
 use sysmlv2_model::json::ElementRef;
 use sysmlv2_solve::{PropagateConfig, PropagateOutcome};
 use sysmlv2_syntax::parser::parse_expression;
-use sysmlv2_syntax::span::LineIndex;
+use sysmlv2_syntax::span::{LineIndex, Span};
 use sysmlv2_transform::{Indent, Library, Session as TSession, check_sources_with_library};
 
 /// Stack reserved for the module, in bytes (16 MiB).
@@ -224,11 +225,16 @@ struct PlantumlOpts {
     link_template: Option<String>,
 }
 
-/// `{open: [selector…], noteBudget, leafBudget, unbounded: [selector…]}`:
-/// which containers emit their members, how many notes draw as cards
-/// per cluster, how many members draw per open container, and which
-/// open containers draw every member regardless (a selector that does
-/// not resolve is ignored).
+/// `{open: [selector…], noteBudget, leafBudget, unbounded: [selector…],
+/// fullWithin?}`: which containers emit their members, how many notes
+/// draw as cards per cluster, how many members draw per open container,
+/// and which open containers draw every member regardless (a selector
+/// that does not resolve is ignored). `fullWithin` is a finite number: when
+/// the summary's would-draw total — its node count plus every node's
+/// `summary.hidden` ([`sysmlv2_viz::summary_would_draw`]) — is at most
+/// that, the reply is the full graph instead, exactly as a request
+/// without `summary` emits it, marked `full: true` and without the
+/// `summary` reply field.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SummaryIn {
@@ -240,6 +246,8 @@ struct SummaryIn {
     note_budget: usize,
     #[serde(default = "default_leaf_budget")]
     leaf_budget: usize,
+    #[serde(default)]
+    full_within: Option<f64>,
 }
 
 fn default_note_budget() -> usize {
@@ -248,6 +256,116 @@ fn default_note_budget() -> usize {
 
 fn default_leaf_budget() -> usize {
     500
+}
+
+/// [`Session::outline`]'s budgets: `{outlineNodes?, outlineDepth?,
+/// shapeNodes?, shapeDepth?}`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OutlineIn {
+    #[serde(default = "default_outline_nodes")]
+    outline_nodes: usize,
+    #[serde(default = "default_outline_depth")]
+    outline_depth: usize,
+    #[serde(default = "default_shape_nodes")]
+    shape_nodes: usize,
+    #[serde(default = "default_shape_depth")]
+    shape_depth: usize,
+}
+
+fn default_outline_nodes() -> usize {
+    4000
+}
+
+fn default_outline_depth() -> usize {
+    24
+}
+
+fn default_shape_nodes() -> usize {
+    20000
+}
+
+fn default_shape_depth() -> usize {
+    64
+}
+
+/// One element of the outline tree (fields in the order a host's own
+/// walk builds them).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutlineNodeOut {
+    name: Option<String>,
+    metaclass: &'static str,
+    qualified_name: Option<String>,
+    children: Vec<OutlineNodeOut>,
+}
+
+/// One named element of the shape: `owner` indexes the nearest named
+/// ancestor recorded before it, `-1` when there is none.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeNodeOut {
+    id: String,
+    name: String,
+    qualified_name: String,
+    metaclass: &'static str,
+    owner: i64,
+}
+
+/// The state of one [`Session::outline`] walk.
+struct OutlineWalk {
+    opts: OutlineIn,
+    /// Outline nodes still to hand out, claimed in visiting order.
+    outline_left: usize,
+    shape: Vec<ShapeNodeOut>,
+    /// A budget cut the shape short: a named element left out, or an
+    /// element at the depth limit with members.
+    truncated: bool,
+}
+
+/// A field of [`Session::rows`]: one per-element read, by the name of
+/// the method that answers it.
+enum RowField {
+    Name,
+    ShortName,
+    QualifiedName,
+    ReferenceSpelling,
+    Metaclass,
+    Owner,
+    IsLibraryElement,
+    ValueSource,
+    ValueIsDefault,
+    Docs,
+    DeclarationSite,
+    MemberExtent,
+    Property(String),
+    Derived(String),
+}
+
+impl RowField {
+    fn parse(field: &str) -> Result<RowField, String> {
+        if let Some(name) = field.strip_prefix("property:") {
+            return Ok(RowField::Property(name.to_string()));
+        }
+        if let Some(name) = field.strip_prefix("derived:") {
+            return Ok(RowField::Derived(name.to_string()));
+        }
+        Ok(match field {
+            "name" => RowField::Name,
+            "shortName" => RowField::ShortName,
+            "qualifiedName" => RowField::QualifiedName,
+            "referenceSpelling" => RowField::ReferenceSpelling,
+            "metaclass" => RowField::Metaclass,
+            "owner" => RowField::Owner,
+            "isLibraryElement" => RowField::IsLibraryElement,
+            "valueSource" => RowField::ValueSource,
+            "valueIsDefault" => RowField::ValueIsDefault,
+            "docs" => RowField::Docs,
+            "declarationSite" => RowField::DeclarationSite,
+            "memberExtent" => RowField::MemberExtent,
+            _ => return Err(format!("unknown row field: {field}")),
+        })
+    }
 }
 
 /// An element selector: a `::`-qualified name, or `{elementId}` for
@@ -316,6 +434,45 @@ fn unit_line_index<'a>(
         .or_insert_with(|| LineIndex::new(session.source(unit).unwrap_or("")))
 }
 
+/// Where `span` of `unit` lies, positioned as an editor positions it:
+/// JSON `{unit, line, col, endLine, endCol}` — the unit's name, 1-based
+/// lines, and columns counted in UTF-16 code units — which is the
+/// language server's location for the same span, one-based. A unit of
+/// an in-memory library is named as the server names it, under the
+/// `sysmlv2-lib:/` scheme a host serves the library's text under.
+/// `mappers` memoizes a unit's line table across the sites of one
+/// answer. A unit whose text the session does not hold has no position.
+fn unit_location<'a>(
+    session: &'a TSession,
+    mappers: &mut HashMap<usize, Option<(String, Mapper<'a>)>>,
+    unit: usize,
+    span: Span,
+) -> Option<serde_json::Value> {
+    let (name, mapper) = mappers
+        .entry(unit)
+        .or_insert_with(|| {
+            let (name, text) = session
+                .units()
+                .find(|(i, _, _)| *i == unit)
+                .map(|(_, name, text)| (name.to_string(), text))
+                .or_else(|| {
+                    session
+                        .library_unit(unit)
+                        .map(|(name, text)| (library_uri(name), text))
+                })?;
+            Some((name, Mapper::new(text, Encoding::Utf16)))
+        })
+        .as_ref()?;
+    let range = mapper.range(span);
+    Some(json!({
+        "unit": name,
+        "line": range.start.line + 1,
+        "col": range.start.character + 1,
+        "endLine": range.end.line + 1,
+        "endCol": range.end.character + 1,
+    }))
+}
+
 /// A verdict's feature bindings as the verify report spells them: `{feature,
 /// value?, unitName?, line?, col?}`. A declaration in a library unit has
 /// no position (library sources are not held).
@@ -364,6 +521,13 @@ fn with_values(detail: String, bindings: &[sysmlv2_model::check::ConstraintBindi
 /// `{op: "rename", target, newName}` · `{op: "setFeatureValue", target,
 /// expr}` · `{op: "setFeatureType", target, type}` (replace the written
 /// `: T` clause in place, or add one where none exists) · `{op:
+/// "setRedefinedFeature", target, feature}` (replace the first written
+/// `:>>` / `redefines` target, a name or a chain, with `feature` as
+/// written) · `{op: "removeFeatureValue", target}` (the `= …`, `:= …` /
+/// `default …` clause goes, its operator with it) · `{op:
+/// "setCommentBody", target, body}` (a comment's or documentation's
+/// `/* … */` body becomes `body`, the text as a reader sees it; the
+/// keyword, name, `about` list and locale stay as written) · `{op:
 /// "insertMember", owner, text}` · `{op: "insertTopLevel", unit, text}`
 /// · `{op: "remove", target}` · `{op: "replaceMember", target, text}`
 /// (identity-preserving update: swaps the declaration for exactly one
@@ -392,6 +556,12 @@ enum EditOpIn {
         #[serde(rename = "type")]
         ty: String,
     },
+    #[serde(rename = "setRedefinedFeature")]
+    SetRedefinedFeature { target: String, feature: String },
+    #[serde(rename = "removeFeatureValue")]
+    RemoveFeatureValue { target: String },
+    #[serde(rename = "setCommentBody")]
+    SetCommentBody { target: String, body: String },
     #[serde(rename = "insertMember")]
     InsertMember { owner: String, text: String },
     #[serde(rename = "insertTopLevel")]
@@ -418,6 +588,9 @@ enum ResolvedOp {
     Rename(ElementRef, String),
     SetFeatureValue(ElementRef, String),
     SetFeatureType(ElementRef, String),
+    SetRedefinedFeature(ElementRef, String),
+    RemoveFeatureValue(ElementRef),
+    SetCommentBody(ElementRef, String),
     InsertMember(ElementRef, String),
     InsertTopLevel(String, String),
     AddUnit(String),
@@ -435,6 +608,15 @@ pub struct Session {
 }
 
 impl Session {
+    /// Whether the session's compact emissions read the rows its build
+    /// made instead of building the model again (see
+    /// `ResolvedModel::emits_built_rows`). Not part of the JS surface: the
+    /// binding's tests hold the reads a host makes to keeping it.
+    #[doc(hidden)]
+    pub fn emits_built_rows(&self) -> bool {
+        self.inner.resolved_ref().emits_built_rows()
+    }
+
     fn guard(&self, e: &Element) -> Result<(), String> {
         if e.gen != self.gen {
             return Err(
@@ -532,6 +714,152 @@ impl Session {
         Ok((viz, root, opts.summary))
     }
 
+    /// Top-level user elements (see [`Self::roots`]).
+    fn root_refs(&mut self) -> Vec<ElementRef> {
+        let r = self.inner.resolved();
+        let all: Vec<ElementRef> = r.user_elements().collect();
+        let mut tops = Vec::new();
+        for e in all {
+            if r.owner(e).is_none() && r.element_type(e) == "Namespace" {
+                tops.extend(r.owned_members(e));
+            }
+        }
+        tops
+    }
+
+    /// The name an outline shows: `derived(e, "name")` when that is a
+    /// string, else the declared name. Errors as `derived` does.
+    fn display_name(&mut self, e: ElementRef) -> Result<Option<String>, String> {
+        let gen = self.gen;
+        match self.derived_json(&Element { e, gen }, "name")? {
+            serde_json::Value::String(name) => Ok(Some(name)),
+            _ => Ok(self.inner.resolved().element_name(e).map(str::to_string)),
+        }
+    }
+
+    /// Visit `e` at `depth` under the shape node `owner` (see
+    /// [`Self::outline`]): its outline node, or `None` once the outline
+    /// budget is spent.
+    fn outline_visit(
+        &mut self,
+        walk: &mut OutlineWalk,
+        e: ElementRef,
+        owner: i64,
+        depth: usize,
+    ) -> Result<Option<OutlineNodeOut>, String> {
+        let name = self.display_name(e)?;
+        let r = self.inner.resolved();
+        let qualified_name = r.element_qualified_name(e);
+        let metaclass = r.element_type(e);
+        // Shape: named elements only. An anonymous one is still walked,
+        // its named members re-parented onto its nearest named ancestor.
+        let mut this = owner;
+        if let (Some(n), Some(q)) = (&name, &qualified_name) {
+            if !n.is_empty() && !q.is_empty() {
+                if walk.shape.len() >= walk.opts.shape_nodes {
+                    walk.truncated = true;
+                } else {
+                    this = i64::try_from(walk.shape.len()).unwrap_or(i64::MAX);
+                    walk.shape.push(ShapeNodeOut {
+                        id: r.element_id(e).to_string(),
+                        name: n.clone(),
+                        qualified_name: q.clone(),
+                        metaclass,
+                        owner,
+                    });
+                }
+            }
+        }
+        // The outline claims its slot before any member is visited.
+        let in_outline = walk.outline_left > 0;
+        walk.outline_left = walk.outline_left.saturating_sub(1);
+        let members = r.owned_members(e);
+        let mut children = Vec::new();
+        if depth < walk.opts.shape_depth {
+            for m in members {
+                let child = self.outline_visit(walk, m, this, depth + 1)?;
+                if let Some(child) = child.filter(|_| depth < walk.opts.outline_depth) {
+                    children.push(child);
+                }
+            }
+        } else if !members.is_empty() {
+            walk.truncated = true;
+        }
+        Ok(in_outline.then_some(OutlineNodeOut {
+            name,
+            metaclass,
+            qualified_name,
+            children,
+        }))
+    }
+
+    /// The JSON of a `{unit, start, end}` source extent.
+    fn extent_json((unit, span): (usize, Span)) -> serde_json::Value {
+        json!({"unit": unit, "start": span.start, "end": span.end})
+    }
+
+    /// Every element's documentation bodies as [`Self::docs`] answers
+    /// them, by element: one pass over the model's annotations, where
+    /// `docs` makes one per element.
+    fn docs_by_target(&mut self) -> HashMap<ElementRef, Vec<String>> {
+        let mut by_target: HashMap<ElementRef, Vec<String>> = HashMap::new();
+        for (target, body) in self.inner.resolved().annotation_bodies() {
+            let text = sysmlv2_model::json::doc_display_text(&body);
+            if !text.is_empty() {
+                by_target.entry(target).or_default().push(text);
+            }
+        }
+        by_target
+    }
+
+    /// One [`Self::rows`] field of `e`, as the per-element read answers
+    /// it; `docs` holds every element's documentation once a row asked.
+    fn row_field(
+        &mut self,
+        e: &Element,
+        field: &RowField,
+        docs: &mut Option<HashMap<ElementRef, Vec<String>>>,
+    ) -> Result<serde_json::Value, String> {
+        Ok(match field {
+            RowField::Name => json!(self.name(e)?),
+            RowField::ShortName => json!(self.short_name(e)?),
+            RowField::QualifiedName => json!(self.qualified_name(e)?),
+            RowField::ReferenceSpelling => json!(self.reference_spelling(e)?),
+            RowField::Metaclass => json!(self.metaclass(e)?),
+            RowField::Owner => {
+                let r = self.inner.resolved();
+                json!(r.owner(e.e).map(|o| r.element_id(o).to_string()))
+            }
+            RowField::IsLibraryElement => json!(self.is_library_element(e)?),
+            RowField::ValueSource => json!(self.value_source(e)?),
+            RowField::ValueIsDefault => json!(self.value_is_default(e)?),
+            RowField::Docs => {
+                let by_target = docs.get_or_insert_with(|| self.docs_by_target());
+                json!(by_target.get(&e.e).map_or(&[][..], Vec::as_slice))
+            }
+            RowField::DeclarationSite => self
+                .declaration_site_of(e.e)
+                .map_or(serde_json::Value::Null, Self::extent_json),
+            RowField::MemberExtent => self
+                .inner
+                .resolved()
+                .member_extent(e.e)
+                .map_or(serde_json::Value::Null, Self::extent_json),
+            RowField::Property(name) => self
+                .inner
+                .resolved()
+                .property(e.e, name)
+                .map_err(|e| e.to_string())?,
+            RowField::Derived(name) => self.derived_json(e, name)?,
+        })
+    }
+
+    /// Where `e` is declared: its name's site, else its member extent.
+    fn declaration_site_of(&mut self, e: ElementRef) -> Option<(usize, Span)> {
+        let r = self.inner.resolved();
+        r.declaration_site(e).or_else(|| r.member_extent(e))
+    }
+
     fn value_to_json(&mut self, v: &EvalValue) -> serde_json::Value {
         match v {
             EvalValue::Boolean(b) => json!(b),
@@ -572,6 +900,13 @@ impl Session {
     }
 }
 
+/// Whether a snapshot decode keeps what hosts shipped in it — the language
+/// server's library symbol table — for them to read: only when the caller
+/// passes `keepHostParts: true`.
+fn keeps_host_parts(keep_host_parts: Option<bool>) -> bool {
+    keep_host_parts.unwrap_or(false)
+}
+
 /// An immutable library graph reusable across session builds and edits.
 /// Prepare the final ordered source bundle once. Changed sources require a new
 /// handle. Sessions retain the library independently of this handle's lifetime.
@@ -592,17 +927,15 @@ impl PreparedLibrary {
         })
     }
 
-    /// Decode a prepared snapshot (the package's `sysml-library.prepared.gz`,
-    /// decompressed) of exactly `sources_json`, the bundle it was generated
-    /// from: no resolve at boot, no syntax trees in memory. A snapshot made by
-    /// another build or from other units is refused with an error, and the
-    /// caller prepares from source with `new` instead. `recording` is the
-    /// sealed resolution snapshot, kept encoded for the builds that must
-    /// resolve the library together with user units.
     /// [`Self::from_snapshot`] reading the snapshot where it lies: `view` stays
     /// in the host's memory and is copied into this module one window at a
     /// time, so the module's memory never holds the whole snapshot (which it
     /// would keep as its high-water mark). Same refusals as `fromSnapshot`.
+    /// The snapshot also carries the language server's library symbol table:
+    /// with `keepHostParts: true` the handle keeps it for a server on it
+    /// (`LspServer.withPreparedLibrary`) to build its table from; by default
+    /// it passes through, verified, and a module that hosts no language
+    /// server holds none of it.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = fromSnapshotStream)]
     #[allow(clippy::needless_pass_by_value)]
@@ -610,6 +943,7 @@ impl PreparedLibrary {
         view: js_sys::Uint8Array,
         sources_json: &str,
         recording: Option<Vec<u8>>,
+        #[wasm_bindgen(js_name = keepHostParts)] keep_host_parts: Option<bool>,
     ) -> Result<PreparedLibrary, String> {
         let len = usize::try_from(view.length()).map_err(|e| e.to_string())?;
         let mut at: u32 = 0;
@@ -625,26 +959,45 @@ impl PreparedLibrary {
             n as usize
         };
         Ok(Self {
-            inner: Library::prepared_snapshot_chunks(
+            inner: Library::prepared_snapshot_chunks_with(
                 parse_sources(sources_json)?,
                 len,
                 fill,
                 recording,
+                keeps_host_parts(keep_host_parts),
             )
             .map_err(|e| e.to_string())?,
         })
     }
 
+    /// Decode a prepared snapshot (the package's `sysml-library.prepared.gz`,
+    /// decompressed) of exactly `sources_json`, the bundle it was generated
+    /// from: no resolve at boot, no syntax trees in memory. A snapshot made by
+    /// another build or from other units is refused with an error, and the
+    /// caller prepares from source with `new` instead. `recording` is the
+    /// sealed resolution snapshot, kept encoded for the builds that must
+    /// resolve the library together with user units. The snapshot also
+    /// carries the language server's library symbol table: with
+    /// `keepHostParts: true` the handle keeps it for a server on it
+    /// (`LspServer.withPreparedLibrary`) to build its table from; by default
+    /// it is verified and dropped, and a module that hosts no language
+    /// server holds none of it.
     #[wasm_bindgen(js_name = fromSnapshot)]
     #[allow(clippy::needless_pass_by_value)]
     pub fn from_snapshot(
         snapshot: Vec<u8>,
         sources_json: &str,
         recording: Option<Vec<u8>>,
+        #[wasm_bindgen(js_name = keepHostParts)] keep_host_parts: Option<bool>,
     ) -> Result<PreparedLibrary, String> {
         Ok(Self {
-            inner: Library::prepared_snapshot(parse_sources(sources_json)?, &snapshot, recording)
-                .map_err(|e| e.to_string())?,
+            inner: Library::prepared_snapshot_with(
+                parse_sources(sources_json)?,
+                &snapshot,
+                recording,
+                keeps_host_parts(keep_host_parts),
+            )
+            .map_err(|e| e.to_string())?,
         })
     }
 }
@@ -1088,8 +1441,14 @@ impl Session {
     /// does not declare the property as derived or the toolkit does not
     /// compute it yet; `derives` tells in advance.
     pub fn derived(&mut self, e: &Element, name: &str) -> Result<String, String> {
-        use sysmlv2_model::json::{DerivedValue, Reference, dangling_id};
         self.guard(e)?;
+        self.derived_json(e, name).map(|json| json.to_string())
+    }
+
+    /// [`Self::derived`]'s answer as a JSON value, for the reads that
+    /// embed it in a document of their own.
+    fn derived_json(&mut self, e: &Element, name: &str) -> Result<serde_json::Value, String> {
+        use sysmlv2_model::json::{DerivedValue, Reference, dangling_id};
         let value = self.derived_value(e, name)?;
         let r = self.inner.resolved();
         let id = |x: ElementRef| serde_json::json!({ "@id": r.element_id(x).to_string() });
@@ -1124,7 +1483,7 @@ impl Session {
             }
             _ => return Err("unsupported derived value shape from a newer toolkit".into()),
         };
-        Ok(json.to_string())
+        Ok(json)
     }
 
     /// Checked owned/derived property by specification name, encoded as JSON.
@@ -1369,6 +1728,45 @@ impl Session {
             .collect())
     }
 
+    /// The links of the feature chain `e` redefines (`attribute :>>
+    /// chassis.mass`), first to last, resolved: the first such
+    /// redefinition's; empty when `e` redefines no chain.
+    #[wasm_bindgen(js_name = redefinedChain)]
+    pub fn redefined_chain(&mut self, e: &Element) -> Result<Vec<Element>, String> {
+        self.guard(e)?;
+        let gen = self.gen;
+        Ok(self
+            .inner
+            .resolved()
+            .redefined_chains(e.e)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| Element { e, gen })
+            .collect())
+    }
+
+    /// Whether `e`'s own value is a default (`default v`) rather than a
+    /// binding (`= v`); undefined when `e` declares no value.
+    #[wasm_bindgen(js_name = valueIsDefault)]
+    pub fn value_is_default(&mut self, e: &Element) -> Result<Option<bool>, String> {
+        self.guard(e)?;
+        Ok(self.inner.resolved().value_is_default(e.e))
+    }
+
+    /// The feature `e` stands for through its redefinitions by name —
+    /// the end of `e` → its first redefinition target → … — or `e`
+    /// itself. Features that redefine one feature, however many steps
+    /// apart, share a root.
+    #[wasm_bindgen(js_name = redefinitionRoot)]
+    pub fn redefinition_root(&mut self, e: &Element) -> Result<Element, String> {
+        self.guard(e)?;
+        let gen = self.gen;
+        let root = self.inner.resolved().redefinition_root(e.e);
+        Ok(Element { e: root, gen })
+    }
+
     /// Explicit `about` targets of an annotating element, resolved.
     #[wasm_bindgen(js_name = annotatedElements)]
     pub fn annotated_elements(&mut self, e: &Element) -> Result<Vec<Element>, String> {
@@ -1444,15 +1842,135 @@ impl Session {
     /// values — are graph plumbing and never appear here.)
     pub fn roots(&mut self) -> Vec<Element> {
         let gen = self.gen;
-        let r = self.inner.resolved();
-        let all: Vec<ElementRef> = r.user_elements().collect();
-        let mut tops = Vec::new();
-        for e in all {
-            if r.owner(e).is_none() && r.element_type(e) == "Namespace" {
-                tops.extend(r.owned_members(e));
+        self.root_refs()
+            .into_iter()
+            .map(|e| Element { e, gen })
+            .collect()
+    }
+
+    /// The model's outline tree and its named-element shape from one
+    /// walk, as JSON: what reading every element through `roots`,
+    /// `members`, `derived(e, "name")`, `name`, `qualifiedName`,
+    /// `metaclass` and `elementId` assembles, in one call and without a
+    /// handle per element.
+    ///
+    /// Options JSON (absent or empty = every default): `{outlineNodes?:
+    /// 4000, outlineDepth?: 24, shapeNodes?: 20000, shapeDepth?: 64}`.
+    ///
+    /// The walk visits `roots()` in order, each depth-first through its
+    /// `members` in declaration order. A root is at depth 0, and the walk
+    /// goes below an element at depth `d` only while `d < shapeDepth`.
+    /// Each visited element is named as `derived(e, "name")` names it
+    /// when that is a string, else by its declared name, else `null`.
+    ///
+    /// - **Outline.** Every visited element claims one of `outlineNodes`
+    ///   slots in visiting order (before its members); one visited after
+    ///   they are spent has no outline node. A node is `{name, metaclass,
+    ///   qualifiedName, children}` (`qualifiedName` `null` for an
+    ///   anonymous element), and a node at depth `d` keeps its members'
+    ///   nodes as `children` only while `d < outlineDepth`.
+    /// - **Shape.** An element whose name and qualified name are both
+    ///   non-empty is recorded as `{id, name, qualifiedName, metaclass,
+    ///   owner}`, in visiting order; `owner` indexes the nearest such
+    ///   ancestor in the list, `-1` for none (an anonymous element's
+    ///   members re-parent onto its nearest named ancestor). Once
+    ///   `shapeNodes` are recorded, every further named element is left
+    ///   out and sets `truncated`; so does an element at `shapeDepth`
+    ///   that has members.
+    ///
+    /// Reply: `{outline: [node…], shape: {nodes: [node…], truncated}}`.
+    /// Errors as `derived` does, or on malformed options.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn outline(&mut self, opts_json: Option<String>) -> Result<String, String> {
+        let opts: OutlineIn = serde_json::from_str(
+            opts_json
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("{}"),
+        )
+        .map_err(|e| format!("bad options: {e}"))?;
+        let mut walk = OutlineWalk {
+            outline_left: opts.outline_nodes,
+            opts,
+            shape: Vec::new(),
+            truncated: false,
+        };
+        let mut outline = Vec::new();
+        for e in self.root_refs() {
+            if let Some(node) = self.outline_visit(&mut walk, e, -1, 0)? {
+                outline.push(node);
             }
         }
-        tops.into_iter().map(|e| Element { e, gen }).collect()
+        #[derive(Serialize)]
+        struct Shape {
+            nodes: Vec<ShapeNodeOut>,
+            truncated: bool,
+        }
+        #[derive(Serialize)]
+        struct Reply {
+            outline: Vec<OutlineNodeOut>,
+            shape: Shape,
+        }
+        serde_json::to_string(&Reply {
+            outline,
+            shape: Shape {
+                nodes: walk.shape,
+                truncated: walk.truncated,
+            },
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// Per-element reads for many elements in one call, as JSON.
+    ///
+    /// `ids_json` is an array of interchange ids and `fields_json` an
+    /// array of field names. The reply is an array in the order of the
+    /// ids: `null` where `elementById` finds no element, else an object
+    /// holding each field under its name, valued as the same-named
+    /// per-element read answers it — `undefined` as `null`, a JSON
+    /// answer decoded:
+    ///
+    /// - `name`, `shortName`, `qualifiedName`, `referenceSpelling`,
+    ///   `metaclass`, `isLibraryElement`, `valueSource`,
+    ///   `valueIsDefault`, `docs`, `declarationSite`, `memberExtent`;
+    /// - `owner`: the owner's id, or `null` for a document root;
+    /// - `property:<name>`: `property(e, name)`;
+    /// - `derived:<name>`: `derived(e, name)`.
+    ///
+    /// A read that errors leaves its field out and puts its message
+    /// under `errors: {field: message}` instead. Errors when either
+    /// array is malformed or names a field outside this list.
+    pub fn rows(&mut self, ids_json: &str, fields_json: &str) -> Result<String, String> {
+        let ids: Vec<String> =
+            serde_json::from_str(ids_json).map_err(|e| format!("bad ids: {e}"))?;
+        let names: Vec<String> =
+            serde_json::from_str(fields_json).map_err(|e| format!("bad fields: {e}"))?;
+        let fields = names
+            .iter()
+            .map(|name| RowField::parse(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut docs = None;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let Some(e) = self.element_by_id(id) else {
+                out.push(serde_json::Value::Null);
+                continue;
+            };
+            let mut row = serde_json::Map::new();
+            let mut errors = serde_json::Map::new();
+            for (name, field) in names.iter().zip(&fields) {
+                match self.row_field(&e, field, &mut docs) {
+                    Ok(value) => row.insert(name.clone(), value),
+                    Err(message) => errors.insert(name.clone(), message.into()),
+                };
+            }
+            if !errors.is_empty() {
+                row.insert("errors".to_string(), errors.into());
+            }
+            out.push(row.into());
+        }
+        Ok(serde_json::Value::Array(out).to_string())
     }
 
     /// Every element of the given metaclass.
@@ -1508,7 +2026,7 @@ impl Session {
     /// Compact interchange JSON (KerML 10.4) for the session's model.
     #[wasm_bindgen(js_name = toCompactJson)]
     pub fn to_compact_json(&self) -> String {
-        self.inner.to_compact_json().to_string()
+        self.inner.to_compact_json_string()
     }
 
     /// Compact-form CBOR for the session's model (a `Uint8Array`) — the
@@ -1518,6 +2036,16 @@ impl Session {
     #[wasm_bindgen(js_name = toCompactCbor)]
     pub fn to_compact_cbor(&self) -> Vec<u8> {
         self.inner.to_compact_cbor()
+    }
+
+    /// The unit structure [`Self::to_compact_cbor`] carries, as JSON
+    /// `[[index, path], …]`: for each user unit, the compact element-array
+    /// index of its root namespace and the unit's source path — the
+    /// `units` that [`describe_cbor`] reports for that payload, read
+    /// without encoding it.
+    #[wasm_bindgen(js_name = unitTable)]
+    pub fn unit_table(&self) -> String {
+        json!(self.inner.unit_structure()).to_string()
     }
 
     /// [`Self::to_compact_cbor`] with **id elision**: graph-derivable
@@ -1659,11 +2187,25 @@ impl Session {
     /// source spans, and compartment rows; edges with kinds) for a
     /// view — the native renderer's input. Options as in
     /// [`Self::to_plantuml`]; views without a graph emitter yet error.
+    ///
+    /// With `summary` (tree view only) the reply is the summary picture
+    /// and carries `summary: {resolved, unresolved}` — the open selectors
+    /// it resolved, as `{id, qualifiedName}`, and those it did not. With
+    /// `summary.fullWithin: n` as well, a scope whose summary would draw
+    /// at most `n` cards in full (its nodes plus every node's
+    /// `summary.hidden`) comes back as the full graph instead: the
+    /// request without `summary` would emit the same document, here with
+    /// `full: true` added and no `summary` field. One call then answers
+    /// what a summary request followed by a full request would.
+    /// `fullWithin` must be a finite number: `JSON.stringify` spells
+    /// `Infinity` and `NaN` as `null`, which reads as no `fullWithin`. A
+    /// host that wants the full graph whatever its size sends a large
+    /// finite number, or leaves `summary` out.
     // The export boundary converts an optional string only when owned.
     #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = toGraph)]
     pub fn to_graph(&mut self, opts_json: Option<String>) -> Result<String, String> {
-        let (mut viz, root, summary_opts) = self.diagram_request(opts_json.as_deref())?;
+        let (mut viz, mut root, summary_opts) = self.diagram_request(opts_json.as_deref())?;
         let view = view_name(viz.view);
         if !matches!(
             viz.view,
@@ -1677,9 +2219,13 @@ impl Session {
         if summary_opts.is_some() && viz.view != sysmlv2_viz::View::Tree {
             return Err("summary emission is tree-only".to_string());
         }
+        let full_within = summary_opts.as_ref().and_then(|sm| sm.full_within);
         if viz.roots.as_ref().is_some_and(|r| r.is_empty()) {
             let mut g = json!({ "view": view, "nodes": [], "edges": [] });
-            if summary_opts.is_some() {
+            if full_within.is_some_and(|n| 0.0 <= n) {
+                // nothing to draw is within any budget
+                g["full"] = json!(true);
+            } else if summary_opts.is_some() {
                 g["summary"] = json!({ "resolved": [], "unresolved": [] });
             }
             return Ok(g.to_string());
@@ -1718,12 +2264,44 @@ impl Session {
             });
         }
         viz.summary = summary;
-        let mut g =
-            sysmlv2_viz::graph(self.inner.resolved(), root, &viz).map_err(|e| e.to_string())?;
-        if summary_opts.is_some() {
-            g["summary"] = json!({ "resolved": resolved_open, "unresolved": unresolved_open });
+        // The summary's total is counted without emitting it, so a scope
+        // that fits emits only its full graph. The total is a whole
+        // number: a budget fits what its whole part does, and a negative
+        // one fits nothing. The count stops once past the budget.
+        let limit = full_within.filter(|n| 0.0 <= *n).map(|n| n as usize);
+        let counted_fit = match limit {
+            Some(limit) => {
+                // The count and the emission after it start from the same
+                // elements: look them up once.
+                let tops = sysmlv2_viz::scope_roots(self.inner.resolved(), root, &viz);
+                viz.roots = Some(tops);
+                root = None;
+                sysmlv2_viz::summary_would_draw_within(self.inner.resolved(), root, &viz, limit)
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+            }
+            None => false,
+        };
+        if !counted_fit {
+            let mut g =
+                sysmlv2_viz::graph(self.inner.resolved(), root, &viz).map_err(|e| e.to_string())?;
+            // The summary's own total decides where a count that stopped
+            // early could not: one that counted elements sharing an id.
+            if !full_within.is_some_and(|n| sysmlv2_viz::summary_would_draw(&g) as f64 <= n) {
+                if summary_opts.is_some() {
+                    g["summary"] =
+                        json!({ "resolved": resolved_open, "unresolved": unresolved_open });
+                }
+                return Ok(g.to_string());
+            }
         }
-        Ok(g.to_string())
+        // The whole scope fits: emit it as the request without a summary
+        // does — the options are that request's once the summary is gone.
+        viz.summary = None;
+        let mut full =
+            sysmlv2_viz::graph(self.inner.resolved(), root, &viz).map_err(|e| e.to_string())?;
+        full["full"] = json!(true);
+        Ok(full.to_string())
     }
 
     /// The containers from the scope root down to an element (root
@@ -1833,6 +2411,15 @@ impl Session {
                 EditOpIn::SetFeatureType { target, ty } => {
                     ResolvedOp::SetFeatureType(resolve(&mut self.inner, &target)?, ty)
                 }
+                EditOpIn::SetRedefinedFeature { target, feature } => {
+                    ResolvedOp::SetRedefinedFeature(resolve(&mut self.inner, &target)?, feature)
+                }
+                EditOpIn::RemoveFeatureValue { target } => {
+                    ResolvedOp::RemoveFeatureValue(resolve(&mut self.inner, &target)?)
+                }
+                EditOpIn::SetCommentBody { target, body } => {
+                    ResolvedOp::SetCommentBody(resolve(&mut self.inner, &target)?, body)
+                }
                 EditOpIn::InsertMember { owner, text } => {
                     ResolvedOp::InsertMember(resolve(&mut self.inner, &owner)?, text)
                 }
@@ -1871,6 +2458,9 @@ impl Session {
                 ResolvedOp::Rename(e, name) => batch.rename(*e, name),
                 ResolvedOp::SetFeatureValue(e, expr) => batch.set_feature_value(*e, expr),
                 ResolvedOp::SetFeatureType(e, ty) => batch.set_feature_type(*e, ty),
+                ResolvedOp::SetRedefinedFeature(e, t) => batch.set_redefined_feature(*e, t),
+                ResolvedOp::RemoveFeatureValue(e) => batch.remove_feature_value(*e),
+                ResolvedOp::SetCommentBody(e, body) => batch.set_comment_body(*e, body),
                 ResolvedOp::InsertMember(e, text) => batch.insert_member(*e, text),
                 ResolvedOp::InsertTopLevel(unit, text) => batch.insert_top_level(unit, text),
                 ResolvedOp::AddUnit(unit) => batch.add_unit(unit),
@@ -1939,22 +2529,107 @@ impl Session {
             .inner
             .resolved()
             .member_extent(e.e)
-            .map(|(unit, span)| {
-                json!({"unit": unit, "start": span.start, "end": span.end}).to_string()
-            }))
+            .map(|site| Self::extent_json(site).to_string()))
     }
 
     #[wasm_bindgen(js_name = declarationSite)]
     pub fn declaration_site(&mut self, e: &Element) -> Result<Option<String>, String> {
         self.guard(e)?;
         Ok(self
-            .inner
-            .resolved()
-            .declaration_site(e.e)
-            .or_else(|| self.inner.resolved().member_extent(e.e))
-            .map(|(unit, span)| {
-                json!({"unit": unit, "start": span.start, "end": span.end}).to_string()
-            }))
+            .declaration_site_of(e.e)
+            .map(|site| Self::extent_json(site).to_string()))
+    }
+
+    /// Find usages: every reference that resolves to the element, with
+    /// the element's declaration — the language server's references
+    /// answer with the declaration included, positioned the same way.
+    /// The selector is a qualified name or `{elementId}`, as `revealPath`
+    /// takes it.
+    ///
+    /// JSON `{declaration: {unit, line, col, endLine, endCol, site} |
+    /// null, references: [{unit, line, col, endLine, endCol, kind,
+    /// owner}]}`. `unit` is the unit's name, as `check` findings carry
+    /// it; a library unit is `sysmlv2-lib:/` and its name percent-encoded
+    /// as a uri path, the uri the server gives it and a host serves the
+    /// library's text under. Lines and columns are 1-based, columns
+    /// counted in UTF-16 code units as an editor counts them, the end
+    /// exclusive.
+    ///
+    /// The declaration's `site` is `name` when its range is the declared
+    /// name, or `extent` when the element declares no name and the range
+    /// is its whole member declaration instead (a nameless redefinition,
+    /// `part :>> chassis { … }`, reached through a chain): somewhere to
+    /// open, not a range to rename at, and the server includes no
+    /// declaration then. The declaration is `null` for an element with
+    /// no recorded source.
+    ///
+    /// A reference's range covers the segment that names the element
+    /// (`Wheel` in `Defs::Wheel`). `kind` is the serialized property it
+    /// feeds (`type`, `superclassifier`, `importedMembership`, …).
+    /// `owner` is `{id, qualifiedName}` of the nearest enclosing element
+    /// that has a qualified name — `w` for `part w : Wheel;`, the package
+    /// an import sits in, the feature whose value names it, the first
+    /// named element around a reference written on something nameless —
+    /// or `null` when nothing around it has one, as at the top level of
+    /// a unit or inside a nameless element there. The sites come in unit
+    /// and position order. A library's own references are not recorded,
+    /// so a library element's sites are the model's references to it.
+    ///
+    /// Errors when the selector does not resolve. Reads only: nothing is
+    /// written into the model, and handles stay valid.
+    pub fn references(&mut self, selector_json: &str) -> Result<String, String> {
+        // A bare name is as good as its JSON string form.
+        let sel: Selector = serde_json::from_str(selector_json)
+            .unwrap_or_else(|_| Selector::Name(selector_json.to_string()));
+        let e = resolve_selector(self.inner.resolved(), &sel)
+            .ok_or_else(|| format!("element not found: {selector_json}"))?;
+        let resolved = self.inner.resolved_ref();
+        let declaration = resolved
+            .declaration_site(e)
+            .map(|site| (site, "name"))
+            .or_else(|| resolved.member_extent(e).map(|site| (site, "extent")));
+        let sites = resolved.references_to(e);
+        // Each site is written on a relationship or an expression, which
+        // has no name of its own; the element named for it is the first
+        // one above that has a qualified name. A unit's root namespace
+        // has none and owns nothing above, so a site with nothing named
+        // around it (at the top level of a unit, or inside a nameless
+        // element there) has no owner.
+        let owners: Vec<serde_json::Value> = sites
+            .iter()
+            .map(|site| {
+                let r = self.inner.resolved();
+                let mut cur = Some(site.owner);
+                while let Some(o) = cur {
+                    if let Some(qualified_name) = r.element_qualified_name(o) {
+                        return json!({
+                            "id": r.element_id(o).to_string(),
+                            "qualifiedName": qualified_name,
+                        });
+                    }
+                    cur = r.owner(o);
+                }
+                serde_json::Value::Null
+            })
+            .collect();
+        let mut mappers = HashMap::new();
+        let declaration = declaration.and_then(|((unit, span), site)| {
+            let mut location = unit_location(&self.inner, &mut mappers, unit, span)?;
+            location["site"] = json!(site);
+            Some(location)
+        });
+        let references: Vec<serde_json::Value> = sites
+            .iter()
+            .zip(owners)
+            .filter_map(|(site, owner)| {
+                let mut location =
+                    unit_location(&self.inner, &mut mappers, site.unit, site.name_span)?;
+                location["kind"] = json!(site.kind);
+                location["owner"] = owner;
+                Some(location)
+            })
+            .collect();
+        Ok(json!({ "declaration": declaration, "references": references }).to_string())
     }
 
     /// The source text of `e`'s bound value expression — the `<expr>`
@@ -1988,13 +2663,15 @@ impl Session {
     /// Verify constraints the way `sysmlv2 verify --ranges` does:
     /// evaluate every non-library constraint, then narrow free
     /// feature domains by joint interval propagation per unit — no
-    /// external solver. Options JSON: `{maxIters?}` (fixpoint pass cap
-    /// per unit, default 100). Returns a JSON report: `{constraints:
+    /// external solver. Options JSON: `{maxIters?, numberFormat?}`
+    /// (fixpoint pass cap per unit, default 100; the
+    /// [`setNumberFormat`](LspServer::set_number_format) spec `rangeApprox`
+    /// writes non-terminating endpoints in, default `"exact"`). Returns a JSON report: `{constraints:
     /// [{unit, unitName, name, elementType, asserted, line, col,
     /// endLine, endCol, status, method, detail, bindings, features}]
     /// (`method` = which stage decided: evaluation|propagation, null
     /// while undecided), ranges:
-    /// [{feature, unit, range, narrowed}], summary: {satisfied,
+    /// [{feature, unit, range, rangeApprox, narrowed}], summary: {satisfied,
     /// violated, undecided}}` — positions 1-based over the result
     /// expression; `status` folds definitive propagation conclusions
     /// into satisfied|violated|undecided; `detail` is the human
@@ -2021,14 +2698,19 @@ impl Session {
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct VerifyOpts {
             max_iters: Option<usize>,
+            number_format: Option<String>,
         }
         let opts: VerifyOpts = serde_json::from_str(opts_json.as_deref().unwrap_or("{}"))
             .map_err(|e| format!("bad verify options: {e}"))?;
-        let cfg = PropagateConfig {
-            max_iters: opts
-                .max_iters
-                .unwrap_or_else(|| PropagateConfig::default().max_iters),
+        let number_format = match opts.number_format.as_deref() {
+            Some(spec) => sysmlv2_model::numfmt::NumberFormat::parse(spec)
+                .map_err(|e| format!("bad verify options: numberFormat: {e}"))?,
+            None => PropagateConfig::default().number_format,
         };
+        let mut cfg = PropagateConfig::default().with_number_format(number_format);
+        if let Some(max_iters) = opts.max_iters {
+            cfg = cfg.with_max_iters(max_iters);
+        }
         // `None` solver = the solverless pipeline; it cannot fail. It runs on
         // the session's own resolved graph, reusing what earlier queries
         // derived instead of resolving the model again.
@@ -2226,7 +2908,7 @@ impl Session {
             .iter()
             .map(|(i, n, t)| (*i, n.as_str(), t.as_str()))
             .collect();
-        let findings = sysmlv2_lint::lint_units(self.inner.resolved(), &cfg, &units);
+        let outcome = sysmlv2_lint::lint_outcome(self.inner.resolved(), &cfg, &units);
         // The shared report shape (`sysmlv2_lint::json`): engine unit
         // indexes are reported unchanged — they are the session's — so
         // every unit gets an identity alias (the table reports only
@@ -2237,9 +2919,10 @@ impl Session {
             table.alias(*i, *i);
         }
         let mut report = sysmlv2_lint::json::Report::new();
-        for f in &findings {
+        for f in &outcome.findings {
             report.push_finding(f, &table);
         }
+        report.set_suppressed(outcome.suppressed.len());
         Ok(report.into_value().to_string())
     }
 
@@ -2730,16 +3413,28 @@ pub fn canonicalize_compact(json: &str) -> Result<String, String> {
 /// derived canonical properties (`owner`, `qualifiedName`, …) dropped
 /// as such a store's ingest drops them, `elementId` always spelled,
 /// absent ownership backpointers completed by first-claimant
-/// derivation from the forward ownership lists, elements sorted by
+/// derivation from the forward ownership lists, each literal's number
+/// spelled as its value type spells it (a `LiteralRational`'s `150` as
+/// `150.0`, a `LiteralInteger`'s `150.0` as `150`), elements sorted by
 /// `@id`. `stateDigestOf(graphNormalizeCompact(doc))` is the digest
 /// such a store reconstructs after ingesting `doc`, so snapshots (and
 /// strict deltas whose base digests live in the same domain) encoded
 /// from this spelling pass the store's end-to-end digest
-/// verification. Idempotent; strict on unknown `@type`s, missing
-/// `@id`s, and keys outside the full schema.
+/// verification; a document printed through `JSON.parse` and
+/// `JSON.stringify`, which drop a whole float's fraction, digests as
+/// the kernel's own spelling of it does. Idempotent; strict on unknown
+/// `@type`s, missing `@id`s, and keys outside the full schema.
+/// Optional `as_spelled`: keep each literal's number as the document
+/// spells it, as this normalization did before every spelling of a
+/// value was one — a digest recorded then is checked against it.
 #[wasm_bindgen(js_name = graphNormalizeCompact)]
-pub fn graph_normalize_compact(json: &str) -> Result<String, String> {
-    sysmlv2_cbor::graph_normalize_compact(json).map_err(|e| e.to_string())
+pub fn graph_normalize_compact(json: &str, as_spelled: Option<bool>) -> Result<String, String> {
+    if as_spelled.unwrap_or(false) {
+        sysmlv2_cbor::graph_normalize_compact_as_spelled(json)
+    } else {
+        sysmlv2_cbor::graph_normalize_compact(json)
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// State digest of a compact interchange element array (JSON text) —
@@ -2918,7 +3613,12 @@ impl LspServer {
     /// (for example a root name the library looked up and missed, or a root
     /// declaration named like one of the library's) has the library resolved
     /// again with it. The server keeps its own reference; the handle may be
-    /// freed afterwards.
+    /// freed afterwards. A handle decoded with `keepHostParts: true`
+    /// (`PreparedLibrary.fromSnapshot`, `fromSnapshotStream`) gives the
+    /// server the library symbol table its snapshot carries, which it builds
+    /// its table from on its first completion or import fix instead of
+    /// parsing every library unit; on any other handle it parses them, as
+    /// before, and answers the same.
     #[must_use]
     #[wasm_bindgen(js_name = withPreparedLibrary)]
     pub fn with_prepared_library(library: &PreparedLibrary) -> LspServer {
@@ -2936,7 +3636,12 @@ impl LspServer {
     /// Returns server→client messages the re-seed produced — the
     /// `workspace/inlayHint/refresh` / `workspace/codeLens/refresh`
     /// requests that make supporting clients re-pull answers the old
-    /// session gave. Relay them exactly like [`Self::handle`] output.
+    /// session gave. Relay them exactly like [`Self::handle`] output. Only
+    /// a re-seed of the same units with the same texts, with no document
+    /// opened, changed or closed since refresh requests last went out,
+    /// returns none. A re-seed that changes only the texts of units open as
+    /// documents, whose open texts overlay them, keeps the server's
+    /// sessions, and the re-pull answers from them.
     #[wasm_bindgen(js_name = setWorkspace)]
     pub fn set_workspace(&mut self, sources_json: &str) -> Result<Vec<String>, String> {
         self.inner
@@ -2969,6 +3674,26 @@ impl LspServer {
         self.inner.take_outbound().map_err(|e| e.to_string())
     }
 
+    /// Set how evaluated-value inlay hints, hover values and range hints
+    /// write a rational without a terminating decimal expansion. `spec`
+    /// is a style — `exact` (`1/15`, the default), `approx`
+    /// (`≈0.06666666666666667`), `overline` (`0.06̅`), `parens` (`0.0(6)`) or
+    /// `unicode` (`¹/₁₅`) — then optional comma-separated settings:
+    /// `digits=N` (significant digits of an approximate decimal, every
+    /// style's fallback; 0 = shortest), `period=N` (`overline`,
+    /// `parens`: longest period written out, default 6), `mixed=bool`
+    /// (`exact`, `unicode`: `2 1/3`, `2¹/₃`), `slash=solidus|fraction|division`
+    /// and `glyphs=bool` (`unicode`), `fraction-digits=N` (`exact`,
+    /// `unicode`: most digits per numerator or denominator, 0 = no
+    /// limit). Throws on a spec it cannot read, naming the problem.
+    /// Returns the refresh requests to relay, like `setWorkspace`.
+    #[wasm_bindgen(js_name = setNumberFormat)]
+    pub fn set_number_format(&mut self, spec: &str) -> Result<Vec<String>, String> {
+        let format = sysmlv2_model::numfmt::NumberFormat::parse(spec)?;
+        self.inner.set_number_format(format);
+        self.inner.take_outbound().map_err(|e| e.to_string())
+    }
+
     /// Set whether accepting a unit completion inside an untyped
     /// attribute's quantity bracket also declares the type the unit
     /// determines (default on). Takes effect on the next completion
@@ -2976,5 +3701,46 @@ impl LspServer {
     #[wasm_bindgen(js_name = setInferUnitTypes)]
     pub fn set_infer_unit_types(&mut self, on: bool) {
         self.inner.set_infer_unit_types(on);
+    }
+}
+
+#[cfg(test)]
+mod host_part_tests {
+    use super::{PreparedLibrary, keeps_host_parts};
+    use sysmlv2_transform::Library;
+
+    /// A snapshot decoded without `keepHostParts`, or with `false`, holds
+    /// none of what hosts shipped in it; with `true` it keeps it for them to
+    /// read. The streamed decode takes its default from the same place.
+    #[test]
+    fn a_snapshot_keeps_its_hosts_parts_only_when_asked() {
+        assert!(!keeps_host_parts(None), "dropped by default");
+        assert!(!keeps_host_parts(Some(false)));
+        assert!(keeps_host_parts(Some(true)));
+        let units = vec![(
+            "lib.sysml".to_owned(),
+            "package L { part def A; }".to_owned(),
+        )];
+        let Library::Prepared(prepared) = Library::prepared_sources(units.clone(), None).unwrap()
+        else {
+            unreachable!("a prepared library");
+        };
+        prepared.carry_host_part("table", &"shipped").unwrap();
+        let key = sysmlv2_model::libcache::hash_units(
+            units.iter().map(|(n, t)| (n.as_str(), t.as_str())),
+        );
+        let bytes = prepared.to_bytes(key).unwrap();
+        let sources = serde_json::json!([{"name": "lib.sysml", "text": units[0].1}]).to_string();
+        let held = |keep: Option<bool>| {
+            let decoded = PreparedLibrary::from_snapshot(bytes.clone(), &sources, None, keep)
+                .expect("the snapshot decodes");
+            match decoded.inner {
+                Library::Prepared(library) => library.take_host_part::<String>("table"),
+                _ => unreachable!("a prepared library"),
+            }
+        };
+        assert_eq!(held(None), None, "dropped by default");
+        assert_eq!(held(Some(false)), None);
+        assert_eq!(held(Some(true)).as_deref(), Some("shipped"));
     }
 }

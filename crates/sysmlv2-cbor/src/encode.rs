@@ -9,7 +9,7 @@
 //! the instance-dependent key sets of the compact emitter reproduce
 //! exactly.
 
-use crate::cbor::Writer;
+use crate::cbor::{Head, Reader, Writer};
 use crate::tables::{
     CborField, ENUM_TABLES, FULL_METACLASS_FIELDS, K_BOOL, K_ELEMENT_ID, K_ENUM, K_LITERAL, K_REF,
     K_REF_LIST, K_STR, K_STR_LIST, METACLASS_FIELDS,
@@ -174,34 +174,38 @@ pub(crate) fn elems_of<'a>(
     elements: &[&'a Value],
     tables: &'static [(&'static str, &'static [CborField])],
 ) -> Result<Vec<Elem<'a>>, Error> {
-    let mut out = Vec::with_capacity(elements.len());
-    for &e in elements {
-        let obj = e
-            .as_object()
-            .ok_or_else(|| Error::new("element is an object"))?;
-        let ty = obj
-            .get("@type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::new("element has a string @type"))?;
-        let code = wire_code(
-            tables
-                .binary_search_by(|(n, _)| n.cmp(&ty))
-                .map_err(|_| Error::new(format!("unknown @type `{ty}`")))?,
-        )?;
-        let id = obj
-            .get("@id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::new(format!("{ty}: element has a string @id")))?;
-        out.push(Elem {
-            obj,
-            ty,
-            code,
-            fields: tables[code as usize].1,
-            id,
-            uuid: parse_uuid(id)?,
-        });
-    }
-    Ok(out)
+    elements.iter().map(|&e| elem_of(e, tables)).collect()
+}
+
+/// One element's [`Elem`] view, as [`elems_of`] makes each.
+pub(crate) fn elem_of<'a>(
+    e: &'a Value,
+    tables: &'static [(&'static str, &'static [CborField])],
+) -> Result<Elem<'a>, Error> {
+    let obj = e
+        .as_object()
+        .ok_or_else(|| Error::new("element is an object"))?;
+    let ty = obj
+        .get("@type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("element has a string @type"))?;
+    let code = wire_code(
+        tables
+            .binary_search_by(|(n, _)| n.cmp(&ty))
+            .map_err(|_| Error::new(format!("unknown @type `{ty}`")))?,
+    )?;
+    let id = obj
+        .get("@id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new(format!("{ty}: element has a string @id")))?;
+    Ok(Elem {
+        obj,
+        ty,
+        code,
+        fields: tables[code as usize].1,
+        id,
+        uuid: parse_uuid(id)?,
+    })
 }
 
 /// Default JSON value of a field, or `None` for kinds without one.
@@ -293,38 +297,32 @@ impl Interner {
     pub(crate) fn with_locals(local: HashMap<Uuid, usize>, elems: &[Elem]) -> Result<Self, Error> {
         let mut ext = BTreeSet::new();
         for e in elems {
-            for (key, value) in e.obj {
-                if key == "@id" || key == "@type" {
-                    continue;
+            id_references(e, |u| {
+                if !local.contains_key(&u) {
+                    ext.insert(u);
                 }
-                let ord = ordinal(e.fields, key)
-                    .ok_or_else(|| ctx(e.ty, key, "not a compact-form property"))?;
-                let kind = e.fields[ord as usize].1;
-                // A null single reference is the non-default null
-                // `write_value` spells; any other non-object shape is
-                // refused there with the field's own message.
-                let targets: &[Value] = match (kind, value) {
-                    (K_REF, Value::Object(_)) => std::slice::from_ref(value),
-                    (K_REF_LIST, Value::Array(a)) => a,
-                    _ => continue,
-                };
-                for t in targets {
-                    let target = ref_target(t).map_err(|err| ctx(e.ty, key, &err.to_string()))?;
-                    if let RefTarget::Id(u) = target {
-                        if !local.contains_key(&u) {
-                            ext.insert(u);
-                        }
-                    }
-                }
-            }
+            })?;
         }
-        let ext: Vec<Uuid> = ext.into_iter().collect();
+        Ok(Self::with_externals(local, ext.into_iter().collect()))
+    }
+
+    /// An interner over `local` and the externals `ext`, which are in
+    /// ascending order.
+    pub(crate) fn with_externals(local: HashMap<Uuid, usize>, ext: Vec<Uuid>) -> Self {
         let ext_index = ext.iter().enumerate().map(|(i, &u)| (u, i)).collect();
-        Ok(Self {
+        Self {
             local,
             ext,
             ext_index,
-        })
+        }
+    }
+
+    /// [`Self::index`], or `None` for an identity it does not hold.
+    pub(crate) fn try_index(&self, u: Uuid) -> Option<u64> {
+        match self.local.get(&u) {
+            Some(&i) => Some(i as u64),
+            None => Some((self.local.len() + *self.ext_index.get(&u)?) as u64),
+        }
     }
 
     /// Wire index of a reference target: locals first, then externals.
@@ -336,9 +334,65 @@ impl Interner {
     }
 }
 
-pub(crate) fn write_ref(w: &mut Writer, interner: &Interner, v: &Value) -> Result<(), Error> {
+/// Every element identity `e`'s references name, in key then list order
+/// — the targets an [`Interner`] indexes. Refuses a key that is not one of
+/// the metaclass's compact-form properties, and a reference of another
+/// shape than `{"@id": …}` or `{"@ref": …}`.
+pub(crate) fn id_references(e: &Elem, mut f: impl FnMut(Uuid)) -> Result<(), Error> {
+    for (key, value) in e.obj {
+        if key == "@id" || key == "@type" {
+            continue;
+        }
+        let ord =
+            ordinal(e.fields, key).ok_or_else(|| ctx(e.ty, key, "not a compact-form property"))?;
+        let kind = e.fields[ord as usize].1;
+        // A null single reference is the non-default null
+        // `write_value` spells; any other non-object shape is
+        // refused there with the field's own message.
+        let targets: &[Value] = match (kind, value) {
+            (K_REF, Value::Object(_)) => std::slice::from_ref(value),
+            (K_REF_LIST, Value::Array(a)) => a,
+            _ => continue,
+        };
+        for t in targets {
+            let target = ref_target(t).map_err(|err| ctx(e.ty, key, &err.to_string()))?;
+            if let RefTarget::Id(u) = target {
+                f(u);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How an element record spells a reference to an element identity.
+pub(crate) trait IdSpelling {
+    fn write_id(&self, w: &mut Writer, u: Uuid);
+}
+
+impl IdSpelling for Interner {
+    /// As its wire index.
+    fn write_id(&self, w: &mut Writer, u: Uuid) {
+        w.uint(self.index(u));
+    }
+}
+
+/// Identities spelled as their 16 bytes, in a record written before the
+/// wire indices are known; [`transcode_record`] respells them.
+pub(crate) struct RawIds;
+
+impl IdSpelling for RawIds {
+    fn write_id(&self, w: &mut Writer, u: Uuid) {
+        w.bstr(u.as_bytes());
+    }
+}
+
+pub(crate) fn write_ref(
+    w: &mut Writer,
+    interner: &impl IdSpelling,
+    v: &Value,
+) -> Result<(), Error> {
     match ref_target(v)? {
-        RefTarget::Id(u) => w.uint(interner.index(u)),
+        RefTarget::Id(u) => interner.write_id(w, u),
         RefTarget::Symbolic(s) => w.tstr(s),
     }
     Ok(())
@@ -346,7 +400,7 @@ pub(crate) fn write_ref(w: &mut Writer, interner: &Interner, v: &Value) -> Resul
 
 pub(crate) fn write_value(
     w: &mut Writer,
-    interner: &Interner,
+    interner: &impl IdSpelling,
     ty: &str,
     field: &CborField,
     v: &Value,
@@ -399,7 +453,7 @@ pub(crate) fn write_value(
 
 pub(crate) fn write_element(
     w: &mut Writer,
-    interner: &Interner,
+    interner: &impl IdSpelling,
     e: &Elem,
     implied_owners: Option<&[Option<&str>; 2]>,
 ) -> Result<(), Error> {
@@ -459,7 +513,7 @@ pub(crate) fn write_element(
 /// Validate a unit-structure table against the element count: indices
 /// strictly ascending and in range, paths non-empty. `None` for an
 /// empty table — absent and empty encode identically.
-fn check_units(
+pub(crate) fn check_units(
     units: &[(usize, String)],
     n_elems: usize,
 ) -> Result<Option<&[(usize, String)]>, Error> {
@@ -482,7 +536,7 @@ fn check_units(
     Ok(Some(units))
 }
 
-fn write_units(w: &mut Writer, units: &[(usize, String)]) {
+pub(crate) fn write_units(w: &mut Writer, units: &[(usize, String)]) {
     w.map(units.len());
     for (i, path) in units {
         w.uint(*i as u64);
@@ -524,7 +578,7 @@ pub(crate) fn owner_absent_bits(e: &Elem) -> u64 {
     bits
 }
 
-fn write_owner_exceptions(w: &mut Writer, exceptions: &[(u64, u64)]) {
+pub(crate) fn write_owner_exceptions(w: &mut Writer, exceptions: &[(u64, u64)]) {
     w.map(exceptions.len());
     for (i, bits) in exceptions {
         w.uint(*i);
@@ -600,14 +654,158 @@ pub fn to_compact_cbor(value: &Value) -> Result<Vec<u8>, Error> {
     encode(&element_views(value)?, false, &[], true)
 }
 
+/// The id scheme the digest-space encoding stamps. It encodes explicit
+/// ids for hashing, with no id derivation, and keeps the original scheme
+/// stamp so a wire scheme change cannot invalidate persisted state
+/// digests or explicit-id deltas.
+const DIGEST_SCHEME: u8 = 1;
+
 /// The digest-space encoding: owners always spelled, no
 /// [`FLAG_IMPLIED_OWNERS`]. State digests canonicalize through this,
 /// so wire-format elision never moves a digest. Not a wire emitter.
 pub(crate) fn to_compact_cbor_canonical(elements: &[&Value]) -> Result<Vec<u8>, Error> {
-    // This encodes explicit ids for hashing, with no id derivation. Keep
-    // the original scheme stamp so a wire scheme change cannot invalidate
-    // persisted state digests or explicit-id deltas.
-    encode_flagged(elements, false, &[], false, 0, 1)
+    encode_flagged(elements, false, &[], false, 0, DIGEST_SCHEME)
+}
+
+/// [`to_compact_cbor_canonical`] of element records written ahead with
+/// their references to element identities spelled by [`RawIds`]: `ids`
+/// are the elements' ids in order, `ext` the ids their references name
+/// that are not among them, ascending, and `record(k)` is the record of
+/// the element whose id is `ids[k]`.
+pub(crate) fn to_compact_cbor_canonical_of_records<'a>(
+    ids: &[Uuid],
+    ext: Vec<Uuid>,
+    record: impl Fn(usize) -> &'a [u8],
+) -> Result<Vec<u8>, Error> {
+    let local = ids.iter().enumerate().map(|(k, &u)| (u, k)).collect();
+    let interner = Interner::with_externals(local, ext);
+    let mut w = Writer::with_magic_for(ids.len());
+    w.array(4);
+    w.uint(header_word_with_scheme(0, DIGEST_SCHEME));
+    w.array(interner.ext.len());
+    for u in &interner.ext {
+        w.bstr(u.as_bytes());
+    }
+    w.array(ids.len());
+    for u in ids {
+        w.bstr(u.as_bytes());
+    }
+    w.array(ids.len());
+    for k in 0..ids.len() {
+        transcode_record(&mut w, &interner, record(k), Elided::default())?;
+    }
+    Ok(w.into_bytes())
+}
+
+/// The wire index of an element identity: an [`Interner`]'s, or that of
+/// a reader that holds the local and external identities some other way.
+pub(crate) trait WireIndex {
+    /// The identity's wire index, or `None` for one not held.
+    fn try_index(&self, u: Uuid) -> Option<u64>;
+}
+
+impl WireIndex for Interner {
+    fn try_index(&self, u: Uuid) -> Option<u64> {
+        Interner::try_index(self, u)
+    }
+}
+
+/// The owner backpointers a transcoded record leaves out, as
+/// [`write_element`] leaves out those that match their derivation, each
+/// as a bit at its field's ordinal: those the record spells as a
+/// presence bit (a null), and those it spells as an entry (a
+/// reference). A compact metaclass's field list fits 64 ordinals.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Elided {
+    pub(crate) bits: u64,
+    pub(crate) entries: u64,
+}
+
+/// Write a record [`write_element`] wrote with [`RawIds`] as it writes it
+/// with `index`: the same bytes, but for each reference to an element
+/// identity, which is its wire index instead of its 16 bytes, and for the
+/// `elided` backpointers, which are left out.
+pub(crate) fn transcode_record(
+    w: &mut Writer,
+    index: &impl WireIndex,
+    record: &[u8],
+    elided: Elided,
+) -> Result<(), Error> {
+    let mut r = Reader::new(record);
+    let bad = || Error::new("a raw element record is [type code, presence bits, values]");
+    if r.array()? != 3 {
+        return Err(bad());
+    }
+    w.array(3);
+    let code = r.index()?;
+    w.uint(code as u64);
+    let fields = METACLASS_FIELDS.get(code).ok_or_else(bad)?.1;
+    match r.head()? {
+        Head::Uint(bits) => w.uint(bits & !elided.bits),
+        Head::Bstr(n) => {
+            let mut bits = r.take(n)?.to_vec();
+            for ord in (0..64).filter(|ord| elided.bits >> ord & 1 == 1) {
+                if let Some(byte) = bits.get_mut(ord / 8) {
+                    *byte &= !(1 << (ord % 8));
+                }
+            }
+            w.bstr(&bits);
+        }
+        _ => return Err(bad()),
+    }
+    let Head::Map(entries) = r.head()? else {
+        return Err(bad());
+    };
+    let left_out = elided.entries.count_ones() as usize;
+    if left_out > entries {
+        return Err(bad());
+    }
+    w.map(entries - left_out);
+    let mut skipped = 0;
+    for _ in 0..entries {
+        let ord = r.index()?;
+        if ord < 64 && elided.entries >> ord & 1 == 1 {
+            r.skip_items(1)?;
+            skipped += 1;
+            continue;
+        }
+        w.uint(ord as u64);
+        match fields.get(ord).ok_or_else(bad)?.1 {
+            K_REF => transcode_ref(w, index, &mut r)?,
+            K_REF_LIST => match r.head()? {
+                Head::Null => w.null(),
+                Head::Array(n) => {
+                    w.array(n);
+                    for _ in 0..n {
+                        transcode_ref(w, index, &mut r)?;
+                    }
+                }
+                _ => return Err(bad()),
+            },
+            _ => w.raw(r.raw_item()?),
+        }
+    }
+    if skipped != left_out || !r.done() {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// One reference of a raw record, null or symbolic as it stands, an
+/// element identity as its wire index.
+fn transcode_ref(w: &mut Writer, index: &impl WireIndex, r: &mut Reader) -> Result<(), Error> {
+    match r.head()? {
+        Head::Null => w.null(),
+        Head::Bstr(16) => {
+            let u = Uuid::from_bytes(r.take(16)?.try_into().expect("16 bytes"));
+            w.uint(index.try_index(u).ok_or_else(|| {
+                Error::new(format!("a raw record names `{u}`, which is not interned"))
+            })?);
+        }
+        Head::Tstr(n) => w.tstr(r.tstr_body(n)?),
+        _ => return Err(Error::new("a raw reference is null, 16 bytes or text")),
+    }
+    Ok(())
 }
 
 /// [`to_compact_cbor`] carrying the model's **unit structure**: each

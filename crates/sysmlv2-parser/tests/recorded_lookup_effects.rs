@@ -134,7 +134,10 @@ fn a_new_implicit_root_invalidates_prepared_absence_proofs() {
 }
 
 #[test]
-fn external_names_invalidate_prepared_recorded_projections() {
+fn prepared_recorded_projections_agree_with_a_cold_build_after_external_names() {
+    // Both builds answer the alias and the feature before and after the
+    // external names arrive; the warm build's recorded projection must not
+    // keep an answer the cold build no longer gives.
     let mut library = Model::new();
     library.add_library_source(
         "external.kerml",
@@ -152,7 +155,7 @@ fn external_names_invalidate_prepared_recorded_projections() {
         ResolvedModel::build(&m)
     };
     let mut warm = build();
-    assert_eq!(warm.resolve_qualified("Child::x"), None);
+    assert!(warm.resolve_qualified("Child::x").is_some());
     warm.set_library_names(&names);
     let mut cold = build();
     cold.set_library_names(&names);

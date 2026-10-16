@@ -26,6 +26,14 @@
 //! (no text) reports a configuration finding rather than skipping it
 //! silently.
 //!
+//! **Directives.** A note in a unit's text — `// sysmlint-disable-next-line
+//! <rule>` above a line, `// sysmlint-disable-line <rule>` trailing it,
+//! or a `// sysmlint-disable <rule>` … `// sysmlint-enable <rule>` range —
+//! suppresses the listed rules' findings there ([`directive`]). They
+//! apply to the units a host hands text for, after every rule has run;
+//! the pseudo-rule `lint-directive` reports a malformed or unused
+//! directive, and [`lint_outcome`] returns what was suppressed.
+//!
 //! A finding may carry a [`Fix`]. Fixes that delete model text are
 //! marked [`Fix::deletes`] so hosts can guard them behind explicit
 //! opt-in. Findings also carry `element` (the engine's edit-target
@@ -34,7 +42,10 @@
 //! (the declared name re-spelled in the required style) — the hooks a
 //! host's quick fixes key on.
 
+pub mod directive;
 pub mod json;
+mod pattern;
+pub use pattern::{PATTERN_METADATA, PatternSpec};
 
 use regex_lite::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -213,12 +224,17 @@ rule_ids! {
     UnqualifiedEnumLiteral = "unqualified-enum-literal",
     UnitSpelling = "unit-spelling",
     DimensionalConsistency = "dimensional-consistency",
+    UnitPrecedence = "unit-precedence",
+    LiteralPattern = "literal-pattern",
     QualifiedNames = "qualified-names",
     MultilineConditions = "multiline-conditions",
     Indentation = "indentation",
     GeneratedProvenanceInvalid = "generated-provenance-invalid",
     GeneratedProvenanceBaselineOutdated = "generated-provenance-baseline-outdated",
     GeneratedElementModified = "generated-element-modified",
+    /// The policing of suppression directives ([`directive`]): a
+    /// malformed or unused directive, or one without a required reason.
+    LintDirective = "lint-directive",
     /// A complaint about the configuration itself, not the model.
     LintConfig = "lint-config",
 }
@@ -542,6 +558,37 @@ pub const RULES: &[Rule] = &[
         options: &[],
     },
     Rule {
+        id: RuleId::UnitPrecedence,
+        description: "a unit bracket on the right operand of `/`, `%`, `+`, `-`, `**` or `^` \
+                      binds to that operand alone — `1 / 15 [km]` is `1 / (15 [km])`, a \
+                      reciprocal length, where `(1 / 15) [km]` was meant (fix: \
+                      parenthesize the value; the written binding made explicit as the \
+                      alternative). Silent when the left operand is itself a quantity \
+                      (`2 * r + 20 [mm]`), when either side is indeterminate, and \
+                      without the standard library",
+        default: Severity::Warn,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: &[],
+    },
+    Rule {
+        id: RuleId::LiteralPattern,
+        description: "a string bound to a feature whose declared type carries a \
+                      `StringPatterns::Pattern` — on the type or a supertype, in its \
+                      body or `about` it; the ambient library annotates the standard \
+                      library's ISO 8601 date-time encoding — that does not match the \
+                      pattern: a feature value, a constructor argument or a calculation \
+                      argument. A value in the annotation's broader `accepts` form \
+                      reports at the `reduced` severity; `patterns` (configuration file \
+                      only) supplies or overrides a pattern per qualified type name",
+        default: Severity::Warn,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: LITERAL_PATTERN_OPTIONS,
+    },
+    Rule {
         id: RuleId::QualifiedNames,
         description: "one element, one reference spelling — the same target written \
                       `MassValue` here and `ISQ::MassValue` there flags the minority \
@@ -627,7 +674,41 @@ pub const RULES: &[Rule] = &[
         families: &[],
         options: &[],
     },
+    Rule {
+        id: RuleId::LintDirective,
+        description: "a suppression directive — `// sysmlint-disable-next-line <rule>` above \
+                      a line, `// sysmlint-disable-line <rule>` trailing it, or a \
+                      `// sysmlint-disable <rule>` … `// sysmlint-enable <rule>` range — \
+                      that is malformed (an unknown directive or rule id, no rule named, an \
+                      `enable` with nothing to re-enable) or suppresses nothing (fix: \
+                      remove it); `reason` set to `required` also reports a directive \
+                      without a ` -- reason`. Directives suppress whatever this rule's \
+                      severity, which governs only the reports about them",
+        default: Severity::Warn,
+        scopes: &[],
+        styles: &[],
+        families: &[],
+        options: DIRECTIVE_OPTIONS,
+    },
 ];
+
+const DIRECTIVE_OPTIONS: &[OptionInfo] = &[OptionInfo {
+    key: "reason",
+    label: "whether a directive must give a reason",
+    kind: OptionKind::Choice {
+        default: Some("optional"),
+        values: &["optional", "required"],
+    },
+}];
+
+const LITERAL_PATTERN_OPTIONS: &[OptionInfo] = &[OptionInfo {
+    key: "reduced",
+    label: "severity of a value in a pattern's broader accepted form",
+    kind: OptionKind::Choice {
+        default: Some("info"),
+        values: SEVERITIES,
+    },
+}];
 
 const UNDOCUMENTED_OPTIONS: &[OptionInfo] = &[OptionInfo {
     key: "depth",
@@ -841,6 +922,15 @@ pub struct Config {
     /// ([`Config::format_indent`]).
     indent_style: IndentStyle,
     indent_size: u8,
+    /// `literal-pattern`'s severity for a value in a pattern's broader
+    /// accepted form.
+    literal_pattern_reduced: Severity,
+    /// `literal-pattern`'s configured patterns, by the qualified name of
+    /// the type each governs — supplied or overriding the model's own.
+    literal_patterns: BTreeMap<String, PatternSpec>,
+    /// `lint-directive`'s `reason` option: a suppression directive
+    /// without a ` -- reason` is reported.
+    directive_reason_required: bool,
     /// Complaints gathered while reading config — surfaced as
     /// `lint-config` findings so a typo never silently disables a rule.
     complaints: Vec<String>,
@@ -898,8 +988,37 @@ impl Default for Config {
             chain_min: sysmlv2_syntax::print::FORMAT_CHAIN_MIN,
             indent_style: IndentStyle::Tabs,
             indent_size: DEFAULT_INDENT_SIZE,
+            literal_pattern_reduced: Severity::Info,
+            literal_patterns: BTreeMap::new(),
+            directive_reason_required: false,
             complaints: Vec::new(),
         }
+    }
+}
+
+impl Config {
+    /// `literal-pattern`'s severity for a value in a pattern's broader
+    /// accepted form (the `reduced` option; info by default, `off`
+    /// keeps such values silent).
+    #[must_use]
+    pub fn literal_pattern_reduced(&self) -> Severity {
+        self.literal_pattern_reduced
+    }
+
+    /// `literal-pattern`'s configured patterns by the qualified name of
+    /// the type each governs (the `patterns` option). An entry takes
+    /// precedence over the model's own annotation of that type.
+    #[must_use]
+    pub fn literal_patterns(&self) -> &BTreeMap<String, PatternSpec> {
+        &self.literal_patterns
+    }
+
+    /// Whether a suppression directive must give a ` -- reason`
+    /// (`lint-directive`'s `reason` option set to `required`; optional
+    /// by default).
+    #[must_use]
+    pub fn directive_reason_required(&self) -> bool {
+        self.directive_reason_required
     }
 }
 
@@ -1091,6 +1210,50 @@ impl Config {
                 }
                 _ => format!("rule `{id}`: option `{key}` must be a positive integer"),
             },
+            (RuleId::LintDirective, "reason") => match val.as_str() {
+                Some("optional") => {
+                    self.directive_reason_required = false;
+                    return;
+                }
+                Some("required") => {
+                    self.directive_reason_required = true;
+                    return;
+                }
+                _ => format!("rule `{id}`: option `{key}` must be `optional` or `required`"),
+            },
+            (RuleId::LiteralPattern, "reduced") => match val.as_str().and_then(Severity::parse) {
+                Some(level) => {
+                    self.literal_pattern_reduced = level;
+                    return;
+                }
+                None => format!(
+                    "rule `{id}`: option `{key}` must be one of {}",
+                    SEVERITIES.join(", ")
+                ),
+            },
+            (RuleId::LiteralPattern, "patterns") => match val.as_object() {
+                Some(map) => {
+                    let mut complaints = Vec::new();
+                    for (name, spec) in map {
+                        match PatternSpec::from_json(spec) {
+                            Ok(spec) => {
+                                self.literal_patterns.insert(name.clone(), spec);
+                            }
+                            Err(e) => complaints
+                                .push(format!("rule `{id}`: option `{key}`: `{name}` {e}")),
+                        }
+                    }
+                    if complaints.is_empty() {
+                        return;
+                    }
+                    complaints.join("; ")
+                }
+                None => format!(
+                    "rule `{id}`: option `{key}` must be an object of qualified type name → \
+                     pattern (a regular expression, or `{{\"regex\": …, \"accepts\": …, \
+                     \"form\": …}}`)"
+                ),
+            },
             (_, "scopes") => {
                 let Some(map) = val.as_object() else {
                     self.complaints.push(format!(
@@ -1118,6 +1281,8 @@ impl Config {
                 RuleId::UnusedParameter => false, // strict: the three contexts only
                 // Textual rule: a line has no metaclass to scope by.
                 RuleId::Indentation => false,
+                // A directive note has no metaclass either.
+                RuleId::LintDirective => false,
                 // Aspect scopes, not metaclasses: the two inventory keys only.
                 RuleId::DimensionalConsistency => false,
                 // Reference sites have no metaclass to scope by.
@@ -1402,6 +1567,28 @@ pub fn lint_units(
     config: &Config,
     units: &[(usize, &str, &str)],
 ) -> Vec<Finding> {
+    lint_outcome(resolved, config, units).findings
+}
+
+/// What a pass produced: the findings to report, and the findings
+/// suppression directives ([`directive`]) hid — a host's summary
+/// counts them, so exceptions stay visible as they accumulate.
+#[derive(Clone, Debug, Default)]
+pub struct Outcome {
+    pub findings: Vec<Finding>,
+    pub suppressed: Vec<Finding>,
+}
+
+/// [`lint_units`] keeping the suppressed findings: directives in the
+/// units' text are applied last, after every rule has run, so they
+/// change what is reported and never what a rule sees. The
+/// `lint-directive` findings about the directives themselves are among
+/// the findings.
+pub fn lint_outcome(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    units: &[(usize, &str, &str)],
+) -> Outcome {
     let sources: Vec<(usize, &str)> = units.iter().map(|&(i, _, t)| (i, t)).collect();
     let sources = sources.as_slice();
     let mut out = Vec::new();
@@ -1447,8 +1634,18 @@ pub fn lint_units(
     if config.cfg(RuleId::UnitSpelling).enabled() {
         unit_spelling(resolved, config, &mut out);
     }
+    if config.cfg(RuleId::LiteralPattern).enabled() {
+        pattern::literal_pattern(resolved, config, &mut out);
+    }
+    // Precedence first: an attribute whose value binds its unit to the
+    // wrong operand has no determinate dimension to type against, so
+    // `dimensional-consistency` steps aside for it.
+    let mut precedence_flagged: BTreeSet<ElementRef> = BTreeSet::new();
+    if config.cfg(RuleId::UnitPrecedence).enabled() {
+        unit_precedence(resolved, config, &mut precedence_flagged, &mut out);
+    }
     if config.cfg(RuleId::DimensionalConsistency).enabled() {
-        dimensional_consistency(resolved, config, &mut out);
+        dimensional_consistency(resolved, config, &precedence_flagged, &mut out);
     }
     if config.cfg(RuleId::QualifiedNames).enabled() {
         if sources.is_empty() {
@@ -1505,15 +1702,21 @@ pub fn lint_units(
             ));
         }
     }
-    out.sort_by(|a, b| {
+    let mut suppressed = directive::apply(config, units, &mut out);
+    let order = |a: &Finding, b: &Finding| {
         (a.unit, a.span.map(|s| s.start), a.rule.id(), &a.message).cmp(&(
             b.unit,
             b.span.map(|s| s.start),
             b.rule.id(),
             &b.message,
         ))
-    });
-    out
+    };
+    out.sort_by(order);
+    suppressed.sort_by(order);
+    Outcome {
+        findings: out,
+        suppressed,
+    }
 }
 
 /// `naming-convention`: declared names against the effective pattern —
@@ -2545,8 +2748,13 @@ fn unit_spelling(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Fi
         };
         sources.push((e, unit, scope, expr));
     }
-    for c in resolved.constraints() {
-        if users.contains(&c.element) {
+    // Constraint bodies declared in the user units, each once: a
+    // bodiless usage typed by a definition carries that definition's
+    // body (a library's, possibly), which the definition's own entry
+    // already covers.
+    let user_units: BTreeSet<usize> = users.iter().map(|&e| resolved.unit_of(e)).collect();
+    for c in resolved.constraints_where(|u| user_units.contains(&u)) {
+        if !c.inherited && users.contains(&c.element) {
             sources.push((c.element, c.unit, c.scope, c.expr));
         }
     }
@@ -2732,16 +2940,26 @@ fn inferred_type_spellings(resolved: &mut ResolvedModel, e: ElementRef) -> Vec<S
     let mut fallback: Option<ElementRef> = None;
     match &value {
         Value::Quantity(_, u) => {
+            let dims = resolved.unit_quantity_dims(u);
             if let Some(unit_elem) = bracket_unit_ref(resolved, scope, &expr) {
+                // The bracket's unit names the value's quantity (`[J]`
+                // is energy before torque) only while the value still
+                // measures what the unit measures: `1 / (15 [km])` is a
+                // reciprocal length, and `km` must not put `LengthValue`
+                // ahead of the types that fit.
                 for def in resolved.typings(unit_elem) {
                     for t in resolved.quantity_types_for_unit_def(def) {
-                        if !targets.contains(&t) {
+                        let fits = match &dims {
+                            Some(d) => resolved.quantity_dims_of_type(t).as_ref() == Some(d),
+                            None => true,
+                        };
+                        if fits && !targets.contains(&t) {
                             targets.push(t);
                         }
                     }
                 }
             }
-            if let Some(dims) = resolved.unit_quantity_dims(u) {
+            if let Some(dims) = dims {
                 for t in resolved.quantity_type_candidates(&dims) {
                     if !targets.contains(&t) {
                         targets.push(t);
@@ -2912,8 +3130,15 @@ fn alternates_clause(spellings: &[String]) -> String {
 /// aspect (warn unless scoped) flags an untyped attribute whose value
 /// determines a type, with the declaring fix. Both sides must be
 /// determinate — no standard library, an opaque user unit, or an
-/// unevaluable value stays silent, never a guess.
-fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &mut Vec<Finding>) {
+/// unevaluable value stays silent, never a guess. `unsettled` holds the
+/// attributes `unit-precedence` flagged: their value's dimension is in
+/// question until the binding is settled, so neither aspect speaks.
+fn dimensional_consistency(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    unsettled: &BTreeSet<ElementRef>,
+    out: &mut Vec<Finding>,
+) {
     use sysmlv2_model::eval::Value;
     let cfg = config.cfg(RuleId::DimensionalConsistency);
     let mismatch_sev = cfg.severity("mismatch");
@@ -2925,7 +3150,10 @@ fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &
     }
     let elems: Vec<ElementRef> = resolved.user_elements().collect();
     for e in elems {
-        if resolved.element_type(e) != "AttributeUsage" || resolved.value_expr(e).is_none() {
+        if resolved.element_type(e) != "AttributeUsage"
+            || resolved.value_expr(e).is_none()
+            || unsettled.contains(&e)
+        {
             continue;
         }
         let Some((unit_idx, name_span)) = resolved.declaration_site(e) else {
@@ -3048,6 +3276,447 @@ fn dimensional_consistency(resolved: &mut ResolvedModel, config: &Config, out: &
         f.fix = spellings.first().map(&retype);
         f.alternatives = spellings.iter().skip(1).map(&retype).collect();
         out.push(f);
+    }
+}
+
+/// `unit-precedence`: a quantity bracket on the right operand of an
+/// arithmetic operator binds to that operand alone — `1 / 15 [km]` is
+/// `1 / (15 [km])`, a reciprocal length, where the author almost always
+/// meant `(1 / 15) [km]`. A site flags when the bracket's magnitude is
+/// a plain number under a known unit and the operand chain the bracket
+/// closes combines plain numbers through at least one operator the
+/// binding matters for (`/`, `%`, `+`, `-`, `**`, `^` — `*` alone
+/// agrees either way). A quantity on the left (`2 * r + 20 [mm]`,
+/// `t / 900 [K]`) makes the written binding the right one and ends the
+/// chain there, as does an indeterminate operand — never a guess.
+/// Parentheses settle it: `(1 / 15) [km]` never matches, `1 / (15
+/// [km])` is skipped, and a parenthesized group ends the chain. A sign
+/// on the magnitude is transparent (`1 / -15 [km]`). Sources are the
+/// user units' feature values and the constraint bodies declared in
+/// them (a bodiless usage's inherited body is its definition's own
+/// entry, a library's never). The fix parenthesizes the chain
+/// (semantic: it changes the value); the alternative makes the written
+/// binding explicit. `flagged` collects the owners whose own value
+/// flagged, for `dimensional-consistency` to step aside.
+fn unit_precedence(
+    resolved: &mut ResolvedModel,
+    config: &Config,
+    flagged: &mut BTreeSet<ElementRef>,
+    out: &mut Vec<Finding>,
+) {
+    use sysmlv2_model::eval::Value;
+    use sysmlv2_model::json::ScopeRef;
+    use sysmlv2_syntax::ast::{BinaryOp, Dialect, Expr, ExprKind, Literal, UnaryOp};
+    use sysmlv2_syntax::print::print_expr_source;
+    use sysmlv2_syntax::visit::{Visit, walk_expr};
+    let cfg = config.cfg(RuleId::UnitPrecedence);
+
+    fn arithmetic(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Rem
+                | BinaryOp::Pow
+                | BinaryOp::Caret
+        )
+    }
+
+    /// Whether the written form of `e` opens with its own `(`: the
+    /// parser folds parentheses into the span, so a node whose span
+    /// starts before its leftmost operand was parenthesized.
+    fn parenthesized(e: &Expr) -> bool {
+        let leftmost = match &e.kind {
+            ExprKind::Binary { lhs, .. } => lhs.span.start,
+            ExprKind::Bracket { target, .. } => target.span.start,
+            _ => return false,
+        };
+        e.span.start != leftmost
+    }
+
+    /// The operand of a sign that is transparent to the binding: a
+    /// unary `-`/`+` wraps the primary, so `1 / -15 [km]` is `1 /
+    /// -(15 [km])` and the unit still binds to the magnitude alone.
+    /// A parenthesized signed quantity (`1 / (-15 [km])`) is a group
+    /// the author closed — its span runs past the operand's.
+    fn signed(e: &Expr) -> Option<&Expr> {
+        match &e.kind {
+            ExprKind::Unary {
+                op: UnaryOp::Plus | UnaryOp::Minus,
+                operand,
+            } if e.span.end == operand.span.end => Some(operand),
+            _ => None,
+        }
+    }
+
+    /// `e` with the bracket spanning `at` replaced by its magnitude —
+    /// the chain the fix parenthesizes, for the message. The bracket
+    /// hangs off right operands (through a sign, possibly), so only
+    /// that path is rebuilt.
+    fn without_bracket(e: &Expr, at: Span) -> Expr {
+        if e.span == at {
+            if let ExprKind::Bracket { target, .. } = &e.kind {
+                return (**target).clone();
+            }
+        }
+        match &e.kind {
+            ExprKind::Binary { op, lhs, rhs } => Expr {
+                kind: ExprKind::Binary {
+                    op: *op,
+                    lhs: lhs.clone(),
+                    rhs: Box::new(without_bracket(rhs, at)),
+                },
+                span: e.span,
+            },
+            ExprKind::Unary { op, operand } => Expr {
+                kind: ExprKind::Unary {
+                    op: *op,
+                    operand: Box::new(without_bracket(operand, at)),
+                },
+                span: e.span,
+            },
+            _ => e.clone(),
+        }
+    }
+
+    /// The written form of `e` where a primary stands — a non-primary
+    /// gets the parentheses the printer restores only in context
+    /// (`(2 + 3)` as the magnitude of `(2 + 3) [km]`).
+    fn primary_text(e: &Expr) -> String {
+        let text = print_expr_source(e, Dialect::Sysml);
+        match &e.kind {
+            ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Conditional { .. }
+            | ExprKind::Classification { .. }
+            | ExprKind::Extent { .. } => format!("({text})"),
+            _ => text,
+        }
+    }
+
+    /// Whether the feature `e`, by its declared types alone, holds a
+    /// plain number: a quantity type says no, a type conforming to the
+    /// library's `NumericalValue` says yes, anything else is
+    /// indeterminate.
+    fn plain_by_type(resolved: &mut ResolvedModel, e: ElementRef) -> Option<bool> {
+        let typings = resolved.typings(e);
+        if typings.is_empty() {
+            return None;
+        }
+        let quantity = resolved.resolve_qualified("Quantities::TensorQuantityValue");
+        let numeric = resolved.resolve_qualified("ScalarValues::NumericalValue");
+        let mut plain = true;
+        for t in typings {
+            if resolved.quantity_dims_of_type(t).is_some()
+                || quantity.is_some_and(|q| resolved.conforms(t, q))
+            {
+                return Some(false);
+            }
+            plain &= numeric.is_some_and(|n| resolved.conforms(t, n));
+        }
+        plain.then_some(true)
+    }
+
+    /// Whether `expr` stands for a plain number: `Some(true)` for a
+    /// number, `Some(false)` for a quantity, `None` when neither is
+    /// determinate. A value decides first; a feature without one
+    /// answers by its declared types; a chain whose value is
+    /// indeterminate (`p.m` through a part) answers by its last
+    /// member's, found at the member's resolved reference site in
+    /// `unit`; an arithmetic form whose value is indeterminate (`n *
+    /// n` over unvalued numbers) composes its operands' answers.
+    fn plain_number(
+        resolved: &mut ResolvedModel,
+        unit: usize,
+        scope: ScopeRef,
+        expr: &Expr,
+    ) -> Option<bool> {
+        match resolved.evaluate_in(scope, expr) {
+            Ok(Value::Integer(_) | Value::Rational(_) | Value::Real(_)) => return Some(true),
+            Ok(Value::Quantity(..)) => return Some(false),
+            Ok(Value::Unbound(e) | Value::UnboundMember(e)) => return plain_by_type(resolved, e),
+            _ => {}
+        }
+        match &expr.kind {
+            ExprKind::Unary {
+                op: UnaryOp::Plus | UnaryOp::Minus,
+                operand,
+            } => plain_number(resolved, unit, scope, operand),
+            ExprKind::ChainStep { member, .. } => {
+                let at = member.span();
+                let last = resolved
+                    .reference_sites()
+                    .iter()
+                    .find(|s| s.unit == unit && (s.span == at || s.name_span == at))
+                    .map(|s| s.target)?;
+                plain_by_type(resolved, last)
+            }
+            ExprKind::Binary { op, lhs, rhs } if arithmetic(*op) => {
+                let sides = (
+                    plain_number(resolved, unit, scope, lhs)?,
+                    plain_number(resolved, unit, scope, rhs)?,
+                );
+                match sides {
+                    (true, true) => Some(true),
+                    (true, false) | (false, true)
+                        if matches!(op, BinaryOp::Mul | BinaryOp::Div) =>
+                    {
+                        Some(false)
+                    }
+                    _ => None,
+                }
+            }
+            ExprKind::Bracket { .. } => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Every bracket that is the right operand of an arithmetic
+    /// operator, with the arithmetic ancestors it closes, outermost
+    /// first — the `rhs` path of each leads to the bracket, through a
+    /// transparent sign at most.
+    struct Sites<'a> {
+        chain: Vec<&'a Expr>,
+        out: Vec<(&'a Expr, Vec<&'a Expr>)>,
+    }
+    impl<'a> Visit<'a> for Sites<'a> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let ExprKind::Binary { op, lhs, rhs } = &e.kind {
+                if arithmetic(*op) {
+                    let chain = std::mem::take(&mut self.chain);
+                    self.visit_expr(lhs);
+                    self.chain = chain;
+                    self.chain.push(e);
+                    self.visit_expr(rhs);
+                    self.chain.pop();
+                    return;
+                }
+            }
+            if !self.chain.is_empty() {
+                if let Some(operand) = signed(e) {
+                    self.visit_expr(operand);
+                    return;
+                }
+                if matches!(e.kind, ExprKind::Bracket { .. }) {
+                    self.out.push((e, self.chain.clone()));
+                }
+            }
+            // Anything else starts over: a bracket inside a magnitude,
+            // a unit, an argument or a body closes no operand of this
+            // chain.
+            let chain = std::mem::take(&mut self.chain);
+            walk_expr(self, e);
+            self.chain = chain;
+        }
+    }
+
+    // Expression sources: user feature values (the owner's own value —
+    // what `dimensional-consistency` types), then the constraint bodies
+    // declared in the user units, each once: a bodiless usage typed by
+    // a definition carries that definition's body — the definition's
+    // own entry when it is a user one, a library's never.
+    let users: BTreeSet<ElementRef> = resolved.user_elements().collect();
+    let user_units: BTreeSet<usize> = users.iter().map(|&e| resolved.unit_of(e)).collect();
+    let mut sources: Vec<(ElementRef, bool, usize, ScopeRef, Expr)> = Vec::new();
+    for &e in &users {
+        let Some((scope, expr)) = resolved.value_expr(e) else {
+            continue;
+        };
+        let Some((unit, _)) = resolved.declaration_site(e) else {
+            continue;
+        };
+        sources.push((e, true, unit, scope, expr));
+    }
+    for c in resolved.constraints_where(|u| user_units.contains(&u)) {
+        if !c.inherited && users.contains(&c.element) {
+            sources.push((c.element, false, c.unit, c.scope, c.expr));
+        }
+    }
+
+    for (owner, is_value, unit, scope, expr) in sources {
+        let severity = cfg.severity(resolved.element_type(owner));
+        if severity == Severity::Off {
+            continue;
+        }
+        let mut sites = Sites {
+            chain: Vec::new(),
+            out: Vec::new(),
+        };
+        sites.visit_expr(&expr);
+        for (bracket, chain) in sites.out {
+            let ExprKind::Bracket { target, arg } = &bracket.kind else {
+                continue;
+            };
+            if parenthesized(bracket) {
+                continue;
+            }
+            let Ok(u) = resolved.unit_of_in(scope, arg) else {
+                continue;
+            };
+            if u.dims_key().is_empty() {
+                continue; // `[m/m]` cancels: nothing to bind
+            }
+            // An already-dimensioned magnitude is annotated by its
+            // bracket (`mass / rho [kg]`), not measured by it.
+            if plain_number(resolved, unit, scope, target) != Some(true) {
+                continue;
+            }
+            // Climb while each operator combines a plain number with
+            // the bracket's side; the chain ends at a quantity, an
+            // indeterminate operand, or a group the author closed.
+            let mut climbed: Vec<&Expr> = Vec::new();
+            for &p in chain.iter().rev() {
+                let ExprKind::Binary { lhs, .. } = &p.kind else {
+                    break;
+                };
+                if plain_number(resolved, unit, scope, lhs) != Some(true) {
+                    break;
+                }
+                climbed.push(p);
+                if parenthesized(p) {
+                    break;
+                }
+            }
+            let Some(&top) = climbed.last() else {
+                continue;
+            };
+            // The innermost operator the binding matters for — the
+            // `*`s beneath it take a plain number times the quantity,
+            // the same either way.
+            let Some((bites_op, bites_lhs)) = climbed.iter().find_map(|p| match &p.kind {
+                ExprKind::Binary { op, lhs, .. } if *op != BinaryOp::Mul => Some((*op, lhs)),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let direct = climbed[0];
+            let ExprKind::Binary { op: direct_op, .. } = &direct.kind else {
+                continue;
+            };
+
+            let unit_text = print_expr_source(arg, Dialect::Sysml);
+            let magnitude = primary_text(target);
+            let written = print_expr_source(top, Dialect::Sysml);
+            let intended = format!(
+                "({}) [{unit_text}]",
+                print_expr_source(&without_bracket(top, bracket.span), Dialect::Sysml)
+            );
+            // What the written binding measures: the chain's own value
+            // when it has one; else, for a bracket closing its operator
+            // directly (`y / 15 [km]` with `y` unvalued), the operator
+            // over a stand-in `1` — the left operand is a plain number,
+            // so the dimension is the bracket's side's alone.
+            let read = match resolved.evaluate_in(scope, top) {
+                Ok(Value::Quantity(_, read)) => Some(read),
+                _ if std::ptr::eq(top, direct) => {
+                    let stand_in = Expr {
+                        kind: ExprKind::Binary {
+                            op: *direct_op,
+                            lhs: Box::new(Expr {
+                                kind: ExprKind::Literal(Literal::Integer("1".to_string())),
+                                span: bracket.span,
+                            }),
+                            rhs: Box::new(bracket.clone()),
+                        },
+                        span: top.span,
+                    };
+                    match resolved.evaluate_in(scope, &stand_in) {
+                        Ok(Value::Quantity(_, read)) => Some(read),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let reading = match read {
+                Some(read) => {
+                    let actual = resolved.unit_quantity_dims(&read);
+                    let meant = resolved.unit_quantity_dims(&u);
+                    match (actual, meant) {
+                        (Some(actual), Some(meant)) if actual != meant => format!(
+                            "measures {} rather than {}",
+                            actual.render(resolved),
+                            meant.render(resolved)
+                        ),
+                        // Same base dimensions (`['°']` is dimensionless
+                        // either way): the units themselves tell them apart.
+                        _ => format!("measures `{}` rather than `{unit_text}`", read.display()),
+                    }
+                }
+                // No value to measure: say what the first operator
+                // (innermost out) that has no value does to the quantity
+                // it was handed — the ones beneath it are fine
+                // (`p1 + p2 / 15 [km]`: the quotient is a reciprocal
+                // length, the sum is what fails). The quantity is named
+                // by its unit at that level when the operand beneath
+                // evaluates, else by the bracket's.
+                None => {
+                    let mut handed = unit_text.clone();
+                    let mut bites = (bites_op, bites_lhs);
+                    for p in &climbed {
+                        let ExprKind::Binary { op, lhs, .. } = &p.kind else {
+                            break;
+                        };
+                        match resolved.evaluate_in(scope, p) {
+                            Ok(Value::Quantity(_, read)) => handed = read.display().to_string(),
+                            _ if *op == BinaryOp::Mul => {}
+                            _ => {
+                                bites = (*op, lhs);
+                                break;
+                            }
+                        }
+                    }
+                    let (op, lhs) = bites;
+                    let left = print_expr_source(lhs, Dialect::Sysml);
+                    match op {
+                        BinaryOp::Add => format!("adds `{left}` to a `{handed}` quantity"),
+                        BinaryOp::Sub => format!("subtracts a `{handed}` quantity from `{left}`"),
+                        BinaryOp::Mul => format!("multiplies `{left}` by a `{handed}` quantity"),
+                        BinaryOp::Div => format!("divides `{left}` by a `{handed}` quantity"),
+                        BinaryOp::Rem => format!("takes `{left}` modulo a `{handed}` quantity"),
+                        _ => format!("raises `{left}` to a `{handed}` quantity"),
+                    }
+                }
+            };
+            let insert = |at: u32, text: &str| Edit {
+                unit,
+                span: Span { start: at, end: at },
+                replacement: text.to_string(),
+            };
+            let mut f = finding(
+                RuleId::UnitPrecedence,
+                severity,
+                format!(
+                    "unit `{unit_text}` binds to `{magnitude}` alone — `{written}` {reading}; \
+                     parenthesize `{intended}` to measure the whole value in `{unit_text}`"
+                ),
+            );
+            f.unit = Some(unit);
+            f.span = Some(top.span);
+            f.element = edit_target(resolved, owner);
+            f.fix = Some(Fix {
+                label: format!("parenthesize the value as `{intended}`"),
+                deletes: false,
+                semantic: true,
+                edits: vec![insert(top.span.start, "("), insert(target.span.end, ")")],
+            });
+            f.alternatives = vec![Fix {
+                label: format!(
+                    "keep `{unit_text}` on `{magnitude}` alone: `({magnitude} [{unit_text}])`"
+                ),
+                deletes: false,
+                semantic: false,
+                edits: vec![
+                    insert(bracket.span.start, "("),
+                    insert(bracket.span.end, ")"),
+                ],
+            }];
+            out.push(f);
+            if is_value {
+                flagged.insert(owner);
+            }
+        }
     }
 }
 
@@ -3178,14 +3847,10 @@ fn qualified_names(
 ) {
     let severity = config.cfg(RuleId::QualifiedNames).base;
     let text_of = |unit: usize| sources.iter().find(|(i, _)| *i == unit).map(|(_, t)| *t);
-    let user_units: BTreeSet<usize> = {
-        let elems: Vec<ElementRef> = resolved.user_elements().collect();
-        elems
-            .iter()
-            .filter_map(|&e| resolved.declaration_site(e))
-            .map(|(u, _)| u)
-            .collect()
-    };
+    let user_units: BTreeSet<usize> = resolved
+        .user_elements()
+        .map(|e| resolved.unit_of(e))
+        .collect();
     let brackets = bracket_arg_spans(resolved);
     struct Site {
         unit: usize,
@@ -3751,12 +4416,16 @@ pub fn canonicalization_digest(config: &Config) -> String {
     };
     let text = format!(
         "v{};indent={indent};chain={};dimensional-consistency={};indentation={};\
-         qualified-names={},{qualified_style};unit-spelling={},{unit_style};untyped-usage={}",
+         qualified-names={},{qualified_style};unit-precedence={};unit-spelling={},{unit_style};\
+         untyped-usage={}",
         CANONICALIZER_SCHEMA_VERSION,
         config.chain_min,
         fix_policy(RuleId::DimensionalConsistency, &["mismatch", "untyped"]),
         fix_policy(RuleId::Indentation, &[]),
         fix_policy(RuleId::QualifiedNames, &[]),
+        // Its own fix is semantic (never swept), but on attributes it
+        // decides whether `dimensional-consistency` fixes the typing.
+        fix_policy(RuleId::UnitPrecedence, &["AttributeUsage"]),
         fix_policy(RuleId::UnitSpelling, &[]),
         fix_policy(RuleId::UntypedUsage, &["AttributeUsage"]),
     );

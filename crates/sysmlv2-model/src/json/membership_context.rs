@@ -1,6 +1,7 @@
 //! Contextual inheritance for import-operation Membership projections.
 use super::{Builder, InheritedBindings, LookupAccess};
-use std::collections::{HashMap, HashSet};
+use crate::layered::{IdMap, IdSet};
+use crate::metaclass::is_a;
 use std::sync::Arc;
 
 /// Ordered semantic identities; no textual scope is fabricated for leaf Types.
@@ -16,8 +17,8 @@ const MAX_CONTEXT_DEPTH: usize = 128;
 
 #[derive(Clone, Default)]
 struct Guards {
-    namespaces: HashMap<usize, bool>,
-    types: HashMap<usize, bool>,
+    namespaces: IdMap<usize, bool>,
+    types: IdMap<usize, bool>,
 }
 impl Guards {
     fn matches(&self, namespaces: &[usize], types: &[usize]) -> bool {
@@ -31,8 +32,8 @@ impl Guards {
     }
 }
 struct Tracking {
-    namespaces: HashSet<usize>,
-    types: HashSet<usize>,
+    namespaces: IdSet<usize>,
+    types: IdSet<usize>,
     family: usize,
     guards: Guards,
 }
@@ -48,7 +49,7 @@ pub(super) struct ImportProjection {
 /// Query-local: graph mutation cannot invalidate a proof between public calls.
 #[derive(Default)]
 pub(super) struct MembershipContext {
-    known: HashMap<(usize, bool), Vec<Complete>>,
+    known: IdMap<(usize, bool), Vec<Complete>>,
     tracking: Vec<Tracking>,
     family: usize,
     pub(super) steps: usize,
@@ -57,7 +58,7 @@ impl MembershipContext {
     pub(super) fn begin_namespace(&mut self, excluded: &[usize]) {
         self.tracking.push(Tracking {
             namespaces: excluded.iter().copied().collect(),
-            types: HashSet::new(),
+            types: IdSet::default(),
             family: 0,
             guards: Guards::default(),
         });
@@ -260,7 +261,7 @@ impl Builder {
         }
         for relationship in relationships {
             let relation = &self.elements[relationship];
-            if crate::metaclass::conforms(relation.ty, "Specialization")
+            if is_a!(relation, "Specialization")
                 && (include_implied
                     || relation
                         .props
@@ -270,9 +271,7 @@ impl Builder {
             {
                 let id = super::implied::specialization_target(relation);
                 let target = id.and_then(|id| self.element_index_of_uuid(id));
-                if target.is_none_or(|target| {
-                    !crate::metaclass::conforms(self.elements[target].ty, "Type")
-                }) {
+                if target.is_none_or(|target| !is_a!(self.elements[target], "Type")) {
                     result.incomplete = true;
                 }
             }
@@ -342,7 +341,7 @@ impl Builder {
                 if !excluded.contains(&base_scope) {
                     excluded.push(base_scope);
                 }
-                let mut seen = HashMap::new();
+                let mut seen = IdMap::default();
                 let mut imported = InheritedBindings::default();
                 let mut order = Vec::new();
                 if self
@@ -519,8 +518,8 @@ mod tests {
         let outer = c.new_type_family();
         let inner = c.new_type_family();
         c.tracking.push(Tracking {
-            namespaces: HashSet::new(),
-            types: HashSet::from([1]),
+            namespaces: IdSet::default(),
+            types: IdSet::from_iter([1]),
             family: outer,
             guards: Guards::default(),
         });

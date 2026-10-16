@@ -754,6 +754,7 @@ fn rule_wide_fix_all_rides_the_quick_fix() {
             "change `attribute` to `port` (rewrites the declaration)",
             "Fix all 2 `usage-kind-mismatch` findings in this file (rewrites the declarations)",
             "Fix all 3 `usage-kind-mismatch` findings across 2 files (rewrites the declarations)",
+            "Disable `usage-kind-mismatch` for this line",
         ]
     );
     let changes = |c: &lsp_types::CodeAction| c.edit.clone().unwrap().changes.unwrap();
@@ -777,13 +778,18 @@ fn rule_wide_fix_all_rides_the_quick_fix() {
         "package B {\n    part def Y { port r : A::Pd; }\n}\n"
     );
     // Both of this document's findings in the request: two single fixes,
-    // the rule-wide pair once.
+    // the rule-wide pair once, and the line directive once — the two
+    // findings share a line.
     let actions = request(&mut client, lint);
     let wide = actions
         .iter()
         .filter(|c| c.title.starts_with("Fix all"))
         .count();
-    assert_eq!((actions.len(), wide), (4, 2), "{actions:#?}");
+    let directives = actions
+        .iter()
+        .filter(|c| c.title.starts_with("Disable"))
+        .count();
+    assert_eq!((actions.len(), wide, directives), (5, 2, 1), "{actions:#?}");
     client.shutdown();
 }
 
@@ -1507,5 +1513,77 @@ fn formatting_follows_the_lint_configuration_as_it_changes() {
         "one operand per line: {:?}",
         edits[0].new_text
     );
+    client.shutdown();
+}
+
+#[test]
+fn lint_directives_suppress_and_a_quick_fix_writes_them() {
+    // Three lowercase definitions: the first has nothing above it, the
+    // second is suppressed by a directive, the third sits under a
+    // directive for another rule (off by default, so dormant).
+    let mut client = Client::start(None);
+    let m = uri("directives.sysml");
+    client.open(
+        &m,
+        "package P {\n    part def widget_one;\n    // sysmlint-disable-next-line naming-convention\n    part def widget_two;\n    // sysmlint-disable-next-line unused-definition\n    part def widget_three;\n}\n",
+    );
+    let p = client.await_publish(&m, |p| {
+        p.diagnostics
+            .iter()
+            .filter(|d| d.source.as_deref() == Some("sysmlv2 lint"))
+            .count()
+            >= 2
+    });
+    let lint: Vec<_> = p
+        .diagnostics
+        .iter()
+        .filter(|d| d.source.as_deref() == Some("sysmlv2 lint"))
+        .cloned()
+        .collect();
+    let lines: Vec<u32> = lint.iter().map(|d| d.range.start.line).collect();
+    assert_eq!(lines, [1, 5], "{lint:?}");
+    let suppress = |client: &mut Client, d: &lsp_types::Diagnostic| -> Vec<lsp_types::TextEdit> {
+        let actions: Option<Vec<CodeActionOrCommand>> =
+            client.request_ok::<CodeActionRequest>(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: m.clone() },
+                range: d.range,
+                context: CodeActionContext {
+                    diagnostics: vec![d.clone()],
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            });
+        let action = actions
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(c)
+                    if c.title == "Disable `naming-convention` for this line" =>
+                {
+                    Some(c)
+                }
+                _ => None,
+            })
+            .expect("the directive quick fix");
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        assert_ne!(action.is_preferred, Some(true));
+        action.edit.unwrap().changes.unwrap().remove(&m).unwrap()
+    };
+    // No note above: a new one at the line's indentation.
+    let edits = suppress(&mut client, &lint[0]);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0].range.start, lsp_types::Position::new(1, 0));
+    assert_eq!(edits[0].range.end, lsp_types::Position::new(1, 0));
+    assert_eq!(
+        edits[0].new_text,
+        "    // sysmlint-disable-next-line naming-convention\n"
+    );
+    // A directive above for another rule: the rule joins its list.
+    let edits = suppress(&mut client, &lint[1]);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0].range.start, lsp_types::Position::new(4, 51));
+    assert_eq!(edits[0].new_text, ", naming-convention");
     client.shutdown();
 }

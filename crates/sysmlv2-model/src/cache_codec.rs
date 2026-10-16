@@ -48,18 +48,56 @@ const MAP: u8 = 8;
 const ENUM: u8 = 9;
 const SOME: u8 = 10;
 const BYTES: u8 = 11;
-pub(crate) fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
-    let mut w = Writer::default();
-    value.serialize(&mut w)?;
-    let mut out = Writer::default();
-    out.count(w.2.len() as u64);
-    for value in &w.2 {
-        out.count(value.len() as u64);
-        out.0.extend_from_slice(value.as_bytes());
-    }
-    out.0.extend(w.0);
-    Ok(out.0)
+/// Values encoded one after the other as the parts of one payload: one
+/// string table at the front, then each part's bytes, so that a reader
+/// that has the table decodes the parts apart from one another — side by
+/// side, or each verified against a checksum of its own before it is read.
+/// A writer puts the table and the body down one after the other without
+/// joining them: the body is as large as the values.
+pub(crate) struct Parts {
+    w: Writer,
+    /// Where each part's bytes end in the body.
+    ends: Vec<usize>,
 }
+
+impl Parts {
+    /// A writer whose body is reserved for about `capacity` bytes up front,
+    /// so a large payload is not copied as the buffer grows.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            w: Writer(Vec::with_capacity(capacity), Default::default(), Vec::new()),
+            ends: Vec::new(),
+        }
+    }
+
+    /// Encode `value` as the next part.
+    pub(crate) fn part(&mut self, value: &impl Serialize) -> Result<()> {
+        value.serialize(&mut self.w)?;
+        self.ends.push(self.w.0.len());
+        Ok(())
+    }
+
+    /// The string table, the body, and where each part's bytes end in it.
+    pub(crate) fn finish(self) -> (Vec<u8>, Vec<u8>, Vec<usize>) {
+        let mut table = Writer::default();
+        table.count(self.w.2.len() as u64);
+        for value in &self.w.2 {
+            table.count(value.len() as u64);
+            table.0.extend_from_slice(value.as_bytes());
+        }
+        (table.0, self.w.0, self.ends)
+    }
+}
+
+/// One value as the table and its bytes joined: what [`decode`] reads.
+pub(crate) fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut parts = Parts::with_capacity(0);
+    parts.part(value)?;
+    let (mut table, body, _) = parts.finish();
+    table.extend_from_slice(&body);
+    Ok(table)
+}
+/// One value from its table and bytes joined (see [`encode`]).
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     decode_from(Slice(bytes))
 }
@@ -206,46 +244,123 @@ impl<S: Source> Source for &mut S {
     }
 }
 
-/// Decode from any source. The string table at the front is copied into
-/// an arena the decoded strings borrow from while decoding (a table entry's
-/// address identifies it to `shared_string`); the rest streams.
-pub(crate) fn decode_from<T: DeserializeOwned, S: Source>(src: S) -> Result<T> {
+/// Decode one value from a source holding exactly it: the string table at
+/// the front, then the value's bytes.
+pub(crate) fn decode_from<T: DeserializeOwned, S: Source>(mut src: S) -> Result<T> {
+    let table = StringTable::read(&mut src)?;
+    decode_part(&table.strings(), src)
+}
+
+/// The string table at the front of a payload: every string once, copied
+/// into one arena the decoded values borrow from while decoding (a table
+/// entry's address identifies it to `shared_string`).
+pub(crate) struct StringTable {
+    arena: Vec<u8>,
+    spans: Vec<(usize, usize)>,
+}
+
+impl StringTable {
+    /// Read the table from the front of `src`, leaving what follows it.
+    pub(crate) fn read<S: Source>(src: &mut S) -> Result<Self> {
+        let mut r = Reader {
+            src,
+            depth: 0,
+            strings: &[],
+        };
+        let count = r.length()?;
+        if count > 1_048_576 {
+            return Err(bad());
+        }
+        let mut arena = Vec::new();
+        let mut spans = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = r.length()?;
+            let text = r.src.take(len)?;
+            std::str::from_utf8(text).map_err(|_| bad())?;
+            spans.push((arena.len(), len));
+            arena.extend_from_slice(text);
+        }
+        Ok(Self { arena, spans })
+    }
+
+    /// Read the table from a source holding exactly it.
+    pub(crate) fn decode<S: Source>(mut src: S) -> Result<Self> {
+        let table = Self::read(&mut src)?;
+        if src.remaining() != 0 {
+            return Err(bad());
+        }
+        Ok(table)
+    }
+
+    /// The strings, borrowing the arena.
+    pub(crate) fn strings(&self) -> Vec<&str> {
+        self.spans
+            .iter()
+            .map(|&(at, len)| {
+                // validated when read
+                std::str::from_utf8(&self.arena[at..at + len]).unwrap_or_default()
+            })
+            .collect()
+    }
+}
+
+/// Decode one value over a payload's string table from a source holding
+/// exactly its bytes: a part of a snapshot, read apart from the other parts
+/// once the table is.
+pub(crate) fn decode_part<T: DeserializeOwned, S: Source>(strings: &[&str], src: S) -> Result<T> {
     let _strings = SharedStrings::enter();
     let mut r = Reader {
         src,
         depth: 0,
-        strings: Vec::new(),
-    };
-    let count = r.length()?;
-    if count > 1_048_576 {
-        return Err(bad());
-    }
-    let mut arena = Vec::new();
-    let mut spans = Vec::with_capacity(count);
-    for _ in 0..count {
-        let len = r.length()?;
-        let text = r.src.take(len)?;
-        std::str::from_utf8(text).map_err(|_| bad())?;
-        spans.push((arena.len(), len));
-        arena.extend_from_slice(text);
-    }
-    // the arena is complete; the table borrows it for the rest of the decode
-    let mut r = Reader {
-        src: r.src,
-        depth: 0,
-        strings: spans
-            .iter()
-            .map(|&(at, len)| {
-                // validated above
-                std::str::from_utf8(&arena[at..at + len]).map_err(|_| bad())
-            })
-            .collect::<Result<Vec<&str>>>()?,
+        strings,
     };
     let value = T::deserialize(&mut r)?;
     if r.src.remaining() != 0 {
         return Err(bad());
     }
     Ok(value)
+}
+
+/// The next `len` bytes of a source as a source of their own — a part of a
+/// payload whose length the header gave — so that a part decoded from a
+/// stream ends exactly where the header says it does.
+pub(crate) struct Limited<'a, S: Source> {
+    inner: &'a mut S,
+    remaining: usize,
+}
+
+impl<'a, S: Source> Limited<'a, S> {
+    pub(crate) fn new(inner: &'a mut S, len: usize) -> Result<Self> {
+        if len > inner.remaining() {
+            return Err(bad());
+        }
+        Ok(Self {
+            inner,
+            remaining: len,
+        })
+    }
+}
+
+impl<S: Source> Source for Limited<'_, S> {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<u8> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.inner.peek()
+    }
+    #[inline]
+    fn take(&mut self, n: usize) -> Result<&[u8]> {
+        if n > self.remaining {
+            return Err(bad());
+        }
+        self.remaining -= n;
+        self.inner.take(n)
+    }
 }
 #[derive(Default)]
 struct Writer(
@@ -454,7 +569,7 @@ compound_struct!(SerializeStructVariant);
 struct Reader<'de, S: Source> {
     src: S,
     depth: usize,
-    strings: Vec<&'de str>,
+    strings: &'de [&'de str],
 }
 impl<S: Source> Reader<'_, S> {
     #[inline]
@@ -857,7 +972,7 @@ mod string_table_tests {
 // it, so a borrowed string's address identifies its table entry. No raw pointer
 // is dereferenced. Nested decodes get independent tables; the guard restores
 // the previous context on both normal returns and unwinding.
-type StringPool = std::collections::HashMap<(usize, usize), std::sync::Arc<str>>;
+type StringPool = crate::layered::IdMap<(usize, usize), std::sync::Arc<str>>;
 thread_local! {
     static SHARED_STRINGS: std::cell::RefCell<Option<StringPool>> = const { std::cell::RefCell::new(None) };
 }

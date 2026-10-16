@@ -1,5 +1,6 @@
 //! One checked Namespace membership composition for operation and property reads.
 use super::*;
+use crate::metaclass::is_a;
 use std::collections::HashMap;
 
 pub(super) struct Sequence {
@@ -184,7 +185,7 @@ fn import_builder(
         }]
     });
     if (target.membership.is_none() || recursive)
-        && conforms(b.elements[imported_element].ty, "Namespace")
+        && is_a!(b.elements[imported_element], "Namespace")
         && !excluded.contains(&imported_element)
     {
         result.extend(visible_builder(
@@ -224,7 +225,7 @@ fn imported_builder(
     )?;
     let relationships: Vec<_> = relationships
         .iter()
-        .filter(|&rel| conforms(b.elements[rel].ty, "Import"))
+        .filter(|&rel| is_a!(b.elements[rel], "Import"))
         .collect();
     let mut excluded = excluded.to_vec();
     excluded.push(owner);
@@ -261,7 +262,7 @@ fn memberships_of_visibility_builder(
     let mut result = owned(b, raw, owner, steps, effective)?;
     if result
         .iter()
-        .any(|m| conforms(b.elements[m.relationship].ty, "ElementFilterMembership"))
+        .any(|m| is_a!(b.elements[m.relationship], "ElementFilterMembership"))
     {
         // Visibility-specific unions and Package's filtered imported collection
         // have distinct normative bodies. Do not silently choose a filter
@@ -318,8 +319,8 @@ fn visible_builder(
         let mut excluded = excluded.to_vec();
         excluded.push(owner);
         for m in children {
-            if conforms(b.elements[m.relationship].ty, "OwningMembership")
-                && conforms(b.elements[m.member].ty, "Namespace")
+            if is_a!(b.elements[m.relationship], "OwningMembership")
+                && is_a!(b.elements[m.member], "Namespace")
                 && (all || m.visibility == "public")
             {
                 result.extend(visible_builder(
@@ -339,7 +340,7 @@ fn visible_builder(
     }
     // Type visibility uses the same complete Membership reduction. Namespace
     // exclusions affect import contributions, never the inheritance graph.
-    if conforms(b.elements[owner].ty, "Type") {
+    if is_a!(b.elements[owner], "Type") {
         charge(steps, excluded.len().saturating_add(1), effective)?;
         let mut inherited_excluded = excluded.to_vec();
         inherited_excluded.push(owner);
@@ -427,7 +428,7 @@ pub(super) fn sequence(
         imported.retain(|m| !colliding.contains(&m.relationship) && !own.contains(&m.relationship));
     }
     let mut all = unique(owned.into_iter().chain(imported.iter().cloned()));
-    if conforms(r.b.elements[owner].ty, "Type") {
+    if is_a!(r.b.elements[owner], "Type") {
         let inherited =
             r.b.checked_type_memberships_for_visibility(owner, excluded, false, steps)
                 .map_err(|_| OperationError::Incomplete { effective })?
@@ -458,13 +459,13 @@ fn filter_memberships(
     let incomplete = || OperationError::Incomplete { effective };
     // ElementFilterMembership defines no filtering for a general Namespace;
     // this composition is specifically Package::importedMemberships.
-    if !conforms(r.b.elements[owner].ty, "Package") {
+    if !is_a!(r.b.elements[owner], "Package") {
         return Ok(());
     }
     charge(steps, owned.len().saturating_mul(5), effective)?;
     for m in owned
         .iter()
-        .filter(|m| conforms(r.b.elements[m.relationship].ty, "ElementFilterMembership"))
+        .filter(|m| is_a!(r.b.elements[m.relationship], "ElementFilterMembership"))
     {
         let relation = &r.b.elements[m.relationship];
         let condition = &r.b.elements[m.member];
@@ -487,7 +488,7 @@ fn filter_memberships(
     charge(steps, owned.len(), effective)?;
     let conditions: Vec<_> = owned
         .iter()
-        .filter(|m| conforms(r.b.elements[m.relationship].ty, "ElementFilterMembership"))
+        .filter(|m| is_a!(r.b.elements[m.relationship], "ElementFilterMembership"))
         .map(|m| m.member)
         .collect();
     charge(steps, conditions.len(), effective)?;
@@ -497,7 +498,7 @@ fn filter_memberships(
     for &condition in &conditions {
         // ElementFilterMembership.condition is typed Expression; a Boolean
         // literal is Boolean-valued without being a BooleanExpression metaclass.
-        if !conforms(r.b.elements[condition].ty, "Expression") {
+        if !is_a!(r.b.elements[condition], "Expression") {
             return Err(incomplete());
         }
         if r.b.elements[condition].ty == "LiteralBoolean"

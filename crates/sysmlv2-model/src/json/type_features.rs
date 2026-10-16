@@ -4,6 +4,7 @@ use super::{
     membership_projection::Membership, semantic::certified_types::Stamp,
     structural_index::StoredStructure, type_relations::TypeRelations,
 };
+use crate::layered::IdMap;
 use crate::metaclass::conforms;
 use std::collections::HashSet;
 
@@ -43,7 +44,7 @@ pub(super) struct MembershipSequence {
     pub inheritable: Vec<Membership>,
     pub non_private: Vec<Membership>,
     pub root_import: bool,
-    pub required_positional: std::collections::HashMap<usize, Vec<usize>>,
+    pub required_positional: IdMap<usize, Vec<usize>>,
 }
 pub(super) fn supported_root(ty: &str) -> bool {
     matches!(
@@ -241,7 +242,7 @@ impl super::Builder {
 mod tests {
     use super::*;
     use crate::{
-        json::{ClosurePolicy, PropertyError},
+        json::{ClosurePolicy, Derived, DerivedValue, PropertyError},
         model::{GraphFormat, Model},
     };
     use serde_json::json;
@@ -433,11 +434,81 @@ mod tests {
         assert_eq!(a.features, refs(&mut r, &["A::x"]));
         assert_eq!(a.memberships.unwrap().len(), 2);
         assert_eq!(a.members.unwrap().len(), 1);
+        // Both Memberships of x — the owning one and the alias — are
+        // inherited, x once among the features; the alias stays a plain
+        // Membership rather than a feature slot of its own.
         let b = complete(&mut r, "B");
-        // The shared inherited-membership filter suppresses competing aliases
-        // of the same Feature by its reflexive redefinition closure.
-        assert!(b.feature_memberships.is_empty());
-        assert!(b.features.is_empty());
+        assert_eq!(b.features, refs(&mut r, &["A::x"]));
+        assert_eq!(b.inherited_features, refs(&mut r, &["A::x"]));
+        assert_eq!(b.feature_memberships.len(), 1);
+        assert_eq!(b.inherited_memberships.len(), 2);
+        assert_eq!(b.memberships.unwrap().len(), 2);
+        assert_eq!(b.members.unwrap().len(), 1);
+    }
+    /// A type that owns a feature and an alias of it passes both Memberships
+    /// on: a subtype's references through either name resolve to the
+    /// feature, a redefinition of it resolves, and the derived inheritance
+    /// agrees — with no library loaded, where every name goes through the
+    /// inherited memberships (the checked projection needs the library's
+    /// roots and is read on the fixture).
+    #[test]
+    fn an_alias_does_not_hide_the_feature_it_names_from_subtypes() {
+        const MODEL: &str = "class A { feature x; alias other for x; } class B specializes A; \
+             class C specializes B { feature y :> x; feature z :> other; } \
+             class D specializes B { feature w :>> x; }";
+        for format in [GraphFormat::LegacyV2, GraphFormat::CanonicalV3] {
+            let mut r = fixture(MODEL, format);
+            full(&mut r);
+            let x = r.resolve_qualified("A::x").unwrap();
+            let b = complete(&mut r, "B");
+            assert_eq!(b.features, vec![x]);
+            assert_eq!(b.inherited_memberships.len(), 2);
+            let mut m = Model::with_graph_format(format);
+            let unit = m.add_source("alias.kerml", MODEL);
+            assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+            let mut r = ResolvedModel::build(&m);
+            full(&mut r);
+            let x = r.resolve_qualified("A::x").unwrap();
+            let id = r.element_id(x).to_string();
+            let target = |r: &mut ResolvedModel, feature: &str, relationship: &str, end: &str| {
+                let f = r.resolve_qualified(feature).unwrap();
+                let Derived::Value(DerivedValue::Elements(rels)) = r.derived(f, relationship)
+                else {
+                    panic!("{feature}: {relationship} is derived")
+                };
+                assert_eq!(rels.len(), 1, "{feature}: one {relationship}");
+                r.element_properties(rels[0])
+                    .get(end)
+                    .and_then(|t| t.get("@id"))
+                    .and_then(|i| i.as_str())
+                    .map(str::to_owned)
+            };
+            assert_eq!(
+                target(&mut r, "C::y", "ownedSubsetting", "subsettedFeature"),
+                Some(id.clone())
+            );
+            assert_eq!(
+                target(&mut r, "C::z", "ownedSubsetting", "subsettedFeature"),
+                Some(id.clone())
+            );
+            assert_eq!(
+                target(&mut r, "D::w", "ownedRedefinition", "redefinedFeature"),
+                Some(id.clone())
+            );
+            let b = r.resolve_qualified("B").unwrap();
+            let Derived::Value(DerivedValue::Elements(inherited)) =
+                r.derived(b, "inheritedFeature")
+            else {
+                panic!("inheritedFeature is derived")
+            };
+            assert_eq!(inherited, vec![x]);
+            let Derived::Value(DerivedValue::Elements(memberships)) =
+                r.derived(b, "inheritedMembership")
+            else {
+                panic!("inheritedMembership is derived")
+            };
+            assert_eq!(memberships.len(), 2);
+        }
     }
     #[test]
     fn malformed_suppressed_features_and_inverse_domains_refuse_complete_reports() {
@@ -512,10 +583,10 @@ mod tests {
         assert_eq!(complete.members, Ok(vec![]));
         // An ordinary unfeatured Feature now has the same complete empty
         // namespace projection. The same-ID kind edit must revalidate it.
-        r.b.elements[e.0].ty = "Feature";
+        r.b.elements[e.0].set_ty("Feature");
         assert_eq!(r.type_feature_report(e).projections, Ok(complete));
         for kind in ["Association", "Expression", "PartUsage", "Predicate"] {
-            r.b.elements[e.0].ty = kind;
+            r.b.elements[e.0].set_ty(kind);
             assert_eq!(
                 r.type_feature_report(e).projections,
                 Err(TypeInputIssue::UnsupportedConfiguration),

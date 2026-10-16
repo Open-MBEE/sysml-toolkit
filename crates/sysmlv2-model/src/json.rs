@@ -21,6 +21,7 @@ mod behavior;
 mod callable_bodies;
 mod cases;
 mod closures;
+mod constructor_sequence;
 mod derived;
 mod derived_compositions;
 mod direction_proof;
@@ -30,11 +31,15 @@ mod literal_inheritance;
 mod membership_context;
 mod metadata_associations;
 mod model_level_evaluability;
+use crate::metaclass::is_a;
 use membership_context::{ImportProjection, MembershipContext, MembershipProjection};
 mod dynamic_graph;
 mod dynamic_invocations;
 mod generated_defaults;
 mod implied;
+pub(crate) use library_plans::LibraryPlansWire;
+pub(crate) use recorded_lookup::GraphWire;
+pub(crate) use structural_index::PrefixWire;
 mod import_memberships;
 mod library_plans;
 pub(crate) use library_plans::{LibraryEnumTypes, LibraryPlans};
@@ -52,6 +57,7 @@ mod positional;
 mod positional_delta;
 pub(crate) mod provider_completeness;
 mod publication;
+mod reach;
 mod recorded_lookup;
 mod redefinition_provenance;
 mod result_redefinition;
@@ -232,14 +238,7 @@ pub fn model_to_compact_json_with_units(
 ) -> (Value, Vec<(usize, String)>) {
     let mut b = Builder::default();
     let boundary = b.build_model(model);
-    // Each unit's first element is its root namespace; user units are
-    // the ones at or past the library boundary.
-    let units: Vec<(usize, String)> = b
-        .unit_starts
-        .iter()
-        .filter(|&&(start, _)| start >= boundary)
-        .map(|&(start, orig)| (start - boundary, model.unit_meta(orig).0.to_owned()))
-        .collect();
+    let units = b.user_unit_structure(boundary, model);
     if model.graph_format() == crate::model::GraphFormat::CanonicalV3 {
         let mut resolved = ResolvedModel::from_builder(b, model);
         let compact = resolved.completed_compact_range(boundary, resolved.b.explicit_len());
@@ -270,17 +269,21 @@ pub fn library_to_compact_json_with_units(
 ) -> (Value, Vec<(usize, String)>) {
     let mut b = Builder::default();
     let boundary = b.build_model(model);
+    // The library's elements are its source rows: a prepared library's own
+    // materialized rows follow them in the prefix (see
+    // `Builder::lib_implied_from`) and are no element of its units.
+    let end = b.lib_implied_from.min(boundary);
     let units: Vec<(usize, String)> = b
         .unit_starts
         .iter()
-        .filter(|&&(start, _)| start < boundary)
+        .filter(|&&(start, _)| start < end)
         .map(|&(start, orig)| (start, model.unit_meta(orig).0.to_owned()))
         .collect();
     if model.graph_format() == crate::model::GraphFormat::CanonicalV3 {
         let mut resolved = ResolvedModel::from_builder(b, model);
-        (resolved.completed_compact_range(0, boundary), units)
+        (resolved.completed_compact_range(0, end), units)
     } else {
-        (b.finish_range(0, boundary), units)
+        (b.finish_range(0, end), units)
     }
 }
 
@@ -433,12 +436,14 @@ pub struct RootShadowing {
     pub resolves_to_library: bool,
 }
 
-/// Resolve a model and report referential findings instead of JSON.
 /// True when any user unit declares a top-level name that also appears as
 /// a top-level name of a library unit — the one situation where a library
 /// reference's resolution could differ from the library-only world the
 /// cache was recorded in. Conservative: any identification on a top-level
-/// package, definition, usage, or alias counts.
+/// package, definition, usage, or alias counts. The sealed snapshot must
+/// be decided before lowering, so it is gated on this test; a build on a
+/// prepared library decides after lowering instead, on what each such root
+/// name then selects ([`Builder::root_shadowing_keeps_library`]).
 fn top_level_shadowing(model: &crate::model::Model) -> bool {
     let user = top_level_names(model.user_units().map(|(_, u)| u));
     if let Some(library) = &model.prepared {
@@ -457,6 +462,13 @@ pub(crate) fn relationship_owners(b: &Builder) -> Vec<Option<usize>> {
     for (i, element) in b.elements.iter().enumerate() {
         for &r in &element.owned_relationships {
             owners[r] = Some(i);
+        }
+    }
+    // The prepared library's own materialized rows are owned through its
+    // view (see `Builder::lib_implied_from`).
+    if let Some(prefix) = &b.prefix_ownership {
+        for (relationship, owner) in prefix.relationship_owners() {
+            owners[relationship] = Some(owner);
         }
     }
     owners
@@ -483,6 +495,7 @@ pub(crate) fn top_level_names<'a>(
     names
 }
 
+/// Resolve a model and report referential findings instead of JSON.
 pub fn model_resolution_report(model: &crate::model::Model) -> ResolutionReport {
     let mut b = Builder::default();
     b.build_model(model);
@@ -657,6 +670,169 @@ pub(crate) struct InheritedBindings {
     pub(crate) implicit_redefinitions: Vec<(usize, usize)>,
 }
 
+/// The inherited-member reducer's walks of each feature's redefinition
+/// chain ([`Builder::reduce_membership_projection`]): for a feature, the
+/// features the walk reached (itself first) and the steps it charged. Every
+/// type that inherits a feature walks the same chain, so the walk is made
+/// once for a state of the rows, the specializations, the dynamic plan and
+/// the positional plan, and read by the other types; the memo is dropped
+/// with the inherited-member memo.
+#[derive(Clone, Default)]
+pub(crate) struct RedefinitionClosures {
+    key: Option<ClosureKey>,
+    /// The walks with the implied heritage (`[1]`) and without it (`[0]`).
+    walks: [ClosureWalks; 2],
+}
+
+/// What a base scope contributes of its own to the enumeration of a scope
+/// that inherits it: its non-private owned and imported members with the
+/// scope each comes from, their Memberships in normative order (public
+/// before protected, owned before imported) and its alias Memberships.
+#[derive(Default)]
+pub(crate) struct BaseContribution {
+    membership_order: Vec<usize>,
+    found: Vec<(usize, usize)>,
+    alias_rels: Vec<usize>,
+    truncated: bool,
+    incomplete: bool,
+}
+
+/// What the inherited-member reducer read of the candidates a heritage
+/// gives ([`Builder::inherited_bindings`]): an owned feature that redefines
+/// none of `reach` and shares no name hash in `names` takes no part in the
+/// reduction, so a scope whose owned features all leave them alone has
+/// the inherited memberships of every other scope with its heritage.
+#[derive(Default)]
+pub(crate) struct HeritageFacts {
+    /// Every feature a candidate's redefinition walk reaches, the
+    /// candidates themselves among them.
+    reach: crate::layered::IdSet<usize>,
+    /// The candidates' name hashes ([`row_name_keys`]), both spellings.
+    names: crate::layered::IdSet<u64>,
+    /// Whether the reduction was complete but for the enumerated scope's
+    /// own planning ([`Builder::owner_planning_incomplete`]).
+    complete: bool,
+}
+
+/// A heritage's facts ([`HeritageFacts`]) and, once a scope whose owned
+/// features leave them alone has enumerated it completely, its inherited
+/// memberships.
+#[derive(Clone)]
+pub(crate) struct HeritageReduction {
+    facts: Arc<HeritageFacts>,
+    bindings: Option<Arc<InheritedBindings>>,
+}
+
+/// Per feature: the features its redefinition walk reached and the steps
+/// the walk charged.
+type ClosureWalks = crate::layered::IdMap<usize, (Arc<[usize]>, usize)>;
+
+/// What a redefinition walk reads besides the rows' content: the tables'
+/// revisions, the dynamic plan, whether a positional plan is in effect and
+/// the planner flags that change how the walk reads them.
+#[derive(Clone)]
+struct ClosureKey {
+    rows: crate::layered::Revision,
+    targets: crate::layered::Revision,
+    resolved: crate::layered::Revision,
+    dynamic: Option<Arc<dynamic_graph::Snapshot>>,
+    positional: bool,
+    semantic_ready: bool,
+    static_planning: bool,
+}
+
+impl ClosureKey {
+    fn same(&self, other: &Self) -> bool {
+        self.rows.same_as(&other.rows)
+            && self.targets.same_as(&other.targets)
+            && self.resolved.same_as(&other.resolved)
+            && match (&self.dynamic, &other.dynamic) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+            && self.positional == other.positional
+            && self.semantic_ready == other.semantic_ready
+            && self.static_planning == other.static_planning
+    }
+}
+
+impl InheritedBindings {
+    /// The outcome with its vectors trimmed to their lengths: the walk grows
+    /// them by pushing, and a kept outcome lives as long as the build —
+    /// tens of thousands of them on a large model.
+    fn compact(mut self) -> Self {
+        self.members.shrink_to_fit();
+        self.alias_rels.shrink_to_fit();
+        self.membership_order.shrink_to_fit();
+        self.implicit_redefinitions.shrink_to_fit();
+        self
+    }
+}
+
+/// A name's FNV-1a hash, never 0 (none) or `u64::MAX` (not made yet).
+fn name_hash(name: Option<&str>) -> u64 {
+    let Some(name) = name else {
+        return 0;
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h.clamp(1, u64::MAX - 1)
+}
+
+/// Each row's declared name and short name, hashed ([`name_hash`]), for
+/// one state of a build's rows: a prepared library's rows take theirs
+/// from the table every build on the library shares, and the build's own
+/// rows have theirs made as they are read.
+#[derive(Clone)]
+pub(crate) struct NameKeys {
+    /// The rows the keys describe (see [`crate::layered::LayeredVec::observe_revision`]).
+    rows: crate::layered::Revision,
+    /// The library's rows' keys, every row's made, read at the row's index.
+    shared: Arc<Vec<[u64; 2]>>,
+    /// The rows above the shared table's, read at the row's index less the
+    /// table's length; `u64::MAX` where a row's are not made yet.
+    own: Vec<[u64; 2]>,
+}
+
+/// Every row's name keys, made: the table a prepared library keeps for
+/// the builds on it (see [`crate::prepared::PreparedLibrary::library_name_keys`]).
+pub(crate) fn name_keys_of(b: &Builder) -> Vec<[u64; 2]> {
+    b.elements
+        .iter()
+        .map(|element| {
+            let (name, short) = element.props.declared_names();
+            [name_hash(name), name_hash(short)]
+        })
+        .collect()
+}
+
+/// Row `e`'s declared name and short name as hashes (0 for none), from
+/// `keys` when kept there, else made and kept.
+fn row_name_keys(
+    elements: &crate::layered::LayeredVec<Elem>,
+    keys: &mut NameKeys,
+    e: usize,
+) -> [u64; 2] {
+    if let Some(key) = keys.shared.get(e) {
+        return *key;
+    }
+    let shared = keys.shared.len();
+    let i = e - shared;
+    if keys.own.len() <= i {
+        keys.own
+            .resize((elements.len() - shared).max(i + 1), [u64::MAX; 2]);
+    }
+    if keys.own[i][0] == u64::MAX {
+        let (name, short) = elements[e].props.declared_names();
+        keys.own[i] = [name_hash(name), name_hash(short)];
+    }
+    keys.own[i]
+}
+
 /// Replace an id-spelled `@ref` placeholder atom (or any nested in an
 /// array) with a reference to that id.
 fn bind_atom(atom: &mut crate::properties::Atom, bound: &mut HashSet<Uuid>) {
@@ -689,10 +865,182 @@ fn bind_atom(atom: &mut crate::properties::Atom, bound: &mut HashSet<Uuid>) {
 /// later `::**` one that also descends into `Q`'s members.
 type ImportVisit = (usize, u8, bool, Vec<(usize, usize)>);
 
+/// Rows by interchange id, a later row winning a shared id. A build on a
+/// prepared library's frozen rows reads theirs through the table the
+/// freeze kept, shared by every build on them, and tables only its own
+/// rows over it (see [`Builder::element_index_of_uuid`]). A table may
+/// instead lie, below a limit, over a table that covers rows past the
+/// build's own — a build cut to its library's source rows over the
+/// library's table, which covers the materialized rows too (see
+/// [`Builder::truncate_prefix_to_source_rows`]): it answers and counts the
+/// rows below the limit only, and takes no rows of its own.
+#[derive(Clone, Default)]
+pub(crate) struct RowsById {
+    rows: crate::layered::LayeredMap<Uuid, usize>,
+    /// The rows the table answers for, when it lies over a table of more
+    /// rows than the build's: those below.
+    limit: Option<usize>,
+}
+
+impl RowsById {
+    /// A table over the frozen table `frozen`, with no rows of its own yet.
+    pub(crate) fn over(frozen: Arc<crate::layered::IdMap<Uuid, usize>>) -> Self {
+        Self {
+            rows: crate::layered::LayeredMap::over(frozen),
+            limit: None,
+        }
+    }
+    /// The rows below `limit` of the table `frozen`, every one of which
+    /// maps to itself there (the caller has checked): exactly `limit`
+    /// entries, the table's other rows hidden.
+    pub(crate) fn below(frozen: Arc<crate::layered::IdMap<Uuid, usize>>, limit: usize) -> Self {
+        Self {
+            rows: crate::layered::LayeredMap::over(frozen),
+            limit: Some(limit),
+        }
+    }
+    pub(crate) fn get(&self, id: &Uuid) -> Option<&usize> {
+        self.rows
+            .get(id)
+            .filter(|&&row| self.limit.is_none_or(|limit| row < limit))
+    }
+    pub(crate) fn contains_key(&self, id: &Uuid) -> bool {
+        self.get(id).is_some()
+    }
+    /// How many ids the table answers.
+    pub(crate) fn len(&self) -> usize {
+        self.limit.unwrap_or_else(|| self.rows.len())
+    }
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Uuid, &usize)> {
+        self.rows
+            .iter()
+            .filter(|&(_, &row)| self.limit.is_none_or(|limit| row < limit))
+    }
+    pub(crate) fn insert(&mut self, id: Uuid, row: usize) {
+        debug_assert!(self.limit.is_none(), "a table below a limit takes no rows");
+        self.rows.insert(id, row);
+    }
+    /// [`crate::layered::LayeredMap::replace`].
+    pub(crate) fn replace(&mut self, id: Uuid, row: usize) -> Option<usize> {
+        debug_assert!(self.limit.is_none(), "a table below a limit takes no rows");
+        self.rows.replace(id, row)
+    }
+    pub(crate) fn freeze(&mut self) {
+        self.rows.freeze();
+    }
+    /// Whether the table lies over `frozen`, shared.
+    #[cfg(test)]
+    pub(crate) fn lies_over(&self, frozen: &Arc<crate::layered::IdMap<Uuid, usize>>) -> bool {
+        Arc::ptr_eq(self.rows.base_arc(), frozen)
+    }
+    /// The shared frozen table, overlaid or not.
+    #[cfg(test)]
+    pub(crate) fn base_arc(&self) -> &Arc<crate::layered::IdMap<Uuid, usize>> {
+        self.rows.base_arc()
+    }
+    /// The rows tabled over the frozen table.
+    #[cfg(test)]
+    pub(crate) fn local_iter(&self) -> impl Iterator<Item = (&Uuid, &usize)> {
+        self.rows.local_iter()
+    }
+}
+impl From<crate::layered::IdMap<Uuid, usize>> for RowsById {
+    /// A table of these rows alone, over no frozen table.
+    fn from(rows: crate::layered::IdMap<Uuid, usize>) -> Self {
+        Self {
+            rows: rows.into(),
+            limit: None,
+        }
+    }
+}
+impl FromIterator<(Uuid, usize)> for RowsById {
+    /// A table of these rows alone, over no frozen table.
+    fn from_iter<I: IntoIterator<Item = (Uuid, usize)>>(rows: I) -> Self {
+        Self {
+            rows: rows.into_iter().collect(),
+            limit: None,
+        }
+    }
+}
+
 /// Valued chain redefinitions by owning type: (redefining feature, resolved
 /// chain links) — see [`Builder::chain_redefinitions`].
 pub(crate) type ChainRedefinitions =
     Arc<crate::layered::LayeredMap<usize, Vec<(usize, Vec<usize>)>>>;
+
+thread_local! {
+    /// The scratch marks the enumerations on this thread borrow and return
+    /// ([`Builder::borrow_marks`]): as many tables as sets are live at
+    /// once, grown as enumerations nest and to the most rows a build on
+    /// the thread has marked. A set is begun anew at each borrow, so every
+    /// build the thread runs lends from the one pool instead of keeping
+    /// tables of its own, grown to its library's rows.
+    static MARKS_POOL: std::cell::RefCell<Vec<crate::layered::Marks>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The builder's element rows as a snapshot writes them: a part of their
+/// own, apart from the rest of the builder's record, so that a reader
+/// decodes them side by side with it (see [`Builder::attach_rows`]).
+pub(crate) struct ElementRows<'a>(&'a crate::layered::LayeredVec<Elem>);
+
+impl serde::Serialize for ElementRows<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        element_table::serialize(self.0, s)
+    }
+}
+
+/// [`ElementRows`] read back.
+pub(crate) struct ElementRowsOwned(crate::layered::LayeredVec<Elem>);
+
+impl<'de> serde::Deserialize<'de> for ElementRowsOwned {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        element_table::deserialize(d).map(Self)
+    }
+}
+
+/// The builder's scope rows as a snapshot writes them, a part of their own
+/// like [`ElementRows`].
+pub(crate) struct ScopeRows<'a>(&'a crate::layered::LayeredVec<Scope>);
+
+impl serde::Serialize for ScopeRows<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        scope_table::serialize(self.0, s)
+    }
+}
+
+/// [`ScopeRows`] read back.
+pub(crate) struct ScopeRowsOwned(crate::layered::LayeredVec<Scope>);
+
+impl<'de> serde::Deserialize<'de> for ScopeRowsOwned {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        scope_table::deserialize(d).map(Self)
+    }
+}
+
+impl Builder {
+    /// The element rows as a snapshot writes them, a part of their own.
+    pub(crate) fn element_rows(&self) -> ElementRows<'_> {
+        ElementRows(&self.elements)
+    }
+
+    /// The scope rows as a snapshot writes them, a part of their own.
+    pub(crate) fn scope_rows(&self) -> ScopeRows<'_> {
+        ScopeRows(&self.scopes)
+    }
+
+    /// Give a builder read back from a snapshot the rows its own record
+    /// leaves out (`elements` and `scopes` are written as parts of their own).
+    pub(crate) fn attach_rows(&mut self, elements: ElementRowsOwned, scopes: ScopeRowsOwned) {
+        self.elements = elements.0;
+        self.scopes = scopes.0;
+    }
+}
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Builder {
@@ -744,23 +1092,34 @@ pub(crate) struct Builder {
     recorded_lookup_suppressed: bool,
     #[serde(skip)]
     library_refs_to_users: bool,
-    /// Immutable library facts; never retain facts about user additions.
+    /// The prepared library's facts, read on first use; never facts about
+    /// user additions. `Some` on every build on a prepared library.
     #[serde(skip)]
-    pub(crate) library_facts: Option<std::sync::Arc<crate::check::facts::Facts>>,
+    pub(crate) library_facts: Option<std::sync::Arc<crate::prepared::LibraryFacts>>,
+    /// The static facts of the rows as they are (see [`Builder::facts`]),
+    /// made once per state of the rows and the metadata associations.
+    #[serde(skip)]
+    pub(crate) facts_memo: Option<crate::check::facts::FactsMemo>,
     /// Names that found no binding in the root scope while this library was
     /// prepared. Only these lookups can change when a model adds root
     /// declarations or root-level imports; root hits are owned members,
     /// which take precedence over anything a later import contributes.
+    #[serde(serialize_with = "crate::prepared::sorted_names")]
     pub(crate) root_misses: HashSet<String>,
-    /// Flat element list in ownership (depth-first) order.
-    #[serde(with = "element_table")]
+    /// Flat element list in ownership (depth-first) order. A snapshot
+    /// writes the rows as a part of their own ([`ElementRows`]), apart from
+    /// this record, and attaches them when read back.
+    #[serde(skip)]
     pub(crate) elements: crate::layered::LayeredVec<Elem>,
     /// Ownership-path hash states, kept only while a build lowers.
     #[serde(skip)]
     path_hashes: Option<PathHashes>,
-    #[serde(with = "scope_table")]
+    /// The scopes; a part of their own in a snapshot like the elements
+    /// ([`ScopeRows`]).
+    #[serde(skip)]
     scopes: crate::layered::LayeredVec<Scope>,
     /// Element index → its body scope (for namespace-owning elements).
+    #[serde(with = "crate::bulk::index_map")]
     pub(crate) elem_scope: crate::layered::LayeredMap<usize, usize>,
     /// Per-scope cache of resolved namespace-import target scopes (with the
     /// recursive flag and the import's bracket-filter indices).
@@ -772,12 +1131,23 @@ pub(crate) struct Builder {
     /// tables', fixed for a pass.
     #[serde(skip)]
     recursive_subs: crate::layered::IdMap<(usize, u8), Arc<[usize]>>,
+    /// What a lookup through each scope can reach (see [`reach`]): the
+    /// lookups in the scope, and those of its whole tree, by scope.
+    #[serde(skip)]
+    reach_memo: crate::layered::ScopeTable<[Option<Arc<reach::Reach>>; 2]>,
+    /// The names beyond each distinct set of reaches (see [`reach`]).
+    #[serde(skip)]
+    reach_beyond: reach::Beyond,
+    /// The scope count [`Self::reach_memo`] was made for.
+    #[serde(skip)]
+    reach_scopes: usize,
     /// [`Self::chain_redefinitions`], with the element count it was built
     /// for.
     #[serde(skip)]
     chain_redefinitions: Option<(usize, ChainRedefinitions)>,
     /// Import relationships a lookup actually resolved a name through
     /// (admitted hits only) — the unused-import check's evidence.
+    #[serde(with = "crate::bulk::index_set")]
     pub(crate) used_imports: crate::layered::IdSet<usize>,
     /// Import relationships the resolution in progress walked through,
     /// each with the access the walk ran under; cleared per user
@@ -803,6 +1173,14 @@ pub(crate) struct Builder {
     /// Per-scope cache of resolved specialization-base scopes.
     #[serde(skip)]
     base_cache: crate::layered::ScopeTable<Option<(Vec<usize>, usize)>>,
+    /// Every scope a lookup reaches from a scope through its bases,
+    /// transitively (the scope itself only through a cycle), sorted; made
+    /// per scope on first use and kept with the base cache it is read from.
+    /// The protected-access test of a lookup asks it for a scope and each
+    /// enclosing one, where it walked the bases with a fresh visited set
+    /// per query.
+    #[serde(skip)]
+    base_closure: crate::layered::ScopeTable<Option<Arc<[usize]>>>,
     /// Rule-required positional edges, keyed by stable element indices.
     #[serde(skip)]
     positional_redefinitions: Option<positional::PositionalRedefinitions>,
@@ -828,6 +1206,14 @@ pub(crate) struct Builder {
     /// once per state of the rows (see [`Builder::library_plans`]).
     #[serde(skip)]
     library_plans_decided: Option<library_plans::LibraryPlansDecided>,
+    /// The last budgeted planning attempt that ran out of budget without
+    /// leaving progress behind: the inputs it planned over (rows, resolved
+    /// targets, library names and configuration, implied plan) and the
+    /// budget it had. A repeat over the same inputs with no more budget
+    /// would fail the same way, so it is refused without planning again
+    /// (see [`Builder::ensure_positional_redefinitions_with_budget`]).
+    #[serde(skip)]
+    positional_budget_exhausted: Option<positional::BudgetExhausted>,
     /// Caller-supplied library-name overrides used by positional planning
     /// before the implied relationship view is materialized.
     #[serde(skip)]
@@ -843,6 +1229,28 @@ pub(crate) struct Builder {
     /// scopes over a few hundred distinct heritages.
     #[serde(skip)]
     inherited_by_heritage: HashMap<(Vec<usize>, bool), Arc<InheritedBindings>>,
+    /// The reducer's per-feature redefinition walks ([`RedefinitionClosures`]),
+    /// dropped with the inherited-member memo; `redefinition_epoch` counts
+    /// the drops, so that a walk a replan interrupted is not kept.
+    #[serde(skip)]
+    redefinition_closures: Option<RedefinitionClosures>,
+    /// Each row's declared name and short name, hashed, for one state of
+    /// the rows ([`row_name_keys`]).
+    #[serde(skip)]
+    name_keys: Option<NameKeys>,
+    #[serde(skip)]
+    redefinition_epoch: u64,
+    /// Per (base scope, include_implied): what the base contributes of its
+    /// own to the enumeration of every scope that inherits it
+    /// ([`BaseContribution`]), dropped with the inherited-member memo.
+    #[serde(skip)]
+    base_contributions: crate::layered::IdMap<(usize, bool), Arc<BaseContribution>>,
+    /// Per (heritage walked, include_implied), for scopes that own
+    /// features: what the reducer read of the heritage's candidates and the
+    /// memberships it leaves ([`HeritageReduction`]), dropped with the
+    /// inherited-member memo.
+    #[serde(skip)]
+    heritage_reductions: HashMap<(Vec<usize>, bool), HeritageReduction>,
     /// Per-scope visit marks and outcomes for the current name query
     /// ([`Self::lookup`]). `None` under the active stamp means the scope is
     /// currently being evaluated (a cyclic re-entry is a miss); `Some`
@@ -937,6 +1345,11 @@ pub(crate) struct Builder {
     /// Root misses behind each scope's `base_cache` entry.
     #[serde(skip)]
     base_misses: crate::layered::ScopeTable<FillMisses>,
+    /// Implied library bases found by name, with the root misses their
+    /// lookups noted ([`Self::resolve_implied_base`]); cleared with the
+    /// base cache.
+    #[serde(skip)]
+    implied_base_memo: HashMap<String, (usize, bool, Vec<String>)>,
     /// Root misses behind each scope's `import_cache` entry — the
     /// resolution of every namespace import target of the scope, which
     /// also yields its `import_targets` entries.
@@ -982,10 +1395,12 @@ pub(crate) struct Builder {
     /// Elements whose feature value is a `default` (KerML FeatureValue
     /// isDefault): a redefining feature with no value of its own inherits
     /// such an expression, re-evaluated in the redefining context.
+    #[serde(serialize_with = "crate::prepared::sorted_set")]
     pub(crate) default_values: HashSet<usize>,
     /// Static contracts for synthesized action parameters and trigger arguments.
     /// Separate from feature values: these do not provide runtime bindings.
     pub(crate) owned_cross_features: crate::layered::LayeredMap<usize, usize>,
+    #[serde(serialize_with = "crate::prepared::sorted_set")]
     pub(crate) payload_flows: HashSet<usize>,
     pub(crate) contract_exprs: crate::layered::LayeredMap<usize, (usize, Expr)>,
     /// Authored ranges for semantic checks: (source element, lexical scope,
@@ -1054,16 +1469,18 @@ pub(crate) struct Builder {
     /// expression evaluator must not mistake their return expressions for
     /// the result of executing the body. This is derived from source on
     /// every build, including builds that replay a library cache.
+    #[serde(serialize_with = "crate::prepared::sorted_set")]
     pub(crate) executable_calculations: HashSet<usize>,
     /// Derived source-site parameter identities, rebuilt when elements are appended.
     #[serde(skip)]
     parameter_sites: Option<parameters::ParameterSites>,
     #[serde(skip)]
     parameter_signatures: Option<parameters::ParameterSignatures>,
-    /// Every named usage member per owning element, in declaration order
-    /// with its element index — the binding targets for `new T(…)`
-    /// constructor evaluation (filtered to data usages at use).
-    pub(crate) ctor_fields: crate::layered::LayeredMap<usize, Vec<(String, usize)>>,
+    /// The constructor sequences of the types `new T(…)` instantiates,
+    /// memoized once the graph is semantically ready — see
+    /// [`Builder::constructor_feature_sequence`].
+    #[serde(skip)]
+    pub(crate) constructor_sequences: Option<constructor_sequence::ConstructorSequences>,
     /// Return-parameter element per owning element — a calculation written
     /// `return x = expr;` yields its return parameter's bound value (the
     /// evaluator's fallback when there is no trailing result expression).
@@ -1078,12 +1495,18 @@ pub(crate) struct Builder {
     /// operators).
     #[serde(skip)]
     pub(crate) spec_index: Option<crate::layered::LayeredMap<usize, Vec<usize>>>,
+    /// Memo of what the specialization index answers per element: the
+    /// closure [`Self::indexed_conforms`] walks and the redefinition targets
+    /// [`Self::indexed_redefinition_targets`] lists, kept for the
+    /// specialization-row and resolved-target revisions it was built at.
+    #[serde(skip)]
+    spec_memo: Option<SpecMemo>,
     /// Lazily built interchange-id → element index map (the inverse of
     /// id assignment) — resolves id-valued relationship properties like
     /// `referencedFeature` without a [`ResolvedModel`] at hand. Rebuilt
     /// when the element count moves (edit sessions append).
     #[serde(skip)]
-    id_index: Option<Arc<crate::layered::IdMap<Uuid, usize>>>,
+    id_index: Option<Arc<RowsById>>,
     /// Element count `id_index` was built for (the map itself is shorter
     /// than the element list when ids collide, which must not force a
     /// rebuild per lookup).
@@ -1098,12 +1521,27 @@ pub(crate) struct Builder {
     /// its own.
     #[serde(skip)]
     pub(crate) prefix_structure: Option<Arc<structural_index::PrefixStructure>>,
+    /// The prefix scan the snapshot carried, until the freeze takes it.
+    #[serde(skip)]
+    pub(crate) prefix_carried: Option<structural_index::PrefixWire>,
+    /// The kept lookup graph the snapshot carried, until the freeze takes it.
+    #[serde(skip)]
+    pub(crate) lookup_carried: Option<recorded_lookup::GraphWire>,
     /// The frozen rows by id, kept by the freeze for the identity
     /// assignment of every build on them (see [`Self::assign_user_ids`]):
     /// the kept lookup graph's own table where there is one, else made at
     /// the freeze. Not serialized: a decoded library's freeze makes its own.
     #[serde(skip)]
     pub(crate) prefix_ids: Option<Arc<crate::layered::IdMap<Uuid, usize>>>,
+    /// The library's rows by id, kept by a build cut to the library's
+    /// source rows (see [`Self::truncate_prefix_to_source_rows`]), whose
+    /// rows are exactly those: the index the build tables for its reads
+    /// lies over this table, below the cut, instead of tabling the rows
+    /// again (see [`Self::element_index_of_uuid`]). The table covers the
+    /// materialized rows the cut left out, which the index hides. Not
+    /// serialized.
+    #[serde(skip)]
+    cut_ids: Option<Arc<crate::layered::IdMap<Uuid, usize>>>,
     /// The library name tables by id, the first entry of an id winning,
     /// made by the first build on the frozen rows whose identity
     /// assignment reads a library row's name from them, and shared by
@@ -1111,6 +1549,28 @@ pub(crate) struct Builder {
     /// serialized: a decoded library's freeze makes its own cell.
     #[serde(skip)]
     pub(crate) prefix_table_names: Arc<std::sync::OnceLock<Arc<HashMap<Uuid, String>>>>,
+    /// The library's qualified names by name, made by the first build on
+    /// the frozen rows that plans implied relationships and shared by every
+    /// build on them (see [`Builder::implied_names`]). Not serialized: a
+    /// decoded library's freeze makes its own cell.
+    #[serde(skip)]
+    pub(crate) prefix_implied_names: Arc<std::sync::OnceLock<Arc<HashMap<String, Uuid>>>>,
+    /// The frozen rows' structural owners of their relationships, for a
+    /// build over the frozen rows cut to their source rows, made by the
+    /// first such build that plans and shared by every one after it (see
+    /// `Builder::specialization_relation_owners`; a build on a prepared
+    /// library reads the library's own table instead). Not serialized: a
+    /// decoded library's freeze makes its own cell.
+    #[serde(skip)]
+    pub(crate) prefix_relation_owners: Arc<std::sync::OnceLock<Arc<Vec<Option<usize>>>>>,
+    /// The frozen rows' specializations validated for the dynamic planner,
+    /// made by the first build on them that prepares a dynamic plan and
+    /// shared by every build on them (see
+    /// [`dynamic_invocations::PrefixValidation`]). Not serialized: a
+    /// decoded library's freeze makes its own cell.
+    #[serde(skip)]
+    pub(crate) prefix_validation:
+        Arc<std::sync::OnceLock<Arc<dynamic_invocations::PrefixValidation>>>,
     /// Lazily built constrained element → first header [`Self::multiplicities`]
     /// row, excluding body/named domain rows,
     /// with the row count it was built from. The table is
@@ -1122,6 +1582,35 @@ pub(crate) struct Builder {
     /// `boundary` of [`Self::build_model`], kept for library-ownership
     /// tests.
     pub(crate) lib_boundary: usize,
+    /// First of the prepared library's own materialized rows — the implied
+    /// relationships and owned results of its elements, made once when it
+    /// was prepared — which lie between its source rows and
+    /// [`Self::lib_boundary`]; equal to `lib_boundary` when it carries none.
+    /// Everything that reads the element list as the model's content skips
+    /// these rows (see [`Self::is_authored`]).
+    #[serde(default)]
+    pub(crate) lib_implied_from: usize,
+    /// The prepared library's ownership view over those rows (see
+    /// [`semantic_ownership::SemanticOwnership`]): the owner each of them
+    /// was added to, and the owned results it certified. A build's own
+    /// view layers over it.
+    #[serde(default)]
+    prefix_ownership: Option<Arc<semantic_ownership::SemanticOwnership>>,
+    /// What else a build on the library needs of those rows (see
+    /// [`implied::PrefixImplied`]).
+    #[serde(default)]
+    prefix_implied: Option<Arc<implied::PrefixImplied>>,
+    /// Set while a library-only build materializes the rows its prepared
+    /// library keeps: the static implied relationships, not the owned
+    /// results (see [`implied::PrefixImplied`]).
+    #[serde(skip)]
+    prefix_static_only: bool,
+    /// Set while the implied planner runs (as `static_planning` and
+    /// `positional_planning` are for theirs): the planners read source rows
+    /// and their own plans, never materialized rows, so the prepared
+    /// library's own rows are kept out of the ownership view meanwhile.
+    #[serde(skip)]
+    implied_planning: bool,
     /// Index of the first *implied* relationship the derivation layer
     /// materialized past the explicit elements (`json/implied.rs`);
     /// `None` until it did. Everything that iterates the element list as
@@ -1185,7 +1674,7 @@ pub(crate) struct Builder {
     pub(crate) metadata_about: std::collections::BTreeMap<usize, Vec<usize>>,
     /// Semantic snapshot changes can invalidate query proofs without row edits.
     #[serde(skip)]
-    metadata_association_generation: Option<std::sync::Arc<()>>,
+    pub(crate) metadata_association_generation: Option<std::sync::Arc<()>>,
     #[serde(default)]
     explicit_metadata_annotations: crate::layered::LayeredVec<usize>,
     #[serde(default)]
@@ -1583,6 +2072,9 @@ struct PendingWork {
 #[derive(Clone)]
 pub(crate) struct Elem {
     pub(crate) ty: &'static str,
+    /// `ty`'s index in the metaclass table (`metaclass::meta_of`), so a
+    /// conformance test of the row dispatches one name, not two.
+    pub(crate) meta: u8,
     id: Uuid,
     /// Ownership path used to derive `id` and children's ids: the whole
     /// path, or under a `path_parent` only the segment this element adds
@@ -1598,6 +2090,47 @@ pub(crate) struct Elem {
     pub(crate) owning_relationship: Option<usize>,
 }
 
+impl Elem {
+    /// Retype the row: `ty` and its cached index together.
+    pub(crate) fn set_ty(&mut self, ty: &'static str) {
+        self.ty = ty;
+        self.meta = crate::metaclass::meta_of(ty);
+    }
+
+    /// Whether the row's metaclass conforms to `general`, by the cached
+    /// index: one name dispatch for `general`. A row typed by no metaclass
+    /// (an interchange import may admit one) answers by name, as before.
+    #[inline]
+    pub(crate) fn conforms(&self, general: &str) -> bool {
+        if self.meta == crate::metaclass::UNKNOWN {
+            return self.ty == general;
+        }
+        crate::metaclass::conforms_meta(self.meta, general)
+    }
+
+    /// [`Self::conforms`] with `general` as an index
+    /// (`const { metaclass::index_const("…") }`): a bit test.
+    #[inline]
+    pub(crate) fn is(&self, general: u8) -> bool {
+        crate::metaclass::conforms_idx(self.meta, general)
+    }
+}
+
+/// What the specialization index answers per element, memoized while the
+/// rows it reads are unchanged: each element's closure under typing and
+/// specialization (itself included, sorted) and its resolved redefinition
+/// targets in index order. A reader checks the revisions before trusting
+/// an entry, so a resolution pass that writes a target starts a new memo.
+#[derive(Clone)]
+struct SpecMemo {
+    specs: crate::layered::Revision,
+    resolved: crate::layered::Revision,
+    closures: crate::layered::IdMap<usize, Arc<[usize]>>,
+    redefinitions: crate::layered::IdMap<usize, Arc<[usize]>>,
+    /// The one empty answer every element without redefinitions shares.
+    empty: Arc<[usize]>,
+}
+
 impl<'de> serde::Deserialize<'de> for Elem {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
@@ -1611,9 +2144,11 @@ impl<'de> serde::Deserialize<'de> for Elem {
             owning_relationship: Option<usize>,
         }
         let w = Wire::deserialize(d)?;
+        let (meta, ty) = crate::metaclass::lookup(&w.ty)
+            .ok_or_else(|| serde::de::Error::custom("unknown metaclass"))?;
         Ok(Self {
-            ty: crate::metaclass::canonical_name(&w.ty)
-                .ok_or_else(|| serde::de::Error::custom("unknown metaclass"))?,
+            ty,
+            meta,
             id: w.id,
             path: w.path,
             path_parent: None,
@@ -1698,6 +2233,7 @@ struct Scope {
     /// Simple redefinition targets of this scope's owner. When resolving
     /// one with that owner excluded, sibling inferred names in its parent
     /// cannot establish the target they themselves are derived from.
+    #[serde(serialize_with = "crate::prepared::sorted_names")]
     redefinition_names: HashSet<String>,
     /// Every name-spelled redefinition target of this scope's owner. Keep
     /// qualification so positional slot reduction can distinguish same-named
@@ -1744,6 +2280,33 @@ struct Scope {
     chain_bases: Vec<Vec<QualifiedName>>,
 }
 
+/// The largest same-name group the implicit-redefinition step of
+/// [`Builder::reduce_membership_projection`] decides pair by pair; a larger
+/// one is walked owner by owner.
+const PAIRWISE_GROUP: usize = 16;
+
+#[cfg(test)]
+thread_local!(static PAIRWISE_GROUP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) });
+
+fn pairwise_group_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = PAIRWISE_GROUP_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    PAIRWISE_GROUP
+}
+
+/// Run `f` with same-name groups up to `limit` members decided pair by
+/// pair (0: every group owner by owner; `usize::MAX`: every group pair by
+/// pair), for the tests that compare the two walks.
+#[cfg(test)]
+pub(crate) fn with_pairwise_group_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+    PAIRWISE_GROUP_OVERRIDE.with(|cell| cell.set(Some(limit)));
+    let result = f();
+    PAIRWISE_GROUP_OVERRIDE.with(|cell| cell.set(None));
+    result
+}
+
 impl Builder {
     fn build(&mut self, unit: &SourceUnit) {
         self.keep_path_hashes();
@@ -1763,12 +2326,17 @@ impl Builder {
         self.graph_format = model.graph_format();
         if let Some(library) = &model.prepared {
             if library.graph_format() == self.graph_format
-                && !top_level_shadowing(model)
                 && !library.builder.user_completes_library(model)
             {
-                let boundary = self.build_on_library(model, &library.builder);
-                self.prepared_from = Some(Arc::clone(library));
-                return boundary;
+                if let Some(boundary) = self.build_on_library(model, &library.builder) {
+                    self.prepared_from = Some(Arc::clone(library));
+                    return boundary;
+                }
+                // A user root declaration changed what a library root name
+                // selects: resolve everything together, as for a completed
+                // root miss.
+                *self = Builder::default();
+                self.graph_format = model.graph_format();
             }
             // A prepared library's own recording stands in for the prepared
             // graph this build cannot reuse.
@@ -2023,7 +2591,16 @@ impl Builder {
         Some(())
     }
 
-    fn build_on_library(&mut self, model: &crate::model::Model, library: &Builder) -> usize {
+    /// Build the user units of `model` on the prepared `library` and return
+    /// the element index where they start; `None`, with the builder holding
+    /// the lowered but unresolved units, when a user root declaration
+    /// changes what a library root name selects, so that the library's
+    /// recorded outcomes cannot stand.
+    fn build_on_library(
+        &mut self,
+        model: &crate::model::Model,
+        library: &Builder,
+    ) -> Option<usize> {
         *self = library.clone();
         self.keep_path_hashes();
         self.semantic_ready = false;
@@ -2047,6 +2624,12 @@ impl Builder {
             }
             self.restore_payload_flags(model, orig, root);
         }
+        // Lowering bound every user root declaration beside the library's;
+        // a root name that no longer selects the library's declaration
+        // sends the model to the joint build before anything is resolved.
+        if !self.root_shadowing_keeps_library(boundary) {
+            return None;
+        }
         // The outcomes the previous build settled on, where this build's
         // units resolve the references they did then (see `settled`).
         self.seed = model
@@ -2059,7 +2642,100 @@ impl Builder {
         }
         self.assign_user_ids(boundary, &roots);
         self.path_hashes = None;
-        boundary
+        Some(boundary)
+    }
+
+    /// Whether every root name declared by both a library unit and a user
+    /// unit still selects what the library's own bindings select, under
+    /// every access a lookup can carry and with every exclusion a library
+    /// lookup can make: the verdict `binding_result` reads off the root
+    /// scope over all of the name's bindings equals the verdict over the
+    /// library's alone. A user declaration whose metaclass does not overlap
+    /// the library's leaves the library's candidate selected, so no library
+    /// reference can resolve differently than it did when the library was
+    /// prepared; one that overlaps makes the name ambiguous, and the
+    /// library has to be resolved again beside it. A library type's own
+    /// bases, values and feature targets resolve with the type itself
+    /// excluded, where the user's declaration would be selected in place of
+    /// whatever a root import or alias supplied: those verdicts are
+    /// compared with the type excluded too. A root alias is read only by a
+    /// lookup whose direct step missed: a user declaration of a name the
+    /// library aliases at the root and declares nowhere is selected where
+    /// the library's lookup read the alias, and a user alias of a name the
+    /// library aliases, or binds where a lookup can miss every binding,
+    /// merges into that read; either sends the model to the joint build.
+    /// The semantic-names filter skips unnamed rows only, which bind no
+    /// name. For the standard library's public root packages this is the
+    /// verdict `check_root_shadowing` reports; the access levels,
+    /// exclusions and alias tests cover roots of other libraries that are
+    /// private, protected, types or aliases, whose reported verdict can
+    /// differ from the build's.
+    fn root_shadowing_keeps_library(&self, boundary: usize) -> bool {
+        const ACCESSES: [LookupAccess; 3] = [
+            LookupAccess::Public,
+            LookupAccess::Protected,
+            LookupAccess::All,
+        ];
+        let root = &self.scopes[0];
+        let library_bindings = |name: &str| -> Vec<Binding> {
+            root.names
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter(|b| b.elem < boundary)
+                .copied()
+                .collect()
+        };
+        // The lookups a library reference can make of a root name: under
+        // every access, and with each library type among the name's
+        // bindings excluded in turn.
+        let lookups = |library: &[Binding]| {
+            let excluded: Vec<Option<usize>> = std::iter::once(None)
+                .chain(
+                    library
+                        .iter()
+                        .filter(|b| is_a!(self.elements[b.elem], "Type"))
+                        .map(|b| Some(b.elem)),
+                )
+                .collect();
+            excluded
+                .into_iter()
+                .flat_map(|exclude| ACCESSES.into_iter().map(move |access| (access, exclude)))
+        };
+        let verdict = |bindings: &[Binding], (access, exclude): (LookupAccess, Option<usize>)| {
+            self.binding_result(Some(bindings), access, exclude, false)
+        };
+        let aliases_kept = root.aliases.iter().all(|(name, _, rel)| {
+            let library = library_bindings(name);
+            if *rel < boundary {
+                !library.is_empty()
+                    || !root
+                        .names
+                        .get(name)
+                        .is_some_and(|bindings| bindings.iter().any(|b| b.elem >= boundary))
+            } else {
+                !root
+                    .aliases
+                    .iter()
+                    .any(|(aliased, _, rel)| *rel < boundary && aliased == name)
+                    && (library.is_empty()
+                        || lookups(&library)
+                            .all(|lookup| verdict(&library, lookup) != LookupResult::Missing))
+            }
+        });
+        aliases_kept
+            && root
+                .names
+                .iter()
+                .filter(|(_, bindings)| {
+                    bindings.iter().any(|b| b.elem < boundary)
+                        && bindings.iter().any(|b| b.elem >= boundary)
+                })
+                .all(|(name, bindings)| {
+                    let library = library_bindings(name);
+                    lookups(&library)
+                        .all(|lookup| verdict(&library, lookup) == verdict(bindings, lookup))
+                })
     }
 
     fn restore_payload_flags(&mut self, model: &crate::model::Model, unit: usize, start: usize) {
@@ -2100,14 +2776,21 @@ impl Builder {
         let (floor, n) = (self.scope_floor, self.scopes.len());
         self.import_cache = ScopeTable::new(floor, n);
         self.base_cache = ScopeTable::new(floor, n);
+        self.implied_base_memo.clear();
+        self.base_closure = ScopeTable::new(floor, n);
         self.import_misses = ScopeTable::new(floor, n);
         self.base_misses = ScopeTable::new(floor, n);
         self.visit_stamp = ScopeTable::new(floor, n);
         self.visit_result = ScopeTable::new(floor, n);
+        self.reach_memo = ScopeTable::new(floor, n);
+        self.reach_beyond.clear();
+        self.reach_scopes = n;
     }
 
     pub(crate) fn reset_lookup_caches(&mut self) {
         self.parameter_signatures = None;
+        self.constructor_sequences = None;
+        self.facts_memo = None;
         self.reset_scope_tables();
         self.recursive_subs.clear();
         self.semantic_metadata_misses = FillMisses::None;
@@ -2119,11 +2802,12 @@ impl Builder {
         // `id_index` stays: the ids it tables change only where identities
         // are assigned, which discards it itself.
         self.spec_index = None;
+        self.spec_memo = None;
         self.mult_index = None;
         self.positional_redefinitions = None;
+        self.positional_budget_exhausted = None;
         self.supported_implied = None;
-        self.inherited_cache.clear();
-        self.inherited_by_heritage.clear();
+        self.drop_inherited_memos();
         self.filters_active = vec![false; self.filter_exprs.len()];
         self.member_import_active.clear();
     }
@@ -2132,12 +2816,24 @@ impl Builder {
         self.publication.suppress();
     }
 
+    /// The kept lookup graph of the frozen library rows as a snapshot
+    /// carries it (see [`recorded_lookup::GraphWire`]), when there is one.
+    pub(crate) fn lookup_wire(&self) -> Option<recorded_lookup::GraphWire> {
+        self.recorded_lookup_prefix
+            .as_ref()
+            .map(|graph| graph.to_wire())
+    }
+
     pub(crate) fn freeze_library(&mut self) {
         assert!(
             self.implied.is_none() && self.implied_from.is_none(),
             "prepared libraries contain source rows only"
         );
         self.publication.suppress();
+        // the kept lookup graph of these rows: the one this build settled
+        // on, else the one the snapshot carried when it fits these rows,
+        // else built now
+        let carried = self.lookup_carried.take();
         if self.recorded_lookup_candidate
             && !self.recorded_lookup_incomplete
             && self.lib_boundary == self.elements.len()
@@ -2146,6 +2842,7 @@ impl Builder {
             let mut graph = self
                 .recorded_lookup_graph
                 .take()
+                .or_else(|| carried.and_then(|wire| recorded_lookup::Graph::from_wire(wire, self)))
                 .unwrap_or_else(|| recorded_lookup::Graph::build(self));
             graph.freeze();
             self.recorded_lookup_prefix = Some(Arc::new(graph));
@@ -2173,8 +2870,27 @@ impl Builder {
         self.scope_floor = self.scopes.len();
         self.reset_scope_tables();
         self.elements.freeze();
-        // the frozen rows' structural scan, shared by every build on them
-        self.prefix_structure = structural_index::StoredStructure::prefix_of(self);
+        // the frozen rows' structural scan, shared by every build on them:
+        // the one the snapshot carried when it fits these rows, else made
+        // now, with its projections, so a snapshot written next carries it
+        self.prefix_structure = self
+            .prefix_carried
+            .take()
+            .and_then(|wire| {
+                let base = Arc::clone(self.elements.base_arc());
+                // the rows by id as the kept lookup graph tables them
+                let ids = self
+                    .recorded_lookup_prefix
+                    .as_ref()
+                    .and_then(|graph| graph.frozen_ids_over(base.len()));
+                structural_index::PrefixStructure::from_wire(wire, base, ids)
+            })
+            .map(Arc::new)
+            .or_else(|| {
+                let prefix = structural_index::StoredStructure::prefix_of(self)?;
+                prefix.make_projections(self);
+                Some(prefix)
+            });
         // the frozen rows by id, shared with the kept lookup graph
         self.prefix_ids = Some(
             self.recorded_lookup_prefix
@@ -2191,15 +2907,19 @@ impl Builder {
                 }),
         );
         self.prefix_table_names = Arc::new(std::sync::OnceLock::new());
+        self.prefix_implied_names = Arc::new(std::sync::OnceLock::new());
+        self.prefix_relation_owners = Arc::new(std::sync::OnceLock::new());
+        self.prefix_validation = Arc::new(std::sync::OnceLock::new());
         self.scopes.freeze();
         self.semantic_memo.freeze();
         self.id_index = None;
         self.spec_index = None;
+        self.spec_memo = None;
         self.mult_index = None;
         self.positional_redefinitions = None;
+        self.positional_budget_exhausted = None;
         self.supported_implied = None;
-        self.inherited_cache.clear();
-        self.inherited_by_heritage.clear();
+        self.drop_inherited_memos();
         self.elem_scope.freeze();
         self.effective_hint.freeze();
         self.values.freeze();
@@ -2208,7 +2928,6 @@ impl Builder {
         self.transition_guards.freeze();
         self.decl_spans.freeze();
         self.member_spans.freeze();
-        self.ctor_fields.freeze();
         self.return_params.freeze();
         self.usage_featuring.freeze();
         self.prefix_meta_next.freeze();
@@ -2279,10 +2998,7 @@ impl Builder {
             && self
                 .explicit_metadata_annotations
                 .iter()
-                .all(|&annotation| {
-                    annotation < n
-                        && crate::metaclass::conforms(self.elements[annotation].ty, "Annotation")
-                })
+                .all(|&annotation| annotation < n && is_a!(self.elements[annotation], "Annotation"))
             && self.semantic_memo.valid(n, ns)
             && self.scopes.iter().enumerate().all(|(s, scope)| {
                 scope.parent.is_none_or(|p| p < s)
@@ -2396,6 +3112,7 @@ impl Builder {
             boundary = self.elements.len();
         }
         self.lib_boundary = boundary;
+        self.lib_implied_from = boundary;
 
         let lib_names_pending = if let Some(cache) = snapshot {
             let exhausted = self
@@ -2730,12 +3447,8 @@ impl Builder {
     /// carries the derived half; see it for the rule and its other
     /// implementations.
     pub(crate) fn effective_name(&self, e: usize) -> Option<String> {
-        let props = &self.elements[e].props;
-        props
-            .get("declaredName")
-            .and_then(|v| v.as_str())
-            .or_else(|| props.get("declaredShortName").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
+        let (name, short) = self.elements[e].props.declared_names();
+        name.or(short).map(str::to_string)
     }
 
     /// The name an element's normative library ID derives from: declared
@@ -3048,42 +3761,61 @@ impl Builder {
         self.finish_range(boundary, end)
     }
 
+    /// The user units' structure as a build from `boundary` laid them out:
+    /// for each, the compact element-array index of its root namespace (a
+    /// unit's first element) paired with the unit's name (its source path).
+    fn user_unit_structure(
+        &self,
+        boundary: usize,
+        model: &crate::model::Model,
+    ) -> Vec<(usize, String)> {
+        self.unit_starts
+            .iter()
+            .filter(|&&(start, _)| start >= boundary)
+            .map(|&(start, orig)| (start - boundary, model.unit_meta(orig).0.to_owned()))
+            .collect()
+    }
+
     fn finish_range(&self, start: usize, end: usize) -> Value {
-        // Materialize relationship arrays as {"@id"} references.
-        let ids: Vec<Uuid> = self.elements.iter().map(|e| e.id).collect();
-        let mut out = Vec::with_capacity(end - start);
-        for i in start..end {
-            let elem = &self.elements[i];
-            let mut obj = Map::new();
-            obj.insert("@type".into(), json!(elem.ty));
-            obj.insert("@id".into(), json!(elem.id.to_string()));
-            obj.insert("elementId".into(), json!(elem.id.to_string()));
-            obj.insert("isImpliedIncluded".into(), json!(false));
+        Value::Array((start..end).map(|i| self.compact_row(i)).collect())
+    }
+
+    /// Row `i` as its compact element object, the item [`Self::finish_range`]
+    /// emits for it.
+    fn compact_row(&self, i: usize) -> Value {
+        // Materialize relationship arrays as {"@id"} references, reading
+        // each id off its row: a table of every row's id would be as long
+        // as the library for a range of a few user rows.
+        let ids = |i: usize| self.elements[i].id;
+        let elem = &self.elements[i];
+        let mut obj = Map::new();
+        obj.insert("@type".into(), json!(elem.ty));
+        obj.insert("@id".into(), json!(elem.id.to_string()));
+        obj.insert("elementId".into(), json!(elem.id.to_string()));
+        obj.insert("isImpliedIncluded".into(), json!(false));
+        obj.insert(
+            "ownedRelationship".into(),
+            Value::Array(
+                elem.owned_relationships
+                    .iter()
+                    .map(|&i| id_value(ids(i)))
+                    .collect(),
+            ),
+        );
+        obj.insert(
+            "owningRelationship".into(),
+            elem.owning_relationship
+                .map(|i| id_value(ids(i)))
+                .unwrap_or(Value::Null),
+        );
+        obj.extend(elem.props.to_json());
+        if !elem.children.is_empty() {
             obj.insert(
-                "ownedRelationship".into(),
-                Value::Array(
-                    elem.owned_relationships
-                        .iter()
-                        .map(|&i| id_value(ids[i]))
-                        .collect(),
-                ),
+                "ownedRelatedElement".into(),
+                Value::Array(elem.children.iter().map(|&i| id_value(ids(i))).collect()),
             );
-            obj.insert(
-                "owningRelationship".into(),
-                elem.owning_relationship
-                    .map(|i| id_value(ids[i]))
-                    .unwrap_or(Value::Null),
-            );
-            obj.extend(elem.props.to_json());
-            if !elem.children.is_empty() {
-                obj.insert(
-                    "ownedRelatedElement".into(),
-                    Value::Array(elem.children.iter().map(|&i| id_value(ids[i])).collect()),
-                );
-            }
-            out.push(Value::Object(obj));
         }
-        Value::Array(out)
+        Value::Object(obj)
     }
 
     // ---- graph primitives ----
@@ -3095,10 +3827,12 @@ impl Builder {
         });
         self.import_cache.push(None);
         self.base_cache.push(None);
+        self.base_closure.push(None);
         self.import_misses.push(FillMisses::None);
         self.base_misses.push(FillMisses::None);
         self.visit_stamp.push([0; 6]);
         self.visit_result.push([None; 6]);
+        self.reach_memo.push([None, None]);
         self.scopes.len() - 1
     }
 
@@ -3166,6 +3900,7 @@ impl Builder {
         };
         self.elements.push(Elem {
             ty,
+            meta: crate::metaclass::meta_of(ty),
             id,
             path,
             path_parent: None,
@@ -3192,6 +3927,79 @@ impl Builder {
     /// implied relationships the derivation layer may have appended.
     pub(crate) fn explicit_len(&self) -> usize {
         self.implied_from.unwrap_or(self.elements.len())
+    }
+
+    /// Whether row `i` is one of the model's source rows: below
+    /// [`Self::explicit_len`], and not one of the prepared library's
+    /// materialized rows (`lib_implied_from..lib_boundary`).
+    #[inline]
+    pub(crate) fn is_authored(&self, i: usize) -> bool {
+        i < self.explicit_len() && (i < self.lib_implied_from || i >= self.lib_boundary)
+    }
+
+    /// Read the prepared library's frozen rows as its source rows alone,
+    /// leaving out the rows it materialized (see [`Self::lib_implied_from`])
+    /// and everything derived over them: the build the library's plans are
+    /// made on, which plans source rows and never reads materialized rows,
+    /// and the build that serves its inherited memberships, read as the
+    /// plans were planned. Only for a build with no rows of its own.
+    pub(super) fn truncate_prefix_to_source_rows(&mut self) {
+        let rows = self.lib_implied_from;
+        if rows == self.lib_boundary {
+            return;
+        }
+        assert_eq!(
+            self.elements.len(),
+            self.lib_boundary,
+            "a build with no rows of its own"
+        );
+        // A build that materialized nothing of its own yet (a demand may
+        // have run on the library's rows alone) starts over unmaterialized.
+        self.implied = None;
+        self.implied_from = None;
+        self.semantic_ownership = None;
+        self.dynamic_graph = None;
+        self.supported_implied = None;
+        self.positional_redefinitions = None;
+        self.library_plans_decided = None;
+        self.elements.limit_base(rows);
+        self.lib_boundary = rows;
+        // The frozen lookup graph, read over the source rows: the build's
+        // lookups take it as their prefix instead of building one again.
+        self.recorded_lookup_prefix = self
+            .recorded_lookup_prefix
+            .take()
+            .map(|graph| Arc::new(graph.over_rows(rows)));
+        self.prefix_ownership = None;
+        self.prefix_implied = None;
+        self.prefix_structure = None;
+        // The library's table of its rows by id is kept for this build's
+        // index to lie over, below the cut.
+        self.cut_ids = self.prefix_ids.take();
+        self.stored_structure = None;
+        self.id_index = None;
+        self.reset_lookup_caches();
+    }
+
+    /// Whether a planner is running: the planners never read materialized
+    /// rows, the prepared library's own included.
+    pub(super) fn planning(&self) -> bool {
+        self.static_planning || self.positional_planning || self.implied_planning
+    }
+
+    /// Whether the prepared library this build is on carries its own
+    /// materialized rows (see [`Self::lib_implied_from`]).
+    #[cfg(test)]
+    pub(crate) fn carries_semantic_rows(&self) -> bool {
+        self.lib_implied_from < self.lib_boundary && self.prefix_ownership.is_some()
+    }
+
+    /// The model's source rows in order — the library's, then this build's
+    /// — leaving out the prepared library's materialized rows between them.
+    pub(crate) fn authored_rows(
+        &self,
+    ) -> std::iter::Chain<std::ops::Range<usize>, std::ops::Range<usize>> {
+        (0..self.lib_implied_from).chain(self.lib_boundary..self.explicit_len())
     }
 
     /// Keep the ownership-path hash state of each element created from
@@ -3251,6 +4059,7 @@ impl Builder {
         };
         self.elements.push(Elem {
             ty,
+            meta: crate::metaclass::meta_of(ty),
             id,
             path,
             path_parent,
@@ -3281,6 +4090,7 @@ impl Builder {
         };
         self.elements.push(Elem {
             ty,
+            meta: crate::metaclass::meta_of(ty),
             id,
             path,
             path_parent,
@@ -3364,7 +4174,7 @@ impl Builder {
                 // `InstantiatedTypeMember`), whatever the referencing
                 // site created it as.
                 if self.elements[elem].ty == "Membership" {
-                    self.elements[elem].ty = "OwningMembership";
+                    self.elements[elem].set_ty("OwningMembership");
                 }
                 let feature = self.new_owned_element("Feature", elem, &format!("{base}.chain"));
                 for (i, link) in links.iter().enumerate() {
@@ -4310,12 +5120,6 @@ impl Builder {
             .map(|n| n.value.clone())
             .unwrap_or_else(|| format!("#{index}"));
         let e = self.build_usage_element(u, rel, scope, &seg, class_override);
-        if let Some(n) = &u.declaration.id.name {
-            self.ctor_fields
-                .entry(owner)
-                .or_default()
-                .push((n.value.clone(), e));
-        }
         // An about-less metadata member annotates its owner (import filters
         // test these annotations; `@M about x;` annotates `x` instead).
         if u.kind == UsageKind::Metadata
@@ -4598,7 +5402,7 @@ impl Builder {
                         // Conjugated port typing is its own metaclass in
                         // SysML; flagged here until modeled.
                         if t.is_conjugated {
-                            self.elements[ft].ty = "ConjugatedPortTyping";
+                            self.elements[ft].set_ty("ConjugatedPortTyping");
                         }
                         if let TargetRef::Name(qn) = &t.target {
                             self.spec_targets
@@ -4870,7 +5674,7 @@ impl Builder {
         }
         // Flow's narrower library base applies only when it owns ends.
         // Keep lookup heritage aligned with the materialized requirements.
-        if crate::metaclass::conforms(self.elements[e].ty, "Flow")
+        if is_a!(self.elements[e], "Flow")
             && self.owned_member_elems(e, true).into_iter().any(|feature| {
                 self.elements[feature]
                     .props
@@ -4879,7 +5683,7 @@ impl Builder {
                     == Some(true)
             })
         {
-            let base = if crate::metaclass::conforms(self.elements[e].ty, "FlowUsage") {
+            let base = if is_a!(self.elements[e], "FlowUsage") {
                 "Flows::flows"
             } else {
                 "Transfers::flowTransfers"
@@ -6318,7 +7122,7 @@ impl Builder {
             let saved_base = self.redefinition_lookup_base.take();
             self.recorded_lookup_suppressed = false;
             self.redefinition_lookup_owner = (key == "redefinedFeature"
-                && crate::metaclass::conforms(self.elements[elem].ty, "Redefinition"))
+                && is_a!(self.elements[elem], "Redefinition"))
             .then(|| exclude.and_then(|feature| self.owner_elem(feature)))
             .flatten();
             self.exclude = exclude;
@@ -6606,22 +7410,53 @@ impl Builder {
         if stale {
             let n = self.elements.len();
             self.id_index_built_for = n;
-            // The frozen rows through the table their freeze kept, copied,
-            // and the rows after them tabled here; every row otherwise.
-            let (mut index, start) = match self.prefix_ids.as_deref() {
+            // The frozen rows through the table their freeze kept, shared,
+            // and the rows after them tabled here over it; every row
+            // otherwise.
+            let frozen = self.prefix_ids.as_ref().filter(|frozen| {
                 // (an identity override writes a frozen row's id: then every
                 // row is tabled)
-                Some(frozen)
-                    if frozen.len() == self.lib_boundary
-                        && self.lib_boundary <= n
-                        && self.elements.base_untouched() =>
-                {
-                    (frozen.clone(), self.lib_boundary)
+                frozen.len() == self.lib_boundary
+                    && self.lib_boundary <= n
+                    && self.elements.base_untouched()
+            });
+            let (mut index, start) = match frozen {
+                // No rows after the frozen ones: their table is the index.
+                Some(frozen) if n == self.lib_boundary => {
+                    note_id_index_tabled(0);
+                    self.id_index = Some(Arc::new(RowsById::over(Arc::clone(frozen))));
+                    return self.id_index.as_ref().unwrap().get(&id).copied();
                 }
-                _ => (
-                    crate::layered::IdMap::with_capacity_and_hasher(n, Default::default()),
-                    0,
-                ),
+                Some(frozen) => (RowsById::over(Arc::clone(frozen)), self.lib_boundary),
+                None => {
+                    // A build cut to its library's source rows has no frozen
+                    // table of its own; the library's covers its rows and
+                    // the materialized rows after them. While every row of
+                    // this build maps to itself there, the table's entries
+                    // below the cut are exactly this build's rows by id, and
+                    // the index lies over the table, hiding the rest.
+                    let cut = self.cut_ids.as_ref().filter(|table| {
+                        n == self.lib_boundary
+                            && self.elements.base_untouched()
+                            && self
+                                .elements
+                                .iter()
+                                .enumerate()
+                                .all(|(i, row)| table.get(&row.id) == Some(&i))
+                    });
+                    if let Some(table) = cut {
+                        note_id_index_tabled(0);
+                        self.id_index = Some(Arc::new(RowsById::below(Arc::clone(table), n)));
+                        return self.id_index.as_ref().unwrap().get(&id).copied();
+                    }
+                    (
+                        RowsById::from(crate::layered::IdMap::with_capacity_and_hasher(
+                            n,
+                            Default::default(),
+                        )),
+                        0,
+                    )
+                }
             };
             note_id_index_tabled(n - start);
             for (i, el) in self.elements.iter().enumerate().skip(start) {
@@ -6710,7 +7545,7 @@ impl Builder {
             let owner = self.multiplicities[i].0;
             // A named/body range's numeric domain is not a declaration of
             // that Multiplicity Feature's own cardinality.
-            if crate::metaclass::conforms(self.elements[owner].ty, "Multiplicity") {
+            if is_a!(self.elements[owner], "Multiplicity") {
                 continue;
             }
             index.entry(owner).or_insert(i);
@@ -6743,7 +7578,7 @@ impl Builder {
     ) {
         for i in rows {
             let owner = self.multiplicities[i].0;
-            let range = if crate::metaclass::conforms(self.elements[owner].ty, "Multiplicity") {
+            let range = if is_a!(self.elements[owner], "Multiplicity") {
                 Some(owner)
             } else {
                 self.local_multiplicity(owner).flatten()
@@ -6772,7 +7607,7 @@ impl Builder {
             .copied()
             .filter(|&r| {
                 if features_only {
-                    is_feature_membership(self.elements[r].ty)
+                    is_a!(self.elements[r], "FeatureMembership")
                 } else {
                     self.elements[r].ty.ends_with("Membership")
                 }
@@ -7764,8 +8599,8 @@ impl Builder {
     /// directed features (`in`, `out`, `inout`) in calculation/action bodies.
     pub(crate) fn is_parameter(&self, e: usize) -> bool {
         self.elements[e].owning_relationship.is_some_and(|r| {
-            crate::metaclass::conforms(self.elements[r].ty, "ParameterMembership")
-                || (is_feature_membership(self.elements[r].ty)
+            is_a!(self.elements[r], "ParameterMembership")
+                || (is_a!(self.elements[r], "FeatureMembership")
                     && self.elements[e]
                         .props
                         .get("direction")
@@ -7786,7 +8621,7 @@ impl Builder {
                 == Some(false)
                 && self.elements[e]
                     .owning_relationship
-                    .is_some_and(|r| is_feature_membership(self.elements[r].ty)))
+                    .is_some_and(|r| is_a!(self.elements[r], "FeatureMembership")))
     }
 
     /// Whether `e` declares its own non-default value expression. The
@@ -7974,31 +8809,94 @@ impl Builder {
     }
 
     /// [`Self::recorded_conforms`] through the specialization index (same
-    /// caller restriction as [`Self::indexed_redefinition_targets`]).
+    /// caller restriction as [`Self::indexed_redefinition_targets`]):
+    /// whether `sup` is in `sub`'s closure under the typing and
+    /// specialization rows. The closure is memoized per element
+    /// ([`Self::spec_closure`]), so a second question about `sub` is a
+    /// binary search.
     pub(crate) fn indexed_conforms(&mut self, sub: usize, sup: usize) -> bool {
         if sub == sup {
             return true;
         }
         self.ensure_spec_index();
+        if let Some(closure) = self.spec_memo().closures.get(&sub) {
+            return closure.binary_search(&sup).is_ok();
+        }
+        self.spec_closure(sub).binary_search(&sup).is_ok()
+    }
+
+    /// The memo of the specialization index's answers for the current
+    /// specialization-row and resolved-target revisions, started afresh when
+    /// either moved since it was built.
+    fn spec_memo(&mut self) -> &mut SpecMemo {
+        let current = match (
+            &self.spec_memo,
+            self.spec_targets.revision(),
+            self.spec_resolved.revision(),
+        ) {
+            (Some(memo), Some(specs), Some(resolved)) => {
+                memo.specs.same_as(specs) && memo.resolved.same_as(resolved)
+            }
+            _ => false,
+        };
+        if !current {
+            self.spec_memo = Some(SpecMemo {
+                specs: self.spec_targets.observe_revision(),
+                resolved: self.spec_resolved.observe_revision(),
+                closures: Default::default(),
+                redefinitions: Default::default(),
+                empty: Arc::from(Vec::new()),
+            });
+        }
+        self.spec_memo.as_mut().expect("just set")
+    }
+
+    /// Every element `e` reaches through the typing and specialization rows,
+    /// `e` itself included, sorted; memoized (see [`Self::spec_memo`]).
+    fn spec_closure(&mut self, e: usize) -> Arc<[usize]> {
+        self.ensure_spec_index();
+        if let Some(hit) = self.spec_memo().closures.get(&e) {
+            return Arc::clone(hit);
+        }
         let index = self.spec_index.as_ref().unwrap();
-        let mut stack = vec![sub];
-        let mut seen = HashSet::new();
+        let mut stack = vec![e];
+        let mut seen = crate::layered::IdSet::default();
         while let Some(x) = stack.pop() {
             if !seen.insert(x) {
                 continue;
             }
             for &i in index.get(&x).into_iter().flatten() {
                 if let Some(t) = self.spec_resolved.get(i).copied().flatten() {
-                    if t == sup {
-                        return true;
-                    }
                     if t != x {
                         stack.push(t);
                     }
                 }
             }
         }
-        false
+        let mut closure: Vec<usize> = seen.into_iter().collect();
+        closure.sort_unstable();
+        let closure: Arc<[usize]> = closure.into();
+        self.spec_memo().closures.insert(e, Arc::clone(&closure));
+        closure
+    }
+
+    /// [`Self::indexed_redefinition_targets`] as a shared slice, memoized
+    /// (see [`Self::spec_memo`]): for the readers that ask about the same
+    /// elements over and over, one walk of the index per element.
+    pub(crate) fn indexed_redefinition_targets_shared(&mut self, e: usize) -> Arc<[usize]> {
+        self.ensure_spec_index();
+        if let Some(hit) = self.spec_memo().redefinitions.get(&e) {
+            return Arc::clone(hit);
+        }
+        let targets = self.indexed_redefinition_targets(e);
+        let memo = self.spec_memo();
+        let targets: Arc<[usize]> = if targets.is_empty() {
+            Arc::clone(&memo.empty)
+        } else {
+            targets.into()
+        };
+        memo.redefinitions.insert(e, Arc::clone(&targets));
+        targets
     }
 
     /// Whether the import relationship `rel` contributes memberships to a
@@ -8006,7 +8904,13 @@ impl Builder {
     /// admitted (KerML `nonPrivateMemberships` takes the public and the
     /// protected imports; `expose` is protected). Unspelled means public.
     fn import_admitted(&self, rel: usize, access: LookupAccess) -> bool {
-        let vis = match self.elements[rel]
+        access.admits(self.membership_visibility(rel))
+    }
+
+    /// The visibility membership `rel` spells, as the access that admits
+    /// it: `All` for private, `Protected`, else `Public` (unspelled too).
+    fn membership_visibility(&self, rel: usize) -> LookupAccess {
+        match self.elements[rel]
             .props
             .get("visibility")
             .and_then(|a| a.as_str())
@@ -8014,8 +8918,15 @@ impl Builder {
             Some("private") => LookupAccess::All,
             Some("protected") => LookupAccess::Protected,
             _ => LookupAccess::Public,
-        };
-        access.admits(vis)
+        }
+    }
+
+    /// The visibility of `e`'s owning membership ([`Self::membership_visibility`]);
+    /// `Public` for an element nothing owns.
+    fn owning_visibility(&self, e: usize) -> LookupAccess {
+        self.elements[e]
+            .owning_relationship
+            .map_or(LookupAccess::Public, |r| self.membership_visibility(r))
     }
 
     fn binding_result(
@@ -8198,8 +9109,12 @@ impl Builder {
                 });
             }
         }
+        let hash = reach::name_hash(name);
         let mut hits: Vec<LookupResult> = Vec::new();
         for base in self.base_scopes(s) {
+            if !self.may_reach(reach::Node::Lookup(base), hash) {
+                continue;
+            }
             hits.push(self.lookup_at_with_names(
                 base,
                 name,
@@ -8223,10 +9138,19 @@ impl Builder {
             if access == LookupAccess::Public && !entry.is_public {
                 continue;
             }
+            let node = if entry.recursive {
+                reach::Node::Tree(entry.scope)
+            } else {
+                reach::Node::Lookup(entry.scope)
+            };
+            if !self.may_reach(node, hash) {
+                continue;
+            }
             let hit = if entry.recursive {
                 self.lookup_recursive(
                     entry.scope,
                     name,
+                    hash,
                     depth + 1,
                     stamp,
                     if entry.is_import_all {
@@ -8274,6 +9198,7 @@ impl Builder {
         &mut self,
         s: usize,
         name: &str,
+        hash: u64,
         depth: usize,
         stamp: u64,
         access: LookupAccess,
@@ -8306,7 +9231,10 @@ impl Builder {
             }
         };
         for &sub in subs.iter() {
-            let hit = self.lookup_recursive(sub, name, depth + 1, stamp, access);
+            if !self.may_reach(reach::Node::Tree(sub), hash) {
+                continue;
+            }
+            let hit = self.lookup_recursive(sub, name, hash, depth + 1, stamp, access);
             result = self.merge_lookup(result, hit);
         }
         result
@@ -8714,7 +9642,7 @@ impl Builder {
             else {
                 return Tri::Unknown;
             };
-            if !crate::metaclass::conforms(self.elements[declaration].ty, "Feature") {
+            if !is_a!(self.elements[declaration], "Feature") {
                 return Tri::Unknown;
             }
             let Some(key) = self.effective_name(declaration) else {
@@ -8838,11 +9766,58 @@ impl Builder {
         (bases, explicit)
     }
 
+    /// The `k`th implied base of scope `s` — a library name the lowering
+    /// wrote for the owner's kind (`Items::items`), rooted at the global
+    /// scope — resolved from `from`, and whether a binary base's role
+    /// admits it. The same few names are resolved for thousands of
+    /// scopes, and a global name resolves the same from any scope, so a
+    /// name found once is kept, with its admission and the root misses
+    /// its lookup noted, until the lookup caches are cleared: a later
+    /// scope takes the element and notes the misses as its own lookup
+    /// would. A name that is not found, or that names the scope's own
+    /// owner (which a base lookup excludes), is looked up as before.
+    fn resolve_implied_base(&mut self, s: usize, from: usize, k: usize) -> Option<usize> {
+        let owner = self.scopes[s].owner;
+        let key = {
+            let qn = &self.scopes[s].implied_bases[k];
+            if !qn.is_global {
+                let qn = qn.clone();
+                return self.resolve(from, &qn, 0);
+            }
+            qn.segments
+                .iter()
+                .map(|segment| segment.value.as_str())
+                .collect::<Vec<_>>()
+                .join("::")
+        };
+        if let Some((elem, admitted, misses)) = self.implied_base_memo.get(&key) {
+            if Some(*elem) != owner {
+                let (elem, admitted) = (*elem, *admitted);
+                let misses = misses.clone();
+                note_misses(&mut self.current_misses, misses.iter());
+                return admitted.then_some(elem);
+            }
+        }
+        let qn = self.scopes[s].implied_bases[k].clone();
+        let mark = self.current_misses.len();
+        let elem = self.resolve(from, &qn, 0)?;
+        let misses = self.current_misses[mark..].to_vec();
+        let admitted = match qn.segments.as_slice() {
+            [package, member] => match implied::binary_role_name(&package.value, &member.value) {
+                Some(role) => self.binary_lookup_target(elem, role),
+                None => true,
+            },
+            _ => true,
+        };
+        self.implied_base_memo.insert(key, (elem, admitted, misses));
+        admitted.then_some(elem)
+    }
+
     fn base_scopes_uncached(&mut self, s: usize) -> (Vec<usize>, usize) {
         self.base_cache[s] = Some((Vec::new(), 0));
-        let bases = self.scopes[s].bases.clone();
-        let implied_bases = self.scopes[s].implied_bases.clone();
-        let chain_bases = self.scopes[s].chain_bases.clone();
+        let n_bases = self.scopes[s].bases.len();
+        let n_implied = self.scopes[s].implied_bases.len();
+        let has_chains = !self.scopes[s].chain_bases.is_empty();
         let from = self.scopes[s].parent.unwrap_or(s);
         let mut result = Vec::new();
         // A base name must never resolve to the element being specialized
@@ -8854,47 +9829,52 @@ impl Builder {
         // A redefinition remains a base even when the declaring Type's
         // filtered inherited view suppresses its target. Use the same header
         // context as the stored relationship, not ordinary member lookup.
-        let redefinitions: Vec<_> = if let Some(owner) = self.scopes[s].owner.filter(|&owner| {
-            self.elements[owner]
-                .owned_relationships
-                .iter()
-                .any(|&r| self.elements[r].ty == "Redefinition")
-        }) {
-            if self.semantic_ready {
-                self.ensure_spec_index();
-                self.spec_index
-                    .as_ref()
-                    .unwrap()
-                    .get(&owner)
-                    .into_iter()
-                    .flatten()
-                    .filter(|&&i| self.spec_targets[i].1 == "Redefinition")
-                    .map(|&i| self.spec_targets[i].3.clone())
-                    .collect()
-            } else {
-                // Lowering can still append specialization declarations;
-                // never establish its permanent index from a partial prefix.
-                self.spec_targets
-                    .iter()
-                    .filter(|(source, kind, _, _)| *source == owner && *kind == "Redefinition")
-                    .map(|(_, _, _, qn)| qn.clone())
-                    .collect()
+        let redefinitions: Vec<QualifiedName> = match self.scopes[s].owner {
+            Some(owner)
+                if n_bases > 0
+                    && self.elements[owner]
+                        .owned_relationships
+                        .iter()
+                        .any(|&r| self.elements[r].ty == "Redefinition") =>
+            {
+                if self.semantic_ready {
+                    self.ensure_spec_index();
+                    self.spec_index
+                        .as_ref()
+                        .unwrap()
+                        .get(&owner)
+                        .into_iter()
+                        .flatten()
+                        .filter(|&&i| self.spec_targets[i].1 == "Redefinition")
+                        .map(|&i| self.spec_targets[i].3.clone())
+                        .collect()
+                } else {
+                    self.spec_targets
+                        .iter()
+                        .filter(|(source, kind, _, _)| *source == owner && *kind == "Redefinition")
+                        .map(|(_, _, _, qn)| qn.clone())
+                        .collect()
+                }
             }
-        } else {
-            Vec::new()
+            _ => Vec::new(),
         };
         let header_owner = self.scopes[s]
             .owner
             .and_then(|owner| self.owner_elem(owner));
+        // Every written base is looked up here, with the owner excluded and
+        // the header context: its specialization row's recorded outcome is
+        // not the same lookup (a conjugated typing's row names the
+        // conjugated definition; a usage typed by a definition of its own
+        // name resolves to itself without the exclusion).
         // Fresh depth budget: the cache is permanent, so outcomes must not
         // depend on the first caller's recursion depth (see import_scopes).
-        for qn in &bases {
+        for k in 0..n_bases {
+            let qn = self.scopes[s].bases[k].clone();
             self.redefinition_lookup_owner = redefinitions
-                .iter()
-                .any(|target| target == qn)
+                .contains(&qn)
                 .then_some(header_owner)
                 .flatten();
-            if let Some(elem) = self.resolve(from, qn, 0) {
+            if let Some(elem) = self.resolve(from, &qn, 0) {
                 if let Some(&sc) = self.elem_scope.get(&elem) {
                     if sc != s {
                         result.push(sc);
@@ -8904,33 +9884,26 @@ impl Builder {
         }
         self.redefinition_lookup_owner = None;
         self.redefinition_lookup_base = None;
-        // A chain-written base contributes the chain's *last* link: the
-        // spine resolves like any reference (member steps in the previous
-        // target's scope), and the landed feature's members are inherited.
-        for links in &chain_bases {
-            let empty = QualifiedName {
-                is_global: false,
-                segments: Vec::new(),
-                span: Span::default(),
-            };
-            if let Some(elem) = self.resolve_chain_member(from, Some(links), &empty) {
-                if let Some(&sc) = self.elem_scope.get(&elem) {
-                    if sc != s && !result.contains(&sc) {
-                        result.push(sc);
+        if has_chains {
+            let chain_bases = self.scopes[s].chain_bases.clone();
+            for links in &chain_bases {
+                let empty = QualifiedName {
+                    is_global: false,
+                    segments: Vec::new(),
+                    span: Span::default(),
+                };
+                if let Some(elem) = self.resolve_chain_member(from, Some(links), &empty) {
+                    if let Some(&sc) = self.elem_scope.get(&elem) {
+                        if sc != s && !result.contains(&sc) {
+                            result.push(sc);
+                        }
                     }
                 }
             }
         }
         let explicit = result.len();
-        for qn in &implied_bases {
-            if let Some(elem) = self.resolve(from, qn, 0) {
-                if let [package, member] = qn.segments.as_slice() {
-                    if let Some(role) = implied::binary_role_name(&package.value, &member.value) {
-                        if !self.binary_lookup_target(elem, role) {
-                            continue;
-                        }
-                    }
-                }
+        for k in 0..n_implied {
+            if let Some(elem) = self.resolve_implied_base(s, from, k) {
                 if let Some(&sc) = self.elem_scope.get(&elem) {
                     if sc != s && !result.contains(&sc) {
                         result.push(sc);
@@ -8938,15 +9911,6 @@ impl Builder {
                 }
             }
         }
-        // A parameter, end or result redefines its general's feature at the
-        // same position by implication (KerML
-        // `checkFeatureParameterRedefinition`, `checkFeatureEndRedefinition`,
-        // `checkFeatureResultRedefinition`), and a redefining feature inherits
-        // the members of what it redefines: `in q;` declared first under
-        // `action def Swapped :> A` reads the members of `A`'s first
-        // parameter, whatever that one is named. The pairing is read off the
-        // owning type's heritage here; the implied relationships materialize
-        // the same edges for the whole model later.
         if let Some(feature) = self.scopes[s].owner {
             if let Some(owner) = self.owner_elem(feature) {
                 for target in self.positional_redefinition_targets(feature, owner) {
@@ -9015,8 +9979,10 @@ impl Builder {
     ///
     /// Ordinary member identities and alias memberships are kept separately
     /// internally, then projected to Membership handles by the public API.
-    /// Redefinition removal compares their distinct Membership identities;
-    /// aliases to Features participate as both candidates and blockers.
+    /// Redefinition removal treats an alias Membership as a Membership of
+    /// its Feature: it goes with the Feature's other Memberships when
+    /// another inherited Feature's closure reaches the Feature or an owned
+    /// feature redefines it, and it never removes them itself.
     /// Acyclic inheritance is evaluated bottom-up without a depth cap;
     /// cycles use a bounded partial walk and are reported as incomplete.
     pub(crate) fn inherited_bindings(
@@ -9056,20 +10022,21 @@ impl Builder {
                     .is_none_or(|e| self.owned_member_elems(e, false).is_empty()))
             .then(|| (self.base_scopes_split(s).0, include_implied))
         };
-        let result = match heritage_key
-            .as_ref()
-            .and_then(|k| self.inherited_by_heritage.get(k))
-        {
-            Some(hit) => Arc::clone(hit),
-            None => {
-                let result = Arc::new(self.inherited_bindings_uncached(s, include_implied));
-                if !result.truncated && !result.incomplete {
-                    if let Some(k) = heritage_key {
+        let result = match heritage_key {
+            Some(k) => match self.inherited_by_heritage.get(&k) {
+                Some(hit) => Arc::clone(hit),
+                None => {
+                    let result = Arc::new(
+                        self.inherited_bindings_uncached(s, include_implied, None)
+                            .compact(),
+                    );
+                    if !result.truncated && !result.incomplete {
                         self.inherited_by_heritage.insert(k, Arc::clone(&result));
                     }
+                    result
                 }
-                result
-            }
+            },
+            None => self.inherited_bindings_by_heritage(s, include_implied),
         };
         self.used_imports = used_imports;
         self.query_imports = query_imports;
@@ -9080,15 +10047,157 @@ impl Builder {
         result
     }
 
+    /// The inherited memberships of a scope that owns something: those of
+    /// every other scope with its heritage when its owned features take no
+    /// part in the reduction ([`HeritageFacts`]), else its own. Whether
+    /// the scope's own planning is complete is its own.
+    fn inherited_bindings_by_heritage(
+        &mut self,
+        s: usize,
+        include_implied: bool,
+    ) -> Arc<InheritedBindings> {
+        let epoch = self.redefinition_epoch;
+        let (mut walked, explicit) = self.base_scopes_split(s);
+        if !include_implied {
+            walked.truncate(explicit);
+        }
+        if walked.contains(&s) {
+            return Arc::new(
+                self.inherited_bindings_uncached(s, include_implied, None)
+                    .compact(),
+            );
+        }
+        let key = (walked, include_implied);
+        let owner = self.scopes[s].owner;
+        if let Some(shared) = self.heritage_reductions.remove(&key) {
+            let leaves_alone = !self.owned_features_interact(owner, include_implied, &shared.facts);
+            let bindings = shared.bindings.clone();
+            if epoch == self.redefinition_epoch {
+                self.heritage_reductions.insert(key.clone(), shared);
+            }
+            match bindings {
+                Some(bindings) if leaves_alone && epoch == self.redefinition_epoch => {
+                    return if self.owner_planning_incomplete(owner, include_implied) {
+                        Arc::new(InheritedBindings {
+                            incomplete: true,
+                            ..(*bindings).clone()
+                        })
+                    } else {
+                        bindings
+                    };
+                }
+                Some(_) => {
+                    return Arc::new(
+                        self.inherited_bindings_uncached(s, include_implied, None)
+                            .compact(),
+                    );
+                }
+                None if !leaves_alone => {
+                    return Arc::new(
+                        self.inherited_bindings_uncached(s, include_implied, None)
+                            .compact(),
+                    );
+                }
+                None => {}
+            }
+        }
+        let mut facts = HeritageFacts::default();
+        let result = Arc::new(
+            self.inherited_bindings_uncached(s, include_implied, Some(&mut facts))
+                .compact(),
+        );
+        if epoch != self.redefinition_epoch {
+            return result;
+        }
+        let leaves_alone = !result.truncated
+            && facts.complete
+            && !self.owned_features_interact(owner, include_implied, &facts);
+        if epoch != self.redefinition_epoch {
+            return result;
+        }
+        // What the heritage leaves, whatever the scope's own planning.
+        let shared = if result.incomplete {
+            Arc::new(InheritedBindings {
+                incomplete: false,
+                ..(*result).clone()
+            })
+        } else {
+            Arc::clone(&result)
+        };
+        let entry = self
+            .heritage_reductions
+            .entry(key)
+            .or_insert(HeritageReduction {
+                facts: Arc::new(facts),
+                bindings: None,
+            });
+        if leaves_alone && entry.bindings.is_none() {
+            entry.bindings = Some(shared);
+        }
+        result
+    }
+
+    /// Whether an owned feature of `owner` takes part in the reduction of
+    /// the candidates `facts` describes: it redefines a feature a
+    /// candidate's redefinition walk reaches, or its name hashes meet a
+    /// candidate's or another owned feature's.
+    fn owned_features_interact(
+        &mut self,
+        owner: Option<usize>,
+        include_implied: bool,
+        facts: &HeritageFacts,
+    ) -> bool {
+        let Some(owner) = owner else {
+            return false;
+        };
+        let owned = self.owned_member_elems(owner, true);
+        let mut names = self.take_name_keys();
+        let mut seen: crate::layered::IdSet<u64> = Default::default();
+        let mut meets = false;
+        for &o in &owned {
+            for key in row_name_keys(&self.elements, &mut names, o) {
+                if key != 0 && (facts.names.contains(&key) || !seen.insert(key)) {
+                    meets = true;
+                }
+            }
+        }
+        self.put_name_keys(names);
+        if meets {
+            return true;
+        }
+        let mut targets = Vec::new();
+        for &o in &owned {
+            self.semantic_redefinition_targets_into(o, include_implied, &mut targets);
+            if targets.drain(..).any(|t| facts.reach.contains(&t)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the planning of `owner`'s own implied heritage is incomplete:
+    /// its dynamic evidence is stale or the positional plan could not
+    /// finish it. Only the implied heritage reads it.
+    fn owner_planning_incomplete(&mut self, owner: Option<usize>, include_implied: bool) -> bool {
+        include_implied
+            && owner.is_some_and(|e| {
+                !self.dynamic_evidence_current(e)
+                    || self
+                        .effective_positional_redefinitions()
+                        .is_some_and(|plan| plan.incomplete.contains(&e))
+            })
+    }
+
     fn inherited_bindings_uncached(
         &mut self,
         s: usize,
         include_implied: bool,
+        mut facts: Option<&mut HeritageFacts>,
     ) -> InheritedBindings {
         // Build dependencies iteratively, then let each base contribute its
         // already-filtered inherited memberships. Pooling raw ancestors loses
         // removals made by intermediate types and changes positional ordering.
-        let mut state = HashMap::new();
+        let mut state = crate::layered::IdMap::default();
         let mut order = Vec::new();
         let mut pending = vec![(s, false)];
         while let Some((scope, exiting)) = pending.pop() {
@@ -9112,7 +10221,7 @@ impl Builder {
             match state.get(&scope) {
                 Some(2) => continue,
                 Some(1) => {
-                    let mut result = self.inherited_bindings_walk(s, include_implied, true);
+                    let mut result = self.inherited_bindings_walk(s, include_implied, true, None);
                     // Cycle exclusions depend on the requested root. Never
                     // reuse a root-relative partial result as a base's closure.
                     result.incomplete = true;
@@ -9130,15 +10239,35 @@ impl Builder {
         }
         let mut result = InheritedBindings::default();
         for scope in order {
-            let value = self.inherited_bindings_walk(scope, include_implied, false);
+            let facts = if scope == s {
+                facts.as_deref_mut()
+            } else {
+                None
+            };
+            let value = self.inherited_bindings_walk(scope, include_implied, false, facts);
             if scope == s {
                 result = value;
             } else {
                 self.inherited_cache
-                    .insert((scope, include_implied), Arc::new(value));
+                    .insert((scope, include_implied), Arc::new(value.compact()));
             }
         }
         result
+    }
+
+    /// A fresh set of scratch marks, from the thread's pool
+    /// ([`MARKS_POOL`]) or new, to give back with [`Self::return_marks`]
+    /// once the set is done with.
+    fn borrow_marks(&mut self) -> crate::layered::Marks {
+        let mut marks = MARKS_POOL
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_default();
+        marks.begin();
+        marks
+    }
+
+    fn return_marks(&mut self, marks: crate::layered::Marks) {
+        MARKS_POOL.with(|pool| pool.borrow_mut().push(marks));
     }
 
     fn inherited_bindings_walk(
@@ -9146,6 +10275,7 @@ impl Builder {
         s: usize,
         include_implied: bool,
         recursive: bool,
+        facts: Option<&mut HeritageFacts>,
     ) -> InheritedBindings {
         let heritage = |b: &mut Self, sc: usize| {
             let (all, explicit) = b.base_scopes_split(sc);
@@ -9155,7 +10285,8 @@ impl Builder {
                 all[..explicit].to_vec()
             }
         };
-        let mut visited: HashSet<usize> = HashSet::from([s]);
+        let mut visited = self.borrow_marks();
+        visited.mark(s);
         let mut pending: Vec<(usize, usize)> = heritage(self, s)
             .into_iter()
             .rev()
@@ -9163,100 +10294,31 @@ impl Builder {
             .collect();
         // (element, contributing scope), each direct base before the next.
         let mut collected: Vec<(usize, usize)> = Vec::new();
-        let mut seen_elems: HashSet<usize> = HashSet::new();
+        let mut seen_elems = self.borrow_marks();
         let mut alias_rels: Vec<usize> = Vec::new();
         let mut membership_order = Vec::new();
         let mut truncated = false;
         let mut incomplete = false;
         while let Some((base, depth)) = pending.pop() {
-            if visited.contains(&base) {
+            if visited.marked(base) {
                 continue;
             }
             if depth > MAX_RESOLUTION_DEPTH {
                 truncated = true;
                 continue;
             }
-            visited.insert(base);
+            visited.mark(base);
             // Preserve direct-base order; order each base's own members by
             // declaration, including members with no declared name.
             let mut found: Vec<(usize, usize)> = Vec::new();
             {
                 let b = base;
-                let begin = found.len();
-                if let Some(owner) = self.scopes[b].owner {
-                    found.extend(
-                        self.owned_member_elems(owner, false)
-                            .into_iter()
-                            .filter(|&e| {
-                                self.elements[e].owning_relationship.is_none_or(|r| {
-                                    self.elements[r]
-                                        .props
-                                        .get("visibility")
-                                        .and_then(|v| v.as_str())
-                                        != Some("private")
-                                })
-                            })
-                            .map(|e| (e, b)),
-                    );
-                }
-                for map in [&self.scopes[b].names, &self.scopes[b].effective_names] {
-                    for bindings in map.values() {
-                        for binding in bindings {
-                            if binding.visibility == LookupAccess::All {
-                                continue; // private: not inherited
-                            }
-                            found.push((binding.elem, b));
-                        }
-                    }
-                }
-                found[begin..].sort_by_key(|&(e, scope)| {
-                    let protected = self.elements[e].owning_relationship.is_some_and(|r| {
-                        self.elements[r]
-                            .props
-                            .get("visibility")
-                            .and_then(|v| v.as_str())
-                            == Some("protected")
-                    });
-                    (protected, e, scope)
-                });
-                // nonPrivateMemberships unions public owned/imported,
-                // protected owned/imported, then inherited memberships. An
-                // import's visibility controls admission, not its target's.
-                let owned = std::mem::take(&mut found);
-                for access in [LookupAccess::Public, LookupAccess::Protected] {
-                    let own: Vec<_> = owned
-                        .iter()
-                        .copied()
-                        .filter(|&(e, _)| {
-                            self.elements[e]
-                                .owning_relationship
-                                .is_none_or(|r| self.import_admitted(r, access))
-                        })
-                        .collect();
-                    let mut own_order: Vec<_> = own
-                        .iter()
-                        .filter_map(|&(e, _)| self.elements[e].owning_relationship)
-                        .collect();
-                    let mut aliases = Vec::new();
-                    self.scope_alias_rels(b, access, &[], &mut aliases);
-                    own_order.extend(aliases.iter().copied());
-                    own_order.sort_unstable();
-                    own_order.dedup();
-                    membership_order.extend(own_order);
-                    alias_rels.extend(aliases);
-                    found.extend(own);
-                    let mut imported = InheritedBindings::default();
-                    membership_order.extend(self.imported_bindings(
-                        b,
-                        include_implied,
-                        access,
-                        &mut imported,
-                    ));
-                    found.extend(imported.members);
-                    alias_rels.extend(imported.alias_rels);
-                    truncated |= imported.truncated;
-                    incomplete |= imported.incomplete;
-                }
+                let own = self.base_contribution(b, include_implied);
+                membership_order.extend(own.membership_order.iter().copied());
+                found.extend(own.found.iter().copied());
+                alias_rels.extend(own.alias_rels.iter().copied());
+                truncated |= own.truncated;
+                incomplete |= own.incomplete;
                 if !recursive {
                     if let Some(inherited) = self.inherited_cache.get(&(b, include_implied)) {
                         membership_order.extend(inherited.membership_order.iter().copied());
@@ -9268,7 +10330,7 @@ impl Builder {
                 }
             }
             for (elem, scope) in found {
-                if seen_elems.insert(elem) {
+                if seen_elems.mark(elem) {
                     collected.push((elem, scope));
                 }
             }
@@ -9281,6 +10343,8 @@ impl Builder {
                 );
             }
         }
+        self.return_marks(visited);
+        self.return_marks(seen_elems);
         self.reduce_inherited_bindings(
             self.scopes[s].owner,
             include_implied,
@@ -9292,8 +10356,83 @@ impl Builder {
                 incomplete,
                 implicit_redefinitions: Vec::new(),
             },
-            None,
+            facts,
         )
+    }
+
+    /// What base `b` contributes of its own to the enumeration of a scope
+    /// that inherits it ([`BaseContribution`]): made once per base and kept
+    /// with the inherited-member memo, unless a depth guard cut it short, it
+    /// is incomplete, or a replan dropped the memo while it was being made.
+    fn base_contribution(&mut self, b: usize, include_implied: bool) -> Arc<BaseContribution> {
+        if let Some(hit) = self.base_contributions.get(&(b, include_implied)) {
+            return Arc::clone(hit);
+        }
+        let epoch = self.redefinition_epoch;
+        let mut out = BaseContribution::default();
+        // Each member with the visibility of its owning membership,
+        // read once: it orders the members and admits them below.
+        let mut owned: Vec<(usize, usize, LookupAccess)> = Vec::new();
+        if let Some(owner) = self.scopes[b].owner {
+            owned.extend(
+                self.owned_member_elems(owner, false)
+                    .into_iter()
+                    .filter_map(|e| {
+                        let vis = self.owning_visibility(e);
+                        (vis != LookupAccess::All).then_some((e, b, vis))
+                    }),
+            );
+        }
+        for map in [&self.scopes[b].names, &self.scopes[b].effective_names] {
+            for bindings in map.values() {
+                for binding in bindings {
+                    if binding.visibility == LookupAccess::All {
+                        continue; // private: not inherited
+                    }
+                    owned.push((binding.elem, b, self.owning_visibility(binding.elem)));
+                }
+            }
+        }
+        owned.sort_by_key(|&(e, scope, vis)| (vis == LookupAccess::Protected, e, scope));
+        // nonPrivateMemberships unions public owned/imported,
+        // protected owned/imported, then inherited memberships. An
+        // import's visibility controls admission, not its target's.
+        for access in [LookupAccess::Public, LookupAccess::Protected] {
+            let own: Vec<_> = owned
+                .iter()
+                .filter(|&&(_, _, vis)| access.admits(vis))
+                .map(|&(e, scope, _)| (e, scope))
+                .collect();
+            let mut own_order: Vec<_> = own
+                .iter()
+                .filter_map(|&(e, _)| self.elements[e].owning_relationship)
+                .collect();
+            let mut aliases = Vec::new();
+            self.scope_alias_rels(b, access, &[], &mut aliases);
+            own_order.extend(aliases.iter().copied());
+            own_order.sort_unstable();
+            own_order.dedup();
+            out.membership_order.extend(own_order);
+            out.alias_rels.extend(aliases);
+            out.found.extend(own);
+            let mut imported = InheritedBindings::default();
+            out.membership_order.extend(self.imported_bindings(
+                b,
+                include_implied,
+                access,
+                &mut imported,
+            ));
+            out.found.extend(imported.members);
+            out.alias_rels.extend(imported.alias_rels);
+            out.truncated |= imported.truncated;
+            out.incomplete |= imported.incomplete;
+        }
+        let out = Arc::new(out);
+        if !out.truncated && !out.incomplete && epoch == self.redefinition_epoch {
+            self.base_contributions
+                .insert((b, include_implied), Arc::clone(&out));
+        }
+        out
     }
 
     /// Preserve compatibility bookkeeping around the shared identity reducer.
@@ -9302,9 +10441,9 @@ impl Builder {
         owner: Option<usize>,
         include_implied: bool,
         mut candidates: InheritedBindings,
-        steps: Option<&mut usize>,
+        facts: Option<&mut HeritageFacts>,
     ) -> InheritedBindings {
-        let reduced = self.reduce_membership_projection(
+        let reduced = self.reduce_membership_projection_noting(
             owner,
             include_implied,
             MembershipProjection {
@@ -9313,25 +10452,121 @@ impl Builder {
                 incomplete: candidates.incomplete,
                 implicit_redefinitions: Vec::new(),
             },
-            steps,
+            None,
+            facts,
         );
-        let retained: HashSet<_> = reduced.membership_order.iter().copied().collect();
-        let mut seen_members = HashSet::new();
+        let mut retained = self.borrow_marks();
+        for &membership in &reduced.membership_order {
+            retained.mark(membership);
+        }
+        let mut seen = self.borrow_marks();
         candidates.members.retain(|(member, _)| {
             self.elements[*member]
                 .owning_relationship
-                .is_some_and(|membership| retained.contains(&membership))
-                && seen_members.insert(*member)
+                .is_some_and(|membership| retained.marked(membership))
+                && seen.mark(*member)
         });
-        let mut seen_aliases = HashSet::new();
+        seen.begin();
         candidates
             .alias_rels
-            .retain(|membership| retained.contains(membership) && seen_aliases.insert(*membership));
+            .retain(|membership| retained.marked(*membership) && seen.mark(*membership));
+        self.return_marks(retained);
+        self.return_marks(seen);
         candidates.membership_order = reduced.membership_order;
         candidates.truncated = reduced.truncated;
         candidates.incomplete = reduced.incomplete;
         candidates.implicit_redefinitions = reduced.implicit_redefinitions;
         candidates
+    }
+
+    /// The kept redefinition walks for the current state (an empty set when
+    /// the state changed since they were made), taken out of the builder for
+    /// the reducer to read and extend, with the epoch they were taken at.
+    fn take_redefinition_closures(&mut self, include_implied: bool) -> (ClosureWalks, u64) {
+        let key = ClosureKey {
+            rows: self.elements.observe_revision(),
+            targets: self.spec_targets.observe_revision(),
+            resolved: self.spec_resolved.observe_revision(),
+            dynamic: self.dynamic_graph.clone(),
+            positional: self.effective_positional_redefinitions().is_some(),
+            semantic_ready: self.semantic_ready,
+            static_planning: self.static_planning,
+        };
+        let memo = self
+            .redefinition_closures
+            .get_or_insert_with(Default::default);
+        if !memo.key.as_ref().is_some_and(|kept| kept.same(&key)) {
+            *memo = RedefinitionClosures {
+                key: Some(key),
+                ..Default::default()
+            };
+        }
+        (
+            std::mem::take(&mut memo.walks[usize::from(include_implied)]),
+            self.redefinition_epoch,
+        )
+    }
+
+    /// Give the walks back, unless the memo was dropped while they were out
+    /// (a replan during a walk): those walks read the plan the drop retired.
+    fn put_redefinition_closures(
+        &mut self,
+        include_implied: bool,
+        walks: ClosureWalks,
+        epoch: u64,
+    ) {
+        if epoch != self.redefinition_epoch {
+            return;
+        }
+        if let Some(memo) = &mut self.redefinition_closures {
+            memo.walks[usize::from(include_implied)] = walks;
+        }
+    }
+
+    /// The row name hashes for the current state of the rows, taken out of
+    /// the builder for a reducer to read and extend ([`row_name_keys`]).
+    /// A build whose rows below its own are its prepared library's frozen
+    /// rows, as the freeze left them, reads theirs from the library's
+    /// table and makes only its own.
+    fn take_name_keys(&mut self) -> NameKeys {
+        let rows = self.elements.observe_revision();
+        match self.name_keys.take() {
+            Some(keys) if keys.rows.same_as(&rows) => keys,
+            _ => {
+                let library = self.prepared_from.as_ref().filter(|prepared| {
+                    self.elements.base_untouched()
+                        && Arc::ptr_eq(
+                            self.elements.base_arc(),
+                            prepared.builder.elements.base_arc(),
+                        )
+                        && self.elements.base_len() == prepared.builder.elements.len()
+                });
+                NameKeys {
+                    rows,
+                    shared: library.map_or_else(Default::default, |prepared| {
+                        Arc::clone(prepared.library_name_keys())
+                    }),
+                    own: Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Give the row name hashes back.
+    fn put_name_keys(&mut self, keys: NameKeys) {
+        self.name_keys = Some(keys);
+    }
+
+    /// Drop the inherited-member memo: per scope, per heritage and per
+    /// base, with the reducer's redefinition walks. `redefinition_epoch`
+    /// counts the drops, so that what a replan interrupted is not kept.
+    pub(crate) fn drop_inherited_memos(&mut self) {
+        self.inherited_cache.clear();
+        self.inherited_by_heritage.clear();
+        self.base_contributions.clear();
+        self.heritage_reductions.clear();
+        self.redefinition_closures = None;
+        self.redefinition_epoch = self.redefinition_epoch.wrapping_add(1);
     }
 
     /// One redefinition reducer for global and context-sensitive candidates.
@@ -9340,7 +10575,19 @@ impl Builder {
         owner: Option<usize>,
         include_implied: bool,
         candidates: MembershipProjection,
+        steps: Option<&mut usize>,
+    ) -> MembershipProjection {
+        self.reduce_membership_projection_noting(owner, include_implied, candidates, steps, None)
+    }
+
+    /// The reducer, noting in `facts` what it read of the candidates.
+    fn reduce_membership_projection_noting(
+        &mut self,
+        owner: Option<usize>,
+        include_implied: bool,
+        candidates: MembershipProjection,
         mut steps: Option<&mut usize>,
+        mut facts: Option<&mut HeritageFacts>,
     ) -> MembershipProjection {
         let MembershipProjection {
             mut membership_order,
@@ -9363,14 +10610,9 @@ impl Builder {
             };
         }
         charge!(membership_order.len());
-        if include_implied {
-            incomplete |= owner.is_some_and(|e| {
-                !self.dynamic_evidence_current(e)
-                    || self
-                        .effective_positional_redefinitions()
-                        .is_some_and(|plan| plan.incomplete.contains(&e))
-            });
-        }
+        // The enumerated scope's own planning, apart from what its
+        // heritage's candidates leave incomplete.
+        let owner_incomplete = self.owner_planning_incomplete(owner, include_implied);
         // An empty inherited projection cannot be shadowed by an owned member.
         // Keep the readiness side effect of the ordinary path when planning
         // has not yet run; once ready, no owned-feature scan is necessary.
@@ -9379,80 +10621,114 @@ impl Builder {
                 || !self.semantic_ready
                 || self.effective_positional_redefinitions().is_some())
         {
+            if let Some(facts) = facts.as_deref_mut() {
+                facts.complete = !truncated && !incomplete;
+            }
             return MembershipProjection {
                 membership_order,
                 truncated,
-                incomplete,
+                incomplete: incomplete || owner_incomplete,
                 implicit_redefinitions: Vec::new(),
             };
         }
         // Membership identity, not memberElement identity, distinguishes
         // contributors. Resolve each unique relationship's target once; the
         // same target may intentionally participate through distinct aliases.
-        let mut seen_memberships = HashSet::new();
-        membership_order.retain(|m| seen_memberships.insert(*m));
+        let mut seen = self.borrow_marks();
+        membership_order.retain(|m| seen.mark(*m));
         let resolved: Vec<_> = membership_order
             .iter()
             .map(|&membership| (membership, self.stored_membership_member(membership)))
             .collect();
-        let mut seen_members = HashSet::new();
+        seen.begin();
         let collected: Vec<_> = resolved
             .iter()
             .filter_map(|&(membership, member)| {
                 let member = member?;
-                (self.elements[member].owning_relationship == Some(membership)
-                    && seen_members.insert(member))
-                .then_some(member)
+                (self.elements[member].owning_relationship == Some(membership) && seen.mark(member))
+                    .then_some(member)
             })
             .collect();
-        let mut feature_memberships: HashMap<usize, usize> = HashMap::new();
+        // The Feature members in element order, once each: a Feature's
+        // Memberships are removed together or not at all.
+        let mut features: Vec<usize> = Vec::new();
         for &(_, member) in &resolved {
             charge!(1);
             if let Some(e) = member {
-                if crate::metaclass::conforms(self.elements[e].ty, "Feature") {
-                    *feature_memberships.entry(e).or_default() += 1;
+                if self.elements[e].is(const { crate::metaclass::index_const("Feature") }) {
+                    features.push(e);
                 }
             } else {
                 incomplete = true;
             }
         }
+        features.sort_unstable();
+        features.dedup();
         // Only actual owned Features seed the direct-target intersection.
         // An owned alias of a redefining Feature is not an ownedFeature.
         let owned = owner
             .map(|owner| self.owned_member_elems(owner, true))
             .unwrap_or_default();
-        let mut owned_direct = HashSet::new();
+        let mut owned_direct = self.borrow_marks();
+        let mut targets = Vec::new();
         for &e in &owned {
             charge!(1);
-            owned_direct.extend(self.semantic_redefinition_targets(e, include_implied));
+            self.semantic_redefinition_targets_into(e, include_implied, &mut targets);
+            for t in targets.drain(..) {
+                owned_direct.mark(t);
+            }
         }
-        let mut shadow = HashSet::new();
-        // Reuse traversal storage; closures are consumed immediately rather
-        // than retained once per Feature. Every candidate remains a blocker
-        // even when another candidate or an owned Feature removes it.
-        let mut closure = HashSet::new();
+        let mut shadow = self.borrow_marks();
+        // Each Feature's redefinition walk is the Feature's own, the same for
+        // every type that inherits it: made once and kept (with the steps it
+        // charged, charged again on every read) until the rows or the plans
+        // change. Every candidate remains a blocker even when another
+        // candidate or an owned Feature removes it.
+        let mut closure = seen;
         let mut stack = Vec::new();
-        for (&e, &count) in &feature_memberships {
-            closure.clear();
-            stack.push(e);
+        let (mut walks, epoch) = self.take_redefinition_closures(include_implied);
+        for &e in &features {
+            let (reach, pops) = match walks.get(&e) {
+                Some((reach, pops)) => (Arc::clone(reach), *pops),
+                None => {
+                    closure.begin();
+                    stack.push(e);
+                    let mut reach = Vec::new();
+                    let mut pops = 0usize;
+                    while let Some(t) = stack.pop() {
+                        pops += 1;
+                        if !closure.mark(t) {
+                            continue;
+                        }
+                        reach.push(t);
+                        self.semantic_redefinition_targets_into(t, include_implied, &mut stack);
+                    }
+                    let reach: Arc<[usize]> = reach.into();
+                    walks.insert(e, (Arc::clone(&reach), pops));
+                    (reach, pops)
+                }
+            };
+            charge!(pops);
+            if let Some(facts) = facts.as_deref_mut() {
+                facts.reach.extend(reach.iter().copied());
+            }
             let mut intersects_owned = false;
-            while let Some(t) = stack.pop() {
-                charge!(1);
-                if !closure.insert(t) {
-                    continue;
+            for &t in reach.iter() {
+                // The candidate is no blocker of its own Memberships, including
+                // in a cycle and however many of them arrive (its owning one
+                // and an alias of it, say): another Feature's closure reaching
+                // it, or an owned redefinition, removes them, as in the
+                // projection reducer.
+                if t != e {
+                    shadow.mark(t);
                 }
-                // Exclude only the candidate's own Membership, including in
-                // a cycle. Another Membership of the same Feature still counts.
-                if t != e || count > 1 {
-                    shadow.insert(t);
-                }
-                intersects_owned |= owned_direct.contains(&t);
-                stack.extend(self.semantic_redefinition_targets(t, include_implied));
+                intersects_owned |= owned_direct.marked(t);
             }
             if intersects_owned {
-                shadow.insert(e);
+                shadow.mark(e);
             }
         }
+        self.put_redefinition_closures(include_implied, walks, epoch);
         // (c) SysML implicit same-name usage redefinition: a usage-family
         //     member whose owning type strictly conforms over another
         //     candidate's owner redefines the same-named candidate
@@ -9460,56 +10736,181 @@ impl Builder {
         //     step, a result or an end: those redefine by position
         //     (`redefines_by_position`), and a reused name at another
         //     position is a collision, not a redefinition.
-        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        for e in owned.iter().copied().chain(collected.iter().copied()) {
+        // Grouped by the names' hashes (kept per row), then, in a group of
+        // more than one, by the names themselves: only equal names group.
+        let mut names = self.take_name_keys();
+        let mut by_name: crate::layered::IdMap<u64, Vec<(usize, usize)>> = Default::default();
+        for (i, e) in owned.iter().chain(&collected).copied().enumerate() {
             // Both spellings share the lookup name space: a short name can
             // shadow (or be shadowed by) a declared name, as in lookup.
-            for key in ["declaredName", "declaredShortName"] {
-                if let Some(n) = self.elements[e].props.get(key).and_then(|a| a.as_str()) {
-                    by_name.entry(n).or_default().push(e);
+            let keys = row_name_keys(&self.elements, &mut names, e);
+            for (spelling, key) in keys.into_iter().enumerate() {
+                if key != 0 {
+                    by_name.entry(key).or_default().push((e, spelling));
+                    if i >= owned.len() {
+                        if let Some(facts) = facts.as_deref_mut() {
+                            facts.names.insert(key);
+                        }
+                    }
                 }
             }
         }
-        let groups: Vec<Vec<usize>> = by_name.into_values().filter(|g| g.len() > 1).collect();
-        let mut implicit_redefinitions: Vec<(usize, usize)> = Vec::new();
-        for group in groups {
-            for &x in &group {
-                if !self.elements[x].ty.ends_with("Usage")
-                    || shadow.contains(&x)
-                    || self.redefines_by_position(x)
-                {
-                    continue;
+        self.put_name_keys(names);
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for group in by_name.into_values().filter(|g| g.len() > 1) {
+            let spelled = |&(e, spelling): &(usize, usize)| {
+                let (name, short) = self.elements[e].props.declared_names();
+                if spelling == 0 { name } else { short }
+            };
+            let first = spelled(&group[0]);
+            if group.iter().all(|m| spelled(m) == first) {
+                groups.push(group.into_iter().map(|(e, _)| e).collect());
+                continue;
+            }
+            let mut by_text: Vec<(&str, Vec<usize>)> = Vec::new();
+            for m in &group {
+                let text = spelled(m).unwrap_or_default();
+                match by_text.iter_mut().find(|(t, _)| *t == text) {
+                    Some((_, members)) => members.push(m.0),
+                    None => by_text.push((text, vec![m.0])),
                 }
-                let Some(ox) = self.owner_elem(x) else {
-                    continue;
-                };
-                for &y in &group {
-                    charge!(1);
-                    if x == y || shadow.contains(&y) {
+            }
+            groups.extend(
+                by_text
+                    .into_iter()
+                    .map(|(_, members)| members)
+                    .filter(|g| g.len() > 1),
+            );
+        }
+        let mut implicit_redefinitions: Vec<(usize, usize)> = Vec::new();
+        // Every group is decided against the shadow set as the earlier
+        // passes left it — what the groups hide is applied once they are
+        // all decided: a member listed under both its names (declared and
+        // short) would otherwise hide, or not, depending on which of its
+        // groups came first. A member this step hides still hides what its
+        // own name shadows, as a spelled redefinition would.
+        let mut newly_shadowed: Vec<usize> = Vec::new();
+        for group in groups {
+            // A member redefines another this way only across owners whose
+            // types strictly conform. A small group is decided pair by
+            // pair; a large one is walked owner by owner along each owner's
+            // specialization closure (kept sorted by the memo) instead — a
+            // group of thousands of same-named features owned by as many
+            // unrelated usages, the bodies of every metadata usage a view
+            // exposes, would otherwise cost millions of conformance tests.
+            // Both walks decide the same pairs (`implicit_redefinitions_are_
+            // the_same_pair_by_pair_and_owner_by_owner`).
+            if group.len() <= pairwise_group_limit() {
+                for &x in &group {
+                    if !self.elements[x].ty.ends_with("Usage")
+                        || shadow.marked(x)
+                        || self.redefines_by_position(x)
+                    {
                         continue;
                     }
-                    let Some(oy) = self.owner_elem(y) else {
+                    let Some(ox) = self.owner_elem(x) else {
                         continue;
                     };
-                    if ox != oy && self.indexed_conforms(ox, oy) && !self.indexed_conforms(oy, ox) {
-                        shadow.insert(y);
-                        implicit_redefinitions.push((y, x));
+                    for &y in &group {
+                        charge!(1);
+                        if x == y || shadow.marked(y) {
+                            continue;
+                        }
+                        let Some(oy) = self.owner_elem(y) else {
+                            continue;
+                        };
+                        if ox != oy
+                            && self.indexed_conforms(ox, oy)
+                            && !self.indexed_conforms(oy, ox)
+                        {
+                            newly_shadowed.push(y);
+                            implicit_redefinitions.push((y, x));
+                        }
+                    }
+                }
+                continue;
+            }
+            let mut owners: Vec<usize> = Vec::new();
+            // By owner: the members that may redefine, and those that may
+            // be redefined.
+            let mut by_owner: crate::layered::IdMap<usize, (Vec<usize>, Vec<usize>)> =
+                Default::default();
+            for &m in &group {
+                charge!(1);
+                let Some(o) = self.owner_elem(m) else {
+                    continue;
+                };
+                let entry = by_owner.entry(o).or_insert_with(|| {
+                    owners.push(o);
+                    Default::default()
+                });
+                if shadow.marked(m) {
+                    continue;
+                }
+                entry.1.push(m);
+                if self.elements[m].ty.ends_with("Usage") && !self.redefines_by_position(m) {
+                    entry.0.push(m);
+                }
+            }
+            if owners.len() < 2 {
+                continue;
+            }
+            for &ox in &owners {
+                let xs = by_owner[&ox].0.clone();
+                if xs.is_empty() {
+                    continue;
+                }
+                // The owners `ox`'s type conforms to, among the group's:
+                // read off its closure when the group has more owners than
+                // the closure has entries, else tested owner by owner.
+                let closure = self.spec_closure(ox);
+                charge!(owners.len().min(closure.len()));
+                let conforming: Vec<usize> = if owners.len() > closure.len() {
+                    closure
+                        .iter()
+                        .copied()
+                        .filter(|&oy| oy != ox && by_owner.contains_key(&oy))
+                        .collect()
+                } else {
+                    owners
+                        .iter()
+                        .copied()
+                        .filter(|&oy| oy != ox && closure.binary_search(&oy).is_ok())
+                        .collect()
+                };
+                for oy in conforming {
+                    let ys = &by_owner[&oy].1;
+                    if ys.is_empty() || self.indexed_conforms(oy, ox) {
+                        continue;
+                    }
+                    for &y in ys {
+                        newly_shadowed.push(y);
+                        implicit_redefinitions.extend(xs.iter().map(|&x| (y, x)));
                     }
                 }
             }
+        }
+        for y in newly_shadowed {
+            shadow.mark(y);
         }
         membership_order.clear();
         membership_order.extend(resolved.into_iter().filter_map(|(membership, member)| {
             member
-                .is_none_or(|member| !shadow.contains(&member))
+                .is_none_or(|member| !shadow.marked(member))
                 .then_some(membership)
         }));
+        self.return_marks(closure);
+        self.return_marks(owned_direct);
+        self.return_marks(shadow);
         implicit_redefinitions.sort_unstable();
         implicit_redefinitions.dedup();
+        if let Some(facts) = facts {
+            facts.complete = !truncated && !incomplete;
+        }
         MembershipProjection {
             membership_order,
             truncated,
-            incomplete,
+            incomplete: incomplete || owner_incomplete,
             implicit_redefinitions,
         }
     }
@@ -9546,7 +10947,7 @@ impl Builder {
             self.ensure_positional_redefinitions();
         }
         let mut order = Vec::new();
-        let mut seen = HashMap::new();
+        let mut seen = crate::layered::IdMap::default();
         let mut excluded = vec![b];
         self.collect_import_edges(
             b,
@@ -9596,7 +10997,7 @@ impl Builder {
         include_implied: bool,
         chain: &[(usize, Vec<usize>)],
         excluded: &mut Vec<usize>,
-        seen: &mut HashMap<ImportVisit, ImportProjection>,
+        seen: &mut crate::layered::IdMap<ImportVisit, ImportProjection>,
         out: &mut InheritedBindings,
         order: &mut Vec<usize>,
         depth: usize,
@@ -9719,7 +11120,7 @@ impl Builder {
         recursive: bool,
         include_implied: bool,
         chain: &[(usize, Vec<usize>)],
-        seen: &mut HashMap<ImportVisit, ImportProjection>,
+        seen: &mut crate::layered::IdMap<ImportVisit, ImportProjection>,
         out: &mut InheritedBindings,
         order: &mut Vec<usize>,
         depth: usize,
@@ -9866,7 +11267,7 @@ impl Builder {
         }
         if self.scopes[sc]
             .owner
-            .is_some_and(|owner| crate::metaclass::conforms(self.elements[owner].ty, "Type"))
+            .is_some_and(|owner| is_a!(self.elements[owner], "Type"))
         {
             let family = context.new_type_family();
             let inherited = self.contextual_inherited_bindings(
@@ -10137,6 +11538,26 @@ impl Builder {
     /// index never resolves anything — safe to call from inside a lookup.
     /// A build whose specialization rows below its own are its prepared
     /// library's frozen rows indexes only its own over the library's index.
+    /// Make the specialization rows' index, for [`Self::resolved_chain_targets`].
+    pub(crate) fn prepare_chain_targets(&mut self) {
+        self.ensure_spec_index();
+    }
+
+    /// The resolved targets of `owner`'s subsettings and redefinitions —
+    /// a multiplicity's chain to the multiplicities it takes its domain
+    /// from — read off the specialization rows' index
+    /// ([`Self::prepare_chain_targets`] first).
+    pub(crate) fn resolved_chain_targets(&self, owner: usize) -> Vec<usize> {
+        self.spec_index
+            .as_ref()
+            .and_then(|index| index.get(&owner))
+            .into_iter()
+            .flatten()
+            .filter(|&&i| matches!(self.spec_targets[i].1, "Subsetting" | "Redefinition"))
+            .filter_map(|&i| self.spec_resolved.get(i).copied().flatten())
+            .collect()
+    }
+
     fn ensure_spec_index(&mut self) {
         if self.spec_index.is_none() {
             let library = self.prepared_from.as_ref().filter(|prepared| {
@@ -10155,6 +11576,8 @@ impl Builder {
             };
             self.index_spec_rows(from..self.spec_targets.len(), &mut index);
             self.spec_index = Some(index);
+            // The memo answers for one index instance; a rebuilt one starts it over.
+            self.spec_memo = None;
         }
     }
 
@@ -10184,7 +11607,7 @@ impl Builder {
         if e == target {
             return true;
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         let mut stack = vec![e];
         while let Some(s) = stack.pop() {
             if !seen.insert(s) {
@@ -10213,7 +11636,7 @@ impl Builder {
         if e == target {
             return true;
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         let mut stack = vec![e];
         while let Some(s) = stack.pop() {
             if !seen.insert(s) {
@@ -10336,9 +11759,9 @@ impl Builder {
         let mut members = self.elements[e]
             .owned_relationships
             .iter()
-            .filter(|&&r| crate::metaclass::conforms(self.elements[r].ty, "Membership"))
+            .filter(|&&r| is_a!(self.elements[r], "Membership"))
             .flat_map(|&r| self.elements[r].children.iter())
-            .filter(|&&child| crate::metaclass::conforms(self.elements[child].ty, "Multiplicity"))
+            .filter(|&&child| is_a!(self.elements[child], "Multiplicity"))
             .copied();
         let first = members.next();
         members.next().is_none().then_some(first)
@@ -10450,9 +11873,18 @@ impl Builder {
     /// closure contains the element owning `target`. This is the KerML
     /// protected-membership access case, including a nested feature typed
     /// by a specializing type.
-    fn scope_can_access_protected(&mut self, mut origin: usize, target: usize) -> bool {
+    pub(crate) fn scope_can_access_protected(&mut self, mut origin: usize, target: usize) -> bool {
+        // Under a dynamic plan the bases carry its overlay, which comes and
+        // goes without a reset of the per-pass tables (`may_reach` makes the
+        // same exception): the closures are made but not kept then, and
+        // none kept is read.
+        let keep = self.effective_dynamic_plan().is_none();
         loop {
-            if self.scope_reaches_base(origin, target, &mut HashSet::new()) {
+            if self
+                .base_closure(origin, keep)
+                .binary_search(&target)
+                .is_ok()
+            {
                 return true;
             }
             let Some(parent) = self.scopes[origin].parent else {
@@ -10462,21 +11894,77 @@ impl Builder {
         }
     }
 
-    fn scope_reaches_base(
-        &mut self,
-        scope: usize,
-        target: usize,
-        seen: &mut HashSet<usize>,
-    ) -> bool {
-        if !seen.insert(scope) {
-            return false;
-        }
-        for base in self.base_scopes(scope) {
-            if base == target || self.scope_reaches_base(base, target, seen) {
-                return true;
+    /// The scopes reachable from `scope` through its bases, transitively,
+    /// sorted (the `base_closure` table): read from the table when `keep`
+    /// and the table has it, else made by the walk the protected-access
+    /// test made per query, and kept when `keep`.
+    fn base_closure(&mut self, scope: usize, keep: bool) -> Arc<[usize]> {
+        if keep {
+            if let Some(Some(closure)) = self.base_closure.get(scope) {
+                return Arc::clone(closure);
             }
         }
-        false
+        let mut seen: crate::layered::IdSet<usize> = Default::default();
+        seen.insert(scope);
+        let mut reached = Vec::new();
+        // The scope is reached as a base of its own only through a cycle.
+        let mut cyclic = false;
+        let mut pending = self.base_scopes(scope);
+        while let Some(base) = pending.pop() {
+            if base == scope {
+                cyclic = true;
+            }
+            if !seen.insert(base) {
+                continue;
+            }
+            reached.push(base);
+            pending.extend(self.base_scopes(base));
+        }
+        if cyclic {
+            reached.push(scope);
+        }
+        reached.sort_unstable();
+        let closure: Arc<[usize]> = reached.into();
+        if keep && scope < self.base_closure.len() {
+            self.base_closure[scope] = Some(Arc::clone(&closure));
+        }
+        closure
+    }
+
+    /// [`Self::scope_can_access_protected`] as the walk answered it before
+    /// the closures were kept, for the test that compares them.
+    #[cfg(test)]
+    pub(crate) fn scope_can_access_protected_walked(
+        &mut self,
+        mut origin: usize,
+        target: usize,
+    ) -> bool {
+        fn reaches(
+            b: &mut Builder,
+            scope: usize,
+            target: usize,
+            seen: &mut crate::layered::IdSet<usize>,
+        ) -> bool {
+            if !seen.insert(scope) {
+                return false;
+            }
+            for base in b.base_scopes(scope) {
+                if base == target || reaches(b, base, target, seen) {
+                    return true;
+                }
+            }
+            false
+        }
+        let mut seen = crate::layered::IdSet::default();
+        loop {
+            if reaches(self, origin, target, &mut seen) {
+                return true;
+            }
+            let Some(parent) = self.scopes[origin].parent else {
+                return false;
+            };
+            origin = parent;
+        }
     }
 
     fn resolve_rest_result(
@@ -11012,12 +12500,17 @@ pub(crate) fn lib_qn(path: &str) -> QualifiedName {
     }
 }
 
-/// Implied specialization bases per definition kind (SysML 8.4.2 Table 31 /
-/// KerML Table 10). Used for *name resolution only* — the compact form never
-/// serializes implied relationships.
+/// The library bases a definition of `kind` implicitly specializes (SysML
+/// 8.4.2 Table 31, KerML Table 10): the resolver's implied heritage and the
+/// planner's implied Subclassifications read them.
+///
+/// Each is the qualified name of the base's own declaration: the planner
+/// finds a base among the library's element names, so an alias of one —
+/// the SysML `Attributes::AttributeValue` for `Base::DataValue` — would
+/// never be found.
 pub(crate) fn implicit_def_bases(kind: DefKind) -> &'static [&'static str] {
     match kind {
-        DefKind::Attribute | DefKind::Enum => &["Attributes::AttributeValue"],
+        DefKind::Attribute | DefKind::Enum => &["Base::DataValue"],
         DefKind::Occurrence | DefKind::Individual => &["Occurrences::Occurrence"],
         DefKind::Item => &["Items::Item"],
         DefKind::Metadata => &["Metadata::MetadataItem"],
@@ -11055,10 +12548,14 @@ pub(crate) fn implicit_def_bases(kind: DefKind) -> &'static [&'static str] {
     }
 }
 
-/// Implied subsetting bases per usage kind (SysML 8.4.2 Table 32).
+/// The library bases a usage of `kind` implicitly subsets (SysML 8.4.2
+/// Table 32), read as [`implicit_def_bases`] is.
+///
+/// Named as in [`implicit_def_bases`]: `Base::dataValues`, which the SysML
+/// `Attributes::attributeValues` aliases.
 pub(crate) fn implicit_usage_bases(kind: UsageKind) -> &'static [&'static str] {
     match kind {
-        UsageKind::Attribute | UsageKind::Enum => &["Attributes::attributeValues"],
+        UsageKind::Attribute | UsageKind::Enum => &["Base::dataValues"],
         UsageKind::Occurrence | UsageKind::Event => &["Occurrences::occurrences"],
         UsageKind::Item => &["Items::items"],
         UsageKind::Metadata => &["Metadata::metadataItems"],
@@ -11425,6 +12922,12 @@ pub struct ConstraintInfo {
     pub asserted: bool,
     /// `assert not` / negated invariant — the expression is expected false.
     pub negated: bool,
+    /// Whether `expr` is carried over from a body declared on another
+    /// element — a bodiless assert's nearest definition body, or a
+    /// closure type's constraint under a satisfaction claim — rather
+    /// than the element's own trailing result. `unit`/`span` then
+    /// locate that other text.
+    pub inherited: bool,
     /// Scope the expression's references resolve from.
     pub scope: ScopeRef,
     /// The result expression.
@@ -11512,7 +13015,7 @@ pub struct ResolvedModel {
     /// Interchange `@id` → element index, built lazily by the connector /
     /// transition accessors (empty until first use): the builder's own index
     /// while no two rows share an id.
-    by_id: Arc<crate::layered::IdMap<Uuid, usize>>,
+    by_id: Arc<RowsById>,
     /// Element count `by_id` was built for. Compared instead of the map's
     /// own length: duplicate ids (an id-scheme collision between
     /// same-named units) make the map smaller than the element list, and
@@ -11558,7 +13061,99 @@ pub struct ResolvedModel {
     /// User features by the elements their explicit redefinitions
     /// target, built lazily by [`Self::redefiners`] (`None` until first
     /// use).
-    pub(crate) redefiner_index: Option<HashMap<usize, Vec<usize>>>,
+    pub(crate) redefiner_index: Option<crate::layered::IdMap<usize, Vec<usize>>>,
+    /// A derived read of a feature-reference expression's names or owners
+    /// deferred making the implied relationships, which any other derived
+    /// read of such an expression makes first: the next read or operation
+    /// that may depend on them makes them before it runs
+    /// ([`Self::make_deferred_implied`]).
+    pub(super) implied_deferred: bool,
+    /// The checked row the public property reads share (see
+    /// [`Self::property`]): the certificates of the receivers read so far.
+    checked_row: semantic::certified_types::CheckedRow,
+    /// The rows [`Self::build`] left, by token: the compact emission of the
+    /// model reads its user units off them, and the library name tables
+    /// are read off this model's own, while nothing has been written since
+    /// (`None` for a model resolved any other way).
+    built: Option<BuiltRows>,
+}
+
+/// What a [`ResolvedModel::build`] left for the model's compact emission
+/// ([`model_to_compact_json_with_units`]) and its library name tables
+/// ([`library_name_map`]) to read: the element rows and the name tables as
+/// the build made them, held by token (see `LayeredVec::observe_rows`), so
+/// that a read of them can tell that nothing has written them since —
+/// what a fresh build of the same model would make — instead of building
+/// the model again.
+///
+/// A build started from settled outcomes (`Model::start_from_settled`) is
+/// read as itself. Its rows are a cold build's by the settled-outcomes
+/// contract (see `json::settled`), which holds for every acyclic model; a
+/// model with a reference cycle, which the checks report, could settle on
+/// another fixed point seeded than cold, and its emission is then the
+/// seeded build's, as every other answer of the model is.
+#[derive(Clone)]
+struct BuiltRows {
+    /// Token of the element rows as the build left them.
+    rows: crate::layered::Revision,
+    /// The user units' rows: from the build's boundary to its end.
+    user: std::ops::Range<usize>,
+    /// The user units' structure (see [`model_to_compact_json_with_units`]).
+    units: Vec<(usize, String)>,
+    /// Tokens and lengths of the library name tables (`lib_qnames`, then
+    /// `lib_mem_qnames`) as the build left them.
+    names: [(crate::layered::Revision, usize); 2],
+}
+
+impl BuiltRows {
+    /// The rows a build of `model` from `boundary` just made, for its
+    /// compact emission and name tables to read.
+    fn observe(b: &mut Builder, boundary: usize, model: &crate::model::Model) -> Self {
+        Self {
+            rows: b.elements.observe_rows(),
+            user: boundary..b.elements.len(),
+            units: b.user_unit_structure(boundary, model),
+            names: [
+                (b.lib_qnames.observe_rows(), b.lib_qnames.len()),
+                (b.lib_mem_qnames.observe_rows(), b.lib_mem_qnames.len()),
+            ],
+        }
+    }
+}
+
+/// A compact element array read off a build's rows one element at a time
+/// (see [`ResolvedModel::built_compact_rows`]).
+pub struct CompactRows<'a> {
+    b: &'a Builder,
+    rows: std::ops::Range<usize>,
+}
+
+impl CompactRows<'_> {
+    /// The number of elements in the array.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the array has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The array's element `i`: the very value the whole array holds at
+    /// that index, made anew on each call.
+    ///
+    /// # Panics
+    ///
+    /// If `i` is not below [`Self::len`].
+    pub fn element(&self, i: usize) -> Value {
+        assert!(i < self.len(), "element {i} of {}", self.len());
+        self.b.compact_row(self.rows.start + i)
+    }
+
+    /// The elements in array order.
+    pub fn elements(&self) -> impl ExactSizeIterator<Item = Value> + '_ {
+        self.rows.clone().map(|i| self.b.compact_row(i))
+    }
 }
 
 /// The enumeration and variation entries of `pairs` (element, body scope):
@@ -11597,18 +13192,152 @@ fn enum_entries<'a>(
 /// The lazily-built quantity-type index of a resolved model (see
 /// `crate::quantity`): scalar quantity types keyed by their dimension
 /// and by the unit definitions their `mRef`s name.
+#[derive(Clone)]
 pub(crate) struct QuantityIndex {
     pub(crate) by_dims: HashMap<crate::quantity::QuantityDims, Vec<usize>>,
     pub(crate) by_unit_def: HashMap<usize, Vec<usize>>,
 }
 
 impl ResolvedModel {
+    /// Share the rows of the user's elements and scopes between this model
+    /// and its forks: a fork then copies the memos, not the rows.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn share_rows(&mut self) {
+        self.b.elements.share_tail();
+        self.b.scopes.share_tail();
+    }
+
+    /// A private copy of the resolved model, its rows shared and its lazily
+    /// filled indexes and memos copied as they stand: a reader that fills
+    /// them as it reads works on the copy and leaves this model as it is.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            b: self.b.clone(),
+            semantic_publication_seen: self.semantic_publication_seen.clone(),
+            rel_owner: self.rel_owner.clone(),
+            rel_member: self.rel_member.clone(),
+            by_id: Arc::clone(&self.by_id),
+            by_id_built_for: self.by_id_built_for,
+            unit_meta: self.unit_meta.clone(),
+            quantity_index: self.quantity_index.clone(),
+            name_memo: self.name_memo.clone(),
+            external_names: self.external_names.clone(),
+            external_by_name: self.external_by_name.clone(),
+            external_ambiguous_names: self.external_ambiguous_names.clone(),
+            external_package: self.external_package.clone(),
+            closure_policy: self.closure_policy,
+            import_truncated: self.import_truncated.clone(),
+            derives_memo: self.derives_memo.clone(),
+            plan_memo: self.plan_memo.clone(),
+            redefiner_index: self.redefiner_index.clone(),
+            implied_deferred: self.implied_deferred,
+            checked_row: Default::default(),
+            built: self.built.clone(),
+        }
+    }
+
     /// Build the element graph for `model` (libraries included) and resolve
     /// all names.
     pub fn build(model: &crate::model::Model) -> ResolvedModel {
         let mut b = Builder::default();
-        b.build_model(model);
-        Self::from_builder(b, model)
+        let boundary = b.build_model(model);
+        let built = BuiltRows::observe(&mut b, boundary, model);
+        let mut resolved = Self::from_builder(b, model);
+        resolved.built = Some(built);
+        resolved
+    }
+
+    /// The rows [`Self::build`] made, while none of them has been written.
+    fn kept_rows(&self) -> Option<&BuiltRows> {
+        self.built
+            .as_ref()
+            .filter(|built| self.b.elements.rows_kept_since(&built.rows))
+    }
+
+    /// Whether [`Self::built_compact_json_with_units`] reads this model's
+    /// rows: the model was built by [`Self::build`] in the stock graph
+    /// format, whose compact emission is the rows as built, and no row the
+    /// build made has been written since. A read that writes one costs
+    /// every later emission a second build of the model.
+    pub fn emits_built_rows(&self) -> bool {
+        self.b.graph_format == crate::model::GraphFormat::LegacyV2 && self.kept_rows().is_some()
+    }
+
+    /// [`model_to_compact_json_with_units`] of the model this was built
+    /// from, read off this model's own rows instead of a second build:
+    /// `Some` while [`Self::emits_built_rows`] holds. Rows appended since
+    /// the build, such as materialized implied relationships, are not the
+    /// user units' and are not read. A second build of a model on a
+    /// prepared library holds a copy of the library's tables beside this
+    /// one's while it resolves; this read allocates only the array it
+    /// returns.
+    ///
+    /// A model built from settled outcomes is read as itself (see
+    /// `BuiltRows`): for an acyclic model that is what a cold build emits.
+    pub fn built_compact_json_with_units(&self) -> Option<(Value, Vec<(usize, String)>)> {
+        if !self.emits_built_rows() {
+            return None;
+        }
+        let built = self.kept_rows()?;
+        Some((
+            self.b.finish_range(built.user.start, built.user.end),
+            built.units.clone(),
+        ))
+    }
+
+    /// The element array of [`Self::built_compact_json_with_units`], to
+    /// be read one element at a time instead of made whole: `Some` while
+    /// [`Self::emits_built_rows`] holds. A writer or a digest that takes
+    /// the elements in turn holds one element's tree at a time, where the
+    /// whole array's is several times the size of its JSON text.
+    pub fn built_compact_rows(&self) -> Option<CompactRows<'_>> {
+        if !self.emits_built_rows() {
+            return None;
+        }
+        let built = self.kept_rows()?;
+        Some(CompactRows {
+            b: &self.b,
+            rows: built.user.clone(),
+        })
+    }
+
+    /// The unit structure [`model_to_compact_json_with_units`] returns for
+    /// the model this was built from, as its build laid the units out:
+    /// `Some` for a model built by [`Self::build`], in any graph format,
+    /// while no row the build made has been written since.
+    pub fn built_unit_structure(&self) -> Option<Vec<(usize, String)>> {
+        self.kept_rows().map(|built| built.units.clone())
+    }
+
+    /// The entries of [`library_name_map`] for the model this was built
+    /// from — each library id with its qualified-name segments, in the
+    /// order that map takes them, so that where an id has more than one
+    /// entry the last is the one it keeps — read off this model's own name
+    /// tables instead of a second build: `Some` for a model built by
+    /// [`Self::build`], in any graph format, while no entry the build made
+    /// has been written since.
+    pub fn built_library_names(&self) -> Option<impl Iterator<Item = (Uuid, &[String])> + '_> {
+        let built = self.built.as_ref()?;
+        let tables = [&self.b.lib_qnames, &self.b.lib_mem_qnames];
+        if !tables
+            .iter()
+            .zip(&built.names)
+            .all(|(table, (token, _))| table.rows_kept_since(token))
+        {
+            return None;
+        }
+        Some(
+            tables
+                .into_iter()
+                .zip(built.names.iter().map(|&(_, len)| len))
+                .flat_map(|(table, len)| {
+                    (0..len).map(move |i| {
+                        let (id, segments) = &table[i];
+                        (*id, segments.as_slice())
+                    })
+                }),
+        )
     }
 
     pub(crate) fn source_compact_json(&self) -> Value {
@@ -11620,7 +13349,7 @@ impl ResolvedModel {
     /// reconstructed by the loader. Prepared library prefixes are textual.
     pub(crate) fn canonical_text_end(&self, e: ElementRef) -> bool {
         self.b.graph_format == crate::model::GraphFormat::CanonicalV3
-            && e.0 < self.b.explicit_len()
+            && self.b.is_authored(e.0)
             && self.b.elements.get(e.0).is_some_and(|row| {
                 metaclass_conforms(row.ty, "Usage")
                     && row.props.get("isEnd").and_then(|v| v.as_bool()) == Some(true)
@@ -11666,32 +13395,47 @@ impl ResolvedModel {
     pub(crate) fn from_builder(mut b: Builder, model: &crate::model::Model) -> Self {
         // A user relationship can specialize a library feature without adding
         // a root name. Such a graph cannot reuse derived library quantities.
-        if let Some(facts) = &b.library_facts {
-            let changed = b.elements.iter().skip(b.lib_boundary).any(|e| {
-                let source = match e.ty {
-                    "FeatureTyping" | "ConjugatedPortTyping" => Some("typedFeature"),
-                    "Subclassification" => Some("subclassifier"),
-                    "Subsetting" | "ReferenceSubsetting" => Some("subsettingFeature"),
-                    "Redefinition" => Some("redefiningFeature"),
-                    "Specialization" => Some("specific"),
-                    "Conjugation" => Some("conjugatedType"),
-                    "TypeFeaturing" => Some("featureOfType"),
-                    "FeatureInverting" => Some("featureInverted"),
-                    _ => None,
-                };
-                source
-                    .and_then(|key| e.props.get(key))
-                    .and_then(|v| v.as_reference())
-                    .is_some_and(|id| facts.contains_id(&id))
-                    || e.props.get("annotatedElement").is_some_and(|v| {
-                        v.as_reference().is_some_and(|id| facts.contains_id(&id))
-                            || v.as_array().is_some_and(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_reference())
-                                    .any(|id| facts.contains_id(&id))
-                            })
-                    })
-            });
+        if b.library_facts.is_some() {
+            let floor = b.lib_boundary;
+            // The frozen rows by id, as the freeze kept them: the library's
+            // ids as it was prepared, which is what its facts table. A build
+            // on a prepared library has that table; the rows are tabled
+            // here otherwise.
+            let in_library = |b: &mut Builder, id: Uuid| match b.prefix_ids.as_deref() {
+                Some(frozen) => frozen.contains_key(&id),
+                None => b.element_index_of_uuid(id).is_some_and(|i| i < floor),
+            };
+            let named: Vec<Uuid> = b
+                .elements
+                .iter()
+                .skip(floor)
+                .flat_map(|e| {
+                    let source = match e.ty {
+                        "FeatureTyping" | "ConjugatedPortTyping" => Some("typedFeature"),
+                        "Subclassification" => Some("subclassifier"),
+                        "Subsetting" | "ReferenceSubsetting" => Some("subsettingFeature"),
+                        "Redefinition" => Some("redefiningFeature"),
+                        "Specialization" => Some("specific"),
+                        "Conjugation" => Some("conjugatedType"),
+                        "TypeFeaturing" => Some("featureOfType"),
+                        "FeatureInverting" => Some("featureInverted"),
+                        _ => None,
+                    };
+                    let sourced = source
+                        .and_then(|key| e.props.get(key))
+                        .and_then(|v| v.as_reference());
+                    let annotated = e.props.get("annotatedElement").into_iter().flat_map(|v| {
+                        v.as_reference().into_iter().chain(
+                            v.as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_reference()),
+                        )
+                    });
+                    sourced.into_iter().chain(annotated).collect::<Vec<_>>()
+                })
+                .collect();
+            let changed = named.into_iter().any(|id| in_library(&mut b, id));
             if changed {
                 b.semantic_memo = Default::default();
             }
@@ -11724,6 +13468,9 @@ impl ResolvedModel {
             derives_memo: HashMap::new(),
             plan_memo: HashMap::new(),
             redefiner_index: None,
+            implied_deferred: false,
+            checked_row: Default::default(),
+            built: None,
         }
     }
 
@@ -11739,6 +13486,7 @@ impl ResolvedModel {
     /// reset, and the implied relationships are re-synthesized only if
     /// none were materialized yet (materialized ones stay).
     pub fn set_library_names(&mut self, names: &HashMap<String, Vec<String>>) {
+        self.make_deferred_implied();
         let dynamic_was_current = self
             .b
             .dynamic_graph
@@ -11791,9 +13539,9 @@ impl ResolvedModel {
             self.b.recorded_lookup_graph = None;
             self.b.recorded_lookup_prefix = None;
             self.b.positional_redefinitions = None;
+            self.b.positional_budget_exhausted = None;
             self.b.supported_implied = None;
-            self.b.inherited_cache.clear();
-            self.b.inherited_by_heritage.clear();
+            self.b.drop_inherited_memos();
             self.import_truncated.clear();
         }
         self.b
@@ -12109,7 +13857,7 @@ impl ResolvedModel {
     /// `<element>`, recursively through quantities, instances, and
     /// sequences. Everything else matches the value's own `Display`.
     pub fn render_value(&self, v: &crate::eval::Value) -> String {
-        self.render_value_with(v, false)
+        self.render_value_with(v, &crate::numfmt::NumberFormat::exact())
     }
 
     /// [`Self::render_value`] for glanceable surfaces (editor hints and
@@ -12117,18 +13865,27 @@ impl ResolvedModel {
     /// as an approximate decimal (`≈0.3333333333333333`) rather than the
     /// exact fraction.
     pub fn render_value_approx(&self, v: &crate::eval::Value) -> String {
-        self.render_value_with(v, true)
+        self.render_value_as(v, &crate::numfmt::NumberFormat::approx())
     }
 
-    fn render_value_with(&self, v: &crate::eval::Value, approx: bool) -> String {
+    /// [`Self::render_value`] with non-terminating rationals written in
+    /// `format` ([`NumberFormat::exact`](crate::numfmt::NumberFormat::exact)
+    /// gives exactly `render_value`).
+    pub fn render_value_as(
+        &self,
+        v: &crate::eval::Value,
+        format: &crate::numfmt::NumberFormat,
+    ) -> String {
+        self.render_value_with(v, format)
+    }
+
+    fn render_value_with(
+        &self,
+        v: &crate::eval::Value,
+        format: &crate::numfmt::NumberFormat,
+    ) -> String {
         use crate::eval::Value;
-        let leaf = |v: &Value| {
-            if approx {
-                v.to_approx_string()
-            } else {
-                v.to_string()
-            }
-        };
+        let leaf = |v: &Value| v.to_string_with(format);
         match v {
             Value::Element(e) | Value::Unbound(e) | Value::UnboundMember(e) => {
                 let el = &self.b.elements[e.0];
@@ -12140,14 +13897,14 @@ impl ResolvedModel {
                     .unwrap_or_else(|| v.to_string())
             }
             Value::Quantity(n, u) => {
-                format!("{} [{}]", self.render_value_with(n, approx), u.display())
+                format!("{} [{}]", self.render_value_with(n, format), u.display())
             }
             Value::Instance {
                 ty_name, fields, ..
             } => {
                 let fields = fields
                     .iter()
-                    .map(|(name, v)| format!("{name} = {}", self.render_value_with(v, approx)))
+                    .map(|(name, v)| format!("{name} = {}", self.render_value_with(v, format)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{ty_name}({fields})")
@@ -12156,7 +13913,7 @@ impl ResolvedModel {
             Value::Sequence(s) => {
                 let items = s
                     .iter()
-                    .map(|v| self.render_value_with(v, approx))
+                    .map(|v| self.render_value_with(v, format))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({items})")
@@ -12267,14 +14024,15 @@ impl ResolvedModel {
         let n = self.b.elements.len();
         if self.rel_owner.len() != n {
             // A build whose rows below its own are its prepared library's
-            // frozen rows reads their relationships' owners from the
-            // library's table.
+            // frozen rows, every one of them, reads their relationships'
+            // owners from the library's table.
             let library = self.b.prepared_from.as_ref().filter(|prepared| {
                 self.b.elements.base_untouched()
                     && Arc::ptr_eq(
                         self.b.elements.base_arc(),
                         prepared.builder.elements.base_arc(),
                     )
+                    && self.b.elements.base_len() == prepared.builder.elements.len()
             });
             let (mut map, from) = match library {
                 Some(prepared) => {
@@ -12290,9 +14048,24 @@ impl ResolvedModel {
                     map[r] = Some(i);
                 }
             }
+            // The library's table already owns the library's materialized
+            // rows through its view, so a row owned as the view says is
+            // left as it is: a write to a frozen row, even of the value
+            // there, would give the table a dense record of written rows.
+            let own = |map: &mut crate::layered::LayeredVec<Option<usize>>,
+                       relationship: usize,
+                       owner: usize| {
+                if map[relationship] != Some(owner) {
+                    map[relationship] = Some(owner);
+                }
+            };
             if let Some(view) = &self.b.semantic_ownership {
                 for (relationship, owner) in view.relationship_owners() {
-                    map[relationship] = Some(owner);
+                    own(&mut map, relationship, owner);
+                }
+            } else if let Some(prefix) = &self.b.prefix_ownership {
+                for (relationship, owner) in prefix.relationship_owners() {
+                    own(&mut map, relationship, owner);
                 }
             }
             self.rel_owner = map;
@@ -12423,6 +14196,145 @@ impl ResolvedModel {
             .collect()
     }
 
+    /// The written `:>> T` / `redefines T` targets of `e`'s declaration
+    /// named outright, in source order: (unit index, span of the
+    /// qualified name as written). A chain target has no such span; see
+    /// [`Self::chain_specialization_spans`].
+    pub fn redefinition_spans(&self, e: ElementRef) -> Vec<(usize, Span)> {
+        let unit = self.b.unit_of_elem(e.0);
+        self.b
+            .spec_targets
+            .iter()
+            .filter(|(owner, kind, _, _)| *owner == e.0 && *kind == "Redefinition")
+            .map(|(_, _, _, qn)| (unit, qn.span))
+            .collect()
+    }
+
+    /// What each of `e`'s own `Redefinition`s names, in source order: a
+    /// chain's resolved links (every written link resolved, else the
+    /// redefinition is left out), or a named target as one link.
+    pub fn redefinition_steps(&mut self, e: ElementRef) -> Vec<Vec<ElementRef>> {
+        self.ensure_by_id();
+        let redefinitions: Vec<usize> = self.b.elements[e.0]
+            .owned_relationships
+            .iter()
+            .copied()
+            .filter(|&r| self.b.elements[r].ty == "Redefinition")
+            .collect();
+        redefinitions
+            .into_iter()
+            .filter_map(|r| match self.chain_feature_of(r) {
+                Some(chain) => {
+                    let links = self.expand_chain(chain);
+                    (links.len() == self.chaining_count(chain)).then_some(links)
+                }
+                None => self
+                    .prop_target(r, "redefinedFeature")
+                    .map(|t| vec![ElementRef(t)]),
+            })
+            .collect()
+    }
+
+    /// Where `e`'s first `Redefinition` target is written: a named
+    /// target's span, or a chain's from its first link's start to its
+    /// last link's end (every link resolved, else `None`). What an edit
+    /// replacing the target splices.
+    pub fn first_redefinition_target_span(&mut self, e: ElementRef) -> Option<(usize, Span)> {
+        self.ensure_by_id();
+        let unit = self.b.unit_of_elem(e.0);
+        let rel = *self.b.elements[e.0]
+            .owned_relationships
+            .iter()
+            .find(|&&r| self.b.elements[r].ty == "Redefinition")?;
+        match self.chain_feature_of(rel) {
+            // the chain's links, by the chaining relationships that carry them
+            Some(chain) => {
+                let chainings: Vec<usize> = self.b.elements[chain]
+                    .owned_relationships
+                    .iter()
+                    .copied()
+                    .filter(|&c| self.b.elements[c].ty == "FeatureChaining")
+                    .collect();
+                let spans: Vec<Span> = self
+                    .b
+                    .ref_sites
+                    .iter()
+                    .filter(|s| s.kind == "chainingFeature" && chainings.contains(&s.owner.0))
+                    .map(|s| s.span)
+                    .collect();
+                if spans.is_empty() || spans.len() != chainings.len() {
+                    return None;
+                }
+                let start = spans.iter().map(|sp| sp.start).min()?;
+                let end = spans.iter().map(|sp| sp.end).max()?;
+                Some((unit, Span { start, end }))
+            }
+            // a named target's span: the written targets in order, chains having none
+            None => {
+                let named_rels: Vec<usize> = self.b.elements[e.0]
+                    .owned_relationships
+                    .iter()
+                    .copied()
+                    .filter(|&r| {
+                        self.b.elements[r].ty == "Redefinition"
+                            && self.chain_feature_of(r).is_none()
+                    })
+                    .collect();
+                let index = named_rels.iter().position(|&r| r == rel)?;
+                self.redefinition_spans(e).get(index).copied()
+            }
+        }
+    }
+
+    /// The chain feature a `Redefinition` (or other specialization)
+    /// relationship owns as its target, when its target is a chain.
+    fn chain_feature_of(&self, rel: usize) -> Option<usize> {
+        let &child = self.b.elements[rel].children.first()?;
+        (self.b.elements[child].ty == "Feature" && self.chaining_count(child) > 0).then_some(child)
+    }
+
+    /// How many `FeatureChaining` links a chain feature writes.
+    fn chaining_count(&self, chain: usize) -> usize {
+        self.b.elements[chain]
+            .owned_relationships
+            .iter()
+            .filter(|&&c| self.b.elements[c].ty == "FeatureChaining")
+            .count()
+    }
+
+    /// Whether `e`'s own value is a default (`default v`) rather than a
+    /// binding (`= v`); `None` when `e` declares no value.
+    pub fn value_is_default(&self, e: ElementRef) -> Option<bool> {
+        self.b
+            .values
+            .contains_key(&e.0)
+            .then(|| self.b.default_values.contains(&e.0))
+    }
+
+    /// The feature `e` stands for through its redefinitions by name:
+    /// the end of the chain `e` → its first redefinition target → that
+    /// target's → …, or `e` itself when it redefines nothing by name.
+    /// Two features that redefine one feature, however many steps
+    /// apart, share a root; a nameless block `part :>> chassis { … }`
+    /// roots at `chassis`.
+    pub fn redefinition_root(&mut self, e: ElementRef) -> ElementRef {
+        // a cycle (a model error) roots at its smallest member, so every
+        // member of it shares one root
+        let mut seen = vec![e];
+        let mut cur = e;
+        for _ in 0..32 {
+            match self.redefinition_targets(cur).first() {
+                Some(&next) if !seen.contains(&next) => {
+                    seen.push(next);
+                    cur = next;
+                }
+                Some(&next) => return *seen.iter().min().unwrap_or(&next),
+                None => break,
+            }
+        }
+        cur
+    }
+
     /// The written specialization clauses of `e`'s declaration (typing,
     /// subsetting, redefinition — any kind), in source order: (unit
     /// index, span of the qualified name as written).
@@ -12434,6 +14346,41 @@ impl ResolvedModel {
             .filter(|(owner, _, _, _)| *owner == e.0)
             .map(|(_, _, _, qn)| (unit, qn.span))
             .collect()
+    }
+
+    /// The links of the feature chains `e`'s own specialization clauses
+    /// name (`attribute :>> chassis.mass`), as written: (unit index, span
+    /// of each resolved link). A chain target is the anonymous feature its
+    /// relationship owns, so [`Self::specialization_spans`] (written names)
+    /// has none of these. Bounded by `e`'s member extent and, when `e`
+    /// carries a value, by the value's start: a chain inside the value
+    /// expression is not a specialization.
+    pub fn chain_specialization_spans(&self, e: ElementRef) -> Vec<(usize, Span)> {
+        let Some((unit, extent)) = self.member_extent(e) else {
+            return Vec::new();
+        };
+        let limit = self
+            .value_expr(e)
+            .map_or(extent.end, |(_, x)| x.span.start.min(extent.end));
+        self.b
+            .ref_sites
+            .iter()
+            .filter(|s| {
+                s.kind == "chainingFeature"
+                    && s.exclude == Some(e)
+                    && s.unit == unit
+                    && s.span.start >= extent.start
+                    && s.span.end <= limit
+            })
+            .map(|s| (s.unit, s.span))
+            .collect()
+    }
+
+    /// Index into [`crate::model::Model::units`] of the unit `e` was
+    /// built from — where its declaration and spans belong, anonymous
+    /// elements and library units included.
+    pub fn unit_of(&self, e: ElementRef) -> usize {
+        self.b.unit_of_elem(e.0)
     }
 
     /// Where `e`'s name is declared: (unit index, span of the name
@@ -12780,7 +14727,7 @@ impl ResolvedModel {
         let node = &self.b.elements[e.0];
         let id = |index: usize| json!({"@id":self.b.elements[index].id.to_string()});
         let mut record = self.element_properties(e);
-        if crate::metaclass::conforms(node.ty, "Feature") {
+        if is_a!(node, "Feature") {
             generated_defaults::fill_owned_defaults(node.ty, &node.props, &mut record);
         }
         record.insert("@type".into(), json!(node.ty));
@@ -12795,7 +14742,7 @@ impl ResolvedModel {
             "owningRelationship".into(),
             node.owning_relationship.map(id).unwrap_or(Value::Null),
         );
-        if crate::metaclass::conforms(node.ty, "Relationship") {
+        if is_a!(node, "Relationship") {
             record.insert(
                 "ownedRelatedElement".into(),
                 Value::Array(node.children.iter().copied().map(id).collect()),
@@ -12858,8 +14805,8 @@ impl ResolvedModel {
     /// chains included, filters applied). Removal is redefinition-driven,
     /// not name-driven, per KerML `removeRedefinedFeatures`: a member is
     /// dropped when another inherited candidate (transitively) redefines
-    /// it (including a distinct Membership of the same Feature), when its
-    /// own redefinition closure meets a feature **directly**
+    /// it — another Membership of the same Feature, an alias of it, is no
+    /// such candidate — when its own redefinition closure meets a feature **directly**
     /// redefined by one of `e`'s owned features (the normative
     /// `ownedFeature.redefinition.redefinedFeature` set is one hop), or
     /// under SysML's implicit same-name usage redefinition; same-name
@@ -12960,9 +14907,8 @@ impl ResolvedModel {
                 .into_iter()
                 .filter_map(|membership| {
                     let member = self.b.stored_membership_member(membership)?;
-                    (crate::metaclass::conforms(self.b.elements[member].ty, "Feature")
-                        && seen.insert(member))
-                    .then_some(member)
+                    (is_a!(self.b.elements[member], "Feature") && seen.insert(member))
+                        .then_some(member)
                 })
                 .map(ElementRef)
                 .collect();
@@ -12972,7 +14918,7 @@ impl ResolvedModel {
             .members
             .iter()
             .map(|&(elem, _)| ElementRef(elem))
-            .filter(|m| crate::metaclass::conforms(self.b.elements[m.0].ty, "Feature"))
+            .filter(|m| is_a!(self.b.elements[m.0], "Feature"))
             .collect()
     }
 
@@ -12982,7 +14928,7 @@ impl ResolvedModel {
     /// sources). `None` when the reference did not resolve or `m` is
     /// not a membership.
     pub fn membership_member(&mut self, m: ElementRef) -> Option<ElementRef> {
-        if !crate::metaclass::conforms(self.b.elements[m.0].ty, "Membership") {
+        if !is_a!(self.b.elements[m.0], "Membership") {
             return None; // a FeatureValue is an OwningMembership too
         }
         self.ensure_rel_member();
@@ -13045,7 +14991,8 @@ impl ResolvedModel {
     /// implied relationships excluded as in [`Self::elements`]), in
     /// creation (document) order.
     pub fn elements_of_metaclass(&self, ty: &str) -> Vec<ElementRef> {
-        (0..self.b.explicit_len())
+        self.b
+            .authored_rows()
             .filter(|&i| self.b.elements[i].ty == ty)
             .map(ElementRef)
             .collect()
@@ -13202,6 +15149,7 @@ impl ResolvedModel {
         if map.is_empty() {
             return Vec::new();
         }
+        self.make_deferred_implied();
         let dynamic_was_current =
             self.b.dynamic_graph.as_ref().is_some_and(|s| {
                 s.current(&self.b) && s.outcome == dynamic_graph::Outcome::Accepted
@@ -13289,8 +15237,7 @@ impl ResolvedModel {
             self.b.implied_from = None;
             self.b.semantic_ownership = None;
             self.b.positional_redefinitions = None;
-            self.b.inherited_cache.clear();
-            self.b.inherited_by_heritage.clear();
+            self.b.drop_inherited_memos();
             self.import_truncated.clear();
         }
         self.by_id_built_for = usize::MAX;
@@ -13443,6 +15390,7 @@ impl ResolvedModel {
         hints: &mut crate::loader::IdReferenceBindings,
         strict: bool,
     ) -> HashSet<Uuid> {
+        self.make_deferred_implied();
         if self.b.id_binding_pending.is_empty() && !self.b.id_spelled_targets.is_empty() {
             return HashSet::new();
         }
@@ -13565,8 +15513,7 @@ impl ResolvedModel {
                 self.b.semantic_ready = true;
                 self.b.positional_redefinitions = None;
                 self.b.supported_implied = None;
-                self.b.inherited_cache.clear();
-                self.b.inherited_by_heritage.clear();
+                self.b.drop_inherited_memos();
                 // External targets stay references by identity even though
                 // no in-model element can supply a semantic outcome.
                 if strict {
@@ -13630,7 +15577,7 @@ impl ResolvedModel {
     /// are reached through [`Self::implied_relationships`] and the
     /// relationship families of [`Self::derived`], not listed here.
     pub fn elements(&self) -> impl Iterator<Item = ElementRef> + '_ {
-        (0..self.b.explicit_len()).map(ElementRef)
+        self.b.authored_rows().map(ElementRef)
     }
 
     /// Every element built from the user units (libraries excluded), in
@@ -13660,6 +15607,24 @@ impl ResolvedModel {
     /// trailing result expression, in (unit, source-position) order.
     pub fn constraints(&mut self) -> Vec<ConstraintInfo> {
         self.constraints_where(|_| true)
+    }
+
+    /// Every result expression written in a unit `keep` admits — the body
+    /// of a calculation, constraint, requirement or invariant — as (owning
+    /// element, unit, the scope its references resolve from, expression),
+    /// in creation order. A usage without a body of its own has no entry.
+    pub fn result_expression_sites(
+        &self,
+        keep: impl Fn(usize) -> bool,
+    ) -> Vec<(ElementRef, usize, ScopeRef, Expr)> {
+        let mut out = Vec::new();
+        for (owner, scope, expr) in &self.b.result_exprs {
+            let unit = self.b.unit_of_elem(*owner);
+            if keep(unit) {
+                out.push((ElementRef(*owner), unit, ScopeRef(*scope), expr.clone()));
+            }
+        }
+        out
     }
 
     /// [`Self::constraints`] whose [`ConstraintInfo::unit`] `keep` admits, in
@@ -13707,6 +15672,7 @@ impl ResolvedModel {
                 element_type: ty,
                 asserted,
                 negated,
+                inherited: false,
                 scope: ScopeRef(*scope),
                 expr: expr.clone(),
             });
@@ -13786,6 +15752,7 @@ impl ResolvedModel {
                 element_type: self.b.elements[a].ty,
                 asserted: true,
                 negated,
+                inherited: true,
                 scope: ScopeRef(scope),
                 expr,
             });
@@ -13974,7 +15941,7 @@ impl ResolvedModel {
     fn satisfaction_role(&self, m: usize) -> Option<SatisfactionRole> {
         if let Some(rel) = self.b.elements[m].owning_relationship {
             let rel = &self.b.elements[rel];
-            if crate::metaclass::conforms(rel.ty, "RequirementConstraintMembership") {
+            if is_a!(rel, "RequirementConstraintMembership") {
                 return Some(match rel.props.get("kind").and_then(|v| v.as_str()) {
                     Some("assumption") => SatisfactionRole::Assumed,
                     _ => SatisfactionRole::Required,
@@ -14054,6 +16021,11 @@ impl ResolvedModel {
                                 element_type: ty,
                                 asserted: true,
                                 negated,
+                                // The body is the member's own when the
+                                // member owns it; else it is the closure
+                                // type's, carried over like a bodiless
+                                // assert's.
+                                inherited: def != m,
                                 scope: ScopeRef(m_scope),
                                 expr,
                             });
@@ -14383,7 +16355,7 @@ impl ResolvedModel {
     pub fn redefiners(&mut self, e: ElementRef) -> Vec<ElementRef> {
         self.sync_semantic_publication();
         if self.redefiner_index.is_none() {
-            let mut index: HashMap<usize, Vec<usize>> = HashMap::new();
+            let mut index: crate::layered::IdMap<usize, Vec<usize>> = Default::default();
             let users: Vec<usize> = (self.b.lib_boundary..self.b.elements.len()).collect();
             for r in users {
                 for t in self.b.redefinition_target_elems(r) {
@@ -15056,6 +17028,37 @@ impl ResolvedModel {
         ends
     }
 
+    /// The feature chains `e`'s own `Redefinition`s redefine
+    /// (`attribute :>> chassis.mass`), one per such redefinition whose
+    /// every link resolved, links first→last. A chain target is the anonymous feature the
+    /// redefinition owns, so [`Self::redefinition_targets`] (written names
+    /// only) does not list it; a redefinition of a plain feature is not
+    /// among these.
+    pub fn redefined_chains(&mut self, e: ElementRef) -> Vec<Vec<ElementRef>> {
+        self.ensure_by_id();
+        let redefinitions: Vec<usize> = self.b.elements[e.0]
+            .owned_relationships
+            .iter()
+            .copied()
+            .filter(|&r| self.b.elements[r].ty == "Redefinition")
+            .collect();
+        redefinitions
+            .into_iter()
+            .filter_map(|r| {
+                let &chain = self.b.elements[r].children.first()?;
+                // every written link resolved: a chain cut short at an
+                // unresolved link is no chain to name or follow
+                let written = self.b.elements[chain]
+                    .owned_relationships
+                    .iter()
+                    .filter(|&&c| self.b.elements[c].ty == "FeatureChaining")
+                    .count();
+                let links = self.expand_chain(chain);
+                (links.len() >= 2 && links.len() == written).then_some(links)
+            })
+            .collect()
+    }
+
     /// The written reference targets of `e`'s own `ReferenceSubsetting`
     /// relationships (a `perform a.b` / `exhibit s` reference), one
     /// feature chain per relationship, links first→last.
@@ -15309,128 +17312,258 @@ mod identity_tables_tests;
 #[cfg(test)]
 mod indexed_reads_tests;
 
-/// Persist element headers and their variable-length lists as separate tables.
-/// A decoded library shares each table's contiguous backing storage.
+#[cfg(test)]
+mod derived_reads_tests;
+
+#[cfg(test)]
+mod built_rows_tests;
+
+/// The element rows as columns the snapshot carries in bulk: a byte per
+/// row for the metaclass, the identifiers, the flag words, the owners, the
+/// property entries by key index into one key table with each atom kind
+/// in its own column, and the index rows as flat tables.
 mod element_table {
     use super::*;
     use crate::{
+        bulk::{Bytes, Ids, Ints, Words},
         flat::{self, Row},
         layered::LayeredVec,
         properties::{Atom, Key, Properties},
     };
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeTuple};
-    #[derive(Serialize)]
-    struct HeaderRef<'a> {
-        ty: &'a str,
-        id: Uuid,
-        path: std::borrow::Cow<'a, str>,
-        present: u64,
-        flags: u64,
-        owner: Option<usize>,
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    const NULL: u8 = 0;
+    const FALSE: u8 = 1;
+    const TRUE: u8 = 2;
+    const STRING: u8 = 3;
+    const REFERENCE: u8 = 4;
+    const OTHER: u8 = 5;
+
+    struct Text(Arc<str>);
+    impl Serialize for Text {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&self.0)
+        }
     }
-    #[derive(Deserialize)]
-    struct Header {
-        ty: Kind,
-        id: Uuid,
-        path: String,
-        present: u64,
-        flags: u64,
-        owner: Option<usize>,
-    }
-    struct Kind(&'static str);
-    impl<'de> Deserialize<'de> for Kind {
+    impl<'de> Deserialize<'de> for Text {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            struct Visitor;
-            impl serde::de::Visitor<'_> for Visitor {
-                type Value = Kind;
-                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    f.write_str("a known metaclass")
-                }
-                fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
-                    crate::metaclass::canonical_name(s)
-                        .map(Kind)
-                        .ok_or_else(|| E::custom("unknown element metaclass"))
-                }
-            }
-            d.deserialize_str(Visitor)
+            crate::cache_codec::shared_string(d).map(Text)
         }
     }
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        /// The metaclass index per row.
+        kinds: Bytes,
+        ids: Ids,
+        /// Whole ownership paths, which decode as such.
+        paths: Vec<String>,
+        present: Words,
+        flags: Words,
+        /// The owning relationship per row, or the row count for none.
+        owners: Ints,
+        /// The property names the rows use, each interned once.
+        keys: Vec<String>,
+        /// Per row, how many property entries; per entry, its key's index
+        /// in `keys` and its atom's kind; the atoms by kind, in entry order.
+        prop_lengths: Ints,
+        prop_keys: Ints,
+        atom_kinds: Bytes,
+        atom_strings: Vec<Text>,
+        atom_refs: Ids,
+        atom_others: Vec<Atom>,
+        #[serde(with = "flat::index_table")]
+        owned: Vec<Row<usize>>,
+        #[serde(with = "flat::index_table")]
+        children: Vec<Row<usize>>,
+    }
+
     pub fn serialize<S: Serializer>(elements: &LayeredVec<Elem>, s: S) -> Result<S::Ok, S::Error> {
-        struct Headers<'a>(&'a LayeredVec<Elem>);
-        impl Serialize for Headers<'_> {
-            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                s.collect_seq(self.0.iter().enumerate().map(|(i, e)| HeaderRef {
-                    ty: e.ty,
-                    id: e.id,
-                    // The table holds whole paths, which decode as such.
-                    path: if e.path_parent.is_some() {
-                        whole_path(self.0, i).into()
-                    } else {
-                        e.path.as_str().into()
-                    },
-                    present: e.props.present,
-                    flags: e.props.flags,
-                    owner: e.owning_relationship,
-                }))
+        let n = elements.len();
+        let mut keys: Vec<String> = Vec::new();
+        let mut key_index: HashMap<&str, usize> = HashMap::new();
+        let mut prop_lengths = Vec::with_capacity(n);
+        let mut prop_keys = Vec::new();
+        let mut atom_kinds = Vec::new();
+        let mut atom_strings = Vec::new();
+        let mut atom_refs = Vec::new();
+        let mut atom_others = Vec::new();
+        for e in elements.iter() {
+            prop_lengths.push(e.props.entries.len());
+            for (key, atom) in e.props.entries.iter() {
+                let k = *key_index.entry(key.name()).or_insert_with(|| {
+                    keys.push(key.name().to_string());
+                    keys.len() - 1
+                });
+                prop_keys.push(k);
+                atom_kinds.push(match atom {
+                    Atom::Null => NULL,
+                    Atom::Bool(false) => FALSE,
+                    Atom::Bool(true) => TRUE,
+                    Atom::String(text) => {
+                        atom_strings.push(Text(text.clone()));
+                        STRING
+                    }
+                    Atom::Reference(reference) => {
+                        atom_refs.push(reference.id);
+                        REFERENCE
+                    }
+                    other => {
+                        atom_others.push(other.clone());
+                        OTHER
+                    }
+                });
             }
         }
-        let mut tuple = s.serialize_tuple(4)?;
-        tuple.serialize_element(&Headers(elements))?;
-        tuple.serialize_element(&flat::Slices(
-            elements.iter().map(|e| &*e.props.entries).collect(),
-        ))?;
-        tuple.serialize_element(&flat::Slices(
-            elements.iter().map(|e| &*e.owned_relationships).collect(),
-        ))?;
-        tuple.serialize_element(&flat::Slices(
-            elements.iter().map(|e| &*e.children).collect(),
-        ))?;
-        tuple.end()
+        let wire = Wire {
+            kinds: Bytes(elements.iter().map(|e| e.meta).collect()),
+            ids: Ids(elements.iter().map(|e| e.id).collect()),
+            paths: elements
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    if e.path_parent.is_some() {
+                        whole_path(elements, i)
+                    } else {
+                        e.path.clone()
+                    }
+                })
+                .collect(),
+            present: Words(elements.iter().map(|e| e.props.present).collect()),
+            flags: Words(elements.iter().map(|e| e.props.flags).collect()),
+            owners: Ints(
+                elements
+                    .iter()
+                    .map(|e| match e.owning_relationship {
+                        Some(owner) if owner >= n => {
+                            Err(serde::ser::Error::custom("an owner past the rows"))
+                        }
+                        Some(owner) => Ok(owner),
+                        None => Ok(n),
+                    })
+                    .collect::<Result<Vec<_>, S::Error>>()?,
+            ),
+            keys,
+            prop_lengths: Ints(prop_lengths),
+            prop_keys: Ints(prop_keys),
+            atom_kinds: Bytes(atom_kinds),
+            atom_strings,
+            atom_refs: Ids(atom_refs),
+            atom_others,
+            owned: elements
+                .iter()
+                .map(|e| e.owned_relationships.clone())
+                .collect(),
+            children: elements.iter().map(|e| e.children.clone()).collect(),
+        };
+        wire.serialize(s)
     }
+
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<LayeredVec<Elem>, D::Error> {
-        #[derive(Deserialize)]
-        struct Wire {
-            headers: Vec<Header>,
-            #[serde(with = "flat::table")]
-            props: Vec<Row<(Key, Atom)>>,
-            #[serde(with = "flat::table")]
-            owned: Vec<Row<usize>>,
-            #[serde(with = "flat::table")]
-            children: Vec<Row<usize>>,
-        }
+        use serde::de::Error;
         let wire = Wire::deserialize(d)?;
-        let n = wire.headers.len();
-        if wire.props.len() != n
+        let n = wire.kinds.0.len();
+        if wire.ids.0.len() != n
+            || wire.paths.len() != n
+            || wire.present.0.len() != n
+            || wire.flags.0.len() != n
+            || wire.owners.0.len() != n
+            || wire.prop_lengths.0.len() != n
             || wire.owned.len() != n
             || wire.children.len() != n
-            || wire
-                .props
-                .iter()
-                .any(|r| r.windows(2).any(|p| p[0].0 >= p[1].0))
         {
-            return Err(serde::de::Error::custom("invalid element table"));
+            return Err(D::Error::custom("invalid element table"));
         }
-        Ok(wire
-            .headers
+        if wire
+            .kinds
+            .0
+            .iter()
+            .any(|&k| usize::from(k) >= crate::metaclass::COUNT)
+        {
+            return Err(D::Error::custom("unknown element metaclass"));
+        }
+        if wire.owners.0.iter().any(|&o| o > n) {
+            return Err(D::Error::custom("invalid element owner"));
+        }
+        let keys: Vec<Key> = wire
+            .keys
+            .iter()
+            .map(|k| crate::properties::key(k))
+            .collect();
+        let entries = wire.prop_keys.0.len();
+        if wire.atom_kinds.0.len() != entries || wire.prop_keys.0.iter().any(|&k| k >= keys.len()) {
+            return Err(D::Error::custom("invalid property columns"));
+        }
+        let mut strings = wire.atom_strings.into_iter();
+        let mut refs = wire.atom_refs.0.into_iter();
+        let mut others = wire.atom_others.into_iter();
+        let mut values: Vec<(Key, Atom)> = Vec::with_capacity(entries);
+        for (&k, &kind) in wire.prop_keys.0.iter().zip(&wire.atom_kinds.0) {
+            let atom = match kind {
+                NULL => Atom::Null,
+                FALSE => Atom::Bool(false),
+                TRUE => Atom::Bool(true),
+                STRING => Atom::String(
+                    strings
+                        .next()
+                        .ok_or_else(|| D::Error::custom("missing string atom"))?
+                        .0,
+                ),
+                REFERENCE => Atom::reference(
+                    refs.next()
+                        .ok_or_else(|| D::Error::custom("missing reference atom"))?,
+                ),
+                OTHER => others
+                    .next()
+                    .ok_or_else(|| D::Error::custom("missing atom"))?,
+                _ => return Err(D::Error::custom("unknown atom kind")),
+            };
+            values.push((keys[k].clone(), atom));
+        }
+        if strings.next().is_some() || refs.next().is_some() || others.next().is_some() {
+            return Err(D::Error::custom("unused atoms"));
+        }
+        let props = flat::rows_from_lengths::<_, D::Error>(&wire.prop_lengths.0, values)?;
+        if props.iter().any(|r| r.windows(2).any(|p| p[0].0 >= p[1].0)) {
+            return Err(D::Error::custom("invalid element table"));
+        }
+        let rows = wire
+            .kinds
+            .0
             .into_iter()
-            .zip(wire.props)
+            .zip(wire.ids.0)
+            .zip(wire.paths)
+            .zip(wire.present.0)
+            .zip(wire.flags.0)
+            .zip(wire.owners.0)
+            .zip(props)
             .zip(wire.owned)
             .zip(wire.children)
-            .map(|(((h, entries), owned_relationships), children)| Elem {
-                ty: h.ty.0,
-                id: h.id,
-                path: h.path,
-                path_parent: None,
-                props: Properties {
-                    present: h.present,
-                    flags: h.flags,
-                    entries,
+            .map(
+                |(
+                    (
+                        ((((((kind, id), path), present), flags), owner), entries),
+                        owned_relationships,
+                    ),
+                    children,
+                )| Elem {
+                    ty: crate::metaclass::NAMES[usize::from(kind)],
+                    meta: kind,
+                    id,
+                    path,
+                    path_parent: None,
+                    props: Properties {
+                        present,
+                        flags,
+                        entries,
+                    },
+                    owned_relationships,
+                    children,
+                    owning_relationship: (owner < n).then_some(owner),
                 },
-                owned_relationships,
-                children,
-                owning_relationship: h.owner,
-            })
-            .collect())
+            )
+            .collect();
+        Ok(rows)
     }
 }
 
@@ -15450,7 +17583,7 @@ mod element_table_tests {
         let bytes = crate::cache_codec::encode(&clean).unwrap();
         assert!(crate::cache_codec::decode::<Table>(&bytes).is_ok());
         let mut bad = Table(clean.0.clone());
-        bad.0[0].ty = "UnknownMetaclass";
+        bad.0[0].set_ty("UnknownMetaclass");
         assert!(
             crate::cache_codec::decode::<Table>(&crate::cache_codec::encode(&bad).unwrap())
                 .is_err()
@@ -15945,5 +18078,155 @@ mod positional_member_tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, ["b", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod session_members_tests {
+    use super::*;
+    use crate::model::Model;
+    use crate::prepared::PreparedLibrary;
+
+    const MODEL: &str = "package VehicleModel {
+        private import ISQ::*;
+        private import SI::*;
+        private import ScalarValues::*;
+        part def Engine {
+            attribute mass : MassValue;
+            attribute power : PowerValue;
+            port fuelIn : FuelPort;
+        }
+        port def FuelPort { in item fuel : Fuel; }
+        item def Fuel;
+        part def Wheel { attribute diameter : LengthValue; }
+        part def Vehicle {
+            attribute mass : MassValue = engine.mass + 4 * wheel.diameter * 0 [kg/m];
+            attribute name : String;
+            part engine : Engine;
+            part wheel : Wheel[4];
+        }
+        part car : Vehicle {
+            attribute :>> name = \"car\";
+        }
+    }";
+
+    /// A small model built and checked on the prepared standard library.
+    fn checked_session(library: &Arc<PreparedLibrary>) -> ResolvedModel {
+        let mut model = Model::new();
+        Arc::clone(library).install(&mut model).unwrap();
+        model.add_source("model.sysml", MODEL);
+        let mut r = ResolvedModel::build(&model);
+        let _ = crate::check::validate_model_with(&mut r, &model);
+        let _ = crate::check::validate_semantics_with(&mut r, &model);
+        r
+    }
+
+    fn standard_library() -> Option<Arc<PreparedLibrary>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec-refs/SysML-v2-Release/sysml.library");
+        if !path.exists() {
+            return None;
+        }
+        let mut base = Model::new();
+        base.load_library_dir(&path).unwrap();
+        Some(base.prepare_library().unwrap())
+    }
+
+    /// A checked session on the prepared standard library tables the
+    /// owners and the name keys of its own rows only, over the library's
+    /// tables: the owner table writes no frozen row, the name keys read the
+    /// library's rows' from the library's table and hold only the
+    /// session's own. Both answer for every row what a table made from
+    /// the session's rows alone answers.
+    #[test]
+    fn a_session_on_the_library_tables_only_its_own_rows_owners_and_names() {
+        let Some(library) = standard_library() else {
+            return;
+        };
+        library.make_plans();
+        let frozen = library.builder.elements.len();
+        let mut r = checked_session(&library);
+        r.ensure_rel_owner();
+        let n = r.b.elements.len();
+        assert!(n > frozen, "the session has rows of its own");
+        assert_eq!(r.rel_owner.len(), n);
+        assert_eq!(r.rel_owner.base_len(), frozen, "over the library's table");
+        assert_eq!(
+            r.rel_owner.written_rows().count(),
+            0,
+            "no frozen row written"
+        );
+        // The owners made the way a session without a library makes them:
+        // the rows' own ownership, then the materialized rows' view.
+        let mut dense = vec![None; n];
+        for (i, element) in r.b.elements.iter().enumerate() {
+            for &rel in &element.owned_relationships {
+                dense[rel] = Some(i);
+            }
+        }
+        let owners: Vec<(usize, usize)> = match (&r.b.semantic_ownership, &r.b.prefix_ownership) {
+            (Some(view), _) => view.relationship_owners().collect(),
+            (None, Some(prefix)) => prefix.relationship_owners().collect(),
+            (None, None) => Vec::new(),
+        };
+        for (relationship, owner) in owners {
+            dense[relationship] = Some(owner);
+        }
+        let differing: Vec<usize> = (0..n).filter(|&i| r.rel_owner[i] != dense[i]).collect();
+        assert!(
+            differing.is_empty(),
+            "{} rows owned otherwise: {:?}",
+            differing.len(),
+            &differing[..differing.len().min(8)]
+        );
+        let keys =
+            r.b.name_keys
+                .as_ref()
+                .expect("the check read the name keys");
+        assert_eq!(keys.shared.len(), frozen, "the library's table");
+        assert!(
+            Arc::ptr_eq(&keys.shared, library.library_name_keys()),
+            "the one table every session shares"
+        );
+        assert!(keys.own.len() <= n - frozen, "only the session's own rows");
+        let mut keys = keys.clone();
+        for e in 0..n {
+            let (name, short) = r.b.elements[e].props.declared_names();
+            assert_eq!(
+                row_name_keys(&r.b.elements, &mut keys, e),
+                [name_hash(name), name_hash(short)],
+                "row {e}"
+            );
+        }
+    }
+
+    /// What a later session on the standard library holds after its build
+    /// and check, member by member: the first session has read the
+    /// library's lazily kept tables, so the second pays only its own.
+    /// Printed, not asserted: run with
+    /// `cargo test -p sysmlv2-model --lib session_members -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "prints a measurement of a session on the standard library"]
+    fn a_later_sessions_members_bytes() {
+        use crate::memtest::{held, kept};
+        let Some(library) = standard_library() else {
+            return;
+        };
+        library.make_plans();
+        let first = kept("first session build and check", || {
+            checked_session(&library)
+        });
+        let mut r = kept("later session build and check", || {
+            checked_session(&library)
+        });
+        held("later session: rel_owner", || {
+            r.rel_owner = Default::default()
+        });
+        held("later session: name keys", || r.b.name_keys = None);
+        held("later session: inherited memos", || {
+            r.b.drop_inherited_memos()
+        });
+        held("later session: the rest", || drop(r));
+        held("first session", || drop(first));
     }
 }

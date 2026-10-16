@@ -404,6 +404,18 @@ pub enum TransformError {
     /// `set_feature_type` on a declaration with more than one written
     /// `: T` clause — which one to replace is ambiguous.
     AmbiguousTyping(ElementRef),
+    /// `set_redefined_feature` on a declaration that writes no `:>> T`
+    /// / `redefines T` target.
+    NoRedefinition(ElementRef),
+    /// The replacement redefinition target does not parse as a feature
+    /// name or chain.
+    InvalidRedefinitionTarget { text: String, message: String },
+    /// `set_comment_body` on an element that is no comment or
+    /// documentation, or whose body is not written as a `/* … */` token.
+    NoCommentBody(ElementRef),
+    /// The replacement comment body cannot be written inside `/* … */`
+    /// (it holds the `*/` that would close it).
+    InvalidCommentBody { text: String, message: String },
     /// The element has no recorded member extent (synthesized, root, or
     /// an alias/import that owns no element).
     NoExtent(ElementRef),
@@ -484,6 +496,18 @@ impl fmt::Display for TransformError {
             }
             TransformError::AmbiguousTyping(e) => {
                 write!(f, "element {e:?} has multiple written typings")
+            }
+            TransformError::NoRedefinition(e) => {
+                write!(f, "element {e:?} writes no redefinition target")
+            }
+            TransformError::InvalidRedefinitionTarget { text, message } => {
+                write!(f, "redefinition target `{text}` does not parse: {message}")
+            }
+            TransformError::NoCommentBody(e) => {
+                write!(f, "element {e:?} has no comment body to set")
+            }
+            TransformError::InvalidCommentBody { text, message } => {
+                write!(f, "comment body `{text}` cannot be written: {message}")
             }
             TransformError::NoExtent(e) => {
                 write!(f, "element {e:?} has no recorded source extent")
@@ -676,32 +700,73 @@ impl Library {
     /// caller can fall back to [`Self::prepared_sources`]. Decoding skips the
     /// resolve and keeps no syntax trees. The optional `recording` (the sealed
     /// resolution snapshot) stays encoded, for the builds that must resolve
-    /// the library together with user units after all.
+    /// the library together with user units after all. What hosts shipped
+    /// with the library is verified and left behind (see
+    /// [`Self::prepared_snapshot_with`]).
     pub fn prepared_snapshot(
         units: Vec<(String, String)>,
         snapshot: &[u8],
         recording: Option<Vec<u8>>,
     ) -> Result<Library, SessionError> {
-        Self::prepared_snapshot_with_format(units, snapshot, recording, GraphFormat::LegacyV2)
+        Self::prepared_snapshot_with(units, snapshot, recording, false)
+    }
+
+    /// [`Self::prepared_snapshot`], keeping what hosts shipped with the
+    /// library — the language server's library symbol table — for them to
+    /// read back when `keep_host_parts`
+    /// ([`sysmlv2_model::prepared::PreparedLibrary::from_bytes_with`]). A
+    /// library no language server is hosted on is decoded without.
+    pub fn prepared_snapshot_with(
+        units: Vec<(String, String)>,
+        snapshot: &[u8],
+        recording: Option<Vec<u8>>,
+        keep_host_parts: bool,
+    ) -> Result<Library, SessionError> {
+        Self::decode_prepared(
+            units,
+            snapshot,
+            recording,
+            GraphFormat::LegacyV2,
+            keep_host_parts,
+        )
     }
 
     /// [`Self::prepared_snapshot`] over a snapshot fed in chunks
     /// ([`sysmlv2_model::prepared::PreparedLibrary::from_chunks`]): `fill`
     /// copies the next bytes of the `len`-byte snapshot into the buffer it is
     /// given, so a host that holds the snapshot elsewhere never copies it
-    /// here whole.
+    /// here whole. What hosts shipped with the library is verified and left
+    /// behind (see [`Self::prepared_snapshot_chunks_with`]).
     pub fn prepared_snapshot_chunks<F: FnMut(&mut [u8]) -> usize>(
         units: Vec<(String, String)>,
         len: usize,
         fill: F,
         recording: Option<Vec<u8>>,
     ) -> Result<Library, SessionError> {
+        Self::prepared_snapshot_chunks_with(units, len, fill, recording, false)
+    }
+
+    /// [`Self::prepared_snapshot_chunks`], keeping what hosts shipped with
+    /// the library for them to read back when `keep_host_parts` (see
+    /// [`Self::prepared_snapshot_with`]).
+    pub fn prepared_snapshot_chunks_with<F: FnMut(&mut [u8]) -> usize>(
+        units: Vec<(String, String)>,
+        len: usize,
+        fill: F,
+        recording: Option<Vec<u8>>,
+        keep_host_parts: bool,
+    ) -> Result<Library, SessionError> {
         let key = libcache::hash_units(
             units
                 .iter()
                 .map(|(name, text)| (name.as_str(), text.as_str())),
         );
-        let library = sysmlv2_model::prepared::PreparedLibrary::from_chunks(len, fill, key)
+        let library = sysmlv2_model::prepared::PreparedLibrary::from_chunks_with(
+            len,
+            fill,
+            key,
+            keep_host_parts,
+        )
             .filter(|library| library.graph_format() == GraphFormat::LegacyV2)
             .ok_or_else(|| {
                 SessionError::Io(std::io::Error::new(
@@ -713,7 +778,9 @@ impl Library {
             Some(bytes) => library.with_lazy_recording(bytes),
             None => library,
         };
-        Ok(Library::Prepared(std::sync::Arc::new(library)))
+        let library = std::sync::Arc::new(library);
+        library.start_plans();
+        Ok(Library::Prepared(library))
     }
 
     /// [`Self::prepared_snapshot`] under the selected lowering/identity contract.
@@ -723,12 +790,28 @@ impl Library {
         recording: Option<Vec<u8>>,
         format: GraphFormat,
     ) -> Result<Library, SessionError> {
+        Self::decode_prepared(units, snapshot, recording, format, false)
+    }
+
+    /// A snapshot held whole, decoded under `format`, its hosts' parts kept
+    /// when `keep_host_parts`.
+    fn decode_prepared(
+        units: Vec<(String, String)>,
+        snapshot: &[u8],
+        recording: Option<Vec<u8>>,
+        format: GraphFormat,
+        keep_host_parts: bool,
+    ) -> Result<Library, SessionError> {
         let key = libcache::hash_units(
             units
                 .iter()
                 .map(|(name, text)| (name.as_str(), text.as_str())),
         );
-        let library = sysmlv2_model::prepared::PreparedLibrary::from_bytes(snapshot, key)
+        let library = sysmlv2_model::prepared::PreparedLibrary::from_bytes_with(
+            snapshot,
+            key,
+            keep_host_parts,
+        )
             .filter(|library| library.graph_format() == format)
             .ok_or_else(|| {
                 SessionError::Io(std::io::Error::new(
@@ -740,7 +823,9 @@ impl Library {
             Some(bytes) => library.with_lazy_recording(bytes),
             None => library,
         };
-        Ok(Library::Prepared(std::sync::Arc::new(library)))
+        let library = std::sync::Arc::new(library);
+        library.start_plans();
+        Ok(Library::Prepared(library))
     }
 
     pub fn dir(path: impl Into<PathBuf>) -> Library {
@@ -1593,8 +1678,54 @@ fn syntax_findings(
     findings
 }
 
+/// `elementId → last qualified-name segment` of library name-table
+/// entries taken in order: the last entry of an id decides, and one with
+/// no segments leaves the id out, as a map of the whole table with each
+/// entry's last segment kept does.
+fn last_segments<'a>(
+    entries: impl Iterator<Item = (String, &'a [String])>,
+) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for (id, segments) in entries {
+        match segments.last() {
+            Some(name) => names.insert(id, name.clone()),
+            None => names.remove(&id),
+        };
+    }
+    names
+}
+
+/// Every id an `@id` of `value` names, at any depth: an element's own and
+/// every reference's.
+fn named_ids(value: &serde_json::Value, out: &mut HashSet<Uuid>) {
+    match value {
+        serde_json::Value::Array(items) => items.iter().for_each(|v| named_ids(v, out)),
+        serde_json::Value::Object(fields) => {
+            for (key, v) in fields {
+                match v.as_str() {
+                    Some(id) if key == "@id" => out.extend(Uuid::parse_str(id).ok()),
+                    _ => named_ids(v, out),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn rebuild(
     sources: &[(String, String)],
+    lib: Option<&Library>,
+    format: GraphFormat,
+    settled: Option<std::sync::Arc<SettledOutcomes>>,
+) -> Result<(Model, ResolvedModel, usize), SessionError> {
+    rebuild_from(sources, None, lib, format, settled)
+}
+
+/// [`rebuild`], taking each unit's syntax from `parsed` when given —
+/// `parsed[i]` is `sources[i]` parsed — instead of parsing the text.
+fn rebuild_from(
+    sources: &[(String, String)],
+    parsed: Option<Vec<sysmlv2_model::model::ParsedSource>>,
     lib: Option<&Library>,
     format: GraphFormat,
     settled: Option<std::sync::Arc<SettledOutcomes>>,
@@ -1616,8 +1747,12 @@ fn rebuild(
         cache_path = load_library_into(&mut model, lib)?;
     }
     let unit_offset = model.unit_count();
+    let mut parsed = parsed.map(Vec::into_iter);
     for (name, src) in sources {
-        let unit = model.add_source(name.clone(), src);
+        let unit = match parsed.as_mut().and_then(Iterator::next) {
+            Some(parsed) => model.add_parsed_source(parsed),
+            None => model.add_source(name.clone(), src),
+        };
         if !unit.diagnostics.is_empty() {
             return Err(SessionError::Parse {
                 unit: name.clone(),
@@ -1751,6 +1886,40 @@ impl Session {
         Ok(session)
     }
 
+    /// [`Self::from_sources_settled`] over units already parsed: `parsed`
+    /// holds each of `sources` parsed, in the same order (see
+    /// [`ParsedSource::new`](sysmlv2_model::model::ParsedSource::new)), and
+    /// the build takes their syntax instead of parsing the texts again — for
+    /// a host that parses every unit to see whether a session can be built
+    /// before it loads the library. The session is the one
+    /// [`Self::from_sources_settled`] builds over `sources`.
+    ///
+    /// # Panics
+    ///
+    /// When `parsed` does not name the units of `sources` in order.
+    #[doc(hidden)]
+    pub fn from_parsed_settled(
+        sources: Vec<(String, String)>,
+        parsed: Vec<sysmlv2_model::model::ParsedSource>,
+        lib: Option<Library>,
+        settled: Option<std::sync::Arc<SettledOutcomes>>,
+    ) -> Result<Session, SessionError> {
+        assert!(
+            parsed.len() == sources.len()
+                && parsed
+                    .iter()
+                    .zip(&sources)
+                    .all(|(parsed, (name, _))| parsed.name() == name),
+            "parsed units must be the sources' units, in order"
+        );
+        let format = GraphFormat::LegacyV2;
+        let (model, resolved, unit_offset) =
+            rebuild_from(&sources, Some(parsed), lib.as_ref(), format, settled)?;
+        let mut session = Self::assemble(sources, lib, unit_offset, model, resolved);
+        session.enforce_graph_format = false;
+        Ok(session)
+    }
+
     /// The outcomes this session's build settled on, for a session over
     /// mostly the same units to start from (see
     /// [`Self::from_sources_settled`]): `Some` only for a build on a
@@ -1780,7 +1949,18 @@ impl Session {
         settled: Option<std::sync::Arc<SettledOutcomes>>,
     ) -> Result<Session, SessionError> {
         let (model, resolved, unit_offset) = rebuild(&sources, lib.as_ref(), format, settled)?;
-        Ok(Session {
+        Ok(Self::assemble(sources, lib, unit_offset, model, resolved))
+    }
+
+    /// A session over a model just built from `sources`.
+    fn assemble(
+        sources: Vec<(String, String)>,
+        lib: Option<Library>,
+        unit_offset: usize,
+        model: Model,
+        resolved: ResolvedModel,
+    ) -> Session {
+        Session {
             sources,
             lib,
             unit_offset,
@@ -1793,7 +1973,7 @@ impl Session {
             strict_id_bindings: false,
             id_reference_values: HashMap::new(),
             id_reference_bindings: HashMap::new(),
-        })
+        }
     }
 
     /// Open a session over an interchange JSON document — the payload
@@ -2007,15 +2187,63 @@ impl Session {
         })
     }
 
+    /// The session's compact element array and unit structure, before the
+    /// explicit-id overlay: read off the session's resolved model while its
+    /// rows are still the ones its build made, which is what a fresh build
+    /// of the model makes, else emitted from a fresh build.
+    fn compact_json_with_units(&self) -> (serde_json::Value, Vec<(usize, String)>) {
+        self.resolved
+            .built_compact_json_with_units()
+            .unwrap_or_else(|| sysmlv2_model::json::model_to_compact_json_with_units(&self.model))
+    }
+
+    /// The session's compact element array, one element at a time, where
+    /// it is the build's rows as they stand: the model was built in the
+    /// stock graph format, no row the build made has been written since,
+    /// and the session overlays no ids (the overlay rewrites the whole
+    /// array).
+    fn compact_rows(&self) -> Option<sysmlv2_model::json::CompactRows<'_>> {
+        if self.overlays_ids() {
+            return None;
+        }
+        self.resolved.built_compact_rows()
+    }
+
+    /// Whether [`Self::to_compact_json_string`], [`Self::to_compact_cbor`],
+    /// [`Self::to_compact_cbor_elided`] and [`Self::state_digest`] write,
+    /// encode and digest the session's compact array off its build's rows
+    /// one element at a time: the array is the build's rows, and their
+    /// records read. Not a choice a host makes: the tests hold the
+    /// sessions that do to it.
+    #[doc(hidden)]
+    pub fn streams_compact_rows(&self) -> bool {
+        self.streamed_records().is_some()
+    }
+
+    /// The element records of [`Self::compact_rows`], each element read
+    /// once and its record written, for the encodings that transcode
+    /// them: `None` where the compact array is not the build's rows, or
+    /// where reading them refuses what the whole array's encoders report.
+    fn streamed_records(&self) -> Option<sysmlv2_cbor::ElementRecords> {
+        let rows = self.compact_rows()?;
+        sysmlv2_cbor::ElementRecords::read(rows.len(), |i| rows.element(i)).ok()
+    }
+
+    /// Whether the session's compact array takes the explicit-id overlay,
+    /// which rewrites ids across the whole array.
+    fn overlays_ids(&self) -> bool {
+        !self.explicit_ids.is_empty() || self.binds_ids
+    }
+
     /// The session's compact element array with the explicit-id overlay.
     fn compact_json_overlaid(&self) -> serde_json::Value {
-        let mut v = sysmlv2_model::json::model_to_compact_json(&self.model);
+        let (mut v, _) = self.compact_json_with_units();
         self.overlay(&mut v);
         v
     }
 
     fn compact_json_with_units_overlaid(&self) -> (serde_json::Value, Vec<(usize, String)>) {
-        let (mut v, units) = sysmlv2_model::json::model_to_compact_json_with_units(&self.model);
+        let (mut v, units) = self.compact_json_with_units();
         self.overlay(&mut v);
         (v, units)
     }
@@ -2028,7 +2256,7 @@ impl Session {
     }
 
     fn overlay(&self, v: &mut serde_json::Value) {
-        if self.explicit_ids.is_empty() && !self.binds_ids {
+        if !self.overlays_ids() {
             return;
         }
         if self.uses_lexical_references() {
@@ -2112,6 +2340,26 @@ impl Session {
         self.compact_json_overlaid()
     }
 
+    /// [`Self::to_compact_json`] as JSON text, the text its `to_string`
+    /// writes. Where the session's compact array is its build's rows, the
+    /// elements are written one at a time and the array is never held.
+    pub fn to_compact_json_string(&self) -> String {
+        let Some(rows) = self.compact_rows() else {
+            return self.to_compact_json().to_string();
+        };
+        // The compact writer puts nothing around an array's items but the
+        // brackets and the commas between them.
+        let mut out = b"[".to_vec();
+        for (i, element) in rows.elements().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            serde_json::to_writer(&mut out, &element).expect("a JSON value writes to memory");
+        }
+        out.push(b']');
+        String::from_utf8(out).expect("JSON text is UTF-8")
+    }
+
     /// Emit the session's model as compact-form CBOR — the
     /// deterministic binary re-encoding of [`Self::to_compact_json`],
     /// decodable back to the identical element array.
@@ -2123,6 +2371,15 @@ impl Session {
     /// a session refuses a blank unit name, which is the one input the
     /// encoder rejects outright.
     pub fn to_compact_cbor(&self) -> Vec<u8> {
+        // Where the compact array is the build's rows, its elements are
+        // encoded one at a time; anything that encoding refuses is left
+        // to the whole array's, which reports it.
+        if let Some(bytes) = self
+            .streamed_records()
+            .and_then(|records| records.to_compact_cbor(&self.unit_structure()).ok())
+        {
+            return bytes;
+        }
         // The corpus gate in sysmlv2-cbor pins the compact emitter's
         // output to the codec tables, so the session's own compact form
         // always encodes. Payloads carry the model's unit structure —
@@ -2151,7 +2408,9 @@ impl Session {
     /// each user unit, the compact element-array index of its root
     /// namespace and the unit's source path.
     pub fn unit_structure(&self) -> Vec<(usize, String)> {
-        sysmlv2_model::json::model_to_compact_json_with_units(&self.model).1
+        self.resolved
+            .built_unit_structure()
+            .unwrap_or_else(|| sysmlv2_model::json::model_to_compact_json_with_units(&self.model).1)
     }
 
     /// [`Self::to_compact_cbor`] with **id elision** (opt-in):
@@ -2169,8 +2428,18 @@ impl Session {
         if self.has_explicit_ids() {
             return Err(SessionError::ExplicitIds);
         }
-        let names = self.library_id_names();
+        // As `to_compact_cbor`: the build's rows are encoded one element
+        // at a time, the library naming only the targets they reference.
+        if let Some(records) = self.streamed_records() {
+            let names = self.library_id_names_among(&records.externals().iter().copied().collect());
+            if let Ok(bytes) =
+                records.to_compact_cbor_elided(&|s| names.get(s).cloned(), &self.unit_structure())
+            {
+                return Ok(bytes);
+            }
+        }
         let (json, units) = self.compact_json_with_units_overlaid();
+        let names = self.library_id_names_in(&[&json]);
         Ok(if self.model.graph_format() == GraphFormat::CanonicalV3 {
             sysmlv2_cbor::to_compact_cbor_elided_with_format(
                 &json,
@@ -2232,8 +2501,8 @@ impl Session {
         if self.has_explicit_ids() {
             return Err(SessionError::ExplicitIds);
         }
-        let names = self.library_id_names();
         let (target, units) = self.compact_json_with_units_overlaid();
+        let names = self.library_id_names_in(&[base, &target]);
         sysmlv2_cbor::delta_compact_cbor_elided(
             base,
             &target,
@@ -2248,11 +2517,43 @@ impl Session {
     /// `elementId → last qualified-name segment` for the session's
     /// library elements — the resolver every id-derivation surface
     /// (elision, elided deltas, decode) names external targets with.
+    /// Read off the session's resolved model while its name tables are the
+    /// ones its build made, else from a fresh build of the model.
     fn library_id_names(&self) -> HashMap<String, String> {
-        sysmlv2_model::json::library_name_map(&self.model)
-            .into_iter()
-            .filter_map(|(id, segs)| segs.last().cloned().map(|n| (id.to_string(), n)))
-            .collect()
+        match self.resolved.built_library_names() {
+            Some(entries) => {
+                last_segments(entries.map(|(id, segments)| (id.to_string(), segments)))
+            }
+            None => last_segments(
+                sysmlv2_model::json::library_name_map(&self.model)
+                    .iter()
+                    .map(|(id, segments)| (id.clone(), segments.as_slice())),
+            ),
+        }
+    }
+
+    /// [`Self::library_id_names`] for the ids the documents name, which
+    /// are all an elision of them asks it for, so that no table of the
+    /// whole library is made.
+    fn library_id_names_in(&self, documents: &[&serde_json::Value]) -> HashMap<String, String> {
+        let mut wanted = HashSet::new();
+        for document in documents {
+            named_ids(document, &mut wanted);
+        }
+        self.library_id_names_among(&wanted)
+    }
+
+    /// [`Self::library_id_names`] for the `wanted` ids, which are all a
+    /// caller asks it for.
+    fn library_id_names_among(&self, wanted: &HashSet<Uuid>) -> HashMap<String, String> {
+        match self.resolved.built_library_names() {
+            Some(entries) => last_segments(
+                entries
+                    .filter(|(id, _)| wanted.contains(id))
+                    .map(|(id, segments)| (id.to_string(), segments)),
+            ),
+            None => self.library_id_names(),
+        }
     }
 
     /// The model's **state digest** — the content identity
@@ -2264,6 +2565,15 @@ impl Session {
     /// As [`Self::to_compact_cbor`] — the digest runs over the same
     /// compact form.
     pub fn state_digest(&self) -> Uuid {
+        // Where the compact array is the build's rows, its elements are
+        // digested one at a time; anything that digest refuses is left to
+        // the whole array's, which reports it.
+        if let Some(rows) = self.compact_rows() {
+            if let Ok(digest) = sysmlv2_cbor::state_digest_streamed(rows.len(), |i| rows.element(i))
+            {
+                return digest;
+            }
+        }
         sysmlv2_cbor::state_digest(&self.to_compact_json())
             .expect("session compact form is covered by the codec tables")
     }
@@ -2939,7 +3249,7 @@ impl Session {
             if !s.plain && !chain_site(s) && !namespace_import_site(s) {
                 continue;
             }
-            if member_import_site(s) || s.kind == "qualifier" || s.unit < self.unit_offset {
+            if s.kind == "qualifier" || s.unit < self.unit_offset {
                 continue;
             }
             if seen.insert((s.unit, s.span.start, s.span.end)) {
@@ -2947,6 +3257,14 @@ impl Session {
             }
         }
         primaries.sort_by_key(|s| (s.unit, s.span.start));
+        // Member-import spans, resolved before the probe loop below takes
+        // `self.resolved` mutably (the classifier closures borrow `self`
+        // immutably, so they cannot be called from inside it).
+        let member_import_spans: HashSet<(usize, u32, u32)> = sites
+            .iter()
+            .filter(|s| member_import_site(s))
+            .map(|s| (s.unit, s.span.start, s.span.end))
+            .collect();
 
         // A maximal run of sites joined by single `.`s is one feature
         // chain (the lift spells chain links as `$::`-rooted names) —
@@ -2987,15 +3305,53 @@ impl Session {
             }
             // Shortest head: the suffix of the target's qualified name
             // that resolves back to the same element under the site's
-            // own scope and exclusion. (A quoted segment containing `::`
-            // would split wrong here; such a candidate simply fails the
-            // resolve check and the site keeps its original spelling.)
+            // own scope and exclusion. (`split_canonical` keeps a quoted
+            // segment whole, `::` inside the quotes included.)
             let Some(head_qn) = self.resolved.element_qualified_name(first.target) else {
                 continue;
             };
-            let segs = sysmlv2_syntax::name::split_canonical(&head_qn);
+            // A member import names one *Membership*, and an element can
+            // have several (an `alias` is a second Membership for the same
+            // element). The element's qualified name spells the element's
+            // own, so deriving candidates from it silently re-points
+            // `import Pkg::Alias;` at the aliased element's own membership
+            // — a model change, not a respelling. Suffixes of what is
+            // *written* keep the final segment, hence the membership.
+            //
+            // The floor of two segments is the other half: a member import
+            // binds exactly its own last segment into the importing scope,
+            // so a one-segment candidate would be satisfied by the very
+            // import being respelled (`import Pkg::Member;` collapsing to
+            // `import Member;`). A longer candidate must find its leading
+            // segment without this import's help: by lexical scoping, or
+            // through a sibling import of the same namespace, which the
+            // reference implementation consults too. So the site ends up
+            // with the *shortest* such suffix, not merely the written path
+            // without its `$::` — on authored text that is usually the
+            // spelling the author wrote. A written path of one segment
+            // keeps that one candidate, so `import $::Pkg;` still unroots.
+            // The reparse-verify pass below is the backstop.
+            let is_member_import =
+                member_import_spans.contains(&(first.unit, first.span.start, first.span.end));
+            let segs = if is_member_import {
+                let written = &src[first.span.start as usize..first.span.end as usize];
+                sysmlv2_syntax::name::split_canonical(
+                    written.strip_prefix("$::").unwrap_or(written),
+                )
+            } else {
+                sysmlv2_syntax::name::split_canonical(&head_qn)
+            };
+            if segs.is_empty() {
+                i += 1;
+                continue;
+            }
+            let min_k = if is_member_import {
+                segs.len().min(2)
+            } else {
+                1
+            };
             let mut head: Option<String> = None;
-            for k in 1..=segs.len() {
+            for k in min_k..=segs.len() {
                 let suffix = &segs[segs.len() - k..];
                 let cand_qn = QualifiedName {
                     is_global: false,
@@ -3285,6 +3641,17 @@ enum Op {
         e: ElementRef,
         ty: String,
     },
+    SetRedefinedFeature {
+        e: ElementRef,
+        target: String,
+    },
+    RemoveFeatureValue {
+        e: ElementRef,
+    },
+    SetCommentBody {
+        e: ElementRef,
+        body: String,
+    },
     InsertMember {
         owner: ElementRef,
         text: String,
@@ -3337,6 +3704,9 @@ impl Op {
             Op::Rename { e, .. }
             | Op::SetFeatureValue { e, .. }
             | Op::SetFeatureType { e, .. }
+            | Op::SetRedefinedFeature { e, .. }
+            | Op::RemoveFeatureValue { e }
+            | Op::SetCommentBody { e, .. }
             | Op::Remove { e }
             | Op::ReplaceMember { e, .. }
             | Op::HoistToUnit { e, .. }
@@ -3594,6 +3964,45 @@ impl EditBuilder<'_> {
         self.ops.push(Op::SetFeatureValue {
             e,
             expr: expr.to_string(),
+        });
+        self
+    }
+
+    /// Replace what `e` redefines: the first written `:>> T` /
+    /// `redefines T` target — a name or a feature chain, as written —
+    /// becomes `target` (spelled as written: a name, a qualified name or
+    /// a chain such as `chassis.mass`). Declaration position, type, value
+    /// and body are untouched; whether the new spelling resolves surfaces
+    /// through the commit's findings, like inserted member text.
+    pub fn set_redefined_feature(&mut self, e: ElementRef, target: &str) -> &mut Self {
+        self.ops.push(Op::SetRedefinedFeature {
+            e,
+            target: target.to_string(),
+        });
+        self
+    }
+
+    /// Remove `e`'s feature value: the `= …`, `:= …` or `default …`
+    /// clause goes, its operator with it (`attribute x : T = 3;` →
+    /// `attribute x : T;`). Refused when `e` declares no value.
+    pub fn remove_feature_value(&mut self, e: ElementRef) -> &mut Self {
+        self.ops.push(Op::RemoveFeatureValue { e });
+        self
+    }
+
+    /// Replace the body of `e`, a comment or documentation, with `body`:
+    /// only the `/* … */` token is rewritten, so the keyword, the name,
+    /// the `about` list and the locale stay as written. `body` is the
+    /// text as a reader sees it, without delimiters or `*` margins; one
+    /// line is written `/* body */`, several as a `*`-guttered block
+    /// aligned under the line the body opens on. Refused when `e` has no
+    /// such body ([`TransformError::NoCommentBody`]) or when `body`
+    /// holds the `*/` that would close it
+    /// ([`TransformError::InvalidCommentBody`]).
+    pub fn set_comment_body(&mut self, e: ElementRef, body: &str) -> &mut Self {
+        self.ops.push(Op::SetCommentBody {
+            e,
+            body: body.to_string(),
         });
         self
     }
@@ -3982,6 +4391,9 @@ impl<'s> Planner<'s> {
             Op::Rename { e, new_name } => self.plan_rename(*e, new_name),
             Op::SetFeatureValue { e, expr } => self.plan_set_value(*e, expr),
             Op::SetFeatureType { e, ty } => self.plan_set_type(*e, ty),
+            Op::SetRedefinedFeature { e, target } => self.plan_set_redefined(*e, target),
+            Op::RemoveFeatureValue { e } => self.plan_remove_value(*e),
+            Op::SetCommentBody { e, body } => self.plan_set_comment_body(*e, body),
             Op::InsertMember { owner, text } => self.plan_insert(*owner, text),
             Op::InsertTopLevel { unit_name, text } => self.plan_insert_top(unit_name, text),
             Op::AddUnit { name } => self.plan_add_unit(name),
@@ -4207,19 +4619,183 @@ impl<'s> Planner<'s> {
             });
             return Ok(());
         }
-        // No value: extend a `;`-terminated declaration with ` = expr`.
+        // No value: extend a `;`-terminated declaration with ` = expr`, or
+        // put it ahead of the body of one that has one (`x { doc … }` →
+        // `x = expr { doc … }`), the body's opening brace being the first
+        // of the declaration; a note between the declaration and its body
+        // or `;` stays after the value.
         let (unit, extent) = r
             .member_extent(e)
             .ok_or(TransformError::NoEditableValue(e))?;
         let src = self.user_src(unit, e)?;
-        if !slice(src, extent).ends_with(';') {
+        let text = slice(src, extent);
+        let at = if let Some(head) = text.strip_suffix(';') {
+            extent.start + trim_trailing_trivia(head).len() as u32
+        } else if text.ends_with('}') {
+            let open = text.find('{').ok_or(TransformError::NoEditableValue(e))?;
+            // after the declaration's last token, ahead of a note before the body
+            extent.start + trim_trailing_trivia(&text[..open]).len() as u32
+        } else {
             return Err(TransformError::NoEditableValue(e));
-        }
+        };
         self.splices.push(Splice {
             unit,
-            start: extent.end - 1,
-            end: extent.end - 1,
+            start: at,
+            end: at,
             text: format!(" = {}", expr.trim()),
+            expects: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn plan_set_redefined(&mut self, e: ElementRef, target: &str) -> Result<(), TransformError> {
+        let target = target.trim();
+        // one name or chain, and nothing more: the probe must parse to one
+        // usage whose one specialization is a redefinition whose target is
+        // the whole of the text (`a = 3`, `a : T`, `a :>> b` are not)
+        let lead = "package __p { feature :>> ";
+        let probe = format!("{lead}{target}; }}");
+        let parse = parse_source(&probe);
+        let whole = parse.diagnostics.is_empty()
+            && !target.is_empty()
+            && parse
+                .unit
+                .members
+                .first()
+                .and_then(|m| match &m.kind {
+                    sysmlv2_syntax::ast::MemberKind::Package(p) => p.body.as_deref(),
+                    _ => None,
+                })
+                .and_then(|body| match body {
+                    [one] => match &one.kind {
+                        sysmlv2_syntax::ast::MemberKind::Usage(u) => Some(u),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .is_some_and(|u| {
+                    let decl = &u.declaration;
+                    u.value.is_none()
+                        && u.body.is_none()
+                        && decl.multiplicity.is_none()
+                        && matches!(
+                            decl.specializations.as_slice(),
+                            [sysmlv2_syntax::ast::FeatureSpecialization::Redefines(ts)]
+                                if matches!(ts.as_slice(), [t]
+                                    if t.span().start as usize == lead.len()
+                                        && t.span().end as usize == lead.len() + target.len())
+                        )
+                });
+        if !whole {
+            return Err(TransformError::InvalidRedefinitionTarget {
+                text: target.to_string(),
+                message: parse
+                    .diagnostics
+                    .first()
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| "not one feature name or chain".into()),
+            });
+        }
+        let (unit, span) = self
+            .session
+            .resolved()
+            .first_redefinition_target_span(e)
+            .ok_or(TransformError::NoRedefinition(e))?;
+        self.consumed.push((unit, span));
+        self.released_identity_ranges.push((unit, span));
+        self.splices.push(Splice {
+            unit,
+            start: span.start,
+            end: span.end,
+            text: target.to_string(),
+            expects: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn plan_remove_value(&mut self, e: ElementRef) -> Result<(), TransformError> {
+        let r = self.session.resolved();
+        let (_, old) = r.value_expr(e).ok_or(TransformError::NoEditableValue(e))?;
+        let (unit, _) = r
+            .declaration_site(e)
+            .or_else(|| r.member_extent(e))
+            .ok_or(TransformError::NoEditableValue(e))?;
+        let src = self.user_src(unit, e)?;
+        // back over the operator that binds the value (notes between it and the
+        // value included) and `default` ahead of it; a value bound some other way
+        // is left to the source editor
+        let head = &src[..old.span.start as usize];
+        let mut start = trim_trailing_trivia(head).len();
+        let op = &head[..start];
+        let mut bound = true;
+        start = if let Some(s) = op.strip_suffix(":=") {
+            s.len()
+        } else if let Some(s) = op.strip_suffix('=') {
+            s.len()
+        } else {
+            bound = false;
+            start
+        };
+        let kept = trim_trailing_trivia(&head[..start]);
+        if let Some(s) = kept.strip_suffix("default") {
+            if s.is_empty() || s.ends_with(|c: char| !c.is_alphanumeric() && c != '_') {
+                start = s.len();
+                bound = true;
+            }
+        }
+        if !bound {
+            return Err(TransformError::NoEditableValue(e));
+        }
+        let start = head[..start].trim_end().len() as u32;
+        self.consumed.push((unit, old.span));
+        self.released_identity_ranges.push((unit, old.span));
+        self.splices.push(Splice {
+            unit,
+            start,
+            end: old.span.end,
+            text: String::new(),
+            expects: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn plan_set_comment_body(&mut self, e: ElementRef, body: &str) -> Result<(), TransformError> {
+        if body.contains("*/") {
+            return Err(TransformError::InvalidCommentBody {
+                text: body.to_string(),
+                message: "a body cannot hold `*/`, which would close it".into(),
+            });
+        }
+        let r = self.session.resolved();
+        if !matches!(r.element_type(e), "Comment" | "Documentation") {
+            return Err(TransformError::NoCommentBody(e));
+        }
+        let (unit, extent) = r.member_extent(e).ok_or(TransformError::NoCommentBody(e))?;
+        let src = self.user_src(unit, e)?;
+        // The body is the declaration's last token (`comment c about x
+        // /* … */`, `doc /* … */`, a bare `/* … */`); notes are trivia,
+        // so they never pass for it.
+        let text = slice(src, extent);
+        let token = tokenize(text)
+            .0
+            .into_iter()
+            .rev()
+            .find(|t| t.kind != TokenKind::Eof && !t.kind.is_trivia())
+            .filter(|t| t.kind == TokenKind::RegularComment)
+            .ok_or(TransformError::NoCommentBody(e))?;
+        let span = Span::new(
+            extent.start + token.span.start,
+            extent.start + token.span.end,
+        );
+        let line = &src[src[..span.start as usize].rfind('\n').map_or(0, |i| i + 1)..];
+        let indent = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+        let spelled = comment_body_spelling(body, indent);
+        self.consumed.push((unit, span));
+        self.splices.push(Splice {
+            unit,
+            start: span.start,
+            end: span.end,
+            text: spelled,
             expects: Vec::new(),
         });
         Ok(())
@@ -4258,13 +4834,16 @@ impl<'s> Planner<'s> {
             _ => return Err(TransformError::AmbiguousTyping(e)),
         }
         // No written typing: add `: T` after the declared name, or after
-        // the last specialization clause of an unnamed feature
-        // (`attribute :>> mass = 10;` → `attribute :>> mass : T = 10;`).
+        // the last specialization clause of an unnamed feature, a chain's
+        // last link included (`attribute :>> mass = 10;` → `attribute :>>
+        // mass : T = 10;`; `attribute :>> chassis.mass;` → `attribute :>>
+        // chassis.mass : T;`).
         let at = r
             .declaration_site(e)
             .or_else(|| {
                 r.specialization_spans(e)
                     .into_iter()
+                    .chain(r.chain_specialization_spans(e))
                     .max_by_key(|&(_, sp)| sp.end)
             })
             .ok_or(TransformError::NotDeclared(e))?;
@@ -6290,6 +6869,61 @@ fn doc_unit_name(root_name: Option<&str>, index: usize) -> String {
         }
     }
     format!("document-{}.sysml", index + 1)
+}
+
+/// `text` without its trailing whitespace and notes (`// …`, `/* … */`).
+fn trim_trailing_trivia(text: &str) -> &str {
+    let mut end = text.trim_end().len();
+    loop {
+        let head = &text[..end];
+        if let Some(open) = head.strip_suffix("*/").and_then(|h| h.rfind("/*")) {
+            end = head[..open].trim_end().len();
+            continue;
+        }
+        // a line note ends the line the value follows
+        let line_start = head.rfind('\n').map_or(0, |i| i + 1);
+        if let Some(note) = head[line_start..].find("//") {
+            end = head[..line_start + note].trim_end().len();
+            continue;
+        }
+        return head;
+    }
+}
+
+/// The `/* … */` token that reads back as `body`. One line is written
+/// inline (`/* body */`); several lines, or a line that opens with the
+/// `*` a reader's view strips as margin, as a `*`-guttered block whose
+/// continuation lines sit under `indent`:
+///
+/// ```text
+/// /*
+///  * line one
+///  *
+///  * line three
+///  */
+/// ```
+///
+/// Each line keeps its own leading spaces after the gutter; the text as
+/// a whole is trimmed, as a reader's view of the body trims it.
+fn comment_body_spelling(body: &str, indent: &str) -> String {
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = body.trim().lines().map(str::trim_end).collect();
+    match lines.as_slice() {
+        [] => "/* */".to_string(),
+        [one] if !one.starts_with('*') => format!("/* {one} */"),
+        _ => {
+            let mut out = String::from("/*\n");
+            for line in lines {
+                out.push_str(indent);
+                out.push_str(if line.is_empty() { " *" } else { " * " });
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str(indent);
+            out.push_str(" */");
+            out
+        }
+    }
 }
 
 fn slice(src: &str, span: Span) -> &str {

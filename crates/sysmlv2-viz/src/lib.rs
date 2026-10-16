@@ -46,7 +46,7 @@ mod graph;
 mod interconnect;
 mod sequence;
 
-pub use graph::{GraphError, graph};
+pub use graph::{GraphError, graph, summary_would_draw, summary_would_draw_within};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -638,6 +638,19 @@ pub fn plantuml(r: &mut ResolvedModel, root: Option<ElementRef>, opts: &VizOptio
     }
 }
 
+/// The elements a diagram of `root` under `opts` starts from: `root`
+/// when given, else `opts.roots` when non-empty, else every top-level
+/// user element. Passed back as `opts.roots` with no `root`, they scope
+/// the same diagram without being looked up again — for a host that
+/// emits or counts one scope more than once.
+pub fn scope_roots(
+    r: &mut ResolvedModel,
+    root: Option<ElementRef>,
+    opts: &VizOptions,
+) -> Vec<ElementRef> {
+    roots_of(r, root, opts)
+}
+
 /// The diagram's top-level elements: a single `root` when given (its
 /// subtree), else the caller's `opts.roots` selection when non-empty
 /// (the package filter), else every top-level user element.
@@ -866,10 +879,8 @@ impl Emitter<'_> {
                     if !matches!(self.classify(m), Kind::Line) {
                         continue;
                     }
-                    let shadowed = self
-                        .r
-                        .element_name(m)
-                        .is_some_and(|n| own_names.iter().any(|o| o == n));
+                    // by the names the lines read, borrowed ones included
+                    let shadowed = display_name(self.r, m).is_some_and(|n| own_names.contains(&n));
                     if shadowed {
                         continue;
                     }
@@ -1088,9 +1099,112 @@ pub(crate) fn display_name(r: &mut ResolvedModel, e: ElementRef) -> Option<Strin
         if let Some(n) = r.element_name(cur) {
             return Some(n.to_string());
         }
+        // A nameless redefinition of a feature chain (`:>> chassis.mass`)
+        // borrows the chain's spelling: the chain itself has no name.
+        if let Some(links) = redefined_chain(r, cur) {
+            return Some(links.join("."));
+        }
         cur = *r.redefinition_targets(cur).first()?;
     }
     None
+}
+
+/// The redefined chain of a nameless redefining feature, as its links'
+/// names (`["chassis", "mass"]`), when it redefines a feature chain and no
+/// feature by name (`:>> total, chassis.mass` borrows `total`, as its
+/// effective name does). A link without a name of its own borrows one
+/// through its redefinitions, as a compartment line does.
+pub(crate) fn redefined_chain(r: &mut ResolvedModel, e: ElementRef) -> Option<Vec<String>> {
+    if r.element_name(e).is_some() || !r.redefinition_targets(e).is_empty() {
+        return None;
+    }
+    let links = r.redefined_chains(e).into_iter().next()?;
+    links
+        .into_iter()
+        .map(|link| {
+            let mut cur = link;
+            for _ in 0..32 {
+                if let Some(n) = r.element_name(cur) {
+                    return Some(n.to_string());
+                }
+                cur = *r.redefinition_targets(cur).first()?;
+            }
+            None
+        })
+        .collect()
+}
+
+/// Whether `e` is a nameless redefining feature — a compartment line that
+/// borrows its redefined feature's name (or chain) for its label.
+pub(crate) fn is_nameless_redefinition(r: &mut ResolvedModel, e: ElementRef) -> bool {
+    r.element_name(e).is_none()
+        && (!r.redefinition_targets(e).is_empty() || !r.redefined_chains(e).is_empty())
+}
+
+/// The types a label shows, and whether they were derived rather than
+/// written: the explicit typings, else the first found through
+/// redefinitions (`part redefines brewing;` keeps the redefined feature's
+/// type, as KerML derives the redefining feature's /type). A nameless
+/// redefinition also looks through subsettings and a chain's last link
+/// (`:>> chassis.mass` finds `mass :> ISQ::mass` and its `MassValue`),
+/// breadth-first; named features keep the redefinition walk alone, so
+/// their labels do not change.
+pub(crate) fn label_types(r: &mut ResolvedModel, e: ElementRef) -> (Vec<ElementRef>, bool) {
+    let typings = r.typings(e);
+    if !typings.is_empty() {
+        return (typings, false);
+    }
+    let mut cur = e;
+    for _ in 0..8 {
+        let Some(&t) = r.redefinition_targets(cur).first() else {
+            break;
+        };
+        let typings = r.typings(t);
+        if !typings.is_empty() {
+            return (typings, true);
+        }
+        cur = t;
+    }
+    // a named feature follows a chain it redefines (`part cb :>> chassis.body`)
+    // but not its subsetting, as a name declares a feature of its own
+    if r.element_name(e).is_some() {
+        for chain in r.redefined_chains(e) {
+            if let Some(&last) = chain.last() {
+                let (typings, _) = label_types(r, last);
+                if !typings.is_empty() {
+                    return (typings, true);
+                }
+            }
+        }
+        return (Vec::new(), false);
+    }
+    let mut queue = std::collections::VecDeque::from([e]);
+    let mut seen = HashSet::new();
+    while let Some(f) = queue.pop_front() {
+        if seen.len() >= 64 {
+            break;
+        }
+        if !seen.insert(f) {
+            continue;
+        }
+        if f != e {
+            let typings = r.typings(f);
+            if !typings.is_empty() {
+                return (typings, true);
+            }
+        }
+        for chain in r.redefined_chains(f) {
+            if let Some(&last) = chain.last() {
+                queue.push_back(last);
+            }
+        }
+        for (kind, t) in r.explicit_specializations(f) {
+            if kind == "Redefinition" || kind == "Subsetting" {
+                queue.push_back(t);
+            }
+        }
+    }
+    (Vec::new(), false)
 }
 
 /// `name : Type1, Type2 [mult]` — the shared label shape for usages
@@ -1098,19 +1212,8 @@ pub(crate) fn display_name(r: &mut ResolvedModel, e: ElementRef) -> Option<Strin
 /// though library elements are never rendered as nodes.
 pub(crate) fn usage_label(r: &mut ResolvedModel, e: ElementRef) -> String {
     let mut label = display_name(r, e).unwrap_or_default();
-    // Explicit typings, else the type derived through redefinition —
-    // `part redefines brewing;` keeps the redefined feature's type in
-    // its label (KerML derives the redefining feature's /type).
-    let mut typings = r.typings(e);
-    let mut cur = e;
-    let mut hops = 0;
-    while typings.is_empty() && hops < 8 {
-        let targets = r.redefinition_targets(cur);
-        let Some(&t) = targets.first() else { break };
-        typings = r.typings(t);
-        cur = t;
-        hops += 1;
-    }
+    // Explicit typings, else the type derived (see `label_types`).
+    let (typings, _) = label_types(r, e);
     let type_names: Vec<String> = typings
         .iter()
         .filter_map(|t| r.element_name(*t).map(str::to_string))

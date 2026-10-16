@@ -191,6 +191,155 @@ fn anonymous_redefining_members_label_by_target_name() {
 }
 
 #[test]
+fn anonymous_chain_redefinitions_label_by_chain() {
+    // `:>> chassis.mass = 2` redefines a feature chain: the line borrows the
+    // chain's spelling, and its type is found through the chain's last link,
+    // that link's redefinition and the redefined feature's subsetting.
+    let mut r = resolved(
+        "package P {
+    attribute def MassValue;
+    attribute massRef : MassValue;
+    part def Base {
+        attribute mass :> massRef;
+    }
+    part def Chassis :> Base {
+        attribute wheelbase : MassValue;
+    }
+    part def Crawler {
+        part chassis : Chassis {
+            attribute :>> mass = 1;
+        }
+    }
+    part def Context {
+        part med : Crawler {
+            attribute :>> chassis.mass = 2;
+        }
+        part tiny : Crawler {
+            part :>> chassis {
+                attribute :>> mass = 3;
+            }
+        }
+    }
+}
+",
+    );
+    let out = plantuml(&mut r, None, &VizOptions::default());
+    assert!(out.contains("chassis.mass : MassValue = 2"), "{out}");
+    assert!(out.contains("mass : MassValue = 3"), "{out}");
+    assert!(!out.contains("\n    = "), "nameless line survived: {out}");
+    // A named feature keeps its label: `mass :> massRef` declares no type and
+    // its subsetting is not followed for it.
+    assert!(out.contains("    mass\n"), "{out}");
+
+    let graph = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let rows: Vec<serde_json::Value> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|n| n["rows"].as_array().cloned().unwrap_or_default())
+        .collect();
+    let row = |label: &str| {
+        rows.iter()
+            .find(|r| r["label"] == label)
+            .unwrap_or_else(|| panic!("no row {label}: {rows:#?}"))
+            .clone()
+    };
+    let chain = row("chassis.mass : MassValue = 2");
+    assert_eq!(chain["redefining"], true);
+    assert_eq!(chain["chain"], serde_json::json!(["chassis", "mass"]));
+    assert_eq!(chain["typeDerived"], true);
+    let nested = row("mass : MassValue = 3");
+    assert_eq!(nested["redefining"], true);
+    assert!(nested.get("chain").is_none(), "{nested}");
+    assert_eq!(nested["typeDerived"], true);
+    // a written type is no derived one, and a named row is no redefining one
+    let wheelbase = row("wheelbase : MassValue");
+    assert!(
+        wheelbase.get("typeDerived").is_none() && wheelbase.get("redefining").is_none(),
+        "{wheelbase}"
+    );
+    // the nested block's card borrows its name the same way; a named card does not
+    let nodes = graph["nodes"].as_array().unwrap();
+    let block = nodes
+        .iter()
+        .find(|n| n["qname"] == "P::Context::tiny::chassis")
+        .unwrap_or_else(|| panic!("no chassis block: {nodes:#?}"));
+    assert_eq!(block["redefining"], true);
+    assert!(block.get("chain").is_none(), "{block}");
+    assert_eq!(block["typeDerived"], true, "{block}");
+    let named = nodes
+        .iter()
+        .find(|n| n["qname"] == "P::Crawler::chassis")
+        .unwrap();
+    assert!(named.get("redefining").is_none(), "{named}");
+    assert!(named.get("typeDerived").is_none(), "{named}");
+}
+
+#[test]
+fn a_named_chain_block_shows_the_chain_s_last_type() {
+    // `part cb :>> chassis.body` declares a name and no type: its type is
+    // the chain's last link's, derived.
+    let mut r = resolved(
+        "package P {
+    part def Body;
+    part def Chassis { part body : Body; }
+    part def Crawler { part chassis : Chassis; }
+    part med : Crawler {
+        part cb :>> chassis.body;
+    }
+}
+",
+    );
+    let graph = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let cb = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["qname"] == "P::med::cb")
+        .unwrap_or_else(|| panic!("no cb: {graph:#?}"));
+    assert_eq!(cb["label"], "cb : Body", "{cb}");
+    assert_eq!(cb["typeDerived"], true, "{cb}");
+}
+
+#[test]
+fn a_chain_cut_short_or_beside_a_named_target_is_no_chain_label() {
+    // An unresolved last link leaves no chain to name (not its resolved
+    // prefix), and a named target written beside a chain names the line,
+    // as its effective name does.
+    let mut r = resolved(
+        "package P {
+    part def Chassis { attribute mass; attribute body; }
+    part def Crawler { part chassis : Chassis; attribute total; }
+    part med : Crawler {
+        attribute :>> chassis.mas = 1;
+        attribute :>> total, chassis.mass = 2;
+    }
+}
+",
+    );
+    let graph = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let rows: Vec<serde_json::Value> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["qname"] == "P::med")
+        .flat_map(|n| n["rows"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert!(
+        !rows.iter().any(|r| r["label"]
+            .as_str()
+            .is_some_and(|l| l.starts_with("chassis "))),
+        "a cut-short chain must not read as its prefix: {rows:#?}"
+    );
+    assert!(rows.iter().all(|r| r.get("chain").is_none()), "{rows:#?}");
+    let total = rows
+        .iter()
+        .find(|r| r["label"].as_str().is_some_and(|l| l.starts_with("total")))
+        .unwrap_or_else(|| panic!("no total row: {rows:#?}"));
+    assert_eq!(total["redefining"], true);
+}
+
+#[test]
 fn graph_emits_note_nodes_for_doc_bodies() {
     let src = "package P {
     part def Box {
@@ -1924,6 +2073,38 @@ fn summary_leaf_budget_truncates_and_counts() {
     assert_eq!(bundle.len(), 1);
     assert_eq!(bundle[0]["source"], node(&g, "P")["id"]);
     assert_eq!(bundle[0]["count"], 2);
+}
+
+#[test]
+fn summary_would_draw_counts_the_nodes_and_what_they_hide() {
+    let mut r = resolved(SUMMARY_MODEL);
+    // P and its doc note, plus the eight drawable elements below P
+    let closed = summary_graph(&mut r, &[], 200, 500);
+    assert_eq!(closed["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(sysmlv2_viz::summary_would_draw(&closed), 2 + 8);
+    // opened at the root: every drawn node, plus what Q and D still hide
+    let open = summary_graph(&mut r, &["P"], 200, 500);
+    let nodes = open["nodes"].as_array().unwrap();
+    let hidden: u64 = ["P::Q", "P::D"]
+        .iter()
+        .map(|q| node(&open, q)["summary"]["hidden"].as_u64().unwrap())
+        .sum();
+    assert!(hidden > 0);
+    assert_eq!(
+        sysmlv2_viz::summary_would_draw(&open),
+        nodes.len() + usize::try_from(hidden).unwrap()
+    );
+    // a full picture is its node count
+    let full = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    assert_eq!(
+        sysmlv2_viz::summary_would_draw(&full),
+        full["nodes"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        sysmlv2_viz::summary_would_draw(&serde_json::json!({"nodes": []})),
+        0
+    );
+    assert_eq!(sysmlv2_viz::summary_would_draw(&serde_json::json!({})), 0);
 }
 
 #[test]

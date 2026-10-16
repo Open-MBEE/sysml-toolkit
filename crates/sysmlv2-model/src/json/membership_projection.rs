@@ -2,9 +2,13 @@
 //! Inputs are provider facts; this algebra does not certify their completeness.
 //! Checked effective-input consumers must validate the same provider graph before
 //! treating the returned sequence as complete. No lookup, publication, or cache.
-use std::collections::{HashMap, HashSet};
+use crate::flat::ListsByRow;
+use crate::layered::{IdMap, IdSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Membership {
     pub(super) relationship: usize,
     pub(super) member: usize,
@@ -30,30 +34,33 @@ pub(super) trait MembershipFacts {
 
 /// The memberships each type exports, by type.
 pub(super) trait Exported {
-    fn exported(&self, e: &usize) -> Option<&Vec<Membership>>;
+    fn exported(&self, e: &usize) -> Option<&[Membership]>;
 }
-impl Exported for HashMap<usize, Vec<Membership>> {
-    fn exported(&self, e: &usize) -> Option<&Vec<Membership>> {
-        self.get(e)
+impl Exported for IdMap<usize, Vec<Membership>> {
+    fn exported(&self, e: &usize) -> Option<&[Membership]> {
+        self.get(e).map(Vec::as_slice)
     }
 }
 /// A planning's own exported memberships over its prepared library's.
 pub(super) struct ExportedOver<'a> {
-    pub own: &'a HashMap<usize, Vec<Membership>>,
-    pub library: &'a HashMap<usize, Vec<Membership>>,
+    pub own: &'a IdMap<usize, Vec<Membership>>,
+    pub library: &'a ListsByRow<Membership>,
 }
 impl Exported for ExportedOver<'_> {
-    fn exported(&self, e: &usize) -> Option<&Vec<Membership>> {
-        self.own.get(e).or_else(|| self.library.get(e))
+    fn exported(&self, e: &usize) -> Option<&[Membership]> {
+        self.own
+            .get(e)
+            .map(Vec::as_slice)
+            .or_else(|| self.library.get(*e))
     }
 }
 
 #[derive(Default)]
 pub(super) struct Reduction {
-    seen: HashSet<usize>,
-    owned_direct: HashSet<usize>,
-    counts: HashMap<usize, usize>,
-    shadow: HashSet<usize>,
+    seen: IdSet<usize>,
+    owned_direct: IdSet<usize>,
+    inherited_features: IdSet<usize>,
+    shadow: IdSet<usize>,
 }
 impl Reduction {
     /// Ordered union of each direct base's complete nonprivate projection.
@@ -96,7 +103,7 @@ impl Reduction {
                 steps,
                 redefinitions
                     .get(feature)
-                    .map_or(0, Vec::len)
+                    .map_or(0, <[usize]>::len)
                     .saturating_add(1),
             )?;
         }
@@ -105,36 +112,38 @@ impl Reduction {
                 .iter()
                 .flat_map(|f| redefinitions.get(f).into_iter().flatten().copied()),
         );
-        reset_scratch_map(&mut self.counts);
+        reset_scratch_set(&mut self.inherited_features);
         charge(steps, inherited.len())?;
         for membership in &inherited {
             if facts.is_feature(membership.member) {
-                *self.counts.entry(membership.member).or_insert(0usize) += 1;
+                self.inherited_features.insert(membership.member);
             }
         }
         reset_scratch_set(&mut self.shadow);
-        // Every membership of one Feature has the same closure and
-        // owned-feature comparison, so traverse that Feature only once.
-        for (&feature, &count) in &self.counts {
+        // Every Membership of one Feature has the same closure and
+        // owned-feature comparison, so traverse that Feature only once. A
+        // Feature's Memberships are removed by another inherited Feature's
+        // redefinition closure reaching it, or by an owned redefinition of
+        // it or of a Feature it redefines; distinct Memberships of one
+        // Feature — its owning Membership and an alias of it — never remove
+        // each other (read literally, `removeRedefinedFeatures` would have
+        // each remove the other, and an alias would hide the Feature it
+        // names from every subtype; the reference implementation keeps both,
+        // as name lookup does).
+        for &feature in &self.inherited_features {
             charge(steps, 1)?;
-            if redefinitions.get(&feature).is_none_or(Vec::is_empty) {
+            if redefinitions.get(&feature).is_none_or(<[usize]>::is_empty) {
                 // The closure is exactly this feature; no traversal or
                 // intermediate collection is necessary.
-                if count > 1 || self.owned_direct.contains(&feature) {
+                if self.owned_direct.contains(&feature) {
                     self.shadow.insert(feature);
                 }
                 continue;
             }
             let closure = traversal.reachable_budget(feature, redefinitions, steps)?;
             charge(steps, closure.len().saturating_mul(2))?;
-            // Reflexive closure suppresses another Membership of this
-            // same Feature, but never suppresses its own Membership.
-            self.shadow.extend(
-                closure
-                    .iter()
-                    .copied()
-                    .filter(|&target| target != feature || count > 1),
-            );
+            self.shadow
+                .extend(closure.iter().copied().filter(|&target| target != feature));
             if closure.iter().any(|t| self.owned_direct.contains(t)) {
                 self.shadow.insert(feature);
             }
@@ -146,8 +155,9 @@ impl Reduction {
                 .saturating_mul(2)
                 .saturating_add(node.owned.len()),
         )?;
-        inherited
-            .retain(|m| !self.counts.contains_key(&m.member) || !self.shadow.contains(&m.member));
+        inherited.retain(|m| {
+            !self.inherited_features.contains(&m.member) || !self.shadow.contains(&m.member)
+        });
         let surviving = inherited;
         let mut features = node.owned.clone();
         features.extend(surviving.iter().filter_map(|membership| {
@@ -197,17 +207,18 @@ impl Reduction {
 // A wide node must not make every later tiny node clear a wide hash table.
 // Retain ordinary capacities, but discard an oversized table after that first
 // wide-to-small transition; its one large clear is charged to the wide node.
-pub(super) fn reset_scratch_set<T>(scratch: &mut HashSet<T>) {
+pub(super) fn reset_scratch_set<T, S: Default>(scratch: &mut HashSet<T, S>) {
     if scratch.capacity() > scratch.len().max(32).saturating_mul(4) {
-        *scratch = HashSet::new();
+        *scratch = HashSet::default();
     } else {
         scratch.clear();
     }
 }
 
-pub(super) fn reset_scratch_map<K, V>(scratch: &mut HashMap<K, V>) {
+#[cfg(test)]
+pub(super) fn reset_scratch_map<K, V, S: Default>(scratch: &mut HashMap<K, V, S>) {
     if scratch.capacity() > scratch.len().max(32).saturating_mul(4) {
-        *scratch = HashMap::new();
+        *scratch = HashMap::default();
     } else {
         scratch.clear();
     }
@@ -217,7 +228,7 @@ pub(super) fn reset_scratch_map<K, V>(scratch: &mut HashMap<K, V>) {
 /// every traversal gets fresh marks; only storage is reused, never reachability.
 pub(super) struct Reachability {
     pub(super) marks: Vec<usize>,
-    sparse: Option<HashSet<usize>>,
+    sparse: Option<IdSet<usize>>,
     pub(super) generation: usize,
     pub(super) todo: Vec<usize>,
     pub(super) reached: Vec<usize>,
@@ -239,7 +250,7 @@ impl Reachability {
     pub(super) fn sparse() -> Self {
         Self {
             marks: Vec::new(),
-            sparse: Some(HashSet::new()),
+            sparse: Some(IdSet::default()),
             generation: 0,
             todo: Vec::new(),
             reached: Vec::new(),
@@ -276,7 +287,7 @@ impl Reachability {
     pub(super) fn reachable(
         &mut self,
         source: usize,
-        graph: &HashMap<usize, Vec<usize>>,
+        graph: &IdMap<usize, Vec<usize>>,
     ) -> &[usize] {
         self.reachable_budget(source, graph, &mut None)
             .expect("unbounded traversal cannot exhaust its budget")
@@ -329,7 +340,7 @@ impl Reachability {
             charge(steps, 1)?;
             if self.visit(e) {
                 self.reached.push(e);
-                charge(steps, graph.get(&e).map_or(0, Vec::len))?;
+                charge(steps, graph.get(&e).map_or(0, <[usize]>::len))?;
                 self.todo
                     .extend(graph.get(&e).into_iter().flatten().copied());
             }
@@ -353,7 +364,7 @@ mod tests {
     use super::*;
     #[test]
     fn sparse_wide_to_small_traversal_work_does_not_retain_wide_clear_cost() {
-        let graph = HashMap::from([(0, (1..10_000).collect()), (10_000, vec![10_001])]);
+        let graph = IdMap::from_iter([(0, (1..10_000).collect()), (10_000, vec![10_001])]);
         let mut dense = Reachability::new(10_002);
         let mut sparse = Reachability::sparse();
         let mut steps = 0;
@@ -391,7 +402,7 @@ mod tests {
     }
     #[test]
     fn existential_reachability_matches_complete_closure_through_graph_growth() {
-        let mut graph: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut graph: IdMap<usize, Vec<usize>> = IdMap::default();
         let mut traversal = Reachability::new(12);
         let mut sparse = Reachability::sparse();
         for round in 0..36 {

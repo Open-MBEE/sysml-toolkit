@@ -21,6 +21,7 @@
 //! `None`, never a guess — callers (the `dimensional-consistency` lint
 //! rule) only speak when both sides are determinate.
 
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use sysmlv2_syntax::Span;
@@ -625,12 +626,12 @@ impl ResolvedModel {
         let unit_type = self.resolve_qualified("MeasurementReferences::MeasurementUnit");
         if let Some(unit_type) = unit_type {
             for e in 0..self.b.elements.len() {
-                if crate::metaclass::conforms(self.b.elements[e].ty, "DataType") {
+                if is_a!(self.b.elements[e], "DataType") {
                     self.quantity_dims_of_type(ElementRef(e));
                     if self.conforms(ElementRef(e), unit_type) {
                         self.unit_def_dims(ElementRef(e));
                     }
-                } else if crate::metaclass::conforms(self.b.elements[e].ty, "Feature")
+                } else if is_a!(self.b.elements[e], "Feature")
                     && self
                         .typings(ElementRef(e))
                         .into_iter()

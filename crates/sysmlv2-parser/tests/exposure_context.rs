@@ -132,10 +132,12 @@ fn contextual_namespace_pruning_stays_at_the_namespace_result_boundary() {
 
 #[test]
 fn aliases_remain_distinct_memberships_during_contextual_reduction() {
+    // D inherits both Memberships of x — the owning one and the alias — and
+    // exposes the one element once.
     check(
         "part def A {part x; alias ax for x;} part def D :> A;",
         "view v {expose D::*;}",
-        &[("v", &[])],
+        &[("v", &["A::x"])],
     );
 }
 

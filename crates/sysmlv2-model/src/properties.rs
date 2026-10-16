@@ -41,7 +41,7 @@ impl<'de> Deserialize<'de> for Key {
         d.deserialize_str(Visitor)
     }
 }
-fn key(name: &str) -> Key {
+pub(crate) fn key(name: &str) -> Key {
     type Keys =
         HashMap<&'static str, Arc<str>, std::hash::BuildHasherDefault<crate::layered::IdHasher>>;
     static KEYS: OnceLock<Keys> = OnceLock::new();
@@ -309,6 +309,28 @@ impl Properties {
             .ok()
             .map(|i| &self.entries[i].1)
     }
+    /// The declared name and the declared short name, found with one
+    /// search: the entries are sorted by key, and the short name's key
+    /// follows the name's with nothing of the schema's between them.
+    pub fn declared_names(&self) -> (Option<&str>, Option<&str>) {
+        let entries = &*self.entries;
+        let (name, mut at) =
+            match entries.binary_search_by(|(key, _)| key.name().cmp("declaredName")) {
+                Ok(i) => (entries[i].1.as_str(), i + 1),
+                Err(i) => (None, i),
+            };
+        let short = loop {
+            match entries.get(at) {
+                Some((key, atom)) => match key.name().cmp("declaredShortName") {
+                    std::cmp::Ordering::Less => at += 1,
+                    std::cmp::Ordering::Equal => break atom.as_str(),
+                    std::cmp::Ordering::Greater => break None,
+                },
+                None => break None,
+            }
+        };
+        (name, short)
+    }
     pub fn insert(&mut self, k: &str, v: impl Into<Atom>) {
         let v = v.into();
         if let Some(bit) = flag(k) {
@@ -394,6 +416,32 @@ impl Properties {
             }
         }
         map
+    }
+}
+
+#[cfg(test)]
+mod declared_names_tests {
+    use super::Properties;
+    use serde_json::Value;
+
+    #[test]
+    fn both_names_one_or_none_with_a_key_between() {
+        let mut p = Properties::new();
+        assert_eq!(p.declared_names(), (None, None));
+        p.insert("declaredShortName", Value::from("s"));
+        assert_eq!(p.declared_names(), (None, Some("s")));
+        p.insert("declaredName", Value::from("n"));
+        assert_eq!(p.declared_names(), (Some("n"), Some("s")));
+        // A key sorting between the two is stepped over.
+        p.insert("declaredNameX", Value::from("x"));
+        p.insert("isAbstract", Value::Bool(true));
+        p.insert("aaa", Value::from("first"));
+        p.insert("zzz", Value::from("last"));
+        assert_eq!(p.declared_names(), (Some("n"), Some("s")));
+        let mut q = Properties::new();
+        q.insert("declaredName", Value::from("n"));
+        q.insert("definition", Value::from("d"));
+        assert_eq!(q.declared_names(), (Some("n"), None));
     }
 }
 

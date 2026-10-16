@@ -1,6 +1,8 @@
 //! Reusable immutable stored-graph topology; never semantic proof results.
 //! Reuse requires identical element rows and authored/implied provenance.
-use super::Builder;
+use super::{Builder, RowsById};
+use crate::layered::{IdMap, IdSet, LayeredVec};
+use crate::metaclass::is_a;
 use crate::{layered::Revision, metaclass::conforms};
 use std::{
     collections::{HashMap, HashSet},
@@ -8,7 +10,7 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum Carrier {
     Missing,
     Unique(usize),
@@ -22,35 +24,73 @@ pub(super) struct StoredStructure {
     revision: Option<Revision>,
     authored_end: usize,
     logical_work: usize,
-    ids: Arc<crate::layered::IdMap<Uuid, usize>>,
-    carriers: Vec<Carrier>,
+    /// The rows by id, shared with the builder's id index.
+    ids: Arc<RowsById>,
+    carriers: LayeredVec<Carrier>,
     multiple_membership_carriers: bool,
-    pub(super) type_featurings: HashMap<usize, Vec<usize>>,
-    pub(super) bad_chains: HashSet<usize>,
-    pub(super) bad_bases: HashSet<usize>,
+    pub(super) type_featurings: IdMap<usize, Vec<usize>>,
+    pub(super) bad_chains: IdSet<usize>,
+    pub(super) bad_bases: IdSet<usize>,
     source_incomplete: bool,
     /// Lazy inverse projection of these same rows; ordinary consumers do not
     /// allocate or scan it. A failed bounded scan is never published.
     typing: OnceLock<Arc<StoredTyping>>,
     // Candidate identities collected during the existing complete row scan.
     // Includes standalone and generated rows, independent of source validity.
-    typing_rows: Vec<usize>,
+    typing_rows: RowList,
     memberships: OnceLock<Arc<MembershipDomains>>,
-    membership_rows: Vec<usize>,
+    membership_rows: RowList,
     imports: OnceLock<Arc<ImportDomains>>,
     pub(super) ids_unique: bool,
     /// Includes standalone/orphan authored Import rows, independent of owner
     /// lists or a stored isImplied flag. Shared absence checks cost O(1).
     pub(super) has_authored_import: bool,
     pub(super) has_recursive_import: bool,
-    import_rows: Vec<usize>,
-    pub(super) metadata_annotation_targets: HashSet<usize>,
-    pub(super) metadata_annotation_sources: HashMap<usize, Vec<usize>>,
+    import_rows: RowList,
+    pub(super) metadata_annotation_targets: IdSet<usize>,
+    pub(super) metadata_annotation_sources: IdMap<usize, Vec<usize>>,
     pub(super) annotations_incomplete: bool,
     /// The kept scan of the frozen rows this structure's scan extended
     /// (`None` when every row was scanned here): the projections read its
     /// projections for those rows and project only the rows after them.
     prefix: Option<Arc<PrefixStructure>>,
+    /// `membership_evidence::member` answers made over these rows while
+    /// they were current, by (owner, membership), with the steps each
+    /// charged: every type that inherits a membership asks for it again.
+    member_answers: std::sync::Mutex<MemberAnswers>,
+}
+
+/// Kept `membership_evidence::member` answers by (owner, membership): the
+/// answer and the steps it charged.
+type MemberAnswers = IdMap<(usize, usize), (Option<usize>, usize)>;
+
+impl StoredStructure {
+    /// A kept `membership_evidence::member` answer and the steps it charged.
+    pub(super) fn member_answer(
+        &self,
+        owner: usize,
+        membership: usize,
+    ) -> Option<(Option<usize>, usize)> {
+        self.member_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(owner, membership))
+            .copied()
+    }
+
+    /// Keep a `membership_evidence::member` answer made over these rows.
+    pub(super) fn keep_member_answer(
+        &self,
+        owner: usize,
+        membership: usize,
+        answer: Option<usize>,
+        charged: usize,
+    ) {
+        self.member_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((owner, membership), (answer, charged));
+    }
 }
 /// Inverse Feature.typing and Feature.subsetting, independent of carrier.
 /// Suffix rows remain subject to the shared semantic carrier certificate.
@@ -67,7 +107,7 @@ pub(super) struct StoredTyping {
 /// projection's.
 #[derive(Default)]
 pub(super) struct TypingSources {
-    own: HashMap<usize, Vec<usize>>,
+    own: IdMap<usize, Vec<usize>>,
     frozen: Option<Arc<StoredTyping>>,
 }
 impl TypingSources {
@@ -91,7 +131,7 @@ impl std::ops::Index<&usize> for TypingSources {
 /// later rows contradict.
 #[derive(Default)]
 pub(super) struct MembershipDomains {
-    bad_owners: HashSet<usize>,
+    bad_owners: IdSet<usize>,
     frozen: Option<Arc<MembershipDomains>>,
     unlocalized: bool,
 }
@@ -114,8 +154,8 @@ impl MembershipDomains {
 /// evidence so a query that does not consume imports need not pay for them.
 #[derive(Default)]
 pub(super) struct ImportDomains {
-    recursive_owners: HashSet<usize>,
-    bad_owners: HashSet<usize>,
+    recursive_owners: IdSet<usize>,
+    bad_owners: IdSet<usize>,
     unlocalized: bool,
 }
 impl ImportDomains {
@@ -141,9 +181,9 @@ fn charge(steps: &mut usize, amount: usize) -> Option<()> {
 fn annotation_ends(
     b: &Builder,
     relationship: usize,
-    carriers: &[Carrier],
-    ids: &crate::layered::IdMap<Uuid, usize>,
-    unsatisfied: &mut HashSet<Uuid>,
+    carriers: &LayeredVec<Carrier>,
+    ids: &RowsById,
+    unsatisfied: &mut IdSet<Uuid>,
     steps: &mut usize,
 ) -> Option<(usize, Option<usize>)> {
     charge(steps, 1)?;
@@ -156,7 +196,7 @@ fn annotation_ends(
         return None;
     }
     charge(steps, relation.children.len())?;
-    let mut children = HashSet::new();
+    let mut children = IdSet::default();
     let mut owned_annotating = None;
     for &child in &relation.children {
         let element = b.elements.get(child)?;
@@ -169,11 +209,11 @@ fn annotation_ends(
         {
             return None;
         }
-        if conforms(element.ty, "AnnotatingElement") && owned_annotating.replace(child).is_some() {
+        if is_a!(element, "AnnotatingElement") && owned_annotating.replace(child).is_some() {
             return None;
         }
     }
-    let owning_annotating = conforms(owner_elem.ty, "AnnotatingElement").then_some(owner);
+    let owning_annotating = is_a!(owner_elem, "AnnotatingElement").then_some(owner);
     // Exactly one owned or owning annotating element, per XMI7633.
     let source = match (owned_annotating, owning_annotating) {
         (Some(source), None) | (None, Some(source)) => source,
@@ -225,7 +265,7 @@ fn annotation_ends(
     // Keep this early nonmetadata certificate bounded to the two normal
     // ownership shapes. Additional owned endpoints still take the complete
     // validation path below.
-    if !conforms(b.elements[source].ty, "MetadataFeature")
+    if !is_a!(b.elements[source], "MetadataFeature")
         && (relation.children.is_empty()
             || (relation.children.len() == 1 && owned_annotating == Some(relation.children[0])))
     {
@@ -285,33 +325,43 @@ fn annotation_ends(
 /// contradictions, and the annotations. The scan of a table's frozen rows
 /// is kept and reused ([`PrefixStructure`]); the rows after them are
 /// scanned again for every structure.
+///
+/// The tables as long as the rows — the carriers, the ids and the row
+/// lists — are layered: a scan extending the kept scan of the frozen rows
+/// shares that scan's tables, frozen, and holds only its own rows' entries
+/// over them (a write to a frozen row's carrier is kept beside them), so
+/// every build on the same frozen rows holds one copy of theirs between
+/// them. The other tables hold only the rows' exceptions and are copied.
 #[derive(Clone, Default)]
 pub(super) struct Scanned {
-    carriers: Vec<Carrier>,
-    ids: crate::layered::IdMap<Uuid, usize>,
+    carriers: LayeredVec<Carrier>,
+    /// The rows by id (a later row wins a shared id). A scan read back from
+    /// a snapshot shares the frozen rows' lookup graph's table, which
+    /// tables the same rows the same way.
+    ids: RowsById,
     logical_work: usize,
     source_incomplete: bool,
     ids_unique: bool,
-    import_rows: Vec<usize>,
+    import_rows: RowList,
     has_authored_import: bool,
     has_recursive_import: bool,
-    type_featurings: HashMap<usize, Vec<usize>>,
-    bad_chains: HashSet<usize>,
-    bad_bases: HashSet<usize>,
-    metadata_annotation_targets: HashSet<usize>,
-    metadata_annotation_sources: HashMap<usize, Vec<usize>>,
+    type_featurings: IdMap<usize, Vec<usize>>,
+    bad_chains: IdSet<usize>,
+    bad_bases: IdSet<usize>,
+    metadata_annotation_targets: IdSet<usize>,
+    metadata_annotation_sources: IdMap<usize, Vec<usize>>,
     annotation_pairs: HashSet<(usize, usize)>,
     annotations_incomplete: bool,
     /// Whether a membership row was claimed by more than one owner.
     multiple_membership_carriers: bool,
     /// The authored membership rows, and the typing and subsetting rows,
     /// in row order: the candidates the domain projections read.
-    membership_rows: Vec<usize>,
-    typing_rows: Vec<usize>,
+    membership_rows: RowList,
+    typing_rows: RowList,
     /// The ids the rows' references named that no row scanned carried: a
     /// later row carrying one would be read as their target by a whole
     /// scan, so a scan of later rows reports such a row (see [`scan`]).
-    unsatisfied: HashSet<Uuid>,
+    unsatisfied: IdSet<Uuid>,
     /// The budget the scan charged; a reuse charges it again, so the budget
     /// reads as if the rows had been scanned.
     steps: usize,
@@ -319,9 +369,83 @@ pub(super) struct Scanned {
 impl Scanned {
     fn new(rows: usize) -> Self {
         Self {
-            carriers: vec![Carrier::Missing; rows],
+            carriers: vec![Carrier::Missing; rows].into(),
             ids_unique: true,
             ..Self::default()
+        }
+    }
+
+    /// Share the layered tables: a clone of this scan then shares them
+    /// instead of copying them, and holds only what it adds.
+    fn freeze(&mut self) {
+        self.carriers.freeze();
+        self.ids.freeze();
+        self.import_rows.freeze();
+        self.membership_rows.freeze();
+        self.typing_rows.freeze();
+    }
+}
+
+/// Rows in row order: the frozen list, shared by every scan extending the
+/// one that made it, then the rows a scan added, all of them later rows.
+#[derive(Clone, Default)]
+struct RowList {
+    frozen: Arc<Vec<usize>>,
+    own: Vec<usize>,
+}
+
+/// Rows of a [`RowList`] in row order, as the two runs they are kept in.
+#[derive(Clone, Copy)]
+struct Rows<'a>(&'a [usize], &'a [usize]);
+
+impl<'a> Rows<'a> {
+    fn len(self) -> usize {
+        self.0.len() + self.1.len()
+    }
+    fn iter(self) -> impl Iterator<Item = usize> + 'a {
+        self.0.iter().chain(self.1).copied()
+    }
+}
+
+impl RowList {
+    fn push(&mut self, row: usize) {
+        self.own.push(row);
+    }
+    fn len(&self) -> usize {
+        self.frozen.len() + self.own.len()
+    }
+    fn last(&self) -> Option<usize> {
+        self.own.last().or_else(|| self.frozen.last()).copied()
+    }
+    /// Every row.
+    fn all(&self) -> Rows<'_> {
+        Rows(&self.frozen, &self.own)
+    }
+    /// The rows from `floor` up to `end`, `end` excluded.
+    fn between(&self, floor: usize, end: usize) -> Rows<'_> {
+        let part = |rows: &[usize]| {
+            rows.partition_point(|&r| r < floor)..rows.partition_point(|&r| r < end)
+        };
+        Rows(&self.frozen[part(&self.frozen)], &self.own[part(&self.own)])
+    }
+    /// Share the rows: a clone then shares them instead of copying them.
+    fn freeze(&mut self) {
+        if self.own.is_empty() {
+            return;
+        }
+        if self.frozen.is_empty() {
+            self.frozen = Arc::new(std::mem::take(&mut self.own));
+        } else {
+            Arc::make_mut(&mut self.frozen).append(&mut self.own);
+        }
+    }
+}
+
+impl From<Vec<usize>> for RowList {
+    fn from(own: Vec<usize>) -> Self {
+        Self {
+            frozen: Arc::default(),
+            own,
         }
     }
 }
@@ -340,12 +464,310 @@ impl Scanned {
 /// spelling — so the whole scan is the guard, not the path.
 pub(crate) struct PrefixStructure {
     base: Arc<Vec<super::Elem>>,
+    /// How many of the base's rows the scan covers: all of them, unless the
+    /// table read its frozen base cut short (`LayeredVec::limit_base`).
+    rows: usize,
     scanned: Scanned,
     /// The frozen rows' typing and membership projections, made by the first
     /// structure that reads one and shared by every structure extending this
     /// scan (`None` past the budget, or where the frozen ids are not unique).
     typing: OnceLock<Option<FrozenTyping>>,
     memberships: OnceLock<Option<FrozenMemberships>>,
+}
+
+/// A prefix scan as a snapshot carries it, with the two projections the
+/// writer had made (see [`PrefixStructure::to_wire`]): a process reading
+/// the snapshot takes them back instead of scanning the library's rows
+/// again. The id map is not carried — identities do not compress, and the
+/// rows carry them already — but made from the rows when the scan is read.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PrefixWire {
+    scanned: ScannedWire,
+    typing: Option<TypingWire>,
+    memberships: Option<MembershipsWire>,
+}
+
+/// A typing projection as the snapshot carries it: the sources by feature,
+/// whether a source is incomplete, and the steps the projection charged.
+type TypingWire = (crate::bulk::IndexLists, bool, usize);
+
+/// A membership projection as the snapshot carries it: the bad owners,
+/// whether a claim is unlocalized, and the steps the projection charged.
+type MembershipsWire = (crate::bulk::Ints, bool, usize);
+
+/// A scan's tables as the snapshot carries them: every set and map as a
+/// vector sorted by key, so the same scan is written the same way every
+/// time; the id map is left out (see [`PrefixWire`]).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ScannedWire {
+    /// The carrier per row: the owner's index, the row count for a missing
+    /// one, the row count plus one for an invalid one.
+    carriers: crate::bulk::Ints,
+    logical_work: usize,
+    source_incomplete: bool,
+    ids_unique: bool,
+    import_rows: crate::bulk::Ints,
+    has_authored_import: bool,
+    has_recursive_import: bool,
+    type_featurings: crate::bulk::IndexLists,
+    bad_chains: crate::bulk::Ints,
+    bad_bases: crate::bulk::Ints,
+    metadata_annotation_targets: crate::bulk::Ints,
+    metadata_annotation_sources: crate::bulk::IndexLists,
+    annotation_pairs: crate::bulk::Pairs,
+    annotations_incomplete: bool,
+    multiple_membership_carriers: bool,
+    membership_rows: crate::bulk::Ints,
+    typing_rows: crate::bulk::Ints,
+    unsatisfied: crate::bulk::Ids,
+    steps: usize,
+}
+
+fn sorted_keys<K: Ord + Copy, V: Clone, S>(map: &HashMap<K, V, S>) -> Vec<(K, V)> {
+    let mut entries: Vec<(K, V)> = map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    entries.sort_by_key(|(k, _)| *k);
+    entries
+}
+
+fn sorted_set<T: Ord + Copy, S>(set: &HashSet<T, S>) -> Vec<T> {
+    let mut entries: Vec<T> = set.iter().copied().collect();
+    entries.sort_unstable();
+    entries
+}
+
+impl Scanned {
+    /// This scan's tables as the snapshot carries them.
+    fn to_wire(&self) -> ScannedWire {
+        use crate::bulk::{Ids, Ints};
+        let rows = self.carriers.len();
+        ScannedWire {
+            carriers: Ints(
+                self.carriers
+                    .iter()
+                    .map(|c| match c {
+                        Carrier::Unique(owner) => *owner,
+                        Carrier::Missing => rows,
+                        Carrier::Invalid => rows + 1,
+                    })
+                    .collect(),
+            ),
+            logical_work: self.logical_work,
+            source_incomplete: self.source_incomplete,
+            ids_unique: self.ids_unique,
+            import_rows: Ints(self.import_rows.all().iter().collect()),
+            has_authored_import: self.has_authored_import,
+            has_recursive_import: self.has_recursive_import,
+            type_featurings: sorted_keys(&self.type_featurings).into(),
+            bad_chains: Ints(sorted_set(&self.bad_chains)),
+            bad_bases: Ints(sorted_set(&self.bad_bases)),
+            metadata_annotation_targets: Ints(sorted_set(&self.metadata_annotation_targets)),
+            metadata_annotation_sources: sorted_keys(&self.metadata_annotation_sources).into(),
+            annotation_pairs: sorted_set(&self.annotation_pairs).into(),
+            annotations_incomplete: self.annotations_incomplete,
+            multiple_membership_carriers: self.multiple_membership_carriers,
+            membership_rows: Ints(self.membership_rows.all().iter().collect()),
+            typing_rows: Ints(self.typing_rows.all().iter().collect()),
+            unsatisfied: Ids(sorted_set(&self.unsatisfied)),
+            steps: self.steps,
+        }
+    }
+
+    /// A scan's tables read back for `rows` rows, the id map still to be
+    /// made; `None` when an index names a row there is not.
+    fn from_wire(wire: ScannedWire, rows: usize) -> Option<Self> {
+        let fits = |i: usize| i < rows;
+        let all_fit = |rows: &[usize]| rows.iter().all(|&r| fits(r));
+        let map_fits =
+            |entries: &[(usize, Vec<usize>)]| entries.iter().all(|(k, v)| fits(*k) && all_fit(v));
+        let carriers: Vec<Carrier> = wire
+            .carriers
+            .0
+            .iter()
+            .map(|&c| {
+                if c < rows {
+                    Some(Carrier::Unique(c))
+                } else if c == rows {
+                    Some(Carrier::Missing)
+                } else if c == rows + 1 {
+                    Some(Carrier::Invalid)
+                } else {
+                    None
+                }
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let type_featurings = wire.type_featurings.into_lists()?;
+        let metadata_annotation_sources = wire.metadata_annotation_sources.into_lists()?;
+        let annotation_pairs = wire.annotation_pairs.into_pairs()?;
+        if carriers.len() != rows
+            || !all_fit(&wire.import_rows.0)
+            || !all_fit(&wire.membership_rows.0)
+            || !all_fit(&wire.typing_rows.0)
+            || !map_fits(&type_featurings)
+            || !all_fit(&wire.bad_chains.0)
+            || !all_fit(&wire.bad_bases.0)
+            || !all_fit(&wire.metadata_annotation_targets.0)
+            || !map_fits(&metadata_annotation_sources)
+            || !annotation_pairs.iter().all(|&(a, b)| fits(a) && fits(b))
+        {
+            return None;
+        }
+        Some(Self {
+            carriers: carriers.into(),
+            ids: Default::default(),
+            logical_work: wire.logical_work,
+            source_incomplete: wire.source_incomplete,
+            ids_unique: wire.ids_unique,
+            import_rows: wire.import_rows.0.into(),
+            has_authored_import: wire.has_authored_import,
+            has_recursive_import: wire.has_recursive_import,
+            type_featurings: type_featurings.into_iter().collect(),
+            bad_chains: wire.bad_chains.0.into_iter().collect(),
+            bad_bases: wire.bad_bases.0.into_iter().collect(),
+            metadata_annotation_targets: wire.metadata_annotation_targets.0.into_iter().collect(),
+            metadata_annotation_sources: metadata_annotation_sources.into_iter().collect(),
+            annotation_pairs: annotation_pairs.into_iter().collect(),
+            annotations_incomplete: wire.annotations_incomplete,
+            multiple_membership_carriers: wire.multiple_membership_carriers,
+            membership_rows: wire.membership_rows.0.into(),
+            typing_rows: wire.typing_rows.0.into(),
+            unsatisfied: wire.unsatisfied.0.into_iter().collect(),
+            steps: wire.steps,
+        })
+    }
+}
+
+impl PrefixStructure {
+    /// This scan as a snapshot carries it, with the projections made so far
+    /// (`freeze_library` makes both before a snapshot is written).
+    pub(crate) fn to_wire(&self) -> PrefixWire {
+        let typing = self.typing.get().and_then(Option::as_ref).map(|frozen| {
+            let mut own: Vec<(usize, Vec<usize>)> = frozen
+                .typing
+                .relationships
+                .own
+                .iter()
+                .map(|(&feature, sources)| (feature, sources.clone()))
+                .collect();
+            own.sort_unstable();
+            (own.into(), frozen.typing.sources_incomplete, frozen.steps)
+        });
+        let memberships = self
+            .memberships
+            .get()
+            .and_then(Option::as_ref)
+            .map(|frozen| {
+                let mut bad: Vec<usize> = frozen.domains.bad_owners.iter().copied().collect();
+                bad.sort_unstable();
+                (
+                    crate::bulk::Ints(bad),
+                    frozen.domains.unlocalized,
+                    frozen.steps,
+                )
+            });
+        PrefixWire {
+            scanned: self.scanned.to_wire(),
+            typing,
+            memberships,
+        }
+    }
+
+    /// A scan read back from its wire form for the frozen rows `base`;
+    /// `None` when the wire does not fit them (a row count or index the
+    /// rows do not have, or an id-uniqueness claim the rows' ids do not
+    /// bear out), in which case the caller scans.
+    pub(crate) fn from_wire(
+        wire: PrefixWire,
+        base: Arc<Vec<super::Elem>>,
+        ids: Option<Arc<crate::layered::IdMap<Uuid, usize>>>,
+    ) -> Option<Self> {
+        let rows = base.len();
+        if rows == 0 {
+            // as `prefix_of`, which scans nothing for no rows
+            return None;
+        }
+        let fits = |i: usize| i < rows;
+        let mut scanned = Scanned::from_wire(wire.scanned, rows)?;
+        // The id map the scan made, from the rows it scanned: a later row's
+        // id wins as it did (the scan keeps the last), and the map is as
+        // long as the rows exactly when the ids are unique. The frozen
+        // rows' lookup graph tables the rows the same way; its table is
+        // shared when it was given.
+        let ids = ids.unwrap_or_else(|| {
+            let mut ids: crate::layered::IdMap<Uuid, usize> =
+                crate::layered::IdMap::with_capacity_and_hasher(rows, Default::default());
+            for (i, row) in base.iter().enumerate() {
+                ids.insert(row.id, i);
+            }
+            Arc::new(ids)
+        });
+        if scanned.ids_unique != (ids.len() == rows) {
+            return None;
+        }
+        scanned.ids = RowsById::over(ids);
+        scanned.freeze();
+        // Both projections as the writer had them — made or not — so that
+        // a handle reading this scan never makes one itself, and writes the
+        // scan as it read it.
+        let typing = OnceLock::new();
+        let carried_typing = match wire.typing {
+            Some((own, sources_incomplete, steps)) => {
+                let own = own.into_lists()?;
+                if !own
+                    .iter()
+                    .all(|(f, s)| fits(*f) && s.iter().all(|&r| fits(r)))
+                {
+                    return None;
+                }
+                Some(FrozenTyping {
+                    typing: Arc::new(StoredTyping {
+                        relationships: TypingSources {
+                            own: own.into_iter().collect(),
+                            frozen: None,
+                        },
+                        sources_incomplete,
+                    }),
+                    steps,
+                })
+            }
+            None => None,
+        };
+        let _ = typing.set(carried_typing);
+        let memberships = OnceLock::new();
+        let carried_memberships = match wire.memberships {
+            Some((bad, unlocalized, steps)) => {
+                let bad = bad.0;
+                if !bad.iter().all(|&r| fits(r)) || !scanned.ids_unique {
+                    return None;
+                }
+                Some(FrozenMemberships {
+                    domains: Arc::new(MembershipDomains {
+                        bad_owners: bad.into_iter().collect(),
+                        frozen: None,
+                        unlocalized,
+                    }),
+                    steps,
+                    // counted over the rows here rather than carried
+                    owner_relationships: base.iter().map(|row| row.owned_relationships.len()).sum(),
+                })
+            }
+            None => None,
+        };
+        let _ = memberships.set(carried_memberships);
+        Some(Self {
+            base,
+            rows,
+            scanned,
+            typing,
+            memberships,
+        })
+    }
+
+    /// Make both projections now, so that a snapshot written afterwards
+    /// carries them.
+    pub(crate) fn make_projections(&self, b: &Builder) {
+        let _ = self.typing(b);
+        let _ = self.memberships(b);
+    }
 }
 /// A projection of the frozen rows, with the budget it charged: a structure
 /// reading it charges that again, so its budget reads as a whole projection's.
@@ -370,8 +792,10 @@ impl PrefixStructure {
         // no rows precede these, so none is claimed
         scan(b, &mut scanned, 0, rows, rows, steps)?;
         scanned.steps = steps.saturating_sub(before);
+        scanned.freeze();
         Some(Self {
             base: Arc::clone(b.elements.base_arc()),
+            rows,
             scanned,
             typing: OnceLock::new(),
             memberships: OnceLock::new(),
@@ -380,7 +804,7 @@ impl PrefixStructure {
 
     /// The number of frozen rows.
     fn rows(&self) -> usize {
-        self.base.len()
+        self.rows
     }
 
     /// The frozen rows' typing projection; `b` shares them.
@@ -393,7 +817,7 @@ impl PrefixStructure {
                     b,
                     &scanned.carriers,
                     &scanned.ids,
-                    &scanned.typing_rows,
+                    scanned.typing_rows.all(),
                     0,
                     &mut steps,
                 )??;
@@ -421,7 +845,7 @@ impl PrefixStructure {
                     b,
                     &scanned.carriers,
                     &scanned.ids,
-                    &scanned.membership_rows,
+                    scanned.membership_rows.all(),
                     0..self.rows(),
                     scanned.multiple_membership_carriers,
                     &mut steps,
@@ -462,18 +886,24 @@ fn note_prefix_reuse() {}
 /// relationship's claims are gathered by the projection of the earlier rows.
 fn project_memberships(
     b: &Builder,
-    carriers: &[Carrier],
-    ids: &crate::layered::IdMap<Uuid, usize>,
-    membership_rows: &[usize],
+    carriers: &LayeredVec<Carrier>,
+    ids: &RowsById,
+    membership_rows: Rows<'_>,
     rows: std::ops::Range<usize>,
     multiple_membership_carriers: bool,
     steps: &mut usize,
 ) -> Option<Option<MembershipDomains>> {
     charge(steps, membership_rows.len())?;
     let mut domains = MembershipDomains::default();
-    let mut claims: HashMap<usize, HashSet<usize>> = HashMap::new();
-    let mut bad_relations = HashSet::new();
-    for &relationship in membership_rows {
+    // The owners each membership claims: the first pass appends every
+    // row's into one arena (a row claims one or two, so a set per row
+    // costs more than the projection), the later passes a few more
+    // pairs; only the owners of the bad relationships are read at the end.
+    let mut claim_owners: Vec<usize> = Vec::with_capacity(membership_rows.len() * 2);
+    let mut claims: crate::layered::IdMap<usize, (usize, usize)> = Default::default();
+    let mut later_claims: Vec<(usize, usize)> = Vec::new();
+    let mut bad_relations: crate::layered::IdSet<usize> = Default::default();
+    for relationship in membership_rows.iter() {
         let row = &b.elements[relationship];
         let actual = match carriers[relationship] {
             Carrier::Unique(owner) => Some(owner),
@@ -483,16 +913,18 @@ fn project_memberships(
                 None
             }
         };
-        let mut owners = HashSet::new();
+        let start = claim_owners.len();
         if let Some(owner) = actual {
-            owners.insert(owner);
+            claim_owners.push(owner);
         }
         let mut claim = |value: &crate::properties::Atom| match value
             .as_reference()
             .and_then(|id| ids.get(&id).copied())
         {
             Some(owner) => {
-                owners.insert(owner);
+                if !claim_owners[start..].contains(&owner) {
+                    claim_owners.push(owner);
+                }
                 if actual != Some(owner) {
                     bad_relations.insert(relationship);
                 }
@@ -512,10 +944,10 @@ fn project_memberships(
             "owningType",
             "featureWithValue",
         ] {
-            if key == "featureWithValue" && !conforms(row.ty, "FeatureValue") {
+            if key == "featureWithValue" && !is_a!(row, "FeatureValue") {
                 continue;
             }
-            if key == "owningType" && !conforms(row.ty, "FeatureMembership") {
+            if key == "owningType" && !is_a!(row, "FeatureMembership") {
                 continue;
             }
             charge(steps, 1)?;
@@ -546,7 +978,7 @@ fn project_memberships(
             domains.unlocalized = true;
             bad_relations.insert(relationship);
         }
-        claims.insert(relationship, owners);
+        claims.insert(relationship, (start, claim_owners.len()));
     }
     // Invalid raw carrier cardinality still identifies every actual owner;
     // localize those contradictions instead of poisoning unrelated domains.
@@ -559,9 +991,9 @@ fn project_memberships(
                 if carriers.get(relationship) == Some(&Carrier::Invalid)
                     && b.elements
                         .get(relationship)
-                        .is_some_and(|r| conforms(r.ty, "Membership"))
+                        .is_some_and(|r| is_a!(r, "Membership"))
                 {
-                    claims.entry(relationship).or_default().insert(owner);
+                    later_claims.push((relationship, owner));
                 }
             }
         }
@@ -569,18 +1001,21 @@ fn project_memberships(
     // The child side is independent evidence: an omitted extra child can
     // claim a perfectly listed singleton Membership and defeat uniqueness.
     charge(steps, rows.len())?;
+    // The memberships a row claims to be owned through: one or two per
+    // row, kept in one vector reused across rows.
+    let mut relationships: Vec<usize> = Vec::new();
     for child in rows.clone() {
         let row = &b.elements[child];
-        let mut relationships = HashSet::new();
+        relationships.clear();
         if let Some(relationship) = row.owning_relationship {
             if b.elements.get(relationship).is_none() {
                 domains.unlocalized = true;
             }
             if b.elements
                 .get(relationship)
-                .is_some_and(|r| conforms(r.ty, "Membership"))
+                .is_some_and(|r| is_a!(r, "Membership"))
             {
-                relationships.insert(relationship);
+                relationships.push(relationship);
             }
         }
         for key in [
@@ -590,7 +1025,7 @@ fn project_memberships(
             "owningParameterMembership",
         ] {
             if matches!(key, "owningFeatureMembership" | "owningParameterMembership")
-                && !conforms(row.ty, "Feature")
+                && !is_a!(row, "Feature")
             {
                 continue;
             }
@@ -600,21 +1035,23 @@ fn project_memberships(
                     continue;
                 }
                 match value.as_reference().and_then(|id| ids.get(&id).copied()) {
-                    Some(relationship) if conforms(b.elements[relationship].ty, "Membership") => {
-                        relationships.insert(relationship);
+                    Some(relationship) if is_a!(b.elements[relationship], "Membership") => {
+                        if !relationships.contains(&relationship) {
+                            relationships.push(relationship);
+                        }
                     }
                     Some(_) if key == "owningRelationship" => {}
                     _ => domains.unlocalized = true,
                 }
             }
         }
-        if conforms(row.ty, "Feature") {
+        if is_a!(row, "Feature") {
             if let Some(value) = row.props.get("owningType") {
                 charge(steps, 1)?;
                 let claimed = value.as_reference().and_then(|id| ids.get(&id).copied());
                 let actual = row.owning_relationship.and_then(|relationship| {
                     let membership = b.elements.get(relationship)?;
-                    if !conforms(membership.ty, "FeatureMembership") {
+                    if !is_a!(membership, "FeatureMembership") {
                         return None;
                     }
                     match carriers.get(relationship)? {
@@ -641,16 +1078,16 @@ fn project_memberships(
         {
             return Some(None);
         }
-        for relationship in relationships {
+        for &relationship in &relationships {
             charge(steps, 1)?;
             let membership = &b.elements[relationship];
-            if !conforms(membership.ty, "OwningMembership")
+            if !is_a!(membership, "OwningMembership")
                 || membership.children.as_ref() != [child]
                 || row.owning_relationship != Some(relationship)
             {
                 bad_relations.insert(relationship);
             }
-            if conforms(membership.ty, "FeatureMembership") {
+            if is_a!(membership, "FeatureMembership") {
                 if let Some(value) = row.props.get("owningType") {
                     charge(steps, 1)?;
                     let owner = value.as_reference().and_then(|id| ids.get(&id).copied());
@@ -661,7 +1098,7 @@ fn project_memberships(
                     if owner != actual {
                         bad_relations.insert(relationship);
                         if let Some(owner) = owner {
-                            claims.entry(relationship).or_default().insert(owner);
+                            later_claims.push((relationship, owner));
                         } else if !value.is_null() {
                             domains.unlocalized = true;
                         }
@@ -670,21 +1107,42 @@ fn project_memberships(
             }
         }
     }
-    charge(steps, bad_relations.len())?;
+    // The later claims sorted by relationship, so each bad relationship's
+    // run is read in place: the charge covers the sort and the reads.
+    charge(
+        steps,
+        bad_relations
+            .len()
+            .saturating_add(later_claims.len().saturating_mul(2)),
+    )?;
+    later_claims.sort_unstable();
     for relationship in bad_relations {
-        if let Some(owners) = claims.get(&relationship) {
-            charge(steps, owners.len())?;
-            domains.bad_owners.extend(owners.iter().copied());
-        } else {
+        // A relationship with no claims at all (never a membership row and
+        // never claimed later) is unlocalized; one with an empty claim set
+        // is not — as the per-row sets had it.
+        let first = claims
+            .get(&relationship)
+            .map(|&(start, end)| &claim_owners[start..end]);
+        let from = later_claims.partition_point(|&(r, _)| r < relationship);
+        let to = later_claims.partition_point(|&(r, _)| r <= relationship);
+        let later = &later_claims[from..to];
+        if first.is_none() && later.is_empty() {
             domains.unlocalized = true;
+            continue;
         }
+        domains
+            .bad_owners
+            .extend(first.into_iter().flatten().copied());
+        domains
+            .bad_owners
+            .extend(later.iter().map(|&(_, owner)| owner));
     }
     Some(Some(domains))
 }
 
 /// Typing and subsetting relationships by source feature, and whether some
 /// relationship's source is missing or contradictory.
-type TypingProjection = (HashMap<usize, Vec<usize>>, bool);
+type TypingProjection = (IdMap<usize, Vec<usize>>, bool);
 
 /// The typing and subsetting rows `rows` by source feature, and whether some
 /// row's source is missing or contradictory. Feature.type reads inverse
@@ -694,16 +1152,16 @@ type TypingProjection = (HashMap<usize, Vec<usize>>, bool);
 /// `floor` as its source: that feature's entry is the earlier rows'.
 fn project_typing(
     b: &Builder,
-    carriers: &[Carrier],
-    ids: &crate::layered::IdMap<Uuid, usize>,
-    rows: &[usize],
+    carriers: &LayeredVec<Carrier>,
+    ids: &RowsById,
+    rows: Rows<'_>,
     floor: usize,
     steps: &mut usize,
 ) -> Option<Option<TypingProjection>> {
     charge(steps, rows.len())?;
-    let mut typing_relationships: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut typing_relationships: IdMap<usize, Vec<usize>> = IdMap::default();
     let mut typing_sources_incomplete = false;
-    for &relationship in rows {
+    for relationship in rows.iter() {
         let element = &b.elements[relationship];
         let mut source_id = None;
         let mut invalid = false;
@@ -727,7 +1185,7 @@ fn project_typing(
                 return None;
             }
             match carriers[relationship] {
-                Carrier::Unique(owner) if conforms(b.elements[owner].ty, "Feature") => Some(owner),
+                Carrier::Unique(owner) if is_a!(b.elements[owner], "Feature") => Some(owner),
                 _ => None,
             }
         });
@@ -760,7 +1218,7 @@ fn project_typing(
         {
             invalid = true;
         }
-        if invalid || source.is_none_or(|source| !conforms(b.elements[source].ty, "Feature")) {
+        if invalid || source.is_none_or(|source| !is_a!(b.elements[source], "Feature")) {
             // Missing/contradictory sources cannot be attributed to an
             // arbitrary local feature, so completeness is globally unknown.
             typing_sources_incomplete = true;
@@ -801,16 +1259,21 @@ fn scan(
     let mut annotation_rows = Vec::new();
     for owner in start..end {
         let element = &b.elements[owner];
-        if owner < authored_end && conforms(element.ty, "Membership") {
+        if b.is_authored(owner) && is_a!(element, "Membership") {
             scanned.membership_rows.push(owner);
         }
-        if conforms(element.ty, "Annotation") {
+        if is_a!(element, "Annotation") {
             annotation_rows.push(owner);
         }
-        if conforms(element.ty, "FeatureTyping") || conforms(element.ty, "Subsetting") {
+        // A prepared library's own materialized rows are not projected: the
+        // planners read source rows only, and a build's reads reach those
+        // rows through the ownership view.
+        if (b.is_authored(owner) || owner >= authored_end)
+            && (is_a!(element, "FeatureTyping") || is_a!(element, "Subsetting"))
+        {
             scanned.typing_rows.push(owner);
         }
-        if conforms(element.ty, "Import") {
+        if is_a!(element, "Import") {
             scanned.import_rows.push(owner);
             scanned.has_recursive_import |= element
                 .props
@@ -818,7 +1281,7 @@ fn scan(
                 .is_some_and(|v| v.as_bool() != Some(false));
         }
         own &= !scanned.unsatisfied.contains(&element.id);
-        if let Some(previous) = scanned.ids.insert(element.id, owner) {
+        if let Some(previous) = scanned.ids.replace(element.id, owner) {
             scanned.ids_unique = false;
             own &= previous >= start;
         }
@@ -828,8 +1291,11 @@ fn scan(
             .saturating_add(element.owned_relationships.len());
         for &rel in &element.owned_relationships {
             own &= rel >= start;
-            let entry = scanned.carriers.get_mut(rel)?;
-            if *entry != Carrier::Missing && conforms(b.elements[rel].ty, "Membership") {
+            if rel >= scanned.carriers.len() {
+                return None;
+            }
+            let entry = &mut scanned.carriers[rel];
+            if *entry != Carrier::Missing && is_a!(b.elements[rel], "Membership") {
                 scanned.multiple_membership_carriers = true;
             }
             *entry = match entry {
@@ -842,24 +1308,29 @@ fn scan(
     // not the authored ownership rows indexed here. Their bases are already
     // supplied by the retained shared implied plan. A stored isImplied flag
     // alone does not establish this provenance and must not bypass checks.
+    // A prepared library's own materialized rows (`Builder::lib_implied_from`)
+    // are passed over the same way.
     for rel in start..end.min(authored_end) {
+        if !b.is_authored(rel) {
+            continue;
+        }
         let carrier = scanned.carriers[rel];
         let element = &b.elements[rel];
-        if conforms(element.ty, "Import") {
+        if is_a!(element, "Import") {
             scanned.has_authored_import = true;
         }
         let owner = match carrier {
             Carrier::Unique(owner) => Some(owner),
             _ => None,
         };
-        let owned_feature = owner.filter(|&e| conforms(b.elements[e].ty, "Feature"));
-        let key = if conforms(element.ty, "TypeFeaturing") {
+        let owned_feature = owner.filter(|&e| is_a!(b.elements[e], "Feature"));
+        let key = if is_a!(element, "TypeFeaturing") {
             "featureOfType"
-        } else if conforms(element.ty, "FeatureChaining") {
+        } else if is_a!(element, "FeatureChaining") {
             "featureChained"
-        } else if conforms(element.ty, "Conjugation") {
+        } else if is_a!(element, "Conjugation") {
             "conjugatedType"
-        } else if conforms(element.ty, "Specialization") {
+        } else if is_a!(element, "Specialization") {
             [
                 "specific",
                 "subclassifier",
@@ -900,7 +1371,7 @@ fn scan(
         };
         if conforms(ty, "TypeFeaturing") {
             if let Some(source) = source {
-                if !conforms(b.elements[source].ty, "Feature") {
+                if !is_a!(b.elements[source], "Feature") {
                     scanned.source_incomplete = true;
                 }
                 scanned.type_featurings.entry(source).or_default().push(rel);
@@ -938,7 +1409,7 @@ fn scan(
             .saturating_add(steps.saturating_sub(before));
         charge(steps, 0)?;
         match ends {
-            Some((source, Some(target))) if conforms(b.elements[source].ty, "MetadataFeature") => {
+            Some((source, Some(target))) if is_a!(b.elements[source], "MetadataFeature") => {
                 scanned.metadata_annotation_targets.insert(target);
                 if scanned.annotation_pairs.insert((source, target)) {
                     scanned
@@ -961,7 +1432,7 @@ impl StoredStructure {
             || self
                 .import_rows
                 .last()
-                .is_some_and(|&row| row >= self.authored_end)
+                .is_some_and(|row| row >= self.authored_end)
     }
     /// Import absence requires inverse owner claims as well as the owner's
     /// forward list. This is raw topology only, not an import contribution plan.
@@ -978,12 +1449,12 @@ impl StoredStructure {
             return Some(Arc::clone(domains));
         }
         let mut domains = ImportDomains::default();
-        let mut claims: HashMap<usize, HashSet<usize>> = HashMap::new();
-        let mut bad_relations = HashSet::new();
+        let mut claims: IdMap<usize, IdSet<usize>> = IdMap::default();
+        let mut bad_relations = IdSet::default();
         let mut multiple_carriers = false;
         if self.has_import_rows() {
             charge(steps, self.import_rows.len())?;
-            for &relationship in &self.import_rows {
+            for relationship in self.import_rows.all().iter() {
                 let row = &b.elements[relationship];
                 let actual = match self.carriers[relationship] {
                     Carrier::Unique(owner) => Some(owner),
@@ -1000,7 +1471,7 @@ impl StoredStructure {
                 // No current publisher certifies generated Import semantics.
                 // A mutated suffix row may not disappear from absence proofs.
                 if relationship >= self.authored_end
-                    || actual.is_some_and(|owner| !conforms(b.elements[owner].ty, "Namespace"))
+                    || actual.is_some_and(|owner| !is_a!(b.elements[owner], "Namespace"))
                     || row.owning_relationship.is_some()
                     || !(row.children.is_empty()
                         || (row.ty == "NamespaceImport"
@@ -1017,7 +1488,7 @@ impl StoredStructure {
                 {
                     bad_relations.insert(relationship);
                 }
-                let mut owners = HashSet::new();
+                let mut owners = IdSet::default();
                 if let Some(owner) = actual {
                     owners.insert(owner);
                 }
@@ -1027,7 +1498,7 @@ impl StoredStructure {
                 {
                     Some(owner) => {
                         owners.insert(owner);
-                        if actual != Some(owner) || !conforms(b.elements[owner].ty, "Namespace") {
+                        if actual != Some(owner) || !is_a!(b.elements[owner], "Namespace") {
                             bad_relations.insert(relationship);
                         }
                     }
@@ -1093,7 +1564,7 @@ impl StoredStructure {
                     if self.carriers.get(relationship) == Some(&Carrier::Invalid)
                         && b.elements
                             .get(relationship)
-                            .is_some_and(|r| conforms(r.ty, "Import"))
+                            .is_some_and(|r| is_a!(r, "Import"))
                     {
                         claims.entry(relationship).or_default().insert(owner);
                     }
@@ -1143,7 +1614,7 @@ impl StoredStructure {
                 b,
                 &self.carriers,
                 &self.ids,
-                &self.membership_rows,
+                self.membership_rows.all(),
                 0..self.authored_end,
                 self.multiple_membership_carriers,
                 steps,
@@ -1164,12 +1635,11 @@ impl StoredStructure {
                 if self.multiple_membership_carriers && !frozen_scan.multiple_membership_carriers {
                     charge(steps, floor.saturating_add(frozen.owner_relationships))?;
                 }
-                let start = self.membership_rows.partition_point(|&r| r < floor);
                 match project_memberships(
                     b,
                     &self.carriers,
                     &self.ids,
-                    &self.membership_rows[start..],
+                    self.membership_rows.between(floor, usize::MAX),
                     floor..self.authored_end,
                     self.multiple_membership_carriers,
                     steps,
@@ -1209,9 +1679,15 @@ impl StoredStructure {
             return Some(Arc::clone(typing));
         }
         let whole = |steps: &mut usize| {
-            let (own, sources_incomplete) =
-                project_typing(b, &self.carriers, &self.ids, &self.typing_rows, 0, steps)?
-                    .expect("a whole projection names no earlier source");
+            let (own, sources_incomplete) = project_typing(
+                b,
+                &self.carriers,
+                &self.ids,
+                self.typing_rows.all(),
+                0,
+                steps,
+            )?
+            .expect("a whole projection names no earlier source");
             Some(StoredTyping {
                 relationships: TypingSources { own, frozen: None },
                 sources_incomplete,
@@ -1225,12 +1701,11 @@ impl StoredStructure {
             Some((floor, frozen)) => {
                 let before = *steps;
                 charge(steps, frozen.steps)?;
-                let start = self.typing_rows.partition_point(|&r| r < floor);
                 match project_typing(
                     b,
                     &self.carriers,
                     &self.ids,
-                    &self.typing_rows[start..],
+                    self.typing_rows.between(floor, usize::MAX),
                     floor,
                     steps,
                 )? {
@@ -1276,9 +1751,7 @@ impl StoredStructure {
         if prefix.rows() != floor {
             return Some(false);
         }
-        let own = self.typing_rows.partition_point(|&r| r < floor)
-            ..self.typing_rows.partition_point(|&r| r < self.authored_end);
-        let authored = &self.typing_rows[own];
+        let authored = self.typing_rows.between(floor, self.authored_end);
         if project_typing(b, &self.carriers, &self.ids, authored, floor, steps)?.is_none() {
             return Some(false);
         }
@@ -1366,6 +1839,7 @@ impl StoredStructure {
             metadata_annotation_sources: scanned.metadata_annotation_sources,
             annotations_incomplete: scanned.annotations_incomplete,
             prefix,
+            member_answers: Default::default(),
         });
         b.id_index = Some(Arc::clone(&stored.ids));
         b.id_index_built_for = n;
@@ -1396,10 +1870,9 @@ impl StoredStructure {
             return whole(b, steps);
         }
         let before = *steps;
-        let kept = b
-            .prefix_structure
-            .as_ref()
-            .filter(|prefix| Arc::ptr_eq(&prefix.base, b.elements.base_arc()));
+        let kept = b.prefix_structure.as_ref().filter(|prefix| {
+            Arc::ptr_eq(&prefix.base, b.elements.base_arc()) && prefix.rows == b.elements.base_len()
+        });
         let reused = kept.is_some();
         let prefix = match kept {
             Some(prefix) => {
@@ -1477,6 +1950,162 @@ impl StoredStructure {
 mod tests {
     use super::*;
     use crate::{json::ResolvedModel, model::Model};
+
+    /// What a prefix scan is made of, for the tests that compare a carried
+    /// scan with a fresh one: the scan's facts and both projections.
+    pub(super) fn prefix_facts(prefix: &PrefixStructure, b: &Builder) -> String {
+        let s = &prefix.scanned;
+        let mut ids: Vec<_> = s.ids.iter().map(|(id, i)| (*id, *i)).collect();
+        ids.sort_unstable();
+        let typing = prefix.typing(b).map(|f| {
+            let mut own: Vec<_> = f
+                .typing
+                .relationships
+                .own
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            own.sort_unstable();
+            (own, f.typing.sources_incomplete, f.steps)
+        });
+        let memberships = prefix.memberships(b).map(|f| {
+            let mut bad: Vec<_> = f.domains.bad_owners.iter().copied().collect();
+            bad.sort_unstable();
+            (bad, f.domains.unlocalized, f.steps, f.owner_relationships)
+        });
+        let mut featurings: Vec<_> = s
+            .type_featurings
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        featurings.sort_unstable();
+        format!(
+            "{:?} {:?} {} {} {} {:?} {} {} {:?} {:?} {:?} {:?} {:?} {} {} {:?} {:?} {:?} {:?}",
+            carriers(&s.carriers),
+            ids,
+            s.logical_work,
+            s.source_incomplete,
+            s.ids_unique,
+            rows(&s.import_rows),
+            s.has_authored_import,
+            s.has_recursive_import,
+            featurings,
+            sorted(&s.bad_chains),
+            sorted(&s.bad_bases),
+            sorted(&s.metadata_annotation_targets),
+            s.annotations_incomplete,
+            s.multiple_membership_carriers,
+            s.steps,
+            rows(&s.membership_rows),
+            rows(&s.typing_rows),
+            typing,
+            memberships
+        )
+    }
+
+    /// A scan's carriers, row by row.
+    pub(super) fn carriers(carriers: &LayeredVec<Carrier>) -> Vec<Carrier> {
+        carriers.iter().copied().collect()
+    }
+
+    /// A row list's rows, in row order.
+    pub(super) fn rows(list: &RowList) -> Vec<usize> {
+        list.all().iter().collect()
+    }
+
+    /// A table of rows by id, by id.
+    pub(super) fn by_id(ids: &RowsById) -> Vec<(Uuid, usize)> {
+        let mut entries: Vec<_> = ids.iter().map(|(id, i)| (*id, *i)).collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    fn sorted(set: &IdSet<usize>) -> Vec<usize> {
+        let mut v: Vec<usize> = set.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// A snapshot carries the frozen rows' scan with both projections, and a
+    /// handle decoded from it has the scan a fresh freeze makes; a wire that
+    /// does not fit the rows is refused and the rows are scanned instead.
+    #[test]
+    fn a_snapshot_carries_the_prefix_scan_and_its_projections() {
+        let mut base = Model::new();
+        base.add_library_source(
+            "lib.sysml",
+            "library package L { part def A { attribute x; part p : A[0..1]; } part def B :> A { attribute :>> x = 1; } connection def C; part a : A; part b : B; connection c : C connect a to b; }",
+        );
+        let fresh = base.prepare_library().unwrap();
+        let fresh_prefix = fresh
+            .builder
+            .prefix_structure
+            .as_ref()
+            .expect("a frozen library has a scan");
+        assert!(
+            fresh_prefix.typing.get().is_some() && fresh_prefix.memberships.get().is_some(),
+            "the freeze made both projections"
+        );
+        let decoded =
+            crate::prepared::PreparedLibrary::from_bytes(&fresh.to_bytes(2).unwrap(), 2).unwrap();
+        let carried = decoded.builder.prefix_structure.as_ref().expect("carried");
+        assert!(
+            carried.typing.get().is_some() && carried.memberships.get().is_some(),
+            "carried with its projections"
+        );
+        assert_eq!(
+            prefix_facts(carried, &decoded.builder),
+            prefix_facts(fresh_prefix, &fresh.builder)
+        );
+        let wire = fresh_prefix.to_wire();
+        let base_rows = Arc::clone(fresh.builder.elements.base_arc());
+        assert!(
+            PrefixStructure::from_wire(wire.clone(), Arc::clone(&base_rows), None).is_some(),
+            "the wire as written fits"
+        );
+        let mut short = wire.clone();
+        short.scanned.carriers.0.pop();
+        assert!(
+            PrefixStructure::from_wire(short, Arc::clone(&base_rows), None).is_none(),
+            "a row count off is refused"
+        );
+        let mut out_of_range = wire.clone();
+        out_of_range.scanned.typing_rows.0.push(base_rows.len());
+        assert!(
+            PrefixStructure::from_wire(out_of_range, Arc::clone(&base_rows), None).is_none(),
+            "an index past the rows is refused"
+        );
+        // Written the same way every time: a second preparation's wire
+        // encodes to the same bytes.
+        let again = {
+            let mut base = Model::new();
+            base.add_library_source(
+                "lib.sysml",
+                "library package L { part def A { attribute x; part p : A[0..1]; } part def B :> A { attribute :>> x = 1; } connection def C; part a : A; part b : B; connection c : C connect a to b; }",
+            );
+            let prepared = base.prepare_library().unwrap();
+            crate::cache_codec::encode(
+                &prepared
+                    .builder
+                    .prefix_structure
+                    .as_ref()
+                    .unwrap()
+                    .to_wire(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            crate::cache_codec::encode(&wire).unwrap(),
+            again,
+            "the same scan, written the same way"
+        );
+        let mut claims_duplicates = wire;
+        claims_duplicates.scanned.ids_unique = !claims_duplicates.scanned.ids_unique;
+        assert!(
+            PrefixStructure::from_wire(claims_duplicates, base_rows, None).is_none(),
+            "an id-uniqueness claim the rows do not bear out is refused"
+        );
+    }
 
     fn fixture() -> ResolvedModel {
         let mut model = Model::new();
@@ -1616,7 +2245,7 @@ mod import_completeness_tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&rel| conforms(r.b.elements[rel].ty, "Import"))
+            .find(|&rel| is_a!(r.b.elements[rel], "Import"))
             .unwrap();
         (r, a, b, u, import)
     }
@@ -1766,7 +2395,7 @@ mod annotation_completeness_tests {
         assert!(!raw.annotations_incomplete);
         assert!(raw.metadata_annotation_targets.contains(&a));
         let source = raw.carrier(&r.b, rel).unwrap().unwrap();
-        r.b.elements[source].ty = "Documentation";
+        r.b.elements[source].set_ty("Documentation");
         let raw = StoredStructure::get(&mut r.b, &mut 0).unwrap();
         assert!(!raw.annotations_incomplete);
         assert!(raw.metadata_annotation_targets.is_empty());
@@ -1824,7 +2453,7 @@ mod annotation_completeness_tests {
         let target_id = r.b.elements[target].id;
         let rel_id = r.b.elements[rel].id;
         // Retain a non-owning namespace membership for the source identity.
-        r.b.elements[old_membership].ty = "Membership";
+        r.b.elements[old_membership].set_ty("Membership");
         r.b.elements[old_membership].children.make_mut().clear();
         r.b.elements[old_membership].props = Default::default();
         r.b.elements[old_membership].props.insert(
@@ -1868,7 +2497,7 @@ mod annotation_completeness_tests {
             serde_json::json!([{"@id":source_id.to_string()}]),
         );
         if documentation {
-            r.b.elements[source].ty = "Documentation";
+            r.b.elements[source].set_ty("Documentation");
         }
         (r, target, source, rel)
     }
@@ -1948,7 +2577,7 @@ mod annotation_completeness_tests {
                 .carrier(&r.b, rel)
                 .unwrap()
                 .unwrap();
-            r.b.elements[source].ty = "Comment";
+            r.b.elements[source].set_ty("Comment");
             r.b.elements[rel]
                 .props
                 .insert("annotatedElement", serde_json::json!({"@ref":"Missing"}));
@@ -2002,7 +2631,7 @@ mod annotation_completeness_tests {
                         .iter()
                         .position(|e| e.ty == "Metaclass")
                         .unwrap();
-                r.b.elements[metadata].ty = "MetadataFeature";
+                r.b.elements[metadata].set_ty("MetadataFeature");
                 let id = r.b.elements[metadata].id.to_string();
                 r.b.elements[rel]
                     .props
@@ -2013,7 +2642,7 @@ mod annotation_completeness_tests {
                         .annotations_incomplete
                 );
             } else {
-                r.b.elements[source].ty = "MetadataFeature";
+                r.b.elements[source].set_ty("MetadataFeature");
                 let mut exhausted = crate::eval::MAX_STEPS;
                 assert!(StoredStructure::get(&mut r.b, &mut exhausted).is_none());
                 let new = StoredStructure::get(&mut r.b, &mut 0).unwrap();
@@ -2287,6 +2916,7 @@ mod membership_domain_tests {
 
 #[cfg(test)]
 mod prefix_tests {
+    use super::tests::{by_id, carriers, rows};
     use super::*;
     use crate::{json::ResolvedModel, model::Model, prepared::PreparedLibrary};
 
@@ -2336,8 +2966,8 @@ mod prefix_tests {
     fn assert_same(layered: &StoredStructure, whole: &StoredStructure) {
         assert_eq!(layered.logical_work, whole.logical_work);
         assert_eq!(layered.authored_end, whole.authored_end);
-        assert_eq!(layered.carriers, whole.carriers);
-        assert_eq!(*layered.ids, *whole.ids);
+        assert_eq!(carriers(&layered.carriers), carriers(&whole.carriers));
+        assert_eq!(by_id(&layered.ids), by_id(&whole.ids));
         assert_eq!(layered.type_featurings, whole.type_featurings);
         assert_eq!(layered.bad_chains, whole.bad_chains);
         assert_eq!(layered.bad_bases, whole.bad_bases);
@@ -2345,7 +2975,7 @@ mod prefix_tests {
         assert_eq!(layered.ids_unique, whole.ids_unique);
         assert_eq!(layered.has_authored_import, whole.has_authored_import);
         assert_eq!(layered.has_recursive_import, whole.has_recursive_import);
-        assert_eq!(layered.import_rows, whole.import_rows);
+        assert_eq!(rows(&layered.import_rows), rows(&whole.import_rows));
         assert_eq!(
             layered.metadata_annotation_targets,
             whole.metadata_annotation_targets
@@ -2359,8 +2989,8 @@ mod prefix_tests {
             layered.multiple_membership_carriers,
             whole.multiple_membership_carriers
         );
-        assert_eq!(layered.membership_rows, whole.membership_rows);
-        assert_eq!(layered.typing_rows, whole.typing_rows);
+        assert_eq!(rows(&layered.membership_rows), rows(&whole.membership_rows));
+        assert_eq!(rows(&layered.typing_rows), rows(&whole.typing_rows));
     }
 
     /// A user row claiming a library relationship row — which no production
@@ -2368,7 +2998,9 @@ mod prefix_tests {
     /// library's: the build scans whole, and the budget is a whole scan's.
     #[test]
     fn a_row_claiming_a_frozen_relationship_scans_whole() {
-        let (_, mut r) = prepared_fixture();
+        let (library, mut r) = prepared_fixture();
+        let kept = library.builder.prefix_structure.as_ref().unwrap();
+        let kept_before = tests::prefix_facts(kept, &library.builder);
         let base_len = r.b.elements.base_len();
         let annotation = (0..base_len)
             .find(|&i| r.b.elements[i].ty == "Annotation")
@@ -2384,6 +3016,11 @@ mod prefix_tests {
         assert_eq!(prefix_reuses(), reuses, "the kept scan did not serve");
         assert_eq!(layered.carriers[annotation], Carrier::Invalid);
         assert!(layered.annotations_incomplete);
+        assert_eq!(
+            tests::prefix_facts(kept, &library.builder),
+            kept_before,
+            "the claim the extending scan met was its own, not the kept scan's"
+        );
 
         let (_, mut w) = prepared_fixture();
         w.b.elements[c].owned_relationships.push(annotation);
@@ -2592,6 +3229,119 @@ mod prefix_tests {
         assert!(layered.ids_unique && !layered.annotations_incomplete);
     }
 
+    /// Whether `structure` reads the frozen rows' carriers, ids and row
+    /// lists from the tables `kept` holds, and holds only its own rows'.
+    fn shares_kept_tables(structure: &StoredStructure, kept: &PrefixStructure) -> bool {
+        let lists = [
+            (&structure.import_rows, &kept.scanned.import_rows),
+            (&structure.membership_rows, &kept.scanned.membership_rows),
+            (&structure.typing_rows, &kept.scanned.typing_rows),
+        ];
+        Arc::ptr_eq(
+            structure.carriers.base_arc(),
+            kept.scanned.carriers.base_arc(),
+        ) && structure.carriers.base_len() == kept.rows
+            && Arc::ptr_eq(structure.ids.base_arc(), kept.scanned.ids.base_arc())
+            && structure.ids.local_iter().all(|(_, &row)| row >= kept.rows)
+            && lists.iter().all(|(list, frozen)| {
+                Arc::ptr_eq(&list.frozen, &frozen.frozen)
+                    && list.own.iter().all(|&row| row >= kept.rows)
+            })
+    }
+
+    /// What a structure answers, table by table.
+    fn answers(structure: &StoredStructure) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            carriers(&structure.carriers),
+            by_id(&structure.ids),
+            rows(&structure.import_rows),
+            rows(&structure.membership_rows),
+            rows(&structure.typing_rows)
+        )
+    }
+
+    /// Two builds on one prepared library hold the library rows' carriers,
+    /// ids and row lists once between them: each structure reads those
+    /// from the tables the library's freeze kept and holds only its own
+    /// rows'. A build whose rows change — a new id, a frozen row written —
+    /// changes its own structure only: the other build and the kept
+    /// tables answer as before. So for a library prepared here and for one
+    /// read back from its snapshot, whose kept scan is the one the
+    /// snapshot carried.
+    #[test]
+    fn builds_on_one_library_share_its_scan_and_keep_their_own_rows() {
+        let (library, _) = prepared_fixture();
+        let decoded =
+            Arc::new(PreparedLibrary::from_bytes(&library.to_bytes(9).unwrap(), 9).unwrap());
+        assert_builds_share_the_kept_scan(&library);
+        assert_builds_share_the_kept_scan(&decoded);
+    }
+
+    /// A build of the user rows on `library`.
+    fn build_on(library: &Arc<PreparedLibrary>) -> ResolvedModel {
+        let mut model = Model::new();
+        Arc::clone(library).install(&mut model).unwrap();
+        model.add_source("user.kerml", USER);
+        let r = ResolvedModel::build(&model);
+        assert!(r.b.library_facts.is_some(), "built on the prepared library");
+        r
+    }
+
+    fn assert_builds_share_the_kept_scan(library: &Arc<PreparedLibrary>) {
+        let mut left = build_on(library);
+        let mut right = build_on(library);
+        let kept = library.builder.prefix_structure.as_ref().unwrap();
+        let kept_before = tests::prefix_facts(kept, &library.builder);
+        let one = StoredStructure::get(&mut left.b, &mut 0).unwrap();
+        let other = StoredStructure::get(&mut right.b, &mut 0).unwrap();
+        assert!(!Arc::ptr_eq(&one, &other), "a structure per build");
+        assert!(shares_kept_tables(&one, kept) && shares_kept_tables(&other, kept));
+        assert!(
+            Arc::ptr_eq(left.b.id_index.as_ref().unwrap(), &one.ids),
+            "the builder's id index is the structure's table"
+        );
+        // An id index tabled apart from a structure shares the frozen rows'
+        // table the freeze kept for identity assignment.
+        left.b.id_index = None;
+        let c = left.resolve_qualified("U::C").unwrap().0;
+        assert_eq!(left.b.element_index_of_uuid(left.b.elements[c].id), Some(c));
+        let index = left.b.id_index.clone().unwrap();
+        assert!(Arc::ptr_eq(
+            index.base_arc(),
+            left.b.prefix_ids.as_ref().unwrap()
+        ));
+        assert!(index.local_iter().all(|(_, &row)| row >= kept.rows));
+        let other_answers = answers(&other);
+
+        // A user row given a new id: the build resolves it, the other does not.
+        let new_id = Uuid::from_u128(0x5ca1ab1e);
+        let old_id = left.b.elements[c].id;
+        left.b.elements[c].id = new_id;
+        let renamed = StoredStructure::get(&mut left.b, &mut 0).unwrap();
+        assert!(shares_kept_tables(&renamed, kept));
+        assert_eq!(renamed.element_for_uuid(&left.b, new_id), Some(c));
+        assert_eq!(renamed.element_for_uuid(&left.b, old_id), None);
+        assert_eq!(other.element_for_uuid(&right.b, new_id), None);
+        assert_eq!(other.element_for_uuid(&right.b, old_id), Some(c));
+
+        // A frozen row written: that build scans whole, into tables of its own.
+        let a = left.resolve_qualified("A").unwrap().0;
+        let row = left.b.elements[a].clone();
+        left.b.elements[a] = row;
+        let whole = StoredStructure::get(&mut left.b, &mut 0).unwrap();
+        assert!(!shares_kept_tables(&whole, kept));
+        assert_eq!(whole.element_for_uuid(&left.b, new_id), Some(c));
+
+        assert!(other.is_current(&right.b));
+        assert!(Arc::ptr_eq(
+            &other,
+            &StoredStructure::get(&mut right.b, &mut 0).unwrap()
+        ));
+        assert_eq!(answers(&other), other_answers);
+        assert_eq!(tests::prefix_facts(kept, &library.builder), kept_before);
+    }
+
     /// The scan is not serialized: decoding freezes the rows again, and
     /// that freeze makes the scan the decoded library keeps.
     #[test]
@@ -2781,7 +3531,7 @@ mod prefix_tests {
                 .owned_relationships
                 .iter()
                 .copied()
-                .find(|&rel| crate::metaclass::conforms(r.b.elements[rel].ty, "Membership"))
+                .find(|&rel| is_a!(r.b.elements[rel], "Membership"))
                 .unwrap();
             r.b.elements[v].owned_relationships.push(membership);
         };

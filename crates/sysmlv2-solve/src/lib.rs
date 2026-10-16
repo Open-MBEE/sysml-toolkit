@@ -44,6 +44,7 @@ use sysmlv2_model::check::{
 };
 use sysmlv2_model::json::ResolvedModel;
 use sysmlv2_model::model::Model;
+use sysmlv2_model::numfmt::NumberFormat;
 use term::RenderCtx;
 use z3::{QueryResult, SExpr};
 
@@ -94,6 +95,20 @@ pub enum WitnessValue {
     WithUnit(Box<WitnessValue>, String),
     /// A solver value this crate does not decode; raw SMT text.
     Other(String),
+}
+
+impl WitnessValue {
+    /// `Display`, with a real value that has no terminating decimal
+    /// expansion written in `format` ([`NumberFormat::exact`] gives
+    /// exactly `Display`).
+    #[must_use]
+    pub fn to_string_with(&self, format: &NumberFormat) -> String {
+        match self {
+            WitnessValue::Real(r) => format.render(r),
+            WitnessValue::WithUnit(v, u) => format!("{} [{u}]", v.to_string_with(format)),
+            v => v.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for WitnessValue {
@@ -270,16 +285,44 @@ fn solve_resolved(
 
 /// Configuration for interval constraint propagation. Propagation
 /// uses no external solver, so unlike [`SolverConfig`] it needs no Z3.
+///
+/// Settings may be added in future releases: start from
+/// [`PropagateConfig::default`] and use the `with_*` methods or assign
+/// the public fields.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PropagateConfig {
     /// Maximum fixpoint passes per unit before stopping. SysMD caps at 100;
     /// the driver also stops early at the first quiescent pass.
     pub max_iters: usize,
+    /// How [`FeatureRange::range_approx`] writes a real endpoint without
+    /// a terminating decimal expansion (default: the exact fraction).
+    pub number_format: NumberFormat,
 }
 
 impl Default for PropagateConfig {
     fn default() -> Self {
-        PropagateConfig { max_iters: 100 }
+        PropagateConfig {
+            max_iters: 100,
+            number_format: NumberFormat::exact(),
+        }
+    }
+}
+
+impl PropagateConfig {
+    /// This configuration with a fixpoint pass cap of `max_iters`.
+    #[must_use]
+    pub fn with_max_iters(mut self, max_iters: usize) -> Self {
+        self.max_iters = max_iters;
+        self
+    }
+
+    /// This configuration rendering [`FeatureRange::range_approx`] in
+    /// `number_format`.
+    #[must_use]
+    pub fn with_number_format(mut self, number_format: NumberFormat) -> Self {
+        self.number_format = number_format;
+        self
     }
 }
 
@@ -294,10 +337,11 @@ pub struct FeatureRange {
     /// Rendered range or set (`[10, +∞]`, `[3, 7]`, `{Red, Green}`), with
     /// exact real endpoints: a terminating decimal or a reduced fraction.
     pub range: String,
-    /// [`Self::range`] for glanceable surfaces such as editor hints: a
-    /// real endpoint without a terminating decimal expansion renders as
-    /// a marked approximate decimal (`≈0.3333333333333333`) instead of a
-    /// fraction.
+    /// The display range: [`Self::range`] with every real endpoint that
+    /// has no terminating decimal expansion written in
+    /// [`PropagateConfig::number_format`]. By default that is exact, so
+    /// this equals `range` unless the caller chose a display format
+    /// (`≈0.3333333333333333`, `0.(3)`, …).
     pub range_approx: String,
     /// Whether propagation tightened the domain past its declared type.
     pub narrowed: bool,
@@ -520,8 +564,8 @@ fn propagate_core(
             ranges.push(FeatureRange {
                 feature: v.display.clone(),
                 unit: v.unit.clone(),
-                range: ival::fmt_dom(&doms[vi], &jt.enums, false),
-                range_approx: ival::fmt_dom(&doms[vi], &jt.enums, true),
+                range: ival::fmt_dom(&doms[vi], &jt.enums, &NumberFormat::exact()),
+                range_approx: ival::fmt_dom(&doms[vi], &jt.enums, &cfg.number_format),
                 narrowed: doms[vi] != baseline[vi],
             });
         }
@@ -1098,7 +1142,7 @@ mod witness_containment {
                 assert!(
                     dom_contains(val, &doms[k], &tr.enums),
                     "witness {disp} = {val} escapes propagated range {} ({:?} in {where_})",
-                    ival::fmt_dom(&doms[k], &tr.enums, false),
+                    ival::fmt_dom(&doms[k], &tr.enums, &NumberFormat::exact()),
                     c.name
                 );
             }

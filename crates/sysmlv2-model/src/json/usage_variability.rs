@@ -5,7 +5,7 @@ use super::{
     structural_index::StoredStructure,
     type_relations::{RelationFact, TypeRelations},
 };
-use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 
 /// Why Usage::mayTimeVary cannot be certified. Errors never mean false.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +99,7 @@ fn read(b: &mut Builder, usage: usize, steps: &mut usize) -> Result<bool, UsageV
     let row = b
         .elements
         .get(usage)
-        .filter(|row| conforms(row.ty, "Usage"))
+        .filter(|row| is_a!(row, "Usage"))
         .ok_or(InvalidElement)?;
     // Only this exact effective declaration is implemented, including through
     // its inherited spelling. Future redefinitions need their own capability.
@@ -500,7 +500,7 @@ mod tests {
             let target = r.resolve_qualified("Links::SelfLink").unwrap();
             match mode {
                 0 => remove_role(&mut r, "Links::SelfLink"),
-                1 => r.b.elements[target.0].ty = "Class",
+                1 => r.b.elements[target.0].set_ty("Class"),
                 2 => r.b.lib_qnames.push((
                     uuid::Uuid::new_v4(),
                     vec!["Links".into(), "SelfLink".into()],
@@ -613,7 +613,7 @@ mod tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&e| conforms(r.b.elements[e].ty, "Subsetting"))
+            .find(|&e| is_a!(r.b.elements[e], "Subsetting"))
             .unwrap();
         r.b.set(subset, "subsettedFeature", json!({"@ref":"Missing"}));
         assert!(r.usage_variability_report(x).value.is_err());

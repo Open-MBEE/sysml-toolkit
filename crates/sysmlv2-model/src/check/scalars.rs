@@ -49,13 +49,9 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         }
         // Every declared type must classify — a type this walk cannot
         // place may admit the value through bases it cannot see.
-        let kinds: Vec<ScalarKind> = tys
-            .iter()
-            .filter_map(|&ty| declared_scalar_kind(&mut r.b, ty))
-            .collect();
-        if kinds.is_empty() || kinds.len() != tys.len() {
+        let Some(kinds) = declared_kinds(&mut r.b, &tys) else {
             continue;
-        }
+        };
         let origin = r.b.set_identity_origin(owner);
         let value = crate::eval::evaluate_expr_in(&mut r.b, scope, &expr);
         r.b.identity_origin_unit = origin;
@@ -68,42 +64,72 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         if kinds.iter().any(|&k| scalar_kind_admits(k, value_kind)) {
             continue;
         }
-        let ty_name = r.b.elements[tys[0]]
-            .props
-            .get("declaredName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<anonymous>")
-            .to_string();
-        let msg = match value_kind {
-            ScalarKind::Number { integral: false }
-                if matches!(kinds[0], ScalarKind::Number { .. }) =>
-            {
-                format!(
-                    "feature value {v} is not an integer and can never conform \
-                     to the declared type `{ty_name}`"
-                )
-            }
-            _ => {
-                let vdesc = match value_kind {
-                    ScalarKind::Boolean => "a Boolean",
-                    ScalarKind::Str => "a String",
-                    ScalarKind::Number { .. } => "a number",
-                };
-                format!(
-                    "feature value evaluates to {vdesc}, which can never \
-                     conform to the declared type `{ty_name}`"
-                )
-            }
-        };
+        let ty_name = declared_type_name(&r.b, tys[0]);
+        let msg = never_conforms_message("feature value", &kinds, value_kind, &v, &ty_name);
         out.push((unit, Diagnostic::warning(expr.span, msg)));
     }
     out
 }
 
+/// The scalar partitions of every declared type in `tys`, or `None`
+/// where the check stays silent: no declared type, or one this walk
+/// cannot place, which may admit a value through bases it cannot see.
+pub(super) fn declared_kinds(
+    b: &mut crate::json::Builder,
+    tys: &[usize],
+) -> Option<Vec<ScalarKind>> {
+    let kinds: Vec<ScalarKind> = tys
+        .iter()
+        .filter_map(|&ty| declared_scalar_kind(b, ty))
+        .collect();
+    (!kinds.is_empty() && kinds.len() == tys.len()).then_some(kinds)
+}
+
+/// The name a conformance finding calls a declared type by.
+pub(super) fn declared_type_name(b: &crate::json::Builder, ty: usize) -> String {
+    b.elements[ty]
+        .props
+        .get("declaredName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<anonymous>")
+        .to_string()
+}
+
+/// The finding for a `subject` ("feature value", "constructor argument
+/// for `x`") whose value `v`, of partition `value_kind`, no declared
+/// partition in `kinds` admits.
+pub(super) fn never_conforms_message(
+    subject: &str,
+    kinds: &[ScalarKind],
+    value_kind: ScalarKind,
+    v: &crate::eval::Value,
+    ty_name: &str,
+) -> String {
+    match value_kind {
+        ScalarKind::Number { integral: false } if matches!(kinds[0], ScalarKind::Number { .. }) => {
+            format!(
+                "{subject} {v} is not an integer and can never conform \
+                 to the declared type `{ty_name}`"
+            )
+        }
+        _ => {
+            let vdesc = match value_kind {
+                ScalarKind::Boolean => "a Boolean",
+                ScalarKind::Str => "a String",
+                ScalarKind::Number { .. } => "a number",
+            };
+            format!(
+                "{subject} evaluates to {vdesc}, which can never \
+                 conform to the declared type `{ty_name}`"
+            )
+        }
+    }
+}
+
 /// The provably-disjoint `ScalarValues` partitions: Boolean, String, and
 /// the Number tower (with `Integer`-and-below tracked for integrality).
 #[derive(Clone, Copy, PartialEq)]
-enum ScalarKind {
+pub(super) enum ScalarKind {
     Boolean,
     Str,
     Number { integral: bool },
@@ -112,7 +138,7 @@ enum ScalarKind {
 /// The partition an evaluated value inhabits — `None` for the values
 /// the conformance check stays silent on (quantities, sequences,
 /// instances, elements).
-fn value_scalar_kind(v: &crate::eval::Value) -> Option<ScalarKind> {
+pub(super) fn value_scalar_kind(v: &crate::eval::Value) -> Option<ScalarKind> {
     use crate::eval::Value;
     Some(match v {
         Value::Boolean(_) => ScalarKind::Boolean,
@@ -131,7 +157,7 @@ fn value_scalar_kind(v: &crate::eval::Value) -> Option<ScalarKind> {
 /// Whether a declared partition admits a value's: same partition, and
 /// within the Number tower an integral requirement met by an integral
 /// value. Cross-partition pairs are provably disjoint.
-fn scalar_kind_admits(decl: ScalarKind, value: ScalarKind) -> bool {
+pub(super) fn scalar_kind_admits(decl: ScalarKind, value: ScalarKind) -> bool {
     match (decl, value) {
         (ScalarKind::Boolean, ScalarKind::Boolean) => true,
         (ScalarKind::Str, ScalarKind::Str) => true,
@@ -175,7 +201,7 @@ impl crate::json::ResolvedModel {
 /// Breadth-first, first match wins: the nearest scalar ancestor decides
 /// integrality (`Size :> Real` classifies non-integral even though `Real`
 /// has integral subtypes). `None` = not provably a scalar type.
-fn declared_scalar_kind(b: &mut crate::json::Builder, ty: usize) -> Option<ScalarKind> {
+pub(super) fn declared_scalar_kind(b: &mut crate::json::Builder, ty: usize) -> Option<ScalarKind> {
     use std::collections::{HashSet, VecDeque};
     let mut queue: VecDeque<usize> = VecDeque::new();
     queue.push_back(ty);

@@ -1,7 +1,7 @@
 //! Direct declaration paths witnessed from an already recorded endpoint.
 use super::{Builder, ProviderCompleteness, StoredStructure, charge};
 use crate::json::{Binding, LookupAccess, QualifiedName, semantic_ownership};
-use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::{collections::HashMap, sync::Arc};
 
 impl ProviderCompleteness {
@@ -51,7 +51,7 @@ impl ProviderCompleteness {
                 return None;
             }
             let sub_scope = b.elem_scope.get(&member).copied();
-            if (conforms(b.elements[member].ty, "Namespace") && sub_scope.is_none())
+            if (is_a!(b.elements[member], "Namespace") && sub_scope.is_none())
                 || sub_scope.is_some_and(|sub| {
                     b.scopes
                         .get(sub)
@@ -74,7 +74,7 @@ impl ProviderCompleteness {
                 let mut names: HashMap<String, Vec<Binding>> = HashMap::new();
                 for m in memberships {
                     charge(steps, 1)?;
-                    if !conforms(b.elements[m.relationship].ty, "OwningMembership") {
+                    if !is_a!(b.elements[m.relationship], "OwningMembership") {
                         continue;
                     }
                     let visibility = match m.visibility {

@@ -3,6 +3,7 @@
 //! feature is typed by, the conformance a redefinition owes its target,
 //! and the binariness a connector inherits through one.
 use super::multiplicity_domains::DomainRows;
+use crate::metaclass::is_a;
 use crate::{json::ResolvedModel, model::Model};
 use std::collections::{HashMap, HashSet};
 use sysmlv2_syntax::diag::Diagnostic;
@@ -263,9 +264,15 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
     // instance/Feature contexts need an explicit evaluation environment.
     let mut receivers = HashSet::new();
     let mut providers = crate::json::provider_completeness::ProviderCompleteness::default();
+    // Only a bound written as an expression can be valid where written
+    // and invalid in a receiver, which is all this pass reports: a
+    // receiver whose heritage reaches no feature with such a bound has
+    // nothing to report, and is not read.
+    let expression_bounds = domains.expression_bounds(&mut r.b);
+    let mut reach: crate::layered::IdMap<usize, bool> = Default::default();
     for (receiver, kind, _, qn) in &resolved {
         if *kind != "Subclassification"
-            || crate::metaclass::conforms(r.b.elements[*receiver].ty, "Feature")
+            || is_a!(r.b.elements[*receiver], "Feature")
             || !receivers.insert(*receiver)
         {
             continue;
@@ -273,6 +280,14 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         let Some(&scope) = r.b.elem_scope.get(receiver) else {
             continue;
         };
+        if !r.b.heritage_reaches_any(
+            scope,
+            &expression_bounds.scopes,
+            &expression_bounds.features,
+            &mut reach,
+        ) {
+            continue;
+        }
         let mut steps = 0;
         if !providers.scope(&mut r.b, scope, &mut steps) {
             continue;
@@ -282,7 +297,7 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         };
         features.retain(|&feature| {
             r.b.owner_elem(feature) != Some(*receiver)
-                && !crate::metaclass::conforms(r.b.elements[feature].ty, "Multiplicity")
+                && !is_a!(r.b.elements[feature], "Multiplicity")
         });
         for (row, feature, reason) in
             domains.inherited_invalid(&mut r.b, scope, &features, &mut steps)

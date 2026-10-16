@@ -1258,6 +1258,20 @@ impl LspServer {
         self.inner.take_outbound().map_err(failed)
     }
 
+    /// Set how evaluated-value inlay hints, hover values and range hints
+    /// write a rational without a terminating decimal expansion, as a
+    /// spec string: `exact` (the default), `approx`, `overline`,
+    /// `parens` or `unicode`, then optional `key=value` settings
+    /// (`digits`, `period`, `mixed`, `slash`, `glyphs`,
+    /// `fraction-digits`). Raises `ValueError` on a spec it cannot read.
+    /// Returns the refresh requests to relay, like `set_workspace`.
+    fn set_number_format(&mut self, spec: &str) -> PyResult<Vec<String>> {
+        let format =
+            sysmlv2_model::numfmt::NumberFormat::parse(spec).map_err(PyValueError::new_err)?;
+        self.inner.set_number_format(format);
+        self.inner.take_outbound().map_err(failed)
+    }
+
     /// Set whether accepting a unit completion inside an untyped
     /// attribute's quantity bracket also declares the type the unit
     /// determines (default on). Takes effect on the next completion

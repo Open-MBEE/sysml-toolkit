@@ -42,7 +42,7 @@ The package ships the OMG standard library under `stdlib/`. The library is licen
 
 - `sysml-library.json.gz` — the 94 library units as `[{name, text}]` (array order is load order — pass the decompressed text through unchanged).
 - `sysml-library.libcache.gz` — a sealed resolution snapshot recorded against exactly that bundle; passing it makes library resolution replay instead of search (several times faster). Stale or corrupt bytes are rejected safely and the build falls back to a cold resolve.
-- `sysml-library.prepared.gz` — the library resolved and frozen, keyed by the bundle's content: `PreparedLibrary.fromSnapshot(prepared, bundle, libcache)` decodes it instead of resolving at startup and keeps no syntax trees in memory (about half the memory of `new PreparedLibrary(bundle, libcache)`). A snapshot from another build or another bundle throws; prepare from source then.
+- `sysml-library.prepared.gz` — the library resolved and frozen, keyed by the bundle's content: `PreparedLibrary.fromSnapshot(prepared, bundle, libcache)` decodes it instead of resolving at startup and keeps no syntax trees in memory (about half the memory of `new PreparedLibrary(bundle, libcache)`). A snapshot from another build or another bundle throws; prepare from source then. The snapshot also carries the language server's library symbol table: a worker that hosts a language server decodes with a trailing `keepHostParts` of `true` (`PreparedLibrary.fromSnapshotStream(view, bundle, libcache, true)`), so that `LspServer.withPreparedLibrary` builds its table from it instead of parsing the library; any other worker leaves it out and holds none of it.
 - `manifest.json` — toolkit version, unit count, sizes.
 
 Serve the two `.gz` files statically and load them once (cache them — they change only with the toolkit version):
@@ -103,6 +103,8 @@ settled?.free();
 settled = session.settledOutcomes();
 ```
 
+`LspServer.setNumberFormat(spec)` sets how value hints, hover values and range hints write a rational without a terminating decimal expansion: `exact` (`1/15`, the default), `approx` (`≈0.06666666666666667`), `overline` (`0.06̅`), `parens` (`0.0(6)`) or `unicode` (`¹/₁₅`), then optional `key=value` settings after commas (`digits`, `period`, `mixed`, `slash`, `glyphs`, `fraction-digits`; the command line's `--number-format` documents them). It throws on a spec it cannot read and returns the refresh requests to relay. `Session.verify` takes the same spec as its `numberFormat` option for each range's `rangeApprox`; `range` stays exact.
+
 `LspServer.withPreparedLibrary(library)` builds the language server on such a handle. A session reuses the library's prepared resolution, where `LspServer.withLibrary(bundle, snapshot)` re-parses the library's sources and rebuilds its graph for every session; a workspace that may change what the library's own names resolve to still has the library resolved together with it: a root name the library looked up and missed replays the resolution recorded in the handle's snapshot (or recorded while preparing, when the snapshot is unusable), a root filter keeps that recording's element identities but resolves the library's references again, and a root declaration named like a library package resolves the library from scratch.
 
 ## Running the command-line module
@@ -137,3 +139,30 @@ remain absent for genuinely anonymous elements; IDs are not display names.
 Library elements can be inspected by ID but remain read-only. Reacquire handles
 after an edit or library reload; IDs refer to the current model state and can
 change when an element's ownership path changes.
+
+### Find usages
+
+`session.references(selector)` answers where an element is used: its declaration
+site and every reference in the session's units that resolves to it, as JSON
+`{declaration, references}`. The selector is a qualified name or
+`{"elementId": id}`. Each site is `{unit, line, col, endLine, endCol}` — the
+unit's name, 1-based lines, and columns counted in UTF-16 code units, so an
+editor can place a cursor on it — and a reference adds `kind`, the property it
+feeds (`type`, `superclassifier`, `importedMembership`, …), and `owner`, the
+`{id, qualifiedName}` of the nearest enclosing element that has a qualified
+name (`w` for `part w : Wheel;`, the package an import sits in, the feature
+whose value names it, the first named element around a reference written on
+something nameless; `null` when nothing around it has one, as at the top level
+of a unit or inside a nameless element there). A reference's range covers the
+segment that names the element (`Wheel` in `Defs::Wheel`).
+
+A library element's declaration names its unit `sysmlv2-lib:/` and the unit's
+name percent-encoded as a uri path (`sysmlv2-lib:/Mini%20Lib/MiniLib.sysml`),
+the same uri the language server's definitions and references use, so the
+host's read-only library documents serve it. A library's own references are
+not recorded, so its elements' sites are the model's references to them.
+`declaration.site` is `"name"` when the range is the declared name and
+`"extent"` when the element declares no name (a nameless redefinition such as
+`part :>> chassis { … }`) and the range is its whole member declaration:
+somewhere to open, not a range to rename at. `declaration` is `null` only for
+an element with no recorded source. Nothing is written; handles stay valid.

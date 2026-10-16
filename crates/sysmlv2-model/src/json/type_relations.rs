@@ -6,6 +6,7 @@
 //! base omission is a negative fact.
 use super::{Builder, provider_completeness::ProviderCompleteness, semantic_ownership};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,10 +234,7 @@ impl TypeRelations {
         let mut active = HashSet::new();
         for depth in 0..=super::MAX_RESOLUTION_DEPTH {
             if charge(steps, 1).is_none()
-                || !b
-                    .elements
-                    .get(general)
-                    .is_some_and(|e| conforms(e.ty, "Type"))
+                || !b.elements.get(general).is_some_and(|e| is_a!(e, "Type"))
                 || !active.insert(receiver)
             {
                 return RelationFact::Unknown;
@@ -331,10 +329,8 @@ impl TypeRelations {
         if fact == RelationFact::No
             && b.elements
                 .get(specific)
-                .is_some_and(|e| conforms(e.ty, "Feature"))
-            && b.elements
-                .get(general)
-                .is_some_and(|e| conforms(e.ty, "Feature"))
+                .is_some_and(|e| is_a!(e, "Feature"))
+            && b.elements.get(general).is_some_and(|e| is_a!(e, "Feature"))
         {
             // The shared-redefinition clause requires both owned-feature
             // sets to be empty. One reciprocal membership witness refutes it.
@@ -364,7 +360,7 @@ impl TypeRelations {
         let mut found = false;
         for relation in relations {
             let member = b.elements.get(relation)?;
-            if !conforms(member.ty, "FeatureMembership") {
+            if !is_a!(member, "FeatureMembership") {
                 continue;
             }
             charge(steps, member.children.len())?;
@@ -434,7 +430,7 @@ impl TypeRelations {
             if let Some(rel) = b.elements[feature].owning_relationship {
                 if !conforms(b.elements.get(rel)?.ty, "FeatureMembership") {
                     if let Some(owner) = self.evidence.carrier(b, rel, steps)? {
-                        if conforms(b.elements[owner].ty, "Feature") {
+                        if is_a!(b.elements[owner], "Feature") {
                             return Some(false);
                         }
                     }
@@ -444,7 +440,7 @@ impl TypeRelations {
                 .evidence
                 .featuring_types(b, feature, &mut HashSet::new(), steps)?;
             for owner in owners {
-                if conforms(b.elements[owner].ty, "Feature") {
+                if is_a!(b.elements[owner], "Feature") {
                     stack.push(owner);
                 } else if !matches!(
                     b.elements[owner].ty,
@@ -455,7 +451,7 @@ impl TypeRelations {
             }
             let relationships = self.evidence.relationships(b, feature, steps)?;
             for relationship in relationships {
-                if conforms(b.elements[relationship].ty, "FeatureChaining") {
+                if is_a!(b.elements[relationship], "FeatureChaining") {
                     stack.push(endpoint(
                         b,
                         feature,
@@ -653,8 +649,8 @@ impl TypeRelations {
                 let mut witnessed = false;
                 for &candidate in owned {
                     charge(steps, 1).ok_or(Unsupported)?;
-                    if conforms(b.elements[candidate].ty, "Subsetting")
-                        && !conforms(b.elements[candidate].ty, "CrossSubsetting")
+                    if is_a!(b.elements[candidate], "Subsetting")
+                        && !is_a!(b.elements[candidate], "CrossSubsetting")
                         && endpoint(
                             b,
                             feature,
@@ -727,7 +723,7 @@ impl TypeRelations {
                 .map_err(|_| Unsupported)?;
             charge(steps, sequence.owned.len()).ok_or(Unsupported)?;
             if !sequence.owned.iter().any(|m| {
-                m.member == feature && conforms(b.elements[m.relationship].ty, "FeatureMembership")
+                m.member == feature && is_a!(b.elements[m.relationship], "FeatureMembership")
             }) {
                 return Err(InvalidRelationship);
             }
@@ -811,7 +807,7 @@ impl TypeRelations {
             return Some(feature_bases);
         }
         let element = b.elements.get(specific)?;
-        if conforms(element.ty, "Definition") {
+        if is_a!(element, "Definition") {
             for key in ["isVariation", "isIndividual"] {
                 if element
                     .props
@@ -976,7 +972,7 @@ impl TypeRelations {
                 };
                 let target = id
                     .and_then(|id| b.element_index_of_uuid(id))
-                    .filter(|&e| e < b.lib_boundary && conforms(b.elements[e].ty, kind));
+                    .filter(|&e| e < b.lib_boundary && b.elements[e].conforms(kind));
                 resolved.insert(name, target);
             }
             self.required_library = Some(resolved);
@@ -995,14 +991,8 @@ impl TypeRelations {
     ) -> RelationFact {
         if charge(steps, 1).is_none()
             || depth > super::MAX_RESOLUTION_DEPTH
-            || !b
-                .elements
-                .get(specific)
-                .is_some_and(|e| conforms(e.ty, "Type"))
-            || !b
-                .elements
-                .get(general)
-                .is_some_and(|e| conforms(e.ty, "Type"))
+            || !b.elements.get(specific).is_some_and(|e| is_a!(e, "Type"))
+            || !b.elements.get(general).is_some_and(|e| is_a!(e, "Type"))
         {
             return RelationFact::Unknown;
         }
@@ -1094,7 +1084,7 @@ impl TypeRelations {
         let conjugations: Vec<_> = relationships
             .iter()
             .copied()
-            .filter(|&r| conforms(b.elements[r].ty, "Conjugation"))
+            .filter(|&r| is_a!(b.elements[r], "Conjugation"))
             .collect();
         let mut targets = Vec::new();
         let mut target_set = HashSet::new();
@@ -1130,7 +1120,7 @@ impl TypeRelations {
             targets.push(target);
         } else {
             for &r in &relationships {
-                if !conforms(b.elements[r].ty, "Specialization") {
+                if !is_a!(b.elements[r], "Specialization") {
                     continue;
                 }
                 let relation = &b.elements[r];
@@ -1150,11 +1140,11 @@ impl TypeRelations {
                     complete = false;
                     continue;
                 }
-                let (source_kind, target_kind) = if conforms(relation.ty, "Subsetting") {
+                let (source_kind, target_kind) = if is_a!(relation, "Subsetting") {
                     ("Feature", "Feature")
-                } else if conforms(relation.ty, "FeatureTyping") {
+                } else if is_a!(relation, "FeatureTyping") {
                     ("Feature", "Type")
-                } else if conforms(relation.ty, "Subclassification") {
+                } else if is_a!(relation, "Subclassification") {
                     ("Classifier", "Classifier")
                 } else {
                     ("Type", "Type")
@@ -1197,7 +1187,7 @@ impl TypeRelations {
         }
         // Feature::supertypes appends the final chaining feature to the Type
         // result. Do not let a missing link masquerade as an unchained feature.
-        if conforms(b.elements[specific].ty, "Feature") {
+        if is_a!(b.elements[specific], "Feature") {
             let raw = super::structural_index::StoredStructure::for_query(b, steps)?;
             match checked_feature_target(b, &raw, specific, &relationships, b.elements.len(), steps)
             {
@@ -1507,15 +1497,14 @@ pub(super) fn type_featuring_source(
     // Preserve explicit external UUIDs, as ordinary checked owned properties
     // do. A carrier fallback always names a known local Feature.
     if let Some(index) = raw.element_for_uuid(b, source) {
-        if !conforms(b.elements[index].ty, "Feature") {
+        if !is_a!(b.elements[index], "Feature") {
             return None;
         }
     }
     if let Some(value) = b.elements[relationship].props.get("owningFeatureOfType") {
         charge(steps, 1)?;
-        let owner = carrier.filter(|&owner| {
-            b.elements[owner].id == source && conforms(b.elements[owner].ty, "Feature")
-        });
+        let owner = carrier
+            .filter(|&owner| b.elements[owner].id == source && is_a!(b.elements[owner], "Feature"));
         if match owner {
             Some(owner) => value.as_reference() != Some(b.elements[owner].id),
             None => !value.is_null(),
@@ -1573,7 +1562,7 @@ impl Builder {
             .elements
             .iter()
             .take(boundary)
-            .any(|e| conforms(e.ty, "FeatureChaining"));
+            .any(|e| is_a!(e, "FeatureChaining"));
         self.checked_chain_bases_from(0, boundary, chained, steps)
     }
 
@@ -1612,7 +1601,7 @@ impl Builder {
             // identity reader cannot certify an unusually large/malformed graph.
             // Preserve qualification for every potentially affected Feature.
             for feature in start..boundary {
-                if conforms(self.elements[feature].ty, "Feature") {
+                if is_a!(self.elements[feature], "Feature") {
                     result.incomplete.insert(feature);
                 }
             }
@@ -1620,7 +1609,7 @@ impl Builder {
         };
         for feature in start..boundary {
             budget(&mut steps, 1)?;
-            if !conforms(self.elements[feature].ty, "Feature") {
+            if !is_a!(self.elements[feature], "Feature") {
                 continue;
             }
             let relationships = &self.elements[feature].owned_relationships;
@@ -1633,7 +1622,7 @@ impl Builder {
                 && !relationships.iter().any(|&r| {
                     self.elements
                         .get(r)
-                        .is_none_or(|e| conforms(e.ty, "FeatureChaining"))
+                        .is_none_or(|e| is_a!(e, "FeatureChaining"))
                 })
             {
                 continue;
@@ -1689,7 +1678,7 @@ pub(super) fn checked_feature_target(
             return None;
         }
         let relation = b.elements.get(relationship)?;
-        if !conforms(relation.ty, "FeatureChaining") {
+        if !is_a!(relation, "FeatureChaining") {
             continue;
         }
         if relationship >= endpoint_boundary
@@ -1938,7 +1927,7 @@ mod tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&rel| conforms(r.b.elements[rel].ty, "Specialization"))
+            .find(|&rel| is_a!(r.b.elements[rel], "Specialization"))
             .unwrap();
         let b_id = r.b.elem_id(b);
         r.b.set(relation, "general", id_ref(b_id));
@@ -2053,7 +2042,7 @@ impl FeaturingEvidence {
     ) -> Option<Option<usize>> {
         charge(steps, 1)?;
         let e = b.elements.get(feature)?;
-        if !conforms(e.ty, "Feature") {
+        if !is_a!(e, "Feature") {
             return None;
         }
         let rel = match e.owning_relationship {
@@ -2061,7 +2050,7 @@ impl FeaturingEvidence {
             None => return Some(None),
         };
         let membership = b.elements.get(rel)?;
-        if !conforms(membership.ty, "OwningMembership") {
+        if !is_a!(membership, "OwningMembership") {
             return None;
         }
         let owner = self.carrier(b, rel, steps)??;
@@ -2087,8 +2076,8 @@ impl FeaturingEvidence {
                 return None;
             }
         }
-        if conforms(membership.ty, "FeatureMembership") {
-            conforms(b.elements[owner].ty, "Type").then_some(Some(owner))
+        if is_a!(membership, "FeatureMembership") {
+            is_a!(b.elements[owner], "Type").then_some(Some(owner))
         } else {
             Some(None)
         }
@@ -2151,7 +2140,7 @@ impl FeaturingEvidence {
                 }
                 let id = relation.props.get("featuringType")?.as_reference()?;
                 let target = b.element_index_of_uuid(id)?;
-                if !conforms(b.elements[target].ty, "Type") {
+                if !is_a!(b.elements[target], "Type") {
                     return None;
                 }
                 validate_relationship_arrays(b, rel, feature, target, steps)?;
@@ -2266,8 +2255,8 @@ mod featuring_evidence_tests {
                     .iter()
                     .copied()
                     .find(|&r0| {
-                        conforms(r.b.elements[r0].ty, "Specialization")
-                            || conforms(r.b.elements[r0].ty, "Conjugation")
+                        is_a!(r.b.elements[r0], "Specialization")
+                            || is_a!(r.b.elements[r0], "Conjugation")
                     })
                     .unwrap();
                 let wrong = r.b.elements[b].id;
@@ -2292,7 +2281,7 @@ mod featuring_evidence_tests {
         let relation =
             r.b.elements
                 .iter()
-                .position(|e| conforms(e.ty, "TypeFeaturing"))
+                .position(|e| is_a!(e, "TypeFeaturing"))
                 .unwrap();
         let x_id = r.b.elements[x].id;
         let b_id = r.b.elements[b].id;
@@ -2333,7 +2322,7 @@ mod featuring_evidence_tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&rel| conforms(r.b.elements[rel].ty, "Specialization"))
+            .find(|&rel| is_a!(r.b.elements[rel], "Specialization"))
             .unwrap();
         let wrong = r.b.elements[b].id;
         r.b.elements[relation]
@@ -2357,7 +2346,7 @@ mod featuring_evidence_tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&r0| conforms(r.b.elements[r0].ty, "Specialization"))
+            .find(|&r0| is_a!(r.b.elements[r0], "Specialization"))
             .unwrap();
         r.b.elements[relation].children = vec![a, a].into();
         r.b.elements[a].owning_relationship = Some(relation);
@@ -2462,7 +2451,7 @@ mod owned_result_projection_tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&r| conforms(resolved.b.elements[r].ty, "FeatureValue"))
+            .find(|&r| is_a!(resolved.b.elements[r], "FeatureValue"))
             .unwrap();
         let expression = resolved.b.elements[value].children[0];
         (resolved, expression, target)
@@ -2663,8 +2652,8 @@ mod ordinary_owned_feature_tests {
                 1 => r.b.set(slot, "isComposite", serde_json::json!(true)),
                 2 => r.b.set(slot, "isVariable", serde_json::json!(true)),
                 3 => r.b.set(slot, "direction", serde_json::json!(false)),
-                4 => r.b.elements[membership].ty = "EndFeatureMembership",
-                5 => r.b.elements[parent].ty = "Function",
+                4 => r.b.elements[membership].set_ty("EndFeatureMembership"),
+                5 => r.b.elements[parent].set_ty("Function"),
                 _ => r.b.elements[parent]
                     .owned_relationships
                     .make_mut()

@@ -230,6 +230,8 @@ Nesting the package under a differently named root, or renaming it, clears both 
 
 ### Semantic constraints (`--lib`)
 
+Constructor arguments are checked as the feature values they are. `new T(…)` binds each argument to one public feature of `T` — a positional argument the feature at its position among `T`'s own features (declaration order) followed by the inherited ones, a named argument the feature of that name — and `check` reports an argument whose value can never conform to that feature's declared type (`new Iso8601DateTime(3)` passes a number for the String-typed encoding), an argument that rebinds a feature whose own value, or that of a feature it redefines, is not a default (`validateFeatureValueOverriding`, as for a written redefinition), a positional and a named argument landing on one feature, and a positional argument on a feature nothing can name (an invariant: a sequence meant as one argument). An argument past the features of the type and its written generals lands on a feature of an implied library base and is not checked. A lambda body's trailing expression is checked in the body's own scope, where an argument bound through a body parameter is undecided.
+
 Semantic checks run with or without a library; `--lib` supplies additional type and relationship information. The example below exercises multiplicity bounds (evaluated with the expression evaluator, so a bound can be an expression), self/circular specialization (errors), and duplicate specialization targets (warnings). Errors are raised only for what is *provably* wrong — a symbolic bound the evaluator cannot compute stays silent:
 
 ```sysml
@@ -323,6 +325,7 @@ $ $sysmlv2 check --format json broken.sysml
     "errors": 1,
     "hints": 0,
     "infos": 0,
+    "suppressed": 0,
     "warnings": 0
   }
 }
@@ -340,6 +343,7 @@ $ $sysmlv2 check --format json clean.sysml
     "errors": 0,
     "hints": 0,
     "infos": 0,
+    "suppressed": 0,
     "warnings": 0
   }
 }
@@ -486,9 +490,40 @@ $ echo $?
 1
 ```
 
+### Suppressing a finding in place
+
+A finding a project accepts at one site is silenced where it sits, in a note that names the rule. Notes — `// …` to the end of a line, `//* … */` across lines — are the hidden channel of the textual notation: they are not model elements, so a directive never reaches the interchange form, and a `/* … */` body, which is a `Comment` element, is never read as one. `sysmlint-disable-next-line <rules>` above a line governs that line (strictly the next one), `sysmlint-disable-line <rules>` trailing a line governs its own, and `sysmlint-disable <rules>` opens a range that `sysmlint-enable <rules>` closes on its own line, or that runs to the end of the file; the rule ids are comma-separated, and ` -- <reason>` may follow them. Given `site.sysml`:
+
+```sysml
+package Site {
+    // sysmlint-disable-next-line naming-convention -- the name the field crews use
+    part def spare_wheel;
+    part def wheel_nut; // sysmlint-disable-line naming-convention
+    // sysmlint-disable naming-convention
+    part def jack_stand;
+    part def lug_wrench;
+    // sysmlint-enable naming-convention
+    part def Hub; // sysmlint-disable-line naming-convention
+}
+```
+
+```console
+$ $sysmlv2 lint site.sysml
+warning: `naming-convention` is not reported on line 9; the directive suppresses nothing [lint-directive]
+  --> site.sysml:9:44
+   |
+   |     part def Hub; // sysmlint-disable-line naming-convention
+   |                                            ^^^^^^^^^^^^^^^^^
+
+4 finding(s) suppressed by directive
+1 warning(s)
+```
+
+Directives change what the pass reports, never what the rules see: a majority-spelling tally still counts a suppressed site, and the count of suppressed findings closes the text report (the JSON summary's `suppressed`). The directives are themselves policed by the rule `lint-directive` (warn by default, configurable like any other): a malformed one — an unknown verb or rule id, no rule named, an `enable` with nothing to re-enable — is reported, never ignored, and so is one that suppresses nothing, with a fix removing it (`--fix --fix-deletes`, since it deletes text the author wrote). A directive for a rule the configuration turns off is dormant, not unused, so a file written for a stricter policy elsewhere stays quiet here; `{"rules": {"lint-directive": {"reason": "required"}}}` additionally reports a directive without a ` -- reason`. `lint-config` findings have no location and cannot be suppressed. In an editor, every lint finding offers the quick fix "Disable `<rule>` for this line", which writes the next-line form above it — or adds the rule to a directive already there.
+
 ### `--fix` — applying the fixes
 
-Findings that carry a fix are applied in place by `--fix`, except the two guarded kinds: fixes that *delete* model text (an unused parameter's fix removes its declaration) additionally need `--fix-deletes`, and fixes that change what a declaration *means* (a usage keyword, a member's visibility) need `--fix-semantic`. Refused fixes are counted on stderr; every rewritten file must reparse cleanly before it is written back:
+Findings that carry a fix are applied in place by `--fix`, except the two guarded kinds: fixes that *delete* model text (an unused parameter's fix removes its declaration) additionally need `--fix-deletes`, and fixes that change what a declaration *means* (a usage keyword, a member's visibility, the value a unit applies to) need `--fix-semantic`. Refused fixes are counted on stderr; every rewritten file must reparse cleanly before it is written back:
 
 ```console
 $ $sysmlv2 lint --fix rig.sysml
@@ -597,6 +632,7 @@ $ $sysmlv2 lint --format json rig.sysml
     "errors": 0,
     "hints": 0,
     "infos": 0,
+    "suppressed": 0,
     "warnings": 2
   }
 }
@@ -622,14 +658,17 @@ rig.sysml:7:12 warn unused-parameter
 | `unqualified-enum-literal` | warn | an unresolved simple name matching exactly one enumeration literal | qualifies it |
 | `unit-spelling` | off | one unit spelled two ways across the model; the `style` option (`quoted-product` / `expression`) enforces a form | re-spells |
 | `dimensional-consistency` | warn | a quantity attribute whose declared type and value unit disagree; the `untyped` scope covers an untyped attribute whose value determines its type (needs the standard library) | re-types, or writes the inferred type |
+| `unit-precedence` | warn | a unit bracket on the right operand of `/`, `%`, `+`, `-`, `**` or `^` binds to that operand alone — `1 / 15 [km]` is `1 / (15 [km])`, a reciprocal length; silent when the left operand is itself a quantity (`2 * r + 20 [mm]`), when either side is indeterminate, and when parentheses settle it (needs the standard library) | parenthesizes the value, `(1 / 15) [km]` (`--fix-semantic`); the written binding made explicit, `1 / (15 [km])`, as the alternative |
+| `literal-pattern` | warn | a string bound to a feature whose declared type carries a `StringPatterns::Pattern` annotation (on the type or a supertype, in its body or `about` it; the ambient library annotates the standard library's ISO 8601 date-time encoding) that does not match the pattern — a feature value, a constructor argument or a calculation argument; a value in the annotation's broader `accepts` form reports at the `reduced` severity (info); the `patterns` option (configuration file only: a regular expression, or `{regex, accepts, form}`, backslashes doubled inside the JSON string) supplies or overrides a pattern per qualified type name; a lambda body's trailing expression is a site of its own, read in the body's scope | — |
 | `qualified-names` | off | one target spelled differently across reference sites; the `style` option (`qualified` / `minimal` / `imported`) enforces a policy | re-spells (adding an import under `imported`) |
 | `multiline-conditions` | off | a condition chain of `min` or more operands on one line (the formatter's threshold) | — |
 | `indentation` | off | leading whitespace off the project's `style` (tabs or spaces) and `size`; verbatim bodies keep their layout | re-indents |
 | `generated-provenance-invalid` | error | corrupted transformer ownership: markers without records, wrong or duplicate claims, malformed baselines | — |
 | `generated-provenance-baseline-outdated` | info | a provenance record predating the baseline fields (legacy, not tamper) | — |
 | `generated-element-modified` | warn | a generated member drifting from its provenance baseline (format-only drift, baseline drift, or a semantic edit) | — |
+| `lint-directive` | warn | a suppression directive — `// sysmlint-disable-next-line <rule>` above a line, `// sysmlint-disable-line <rule>` trailing it, `// sysmlint-disable <rule>` … `// sysmlint-enable <rule>` around a range — that is malformed or suppresses nothing; the `reason` option (`required`) also reports one without a ` -- reason` | removes the unused directive (`--fix-deletes`) |
 
-`--lib` supplies resolution context only (`dimensional-consistency` stays silent without the standard library's quantity types); library elements are never linted.
+`--lib` supplies resolution context only (`dimensional-consistency` and `unit-precedence` stay silent without the standard library's quantity types; `literal-pattern` reads the ambient `StringPatterns` library, whose annotation of the standard library's ISO 8601 date-time encoding needs the standard library to resolve); library elements are never linted. An attribute `unit-precedence` flags has no determinate dimension to type against, so `dimensional-consistency` says nothing about it until the binding is settled.
 
 `redefinition-outside-inheritance` is an authoring heuristic for owners with complete recorded explicit general contexts. It preserves intentionally imported or aliased members of the general, and skips qualified, unresolved and identity-spelled references. For example, `attribute :>> mass` can resolve to an imported quantity feature when the inherited vehicle has only `chassis.mass`. The warning names the target; it does not change the reference or insert `default`. To allow replacement of an inherited binding, `default` belongs on the earlier declaration that supplies that binding, not on the attempted override.
 
@@ -749,7 +788,41 @@ $ $sysmlv2 convert m.sysml --to compact-json --lib "$lib" | grep -A1 '"type"'
 
 Library elements participate in resolution but are not serialized — the output stays scoped to your model.
 
-Native directory loading saves a build- and content-identified `.prepared` snapshot and shares a live prepared library across SDK sessions. Warm loads reuse the resolved graph and static facts; source trees reconstruct on demand. Set `SYSMLV2_CACHE_DIR` to choose the cache directory or `SYSMLV2_LIB_CACHE=off` to disable library caching. A fresh process with a populated disk cache is warm; a retained SDK session also avoids disk decoding. Neither means the operating-system file cache is cold. In-memory/WASM bundles use the separate resolution-only snapshot API.
+Native directory loading saves a build- and content-identified `.prepared` snapshot and shares a live prepared library across SDK sessions. Warm loads reuse the resolved graph and static facts; source trees reconstruct on demand. Set `SYSMLV2_CACHE_DIR` to choose the cache directory or `SYSMLV2_LIB_CACHE=off` to disable library caching. A fresh process with a populated disk cache is warm; a retained SDK session also avoids disk decoding, and so does a later session in a process whose earlier sessions closed, since the two most recently decoded libraries stay in memory (`SYSMLV2_LIB_RETAIN=off` keeps none). On Windows the cache falls back to `%LOCALAPPDATA%\sysmlv2`, then `%USERPROFILE%\.cache\sysmlv2`, when none of the variables is set. Neither means the operating-system file cache is cold. In-memory/WASM bundles use the separate resolution-only snapshot API.
+
+### Shipping the snapshot — `prepare`
+
+The first run against a library prepares it from source, about 0.8 s for the standard library; every later run reads the snapshot. To make the first run as fast as the next — after an install, in a container, on a build agent — write the snapshot ahead of time and ship it beside the toolkit:
+
+```console
+$ $sysmlv2 prepare --lib "$lib" --out dist/prepared
+dist/prepared/stdlib-930ea712a6b7cf51.prepared
+dist/prepared/stdlib-930ea712a6b7cf51.libcache
+```
+
+A run whose cache has no snapshot for that library reads the two files from `dist/prepared` in place when the directory is given as `SYSMLV2_LIB_SNAPSHOT_DIR`, or is named `prepared` and lies beside the library directory (a library packaged with a host — a Python extension, a web bundle — ships its snapshot beside itself) or beside the executable:
+
+```console
+$ SYSMLV2_LIB_SNAPSHOT_DIR=dist/prepared SYSMLV2_CACHE_DIR=$(mktemp -d) $sysmlv2 check --lib "$lib" m.sysml
+```
+
+Nothing is copied into the cache. The files are for the toolkit build that wrote them, like the cache's own: another build passes them over and prepares the library from source.
+
+### A library bundle
+
+`--lib` (and `SYSMLV2_LIB_DIR`) may name a library bundle file instead of a directory: the JSON array of `{name, text}` units the WebAssembly package ships as `stdlib/sysml-library.json.gz`, decompressed. Its units load in array order under their bundle names and are keyed by their content as the package's `PreparedLibrary.fromSnapshot` keys them, so the prepared snapshot generated with the bundle (`sysml-library.prepared.gz`, decompressed, beside the bundle under its stem) is decoded instead of the library being prepared from source:
+
+```console
+$ ls stdlib/
+sysml-library.json  sysml-library.libcache  sysml-library.prepared
+$ $sysmlv2 check --lib stdlib/sysml-library.json m.sysml
+```
+
+A host that already holds the package's files, such as a browser terminal running the WebAssembly CLI, mounts them and pays no preparation on its first run. `<stem>.libcache` beside the bundle, when present, serves the builds that resolve the library together with the model. The cache's own snapshot of the bundle is read first; a snapshot from another toolkit build, of other units or for another graph format is passed over, and the library is prepared from the bundle and saved to the cache, as for a directory. Neither file may be compressed.
+
+A bundle loads exactly its units: it carries the ambient library when it was generated with it, nothing is added to it, and `SYSMLV2_AMBIENT` does not change it. Its units are named by their paths within the library (`Domain Libraries/Quantities and Units/SI.sysml`), not by file name, and every output that names a library unit names it by that path: `describe` locates a library element by it, and `check`'s `validateFeatureValueOverriding` finding, for a redefinition or a constructor argument that overrides a value the library binds, says the value is bound at that path. The library's nameless elements, whose ids derive from their unit's name, take the ids the WebAssembly package gives them, so `convert --library` and the full form's references to such elements differ from a directory load's. Named library elements keep their qualified-name ids.
+
+Only the two files beside the bundle and the cache directory are looked in: `SYSMLV2_LIB_SNAPSHOT_DIR` and the `prepared` directories hold snapshots named by a directory library's key, which a bundle's never matches. `prepare` and `lsp` take a directory and refuse a file.
 
 ### Ambient libraries
 
@@ -965,7 +1038,7 @@ isLong = true
 peakPower = 500000/3183
 ```
 
-Quantities (`2700 [mm]`) carry their units: same-unit values add and compare on the numbers, scalars scale them, and *different* units never mix silently — `1 [kg] + 1 [mm]` is a type error, not a wrong number. User-defined calculations invoke with positional or named arguments (`Power(rpm = 6000, torque = 250)`), and may recurse (bounded).
+Quantities (`2700 [mm]`) carry their units: same-unit values add and compare on the numbers, scalars scale them, and *different* units never mix silently — `1 [kg] + 1 [mm]` is a type error, not a wrong number. User-defined calculations invoke with positional or named arguments (`Power(rpm = 6000, torque = 250)`), and may recurse (bounded). A constructor (`new T(…)`) binds its positional arguments to `T`'s public features in order — its own in declaration order, then the inherited ones — valued or not, so a defaulted field can be set by position while rebinding a non-default value is an error.
 
 Note `carTotal`: the chain step `car.totalMass` evaluates the inherited expression in `car`'s **featuring context**, so the redefined `baseMass = 1200.0` shadows the definition's `1000.5`. Individual features evaluate by qualified name:
 
@@ -974,6 +1047,60 @@ $ $sysmlv2 eval demo.sysml Demo::carTotal Demo::Vehicle::totalMass
 Demo::carTotal = 1294
 Demo::Vehicle::totalMass = 1094.5
 ```
+
+### `--number-format` — how non-terminating results print
+
+`--number-format <SPEC>` chooses how a rational without a terminating decimal expansion prints in `eval`, `query`, and `verify`'s solver witnesses and narrowed ranges. Integers and terminating decimals always print as the exact decimal, and findings and the bindings that explain a verdict stay exact whatever the flag says. A spec is a style, then optional `key=value` settings after commas:
+
+| Style | `7/3` | Settings |
+|---|---|---|
+| `exact` (default) | `7/3` | `mixed` (`2 1/3`), `fraction-digits`, `digits` |
+| `approx` | `≈2.3333333333333335` | `digits` |
+| `overline` | `2.3̅` (U+0305 over each repeating digit) | `period`, `digits` |
+| `parens` | `2.(3)` | `period`, `digits` |
+| `unicode` | `2¹/₃` | `mixed`, `slash`, `glyphs`, `fraction-digits`, `digits` |
+
+- `digits=N`: significant digits of an approximate decimal, rounded on the exact value. This is the `approx` style's own precision and every other style's fallback. `0` means the double's shortest round-trip spelling, which is `approx`'s default; the other styles default to 6. Below `1e-6` and from `1e21` up, the approximate decimal takes an exponent (`≈3.33e399`).
+- `period=N`: the longest repeating period `overline` and `parens` write out, from 1 to 1000 (default 6). A longer period, or a non-repeating prefix longer than 15 digits, falls back to the approximate decimal.
+- `mixed=true|false`: write an improper fraction as a whole number and a proper fraction (default `false` for `exact`, `true` for `unicode`).
+- `slash=solidus|fraction|division`: the character between a `unicode` fraction's digits — `/`, `⁄` (U+2044) or `∕` (U+2215); default `solidus`.
+- `glyphs=true|false`: let `unicode` use a precomposed fraction (`⅓`, `⅔`, `⅙`, `⅚`, `⅐`, `⅑`) where one exists (default `false`).
+- `fraction-digits=N`: the most digits a numerator or denominator may have before the value falls back; a mixed number's whole part does not count. `0` means no limit, the `exact` default; `unicode` defaults to 2.
+
+A setting the style does not use is an error, as is an unknown style or setting. Given `gear.sysml`:
+
+```sysml
+package Gear {
+    attribute ratio = 7 / 3;
+    attribute share = 1 / 15;
+    attribute step = 360 / 7;
+}
+```
+
+```console
+$ $sysmlv2 eval gear.sysml --all --number-format exact,mixed=true
+ratio = 2 1/3
+share = 1/15
+step = 51 3/7
+$ $sysmlv2 eval gear.sysml --all --number-format approx,digits=4
+ratio = ≈2.333
+share = ≈0.06667
+step = ≈51.43
+$ $sysmlv2 eval gear.sysml --all --number-format parens
+ratio = 2.(3)
+share = 0.0(6)
+step = 51.(428571)
+$ $sysmlv2 eval gear.sysml --all --number-format unicode
+ratio = 2¹/₃
+share = ¹/₁₅
+step = 51³/₇
+$ $sysmlv2 eval gear.sysml --all --number-format parens,period=3
+ratio = 2.(3)
+share = 0.0(6)
+step = ≈51.4286
+```
+
+The language server takes the same spec for its value hints, hover values and range hints, where the default is also `exact`: `sysmlv2 lsp --number-format <SPEC>` sets the server's default, and a client's `initializationOptions.numberFormat` overrides it. Commands that print no values do not accept the flag.
 
 The `examples/evalstats` run computes 3,306/3,993 feature values (82.8%); 614 are indeterminate over unbound inputs and 73 return errors. Seventeen errors explicitly reject calculations requiring statement execution. These categories distinguish a computed value from a successful indeterminate result; `tests/eval.rs` gates evaluation without panics.
 

@@ -56,15 +56,32 @@ impl RestKey {
     }
 }
 
+/// What a session is current for: (uri string, version, text) per open
+/// document, sorted by uri (see [`Nav::fingerprint_of`]).
+type Fingerprint = Vec<(String, i32, OpenText)>;
+
+/// An open document's text in a [`Fingerprint`]. The version alone does
+/// not tell a document closed and opened again at the same version with
+/// other text from the one it replaces; the text does. Compared by
+/// identity first, so a document left as it was costs no comparison.
+#[derive(Clone)]
+struct OpenText(Arc<str>);
+
+impl PartialEq for OpenText {
+    fn eq(&self, other: &OpenText) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
 /// The session fingerprint, the package, and the actions planned for it.
-type SplitCache = (Vec<(String, i32)>, ElementRef, Vec<(String, WorkspaceEdit)>);
+type SplitCache = (Fingerprint, ElementRef, Vec<(String, WorkspaceEdit)>);
 
 /// The session read-only navigation answers from while the strict one
 /// cannot build (see [`Nav::read_session`]): the strict session's
 /// sources, the units that do not parse salvaged, for one fingerprint —
 /// `None` when even that could not build.
 struct Tolerant {
-    fingerprint: Vec<(String, i32)>,
+    fingerprint: Fingerprint,
     session: Option<Session>,
     /// Each unit as written, in the order the session was built from:
     /// positions in the session's units are read off these. Salvage
@@ -171,19 +188,265 @@ pub struct SplitResponse {
     pub edit: Option<WorkspaceEdit>,
 }
 
+/// The standard library's qualified symbol table and the measurement-unit
+/// types it declares — what completion and import fixes layer every
+/// workspace table over. Built from a syntax-tier parse of the library
+/// texts, one unit at a time, each unit's tree dropped before the next is
+/// parsed: no model build, since structure is syntactic. A prepared
+/// library's snapshot may carry what that parse yields (see
+/// [`ship_library_table`]); the table is then built from that instead.
+struct LibraryTable {
+    table: Arc<SymbolTable>,
+    /// The library's measurement-unit type, and the definitions
+    /// specializing it (see [`crate::kinds::unit_types`]).
+    unit_types: Arc<std::collections::HashSet<String>>,
+}
+
+/// The tag a prepared snapshot carries the library's symbols under (see
+/// [`ship_library_table`]).
+const LIBRARY_SYMBOLS: &str = "sysmlv2-lsp/library-symbols";
+
+/// This crate's build: a snapshot's library symbols are read back only
+/// when the same build walked the library (see `build.rs`).
+const BUILD: &str = env!("SYSMLV2_LSP_FINGERPRINT");
+
+impl LibraryTable {
+    /// The table of `library`'s units; empty without one.
+    fn build(library: Option<&Library>) -> LibraryTable {
+        let (symbols, links) = library.map(walk_library).unwrap_or_default();
+        LibraryTable::of(symbols, links)
+    }
+
+    /// The table of the symbols `prepared`'s snapshot carries, when this
+    /// build of the crate walked the library for it (see
+    /// [`ship_library_table`]); `None` otherwise, and once read.
+    fn shipped(prepared: &sysmlv2_parser::prepared::PreparedLibrary) -> Option<LibraryTable> {
+        let shipped = prepared.take_host_part::<Shipped>(LIBRARY_SYMBOLS)?;
+        if shipped.build != BUILD {
+            return None;
+        }
+        let (symbols, links) = shipped.walked()?;
+        Some(LibraryTable::of(symbols, links))
+    }
+
+    /// The table of what a walk over the library's units yields.
+    fn of(mut symbols: Vec<QualifiedSymbol>, mut links: Links) -> LibraryTable {
+        // Kept as long as the library is: no room to grow.
+        symbols.shrink_to_fit();
+        links.imports.shrink_to_fit();
+        let table = SymbolTable::new(symbols, links, None);
+        // The library's measurement-unit type, and the definitions
+        // specializing it — aliases of them too, as the table takes them.
+        let root = table
+            .symbols()
+            .iter()
+            .find(|s| {
+                s.qualified == "MeasurementReferences::MeasurementUnit"
+                    && matches!(s.decl, crate::kinds::Decl::Definition(_))
+            })
+            .map(|s| s.name.as_str());
+        let unit_types = crate::kinds::unit_types(
+            root,
+            &std::collections::HashSet::new(),
+            definitions(table.symbols()),
+        );
+        LibraryTable {
+            table: Arc::new(table),
+            unit_types: Arc::new(unit_types),
+        }
+    }
+}
+
+/// What the library table is built from: every named symbol of
+/// `library`'s units and their links, in library order.
+fn walk_library(library: &Library) -> (Vec<QualifiedSymbol>, Links) {
+    #[cfg(test)]
+    LIBRARY_WALKS.with(|n| n.set(n.get() + 1));
+    let mut symbols: Vec<QualifiedSymbol> = Vec::new();
+    let mut links = Links::default();
+    for_each_library_source(library, |name, text| {
+        let kerml = crate::is_kerml(name);
+        collect_unit(text, kerml, None, Encoding::Utf8, &mut symbols, &mut links);
+    });
+    (symbols, links)
+}
+
+/// Ship the library's symbols in the snapshots written from `prepared`:
+/// what a server builds its library symbol table from, stamped with this
+/// build of the crate. A server on a library decoded from such a snapshot
+/// with its hosts' parts kept
+/// ([`sysmlv2_parser::prepared::PreparedLibrary::from_bytes_with`]) builds
+/// the table from them instead of parsing every unit on its first
+/// completion or import fix, and answers the same; a server on a library
+/// decoded without them, or of another build, parses the units as before.
+pub fn ship_library_table(
+    prepared: &Arc<sysmlv2_parser::prepared::PreparedLibrary>,
+) -> std::io::Result<()> {
+    let (symbols, links) = walk_library(&Library::Prepared(Arc::clone(prepared)));
+    prepared.carry_host_part(LIBRARY_SYMBOLS, &Shipped::of(symbols, links))
+}
+
+/// What a prepared snapshot carries of the library's symbols (see
+/// [`ship_library_table`]): the build of this crate that walked the
+/// library, and what the walk yields — but for the qualified paths, which
+/// are spelled again on the way back: nearly every one is the path of a
+/// symbol before it and a name.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Shipped {
+    build: String,
+    symbols: Vec<QualifiedSymbol>,
+    links: Links,
+    /// Each symbol's qualified path, then the path of each declaration
+    /// whose specializations the links record, in order.
+    paths: Vec<Spelling>,
+}
+
+/// How a shipped qualified path is spelled again.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum Spelling {
+    /// The symbol's own name: a symbol at the root.
+    Name,
+    /// The path of the symbol at the index, which comes before this
+    /// one, then this symbol's name.
+    Under(u32),
+    /// The path of the symbol at the index.
+    Of(u32),
+    /// As it is: a path none of the others spells.
+    Spelled(String),
+}
+
+impl Shipped {
+    /// What a walk over the library yielded, as a snapshot carries it.
+    fn of(mut symbols: Vec<QualifiedSymbol>, mut links: Links) -> Shipped {
+        let paths = {
+            // The first symbol at each path.
+            let mut first: HashMap<&str, u32> = HashMap::new();
+            for (i, s) in (0u32..).zip(&symbols) {
+                first.entry(s.qualified.as_str()).or_insert(i);
+            }
+            let own = (0u32..).zip(&symbols).map(|(i, s)| {
+                if s.qualified == s.name {
+                    return Spelling::Name;
+                }
+                match s.parent().and_then(|parent| first.get(parent)) {
+                    Some(&parent) if parent < i => Spelling::Under(parent),
+                    _ => Spelling::Spelled(s.qualified.clone()),
+                }
+            });
+            let bases = links.bases.iter().map(|(path, _)| {
+                first
+                    .get(path.as_str())
+                    .map_or_else(|| Spelling::Spelled(path.clone()), |&i| Spelling::Of(i))
+            });
+            own.chain(bases).collect()
+        };
+        for s in &mut symbols {
+            s.qualified = String::new();
+        }
+        for (path, _) in &mut links.bases {
+            *path = String::new();
+        }
+        Shipped {
+            build: BUILD.to_string(),
+            symbols,
+            links,
+            paths,
+        }
+    }
+
+    /// What the walk yielded, its paths spelled again; `None` when the
+    /// spellings do not fit the symbols.
+    fn walked(self) -> Option<(Vec<QualifiedSymbol>, Links)> {
+        let Shipped {
+            mut symbols,
+            mut links,
+            paths,
+            ..
+        } = self;
+        if paths.len() != symbols.len() + links.bases.len() {
+            return None;
+        }
+        let mut paths = paths.into_iter();
+        for i in 0..symbols.len() {
+            symbols[i].qualified = match paths.next()? {
+                Spelling::Name => symbols[i].name.clone(),
+                Spelling::Under(parent) if (parent as usize) < i => {
+                    format!(
+                        "{}::{}",
+                        symbols[parent as usize].qualified, symbols[i].name
+                    )
+                }
+                Spelling::Spelled(path) => path,
+                Spelling::Under(_) | Spelling::Of(_) => return None,
+            };
+        }
+        for ((path, _), spelling) in links.bases.iter_mut().zip(paths) {
+            *path = match spelling {
+                Spelling::Of(i) => symbols.get(i as usize)?.qualified.clone(),
+                Spelling::Spelled(spelled) => spelled,
+                Spelling::Name | Spelling::Under(_) => return None,
+            };
+        }
+        Some((symbols, links))
+    }
+}
+
+/// Whether an open document among `uris` overlays the unit at `i` of the
+/// seeded `units`: a document overlays the first unit it names (see
+/// [`crate::worker::overlay_source`]), so a later spelling of the same
+/// unit keeps its seeded text.
+fn overlaid<'a>(
+    units: &[(String, String)],
+    i: usize,
+    mut uris: impl Iterator<Item = &'a str>,
+) -> bool {
+    let names = |uri: &str, unit: &(String, String)| crate::worker::same_unit(uri, &unit.0);
+    uris.any(|uri| names(uri, &units[i]) && !units[..i].iter().any(|unit| names(uri, unit)))
+}
+
+/// Each of the library's units as `(unit name, text)`, in library order:
+/// read in place, or a file at a time from a directory, never all copied
+/// at once.
+fn for_each_library_source(library: &Library, mut each: impl FnMut(&str, &str)) {
+    fn walk(dir: &std::path::Path, each: &mut dyn FnMut(&str, &str)) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, each);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("sysml") | Some("kerml")
+            ) {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    each(&path.display().to_string(), &text);
+                }
+            }
+        }
+    }
+    match library {
+        Library::Prepared(library) => library.sources().for_each(|(name, text)| each(name, text)),
+        Library::Sources { units, .. } => units.iter().for_each(|(name, text)| each(name, text)),
+        Library::Dir(dir) => walk(dir, &mut each),
+    }
+}
+
 pub struct Nav {
     pub library: Option<Library>,
     /// Every named symbol in the standard library with its qualified
-    /// path, and the library's imports — computed once per Nav from the
-    /// library *texts* (a syntax-tier parse; no model build), since
-    /// structure is syntactic. Feeds both the flat completion list
+    /// path, and the library's imports — computed from the library
+    /// *texts* (a syntax-tier parse; no model build), since structure is
+    /// syntactic, once per prepared library (see [`LibraryTable`]) or
+    /// else once per Nav. Feeds both the flat completion list
     /// (packages + direct members) and the qualifier-filtered
     /// import/member completions; shared with every workspace table,
     /// which layers over it.
     library_symbols: Option<Arc<SymbolTable>>,
     /// The measurement-unit types the library declares (see
     /// [`crate::kinds::unit_types`]), built with the library's table.
-    library_unit_types: std::collections::HashSet<String>,
+    library_unit_types: Arc<std::collections::HashSet<String>>,
     /// Workspace root: on-disk units under it join every session build
     /// (open documents overlaid), so navigation crosses into units the
     /// client never opened. Re-read at rebuild time — the worker tier's
@@ -210,7 +473,7 @@ pub struct Nav {
     /// The fingerprint the strict session last failed to build for — a
     /// unit that does not parse — so a request with the same documents
     /// does not parse them all again to find that out.
-    strict_failed: Option<Vec<(String, i32)>>,
+    strict_failed: Option<Fingerprint>,
     /// Read-only navigation's session while the strict one cannot build.
     tolerant: Option<Tolerant>,
     /// What the tolerant session's builds made of each unit.
@@ -218,8 +481,8 @@ pub struct Nav {
     /// Failures behind an empty answer, waiting for the server to pass
     /// them to the client ([`Nav::take_reports`]).
     reports: Vec<Report>,
-    /// (uri string, version) per open doc at the last rebuild.
-    fingerprint: Vec<(String, i32)>,
+    /// (uri string, version, text) per open doc at the last rebuild.
+    fingerprint: Fingerprint,
     /// The solverless verify pass shared by inlay hints and code
     /// lenses, cached per session build (both fire on every scroll —
     /// recomputing per request would run propagation dozens of times
@@ -243,6 +506,12 @@ pub struct Nav {
     /// `initializationOptions.hideRedundantValueHints` or the push
     /// server's setter.
     hide_redundant_value_hints: bool,
+    /// How evaluated-value inlay hints, hover values and range hints
+    /// write a rational without a terminating decimal expansion.
+    /// Default: the exact fraction (`1/3`); hosts
+    /// set it via `initializationOptions.numberFormat` or the push
+    /// server's setter.
+    number_format: sysmlv2_parser::numfmt::NumberFormat,
     /// The client declared `completionItem.snippetSupport` at
     /// `initialize`: a repair suffix riding a completion's main edit
     /// may carry a `$0` stop that parks the cursor before the
@@ -336,7 +605,7 @@ impl Nav {
         Nav {
             library,
             library_symbols: None,
-            library_unit_types: std::collections::HashSet::new(),
+            library_unit_types: Arc::default(),
             root: None,
             workspace: None,
             workspace_seed_symbols: None,
@@ -347,6 +616,7 @@ impl Nav {
             lint: None,
             split_cache: None,
             hide_redundant_value_hints: true,
+            number_format: sysmlv2_parser::numfmt::NumberFormat::exact(),
             snippet_completions: false,
             insert_replace_completions: false,
             signature_label_offsets: false,
@@ -433,6 +703,19 @@ impl Nav {
         self.hide_redundant_value_hints = on;
     }
 
+    /// Set how evaluated-value inlay hints, hover values and range
+    /// hints write a rational without a terminating decimal expansion
+    /// (the exact fraction by default). Like the redundant-hint
+    /// switch, answers change without any source changing, so the host
+    /// should ask clients to re-pull hints.
+    pub fn set_number_format(&mut self, format: sysmlv2_parser::numfmt::NumberFormat) {
+        if self.number_format != format {
+            self.number_format = format;
+            // Range hints are rendered when the verify pass runs.
+            self.verify = None;
+        }
+    }
+
     /// Set whether accepting a unit completion inside an untyped
     /// attribute's quantity bracket also declares the type the unit
     /// determines (on by default).
@@ -445,12 +728,66 @@ impl Nav {
     /// documents under, or an open document duplicates its on-model
     /// unit instead of overlaying it.
     ///
-    /// The completion tier's session stays: it is kept by the texts it
-    /// was built from, so a re-seed that leaves them as they were — the
-    /// host seeds every open document after each pause in typing —
-    /// leaves it current, and one that changes them has the next request
-    /// build another.
-    pub fn set_workspace_sources(&mut self, units: Arc<Vec<(String, String)>>) {
+    /// What was built from the previous units stays while it is current
+    /// for the new ones. Units seeded as they were — the same names in the
+    /// same order, the same texts — change nothing. Nor does a new text
+    /// for a unit an open document overlays, both now and in every
+    /// document set a held session (or a failed build) was made for: no
+    /// session over those documents reads the seeded copy — the host
+    /// seeds every open document after each pause in typing. Any other
+    /// change drops the navigation sessions and what was derived from
+    /// them.
+    ///
+    /// The completion tier's session stays either way: it is kept by the
+    /// texts it was built from, so a re-seed that leaves them as they
+    /// were leaves it current, and one that changes them has the next
+    /// request build another.
+    ///
+    /// Returns whether any unit's text, or the units, changed: answers
+    /// already given for one document may read another's text — a value
+    /// hint reads what another unit declares — so a client holding them
+    /// should re-pull, though the sessions that answer it were kept.
+    pub fn set_workspace_sources(
+        &mut self,
+        units: Arc<Vec<(String, String)>>,
+        docs: &BTreeMap<Uri, Document>,
+    ) -> bool {
+        let changed = self.reseeded_units(&units);
+        let current = changed
+            .as_ref()
+            .is_some_and(|changed| self.overlaid_wherever_held(changed, &units, docs));
+        let identical = changed.as_ref().is_some_and(Vec::is_empty);
+        let hash = |text: &str| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            hasher.finish()
+        };
+        if let (true, Some(changed)) = (current, changed) {
+            if !changed.is_empty() {
+                // The seeded units' own symbols are gathered again when
+                // next asked for; the workspace below a document stays
+                // while every changed unit was open beneath it, its
+                // seeded copy left out.
+                self.workspace_seed_symbols = None;
+                let rest_overlaid = self.workspace_rest.as_ref().is_some_and(|(key, _)| {
+                    changed.iter().all(|&i| {
+                        let name = &units[i].0;
+                        key.current == *name || key.others.iter().any(|(u, _)| u == name)
+                    })
+                });
+                if !rest_overlaid {
+                    self.workspace_rest = None;
+                }
+                for &i in &changed {
+                    if let Some(slot) = self.seed_hashes.get_mut(i) {
+                        slot.1 = hash(&units[i].1);
+                    }
+                }
+            }
+            self.workspace = Some(units);
+            return !identical;
+        }
         self.workspace = Some(units);
         self.workspace_seed_symbols = None;
         self.workspace_rest = None;
@@ -458,14 +795,55 @@ impl Nav {
             .workspace
             .iter()
             .flat_map(|units| units.iter())
-            .map(|(name, text)| {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                text.hash(&mut hasher);
-                (name.clone(), hasher.finish())
-            })
+            .map(|(name, text)| (name.clone(), hash(text)))
             .collect();
         self.invalidate_navigation();
+        true
+    }
+
+    /// The indexes of the units whose texts `units` changes, when it seeds
+    /// the units the workspace holds — the same names in the same order;
+    /// `None` when it seeds others, or none were seeded before.
+    fn reseeded_units(&self, units: &Arc<Vec<(String, String)>>) -> Option<Vec<usize>> {
+        let previous = self.workspace.as_ref()?;
+        if Arc::ptr_eq(previous, units) {
+            return Some(Vec::new());
+        }
+        let same_names = previous.len() == units.len()
+            && previous
+                .iter()
+                .zip(units.iter())
+                .all(|((a, _), (b, _))| a == b);
+        same_names.then(|| {
+            (0..units.len())
+                .filter(|&i| previous[i].1 != units[i].1)
+                .collect()
+        })
+    }
+
+    /// Whether every unit of `units` at the indexes `changed` is overlaid
+    /// by one of `docs`, and was overlaid in the document set of every
+    /// session, and of the failed build, held: what those were built from
+    /// then never read the seeded text the change replaces, and a build for
+    /// those documents now would not read the new one.
+    fn overlaid_wherever_held(
+        &self,
+        changed: &[usize],
+        units: &[(String, String)],
+        docs: &BTreeMap<Uri, Document>,
+    ) -> bool {
+        let held = [
+            self.session.as_ref().map(|_| &self.fingerprint),
+            self.tolerant.as_ref().map(|t| &t.fingerprint),
+            self.strict_failed.as_ref(),
+        ];
+        changed.iter().all(|&i| {
+            overlaid(units, i, docs.keys().map(|uri| uri.as_str()))
+                && held
+                    .iter()
+                    .flatten()
+                    .all(|fp| overlaid(units, i, fp.iter().map(|(uri, _, _)| uri.as_str())))
+        })
     }
 
     /// Drop the cached sessions (after a rename commit mutated one, the
@@ -903,6 +1281,8 @@ impl Nav {
         let fp = Self::fingerprint_of(docs);
         if self.session.is_none() || fp != self.fingerprint {
             if self.strict_failed.as_ref() == Some(&fp) {
+                // The documents' texts as held now (see below).
+                self.strict_failed = Some(fp);
                 return None;
             }
             let sources = self.assemble_sources(docs, &fp);
@@ -919,8 +1299,36 @@ impl Nav {
             self.verify = None;
             self.lint = None;
             self.split_cache = None;
+        } else {
+            // The same texts, perhaps under new handles (a document opened
+            // again with the text it had): hold those, so that the next
+            // request compares by identity again and the old copies go.
+            if let Some((cached, _, _)) = &mut self.split_cache {
+                if *cached == fp {
+                    cached.clone_from(&fp);
+                }
+            }
+            self.fingerprint = fp;
         }
         self.session.as_mut()
+    }
+
+    /// Whether every fingerprint held names each open document's text by
+    /// the handle the document holds.
+    #[cfg(test)]
+    pub(crate) fn fingerprints_hold_open_texts(&self, docs: &BTreeMap<Uri, Document>) -> bool {
+        let held = [
+            self.session.as_ref().map(|_| &self.fingerprint),
+            self.tolerant.as_ref().map(|t| &t.fingerprint),
+            self.strict_failed.as_ref(),
+            self.split_cache.as_ref().map(|(fp, _, _)| fp),
+        ];
+        held.into_iter().flatten().all(|fp| {
+            fp.iter().all(|(uri, _, text)| {
+                docs.iter()
+                    .any(|(u, d)| u.as_str() == uri && Arc::ptr_eq(&d.text, &text.0))
+            })
+        })
     }
 
     /// The models held right now: the strict session, read-only
@@ -932,14 +1340,14 @@ impl Nav {
             + usize::from(self.completion_session.is_some())
     }
 
-    /// (uri string, version) per open document, sorted: what a session
-    /// is current for.
-    fn fingerprint_of(docs: &BTreeMap<Uri, Document>) -> Vec<(String, i32)> {
-        let mut fp: Vec<(String, i32)> = docs
+    /// (uri string, version, text) per open document, sorted by uri: what
+    /// a session is current for.
+    fn fingerprint_of(docs: &BTreeMap<Uri, Document>) -> Fingerprint {
+        let mut fp: Fingerprint = docs
             .iter()
-            .map(|(u, d)| (u.to_string(), d.version))
+            .map(|(u, d)| (u.to_string(), d.version, OpenText(Arc::clone(&d.text))))
             .collect();
-        fp.sort();
+        fp.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
         fp
     }
 
@@ -960,7 +1368,11 @@ impl Nav {
             });
         }
         let fp = Self::fingerprint_of(docs);
-        if self.tolerant.as_ref().is_none_or(|t| t.fingerprint != fp) {
+        if let Some(t) = self.tolerant.as_mut().filter(|t| t.fingerprint == fp) {
+            // The same texts: hold them as the documents do (see
+            // [`Self::session`]).
+            t.fingerprint = fp;
+        } else {
             self.tolerant = None;
             // The strict session is for versions these documents have
             // left, and answers nothing for them: let it go rather than
@@ -997,14 +1409,14 @@ impl Nav {
     fn assemble_sources(
         &self,
         docs: &BTreeMap<Uri, Document>,
-        fp: &[(String, i32)],
+        fp: &[(String, i32, OpenText)],
     ) -> Vec<(String, String)> {
         let mut sources: Vec<(String, String)> = match (&self.workspace, &self.root) {
             (Some(units), _) => units.as_ref().clone(),
             (None, Some(root)) => crate::worker::root_sources(root),
             (None, None) => Vec::new(),
         };
-        for (u, _) in fp {
+        for (u, _, _) in fp {
             let uri = Uri::from_str(u).unwrap();
             crate::worker::overlay_source(&mut sources, u, &docs[&uri].text);
         }
@@ -1015,22 +1427,21 @@ impl Nav {
     /// when any unit fails to parse (sessions refuse parse errors) —
     /// the ordinary state of a document mid-edit, and the syntax tier
     /// already shows those errors; the units are parsed ahead of the
-    /// library, so that refusal costs no model build. A library that
-    /// cannot be read is not ordinary and is recorded for the client:
-    /// without it every model-backed answer here is silently empty.
+    /// library, so that refusal costs no model build, and the build
+    /// takes the trees parsed here rather than parsing every unit again.
+    /// A library that cannot be read is not ordinary and is recorded for
+    /// the client: without it every model-backed answer here is silently
+    /// empty.
     fn build_session(&mut self, sources: Vec<(String, String)>) -> Option<Session> {
-        let parses = |(name, text): &(String, String)| {
-            let parse = if crate::is_kerml(name) {
-                sysmlv2_parser::parser::parse_kerml_source(text)
-            } else {
-                sysmlv2_parser::parser::parse_source(text)
-            };
-            !parse.has_errors()
-        };
-        if !sources.iter().all(parses) {
-            return None;
+        let mut parsed = Vec::with_capacity(sources.len());
+        for (name, text) in &sources {
+            let unit = sysmlv2_parser::model::ParsedSource::new(name.as_str(), text);
+            if !unit.diagnostics().is_empty() {
+                return None;
+            }
+            parsed.push(unit);
         }
-        self.build_parsed_session(sources)
+        self.build_session_from(sources, Some(parsed))
     }
 
     /// [`Self::build_session`] for the completion tier, where one unit's
@@ -1053,6 +1464,16 @@ impl Nav {
     /// pass with the configured library — resolving the units, then
     /// loading the library into the session, would resolve them twice.
     fn build_parsed_session(&mut self, sources: Vec<(String, String)>) -> Option<Session> {
+        self.build_session_from(sources, None)
+    }
+
+    /// [`Self::build_parsed_session`], taking the units' syntax from
+    /// `parsed` — each of `sources` parsed, in order — when given.
+    fn build_session_from(
+        &mut self,
+        sources: Vec<(String, String)>,
+        parsed: Option<Vec<sysmlv2_parser::model::ParsedSource>>,
+    ) -> Option<Session> {
         #[cfg(test)]
         SESSION_BUILDS.with(|n| n.set(n.get() + 1));
         // The outcomes the most recent session settled on: the units this
@@ -1062,7 +1483,12 @@ impl Nav {
             .first()
             .and_then(|&kind| self.built(kind))
             .and_then(|(session, _)| session.settled_outcomes());
-        match Session::from_sources_settled(sources, self.library.clone(), settled) {
+        let library = self.library.clone();
+        let built = match parsed {
+            Some(parsed) => Session::from_parsed_settled(sources, parsed, library, settled),
+            None => Session::from_sources_settled(sources, library, settled),
+        };
+        match built {
             Ok(session) => Some(session),
             Err(e) => {
                 // With every unit parsing, what refuses the session is the
@@ -1328,11 +1754,7 @@ impl Nav {
         cut: Span,
     ) -> (Vec<(String, String)>, u64) {
         use std::hash::{Hash, Hasher};
-        let mut fp: Vec<(String, i32)> = docs
-            .iter()
-            .map(|(u, d)| (u.to_string(), d.version))
-            .collect();
-        fp.sort();
+        let fp = Self::fingerprint_of(docs);
         let mut sources = self.assemble_sources(docs, &fp);
         let name = uri.to_string();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1545,6 +1967,7 @@ impl Nav {
         offset: u32,
         enc: Encoding,
     ) -> Option<(String, Range)> {
+        let number_format = self.number_format;
         let read = self.read_session(docs)?;
         let session = &mut *read.session;
         let unit = Self::unit_of_static(uri, session)?;
@@ -1612,7 +2035,10 @@ impl Nav {
                 | sysmlv2_parser::eval::Value::UnboundMember(_),
             )
             | Err(_) => text,
-            Ok(v) => format!("{text}  \n= `{}`", resolved.render_value_approx(&v)),
+            Ok(v) => format!(
+                "{text}  \n= `{}`",
+                resolved.render_value_as(&v, &number_format)
+            ),
         };
         // Documentation bodies annotating the element join the card
         // under a rule, block-comment `*` gutters stripped. A named doc
@@ -2374,81 +2800,26 @@ impl Nav {
         })
     }
 
-    /// Completion: the dialect-merged keyword vocabulary plus
-    /// every name declared in the open documents, kinds mapped from the
-    /// outline. Deliberately position-blind in this first cut — the
-    /// body-context inversion of the validation matrix is the noted follow-up.
-    /// The library's `(unit name, text)` sources.
-    fn library_sources(lib: &Library) -> Vec<(String, String)> {
-        match lib {
-            Library::Prepared(library) => library
-                .sources()
-                .map(|(name, text)| (name.to_owned(), text.to_owned()))
-                .collect(),
-            Library::Sources { units, .. } => units.as_ref().clone(),
-            Library::Dir(dir) => {
-                fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-                    let Ok(entries) = std::fs::read_dir(dir) else {
-                        return;
-                    };
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            walk(&path, out);
-                        } else if matches!(
-                            path.extension().and_then(|e| e.to_str()),
-                            Some("sysml") | Some("kerml")
-                        ) {
-                            if let Ok(text) = std::fs::read_to_string(&path) {
-                                out.push((path.display().to_string(), text));
-                            }
-                        }
-                    }
-                }
-                let mut out = Vec::new();
-                walk(dir, &mut out);
-                out
-            }
-        }
-    }
-
     /// The standard library's qualified symbols ([`Self::library_table_ref`]).
     fn library_symbols(&mut self) -> &[QualifiedSymbol] {
         self.library_table_ref().symbols()
     }
 
-    /// The standard library's qualified symbol table, built once per Nav
-    /// from a syntax-tier parse of the library texts. Model-free by
-    /// design: structure is syntactic, and this must not add a
-    /// per-keystroke model build.
+    /// The standard library's qualified symbol table (see
+    /// [`LibraryTable`]), built on first use: once per prepared library,
+    /// which keeps it for every server on it — from the symbols its
+    /// snapshot carries, when it carries them — else once per Nav.
     fn library_table_ref(&mut self) -> &SymbolTable {
         if self.library_symbols.is_none() {
-            let mut symbols: Vec<QualifiedSymbol> = Vec::new();
-            let mut links = Links::default();
-            if let Some(lib) = &self.library {
-                for (name, text) in Self::library_sources(lib) {
-                    let kerml = crate::is_kerml(name.as_str());
-                    collect_unit(&text, kerml, None, Encoding::Utf8, &mut symbols, &mut links);
-                }
-            }
-            let table = SymbolTable::new(symbols, links, None);
-            // The library's measurement-unit type, and the definitions
-            // specializing it — aliases of them too, as the table takes
-            // them.
-            let root = table
-                .symbols()
-                .iter()
-                .find(|s| {
-                    s.qualified == "MeasurementReferences::MeasurementUnit"
-                        && matches!(s.decl, crate::kinds::Decl::Definition(_))
-                })
-                .map(|s| s.name.as_str());
-            self.library_unit_types = crate::kinds::unit_types(
-                root,
-                &std::collections::HashSet::new(),
-                definitions(table.symbols()),
-            );
-            self.library_symbols = Some(Arc::new(table));
+            let built = match &self.library {
+                Some(Library::Prepared(prepared)) => prepared.derived(|| {
+                    LibraryTable::shipped(prepared)
+                        .unwrap_or_else(|| LibraryTable::build(self.library.as_ref()))
+                }),
+                library => Arc::new(LibraryTable::build(library.as_ref())),
+            };
+            self.library_unit_types = Arc::clone(&built.unit_types);
+            self.library_symbols = Some(Arc::clone(&built.table));
         }
         self.library_symbols.as_deref().expect("built above")
     }
@@ -2483,17 +2854,6 @@ impl Nav {
         enc: Encoding,
     ) -> SymbolTable {
         let library = self.library_table();
-        if self.workspace_seed_symbols.is_none() {
-            if let Some(units) = &self.workspace {
-                let mut seed: Vec<QualifiedSymbol> = Vec::new();
-                let mut seed_links = Links::default();
-                for (name, text) in units.iter() {
-                    let kerml = crate::is_kerml(name);
-                    collect_unit(text, kerml, Some(name), enc, &mut seed, &mut seed_links);
-                }
-                self.workspace_seed_symbols = Some((seed, seed_links));
-            }
-        }
         let current = uri.to_string();
         let key = RestKey {
             others: docs
@@ -2509,6 +2869,17 @@ impl Nav {
             _ => {
                 let (mut symbols, mut links) =
                     workspace_symbols(docs.iter().filter(|(u, _)| u.to_string() != *current), enc);
+                if self.workspace_seed_symbols.is_none() {
+                    if let Some(units) = &self.workspace {
+                        let mut seed: Vec<QualifiedSymbol> = Vec::new();
+                        let mut seed_links = Links::default();
+                        for (name, text) in units.iter() {
+                            let kerml = crate::is_kerml(name);
+                            collect_unit(text, kerml, Some(name), enc, &mut seed, &mut seed_links);
+                        }
+                        self.workspace_seed_symbols = Some((seed, seed_links));
+                    }
+                }
                 if let Some((seed, seed_links)) = &self.workspace_seed_symbols {
                     let open: std::collections::HashSet<String> =
                         docs.keys().map(|u| u.to_string()).collect();
@@ -3091,11 +3462,7 @@ impl Nav {
         statement: Option<Span>,
         (before, after): (usize, usize),
     ) -> Option<Vec<ScopeMember>> {
-        let mut fp: Vec<(String, i32)> = docs
-            .iter()
-            .map(|(u, d)| (u.to_string(), d.version))
-            .collect();
-        fp.sort();
+        let fp = Self::fingerprint_of(docs);
         let now = self.assemble_sources(docs, &fp);
         let name = uri.to_string();
         // The text outside the body tells nothing of a statement salvaged
@@ -3827,7 +4194,7 @@ impl Nav {
             resolved,
             model,
             None,
-            &sysmlv2_solve::PropagateConfig::default(),
+            &sysmlv2_solve::PropagateConfig::default().with_number_format(self.number_format),
         )
         .ok();
     }
@@ -3836,14 +4203,25 @@ impl Nav {
     /// non-literal value expression the evaluator settles) and
     /// propagated ranges (`∈ [10, +∞] [m]` after the declared name of a
     /// feature whose domain the asserted constraints narrow).
+    ///
+    /// With a `range`, only the hints placed inside it (its ends
+    /// included) are computed — a client asks for what is in view — and
+    /// they are the whole document's hints there. The caps stay the
+    /// document's: the candidates are the document's first 200 value
+    /// expressions and the verify pass's first 200 narrowed ranges,
+    /// wherever the range lies.
     pub fn inlay_hints(
         &mut self,
         docs: &BTreeMap<Uri, Document>,
         uri: &Uri,
+        range: Option<Range>,
         enc: Encoding,
     ) -> Vec<lsp_types::InlayHint> {
+        let within =
+            |position: Position| range.is_none_or(|r| r.start <= position && position <= r.end);
         use sysmlv2_parser::ast::ExprKind;
         let hide_redundant = self.hide_redundant_value_hints;
+        let number_format = self.number_format;
         let Some(doc_text) = docs.get(uri).map(|d| d.text.clone()) else {
             return Vec::new();
         };
@@ -3891,6 +4269,10 @@ impl Nav {
         };
         v.visit_unit(&parse.unit);
         for (name_span, expr_span, bare_ref) in v.sites.into_iter().take(200) {
+            let position = mapper.position(expr_span.end);
+            if !within(position) {
+                continue;
+            }
             let Some(e) = session.resolved().declaration_at(unit, name_span.start) else {
                 continue;
             };
@@ -3912,23 +4294,20 @@ impl Nav {
                         None => continue,
                     }
                 }
-                // Editor hints favour a glanceable decimal over an exact
-                // fraction (`≈0.3333333333333333`, not `1/3`).
-                v => session.resolved().render_value_approx(&v),
+                // In the configured number format: by default the exact
+                // fraction (`1/3`).
+                v => session.resolved().render_value_as(&v, &number_format),
             };
-            // A hint that restates the declared expression token for
-            // token (`x = 3.63 [kg]` ⇒ ` = 3.63 [kg]`) adds nothing.
+            // A hint that restates the declared expression (`x = 3.63 [kg]`,
+            // `10[kg]` or `10 ['m/s²']` ⇒ ` = 10 [m/s²]`) adds nothing.
             if hide_redundant
-                && expr_span
-                    .slice(&doc_text)
-                    .split_whitespace()
-                    .eq(rendered.split_whitespace())
+                && hint_spelling(expr_span.slice(&doc_text)) == hint_spelling(&rendered)
             {
                 continue;
             }
             let label = format!(" = {rendered}");
             out.push(lsp_types::InlayHint {
-                position: mapper.position(expr_span.end),
+                position,
                 label: lsp_types::InlayHintLabel::String(label),
                 kind: None,
                 text_edits: None,
@@ -3981,15 +4360,19 @@ impl Nav {
                 if dunit != unit {
                     continue;
                 }
-                // Editor hints take the glanceable spelling: a bound
-                // without a terminating decimal expansion shows as an
-                // approximate decimal rather than a fraction.
+                let position = mapper.position(dspan.end);
+                if !within(position) {
+                    continue;
+                }
+                // Editor hints take the display range: a bound without a
+                // terminating decimal expansion in the configured number
+                // format (the exact fraction by default).
                 let label = match &r.unit {
                     Some(u) => format!(" ∈ {} [{u}]", r.range_approx),
                     None => format!(" ∈ {}", r.range_approx),
                 };
                 out.push(lsp_types::InlayHint {
-                    position: mapper.position(dspan.end),
+                    position,
                     label: lsp_types::InlayHintLabel::String(label),
                     kind: None,
                     text_edits: None,
@@ -4149,7 +4532,7 @@ impl Nav {
         enc: Encoding,
     ) -> Option<Location> {
         if let Some((name, text)) = session.library_unit(unit) {
-            let uri = format!("sysmlv2-lib:/{}", crate::worker::encode_uri_path(name));
+            let uri = crate::worker::library_uri(name);
             let mapper = Mapper::new(text, enc);
             return Some(Location {
                 uri: Uri::from_str(&uri).ok()?,
@@ -4346,6 +4729,42 @@ fn quoted_name_at(text: &str, offset: u32) -> Option<(String, u32)> {
 
 fn is_identifier(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(is_ident_byte) && !s.as_bytes()[0].is_ascii_digit()
+}
+
+/// The spelling a value hint is compared by against its declared
+/// expression: whitespace outside string literals dropped and quoted
+/// names unquoted (escapes resolved), so `10[kg]` and `10 ['kg']` both
+/// read as the `10 [kg]` a hint renders. String literals stay verbatim.
+fn hint_spelling(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {}
+            '"' => {
+                out.push(c);
+                while let Some(d) = chars.next() {
+                    out.push(d);
+                    if d == '\\' {
+                        out.extend(chars.next());
+                    } else if d == '"' {
+                        break;
+                    }
+                }
+            }
+            '\'' => {
+                while let Some(d) = chars.next() {
+                    match d {
+                        '\\' => out.extend(chars.next()),
+                        '\'' => break,
+                        d => out.push(d),
+                    }
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Candidates within a small edit distance of `name`, best first —
@@ -4578,7 +4997,7 @@ fn unmatched_whole(filter: &str, tail: &str) -> String {
 /// declares the very word being typed, and offering that back
 /// (qualified into its accidental owner) would outrank the real
 /// target.
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct QualifiedSymbol {
     name: String,
     qualified: String,
@@ -6046,6 +6465,8 @@ thread_local! {
     pub(crate) static SESSION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Enclosing elements' member lists read off a model on this thread.
     pub(crate) static MEMBER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Walks over a library's texts for its symbol table on this thread.
+    pub(crate) static LIBRARY_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -6150,5 +6571,175 @@ mod context_tests {
         let text = "package P { part x : ISQ::Torque }";
         let cx = completion_context(text, 32, Dialect::Sysml);
         assert!(cx.dot_chain.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod library_table_tests {
+    use super::{LIBRARY_SYMBOLS, LIBRARY_WALKS, Nav, Shipped};
+    use std::sync::Arc;
+    use sysmlv2_parser::prepared::PreparedLibrary;
+    use sysmlv2_transform::Library;
+
+    /// The standard library's units, by file name, in name order.
+    fn standard_library() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        sysmlv2_testkit::collect_files(&sysmlv2_testkit::library_dir(), &mut files);
+        files.sort();
+        let units: Vec<(String, String)> = files
+            .iter()
+            .map(|f| {
+                let name = f.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(f).expect("library unit"))
+            })
+            .collect();
+        assert!(units.len() > 90, "the standard library");
+        units
+    }
+
+    /// A table's symbols, imports and specializations, spelled out: what
+    /// each declaration specializes is held by path, unordered.
+    fn spelled(table: &super::SymbolTable) -> (String, String, String) {
+        let (symbols, mut links) = table.parts();
+        links.bases.sort_by(|a, b| a.0.cmp(&b.0));
+        (
+            format!("{symbols:?}"),
+            format!("{:?}", links.imports),
+            format!("{:?}", links.bases),
+        )
+    }
+
+    /// The standard library's symbol table is made once per prepared
+    /// library — every server on it reads the one table — and is the
+    /// table a server makes of the same units on its own: the same
+    /// symbols, imports and specializations in the same order, and the
+    /// same measurement-unit types.
+    #[test]
+    fn the_library_table_is_made_once_per_prepared_library() {
+        let units = standard_library();
+        let prepared = Library::prepared_sources(units.clone(), None).unwrap();
+        let mut first = Nav::new_with(Some(prepared.clone()));
+        let mut second = Nav::new_with(Some(prepared));
+        let shared = first.library_table();
+        assert!(Arc::ptr_eq(&shared, &second.library_table()));
+        assert!(Arc::ptr_eq(
+            &first.library_unit_types,
+            &second.library_unit_types
+        ));
+        let mut own = Nav::new_with(Some(Library::sources(units)));
+        let table = own.library_table();
+        assert!(table.symbols().len() > 1000, "{}", table.symbols().len());
+        assert_eq!(spelled(&shared), spelled(&table));
+        assert!(!own.library_unit_types.is_empty());
+        assert_eq!(first.library_unit_types, own.library_unit_types);
+    }
+
+    /// The library's symbols a prepared snapshot carries are what a walk
+    /// over its texts yields — every symbol, import and specialization,
+    /// every field, in walk order — and a server on a library decoded from
+    /// that snapshot with its hosts' parts kept, held whole or fed in
+    /// chunks, builds its table from them without parsing a unit: the table
+    /// a server parsing the texts builds, with the same measurement-unit
+    /// types. A server on a library decoded the default way, which drops
+    /// them, parses the texts and builds the same table.
+    #[test]
+    fn the_library_table_a_snapshot_carries_is_the_one_its_texts_make() {
+        let Library::Prepared(prepared) =
+            Library::prepared_sources(standard_library(), None).expect("the library prepares")
+        else {
+            unreachable!("a prepared library");
+        };
+        let library = Library::Prepared(Arc::clone(&prepared));
+        let (symbols, links) = super::walk_library(&library);
+        let walked = format!("{symbols:?}\n{links:?}");
+        let mut parsing = Nav::new_with(Some(Library::Prepared(Arc::clone(&prepared))));
+        let parsed = parsing.library_table();
+        super::ship_library_table(&prepared).unwrap();
+        let bytes = prepared.to_bytes(1).unwrap();
+        let feed = |bytes: &[u8]| {
+            let mut at = 0;
+            let bytes = bytes.to_vec();
+            move |buf: &mut [u8]| {
+                let n = buf.len().min(1000).min(bytes.len() - at);
+                buf[..n].copy_from_slice(&bytes[at..at + n]);
+                at += n;
+                n
+            }
+        };
+        let carried = PreparedLibrary::from_bytes_with(&bytes, 1, true).unwrap();
+        let shipped = carried
+            .take_host_part::<Shipped>(LIBRARY_SYMBOLS)
+            .expect("the snapshot carries the library's symbols");
+        assert_eq!(shipped.build, super::BUILD);
+        assert!(
+            shipped.symbols.iter().all(|s| s.qualified.is_empty()),
+            "no path is carried in the symbols"
+        );
+        let as_is = shipped
+            .paths
+            .iter()
+            .filter(|p| matches!(p, super::Spelling::Spelled(_)))
+            .count();
+        assert_eq!(
+            as_is, 0,
+            "every path is spelled from a name and another path"
+        );
+        let (symbols, links) = shipped.walked().expect("the paths are spelled again");
+        assert_eq!(format!("{symbols:?}\n{links:?}"), walked);
+        for (decoded, parses) in [
+            (
+                PreparedLibrary::from_bytes_with(&bytes, 1, true).unwrap(),
+                0,
+            ),
+            (
+                PreparedLibrary::from_chunks_with(bytes.len(), feed(&bytes), 1, true).unwrap(),
+                0,
+            ),
+            (PreparedLibrary::from_bytes(&bytes, 1).unwrap(), 1),
+            (
+                PreparedLibrary::from_chunks(bytes.len(), feed(&bytes), 1).unwrap(),
+                1,
+            ),
+        ] {
+            let walks = LIBRARY_WALKS.with(std::cell::Cell::get);
+            let mut nav = Nav::new_with(Some(Library::Prepared(Arc::new(decoded))));
+            let table = nav.library_table();
+            assert_eq!(
+                LIBRARY_WALKS.with(std::cell::Cell::get),
+                walks + parses,
+                "units parsed only without the shipped symbols"
+            );
+            assert_eq!(spelled(&table), spelled(&parsed));
+            assert_eq!(nav.library_unit_types, parsing.library_unit_types);
+        }
+    }
+
+    /// Symbols another build of the crate walked are not read back: a
+    /// server parses the library's texts instead, and builds the table
+    /// it always did.
+    #[test]
+    fn a_library_table_another_build_walked_is_parsed_again() {
+        let Library::Prepared(prepared) =
+            Library::prepared_sources(standard_library(), None).expect("the library prepares")
+        else {
+            unreachable!("a prepared library");
+        };
+        let (symbols, links) = super::walk_library(&Library::Prepared(Arc::clone(&prepared)));
+        let parsed = super::LibraryTable::of(symbols.clone(), links.clone());
+        let mut shipped = Shipped::of(symbols, links);
+        shipped.build = "another build".into();
+        prepared.carry_host_part(LIBRARY_SYMBOLS, &shipped).unwrap();
+        let decoded =
+            PreparedLibrary::from_bytes_with(&prepared.to_bytes(1).unwrap(), 1, true).unwrap();
+        let walks = LIBRARY_WALKS.with(std::cell::Cell::get);
+        let mut nav = Nav::new_with(Some(Library::Prepared(Arc::new(decoded))));
+        let table = nav.library_table();
+        assert_eq!(
+            LIBRARY_WALKS.with(std::cell::Cell::get),
+            walks + 1,
+            "parsed"
+        );
+        assert_eq!(spelled(&table), spelled(&parsed.table));
+        assert_eq!(nav.library_unit_types, parsed.unit_types);
     }
 }

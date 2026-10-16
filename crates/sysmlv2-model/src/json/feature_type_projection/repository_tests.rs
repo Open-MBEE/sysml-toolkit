@@ -59,7 +59,7 @@ fn cross_subsetting_does_not_contribute_typing_dependencies() {
         .copied()
         .find(|&edge| r.b.elements[edge].ty == "Subsetting")
         .unwrap();
-    r.b.elements[relation].ty = "CrossSubsetting";
+    r.b.elements[relation].set_ty("CrossSubsetting");
     let mut steps = 0;
     let mut evidence = RepositoryTyping::new(&mut r.b, &mut steps).unwrap();
     let input = evidence.inputs(y, &mut steps).unwrap();
@@ -215,7 +215,7 @@ fn nested_composite_owner_proof_refuses_mutations_cycles_and_budget_then_retries
         // Ordinary typed Kernel Feature owners use the same complete owner
         // projection; the child remains a SysML OccurrenceUsage.
         let original_properties = r.b.elements[owner.0].props.clone();
-        r.b.elements[owner.0].ty = "Feature";
+        r.b.elements[owner.0].set_ty("Feature");
         r.b.elements[owner.0]
             .props
             .insert("isVariable", json!(false));
@@ -223,7 +223,7 @@ fn nested_composite_owner_proof_refuses_mutations_cycles_and_budget_then_retries
             .props
             .insert("isComposite", json!(false));
         assert_eq!(r.feature_type_report(child).types, Ok(vec![ty]));
-        r.b.elements[owner.0].ty = "OccurrenceUsage";
+        r.b.elements[owner.0].set_ty("OccurrenceUsage");
         r.b.elements[owner.0].props = original_properties;
         let properties = r.b.elements[owner.0].props.clone();
         for (name, value) in [

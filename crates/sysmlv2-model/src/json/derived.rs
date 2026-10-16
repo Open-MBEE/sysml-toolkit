@@ -26,6 +26,7 @@
 use super::derived_compositions::COMPOSITIONS;
 use super::{ElementRef, ResolvedModel};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use crate::properties::Atom;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -473,6 +474,33 @@ pub fn dangling_id(spelling: &str) -> String {
 /// bases (`ownedDisjoining = ownedRelationship->selectByKind(Disjoining)`).
 const OWNED_BASES: &[&str] = &["ownedRelationship"];
 
+/// The derived names a feature-reference expression answers without its
+/// implied relationships: its names and the chain of its owners, read from
+/// its own row, its owners' rows and the naming rule. The implied
+/// relationships add only what an element owns — its implied
+/// specializations, the expression's generated result — and the naming
+/// rule reads the written redefinitions and the positional targets of the
+/// owner's heritage, not the implied `Redefinition` rows (`naming.rs`).
+/// A read of one of these defers the implied relationships rather than
+/// skipping them: the next read that may depend on them — a derived read
+/// of another name, of any element, or a checked read computed from them
+/// — makes them first (`implied_deferred`), so a host that asks only these
+/// never pays for them and those reads answer as before.
+/// `derived_reads_tests` holds every element's answers to these, over the
+/// corpus, to the ones read once the implied relationships are made.
+pub(super) const NAMES_AND_OWNERS: &[&str] = &[
+    "endOwningType",
+    "isLibraryElement",
+    "name",
+    "owner",
+    "owningFeatureMembership",
+    "owningMembership",
+    "owningNamespace",
+    "owningType",
+    "qualifiedName",
+    "shortName",
+];
+
 fn is_exact(name: &str) -> bool {
     EXACT.binary_search(&name).is_ok()
 }
@@ -717,8 +745,19 @@ impl ResolvedModel {
     /// arm, so callers hold the invariant.
     pub(crate) fn derived_computable(&mut self, e: ElementRef, name: &str) -> Derived {
         let ty = self.b.elements[e.0].ty;
-        if ty == "FeatureReferenceExpression" {
-            self.ensure_implied();
+        // A feature-reference expression's result comes with the implied
+        // relationships, which are materialized for the whole model at
+        // once; a read of what the expression owns or specializes needs
+        // them, a read of its names or of its owners does not. Such a read
+        // defers them instead: the next read that may depend on them, of
+        // any element, makes them first, so it answers as it would have
+        // had this read made them.
+        if ty == "FeatureReferenceExpression" || self.implied_deferred {
+            if !NAMES_AND_OWNERS.contains(&name) {
+                self.ensure_implied();
+            } else if ty == "FeatureReferenceExpression" {
+                self.implied_deferred = true;
+            }
         }
         use DerivedValue as V;
         // The typing-side original is a single reference, unlike PortUsage's
@@ -1054,7 +1093,7 @@ impl ResolvedModel {
     }
 
     pub(super) fn is_kind(&self, e: ElementRef, general: &str) -> bool {
-        conforms(self.b.elements[e.0].ty, general)
+        self.b.elements[e.0].conforms(general)
     }
 
     // ---- Element ----
@@ -1106,7 +1145,9 @@ impl ResolvedModel {
     /// looser filter keeps a foreign payload's shape visible).
     fn d_owning_membership(&self, e: ElementRef) -> Option<ElementRef> {
         let rel = self.b.elements[e.0].owning_relationship?;
-        conforms(self.b.elements[rel].ty, "Membership").then_some(ElementRef(rel))
+        self.b.elements[rel]
+            .conforms("Membership")
+            .then_some(ElementRef(rel))
     }
 
     /// `Element::owningNamespace = owningMembership.membershipOwningNamespace`.
@@ -1134,7 +1175,7 @@ impl ResolvedModel {
     ) -> Vec<ElementRef> {
         self.projected_owned_relationships(e)
             .into_iter()
-            .filter(|r| conforms(self.b.elements[r.0].ty, general))
+            .filter(|r| self.b.elements[r.0].conforms(general))
             .collect()
     }
 
@@ -1147,7 +1188,7 @@ impl ResolvedModel {
     pub(super) fn d_owned_members(&self, e: ElementRef) -> Vec<ElementRef> {
         self.d_owned_memberships(e)
             .into_iter()
-            .filter(|&m| conforms(self.b.elements[m.0].ty, "OwningMembership"))
+            .filter(|&m| is_a!(self.b.elements[m.0], "OwningMembership"))
             .filter_map(|m| self.d_owned_member_element(m))
             .collect()
     }
@@ -1433,7 +1474,9 @@ impl ResolvedModel {
     /// is a FeatureMembership.
     fn d_owning_feature_membership(&self, e: ElementRef) -> Option<ElementRef> {
         let rel = self.b.elements[e.0].owning_relationship?;
-        conforms(self.b.elements[rel].ty, "FeatureMembership").then_some(ElementRef(rel))
+        self.b.elements[rel]
+            .conforms("FeatureMembership")
+            .then_some(ElementRef(rel))
     }
 
     /// `Feature::owningType = owningFeatureMembership.owningType`.
@@ -1835,7 +1878,7 @@ impl ResolvedModel {
             .get("importedMembership")?
             .clone();
         match self.reference_of(&atom)? {
-            Reference::Element(m) if conforms(self.b.elements[m.0].ty, "Membership") => {
+            Reference::Element(m) if is_a!(self.b.elements[m.0], "Membership") => {
                 self.d_member_element(m)
             }
             // A foreign payload may reference the element directly.

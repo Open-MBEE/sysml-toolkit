@@ -1,6 +1,7 @@
 //! Rule-required positional redefinitions, shared by inheritance and the
 //! materialized relationship view. This table never changes compact storage.
 
+use super::implied;
 #[cfg(test)]
 use super::membership_projection::{reset_scratch_map, reset_scratch_set};
 use super::{
@@ -10,34 +11,126 @@ use super::{
         Reduction, charge,
     },
 };
+use crate::flat::ListsByRow;
+use crate::layered::{IdMap, IdSet};
 use crate::metaclass::conforms;
-use std::collections::{HashMap, HashSet};
+use crate::metaclass::is_a;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub(super) struct PositionalRedefinitions {
-    pub targets: HashMap<usize, Vec<usize>>,
-    pub incomplete: HashSet<usize>,
+    pub targets: IdMap<usize, Vec<usize>>,
+    pub incomplete: IdSet<usize>,
+}
+
+/// A positional plan as a snapshot carries it: its maps as vectors sorted by
+/// key, so that the same plan is written the same way every time.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct PositionalRedefinitionsWire {
+    targets: crate::bulk::IndexLists,
+    incomplete: crate::bulk::Ints,
+}
+
+impl PositionalRedefinitions {
+    /// This plan as a snapshot carries it.
+    pub(super) fn to_wire(&self) -> PositionalRedefinitionsWire {
+        PositionalRedefinitionsWire {
+            targets: implied::sorted_by_key(self.targets.iter().map(|(f, t)| (*f, t.clone())))
+                .into(),
+            incomplete: crate::bulk::Ints(implied::sorted(self.incomplete.iter().copied())),
+        }
+    }
+
+    /// A plan read back from its wire form, over `rows` rows; `None` when
+    /// the wire names a row there is not.
+    pub(super) fn from_wire(wire: PositionalRedefinitionsWire, rows: usize) -> Option<Self> {
+        let targets = wire.targets.into_lists()?;
+        let incomplete = wire.incomplete.0;
+        let in_range = |i: usize| i < rows;
+        let fits = targets
+            .iter()
+            .all(|(f, ts)| in_range(*f) && ts.iter().all(|&t| in_range(t)))
+            && incomplete.iter().all(|&f| in_range(f));
+        fits.then(|| Self {
+            targets: targets.into_iter().collect(),
+            incomplete: incomplete.into_iter().collect(),
+        })
+    }
+}
+
+/// A budgeted planning attempt that ran out of budget: what it planned over
+/// — the revisions of the element, specialization, resolved-target and
+/// library-name rows, the library-name configuration and the implied plan
+/// it started from — and the budget it had after the entry charge. Planning
+/// is a function of those inputs, so an attempt over the same inputs with
+/// no more budget fails the same way.
+#[derive(Clone)]
+pub(super) struct BudgetExhausted {
+    rows: crate::layered::Revision,
+    specs: crate::layered::Revision,
+    resolved: crate::layered::Revision,
+    names: crate::layered::Revision,
+    library_configuration: bool,
+    implied: Option<usize>,
+    remaining: usize,
+}
+
+/// The identity of a published implied plan, as the memo of exhausted
+/// attempts compares it: the same allocation is the same plan. An address
+/// reused by a later plan stands for an equally warm one, so a refusal on
+/// it is still right.
+fn implied_identity(plan: &Arc<implied::SupportedImpliedSpecializations>) -> usize {
+    Arc::as_ptr(plan) as usize
+}
+
+/// What a planning attempt leaves behind for the next one even when it
+/// runs out of budget: the implied plan, the decision whether the library's
+/// plans are extended, the identity index and the structural certificate.
+/// An attempt that advanced any of these is not remembered as exhausted,
+/// because a repeat starts further along. Presence suffices for the index
+/// and the certificate: one that went stale was dropped with a revision
+/// change the memo keys on anyway.
+#[derive(PartialEq, Eq)]
+struct PlanningProgress {
+    implied: Option<usize>,
+    library_plans_decided: bool,
+    id_index: bool,
+    stored_structure: bool,
 }
 
 /// The direct bases a positional planning reads, by type: a table of them, or
 /// a build's own over its prepared library's ([`OverLibrary`]).
 pub(super) trait DirectBases {
-    fn get(&self, e: &usize) -> Option<&Vec<usize>>;
+    fn get(&self, e: &usize) -> Option<&[usize]>;
 }
-impl DirectBases for HashMap<usize, Vec<usize>> {
-    fn get(&self, e: &usize) -> Option<&Vec<usize>> {
-        HashMap::get(self, e)
+impl DirectBases for IdMap<usize, Vec<usize>> {
+    fn get(&self, e: &usize) -> Option<&[usize]> {
+        HashMap::get(self, e).map(Vec::as_slice)
+    }
+}
+impl DirectBases for ListsByRow<usize> {
+    fn get(&self, e: &usize) -> Option<&[usize]> {
+        ListsByRow::get(self, *e)
+    }
+}
+impl DirectBases for crate::layered::LayeredMap<usize, Vec<usize>> {
+    fn get(&self, e: &usize) -> Option<&[usize]> {
+        crate::layered::LayeredMap::get(self, e).map(Vec::as_slice)
     }
 }
 /// A build's own types' direct bases over its library's: the two tables name
 /// disjoint types.
 pub(super) struct OverLibrary<'a> {
-    pub own: &'a HashMap<usize, Vec<usize>>,
-    pub library: &'a HashMap<usize, Vec<usize>>,
+    pub own: &'a IdMap<usize, Vec<usize>>,
+    pub library: &'a ListsByRow<usize>,
 }
 impl DirectBases for OverLibrary<'_> {
-    fn get(&self, e: &usize) -> Option<&Vec<usize>> {
-        self.own.get(e).or_else(|| self.library.get(e))
+    fn get(&self, e: &usize) -> Option<&[usize]> {
+        self.own
+            .get(e)
+            .map(Vec::as_slice)
+            .or_else(|| self.library.get(*e))
     }
 }
 
@@ -51,9 +144,9 @@ pub(super) struct PositionalWorkspace {
     explicit: usize,
     one_shot: bool,
     roots: Option<Vec<usize>>,
-    ids: Option<HashSet<uuid::Uuid>>,
-    owned: HashMap<usize, (Vec<usize>, Option<Vec<PositionalMembership>>)>,
-    unresolved: HashMap<usize, bool>,
+    ids: Option<IdSet<uuid::Uuid>>,
+    owned: IdMap<usize, (Vec<usize>, Option<Vec<PositionalMembership>>)>,
+    unresolved: IdMap<usize, bool>,
     reduction: Option<CompleteReduction>,
     /// When set, the types a planning reached are recorded here.
     reached: Option<Vec<usize>>,
@@ -67,32 +160,490 @@ pub(super) struct PositionalWorkspace {
 
 /// The positional roles of a type's effective features: its ends, its
 /// results and its other parameters, each in effective order.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Roles {
     ends: Vec<usize>,
     results: Vec<usize>,
     parameters: Vec<usize>,
 }
 
+/// A type's roles, borrowed from a table.
+#[derive(Clone, Copy)]
+pub(super) struct RolesRef<'a> {
+    pub(super) ends: &'a [usize],
+    pub(super) results: &'a [usize],
+    pub(super) parameters: &'a [usize],
+}
+impl Roles {
+    fn as_ref(&self) -> RolesRef<'_> {
+        RolesRef {
+            ends: &self.ends,
+            results: &self.results,
+            parameters: &self.parameters,
+        }
+    }
+}
+
 /// What a planning derived for every type it completed — its effective
 /// features, their roles, its exported memberships — and the redefinitions
-/// it read and added. A prepared library's planning keeps these, and a build
-/// on the library plans only its own types over them
+/// it read and added, as the planning makes them. A prepared library's
+/// planning keeps these by row ([`PlannedLibraryTypes`]), and a build on
+/// the library plans only its own types over them
 /// (see [`Builder::plan_positional_on_library`]).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct PlannedTypes {
-    effective: HashMap<usize, Vec<usize>>,
-    roles: HashMap<usize, Roles>,
-    exported: HashMap<usize, Vec<PositionalMembership>>,
-    redefinitions: HashMap<usize, Vec<usize>>,
+    effective: IdMap<usize, Vec<usize>>,
+    roles: IdMap<usize, Roles>,
+    exported: IdMap<usize, Vec<PositionalMembership>>,
+    redefinitions: IdMap<usize, Vec<usize>>,
+}
+
+/// What a prepared library's planning derived, laid out by row (see
+/// [`PlannedTypes`]): read back from a snapshot in one pass per table,
+/// with no table to hash, and read by index. The roles are three lists by
+/// row, present together.
+#[derive(Clone, Default)]
+pub(super) struct PlannedLibraryTypes {
+    pub(super) effective: ListsByRow<usize>,
+    ends: ListsByRow<usize>,
+    results: ListsByRow<usize>,
+    parameters: ListsByRow<usize>,
+    pub(super) exported: ListsByRow<PositionalMembership>,
+    pub(super) redefinitions: ListsByRow<usize>,
+}
+
+impl PlannedLibraryTypes {
+    /// The roles of type `e`, when the planning completed it.
+    pub(super) fn roles(&self, e: usize) -> Option<RolesRef<'_>> {
+        Some(RolesRef {
+            ends: self.ends.get(e)?,
+            results: self.results.get(e)?,
+            parameters: self.parameters.get(e)?,
+        })
+    }
+
+    /// What `planned` derived, laid out over `rows` rows.
+    pub(super) fn from_planned(rows: usize, planned: &PlannedTypes) -> Self {
+        let roles = |pick: fn(&Roles) -> &Vec<usize>| {
+            let lists: IdMap<usize, Vec<usize>> = planned
+                .roles
+                .iter()
+                .map(|(e, roles)| (*e, pick(roles).clone()))
+                .collect();
+            ListsByRow::from_map(rows, &lists)
+        };
+        Self {
+            effective: ListsByRow::from_map(rows, &planned.effective),
+            ends: roles(|roles| &roles.ends),
+            results: roles(|roles| &roles.results),
+            parameters: roles(|roles| &roles.parameters),
+            exported: ListsByRow::from_map(rows, &planned.exported),
+            redefinitions: ListsByRow::from_map(rows, &planned.redefinitions),
+        }
+        .sharing_ranks()
+    }
+
+    /// This planning with its tables sharing their row ranks where they
+    /// have lists on the same rows: the planning keeps every table for the
+    /// types it completed, so the ranks are one vector for all of them.
+    fn sharing_ranks(mut self) -> Self {
+        self.ends.share_ranks_with(&self.effective);
+        self.results.share_ranks_with(&self.effective);
+        self.parameters.share_ranks_with(&self.effective);
+        self.exported.share_ranks_with(&self.effective);
+        self.redefinitions.share_ranks_with(&self.effective);
+        self
+    }
+
+    /// What this planning derived, as a snapshot carries it.
+    pub(super) fn to_wire(&self) -> PlannedTypesWire {
+        PlannedTypesWire {
+            effective: (&self.effective).into(),
+            roles: RoleLists::from_rows(&self.ends, &self.results, &self.parameters),
+            exported: MembershipLists::from_rows(&self.exported),
+            redefinitions: (&self.redefinitions).into(),
+        }
+    }
+
+    /// A planning read back from its wire form, over `rows` rows; `None`
+    /// when the wire names a row there is not.
+    pub(super) fn from_wire(wire: PlannedTypesWire, rows: usize) -> Option<Self> {
+        let effective = wire.effective.into_rows(rows)?;
+        let redefinitions = wire.redefinitions.into_rows(rows)?;
+        if !effective
+            .values()
+            .iter()
+            .chain(redefinitions.values())
+            .all(|&f| f < rows)
+        {
+            return None;
+        }
+        let (ends, results, parameters) = wire.roles.into_rows(rows)?;
+        let exported = wire.exported.into_rows(rows)?;
+        Some(
+            Self {
+                effective,
+                ends,
+                results,
+                parameters,
+                exported,
+                redefinitions,
+            }
+            .sharing_ranks(),
+        )
+    }
+
+    /// Whether the planning kept what it derived for type `e`.
+    #[cfg(test)]
+    pub(super) fn has(&self, e: usize) -> bool {
+        self.effective.contains(e) && self.roles(e).is_some() && self.exported.contains(e)
+    }
+
+    /// The types the planning kept effective features for, in order.
+    #[cfg(test)]
+    pub(super) fn types(&self) -> Vec<usize> {
+        self.effective.iter().map(|(e, _)| e).collect()
+    }
+}
+
+#[cfg(test)]
+impl PlannedLibraryTypes {
+    /// Drop this planning a table at a time, naming each to `note` once it
+    /// is gone, for the tests that measure what each holds.
+    pub(super) fn drop_members(self, note: &mut dyn FnMut(&str)) {
+        let Self {
+            effective,
+            ends,
+            results,
+            parameters,
+            exported,
+            redefinitions,
+        } = self;
+        fn shape<T>(name: &str, lists: &ListsByRow<T>) {
+            println!(
+                "  {name}: {} rows, {} with a list, {} values",
+                lists.rows(),
+                lists.iter().count(),
+                lists.values().len()
+            );
+        }
+        shape("effective", &effective);
+        shape("ends", &ends);
+        shape("results", &results);
+        shape("parameters", &parameters);
+        shape("exported", &exported);
+        shape("redefinitions", &redefinitions);
+        drop(effective);
+        note("effective");
+        drop(ends);
+        note("ends");
+        drop(results);
+        note("results");
+        drop(parameters);
+        note("parameters");
+        drop(exported);
+        note("exported");
+        drop(redefinitions);
+        note("redefinitions");
+    }
+}
+
+/// What a planning derived, as a snapshot carries it: the maps as vectors
+/// sorted by key, so that the same planning is written the same way every
+/// time.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct PlannedTypesWire {
+    effective: crate::bulk::IndexLists,
+    roles: RoleLists,
+    exported: MembershipLists,
+    redefinitions: crate::bulk::IndexLists,
+}
+
+/// The roles of each planned type as columns: the types, then each role's
+/// list lengths and values.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RoleLists {
+    types: crate::bulk::Ints,
+    ends: crate::bulk::IndexLists,
+    results: crate::bulk::IndexLists,
+    parameters: crate::bulk::IndexLists,
 }
 #[cfg(test)]
+impl From<Vec<(usize, Roles)>> for RoleLists {
+    fn from(roles: Vec<(usize, Roles)>) -> Self {
+        Self {
+            types: crate::bulk::Ints(roles.iter().map(|r| r.0).collect()),
+            ends: roles
+                .iter()
+                .map(|(e, r)| (*e, r.ends.clone()))
+                .collect::<Vec<_>>()
+                .into(),
+            results: roles
+                .iter()
+                .map(|(e, r)| (*e, r.results.clone()))
+                .collect::<Vec<_>>()
+                .into(),
+            parameters: roles
+                .into_iter()
+                .map(|(e, r)| (e, r.parameters))
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+}
+impl RoleLists {
+    /// The roles back as three lists by row over `rows` rows; `None` when
+    /// the columns disagree on their types or name a row there is not.
+    fn into_rows(
+        self,
+        rows: usize,
+    ) -> Option<(ListsByRow<usize>, ListsByRow<usize>, ListsByRow<usize>)> {
+        let types = self.types.0.as_slice();
+        if self.ends.keys() != types
+            || self.results.keys() != types
+            || self.parameters.keys() != types
+        {
+            return None;
+        }
+        let ends = self.ends.into_rows(rows)?;
+        let results = self.results.into_rows(rows)?;
+        let parameters = self.parameters.into_rows(rows)?;
+        let fits = ends
+            .values()
+            .iter()
+            .chain(results.values())
+            .chain(parameters.values())
+            .all(|&f| f < rows);
+        fits.then_some((ends, results, parameters))
+    }
+
+    /// The roles laid out by row as columns: the three tables are present
+    /// on the same types.
+    fn from_rows(
+        ends: &ListsByRow<usize>,
+        results: &ListsByRow<usize>,
+        parameters: &ListsByRow<usize>,
+    ) -> Self {
+        Self {
+            types: crate::bulk::Ints(ends.iter().map(|(t, _)| t).collect()),
+            ends: ends.into(),
+            results: results.into(),
+            parameters: parameters.into(),
+        }
+    }
+
+    /// The roles back; `None` when the columns disagree on their types.
+    #[cfg(test)]
+    fn into_lists(self) -> Option<Vec<(usize, Roles)>> {
+        let ends = self.ends.into_lists()?;
+        let results = self.results.into_lists()?;
+        let parameters = self.parameters.into_lists()?;
+        let n = self.types.0.len();
+        if ends.len() != n || results.len() != n || parameters.len() != n {
+            return None;
+        }
+        let agree = self
+            .types
+            .0
+            .iter()
+            .zip(&ends)
+            .zip(&results)
+            .zip(&parameters)
+            .all(|(((t, e), r), p)| *t == e.0 && *t == r.0 && *t == p.0);
+        if !agree {
+            return None;
+        }
+        Some(
+            ends.into_iter()
+                .zip(results)
+                .zip(parameters)
+                .map(|(((e, ends), (_, results)), (_, parameters))| {
+                    (
+                        e,
+                        Roles {
+                            ends,
+                            results,
+                            parameters,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The exported memberships of each planned type as columns.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MembershipLists {
+    types: crate::bulk::Ints,
+    lengths: crate::bulk::Ints,
+    relationships: crate::bulk::Ints,
+    members: crate::bulk::Ints,
+}
+#[cfg(test)]
+impl From<Vec<(usize, Vec<PositionalMembership>)>> for MembershipLists {
+    fn from(lists: Vec<(usize, Vec<PositionalMembership>)>) -> Self {
+        Self {
+            types: crate::bulk::Ints(lists.iter().map(|l| l.0).collect()),
+            lengths: crate::bulk::Ints(lists.iter().map(|l| l.1.len()).collect()),
+            relationships: crate::bulk::Ints(
+                lists
+                    .iter()
+                    .flat_map(|l| l.1.iter().map(|m| m.relationship))
+                    .collect(),
+            ),
+            members: crate::bulk::Ints(
+                lists
+                    .into_iter()
+                    .flat_map(|l| l.1.into_iter().map(|m| m.member))
+                    .collect(),
+            ),
+        }
+    }
+}
+impl MembershipLists {
+    /// The memberships back as lists by row over `rows` rows; `None` when
+    /// the columns do not cover each other or name a row there is not.
+    fn into_rows(self, rows: usize) -> Option<ListsByRow<PositionalMembership>> {
+        if self.relationships.0.len() != self.members.0.len() {
+            return None;
+        }
+        let values: Vec<PositionalMembership> = self
+            .relationships
+            .0
+            .into_iter()
+            .zip(self.members.0)
+            .map(|(relationship, member)| PositionalMembership {
+                relationship,
+                member,
+            })
+            .collect();
+        let lists = ListsByRow::from_sorted(rows, &self.types.0, &self.lengths.0, values)?;
+        lists
+            .values()
+            .iter()
+            .all(|m| m.relationship < rows && m.member < rows)
+            .then_some(lists)
+    }
+
+    /// The memberships laid out by row as columns.
+    fn from_rows(lists: &ListsByRow<PositionalMembership>) -> Self {
+        Self {
+            types: crate::bulk::Ints(lists.iter().map(|(t, _)| t).collect()),
+            lengths: crate::bulk::Ints(lists.iter().map(|(_, l)| l.len()).collect()),
+            relationships: crate::bulk::Ints(
+                lists.values().iter().map(|m| m.relationship).collect(),
+            ),
+            members: crate::bulk::Ints(lists.values().iter().map(|m| m.member).collect()),
+        }
+    }
+
+    /// The memberships back; `None` when the columns do not cover each other.
+    #[cfg(test)]
+    fn into_lists(self) -> Option<Vec<(usize, Vec<PositionalMembership>)>> {
+        if self.relationships.0.len() != self.members.0.len()
+            || self.types.0.len() != self.lengths.0.len()
+            || self
+                .lengths
+                .0
+                .iter()
+                .try_fold(0usize, |n, &l| n.checked_add(l))
+                != Some(self.members.0.len())
+        {
+            return None;
+        }
+        let mut memberships =
+            self.relationships
+                .0
+                .into_iter()
+                .zip(self.members.0)
+                .map(|(relationship, member)| PositionalMembership {
+                    relationship,
+                    member,
+                });
+        Some(
+            self.types
+                .0
+                .into_iter()
+                .zip(self.lengths.0)
+                .map(|(t, len)| (t, memberships.by_ref().take(len).collect()))
+                .collect(),
+        )
+    }
+}
+
+#[cfg(test)]
 impl PlannedTypes {
-    /// Whether the planning kept what it derived for type `e`.
-    pub(super) fn has(&self, e: usize) -> bool {
-        self.effective.contains_key(&e)
-            && self.roles.contains_key(&e)
-            && self.exported.contains_key(&e)
+    /// What this planning derived, as a snapshot carries it.
+    pub(super) fn to_wire(&self) -> PlannedTypesWire {
+        PlannedTypesWire {
+            effective: implied::sorted_by_key(self.effective.iter().map(|(e, f)| (*e, f.clone())))
+                .into(),
+            roles: implied::sorted_by_key(self.roles.iter().map(|(e, r)| (*e, r.clone()))).into(),
+            exported: implied::sorted_by_key(self.exported.iter().map(|(e, m)| (*e, m.clone())))
+                .into(),
+            redefinitions: implied::sorted_by_key(
+                self.redefinitions.iter().map(|(e, r)| (*e, r.clone())),
+            )
+            .into(),
+        }
+    }
+
+    /// A planning read back from its wire form, over `rows` rows; `None`
+    /// when the wire names a row there is not.
+    pub(super) fn from_wire(wire: PlannedTypesWire, rows: usize) -> Option<Self> {
+        let wire = PlannedTypesLists {
+            effective: wire.effective.into_lists()?,
+            roles: wire.roles.into_lists()?,
+            exported: wire.exported.into_lists()?,
+            redefinitions: wire.redefinitions.into_lists()?,
+        };
+        let in_range = |i: usize| i < rows;
+        let all_in_range = |entries: &[(usize, Vec<usize>)]| {
+            entries
+                .iter()
+                .all(|(e, rows)| in_range(*e) && rows.iter().all(|&r| in_range(r)))
+        };
+        let fits = all_in_range(&wire.effective)
+            && all_in_range(&wire.redefinitions)
+            && wire.roles.iter().all(|(e, roles)| {
+                in_range(*e)
+                    && roles
+                        .ends
+                        .iter()
+                        .chain(&roles.results)
+                        .chain(&roles.parameters)
+                        .all(|&f| in_range(f))
+            })
+            && wire.exported.iter().all(|(e, memberships)| {
+                in_range(*e)
+                    && memberships
+                        .iter()
+                        .all(|m| in_range(m.relationship) && in_range(m.member))
+            });
+        fits.then(|| Self {
+            effective: wire.effective.into_iter().collect(),
+            roles: wire.roles.into_iter().collect(),
+            exported: wire.exported.into_iter().collect(),
+            redefinitions: wire.redefinitions.into_iter().collect(),
+        })
+    }
+}
+/// A planning's wire with its columns split back into lists.
+#[cfg(test)]
+struct PlannedTypesLists {
+    effective: Vec<(usize, Vec<usize>)>,
+    roles: Vec<(usize, Roles)>,
+    exported: Vec<(usize, Vec<PositionalMembership>)>,
+    redefinitions: Vec<(usize, Vec<usize>)>,
+}
+
+#[cfg(test)]
+impl PlannedTypes {
+    /// Keep no effective features for type `e`, for the tests of what a
+    /// read-back refuses.
+    pub(super) fn keep_nothing_for(&mut self, e: usize) {
+        self.effective.insert(e, Vec::new());
     }
 }
 /// Recorded bootstrap edges indexed only for one planner invocation. These
@@ -100,8 +651,8 @@ impl PlannedTypes {
 /// never be cached on Builder, StoredStructure, or the cross-pass workspace.
 #[derive(Default)]
 struct RecordedRedefinitions {
-    targets: HashMap<usize, HashSet<usize>>,
-    incomplete: HashSet<usize>,
+    targets: IdMap<usize, IdSet<usize>>,
+    incomplete: IdSet<usize>,
 }
 impl RecordedRedefinitions {
     fn build(b: &Builder, steps: &mut usize) -> Option<Self> {
@@ -120,11 +671,7 @@ impl RecordedRedefinitions {
         Some(index)
     }
 
-    fn sources_match(
-        &self,
-        actual: &HashMap<usize, Vec<usize>>,
-        steps: &mut usize,
-    ) -> Option<bool> {
+    fn sources_match(&self, actual: &IdMap<usize, Vec<usize>>, steps: &mut usize) -> Option<bool> {
         for (source, targets) in actual {
             charge(
                 &mut Some(&mut *steps),
@@ -133,7 +680,7 @@ impl RecordedRedefinitions {
             if self.incomplete.contains(source) {
                 return Some(false);
             }
-            let current: HashSet<_> = targets.iter().copied().collect();
+            let current: IdSet<_> = targets.iter().copied().collect();
             if self
                 .targets
                 .get(source)
@@ -150,26 +697,26 @@ impl RecordedRedefinitions {
 struct ImportProof {
     recorded: Option<RecordedRedefinitions>,
     // Domain evidence only, local to this immutable planning invocation.
-    role_domains: HashSet<usize>,
+    role_domains: IdSet<usize>,
 }
 struct ImportSourceContext<'a> {
     owner: usize,
     bases: &'a dyn DirectBases,
-    incomplete: &'a HashSet<usize>,
+    incomplete: &'a IdSet<usize>,
     ordinary_only: bool,
     allow_prerequisites: bool,
 }
 
 struct CompleteReduction {
     order: Vec<usize>,
-    nodes: HashMap<usize, Node>,
-    prerequisites: HashMap<usize, Vec<usize>>,
-    incomplete: HashSet<usize>,
-    redefinitions: HashMap<usize, Vec<usize>>,
+    nodes: IdMap<usize, Node>,
+    prerequisites: IdMap<usize, Vec<usize>>,
+    incomplete: IdSet<usize>,
+    redefinitions: IdMap<usize, Vec<usize>>,
     result: PositionalRedefinitions,
 }
 fn charge_map_vectors(
-    map: &HashMap<usize, Vec<usize>>,
+    map: &IdMap<usize, Vec<usize>>,
     steps: &mut Option<&mut usize>,
 ) -> Option<()> {
     charge(steps, map.capacity())?;
@@ -234,10 +781,10 @@ impl PositionalWorkspace {
 struct CompatibilityMembershipFacts<'a>(&'a Builder);
 impl MembershipFacts for CompatibilityMembershipFacts<'_> {
     fn is_feature(&self, member: usize) -> bool {
-        conforms(self.0.elements[member].ty, "Feature")
+        is_a!(self.0.elements[member], "Feature")
     }
     fn is_feature_membership(&self, relationship: usize) -> bool {
-        conforms(self.0.elements[relationship].ty, "FeatureMembership")
+        is_a!(self.0.elements[relationship], "FeatureMembership")
     }
     fn is_protected(&self, relationship: usize) -> bool {
         self.0.elements[relationship]
@@ -248,8 +795,16 @@ impl MembershipFacts for CompatibilityMembershipFacts<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static BUDGETED_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Builder {
-    pub(super) fn ensure_positional_redefinitions(&mut self) {
+    /// Plan the positional redefinitions now, without a budget, when the
+    /// model is semantically ready and no plan is published yet: what the
+    /// first enumeration of inherited members with implied heritage does.
+    pub(crate) fn ensure_positional_redefinitions(&mut self) {
         if !self.positional_planning {
             self.refresh_supported_chain_evidence(None)
                 .expect("unbounded chain validation");
@@ -273,15 +828,62 @@ impl Builder {
         self.static_planning = previous_static;
         self.used_imports = used;
         self.query_imports = walks;
-        self.inherited_cache.clear();
-        self.inherited_by_heritage.clear();
+        self.drop_inherited_memos();
         self.positional_redefinitions = Some(plan);
         self.positional_from_library = from_library;
+        self.positional_budget_exhausted = None;
+    }
+
+    /// Whether a positional plan is published.
+    #[cfg(test)]
+    pub(crate) fn has_positional_plan(&self) -> bool {
+        self.positional_redefinitions.is_some()
+    }
+
+    /// How many budgeted planning attempts this thread has made: entries
+    /// that found no plan published and went on to plan (or to be refused).
+    #[cfg(test)]
+    pub(crate) fn budgeted_planning_attempts() -> usize {
+        BUDGETED_ATTEMPTS.with(|count| count.get())
+    }
+
+    fn planning_progress(&self) -> PlanningProgress {
+        PlanningProgress {
+            implied: self.supported_implied.as_ref().map(implied_identity),
+            library_plans_decided: self.library_plans_decided.is_some(),
+            id_index: self.id_index.is_some(),
+            stored_structure: self.stored_structure.is_some(),
+        }
+    }
+
+    /// Whether a budgeted attempt with `remaining` steps after its entry
+    /// charge would repeat a remembered exhausted one over the same inputs.
+    fn refused_as_exhausted(&self, remaining: usize) -> bool {
+        let Some(exhausted) = &self.positional_budget_exhausted else {
+            return false;
+        };
+        let same = |revision: Option<&crate::layered::Revision>, at: &crate::layered::Revision| {
+            revision.is_some_and(|revision| revision.same_as(at))
+        };
+        remaining <= exhausted.remaining
+            && same(self.elements.revision(), &exhausted.rows)
+            && same(self.spec_targets.revision(), &exhausted.specs)
+            && same(self.spec_resolved.revision(), &exhausted.resolved)
+            && same(self.lib_qnames.revision(), &exhausted.names)
+            && self.external_implied_names.is_empty() == exhausted.library_configuration
+            && self.supported_implied.as_ref().map(implied_identity) == exhausted.implied
     }
 
     /// Prepare a complete positional table within the caller's allowance.
     /// In-progress work is private: refusal never publishes an empty sentinel.
-    pub(super) fn ensure_positional_redefinitions_with_budget(
+    ///
+    /// An attempt that runs out of budget without leaving any progress
+    /// behind is remembered with its inputs and the budget it had; while
+    /// the inputs are the same, a repeat with no more budget is refused
+    /// right after the entry charge instead of planning again to the same
+    /// end. A repeat with more budget, over changed inputs, or after an
+    /// attempt that did make progress plans again.
+    pub(crate) fn ensure_positional_redefinitions_with_budget(
         &mut self,
         steps: &mut usize,
     ) -> bool {
@@ -291,6 +893,38 @@ impl Builder {
         if self.positional_planning {
             return false;
         }
+        let remaining = crate::eval::MAX_STEPS.saturating_sub(*steps);
+        let unplanned = self.semantic_ready && self.positional_redefinitions.is_none();
+        if unplanned && self.refused_as_exhausted(remaining) {
+            return false;
+        }
+        #[cfg(test)]
+        if unplanned {
+            BUDGETED_ATTEMPTS.with(|count| count.set(count.get() + 1));
+        }
+        let before = self.planning_progress();
+        let planned = self.ensure_positional_redefinitions_within(steps);
+        if planned || !unplanned || self.positional_redefinitions.is_some() {
+            self.positional_budget_exhausted = None;
+        } else if self.planning_progress() == before {
+            self.positional_budget_exhausted = Some(BudgetExhausted {
+                rows: self.elements.observe_revision(),
+                specs: self.spec_targets.observe_revision(),
+                resolved: self.spec_resolved.observe_revision(),
+                names: self.lib_qnames.observe_revision(),
+                library_configuration: self.external_implied_names.is_empty(),
+                implied: before.implied,
+                remaining,
+            });
+        } else {
+            self.positional_budget_exhausted = None;
+        }
+        planned
+    }
+
+    /// [`Self::ensure_positional_redefinitions_with_budget`] without the
+    /// memory of exhausted attempts: the planning itself.
+    fn ensure_positional_redefinitions_within(&mut self, steps: &mut usize) -> bool {
         if self
             .refresh_supported_chain_evidence(Some(&mut *steps))
             .is_none()
@@ -336,8 +970,7 @@ impl Builder {
         let Some((plan, from_library)) = plan else {
             return false;
         };
-        self.inherited_cache.clear();
-        self.inherited_by_heritage.clear();
+        self.drop_inherited_memos();
         self.positional_redefinitions = Some(plan);
         self.positional_from_library = from_library;
         true
@@ -387,8 +1020,8 @@ impl Builder {
     pub(super) fn plan_positional_reaching(
         &mut self,
         direct_bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
-    ) -> (PositionalRedefinitions, HashSet<usize>, PlannedTypes) {
+        incomplete: &IdSet<usize>,
+    ) -> (PositionalRedefinitions, IdSet<usize>, PlannedTypes) {
         let mut workspace = PositionalWorkspace::one_shot();
         workspace.reached = Some(Vec::new());
         workspace.planned = Some(PlannedTypes::default());
@@ -422,7 +1055,7 @@ impl Builder {
         &mut self,
         library: &std::sync::Arc<super::LibraryPlans>,
         direct_bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         mut steps: Option<&mut usize>,
     ) -> Option<Option<PositionalRedefinitions>> {
         let floor = library.rows;
@@ -430,13 +1063,13 @@ impl Builder {
         charge(&mut steps, end - floor)?;
         let mut roots = Vec::new();
         for e in floor..end {
-            if !conforms(self.elements[e].ty, "Type") {
+            if !is_a!(self.elements[e], "Type") {
                 continue;
             }
             let mut found = false;
             for &rel in &self.elements[e].owned_relationships {
                 charge(&mut steps, 1)?;
-                if !super::is_feature_membership(self.elements[rel].ty) {
+                if !is_a!(self.elements[rel], "FeatureMembership") {
                     continue;
                 }
                 for &f in &self.elements[rel].children {
@@ -504,7 +1137,7 @@ impl Builder {
     pub(super) fn plan_positional_redefinitions_with_bases(
         &mut self,
         direct_bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
     ) -> PositionalRedefinitions {
         self.plan_positional_redefinitions_with_bases_and_budget(direct_bases, incomplete, None)
             .expect("unbounded positional construction cannot exhaust its budget")
@@ -515,7 +1148,7 @@ impl Builder {
     pub(super) fn plan_positional_redefinitions_with_bases_and_budget(
         &mut self,
         direct_bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         steps: Option<&mut usize>,
     ) -> Option<PositionalRedefinitions> {
         self.plan_positional_redefinitions_with_workspace(
@@ -529,7 +1162,7 @@ impl Builder {
     pub(super) fn plan_positional_redefinitions_with_workspace(
         &mut self,
         direct_bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         steps: Option<&mut usize>,
         workspace: &mut PositionalWorkspace,
     ) -> Option<PositionalRedefinitions> {
@@ -547,9 +1180,9 @@ impl Builder {
     /// the caller's complete ordered Membership evidence. No plan is published.
     pub(super) fn plan_checked_positional(
         &mut self,
-        nodes: &HashMap<usize, Node>,
+        nodes: &IdMap<usize, Node>,
         bases: &dyn DirectBases,
-        import_owners: &HashSet<usize>,
+        import_owners: &IdSet<usize>,
         steps: &mut usize,
     ) -> Option<PositionalRedefinitions> {
         let mut budget = Some(steps);
@@ -576,13 +1209,13 @@ impl Builder {
         // bounded Package traversal for selectors outside the legacy leaf domain.
         if !import_owners.is_empty() {
             let mut import_proof = ImportProof::default();
-            let mut prerequisites = HashMap::new();
+            let mut prerequisites = IdMap::default();
             charge(&mut budget, import_owners.len())?;
             for &owner in import_owners {
                 let (mut public, mut protected) = self.positional_imports(
                     owner,
                     bases,
-                    &HashSet::new(),
+                    &IdSet::default(),
                     &mut budget,
                     &mut import_proof,
                     &mut prerequisites,
@@ -602,7 +1235,7 @@ impl Builder {
                     (&mut protected, &node.protected_imports),
                 ] {
                     charge(&mut budget, actual.len().saturating_add(expected.len()))?;
-                    let mut seen = HashSet::new();
+                    let mut seen = IdSet::default();
                     actual.retain(|m| seen.insert(m.relationship));
                     if actual != expected {
                         return None;
@@ -612,7 +1245,7 @@ impl Builder {
         }
         self.plan_positional_with_result_query(
             bases,
-            &HashSet::new(),
+            &IdSet::default(),
             budget,
             Some(&roots),
             None,
@@ -625,12 +1258,12 @@ impl Builder {
     /// using the positional algorithm's reachability-based edge omissions.
     pub(super) fn positional_redefinition_sources_match(
         &self,
-        actual: &HashMap<usize, Vec<usize>>,
+        actual: &IdMap<usize, Vec<usize>>,
         steps: &mut usize,
     ) -> Option<bool> {
         let mut budget = Some(steps);
         charge(&mut budget, self.spec_targets.len())?;
-        let mut indexed: HashMap<usize, HashSet<usize>> = HashMap::new();
+        let mut indexed: IdMap<usize, IdSet<usize>> = IdMap::default();
         for (i, &(owner, kind, _, _)) in self.spec_targets.iter().enumerate() {
             if kind == "Redefinition" && actual.contains_key(&owner) {
                 let Some(target) = self.spec_resolved.get(i).copied().flatten() else {
@@ -645,7 +1278,7 @@ impl Builder {
                 targets.len().saturating_mul(2).saturating_add(1),
             )?;
             let expected = indexed.remove(owner).unwrap_or_default();
-            let current: HashSet<_> = targets.iter().copied().collect();
+            let current: IdSet<_> = targets.iter().copied().collect();
             if current != expected {
                 return Some(false);
             }
@@ -660,11 +1293,11 @@ impl Builder {
     pub(super) fn plan_unique_result_candidates(
         &mut self,
         direct_bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         roots: &[usize],
         steps: &mut usize,
-    ) -> Option<HashMap<usize, usize>> {
-        let mut candidates = HashMap::new();
+    ) -> Option<IdMap<usize, usize>> {
+        let mut candidates = IdMap::default();
         let plan = self.plan_positional_with_result_query(
             direct_bases,
             incomplete,
@@ -680,10 +1313,10 @@ impl Builder {
     fn plan_positional_with_result_query(
         &mut self,
         direct_bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         mut steps: Option<&mut usize>,
         selected_roots: Option<&[usize]>,
-        mut result_candidates: Option<&mut HashMap<usize, usize>>,
+        mut result_candidates: Option<&mut IdMap<usize, usize>>,
         workspace: &mut PositionalWorkspace,
     ) -> Option<PositionalRedefinitions> {
         charge(&mut steps, 1)?;
@@ -701,9 +1334,9 @@ impl Builder {
             charge(&mut steps, cached.len())?;
             roots.extend_from_slice(cached);
         } else {
-            for e in 0..self.explicit_len() {
+            for e in self.authored_rows() {
                 charge(&mut steps, 1)?;
-                if !conforms(self.elements[e].ty, "Type") {
+                if !is_a!(self.elements[e], "Type") {
                     continue;
                 }
                 // Root discovery needs existence, not an ordered collection.
@@ -711,7 +1344,7 @@ impl Builder {
                 let mut found = false;
                 for &rel in &self.elements[e].owned_relationships {
                     charge(&mut steps, 1)?;
-                    if !super::is_feature_membership(self.elements[rel].ty) {
+                    if !is_a!(self.elements[rel], "FeatureMembership") {
                         continue;
                     }
                     for &f in &self.elements[rel].children {
@@ -735,16 +1368,16 @@ impl Builder {
             workspace.roots = Some(roots.clone());
         }
 
-        let mut nodes = HashMap::new();
+        let mut nodes = IdMap::default();
         let mut import_proof = ImportProof::default();
-        let mut prerequisites = HashMap::new();
+        let mut prerequisites = IdMap::default();
         charge(&mut steps, roots.len())?;
         let mut todo = roots.clone();
         // A planning extending its prepared library's reads what the
         // library's planning derived for every type that planning reached.
         let library = workspace.library.clone();
         let seeded = |e: &usize| library.as_ref().is_some_and(|l| l.reached.contains(e));
-        let empty = PlannedTypes::default();
+        let empty = PlannedLibraryTypes::default();
         let planned = library.as_ref().map_or(&empty, |l| &l.planned);
         while let Some(e) = todo.pop() {
             charge(&mut steps, 1)?;
@@ -753,9 +1386,15 @@ impl Builder {
             }
             charge(
                 &mut steps,
-                direct_bases.get(&e).map_or(0, Vec::len).saturating_mul(2),
+                direct_bases
+                    .get(&e)
+                    .map_or(0, <[usize]>::len)
+                    .saturating_mul(2),
             )?;
-            let bases = direct_bases.get(&e).cloned().unwrap_or_default();
+            let bases = direct_bases
+                .get(&e)
+                .map(<[usize]>::to_vec)
+                .unwrap_or_default();
             todo.extend(bases.iter().copied());
             let imports = self.positional_imports(
                 e,
@@ -810,11 +1449,11 @@ impl Builder {
         }
         // Iterative postorder avoids a native-stack dependency on model depth.
         // Cyclic bases have no well-founded positional ordering; do not guess.
-        let mut state = HashMap::new();
+        let mut state = IdMap::default();
         let mut order = Vec::new();
         charge(&mut steps, incomplete.len())?;
         let mut plan = PositionalRedefinitions {
-            targets: HashMap::new(),
+            targets: IdMap::default(),
             incomplete: incomplete.clone(),
         };
         if let Some(library) = &library {
@@ -833,13 +1472,7 @@ impl Builder {
             .cloned();
         if indexed_ids.is_none() && workspace.ids.is_none() {
             charge(&mut steps, self.explicit_len())?;
-            workspace.ids = Some(
-                self.elements
-                    .iter()
-                    .take(self.explicit_len())
-                    .map(|e| e.id)
-                    .collect(),
-            );
+            workspace.ids = Some(self.authored_rows().map(|i| self.elements[i].id).collect());
         }
         let ids = workspace.ids.as_ref();
         for &e in nodes.keys() {
@@ -850,7 +1483,7 @@ impl Builder {
                 charge(&mut steps, self.elements[e].owned_relationships.len())?;
                 let value = self.elements[e].owned_relationships.iter().any(|&r| {
                     let rel = &self.elements[r];
-                    conforms(rel.ty, "Specialization")
+                    is_a!(rel, "Specialization")
                         && ![
                             "general",
                             "superclassifier",
@@ -868,7 +1501,7 @@ impl Builder {
                                 || ids.is_some_and(|ids| ids.contains(&id)),
                                 |raw| {
                                     raw.element_for_uuid(self, id)
-                                        .is_some_and(|target| target < self.explicit_len())
+                                        .is_some_and(|target| self.is_authored(target))
                                 },
                             )
                         })
@@ -916,7 +1549,7 @@ impl Builder {
 
         // The library's rows' redefinitions, the positional ones its planning
         // added included, are in its final graph (`planned.redefinitions`).
-        let mut redefinitions = HashMap::new();
+        let mut redefinitions = IdMap::default();
         let from = library.as_ref().map_or(0, |l| l.spec_rows);
         for i in from..self.spec_targets.len() {
             let (e, kind, _, _) = self.spec_targets[i];
@@ -959,9 +1592,9 @@ impl Builder {
         } else {
             None
         };
-        let mut effective: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut roles: HashMap<usize, Roles> = HashMap::new();
-        let mut exported: HashMap<usize, Vec<PositionalMembership>> = HashMap::new();
+        let mut effective: IdMap<usize, Vec<usize>> = IdMap::default();
+        let mut roles: IdMap<usize, Roles> = IdMap::default();
+        let mut exported: IdMap<usize, Vec<PositionalMembership>> = IdMap::default();
         let mut traversal = if selected_roots.is_some() {
             Reachability::sparse()
         } else {
@@ -982,7 +1615,7 @@ impl Builder {
             }
             if node.bases.iter().any(|b| {
                 plan.incomplete.contains(b)
-                    || !(effective.contains_key(b) || planned.effective.contains_key(b))
+                    || !(effective.contains_key(b) || planned.effective.contains(*b))
             }) {
                 plan.incomplete.insert(e);
             }
@@ -991,7 +1624,7 @@ impl Builder {
                 if required.iter().any(|dependency| {
                     plan.incomplete.contains(dependency)
                         || !(effective.contains_key(dependency)
-                            || planned.effective.contains_key(dependency))
+                            || planned.effective.contains(*dependency))
                 }) {
                     plan.incomplete.insert(e);
                 }
@@ -1018,10 +1651,9 @@ impl Builder {
                 .copied()
                 .filter(|&f| self.positional_is_result(f))
                 .collect();
-            let behavior =
-                conforms(self.elements[e].ty, "Behavior") || conforms(self.elements[e].ty, "Step");
-            let function = conforms(self.elements[e].ty, "Function")
-                || conforms(self.elements[e].ty, "Expression");
+            let behavior = is_a!(self.elements[e], "Behavior") || is_a!(self.elements[e], "Step");
+            let function =
+                is_a!(self.elements[e], "Function") || is_a!(self.elements[e], "Expression");
             let subject_family = |kind| {
                 if conforms(kind, "RequirementDefinition") || conforms(kind, "RequirementUsage") {
                     Some(0)
@@ -1034,7 +1666,7 @@ impl Builder {
             let is_subject = |feature: usize| {
                 self.elements[feature]
                     .owning_relationship
-                    .is_some_and(|r| conforms(self.elements[r].ty, "SubjectMembership"))
+                    .is_some_and(|r| is_a!(self.elements[r], "SubjectMembership"))
             };
             let subjects: Vec<_> = parameters
                 .iter()
@@ -1094,7 +1726,8 @@ impl Builder {
                 charge(&mut steps, 1)?;
                 let base_roles = roles
                     .get(&base)
-                    .or_else(|| planned.roles.get(&base))
+                    .map(Roles::as_ref)
+                    .or_else(|| planned.roles(base))
                     .expect("a complete base has roles");
                 charge(&mut steps, ends.len().min(base_roles.ends.len()))?;
                 let base_ends = base_roles.ends.iter().copied();
@@ -1138,16 +1771,16 @@ impl Builder {
                         // also redefines one explicitly: `in :>> b;` in a
                         // specialization of `Diff { in a; in b; }` redefines
                         // `a` as well as `b`, leaving one parameter.
-                        let explicit_invocation_argument =
-                            conforms(self.elements[e].ty, "InvocationExpression")
-                                && self.elements[source].owned_relationships.iter().any(|&r| {
-                                    conforms(self.elements[r].ty, "Redefinition")
-                                        && self.elements[r]
-                                            .props
-                                            .get("isImplied")
-                                            .and_then(|v| v.as_bool())
-                                            != Some(true)
-                                });
+                        let explicit_invocation_argument = self.elements[e]
+                            .conforms("InvocationExpression")
+                            && self.elements[source].owned_relationships.iter().any(|&r| {
+                                is_a!(self.elements[r], "Redefinition")
+                                    && self.elements[r]
+                                        .props
+                                        .get("isImplied")
+                                        .and_then(|v| v.as_bool())
+                                        != Some(true)
+                            });
                         if !explicit_invocation_argument {
                             add_edge(
                                 source,
@@ -1308,10 +1941,10 @@ impl Builder {
         &mut self,
         owner: usize,
         bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         steps: &mut Option<&mut usize>,
         proof: &mut ImportProof,
-        prerequisites: &mut HashMap<usize, Vec<usize>>,
+        prerequisites: &mut IdMap<usize, Vec<usize>>,
     ) -> Option<(Vec<PositionalMembership>, Vec<PositionalMembership>)> {
         let leaf = self.positional_leaf_imports(owner, bases, incomplete, steps);
         if self.graph_format != crate::model::GraphFormat::CanonicalV3 {
@@ -1325,7 +1958,7 @@ impl Builder {
                 .0
                 .iter()
                 .chain(&imports.1)
-                .any(|m| conforms(self.elements[m.member].ty, "Feature"))
+                .any(|m| is_a!(self.elements[m.member], "Feature"))
             {
                 return Some(imports);
             }
@@ -1378,7 +2011,7 @@ impl Builder {
         charge(&mut Some(&mut *steps), relationships.len())?;
         if relationships
             .iter()
-            .any(|rel| conforms(self.elements[rel].ty, "ElementFilterMembership"))
+            .any(|rel| is_a!(self.elements[rel], "ElementFilterMembership"))
         {
             return None;
         }
@@ -1426,7 +2059,11 @@ impl Builder {
             .0
             .iter()
             .chain(&imports.1)
-            .filter_map(|m| conforms(self.elements[m.member].ty, "Feature").then_some(m.member))
+            .filter_map(|m| {
+                self.elements[m.member]
+                    .conforms("Feature")
+                    .then_some(m.member)
+            })
             .collect();
         if todo.is_empty() {
             return Some(Vec::new());
@@ -1439,13 +2076,13 @@ impl Builder {
             return None;
         }
         let domains = raw.membership_domains(self, steps)?;
-        let mut seen = HashSet::new();
+        let mut seen = IdSet::default();
         let mut dependency = Reachability::sparse();
-        let mut owners = HashMap::new();
-        let mut authored = HashMap::new();
-        let mut redefinitions = HashMap::new();
-        let mut roles = HashSet::new();
-        let mut external_roles = HashSet::new();
+        let mut owners = IdMap::default();
+        let mut authored = IdMap::default();
+        let mut redefinitions = IdMap::default();
+        let mut roles = IdSet::default();
+        let mut external_roles = IdSet::default();
         let mut required = Vec::new();
         while let Some(feature) = todo.pop() {
             charge(&mut Some(&mut *steps), 1)?;
@@ -1567,11 +2204,11 @@ impl Builder {
                 owned.len().saturating_add(incoming.len()),
             )?;
             let relationships: Vec<_> = owned.iter().chain(incoming.iter().copied()).collect();
-            let mut seen_relationships = HashSet::new();
+            let mut seen_relationships = IdSet::default();
             let mut authored_targets = Vec::new();
             let mut targets = Vec::new();
             for relationship in relationships {
-                if !conforms(self.elements[relationship].ty, "Redefinition")
+                if !is_a!(self.elements[relationship], "Redefinition")
                     || !seen_relationships.insert(relationship)
                 {
                     continue;
@@ -1595,7 +2232,7 @@ impl Builder {
                     "Feature",
                     steps,
                 )?;
-                if relationship < self.explicit_len() {
+                if self.is_authored(relationship) {
                     authored_targets.push(target);
                 }
                 targets.push(target);
@@ -1614,7 +2251,7 @@ impl Builder {
         }
         if !external_roles.is_empty() || !context.allow_prerequisites {
             let mut closure = Reachability::sparse();
-            let mut acyclic = HashMap::new();
+            let mut acyclic = IdMap::default();
             for root in roots {
                 let reached =
                     closure.reachable_budget(root, &redefinitions, &mut Some(&mut *steps))?;
@@ -1664,7 +2301,7 @@ impl Builder {
             }
         }
         charge(&mut Some(&mut *steps), required.len())?;
-        let mut unique = HashSet::new();
+        let mut unique = IdSet::default();
         required.retain(|owner| unique.insert(*owner));
         for &owner in &required {
             self.positional_role_prerequisite_domain(
@@ -1687,7 +2324,7 @@ impl Builder {
         raw: &super::structural_index::StoredStructure,
         root: usize,
         bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         steps: &mut usize,
         proof: &mut ImportProof,
     ) -> Option<()> {
@@ -1700,7 +2337,7 @@ impl Builder {
         }
         let domains = raw.membership_domains(self, steps)?;
         let imports = raw.import_domains(self, steps)?;
-        let mut visited = HashSet::new();
+        let mut visited = IdSet::default();
         let mut todo = vec![root];
         while let Some(owner) = todo.pop() {
             charge(&mut Some(&mut *steps), 1)?;
@@ -1723,7 +2360,7 @@ impl Builder {
             {
                 return None;
             }
-            let base = bases.get(&owner).map_or(&[][..], Vec::as_slice);
+            let base = bases.get(&owner).unwrap_or(&[][..]);
             charge(&mut Some(&mut *steps), base.len())?;
             todo.extend(base.iter().copied());
             let relationships = super::semantic_ownership::owned_relationships(self, owner)?;
@@ -1765,7 +2402,7 @@ impl Builder {
                 if conforms(kind, "Membership") {
                     let member =
                         super::membership_evidence::member(self, raw, owner, relationship, steps)?;
-                    if conforms(self.elements[member].ty, "Feature") {
+                    if is_a!(self.elements[member], "Feature") {
                         features.push(PositionalMembership {
                             relationship,
                             member,
@@ -1824,7 +2461,7 @@ impl Builder {
         &mut self,
         owner: usize,
         bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         steps: &mut Option<&mut usize>,
     ) -> Option<(Vec<PositionalMembership>, Vec<PositionalMembership>)> {
         charge(steps, self.elements[owner].owned_relationships.len())?;
@@ -1833,7 +2470,7 @@ impl Builder {
             .iter()
             .copied()
             .filter(|&r| {
-                conforms(self.elements[r].ty, "Import")
+                is_a!(self.elements[r], "Import")
                     && self.import_admitted(r, super::LookupAccess::Protected)
             })
             .collect();
@@ -1863,7 +2500,7 @@ impl Builder {
                 .get("visibility")
                 .and_then(|v| v.as_str())
                 == Some("protected");
-            let memberships = if conforms(self.elements[import].ty, "MembershipImport") {
+            let memberships = if is_a!(self.elements[import], "MembershipImport") {
                 let membership = self.positional_reference(import, "importedMembership")?;
                 let declaring = self.positional_reference(membership, "owningRelatedElement")?;
                 if !self.positional_import_leaf(declaring, bases, incomplete, steps)? {
@@ -1891,8 +2528,7 @@ impl Builder {
                     .iter()
                     .copied()
                     .filter(|&r| {
-                        conforms(self.elements[r].ty, "Membership")
-                            && self.import_admitted(r, access)
+                        is_a!(self.elements[r], "Membership") && self.import_admitted(r, access)
                     })
                     .collect()
             };
@@ -1925,7 +2561,7 @@ impl Builder {
         &self,
         owner: usize,
         bases: &dyn DirectBases,
-        incomplete: &HashSet<usize>,
+        incomplete: &IdSet<usize>,
         steps: &mut Option<&mut usize>,
     ) -> Option<bool> {
         charge(
@@ -1937,10 +2573,9 @@ impl Builder {
         )?;
         Some(
             !incomplete.contains(&owner)
-                && bases.get(&owner).is_none_or(Vec::is_empty)
+                && bases.get(&owner).is_none_or(<[usize]>::is_empty)
                 && !self.elements[owner].owned_relationships.iter().any(|&r| {
-                    conforms(self.elements[r].ty, "Import")
-                        || conforms(self.elements[r].ty, "Specialization")
+                    is_a!(self.elements[r], "Import") || is_a!(self.elements[r], "Specialization")
                 })
                 && self
                     .elem_scope
@@ -1965,7 +2600,7 @@ impl Builder {
     pub(super) fn positional_is_result(&self, e: usize) -> bool {
         self.elements[e]
             .owning_relationship
-            .is_some_and(|r| conforms(self.elements[r].ty, "ReturnParameterMembership"))
+            .is_some_and(|r| is_a!(self.elements[r], "ReturnParameterMembership"))
     }
 
     fn positional_owned_memberships(
@@ -1985,7 +2620,7 @@ impl Builder {
             .iter()
             .copied()
             .filter(|&r| {
-                conforms(self.elements[r].ty, "Membership")
+                is_a!(self.elements[r], "Membership")
                     && self.import_admitted(r, super::LookupAccess::Protected)
             })
             .collect();
@@ -2000,12 +2635,32 @@ impl Builder {
             .collect()
     }
 
+    /// The features `e` redefines as the semantic passes read them, as a
+    /// list (see [`Self::semantic_redefinition_targets_into`]).
+    #[cfg(test)]
     pub(super) fn semantic_redefinition_targets(
         &mut self,
         e: usize,
         include_implied: bool,
     ) -> Vec<usize> {
-        let mut targets = self.indexed_redefinition_targets(e);
+        let mut targets = Vec::new();
+        self.semantic_redefinition_targets_into(e, include_implied, &mut targets);
+        targets
+    }
+
+    /// The features `e` redefines as the semantic passes read them, pushed
+    /// onto `out`: the recorded targets first, then the positional ones not
+    /// among them — so a walk's stack takes them without an allocation per
+    /// element.
+    pub(super) fn semantic_redefinition_targets_into(
+        &mut self,
+        e: usize,
+        include_implied: bool,
+        out: &mut Vec<usize>,
+    ) {
+        let recorded = self.indexed_redefinition_targets_shared(e);
+        let start = out.len();
+        out.extend(recorded.iter().copied());
         if include_implied
             && self.semantic_ready
             && self.dynamic_evidence_current(e)
@@ -2020,12 +2675,11 @@ impl Builder {
                 .into_iter()
                 .flatten()
             {
-                if !targets.contains(&target) {
-                    targets.push(target);
+                if !out[start..].contains(&target) {
+                    out.push(target);
                 }
             }
         }
-        targets
     }
 }
 
@@ -2033,8 +2687,8 @@ impl Builder {
 // This validates the inspected graph; the common planner still derives all edges.
 fn acyclic_redefinition_closure(
     root: usize,
-    graph: &HashMap<usize, Vec<usize>>,
-    state: &mut HashMap<usize, u8>,
+    graph: &IdMap<usize, Vec<usize>>,
+    state: &mut IdMap<usize, u8>,
     steps: &mut usize,
 ) -> Option<()> {
     let mut todo = vec![(root, false)];
@@ -2064,9 +2718,9 @@ fn acyclic_redefinition_closure(
 fn add_edge(
     source: usize,
     target: usize,
-    graph: &mut HashMap<usize, Vec<usize>>,
-    library: &HashMap<usize, Vec<usize>>,
-    added: &mut HashMap<usize, Vec<usize>>,
+    graph: &mut IdMap<usize, Vec<usize>>,
+    library: &ListsByRow<usize>,
+    added: &mut IdMap<usize, Vec<usize>>,
     traversal: &mut Reachability,
     steps: &mut Option<&mut usize>,
 ) -> Option<()> {
@@ -2078,7 +2732,12 @@ fn add_edge(
         charge(steps, 1)?;
         graph
             .entry(source)
-            .or_insert_with(|| library.get(&source).cloned().unwrap_or_default())
+            .or_insert_with(|| {
+                library
+                    .get(source)
+                    .map(<[usize]>::to_vec)
+                    .unwrap_or_default()
+            })
             .push(target);
         added.entry(source).or_default().push(target);
     }
@@ -2087,13 +2746,14 @@ fn add_edge(
 
 /// A complete type's effective features: planned here, or by the library.
 fn effective_of<'a>(
-    effective: &'a HashMap<usize, Vec<usize>>,
-    planned: &'a PlannedTypes,
+    effective: &'a IdMap<usize, Vec<usize>>,
+    planned: &'a PlannedLibraryTypes,
     e: &usize,
-) -> &'a Vec<usize> {
+) -> &'a [usize] {
     effective
         .get(e)
-        .or_else(|| planned.effective.get(e))
+        .map(Vec::as_slice)
+        .or_else(|| planned.effective.get(*e))
         .expect("a complete base has effective features")
 }
 
@@ -2414,7 +3074,7 @@ mod tests {
     #[test]
     fn traversal_charges_edges_before_growing_pending_work_and_recovers() {
         let mut traversal = Reachability::new(4);
-        let graph = HashMap::from([(0, vec![1, 2]), (1, vec![3]), (2, vec![3]), (3, vec![0])]);
+        let graph = IdMap::from_iter([(0, vec![1, 2]), (1, vec![3]), (2, vec![3]), (3, vec![0])]);
         let mut work = crate::eval::MAX_STEPS - 2;
         assert!(
             traversal
@@ -2504,7 +3164,7 @@ mod tests {
 
     #[test]
     fn wide_scratch_tables_do_not_follow_a_run_of_tiny_nodes() {
-        let mut members: HashSet<_> = (0..4096).collect();
+        let mut members: IdSet<_> = (0..4096).collect();
         let mut counts: HashMap<_, _> = (0..4096).map(|e| (e, 1)).collect();
         reset_scratch_set(&mut members);
         reset_scratch_map(&mut counts);
@@ -2523,7 +3183,7 @@ mod tests {
     fn reusable_traversal_matches_transitive_closure_for_every_three_node_graph() {
         let mut traversal = Reachability::new(3);
         for bits in 0..512 {
-            let mut graph = HashMap::new();
+            let mut graph = IdMap::default();
             let mut expected = [[false; 3]; 3];
             for (source, row) in expected.iter_mut().enumerate() {
                 row[source] = true;
@@ -2559,7 +3219,7 @@ mod tests {
     #[test]
     fn traversal_observes_graph_growth_and_generation_wrap() {
         let mut traversal = Reachability::new(4);
-        let mut graph = HashMap::from([(0, vec![1, 2]), (1, vec![3]), (2, vec![3])]);
+        let mut graph = IdMap::from_iter([(0, vec![1, 2]), (1, vec![3]), (2, vec![3])]);
         assert_eq!(traversal.reachable(3, &graph), [3]);
         assert_eq!(traversal.reachable(0, &graph).len(), 4);
         graph.insert(3, vec![0]);
@@ -2570,5 +3230,174 @@ mod tests {
         graph.clear();
         assert_eq!(traversal.reachable(0, &graph), [0]);
         assert_eq!(traversal.reachable(3, &graph), [3]);
+    }
+
+    #[test]
+    fn an_exhausted_budgeted_attempt_is_not_repeated_with_no_more_budget() {
+        let mut model = crate::model::Model::new();
+        model.add_source(
+            "exhausted.kerml",
+            "function A {in p; return result;} function B specializes A {in q; return r;} feature call=B(1);",
+        );
+        assert!(!model.has_errors());
+        let mut r = super::super::ResolvedModel::build(&model);
+        r.b.positional_redefinitions = None;
+        assert!(r.b.positional_budget_exhausted.is_none());
+        // Two steps of budget: the entry charge takes one, the chain-evidence
+        // refresh the other, and the planning does not fit in what is left.
+        let mut steps = crate::eval::MAX_STEPS - 2;
+        assert!(!r.b.ensure_positional_redefinitions_with_budget(&mut steps));
+        assert!(r.b.positional_redefinitions.is_none());
+        assert!(
+            steps >= crate::eval::MAX_STEPS,
+            "the attempt charged its work"
+        );
+        let exhausted = r.b.positional_budget_exhausted.clone().expect("remembered");
+        assert_eq!(exhausted.remaining, 1);
+        // The same budget over the same inputs is refused after the entry charge alone.
+        let mut again = crate::eval::MAX_STEPS - 2;
+        assert!(!r.b.ensure_positional_redefinitions_with_budget(&mut again));
+        assert_eq!(again, crate::eval::MAX_STEPS - 1);
+        // Less budget likewise.
+        let mut less = crate::eval::MAX_STEPS - 1;
+        assert!(!r.b.ensure_positional_redefinitions_with_budget(&mut less));
+        assert_eq!(less, crate::eval::MAX_STEPS);
+        // More budget plans again: the attempt charges past the entry.
+        let mut more = crate::eval::MAX_STEPS - 3;
+        let planned = r.b.ensure_positional_redefinitions_with_budget(&mut more);
+        assert!(planned || more >= crate::eval::MAX_STEPS - 1);
+        r.b.positional_redefinitions = None;
+        assert!(r.b.positional_budget_exhausted.is_some() || planned);
+        // A change to the resolved specialization targets is a new input:
+        // the same budget plans again, although no element row changed.
+        let mut steps = crate::eval::MAX_STEPS - 2;
+        assert!(!r.b.ensure_positional_redefinitions_with_budget(&mut steps));
+        let rows = r.b.elements.observe_revision();
+        let target = r.b.spec_resolved[0];
+        r.b.spec_resolved[0] = None;
+        r.b.spec_resolved[0] = target;
+        assert!(rows.same_as(&r.b.elements.observe_revision()));
+        let mut retried = crate::eval::MAX_STEPS - 2;
+        assert!(!r.b.ensure_positional_redefinitions_with_budget(&mut retried));
+        assert!(
+            retried >= crate::eval::MAX_STEPS,
+            "a changed input is planned again"
+        );
+        // Dropping the plan for another library-name configuration forgets
+        // the exhausted attempt as well.
+        assert!(r.b.positional_budget_exhausted.is_some());
+        r.set_library_names(&HashMap::new());
+        assert!(r.b.positional_budget_exhausted.is_none());
+        // The whole budget publishes, and a published plan is answered before
+        // any memory is consulted.
+        assert!(r.b.ensure_positional_redefinitions_with_budget(&mut 0));
+        assert!(r.b.positional_redefinitions.is_some());
+        assert!(r.b.positional_budget_exhausted.is_none());
+        let mut none = crate::eval::MAX_STEPS - 2;
+        assert!(r.b.ensure_positional_redefinitions_with_budget(&mut none));
+    }
+
+    #[test]
+    fn a_published_plan_makes_the_budgeted_path_free_of_planning() {
+        let mut model = crate::model::Model::new();
+        model.add_source(
+            "published.kerml",
+            "function A {in p; return result;} feature call=A(1);",
+        );
+        assert!(!model.has_errors());
+        let mut r = super::super::ResolvedModel::build(&model);
+        r.b.ensure_positional_redefinitions();
+        assert!(r.b.has_positional_plan());
+        assert!(r.b.positional_budget_exhausted.is_none());
+        let mut steps = crate::eval::MAX_STEPS - 2;
+        assert!(r.b.ensure_positional_redefinitions_with_budget(&mut steps));
+        assert_eq!(
+            steps,
+            crate::eval::MAX_STEPS,
+            "entry charge and refresh only"
+        );
+        assert!(r.b.positional_budget_exhausted.is_none());
+    }
+}
+
+#[cfg(test)]
+mod wire_rows_tests {
+    use super::*;
+    use crate::bulk::Ints;
+
+    fn roles(types: &[usize], lists: &[(usize, Vec<usize>)]) -> RoleLists {
+        RoleLists {
+            types: Ints(types.to_vec()),
+            ends: lists.to_vec().into(),
+            results: lists.to_vec().into(),
+            parameters: lists.to_vec().into(),
+        }
+    }
+
+    /// The roles' columns must name the same types, within the rows, with
+    /// every feature within the rows.
+    #[test]
+    fn roles_columns_that_disagree_or_leave_the_rows_are_refused() {
+        let lists = vec![(1, vec![2]), (3, vec![])];
+        let (ends, results, parameters) = roles(&[1, 3], &lists).into_rows(4).unwrap();
+        assert_eq!(ends.get(1), Some(&[2][..]));
+        assert_eq!(results.get(3), Some(&[][..]));
+        assert_eq!(parameters.get(0), None);
+        assert!(
+            roles(&[1, 2], &lists).into_rows(4).is_none(),
+            "the types disagree"
+        );
+        assert!(
+            roles(&[1, 3], &lists).into_rows(3).is_none(),
+            "a type past the rows"
+        );
+        assert!(
+            roles(&[1], &[(1, vec![5])]).into_rows(3).is_none(),
+            "a feature past the rows"
+        );
+    }
+
+    /// The memberships' columns must cover each other, within the rows.
+    #[test]
+    fn membership_columns_that_do_not_cover_each_other_are_refused() {
+        let lists = |types: Vec<usize>, lengths: Vec<usize>, rel: Vec<usize>, mem: Vec<usize>| {
+            MembershipLists {
+                types: Ints(types),
+                lengths: Ints(lengths),
+                relationships: Ints(rel),
+                members: Ints(mem),
+            }
+        };
+        let laid = lists(vec![1], vec![1], vec![2], vec![3])
+            .into_rows(4)
+            .unwrap();
+        assert_eq!(
+            laid.get(1).map(|m| (m[0].relationship, m[0].member)),
+            Some((2, 3))
+        );
+        assert!(
+            lists(vec![1], vec![1], vec![2], vec![])
+                .into_rows(4)
+                .is_none(),
+            "relationships and members differ"
+        );
+        assert!(
+            lists(vec![1], vec![2], vec![2], vec![3])
+                .into_rows(4)
+                .is_none(),
+            "a length past the values"
+        );
+        assert!(
+            lists(vec![1], vec![1], vec![4], vec![3])
+                .into_rows(4)
+                .is_none(),
+            "a relationship past the rows"
+        );
+        assert!(
+            lists(vec![1], vec![1], vec![2], vec![4])
+                .into_rows(4)
+                .is_none(),
+            "a member past the rows"
+        );
     }
 }

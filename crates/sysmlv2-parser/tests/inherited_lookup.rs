@@ -89,24 +89,31 @@ fn endpoint(r: &mut ResolvedModel, owner: &str, kind: &str, property: &str, targ
 }
 
 #[test]
-fn distinct_feature_memberships_are_removed_before_lookup_and_binding() {
+fn distinct_feature_memberships_are_both_inherited_for_lookup_and_binding() {
     let library = "class Base { feature x; alias ax for x; } class Child specializes Base;";
     let user = "feature useX subsets Child::x; feature useAlias references Child::ax;";
     for mut r in models(library, user) {
         for warm in [false, true] {
             if warm {
                 let child = r.resolve_qualified("Child").unwrap();
-                assert!(r.inherited_memberships(child, false).is_empty());
+                assert_eq!(r.inherited_memberships(child, false).len(), 2);
             }
-            assert_eq!(r.resolve_qualified("Child::x"), None);
-            assert_eq!(r.resolve_qualified("Child::ax"), None);
-            endpoint(&mut r, "useX", "Subsetting", "subsettedFeature", None);
+            let x = r.resolve_qualified("Base::x").unwrap();
+            assert_eq!(r.resolve_qualified("Child::x"), Some(x));
+            assert_eq!(r.resolve_qualified("Child::ax"), Some(x));
+            endpoint(
+                &mut r,
+                "useX",
+                "Subsetting",
+                "subsettedFeature",
+                Some("Base::x"),
+            );
             endpoint(
                 &mut r,
                 "useAlias",
                 "ReferenceSubsetting",
                 "referencedFeature",
-                None,
+                Some("Base::x"),
             );
         }
     }
@@ -223,7 +230,7 @@ fn alias_visibility_applies_to_the_membership_instead_of_its_target() {
 }
 
 #[test]
-fn a_shared_alias_identity_survives_a_diamond_but_distinct_aliases_do_not() {
+fn shared_and_distinct_alias_identities_both_survive_inheritance() {
     let library = "class Values { feature x; }
         class Base { alias ax for Values::x; }
         class Left specializes Base; class Right specializes Base;
@@ -236,16 +243,17 @@ fn a_shared_alias_identity_survives_a_diamond_but_distinct_aliases_do_not() {
     ) {
         let x = r.resolve_qualified("Values::x").unwrap();
         assert_eq!(r.resolve_qualified("Shared::ax"), Some(x));
-        assert_eq!(r.resolve_qualified("Distinct::ax"), None);
-        assert_eq!(r.resolve_qualified("Distinct::bx"), None);
-        endpoint(
-            &mut r,
-            "a",
-            "Subsetting",
-            "subsettedFeature",
-            Some("Values::x"),
-        );
-        endpoint(&mut r, "b", "Subsetting", "subsettedFeature", None);
+        assert_eq!(r.resolve_qualified("Distinct::ax"), Some(x));
+        assert_eq!(r.resolve_qualified("Distinct::bx"), Some(x));
+        for feature in ["a", "b"] {
+            endpoint(
+                &mut r,
+                feature,
+                "Subsetting",
+                "subsettedFeature",
+                Some("Values::x"),
+            );
+        }
     }
 }
 
@@ -261,15 +269,21 @@ fn library_origin_references_use_the_same_selection_after_cache_replay() {
             "before",
             "ReferenceSubsetting",
             "referencedFeature",
-            None,
+            Some("Base::x"),
         );
-        endpoint(&mut r, "after", "Subsetting", "subsettedFeature", None);
+        endpoint(
+            &mut r,
+            "after",
+            "Subsetting",
+            "subsettedFeature",
+            Some("Base::x"),
+        );
         endpoint(
             &mut r,
             "userReference",
             "ReferenceSubsetting",
             "referencedFeature",
-            None,
+            Some("Base::x"),
         );
     }
 }
@@ -280,7 +294,7 @@ fn identity_overrides_preserve_cached_membership_selection_and_reference_endpoin
         class Child specializes Base;";
     for mut r in models(
         library,
-        "feature gone subsets Child::ax; feature kept subsets Child::safe;",
+        "feature aliased subsets Child::ax; feature kept subsets Child::safe;",
     ) {
         let child = r.resolve_qualified("Child").unwrap();
         r.inherited_memberships(child, true);
@@ -294,10 +308,16 @@ fn identity_overrides_preserve_cached_membership_selection_and_reference_endpoin
             (r.element_id(x), replacement),
             (r.element_id(safe), replacement_safe),
         ]));
-        assert_eq!(r.resolve_qualified("Child::x"), None);
-        assert_eq!(r.resolve_qualified("Child::ax"), None);
+        assert_eq!(r.resolve_qualified("Child::x"), Some(x));
+        assert_eq!(r.resolve_qualified("Child::ax"), Some(x));
         assert_eq!(r.resolve_qualified("Child::safe"), Some(safe));
-        endpoint(&mut r, "gone", "Subsetting", "subsettedFeature", None);
+        endpoint(
+            &mut r,
+            "aliased",
+            "Subsetting",
+            "subsettedFeature",
+            Some("Base::x"),
+        );
         endpoint(
             &mut r,
             "kept",
@@ -347,21 +367,22 @@ fn user_completion_rechecks_library_references_that_depend_on_alias_membership()
         library,
         "class Future { alias x for Base::x; } feature userReference references Child::ax;",
     ) {
-        assert_eq!(r.resolve_qualified("Child::x"), None);
-        assert_eq!(r.resolve_qualified("Child::ax"), None);
+        let x = r.resolve_qualified("Base::x").unwrap();
+        assert_eq!(r.resolve_qualified("Child::x"), Some(x));
+        assert_eq!(r.resolve_qualified("Child::ax"), Some(x));
         endpoint(
             &mut r,
             "libraryReference",
             "ReferenceSubsetting",
             "referencedFeature",
-            None,
+            Some("Base::x"),
         );
         endpoint(
             &mut r,
             "userReference",
             "ReferenceSubsetting",
             "referencedFeature",
-            None,
+            Some("Base::x"),
         );
     }
     let library = "class Base { alias ax for Future::x; }
@@ -747,10 +768,13 @@ fn imports_in_base_bodies_keep_their_actual_member_access_walks() {
 
 #[test]
 fn suppressed_inheritance_cannot_certify_an_alias_lexical_fallback() {
+    // B's own `y` redefines Q::x, which removes A's aliases of it from B's
+    // inheritance; `ax` in B's nested class then resolves only through P's
+    // private import of A.
     let library = "package Q { feature x; }
         class A { alias ax for Q::x; alias bx for Q::x; }
         package P { private import A::*;
-            class B specializes A { class AliasOwner { alias selected for ax; } }
+            class B specializes A { feature y redefines ax; class AliasOwner { alias selected for ax; } }
         }
         class Child specializes P::B::AliasOwner;";
     for mut r in models(library, "feature selected references Child::selected;") {

@@ -3,6 +3,8 @@ use super::{
     Builder, ElementRef, InheritedBindings, LookupAccess, LookupResult, MembershipContext,
     ResolvedModel,
 };
+use crate::layered::IdMap;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 impl ResolvedModel {
@@ -74,8 +76,7 @@ impl Builder {
         let mut scopes = Vec::new();
         let mut seen_scopes = HashSet::new();
         for &membership in inherited.membership_order.iter().chain(&imported_order) {
-            if !crate::metaclass::conforms(self.elements[membership].ty, "ElementFilterMembership")
-            {
+            if !is_a!(self.elements[membership], "ElementFilterMembership") {
                 continue;
             }
             wanted.insert(membership);
@@ -132,12 +133,12 @@ impl Builder {
         let mut out = InheritedBindings::default();
         // This memo's key includes access, recursion, and the filter path.
         // Sharing it avoids diamond expansion without conflating filtered paths.
-        let mut seen = HashMap::new();
+        let mut seen = IdMap::default();
         // Expose.importedMemberships starts with the empty exclusion set.
         // collect_import_scope adds each visited namespace to break cycles.
         let mut excluded = Vec::new();
         for relationship in relationships {
-            if !crate::metaclass::conforms(self.elements[relationship].ty, "Expose") {
+            if !is_a!(self.elements[relationship], "Expose") {
                 continue;
             }
             if let Some(&index) = member_by_rel.get(&relationship) {

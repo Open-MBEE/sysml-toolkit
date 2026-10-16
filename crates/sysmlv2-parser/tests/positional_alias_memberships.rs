@@ -76,11 +76,11 @@ fn check(library: &str, source: &str, expected: Option<&str>, incomplete: bool) 
 }
 
 #[test]
-fn owning_membership_and_alias_of_same_feature_remove_each_other_before_pairing() {
+fn an_owning_membership_and_an_alias_of_one_end_keep_its_slot() {
     check(
         "package P { assoc Base { end feature x; alias ax for x; } assoc Mid specializes Base; }",
         "package U { assoc Leaf specializes P::Mid { end feature slot; } }",
-        None,
+        Some("P::Base::x"),
         false,
     );
 }
@@ -116,7 +116,7 @@ fn owned_alias_does_not_seed_owned_feature_redefinition_targets() {
 }
 
 #[test]
-fn imported_aliases_participate_in_filtering_before_slot_projection() {
+fn imported_aliases_keep_the_imported_ends_slot() {
     for import in [
         "public import Values::*;",
         "public import Values::x; public import Values::ax;",
@@ -127,15 +127,18 @@ fn imported_aliases_participate_in_filtering_before_slot_projection() {
                 "package P {{ assoc Values {{ end feature x; alias ax for x; }} assoc Base {{ {import} }} assoc Mid specializes Base; }}"
             ),
             "package U { assoc Leaf specializes P::Mid { end feature slot; } }",
-            None,
+            Some("P::Values::x"),
             false,
         );
     }
 }
 
 #[test]
-fn private_aliases_do_not_block_but_protected_aliases_do() {
-    for (visibility, expected) in [("private", Some("P::Base::x")), ("protected", None)] {
+fn alias_visibility_does_not_remove_the_end_it_names() {
+    for (visibility, expected) in [
+        ("private", Some("P::Base::x")),
+        ("protected", Some("P::Base::x")),
+    ] {
         check(
             &format!(
                 "package P {{ assoc Base {{ end feature x; {visibility} alias ax for x; }} assoc Mid specializes Base; }}"

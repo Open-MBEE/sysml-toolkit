@@ -5,6 +5,22 @@ use sysmlv2_parser::json::{library_to_compact_json, model_to_compact_json};
 use sysmlv2_parser::libcache::{LibraryCache, TOOLKIT_BUILD, hash_library_dir};
 use sysmlv2_parser::model::Model;
 
+/// The recording's whole-file checksum as the toolkit seals it: FNV-1a
+/// folded eight bytes at a time, the tail byte by byte.
+fn seal(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let (chunks, tail) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        h ^= u64::from_le_bytes(*chunk);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &b in tail {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 const USER_SRC: &str = "package Demo {
     private import ScalarValues::*;
     part def Vehicle { attribute mass : Real = 1500.0; }
@@ -191,11 +207,7 @@ fn stale_fingerprint_disables_replay_soundly() {
     let fp_off = 11 + bytes[8] as usize;
     bytes[fp_off] ^= 0xff;
     let body_len = bytes.len() - 8;
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in &bytes[..body_len] {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
+    let h = seal(&bytes[..body_len]);
     bytes[body_len..].copy_from_slice(&h.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
     let tampered = LibraryCache::load(&path).expect("structurally valid");
@@ -237,11 +249,7 @@ fn invalid_cache_files_are_rejected() {
     huge.extend_from_slice(version);
     huge.extend_from_slice(&0u64.to_le_bytes());
     huge.extend_from_slice(&u64::MAX.to_le_bytes());
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in &huge {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
+    let h = seal(&huge);
     huge.extend_from_slice(&h.to_le_bytes());
     std::fs::write(&path, &huge).unwrap();
     assert!(LibraryCache::load(&path).is_none());
@@ -296,7 +304,7 @@ fn header_carries_a_source_fingerprint_beyond_the_crate_version() {
 fn cache_from_another_toolkit_build_is_rejected() {
     fn sealed_empty_cache(build: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"SYSML8LC");
+        buf.extend_from_slice(b"SYSML9LC");
         buf.push(build.len() as u8);
         buf.extend_from_slice(build);
         buf.push(2); // legacy authored graph format
@@ -305,11 +313,7 @@ fn cache_from_another_toolkit_build_is_rejected() {
         for _ in 0..4 {
             buf.extend_from_slice(&0u64.to_le_bytes()); // empty tables
         }
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &b in &buf {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
+        let h = seal(&buf);
         buf.extend_from_slice(&h.to_le_bytes());
         buf
     }

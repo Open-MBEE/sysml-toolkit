@@ -44,21 +44,21 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.10.2"
+version = "0.10.10"
 edition = "2021"
 rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/Open-MBEE/sysml-toolkit"
 
 [workspace.dependencies]
-sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.10.2" }
-sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.10.2" }
-sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.10.2" }
-sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.10.2" }
+sysmlv2-parser = { path = "crates/sysmlv2-parser", version = "0.10.10" }
+sysmlv2-cbor = { path = "crates/sysmlv2-cbor", version = "0.10.10" }
+sysmlv2-solve = { path = "crates/sysmlv2-solve", version = "0.10.10" }
+sysmlv2-lint = { path = "crates/sysmlv2-lint", version = "0.10.10" }
 sysmlv2-testkit = { path = "crates/sysmlv2-testkit" }
-sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.10.2" }
-sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.10.2" }
-sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.10.2" }
+sysmlv2-transform = { path = "crates/sysmlv2-transform", version = "0.10.10" }
+sysmlv2-viz = { path = "crates/sysmlv2-viz", version = "0.10.10" }
+sysmlv2-lsp = { path = "crates/sysmlv2-lsp", version = "0.10.10" }
 lsp-server = "0.10"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
@@ -73,8 +73,12 @@ uuid = { version = "1", features = ["v4", "v5", "js"] }
 # owner's hash state by a child's path segment.
 sha1_smol = "1"
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
-jsonschema = "0.56"
+# Tests only: validates the full form against the published schemas.
+# Those schemas bundle every definition their references name, so no
+# reference is fetched and the network and TLS features stay off.
+jsonschema = { version = "0.58", default-features = false }
 miniz_oxide = "0.9"
+memmap2 = "0.9"
 regex-lite = "0.1"
 num-bigint = "0.4"
 num-integer = "0.1"

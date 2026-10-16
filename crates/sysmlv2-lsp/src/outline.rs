@@ -120,7 +120,7 @@ pub(crate) struct Plumbing {
 
 /// A reference as written: an alias's target, or what a declaration
 /// specializes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Written {
     /// One raw name per segment.
     pub target: Vec<String>,
@@ -131,7 +131,7 @@ pub(crate) struct Written {
 /// What a declaration specializes, as written: a type a usage is typed
 /// by, a feature it subsets, redefines, or references, a definition a
 /// definition specializes. Its members are the declaration's too.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Base {
     pub written: Written,
     /// A feature the declaration redefines: found among what the
@@ -651,9 +651,21 @@ fn usage_kinded(
     s
 }
 
-/// `: T1, T2 [mult]` from the declaration, spelled as in source.
+/// `: T1, T2 [mult]` from the declaration, spelled as in source; an
+/// anonymous usage that redefines something leads with what it redefines
+/// (`:>> chassis.mass : T`), since its `«keyword»` name alone tells one
+/// such member from the next no better than their order.
 fn usage_detail(u: &Usage, ctx: &Ctx<'_>) -> Option<String> {
     let mut parts = Vec::new();
+    if u.declaration.id.is_empty() {
+        for s in &u.declaration.specializations {
+            if let FeatureSpecialization::Redefines(targets) = s {
+                let names: Vec<&str> = targets.iter().map(|t| ctx.spell(t)).collect();
+                parts.push(format!(":>> {}", names.join(", ")));
+                break;
+            }
+        }
+    }
     for s in &u.declaration.specializations {
         if let FeatureSpecialization::TypedBy(types) = s {
             let names: Vec<String> = types

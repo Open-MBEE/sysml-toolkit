@@ -24,21 +24,68 @@ use sysmlv2_parser::parser::{Parse, parse_kerml_source, parse_source};
 use sysmlv2_parser::print::{Indent, PrintOptions, format_source_with, print_source_opts};
 use sysmlv2_parser::span::{LineIndex, Span};
 
+mod bundle;
 mod kpar;
 
 /// Load a prepared standard library; the model layer also shares its immutable
 /// prefix across SDK/session rebuilds. Any legacy recording is saved after build.
 /// A cache the loader could not write is reported here — this process has a
-/// standard error stream to report it on, the library does not.
+/// standard error stream to report it on, the library does not. `dir` may
+/// name a library bundle file instead (see [`bundle`]).
 fn load_library(model: &mut Model, dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    if bundle::is_bundle(dir) {
+        match load_bundle(dir, model.graph_format())? {
+            bundle::Bundle::Prepared(library) => library.install(model)?,
+            bundle::Bundle::Sources(units) => {
+                for (name, text) in &units {
+                    model.add_library_source(name.clone(), text);
+                }
+            }
+        }
+        return Ok(None);
+    }
     let load = sysmlv2_parser::prepared::load_library_with_cache(model, dir)?;
-    // One cache location, one cause, one remedy: several unwritable cache
-    // files in a run say the same thing, so the first speaks for the run.
-    if let Some(warning) = load.warnings.first() {
+    // A cold run's cache files are written while the verb runs; `run`
+    // joins the writes before the process ends.
+    if let Some(pending) = load.pending {
+        pending.detach();
+    }
+    warn_library_cache(&load.warnings);
+    Ok(load.recording_path)
+}
+
+/// The library bundle at `path`, its warnings said.
+fn load_bundle(
+    path: &Path,
+    format: sysmlv2_parser::model::GraphFormat,
+) -> std::io::Result<bundle::Bundle> {
+    let load = bundle::load(path, format)?;
+    warn_library_cache(&load.warnings);
+    Ok(load.bundle)
+}
+
+/// The library a session loads for `--lib`: the directory, or the bundle
+/// as [`load_library`] loads it.
+fn session_library(path: &Path) -> std::io::Result<sysmlv2_transform::Library> {
+    if !bundle::is_bundle(path) {
+        return Ok(sysmlv2_transform::Library::dir(path));
+    }
+    Ok(
+        match load_bundle(path, sysmlv2_parser::model::GraphFormat::default())? {
+            bundle::Bundle::Prepared(library) => sysmlv2_transform::Library::Prepared(library),
+            bundle::Bundle::Sources(units) => sysmlv2_transform::Library::sources(units),
+        },
+    )
+}
+
+/// Say what a library load could not do with its cache. One cache
+/// location, one cause, one remedy: several unwritable cache files in a
+/// run say the same thing, so the first speaks for the run.
+fn warn_library_cache(warnings: &[String]) {
+    if let Some(warning) = warnings.first() {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| eprintln!("warning: {warning}"));
     }
-    Ok(load.recording_path)
 }
 
 /// Inverse of [`flexo_payload`] for Flexo *responses*: unwrap
@@ -251,6 +298,12 @@ fn save_library_cache(model: &Model, path: Option<PathBuf>) {
                   SYSMLV2_CACHE_DIR to relocate the cache or SYSMLV2_LIB_CACHE=off\n\
                   to disable it (e.g. for benchmarking).\n\
                   \n\
+                  --lib may also name a library bundle file: the JSON [{name, text}]\n\
+                  the WebAssembly package ships, its units named by their paths. The\n\
+                  prepared snapshot generated with it, <stem>.prepared beside it, is\n\
+                  read instead of preparing the library (prepare and lsp take a\n\
+                  directory).\n\
+                  \n\
                   Ambient model context: when SYSMLV2_MODEL_DIR names a directory,\n\
                   its .sysml/.kerml files stand in for omitted input files (fmt\n\
                   honors this under --check only), and a stderr note records that\n\
@@ -280,6 +333,51 @@ struct Cli {
     /// with nothing [env: SYSMLV2_UNIT_SPELLINGS=off]
     #[arg(long = "no-unit-spellings", global = true)]
     no_unit_spellings: bool,
+}
+
+/// `--number-format` for the commands that print computed values.
+#[derive(clap::Args, Clone, Debug, Default)]
+struct NumberFormatArg {
+    /// How a rational without a terminating decimal expansion prints:
+    /// a style — exact (`1/15`, the default), approx
+    /// (`≈0.06666666666666667`), overline
+    /// (`0.06̅`), parens (`0.0(6)`), unicode (`¹/₁₅`) — then optional
+    /// settings after commas: digits=N (significant digits of an
+    /// approximate decimal, every style's fallback; 0 = shortest),
+    /// period=N (overline, parens: longest period written out, default
+    /// 6), mixed=true|false (exact, unicode: `2 1/3`, `2¹/₃`),
+    /// slash=solidus|fraction|division and glyphs=true|false (unicode),
+    /// fraction-digits=N (exact, unicode: most digits per numerator or
+    /// denominator, 0 = no limit). Example: --number-format
+    /// overline,period=3. Findings and verdict bindings stay exact
+    #[arg(long = "number-format", value_name = "SPEC")]
+    number_format: Option<sysmlv2_parser::numfmt::NumberFormat>,
+}
+
+thread_local! {
+    /// The `--number-format` of the command running on this thread,
+    /// set by [`with_number_format`] around its dispatch only; anything
+    /// else (library callers of the `run_*` functions) prints exact.
+    static NUMBER_FORMAT: std::cell::Cell<Option<sysmlv2_parser::numfmt::NumberFormat>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn number_format() -> sysmlv2_parser::numfmt::NumberFormat {
+    NUMBER_FORMAT
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(sysmlv2_parser::numfmt::NumberFormat::exact)
+}
+
+/// Run `body` with `format` as this thread's number format, restoring
+/// the previous one after.
+fn with_number_format<T>(
+    format: Option<sysmlv2_parser::numfmt::NumberFormat>,
+    body: impl FnOnce() -> T,
+) -> T {
+    let previous = NUMBER_FORMAT.with(|slot| slot.replace(format));
+    let out = body();
+    NUMBER_FORMAT.with(|slot| slot.set(previous));
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -410,7 +508,7 @@ enum Command {
         /// output into one file per root namespace
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
         /// Flexo MMS conventions on JSON output: each root namespace's
@@ -501,8 +599,9 @@ enum Command {
         /// state digest matches each delta's base or result digest
         #[arg(long = "find-base", value_name = "DIR")]
         find_base: Option<PathBuf>,
-        /// Standard-library directory — lets id-elided snapshots with
-        /// library-typed elements re-derive their ids for digesting
+        /// Standard-library directory or bundle file — lets id-elided
+        /// snapshots with library-typed elements re-derive their ids for
+        /// digesting
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
         /// Emit a delta from BASE to the single snapshot input, pairing
@@ -586,6 +685,32 @@ enum Command {
         #[arg(long, value_parser = parse_indent_arg, default_value = "4")]
         indent: Indent,
     },
+    /// Prepare a standard library's snapshot ahead of time
+    #[command(
+        long_about = "Prepare a standard library's snapshot ahead of time.\n\
+                      \n\
+                      Writes the library's complete snapshot (stdlib-<key>.prepared) and\n\
+                      its resolution recording (stdlib-<key>.libcache) into OUT, named by\n\
+                      the library's content key as the cache names them. A run whose cache\n\
+                      has no snapshot for that library reads them from OUT in place —\n\
+                      OUT given as SYSMLV2_LIB_SNAPSHOT_DIR, or a directory named\n\
+                      `prepared` beside the library directory or beside the executable —\n\
+                      instead of preparing the library from source, so the first run after\n\
+                      an install is as fast as the next. The files are for this toolkit\n\
+                      build and the default graph format; another build passes them over\n\
+                      and prepares.",
+        after_help = "EXAMPLES:\n\
+                      \x20 sysmlv2 prepare --lib spec-refs/SysML-v2-Release/sysml.library --out dist/prepared\n\
+                      \x20 SYSMLV2_LIB_SNAPSHOT_DIR=dist/prepared sysmlv2 check --lib spec-refs/SysML-v2-Release/sysml.library model.sysml"
+    )]
+    Prepare {
+        /// Standard-library directory to prepare
+        #[arg(long, env = "SYSMLV2_LIB_DIR")]
+        lib: Option<PathBuf>,
+        /// Directory the two files are written into (created if needed)
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Parse and validate files (syntax + body-context legality; exit 1 on
     /// any error). With --lib, also runs referential checks as warnings.
     #[command(after_help = "Checks run in stages: parse diagnostics, then\n\
@@ -620,7 +745,8 @@ enum Command {
         /// Files to check; `-` reads stdin; optional when
         /// SYSMLV2_MODEL_DIR is set
         files: Vec<PathBuf>,
-        /// Standard-library directory; enables referential checks
+        /// Standard-library directory or bundle file; enables referential
+        /// checks
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
         /// Treat warnings as failures: exit 1 on any finding (for
@@ -647,8 +773,9 @@ enum Command {
                             opt in per rule or per stereotype scope;\n\
                             naming-convention is info (a casing nudge —\n\
                             tighten or disable per project);\n\
-                            dimensional-consistency, unqualified-enum-literal\n\
-                            and visibility-blocked-reference warn;\n\
+                            dimensional-consistency, unit-precedence,\n\
+                            literal-pattern, unqualified-enum-literal and\n\
+                            visibility-blocked-reference warn;\n\
                             import-visibility, usage-kind-mismatch and\n\
                             port-member-referential are info findings that\n\
                             carry the fix for an error `check` already\n\
@@ -674,8 +801,8 @@ enum Command {
         /// Files to lint; `-` reads stdin; optional when
         /// SYSMLV2_MODEL_DIR is set
         files: Vec<PathBuf>,
-        /// Standard-library directory (resolution context only; library
-        /// elements are never linted)
+        /// Standard-library directory or bundle file (resolution context
+        /// only; library elements are never linted)
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
         /// Lint config JSON; defaults to sysmlint.json beside the first
@@ -695,8 +822,8 @@ enum Command {
         #[arg(long, requires = "fix")]
         fix_deletes: bool,
         /// With --fix: also apply fixes that change what a declaration
-        /// means (a usage keyword, a member's visibility) rather than
-        /// how it is spelled
+        /// means (a usage keyword, a member's visibility, the value a
+        /// unit applies to) rather than how it is spelled
         #[arg(long, requires = "fix")]
         fix_semantic: bool,
         /// Exit 1 on any finding at all (warnings, infos and hints
@@ -734,10 +861,12 @@ enum Command {
                             \x20 sysmlv2 verify model.sysml --solve\n\
                             \x20 sysmlv2 verify src/*.sysml --lib spec-refs/SysML-v2-Release/sysml.library")]
     Verify {
+        #[command(flatten)]
+        number_format: NumberFormatArg,
         /// Input files (.sysml or .kerml) forming one model; `-` reads
         /// stdin; optional when SYSMLV2_MODEL_DIR is set
         files: Vec<PathBuf>,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
         /// Interval-propagate undecided constraints and print narrowed
@@ -766,6 +895,8 @@ enum Command {
                             \x20 sysmlv2 eval a.sysml b.sysml --all\n\
                             \x20 sysmlv2 eval model.sysml 'Pkg::totalMass' 'Pkg::cost'")]
     Eval {
+        #[command(flatten)]
+        number_format: NumberFormatArg,
         /// Input file (.sysml or .kerml), or `-` for stdin; optional when
         /// SYSMLV2_MODEL_DIR is set (a leading qualified name is then a
         /// name, not a file)
@@ -776,7 +907,7 @@ enum Command {
         /// Evaluate every feature that has a value expression
         #[arg(long)]
         all: bool,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
@@ -804,13 +935,15 @@ enum Command {
                       \x20 cat model.sysml | sysmlv2 query - 'ownedFeature(Vehicle)'"
     )]
     Query {
+        #[command(flatten)]
+        number_format: NumberFormatArg,
         /// Input file (.sysml or .kerml), or `-` for stdin; optional when
         /// SYSMLV2_MODEL_DIR is set (the expression alone then suffices)
         input: Option<PathBuf>,
         /// The query expression; arguments ending in `.sysml`/`.kerml`
         /// are further files joining the model
         args: Vec<String>,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
@@ -832,7 +965,7 @@ enum Command {
         /// The ::-qualified element name; arguments ending in
         /// `.sysml`/`.kerml` are further files joining the model
         args: Vec<String>,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
@@ -849,7 +982,7 @@ enum Command {
         /// The ::-qualified element name; arguments ending in
         /// `.sysml`/`.kerml` are further files joining the model
         args: Vec<String>,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
@@ -911,7 +1044,8 @@ enum Command {
         /// Root the diagram at this ::-qualified element
         #[arg(long)]
         element: Option<String>,
-        /// Standard-library directory (names library references in labels)
+        /// Standard-library directory or bundle file (names library
+        /// references in labels)
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
         /// Lay the diagram out left-to-right instead of top-to-bottom
@@ -991,6 +1125,10 @@ enum Command {
         /// resolve standard-library names too (cached, ~0.15 s warm)
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
+        /// The default for value hints, hover values and range hints; a
+        /// client's `initializationOptions.numberFormat` overrides it
+        #[command(flatten)]
+        number_format: NumberFormatArg,
     },
 }
 
@@ -1018,7 +1156,7 @@ enum RefactorOp {
         /// Print the would-be changes as a diff; write nothing
         #[arg(long)]
         dry_run: bool,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
@@ -1056,7 +1194,7 @@ enum RefactorOp {
         /// extension)
         #[arg(long)]
         dir: Option<String>,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
@@ -1076,7 +1214,7 @@ enum RefactorOp {
         /// Print the would-be changes as a diff; write nothing
         #[arg(long)]
         dry_run: bool,
-        /// Standard-library directory for reference resolution
+        /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
     },
@@ -1099,7 +1237,7 @@ fn render_query_value(
             None => format!("<anonymous> ({ty})"),
         };
     }
-    v.to_string()
+    v.to_string_with(&number_format())
 }
 
 /// `--indent` values: `tabs`, or a space count 1–16.
@@ -1338,6 +1476,20 @@ impl<'a> Sink<'a> {
                 }
             }
             Sink::Json { report, units } => report.push_finding(f, units),
+        }
+    }
+
+    /// How many findings suppression directives in the sources hid: a
+    /// count line in the text report (when any), the summary's
+    /// `suppressed` in JSON.
+    fn suppressed(&mut self, n: usize) {
+        match self {
+            Sink::Text(_) => {
+                if n > 0 {
+                    eprintln!("{n} finding(s) suppressed by directive");
+                }
+            }
+            Sink::Json { report, .. } => report.set_suppressed(n),
         }
     }
 
@@ -1891,6 +2043,7 @@ impl LoadedModel {
     pub fn into_resolved(self) -> sysmlv2_parser::json::ResolvedModel {
         let resolved = sysmlv2_parser::json::ResolvedModel::build(&self.model);
         save_library_cache(&self.model, self.lib_cache);
+        leave_to_exit(self.model);
         resolved
     }
 }
@@ -2213,7 +2366,10 @@ fn refactor_session(
         }
     };
     if let Some(lib) = lib {
-        if let Err(e) = session.load_library(lib) {
+        let loaded = session_library(lib)
+            .map_err(sysmlv2_transform::SessionError::from)
+            .and_then(|library| session.load_library_from(library));
+        if let Err(e) = loaded {
             eprintln!("error: cannot load library {}: {e}", lib.display());
             return Err(ExitCode::FAILURE);
         }
@@ -2869,7 +3025,11 @@ fn verdict_line(
                     VerdictCat::Vio,
                 ),
                 Some(SolveOutcome::Satisfiable(w)) => {
-                    let vals: Vec<String> = w.iter().map(|(n, v)| format!("{n} = {v}")).collect();
+                    let fmt = number_format();
+                    let vals: Vec<String> = w
+                        .iter()
+                        .map(|(n, v)| format!("{n} = {}", v.to_string_with(&fmt)))
+                        .collect();
                     (
                         format!(
                             "undecided ({why}) — z3: satisfiable, e.g. {}",
@@ -2995,7 +3155,9 @@ fn verify_and_report(
                 false,
             )?;
         }
-        sysmlv2_parser::check::satisfaction_claims(model, &mut rm)
+        let claims = sysmlv2_parser::check::satisfaction_claims(model, &mut rm);
+        leave_to_exit(rm);
+        claims
     } else {
         let cfg = SolverConfig {
             z3_path: z3,
@@ -3004,7 +3166,7 @@ fn verify_and_report(
         let report = match sysmlv2_solve::verify_constraints(
             model,
             solve.then_some(&cfg),
-            &PropagateConfig::default(),
+            &PropagateConfig::default().with_number_format(number_format()),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3094,8 +3256,10 @@ fn verify_and_report(
         stdout_result(writeln!(out, "\nnarrowed ranges:"))?;
         for r in &narrowed {
             stdout_result(match &r.unit {
-                Some(u) => writeln!(out, "  {} ∈ {} [{u}]", r.feature, r.range),
-                None => writeln!(out, "  {} ∈ {}", r.feature, r.range),
+                // `range_approx` is in the `--number-format` the run
+                // was given (exact unless one was).
+                Some(u) => writeln!(out, "  {} ∈ {} [{u}]", r.feature, r.range_approx),
+                None => writeln!(out, "  {} ∈ {}", r.feature, r.range_approx),
             })?;
         }
     }
@@ -3670,9 +3834,16 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             // session (ids preserved, foreign ones included) and the
             // full form emitted from it, so this verb and the
             // session API cannot disagree.
-            let library = lib
-                .as_ref()
-                .map(|dir| sysmlv2_transform::Library::dir(dir.clone()));
+            let library = match lib.as_deref() {
+                Some(dir) => match session_library(dir) {
+                    Ok(library) => Some(library),
+                    Err(e) => {
+                        eprintln!("error: cannot load library {}: {e}", dir.display());
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => None,
+            };
             let session = match sysmlv2_transform::Session::from_interchange_json_with(
                 &value,
                 library.as_ref(),
@@ -4119,6 +4290,37 @@ fn run_payload(args: PayloadArgs) -> ExitCode {
     }
 }
 
+/// `prepare`: write a library's snapshot and recording into a directory.
+fn run_prepare(lib: Option<&Path>, out: &Path, quiet: bool) -> ExitCode {
+    let Some(lib) = lib else {
+        eprintln!("error: no library directory: give --lib or set SYSMLV2_LIB_DIR");
+        return ExitCode::FAILURE;
+    };
+    if bundle::is_bundle(lib) {
+        eprintln!(
+            "error: {} is a file: prepare takes a library directory (a bundle's \
+             snapshot is generated with the bundle, as <stem>.prepared beside it)",
+            lib.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    match sysmlv2_parser::prepared::prepare_library_into(lib, out) {
+        Ok(paths) => {
+            if !quiet {
+                println!("{}", paths.snapshot.display());
+                if let Some(recording) = paths.recording {
+                    println!("{}", recording.display());
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: could not prepare {}: {e}", lib.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `fmt`: rewrite each file in canonical form, or report which files
 /// are not in it.
 fn run_fmt(
@@ -4287,6 +4489,7 @@ fn run_check(
                 );
             }
         }
+        leave_to_exit((r, model));
     }
 
     if let Err(code) = sink.finish() {
@@ -4430,7 +4633,8 @@ fn run_lint(args: LintArgs, quiet: bool) -> ExitCode {
         .enumerate()
         .map(|(k, (_, _, src))| (boundary + k, names[k].as_str(), *src))
         .collect();
-    let findings = sysmlv2_lint::lint_units(&mut resolved, &cfg, &texts);
+    let outcome = sysmlv2_lint::lint_outcome(&mut resolved, &cfg, &texts);
+    let findings = outcome.findings;
 
     for f in &findings {
         match f.severity {
@@ -4551,6 +4755,8 @@ fn run_lint(args: LintArgs, quiet: bool) -> ExitCode {
         }
     }
 
+    sink.suppressed(outcome.suppressed.len());
+    leave_to_exit((resolved, model));
     if let Err(code) = sink.finish() {
         return code;
     }
@@ -4580,6 +4786,7 @@ pub fn run_verify(
         z3,
     );
     save_library_cache(&loaded.model, loaded.lib_cache);
+    leave_to_exit(loaded.model);
     let violated = verdict?;
     stdout_result(out.flush())?;
     if violated {
@@ -4602,6 +4809,7 @@ pub fn run_eval(
     let mut resolved = load_model(files, lib, quiet)?.into_resolved();
     let mut failed = false;
     let mut out = stdout_writer();
+    let fmt = number_format();
     let written = (|| -> io::Result<()> {
         if all {
             for e in resolved.features_with_values() {
@@ -4610,7 +4818,7 @@ pub fn run_eval(
                     .or_else(|| resolved.element_lookup_name(e))
                     .unwrap_or_else(|| "<anonymous>".to_string());
                 match resolved.evaluate(e) {
-                    Ok(v) => writeln!(out, "{label} = {v}")?,
+                    Ok(v) => writeln!(out, "{label} = {}", v.to_string_with(&fmt))?,
                     Err(err) => writeln!(out, "{label}: {err}")?,
                 }
             }
@@ -4625,7 +4833,7 @@ pub fn run_eval(
             // featuring context, so `Pkg::part::attr` computes the
             // same value as `part.attr`.
             match resolved.evaluate_qualified(name) {
-                Ok(v) => writeln!(out, "{name} = {v}")?,
+                Ok(v) => writeln!(out, "{name} = {}", v.to_string_with(&fmt))?,
                 Err(err) => {
                     eprintln!("error: {name}: {err}");
                     failed = true;
@@ -4635,6 +4843,7 @@ pub fn run_eval(
         out.flush()
     })();
     stdout_result(written)?;
+    leave_to_exit(resolved);
     if failed {
         return Err(CliError::Reported(ExitCode::FAILURE));
     }
@@ -4678,6 +4887,7 @@ pub fn run_query(
         Err(e) => return Err(fail(e.to_string())),
     };
     stdout_result(written.and_then(|()| out.flush()))?;
+    leave_to_exit(resolved);
     Ok(())
 }
 
@@ -4724,6 +4934,7 @@ pub fn run_describe(
         out.flush()
     })();
     stdout_result(written)?;
+    leave_to_exit(resolved);
     Ok(())
 }
 
@@ -4754,6 +4965,7 @@ pub fn run_members(
         out.flush()
     })();
     stdout_result(written)?;
+    leave_to_exit(resolved);
     Ok(())
 }
 
@@ -4857,6 +5069,7 @@ pub fn run_viz(args: VizArgs, quiet: bool) -> Result<(), CliError> {
         .with_roots(roots);
     let text = sysmlv2_viz::plantuml(&mut resolved, root, &opts);
     write_bytes(args.output.as_deref(), text.as_bytes())?;
+    leave_to_exit(resolved);
     Ok(())
 }
 
@@ -4895,9 +5108,40 @@ where
     let expand_unit_spellings = !(cli.no_unit_spellings
         || std::env::var("SYSMLV2_UNIT_SPELLINGS").is_ok_and(|v| v == "off" || v == "0"));
     sysmlv2_parser::eval::set_unit_spelling_expansion(expand_unit_spellings);
-    sysmlv2_parser::parser::on_parsing_stack("sysmlv2", say_the_stack_was_refused, move || {
-        dispatch(cli.command, quiet)
-    })
+    let code =
+        sysmlv2_parser::parser::on_parsing_stack("sysmlv2", say_the_stack_was_refused, move || {
+            dispatch(cli.command, quiet)
+        });
+    // The library cache a cold run writes while the verb runs: joined
+    // here, so the files are complete when the process ends, and what
+    // could not be written is said once, as for a write in line.
+    if let Some(warning) = sysmlv2_parser::prepared::finish_pending_saves().first() {
+        eprintln!("warning: {warning}");
+    }
+    code
+}
+
+static FORGET_AT_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Let a verb leave its model and the shared library to the operating
+/// system instead of freeing them, for a process that ends right after the
+/// verb: the binary asks for it before [`run`]. A caller that runs verbs in
+/// process does not ask, and every verb frees what it made.
+pub fn forget_at_exit() {
+    FORGET_AT_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn forgets_at_exit() -> bool {
+    FORGET_AT_EXIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drop `value` — or, when the binary asked to [`forget_at_exit`], leave
+/// it to the operating system: freeing a check's model and the shared
+/// library took a sixth of a small warm check.
+fn leave_to_exit<T>(value: T) {
+    if forgets_at_exit() {
+        std::mem::forget(value);
+    }
 }
 
 /// Say that the stack the parser's bound assumes could not be reserved.
@@ -4990,6 +5234,7 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             stdout,
             indent,
         } => run_fmt(files, check, stdout, indent, quiet),
+        Command::Prepare { lib, out } => run_prepare(lib.as_deref(), &out, quiet),
         Command::Check {
             files,
             lib,
@@ -5023,22 +5268,33 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
         #[cfg(feature = "solve")]
         Command::Verify {
             files,
+            number_format,
             lib,
             ranges,
             solve,
             z3,
-        } => finish(run_verify(files, lib.as_deref(), ranges, solve, z3, quiet)),
+        } => with_number_format(number_format.number_format, || {
+            finish(run_verify(files, lib.as_deref(), ranges, solve, z3, quiet))
+        }),
 
         Command::Eval {
             input,
             names,
+            number_format,
             all,
             lib,
-        } => finish(run_eval(input, names, all, lib.as_deref(), quiet)),
+        } => with_number_format(number_format.number_format, || {
+            finish(run_eval(input, names, all, lib.as_deref(), quiet))
+        }),
 
-        Command::Query { input, args, lib } => {
+        Command::Query {
+            input,
+            args,
+            number_format,
+            lib,
+        } => with_number_format(number_format.number_format, || {
             finish(run_query(input, args, lib.as_deref(), quiet))
-        }
+        }),
 
         Command::Describe { input, args, lib } => {
             finish(run_describe(input, args, lib.as_deref(), quiet))
@@ -5089,13 +5345,29 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
         )),
 
         #[cfg(feature = "lsp")]
-        Command::Lsp { lib } => match sysmlv2_lsp::run_stdio(lib) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
+        Command::Lsp { lib, number_format } => {
+            // The language server reads a library directory's files for its
+            // navigation; a bundle is refused here rather than half served.
+            if let Some(lib) = lib.as_deref().filter(|lib| bundle::is_bundle(lib)) {
+                eprintln!(
+                    "error: {} is a file: lsp takes a library directory",
+                    lib.display()
+                );
+                return ExitCode::FAILURE;
             }
-        },
+            match sysmlv2_lsp::run_stdio_with_number_format(
+                lib,
+                number_format
+                    .number_format
+                    .unwrap_or_else(sysmlv2_parser::numfmt::NumberFormat::approx),
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 

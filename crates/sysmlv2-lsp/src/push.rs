@@ -63,11 +63,21 @@ pub struct PushServer {
     /// may also override it via
     /// `initializationOptions.hideRedundantValueHints`.
     hide_redundant_hints: bool,
+    /// How value hints, hover values and range hints write a rational
+    /// without a terminating decimal expansion. Held like
+    /// `hide_redundant_hints`; `initialize` may override it via
+    /// `initializationOptions.numberFormat`.
+    number_format: sysmlv2_parser::numfmt::NumberFormat,
     /// Accepting a unit completion inside an untyped attribute's
     /// quantity bracket also declares the type the unit determines.
     /// Held like `hide_redundant_hints`; `initialize` may override it
     /// via `initializationOptions.inferUnitTypes`.
     infer_unit_types: bool,
+    /// A document opened, changed or closed since refresh requests last
+    /// went out: answers the client pulled for other documents since may
+    /// read texts the documents have left, so even a re-seed that changes
+    /// nothing asks for a re-pull.
+    documents_moved: bool,
 }
 
 impl Default for PushServer {
@@ -123,7 +133,9 @@ impl PushServer {
             inlay_refresh: false,
             code_lens_refresh: false,
             next_refresh_id: 0,
+            documents_moved: false,
             hide_redundant_hints: true,
+            number_format: sysmlv2_parser::numfmt::NumberFormat::exact(),
             infer_unit_types: true,
         }
     }
@@ -137,6 +149,23 @@ impl PushServer {
         self.hide_redundant_hints = on;
         if let Some(server) = &mut self.server {
             server.nav.set_hide_redundant_value_hints(on);
+            self.send_refreshes();
+        }
+    }
+
+    /// Set how value hints, hover values and range hints write a
+    /// rational without a terminating decimal expansion (an approximate
+    /// decimal by default; see
+    /// [`NumberFormat`](sysmlv2_parser::numfmt::NumberFormat)). On a
+    /// running server supporting clients are asked to re-pull — drain
+    /// with [`Self::take_outbound`].
+    pub fn set_number_format(&mut self, format: sysmlv2_parser::numfmt::NumberFormat) {
+        if self.number_format == format {
+            return;
+        }
+        self.number_format = format;
+        if let Some(server) = &mut self.server {
+            server.nav.set_number_format(format);
             self.send_refreshes();
         }
     }
@@ -161,15 +190,27 @@ impl PushServer {
     ///
     /// A re-seed on a running server invalidates inlay hints and code
     /// lenses the client already pulled (both answer from the seeded
-    /// session), so refresh requests go out to clients that support
-    /// them — drain with [`Self::take_outbound`] (the host relays them
-    /// like any [`Self::handle`] output; without the drain they ride
-    /// along with the next dispatch).
+    /// session, and one document's answers read the others' texts), so
+    /// refresh requests go out to clients that support them — drain with
+    /// [`Self::take_outbound`] (the host relays them like any
+    /// [`Self::handle`] output; without the drain they ride along with
+    /// the next dispatch). Only a re-seed of the same units with the same
+    /// texts, with no document opened, changed or closed since refresh
+    /// requests last went out, asks for nothing.
+    ///
+    /// The sessions themselves stay while they are current: for the same
+    /// units with the same texts, and for new texts only for units open as
+    /// documents, whose open texts overlay their seeded copies — the
+    /// re-pull then answers from them.
     pub fn set_workspace_sources(&mut self, units: Vec<(String, String)>) {
         let units = std::sync::Arc::new(units);
         if let Some(server) = &mut self.server {
-            server.nav.set_workspace_sources(units.clone());
-            self.send_refreshes();
+            let changed = server
+                .nav
+                .set_workspace_sources(units.clone(), &server.docs);
+            if changed || self.documents_moved {
+                self.send_refreshes();
+            }
         }
         self.workspace = Some(units);
     }
@@ -191,6 +232,7 @@ impl PushServer {
         let Some(server) = &self.server else {
             return;
         };
+        self.documents_moved = false;
         for (supported, method) in [
             (self.inlay_refresh, "workspace/inlayHint/refresh"),
             (self.code_lens_refresh, "workspace/codeLens/refresh"),
@@ -249,6 +291,16 @@ impl PushServer {
                 // `initialized` and `exit` need nothing here; the rest
                 // only make sense on a built server.
                 if let Some(server) = &mut self.server {
+                    use lsp_types::notification::{
+                        DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+                        Notification as _,
+                    };
+                    self.documents_moved |= [
+                        DidOpenTextDocument::METHOD,
+                        DidChangeTextDocument::METHOD,
+                        DidCloseTextDocument::METHOD,
+                    ]
+                    .contains(&n.method.as_str());
                     server.handle_notification(n)?;
                 }
             }
@@ -318,12 +370,20 @@ impl PushServer {
             .send(Message::Response(Response::new_ok(req.id, result)))?;
         let mut nav = crate::nav::Nav::new_with(self.library.clone());
         if let Some(units) = &self.workspace {
-            nav.set_workspace_sources(units.clone());
+            nav.set_workspace_sources(units.clone(), &BTreeMap::new());
         }
         if let Some(on) = crate::hide_redundant_value_hints(&init) {
             self.hide_redundant_hints = on;
         }
         nav.set_hide_redundant_value_hints(self.hide_redundant_hints);
+        match crate::number_format(&init) {
+            Some(Ok(format)) => self.number_format = format,
+            Some(Err(err)) => {
+                let _ = connection.sender.send(crate::number_format_refused(&err));
+            }
+            None => {}
+        }
+        nav.set_number_format(self.number_format);
         if let Some(on) = crate::infer_unit_types(&init) {
             self.infer_unit_types = on;
         }
@@ -339,6 +399,7 @@ impl PushServer {
             worker: worker::Worker::disabled(),
             root: None,
             reported: std::collections::HashSet::new(),
+            publishes_diagnostics: crate::publish_diagnostics(&init).unwrap_or(true),
         });
         Ok(())
     }
@@ -5585,6 +5646,135 @@ mod tests {
         s
     }
 
+    /// A server on a library decoded from a snapshot that carries the
+    /// library's symbols answers what a server parsing the library's texts
+    /// answers, request for request: completion at a member position, after
+    /// a qualifier, in an import and inside a unit bracket, an import fix
+    /// for an unresolved name, and workspace symbols. Decoded keeping its
+    /// hosts' parts, the library gives the server its table, and no unit
+    /// is parsed; decoded the default way, it drops them, and the server
+    /// parses the texts as one on them does.
+    #[test]
+    fn a_snapshot_carrying_the_library_table_answers_as_the_texts_do() {
+        let mut files = Vec::new();
+        sysmlv2_testkit::collect_files(&sysmlv2_testkit::library_dir(), &mut files);
+        let units: Vec<(String, String)> = files
+            .iter()
+            .map(|f| {
+                let text = std::fs::read_to_string(f).expect("library unit");
+                (f.display().to_string(), text)
+            })
+            .collect();
+        let sysmlv2_transform::Library::Prepared(prepared) =
+            sysmlv2_transform::Library::prepared_sources(units.clone(), None).unwrap()
+        else {
+            unreachable!("a prepared library");
+        };
+        crate::ship_library_table(&prepared).unwrap();
+        let bytes = prepared.to_bytes(1).unwrap();
+        let decoded = |keep| {
+            let library =
+                sysmlv2_parser::prepared::PreparedLibrary::from_bytes_with(&bytes, 1, keep)
+                    .unwrap();
+            PushServer::with_library(sysmlv2_transform::Library::Prepared(std::sync::Arc::new(
+                library,
+            )))
+        };
+        let mut servers = [
+            PushServer::with_library_sources(units, None),
+            decoded(false),
+            decoded(true),
+        ];
+        let docs = [
+            "package A {\n    private import ISQ::*;\n    part def P {\n        attribute m : Mass|\n    }\n}\n",
+            "package B {\n    attribute t : ISQ::|\n}\n",
+            "package C {\n    private import Scalar|\n}\n",
+            "package D {\n    private import SI::*;\n    attribute g = 9.8 [m|\n}\n",
+            "package E {\n    |\n}\n",
+        ];
+        let walks = || crate::nav::LIBRARY_WALKS.with(std::cell::Cell::get);
+        let answers = servers.each_mut().map(|s| {
+            let before = walks();
+            responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}}}}),
+            );
+            let mut out = Vec::new();
+            for (i, marked) in docs.iter().enumerate() {
+                let uri = format!("file:///w/d{i}.sysml");
+                let at = marked.find('|').expect("cursor marker");
+                let text = marked.replacen('|', "", 1);
+                let line = marked[..at].matches('\n').count();
+                let character = at - marked[..at].rfind('\n').map_or(0, |i| i + 1);
+                responses(
+                    s,
+                    &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+                        "params": {"textDocument": {"uri": uri, "languageId": "sysml",
+                                                    "version": 1, "text": text}}}),
+                );
+                out.extend(responses(
+                    s,
+                    &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+                        "params": {"textDocument": {"uri": uri},
+                                   "position": {"line": line, "character": character}}}),
+                ));
+                responses(
+                    s,
+                    &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didClose",
+                        "params": {"textDocument": {"uri": uri}}}),
+                );
+            }
+            responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                    "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                     "version": 1,
+                                     "text": "package P {\n    attribute m : MassValue;\n}\n"}}}),
+            );
+            let range = serde_json::json!({"start": {"line": 1, "character": 18},
+                                           "end": {"line": 1, "character": 27}});
+            out.extend(responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/codeAction",
+                    "params": {"textDocument": {"uri": "file:///w/m.sysml"},
+                               "range": range,
+                               "context": {"diagnostics": [
+                                   {"range": range, "message": "unresolved reference `MassValue`"}]}}}),
+            ));
+            out.extend(responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "workspace/symbol",
+                    "params": {"query": "Mass"}}),
+            ));
+            (out, walks() - before)
+        });
+        let [(texts, parsed), (dropped, reparsed), (carried, unparsed)] = answers;
+        assert_eq!(
+            (parsed, reparsed, unparsed),
+            (1, 1, 0),
+            "only the server given the shipped symbols parses no unit"
+        );
+        let completions = |out: &[serde_json::Value]| {
+            out.iter()
+                .filter(|r| r["id"] == 2)
+                .map(|r| r["result"].as_array().map_or(0, Vec::len))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            completions(&texts).iter().all(|&n| n > 0),
+            "every position completes: {:?}",
+            completions(&texts)
+        );
+        let fixes = texts.iter().find(|r| r["id"] == 3).expect("actions");
+        assert!(
+            fixes.to_string().contains("Add import ISQ::MassValue"),
+            "{fixes}"
+        );
+        assert_eq!(texts, dropped);
+        assert_eq!(texts, carried);
+    }
+
     /// The labels an editor lists at the `|` in `body` — a member
     /// position of `part def P` in a package importing the vehicle
     /// model and the quantities — narrowed to those starting with the
@@ -8882,5 +9072,566 @@ mod tests {
             methods.contains(&"workspace/inlayHint/refresh".to_string()),
             "expected a refresh request, got {methods:?}"
         );
+    }
+
+    /// A number-format change on a running server re-spells what the
+    /// next pull answers — the value hint, the range hint (rendered by
+    /// the cached verify pass) and the hover alike.
+    #[test]
+    fn number_format_change_respells_hints_and_hover() {
+        use sysmlv2_parser::numfmt::NumberFormat;
+        let mut s = PushServer::new();
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {}}}),
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/n.sysml", "languageId": "sysml", "version": 1,
+                    "text": "part def P {\n    attribute third = 2 / 6;\n    attribute x;\n    assert constraint { 3 * x < 1 }\n}\n"}}}),
+        );
+        let mut id = 1;
+        let mut pull = |s: &mut PushServer| -> (Vec<String>, String) {
+            id += 2;
+            let hints = responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/inlayHint",
+                    "params": {"textDocument": {"uri": "file:///w/n.sysml"},
+                               "range": {"start": {"line": 0, "character": 0},
+                                         "end": {"line": 9, "character": 0}}}}),
+            )[0]["result"]
+                .as_array()
+                .expect("hints")
+                .iter()
+                .map(|h| h["label"].as_str().unwrap_or_default().to_string())
+                .collect();
+            let hover = responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id + 1, "method": "textDocument/hover",
+                    "params": {"textDocument": {"uri": "file:///w/n.sysml"},
+                               "position": {"line": 1, "character": 15}}}),
+            )[0]["result"]["contents"]["value"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            (hints, hover)
+        };
+        let (hints, hover) = pull(&mut s);
+        assert!(hints.contains(&" = 1/3".to_string()), "{hints:?}");
+        assert!(
+            hints.iter().any(|l| l.contains("∈") && l.contains("1/3")),
+            "{hints:?}"
+        );
+        assert!(hover.contains("= `1/3`"), "{hover}");
+        s.set_number_format(NumberFormat::parse("parens").unwrap());
+        let (hints, hover) = pull(&mut s);
+        assert!(hints.contains(&" = 0.(3)".to_string()), "{hints:?}");
+        assert!(
+            hints.iter().any(|l| l.contains("∈") && l.contains("0.(3)")),
+            "the cached range hint is re-rendered: {hints:?}"
+        );
+        assert!(hover.contains("= `0.(3)`"), "{hover}");
+    }
+
+    /// A number-format change on a running server asks clients to
+    /// re-pull; setting the format already in force asks nothing, and a
+    /// pre-`initialize` setting is held for the server build.
+    #[test]
+    fn number_format_change_requests_refresh() {
+        use sysmlv2_parser::numfmt::NumberFormat;
+        let outbound = |s: &mut PushServer| -> Vec<String> {
+            s.take_outbound()
+                .expect("serializable outbound")
+                .iter()
+                .map(|m| {
+                    let v: serde_json::Value = serde_json::from_str(m).expect("valid json");
+                    v["method"].as_str().unwrap_or_default().to_string()
+                })
+                .collect()
+        };
+        let parens = NumberFormat::parse("parens").unwrap();
+        let mut s = PushServer::new();
+        s.set_number_format(parens);
+        assert_eq!(outbound(&mut s), Vec::<String>::new());
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {"workspace": {
+                    "inlayHint": {"refreshSupport": true}}}}}),
+        );
+        assert_eq!(s.number_format, parens, "held across initialize");
+        s.set_number_format(parens);
+        assert_eq!(
+            outbound(&mut s),
+            Vec::<String>::new(),
+            "unchanged: no refresh"
+        );
+        s.set_number_format(NumberFormat::parse("unicode").unwrap());
+        let methods = outbound(&mut s);
+        assert!(
+            methods.contains(&"workspace/inlayHint/refresh".to_string()),
+            "expected a refresh request, got {methods:?}"
+        );
+    }
+
+    /// A server whose client takes refresh requests, seeded with `units`;
+    /// the first seed's requests drained.
+    fn seeded_server(units: &[(&str, &str)]) -> PushServer {
+        let mut s = PushServer::new();
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {"workspace": {
+                    "inlayHint": {"refreshSupport": true},
+                    "codeLens": {"refreshSupport": true}}}}}),
+        );
+        s.set_workspace_sources(owned(units));
+        assert_eq!(refreshes(&mut s), 2, "a first seed asks for a re-pull");
+        s
+    }
+
+    fn owned(units: &[(&str, &str)]) -> Vec<(String, String)> {
+        units
+            .iter()
+            .map(|(name, text)| (name.to_string(), text.to_string()))
+            .collect()
+    }
+
+    /// The refresh requests waiting to go out.
+    fn refreshes(s: &mut PushServer) -> usize {
+        s.take_outbound()
+            .expect("serializable outbound")
+            .iter()
+            .filter(|m| m.contains("/refresh"))
+            .count()
+    }
+
+    /// The labels of the inlay hints of `uri`'s first hundred lines.
+    fn hint_labels(s: &mut PushServer, uri: &str) -> Vec<String> {
+        responses(
+            s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "textDocument/inlayHint",
+                "params": {"textDocument": {"uri": uri},
+                           "range": {"start": {"line": 0, "character": 0},
+                                     "end": {"line": 99, "character": 0}}}}),
+        )[0]["result"]
+            .as_array()
+            .expect("hints")
+            .iter()
+            .map(|h| h["label"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The labels a completion at `line`/`character` of `uri` offers.
+    fn offered(s: &mut PushServer, uri: &str, line: u32, character: u32) -> Vec<String> {
+        let out = responses(
+            s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 8, "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri},
+                           "position": {"line": line, "character": character}}}),
+        );
+        let result = &out[0]["result"];
+        let items = result
+            .as_array()
+            .or_else(|| result["items"].as_array())
+            .expect("completion items");
+        completion_labels(items)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    const SEED_A: &str = "file:///w/a.sysml";
+    const SEED_B: &str = "file:///w/b.sysml";
+    const SEED_A_TEXT: &str =
+        "package A {\n    private import B::*;\n    attribute x = n * 2;\n}\n";
+    const SEED_B_TEXT: &str = "package B {\n    attribute n = 3;\n}\n";
+
+    /// The models the server holds.
+    fn sessions_held(s: &PushServer) -> usize {
+        s.server.as_ref().expect("initialized").nav.sessions_held()
+    }
+
+    fn close(s: &mut PushServer, uri: &str) {
+        responses(
+            s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didClose",
+                "params": {"textDocument": {"uri": uri}}}),
+        );
+    }
+
+    /// Seeding the units the workspace holds as they are keeps every
+    /// session: the next pull builds nothing and answers as before. It asks
+    /// the client to re-pull only when a document opened, changed or
+    /// closed since refresh requests last went out — another document's
+    /// answers may have been pulled while the documents read otherwise (an
+    /// edit undone before the host seeded again).
+    #[test]
+    fn an_identical_reseed_keeps_the_sessions() {
+        let c = "file:///w/c.sysml";
+        let c_text = "package C {\n    private import B::*;\n    attribute y = n + 1;\n}\n";
+        let seed = [(SEED_A, SEED_A_TEXT), (SEED_B, SEED_B_TEXT), (c, c_text)];
+        let mut s = seeded_server(&seed);
+        put(&mut s, SEED_A, 1, SEED_A_TEXT);
+        assert_eq!(hint_labels(&mut s, SEED_A), [" = 6"]);
+        crate::nav::SESSION_BUILDS.with(|n| n.set(0));
+        // `a` opened since the first seed's refresh.
+        s.set_workspace_sources(owned(&seed));
+        assert_eq!(refreshes(&mut s), 2);
+        s.set_workspace_sources(owned(&seed));
+        assert_eq!(refreshes(&mut s), 0);
+        assert_eq!(hint_labels(&mut s, SEED_A), [" = 6"]);
+        assert_eq!(crate::nav::SESSION_BUILDS.with(std::cell::Cell::get), 0);
+        // `c` shows `b` typed and undone, its hint pulled in between.
+        put(&mut s, c, 1, c_text);
+        put(&mut s, SEED_B, 1, SEED_B_TEXT);
+        s.set_workspace_sources(owned(&seed));
+        assert_eq!(refreshes(&mut s), 2);
+        put(&mut s, SEED_B, 2, &SEED_B_TEXT.replace('3', "5"));
+        assert_eq!(hint_labels(&mut s, c), [" = 6"]);
+        put(&mut s, SEED_B, 3, SEED_B_TEXT);
+        s.set_workspace_sources(owned(&seed));
+        assert_eq!(
+            refreshes(&mut s),
+            2,
+            "the client holds `c`'s hint for `b` typed"
+        );
+        assert_eq!(hint_labels(&mut s, c), [" = 4"]);
+    }
+
+    /// A seed that changes only units open as documents keeps the
+    /// sessions — whether it seeds the open text (the host's seed after a
+    /// pause in typing) or another — since the open text overlays it, and
+    /// asks the client to re-pull, which the kept sessions answer. Once
+    /// the document closes, its seeded copy is what every answer reads:
+    /// the same as a server seeded so from the start.
+    #[test]
+    fn a_reseed_of_open_units_keeps_the_sessions_and_asks_for_a_refresh() {
+        let c = "file:///w/c.sysml";
+        let c_text = "package C {\n    private import A::*;\n    attribute y = x + 1;\n    attribute z = w;\n}\n";
+        let edited = SEED_A_TEXT.replace("n * 2", "n * 4");
+        let stale = SEED_A_TEXT.replace("}\n", "    attribute w = 5;\n}\n");
+        let mut s = seeded_server(&[(SEED_A, SEED_A_TEXT), (SEED_B, SEED_B_TEXT)]);
+        put(&mut s, SEED_A, 1, SEED_A_TEXT);
+        assert_eq!(hint_labels(&mut s, SEED_A), [" = 6"]);
+        put(&mut s, SEED_A, 2, &edited);
+        assert_eq!(hint_labels(&mut s, SEED_A), [" = 12"]);
+        // The workspace below `a`, for completion there.
+        let in_a = offered(&mut s, SEED_A, 2, 18);
+        crate::nav::SESSION_BUILDS.with(|n| n.set(0));
+        for text in [edited.as_str(), stale.as_str()] {
+            s.set_workspace_sources(owned(&[(SEED_A, text), (SEED_B, SEED_B_TEXT)]));
+            assert_eq!(refreshes(&mut s), 2);
+            assert_eq!(hint_labels(&mut s, SEED_A), [" = 12"]);
+            assert_eq!(offered(&mut s, SEED_A, 2, 18), in_a);
+        }
+        assert_eq!(crate::nav::SESSION_BUILDS.with(std::cell::Cell::get), 0);
+        // Closed, `a` is its seeded copy.
+        close(&mut s, SEED_A);
+        put(&mut s, c, 1, c_text);
+        let mut fresh = seeded_server(&[(SEED_A, &stale), (SEED_B, SEED_B_TEXT)]);
+        put(&mut fresh, c, 1, c_text);
+        assert_eq!(hint_labels(&mut s, c), [" = 7", " = 5"]);
+        assert_eq!(hint_labels(&mut fresh, c), [" = 7", " = 5"]);
+        let in_c = offered(&mut s, c, 3, 19);
+        assert!(in_c.contains(&"w".to_string()), "{in_c:?}");
+        assert_eq!(in_c, offered(&mut fresh, c, 3, 19));
+    }
+
+    /// Two editors show `a` and `c`, and `c`'s hint reads what `a`
+    /// declares. Typing in `a`, then the host's seed of the typed text,
+    /// asks the client to re-pull: it holds `c`'s hint for `a` as it was.
+    #[test]
+    fn a_reseed_of_an_open_unit_refreshes_what_other_documents_hold() {
+        let (a, c) = ("file:///w/a.sysml", "file:///w/c.sysml");
+        let a_text = |n: u32| format!("package A {{\n    attribute n = {n};\n}}\n");
+        let c_text = "package C {\n    private import A::*;\n    attribute y = n + 1;\n}\n";
+        let mut s = seeded_server(&[(a, &a_text(3)), (c, c_text)]);
+        put(&mut s, a, 1, &a_text(3));
+        put(&mut s, c, 1, c_text);
+        assert_eq!(hint_labels(&mut s, c), [" = 4"]);
+        put(&mut s, a, 2, &a_text(5));
+        // The editor showing `a` pulls its own hints on the change.
+        hint_labels(&mut s, a);
+        crate::nav::SESSION_BUILDS.with(|n| n.set(0));
+        s.set_workspace_sources(owned(&[(a, &a_text(5)), (c, c_text)]));
+        assert_eq!(refreshes(&mut s), 2);
+        assert_eq!(hint_labels(&mut s, c), [" = 6"]);
+        assert_eq!(crate::nav::SESSION_BUILDS.with(std::cell::Cell::get), 0);
+        let lenses = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "textDocument/codeLens",
+                "params": {"textDocument": {"uri": c}}}),
+        );
+        assert!(lenses[0]["result"].is_array(), "{lenses:?}");
+    }
+
+    /// A seed may spell one unit twice; an open document overlays the
+    /// first spelling only, and the session reads the second as seeded. A
+    /// new text for the second is no open unit's: it rebuilds.
+    #[test]
+    fn a_later_spelling_of_an_open_unit_is_read_as_seeded() {
+        let (x, y) = ("file:///w/aA.sysml", "file:///w/a%41.sysml");
+        let x_text = "package X {\n    private import Y::*;\n    attribute v = w + 0;\n}\n";
+        let y_text = |w: u32| format!("package Y {{\n    attribute w = {w};\n}}\n");
+        let mut s = seeded_server(&[(x, x_text), (y, &y_text(2))]);
+        put(&mut s, x, 1, x_text);
+        assert_eq!(hint_labels(&mut s, x), [" = 2"]);
+        s.set_workspace_sources(owned(&[(x, x_text), (y, &y_text(5))]));
+        assert_eq!(refreshes(&mut s), 2);
+        assert_eq!(sessions_held(&s), 0);
+        let mut fresh = seeded_server(&[(x, x_text), (y, &y_text(5))]);
+        put(&mut fresh, x, 1, x_text);
+        assert_eq!(hint_labels(&mut s, x), hint_labels(&mut fresh, x));
+        assert_eq!(hint_labels(&mut s, x), [" = 5"]);
+    }
+
+    /// A document closed and opened again at the version it had, with
+    /// other text, is read anew — re-seeded in between or not — not
+    /// answered from the session its old text built.
+    #[test]
+    fn a_document_reopened_at_its_version_is_read_anew() {
+        let (a, c) = ("file:///w/a.sysml", "file:///w/c.sysml");
+        let a_text = |n: u32| format!("package A {{\n    attribute n = {n};\n}}\n");
+        let c_text = "package C {\n    private import A::*;\n    attribute y = n + 1;\n}\n";
+        for reseed in [false, true] {
+            let mut s = seeded_server(&[(a, &a_text(3)), (c, c_text)]);
+            put(&mut s, a, 1, &a_text(3));
+            put(&mut s, c, 1, c_text);
+            assert_eq!(hint_labels(&mut s, c), [" = 4"]);
+            if reseed {
+                s.set_workspace_sources(owned(&[(a, &a_text(7)), (c, c_text)]));
+            }
+            close(&mut s, a);
+            put(&mut s, a, 1, &a_text(9));
+            assert_eq!(hint_labels(&mut s, c), [" = 10"], "re-seeded: {reseed}");
+        }
+        // Reopened with the text it had, the session stands.
+        let mut s = seeded_server(&[(a, &a_text(3)), (c, c_text)]);
+        put(&mut s, a, 1, &a_text(3));
+        put(&mut s, c, 1, c_text);
+        assert_eq!(hint_labels(&mut s, c), [" = 4"]);
+        close(&mut s, a);
+        put(&mut s, a, 1, &a_text(3));
+        crate::nav::SESSION_BUILDS.with(|n| n.set(0));
+        assert_eq!(hint_labels(&mut s, c), [" = 4"]);
+        assert_eq!(crate::nav::SESSION_BUILDS.with(std::cell::Cell::get), 0);
+        // It holds the reopened text, not a copy of the old one.
+        let holds_open_texts = |s: &PushServer| {
+            let server = s.server.as_ref().expect("initialized");
+            server.nav.fingerprints_hold_open_texts(&server.docs)
+        };
+        assert!(holds_open_texts(&s));
+        // So does read-only navigation's session, and the failed build's
+        // record, while a unit does not parse.
+        let broken = "package A {\n    attribute n = 3;\n    part p : ;\n}\n";
+        put(&mut s, a, 2, broken);
+        let hover = |s: &mut PushServer| {
+            responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "textDocument/hover",
+                    "params": {"textDocument": {"uri": c},
+                               "position": {"line": 2, "character": 18}}}),
+            )[0]["result"]
+                .clone()
+        };
+        let before = hover(&mut s);
+        assert!(!before.is_null());
+        close(&mut s, a);
+        put(&mut s, a, 1, broken);
+        put(&mut s, a, 2, broken);
+        crate::nav::SESSION_BUILDS.with(|n| n.set(0));
+        assert_eq!(hover(&mut s), before);
+        assert_eq!(crate::nav::SESSION_BUILDS.with(std::cell::Cell::get), 0);
+        assert!(holds_open_texts(&s));
+    }
+
+    /// A seed that changes a unit no session reads overlaid — one not
+    /// open, or open only since the session held was built — drops the
+    /// sessions and asks the client to re-pull, as any change did.
+    #[test]
+    fn a_reseed_of_units_read_as_seeded_rebuilds_and_asks_for_a_refresh() {
+        let mut s = seeded_server(&[(SEED_A, SEED_A_TEXT), (SEED_B, SEED_B_TEXT)]);
+        put(&mut s, SEED_A, 1, SEED_A_TEXT);
+        assert_eq!(hint_labels(&mut s, SEED_A), [" = 6"]);
+        crate::nav::SESSION_BUILDS.with(|n| n.set(0));
+        let five = SEED_B_TEXT.replace('3', "5");
+        s.set_workspace_sources(owned(&[(SEED_A, SEED_A_TEXT), (SEED_B, &five)]));
+        assert_eq!(refreshes(&mut s), 2);
+        assert_eq!(sessions_held(&s), 0);
+        assert_eq!(hint_labels(&mut s, SEED_A), [" = 10"]);
+        assert_eq!(crate::nav::SESSION_BUILDS.with(std::cell::Cell::get), 1);
+        // `b` opens after the session was built: it read `b` as seeded.
+        put(&mut s, SEED_B, 1, &five);
+        let seven = SEED_B_TEXT.replace('3', "7");
+        s.set_workspace_sources(owned(&[(SEED_A, SEED_A_TEXT), (SEED_B, &seven)]));
+        assert_eq!(refreshes(&mut s), 2);
+        assert_eq!(sessions_held(&s), 0);
+        // Renamed, reordered or added units are other units.
+        for seed in [
+            vec![(SEED_B, seven.as_str()), (SEED_A, SEED_A_TEXT)],
+            vec![
+                (SEED_A, SEED_A_TEXT),
+                (SEED_B, seven.as_str()),
+                ("file:///w/d.sysml", ""),
+            ],
+            vec![(SEED_A, SEED_A_TEXT)],
+        ] {
+            assert_eq!(hint_labels(&mut s, SEED_A).len(), 1);
+            s.set_workspace_sources(owned(&seed));
+            assert_eq!(refreshes(&mut s), 2, "{seed:?}");
+            assert_eq!(sessions_held(&s), 0, "{seed:?}");
+        }
+    }
+
+    /// `initializationOptions.publishDiagnostics: false` publishes no
+    /// diagnostics — on open, on change, or the clearing on close — while
+    /// everything else answers as before; absent or `true`, they publish.
+    #[test]
+    fn publish_diagnostics_false_publishes_none() {
+        let uri = "file:///w/m.sysml";
+        for (options, publishes) in [
+            (serde_json::Value::Null, true),
+            (serde_json::json!({"publishDiagnostics": true}), true),
+            (serde_json::json!({"publishDiagnostics": false}), false),
+        ] {
+            let mut s = PushServer::new();
+            responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"capabilities": {}, "initializationOptions": options}}),
+            );
+            let mut published = 0;
+            let mut count = |out: Vec<serde_json::Value>| {
+                published += out
+                    .iter()
+                    .filter(|m| m["method"] == "textDocument/publishDiagnostics")
+                    .count();
+            };
+            count(responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                    "textDocument": {"uri": uri, "languageId": "sysml", "version": 1,
+                                     "text": "package P { part def X; part x : X; "}}}),
+            ));
+            count(responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+                    "textDocument": {"uri": uri, "version": 2},
+                    "contentChanges": [{"text": "package P { part def X; part x : X; part y : "}]}}),
+            ));
+            let symbols = responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentSymbol",
+                    "params": {"textDocument": {"uri": uri}}}),
+            );
+            assert_eq!(symbols[0]["result"][0]["name"], "P", "{symbols:?}");
+            count(responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didClose",
+                    "params": {"textDocument": {"uri": uri}}}),
+            ));
+            assert_eq!(published, if publishes { 3 } else { 0 }, "{options}");
+        }
+    }
+
+    /// Inlay hints asked for a range are the whole document's hints
+    /// placed inside it, its ends included — on a server that answered
+    /// the whole document before and on one that never did — with the
+    /// document's caps: past its first 200 value expressions, a range
+    /// gets no value hint either.
+    #[test]
+    fn ranged_inlay_hints_are_the_documents_hints_in_the_range() {
+        let uri = "file:///w/r.sysml";
+        let mut text = String::new();
+        for i in 0..120 {
+            text.push_str(&format!(
+                "part def P{i} {{\n    /* é */ attribute a{i} = {i} / 3;\n    attribute b{i} = a{i} + 1;\n    \
+                 attribute x{i};\n    assert constraint {{ 3 * x{i} < {i} }}\n}}\n"
+            ));
+        }
+        let lines = u32::try_from(text.matches('\n').count()).unwrap();
+        let server = || {
+            let mut s = PushServer::new();
+            responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"capabilities": {}}}),
+            );
+            put(&mut s, uri, 1, &text);
+            s
+        };
+        let hints = |s: &mut PushServer, start: (u32, u32), end: (u32, u32)| {
+            responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/inlayHint",
+                    "params": {"textDocument": {"uri": uri},
+                               "range": {"start": {"line": start.0, "character": start.1},
+                                         "end": {"line": end.0, "character": end.1}}}}),
+            )[0]["result"]
+                .as_array()
+                .expect("hints")
+                .clone()
+        };
+        let at = |h: &serde_json::Value| {
+            (
+                u32::try_from(h["position"]["line"].as_u64().unwrap()).unwrap(),
+                u32::try_from(h["position"]["character"].as_u64().unwrap()).unwrap(),
+            )
+        };
+        let mut warm = server();
+        let full = hints(&mut warm, (0, 0), (lines + 1, 0));
+        // Two value expressions a block, six lines a block: the first 200
+        // are the first hundred blocks'.
+        let last_value = full
+            .iter()
+            .filter(|h| h["label"].as_str().unwrap().starts_with(" = "))
+            .map(at)
+            .max()
+            .unwrap();
+        assert!(last_value.0 < 100 * 6 && lines > 110 * 6, "{last_value:?}");
+        assert!(
+            full.iter()
+                .any(|h| h["label"].as_str().unwrap().contains('∈')),
+            "{full:?}"
+        );
+        let mut ranges = vec![
+            ((0, 0), (0, 0)),
+            ((3, 0), (40, 0)),
+            ((last_value.0, 0), (lines + 1, 0)),
+            ((lines - 30, 0), (lines + 1, 0)),
+            ((lines + 5, 0), (lines + 9, 0)),
+        ];
+        for h in full.iter().step_by(7) {
+            let (line, character) = at(h);
+            ranges.push(((line, character), (line, character)));
+            ranges.push(((line, character + 1), (line + 6, 0)));
+            ranges.push(((line.saturating_sub(4), 0), (line, character)));
+            ranges.push((
+                (line.saturating_sub(4), 0),
+                (line, character.saturating_sub(1)),
+            ));
+        }
+        for (k, (start, end)) in ranges.into_iter().enumerate() {
+            let expected: Vec<serde_json::Value> = full
+                .iter()
+                .filter(|h| start <= at(h) && at(h) <= end)
+                .cloned()
+                .collect();
+            assert_eq!(hints(&mut warm, start, end), expected, "{start:?}..{end:?}");
+            if k % 9 == 0 {
+                assert_eq!(
+                    hints(&mut server(), start, end),
+                    expected,
+                    "{start:?}..{end:?}"
+                );
+            }
+        }
     }
 }

@@ -728,13 +728,24 @@ fn decimal_bounds_stay_exact() {
 }
 
 #[test]
-fn non_terminating_bounds_print_as_fractions_and_hint_as_decimals() {
-    let p = prop(
-        "package Ratio {
+fn non_terminating_bounds_print_as_fractions_and_display_in_the_configured_format() {
+    let src = "package Ratio {
             attribute def Real;
             attribute share[1] : Real;
             assert constraint c { share >= 1 / 3 and share <= 2 / 3 }
-        }",
+        }";
+    // By default the display range is exact too.
+    let p = prop(src);
+    let r = range_of(&p, "share");
+    assert_eq!(r.range, "[1/3, 2/3]");
+    assert_eq!(r.range_approx, "[1/3, 2/3]");
+    // A display format re-spells the display range only.
+    let mut model = Model::new();
+    model.add_source("t.sysml", src);
+    let approx = sysmlv2_model::numfmt::NumberFormat::parse("approx").unwrap();
+    let p = propagate_constraints(
+        &model,
+        &PropagateConfig::default().with_number_format(approx),
     );
     let r = range_of(&p, "share");
     assert_eq!(r.range, "[1/3, 2/3]");

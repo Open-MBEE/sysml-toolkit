@@ -1,6 +1,7 @@
 //! Supported fixed-base expression heritage without allocating textual declaration scopes.
 use super::{Builder, MembershipContext, MembershipProjection, implied};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use uuid::Uuid;
 
 /// Present generic endpoint arrays must describe the same local carrier as
@@ -106,7 +107,7 @@ impl Builder {
             .planned_literal_target(ty)
             .and_then(|id| self.element_index_of_uuid(id));
         let required_ready = required.is_some_and(|required| {
-            conforms(self.elements[required].ty, "Feature")
+            is_a!(self.elements[required], "Feature")
                 && self.literal_has_typing(required, "Function", &mut context)
         });
         let result_ready = self
@@ -135,11 +136,11 @@ impl Builder {
         }
         let mut found = None;
         for &membership in &inherited.membership_order {
-            if !conforms(self.elements[membership].ty, "ReturnParameterMembership") {
+            if !is_a!(self.elements[membership], "ReturnParameterMembership") {
                 continue;
             }
             let member = self.stored_membership_member(membership)?;
-            if !conforms(self.elements[member].ty, "Feature")
+            if !is_a!(self.elements[member], "Feature")
                 || self.elements[member].owning_relationship != Some(membership)
                 || self.elements[membership].children.len() != 1
                 || self.elements[membership].children.first().copied() != Some(member)
@@ -182,7 +183,7 @@ impl Builder {
                 return None;
             }
             let owner = self.element_index_of_uuid(owner_id)?;
-            if !conforms(self.elements[owner].ty, "Type")
+            if !is_a!(self.elements[owner], "Type")
                 || !context.charge(self.elements[owner].owned_relationships.len())
                 || self.elements[owner]
                     .owned_relationships
@@ -212,7 +213,7 @@ impl Builder {
         let mut seen = std::collections::HashSet::new();
         for relationship in relationships {
             let relation = &self.elements[relationship];
-            if !conforms(relation.ty, "FeatureTyping") {
+            if !is_a!(relation, "FeatureTyping") {
                 continue;
             }
             if !seen.insert(relationship)

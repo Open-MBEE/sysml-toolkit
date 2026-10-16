@@ -2,12 +2,15 @@
 use sysmlv2_parser::{json::ResolvedModel, model::Model};
 
 #[test]
-fn suppressed_public_aliases_are_not_reported_as_visibility_blocked() {
+fn removed_public_aliases_are_not_reported_as_visibility_blocked() {
+    // Mid's own `y` redefines x, which removes x's aliases from what Child
+    // inherits: a semantic removal, not a visibility block.
     let mut m = Model::new();
     m.add_source(
         "aliases.kerml",
-        "class Base { private feature x; alias ax for x; alias bx for x; }
-        class Mid specializes Base; class Child specializes Mid; feature useX references Child::ax;",
+        "class Base { feature x; alias ax for x; alias bx for x; }
+        class Mid specializes Base { feature y redefines x; } class Child specializes Mid;
+        feature useX references Child::ax;",
     );
     assert!(!m.has_errors());
     let mut r = ResolvedModel::build(&m);

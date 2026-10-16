@@ -1,5 +1,6 @@
 //! Static ownership, specialization, and feature-property constraints.
 use super::facts::{Facts, flag, is};
+use crate::metaclass::is_a;
 use crate::{
     json::{Builder, ResolvedModel},
     model::Model,
@@ -7,15 +8,15 @@ use crate::{
 use sysmlv2_syntax::{Span, diag::Diagnostic};
 
 fn occurrence(b: &Builder, g: &Facts, e: usize) -> bool {
-    is(b, e, "Class")
-        || is(b, e, "OccurrenceUsage")
-        || g.typed(b, e).iter().any(|&t| is(b, t, "Class"))
+    is_a!(b.elements[e], "Class")
+        || is_a!(b.elements[e], "OccurrenceUsage")
+        || g.typed(b, e).iter().any(|&t| is_a!(b.elements[t], "Class"))
 }
 pub(super) fn variable(b: &Builder, g: &Facts, e: usize) -> bool {
     if flag(b, e, "isVariable") {
         return true;
     }
-    if !is(b, e, "Usage") {
+    if !is_a!(b.elements[e], "Usage") {
         return false;
     }
     // SysML derives variability from an occurrence owning type. A portion
@@ -41,7 +42,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
     for (i, (e, kind, _, qn)) in b.spec_targets.iter().enumerate() {
         if *e < b.lib_boundary
             || !matches!(*kind, "Subclassification" | "Subsetting")
-            || !is(b, *e, "Classifier")
+            || !is_a!(b.elements[*e], "Classifier")
         {
             continue;
         }
@@ -50,24 +51,30 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
         };
         let cases = [
             (
-                is(b, *e, "DataType") && (is(b, t, "Class") || is(b, t, "Association")),
+                is_a!(b.elements[*e], "DataType")
+                    && (is_a!(b.elements[t], "Class") || is_a!(b.elements[t], "Association")),
                 "validateDataTypeSpecialization",
                 "A data type cannot specialize a class or association",
             ),
             (
-                is(b, *e, "Class")
-                    && (is(b, t, "DataType")
-                        || (is(b, t, "Association") && !is(b, *e, "Association"))),
+                is_a!(b.elements[*e], "Class")
+                    && (is_a!(b.elements[t], "DataType")
+                        || (is_a!(b.elements[t], "Association")
+                            && !is_a!(b.elements[*e], "Association"))),
                 "validateClassSpecialization",
                 "A class cannot specialize a data type or an unrelated association family",
             ),
             (
-                is(b, *e, "Structure") && is(b, t, "Behavior") && !is(b, t, "Structure"),
+                is_a!(b.elements[*e], "Structure")
+                    && is_a!(b.elements[t], "Behavior")
+                    && !is_a!(b.elements[t], "Structure"),
                 "validateStructureSpecialization",
                 "A structure cannot specialize a behavior",
             ),
             (
-                is(b, *e, "Behavior") && is(b, t, "Structure") && !is(b, t, "Behavior"),
+                is_a!(b.elements[*e], "Behavior")
+                    && is_a!(b.elements[t], "Structure")
+                    && !is_a!(b.elements[t], "Behavior"),
                 "validateBehaviorSpecialization",
                 "A behavior cannot specialize a structure",
             ),
@@ -146,20 +153,21 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
         }
         let span = g.span(b, e);
         let ty = b.elements[e].ty;
-        let variation = flag(b, e, "isVariation") || is(b, e, "EnumerationDefinition");
+        let variation = flag(b, e, "isVariation") || is_a!(b.elements[e], "EnumerationDefinition");
         if variation {
             for &m in &g.members[e] {
-                if is(b, m, "Usage")
-                    && !is(b, m, "MetadataUsage")
-                    && !is(b, m, "EnumerationUsage")
+                if is_a!(b.elements[m], "Usage")
+                    && !is_a!(b.elements[m], "MetadataUsage")
+                    && !is_a!(b.elements[m], "EnumerationUsage")
                     && b.elements[m].owning_relationship.is_some_and(|rel| {
-                        is(b, rel, "FeatureMembership") && !is(b, rel, "VariantMembership")
+                        is_a!(b.elements[rel], "FeatureMembership")
+                            && !is_a!(b.elements[rel], "VariantMembership")
                     })
                 {
                     report(
                         m,
                         g.span(b, m),
-                        if is(b, e, "Definition") {
+                        if is_a!(b.elements[e], "Definition") {
                             "validateDefinitionVariationMembership"
                         } else {
                             "validateUsageVariationMembership"
@@ -168,14 +176,13 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                     );
                 }
             }
-            if g.supers[e]
-                .iter()
-                .any(|&s| flag(b, s, "isVariation") || is(b, s, "EnumerationDefinition"))
-            {
+            if g.supers[e].iter().any(|&s| {
+                flag(b, s, "isVariation") || is_a!(b.elements[s], "EnumerationDefinition")
+            }) {
                 report(
                     e,
                     span,
-                    if is(b, e, "Definition") {
+                    if is_a!(b.elements[e], "Definition") {
                         "validateDefinitionVariationSpecialization"
                     } else {
                         "validateUsageVariationSpecialization"
@@ -279,7 +286,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 "A user library package must not be marked standard",
             );
         }
-        if is(b, e, "Feature") {
+        if is_a!(b.elements[e], "Feature") {
             let is_var = variable(b, g, e);
             if flag(b, e, "isVariable") && !g.featuring(b, e).is_some_and(|o| occurrence(b, g, o)) {
                 report(
@@ -316,11 +323,11 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 }
             }
         }
-        if is(b, e, "OccurrenceUsage") {
+        if is_a!(b.elements[e], "OccurrenceUsage") {
             let typed = g.typed(b, e);
             let n = typed
                 .iter()
-                .filter(|&&t| flag(b, t, "isIndividual") && is(b, t, "Definition"))
+                .filter(|&&t| flag(b, t, "isIndividual") && is_a!(b.elements[t], "Definition"))
                 .count();
             if n > 1 {
                 report(
@@ -343,7 +350,8 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 .get("portionKind")
                 .is_some_and(|p| p.is_string())
                 && !g.featuring(b, e).is_some_and(|o| {
-                    is(b, o, "OccurrenceDefinition") || is(b, o, "OccurrenceUsage")
+                    is_a!(b.elements[o], "OccurrenceDefinition")
+                        || is_a!(b.elements[o], "OccurrenceUsage")
                 })
             {
                 report(
@@ -355,7 +363,10 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
             }
         }
         if let Some(owner) = g.owner[e] {
-            if is(b, e, "Usage") && !is(b, e, "PortUsage") && flag(b, e, "isComposite") {
+            if is_a!(b.elements[e], "Usage")
+                && !is_a!(b.elements[e], "PortUsage")
+                && flag(b, e, "isComposite")
+            {
                 let rule = match b.elements[owner].ty {
                     "PortDefinition" => Some("validatePortDefinitionOwnedUsagesNotComposite"),
                     "PortUsage" => Some("validatePortUsageNestedUsagesNotComposite"),
@@ -370,10 +381,12 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                     );
                 }
             }
-            if is(b, e, "PortUsage")
-                && (is(b, owner, "PortDefinition") || is(b, owner, "PortUsage"))
-                && g.owner[owner]
-                    .is_some_and(|o| is(b, o, "PortDefinition") || is(b, o, "PortUsage"))
+            if is_a!(b.elements[e], "PortUsage")
+                && (is_a!(b.elements[owner], "PortDefinition")
+                    || is_a!(b.elements[owner], "PortUsage"))
+                && g.owner[owner].is_some_and(|o| {
+                    is_a!(b.elements[o], "PortDefinition") || is_a!(b.elements[o], "PortUsage")
+                })
                 && b.elements[e]
                     .owning_relationship
                     .is_some_and(|rel| b.elements[rel].ty == "VariantMembership")
@@ -387,10 +400,11 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 );
             }
             if flag(b, e, "isEnd")
-                && (is(b, owner, "InterfaceDefinition") || is(b, owner, "InterfaceUsage"))
-                && !is(b, e, "PortUsage")
+                && (is_a!(b.elements[owner], "InterfaceDefinition")
+                    || is_a!(b.elements[owner], "InterfaceUsage"))
+                && !is_a!(b.elements[e], "PortUsage")
             {
-                let rule = if is(b, owner, "InterfaceDefinition") {
+                let rule = if is_a!(b.elements[owner], "InterfaceDefinition") {
                     "validateInterfaceDefinitionEnd"
                 } else {
                     "validateInterfaceUsageEnd"
@@ -421,7 +435,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 }
             }
         }
-        if is(b, e, "ViewDefinition") || is(b, e, "ViewUsage") {
+        if is_a!(b.elements[e], "ViewDefinition") || is_a!(b.elements[e], "ViewUsage") {
             let count = g.members[e]
                 .iter()
                 .filter(|&&m| {
@@ -434,7 +448,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 report(
                     e,
                     span,
-                    if is(b, e, "ViewDefinition") {
+                    if is_a!(b.elements[e], "ViewDefinition") {
                         "validateViewDefinitionOnlyOnvViewRendering"
                     } else {
                         "validateViewUsageOnlyOneRendering"
@@ -443,7 +457,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 );
             }
         }
-        if is(b, e, "Function") || is(b, e, "Expression") {
+        if is_a!(b.elements[e], "Function") || is_a!(b.elements[e], "Expression") {
             let results = g
                 .closure(e)
                 .into_iter()
@@ -453,7 +467,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 report(
                     e,
                     span,
-                    if is(b, e, "Function") {
+                    if is_a!(b.elements[e], "Function") {
                         "validateFunctionResultExpressionMembership"
                     } else {
                         "validateExpressionResultExpressionMembership"
@@ -473,7 +487,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 report(
                     e,
                     span,
-                    if is(b, e, "Function") {
+                    if is_a!(b.elements[e], "Function") {
                         "validateFunctionResultParameterMembership"
                     } else {
                         "validateExpressionResultParameterMembership"
@@ -482,10 +496,10 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 );
             }
         }
-        if is(b, e, "Type")
+        if is_a!(b.elements[e], "Type")
             && g.members[e]
                 .iter()
-                .filter(|&&m| is(b, m, "Multiplicity"))
+                .filter(|&&m| is_a!(b.elements[m], "Multiplicity"))
                 .count()
                 > 1
         {
@@ -541,8 +555,8 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 "A feature cannot chain through itself",
             );
         }
-        if is(b, e, "StateDefinition") || is(b, e, "StateUsage") {
-            let definition = is(b, e, "StateDefinition");
+        if is_a!(b.elements[e], "StateDefinition") || is_a!(b.elements[e], "StateUsage") {
+            let definition = is_a!(b.elements[e], "StateDefinition");
             for kind in ["entry", "do", "exit"] {
                 let n = g.members[e]
                     .iter()
@@ -568,9 +582,9 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 }
             }
             if flag(b, e, "isParallel")
-                && g.members[e]
-                    .iter()
-                    .any(|&m| is(b, m, "TransitionUsage") || is(b, m, "Succession"))
+                && g.members[e].iter().any(|&m| {
+                    is_a!(b.elements[m], "TransitionUsage") || is_a!(b.elements[m], "Succession")
+                })
             {
                 report(
                     e,
@@ -584,8 +598,10 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 );
             }
         }
-        if is(b, e, "ControlNode")
-            && !g.owner[e].is_some_and(|o| is(b, o, "ActionDefinition") || is(b, o, "ActionUsage"))
+        if is_a!(b.elements[e], "ControlNode")
+            && !g.owner[e].is_some_and(|o| {
+                is_a!(b.elements[o], "ActionDefinition") || is_a!(b.elements[o], "ActionUsage")
+            })
         {
             report(
                 e,
@@ -594,7 +610,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 "A control node must be owned by an action",
             );
         }
-        if is(b, e, "Association") {
+        if is_a!(b.elements[e], "Association") {
             let ends: Vec<_> = g.members[e]
                 .iter()
                 .copied()
@@ -633,7 +649,8 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                     .owning_relationship
                     .is_some_and(|r| b.elements[r].ty == "ObjectiveMembership")
                     && g.owner[o].is_some_and(|c| {
-                        is(b, c, "VerificationCaseDefinition") || is(b, c, "VerificationCaseUsage")
+                        is_a!(b.elements[c], "VerificationCaseDefinition")
+                            || is_a!(b.elements[c], "VerificationCaseUsage")
                     })
             });
             if !valid {
@@ -645,7 +662,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 );
             }
         }
-        if is(b, e, "MetadataFeature") {
+        if is_a!(b.elements[e], "MetadataFeature") {
             let types = g.typed(b, e);
             if !types.is_empty() && types.iter().all(|&t| flag(b, t, "isAbstract")) {
                 report(

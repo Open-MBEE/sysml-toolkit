@@ -41,6 +41,11 @@ impl Writer {
         self.buf
     }
 
+    /// The number of bytes written.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Append pre-encoded CBOR items (candidate encodings compared in
     /// a scratch writer, then adopted verbatim).
     pub fn raw(&mut self, bytes: &[u8]) {
@@ -288,6 +293,13 @@ impl<'a> Reader<'a> {
             out.push((key, v));
         }
         Ok(out)
+    }
+
+    /// The bytes of the next complete item, which is skipped.
+    pub fn raw_item(&mut self) -> Result<&'a [u8], Error> {
+        let start = self.pos;
+        self.skip_items(1)?;
+        Ok(&self.buf[start..self.pos])
     }
 
     pub fn skip_items(&mut self, count: u64) -> Result<(), Error> {

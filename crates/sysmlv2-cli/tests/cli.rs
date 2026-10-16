@@ -444,6 +444,59 @@ fn lint_rule_overrides_and_config_findings() {
 }
 
 #[test]
+fn lint_directives_suppress_findings_and_report_unused_ones() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-lint-directives-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.sysml");
+    fs::write(
+        &input,
+        "package P {\n    // sysmlint-disable-next-line naming-convention\n    part def widget_one;\n    part def Wheel; // sysmlint-disable-line naming-convention\n}\n",
+    )
+    .unwrap();
+
+    // The directive above hides the casing finding; the trailing one
+    // hides nothing and is reported, with the count of what was hidden.
+    let out = sysmlv2(&["lint", input.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(!err.contains("widget_one"), "{err}");
+    assert!(
+        err.contains(
+            "`naming-convention` is not reported on line 4; the directive suppresses nothing \
+             [lint-directive]"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("1 finding(s) suppressed by directive"),
+        "{err}"
+    );
+
+    // The JSON summary carries the count.
+    let out = sysmlv2(&["lint", "--format", "json", input.to_str().unwrap()]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["summary"]["suppressed"], 1, "{v}");
+    assert_eq!(v["findings"][0]["rule"], "lint-directive", "{v}");
+
+    // Removing the unused directive is a deleting fix.
+    let out = sysmlv2(&["lint", "--fix", input.to_str().unwrap()]);
+    assert!(
+        stderr(&out).contains("1 deletion fix(es)"),
+        "{}",
+        stderr(&out)
+    );
+    let out = sysmlv2(&["lint", "--fix", "--fix-deletes", input.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(&input).unwrap(),
+        "package P {\n    // sysmlint-disable-next-line naming-convention\n    part def widget_one;\n    part def Wheel;\n}\n"
+    );
+}
+
+#[test]
 fn convert_json_back_to_text() {
     let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-lift-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
@@ -3158,7 +3211,7 @@ fn lint_format_json_writes_one_report_to_stdout() {
     let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
     assert_eq!(
         doc["summary"],
-        serde_json::json!({"errors": 0, "warnings": 1, "infos": 0, "hints": 0})
+        serde_json::json!({"errors": 0, "warnings": 1, "infos": 0, "hints": 0, "suppressed": 0})
     );
     let f = &doc["findings"][0];
     assert_eq!(f["stage"], "lint");
@@ -3495,4 +3548,97 @@ fn else_if_chains_respect_the_nesting_bound() {
         }
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// `--number-format` re-spells non-terminating rationals in `eval`,
+/// `query` and `verify --ranges`; without it the output is the exact
+/// fraction it always was, and a spec the toolkit cannot read is a
+/// usage error naming the problem.
+#[test]
+fn number_format_respells_printed_values() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-numfmt-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("m.sysml");
+    fs::write(
+        &file,
+        "package M {\n    attribute third = 2 / 6;\n    attribute mixed = 7 / 3;\n    \
+         attribute tenth = 0.1;\n    attribute x : ScalarValues::Real[1];\n    \
+         assert constraint lo { x >= 0 }\n    assert constraint hi { 3 * x <= 1 }\n}\n",
+    )
+    .unwrap();
+    let file = file.to_str().unwrap();
+    let eval = |spec: Option<&str>| -> String {
+        let mut args = vec!["eval", file, "M::third", "M::mixed", "M::tenth"];
+        if let Some(spec) = spec {
+            args.splice(1..1, ["--number-format", spec]);
+        }
+        let out = sysmlv2(&args);
+        assert!(out.status.success(), "{spec:?}: {}", stderr(&out));
+        stdout(&out)
+    };
+    assert_eq!(
+        eval(None),
+        "M::third = 1/3\nM::mixed = 7/3\nM::tenth = 0.1\n"
+    );
+    for (spec, third, mixed) in [
+        ("exact,mixed=true", "1/3", "2 1/3"),
+        ("approx,digits=3", "≈0.333", "≈2.33"),
+        ("overline", "0.3\u{305}", "2.3\u{305}"),
+        ("parens", "0.(3)", "2.(3)"),
+        ("unicode", "¹/₃", "2¹/₃"),
+        ("unicode,glyphs=true,slash=fraction", "⅓", "2⅓"),
+    ] {
+        assert_eq!(
+            eval(Some(spec)),
+            format!("M::third = {third}\nM::mixed = {mixed}\nM::tenth = 0.1\n"),
+            "{spec}"
+        );
+    }
+    // It may follow the positionals too.
+    let out = sysmlv2(&["query", file, "(1/3, 2/7)", "--number-format", "parens"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "0.(3)\n0.(285714)\n");
+    let out = sysmlv2(&["verify", "--ranges", "--number-format", "unicode", file]);
+    assert!(
+        stdout(&out).contains("x ∈ [0, ¹/₃]"),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let out = sysmlv2(&["verify", "--ranges", file]);
+    assert!(stdout(&out).contains("x ∈ [0, 1/3]"), "{}", stdout(&out));
+
+    let out = sysmlv2(&[
+        "eval",
+        "--number-format",
+        "overline,width=3",
+        file,
+        "M::third",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown setting `width`"),
+        "{}",
+        stderr(&out)
+    );
+    // A command that prints no values does not take it.
+    let out = sysmlv2(&["parse", "--number-format", "parens", file]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    // Values past the double's range keep their digits.
+    let big = dir.join("big.sysml");
+    fs::write(
+        &big,
+        "package B {\n    attribute huge = 10 ** 400 / 3;\n}\n",
+    )
+    .unwrap();
+    let out = sysmlv2(&[
+        "eval",
+        "--number-format",
+        "approx,digits=3",
+        big.to_str().unwrap(),
+        "B::huge",
+    ]);
+    assert_eq!(stdout(&out), "B::huge = ≈3.33e399\n", "{}", stderr(&out));
+    fs::remove_dir_all(&dir).ok();
 }

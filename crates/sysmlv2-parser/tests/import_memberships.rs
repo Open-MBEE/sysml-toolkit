@@ -543,7 +543,7 @@ fn named_self_import_collides_with_the_owned_membership() {
 }
 
 #[test]
-fn inheritance_filters_distinct_memberships_of_one_feature_but_not_diamond_repeats() {
+fn inheritance_keeps_distinct_memberships_of_one_feature_and_dedups_diamond_repeats() {
     let library = "package L {
         class Values { feature x; class T; }
         class Aliases { alias a for Values::x; alias b for Values::x; }
@@ -563,16 +563,21 @@ fn inheritance_filters_distinct_memberships_of_one_feature_but_not_diamond_repea
             alias(&mut r, "L::Types", "a"),
             alias(&mut r, "L::Types", "b"),
         ];
+        let x = r.resolve_qualified("L::Mixed::x").unwrap();
         for include_implied in [false, true, false] {
             r.set_closure_policy(ClosurePolicy::Closure { include_implied });
-            for name in ["A", "B"] {
+            // Two aliases of one Feature, or its owning Membership and an
+            // alias, are both inherited; only a FeatureMembership makes the
+            // Feature an inherited feature.
+            for (name, features) in [("A", vec![]), ("B", vec![x])] {
                 let e = r.resolve_qualified(name).unwrap();
-                assert!(
-                    r.inherited_memberships(e, include_implied).is_empty(),
+                assert_eq!(
+                    r.inherited_memberships(e, include_implied).len(),
+                    2,
                     "{name}"
                 );
-                assert!(many(&mut r, e, "inheritedMembership").is_empty());
-                assert!(many(&mut r, e, "inheritedFeature").is_empty());
+                assert_eq!(many(&mut r, e, "inheritedMembership").len(), 2, "{name}");
+                assert_eq!(many(&mut r, e, "inheritedFeature"), features, "{name}");
             }
             let c = r.resolve_qualified("C").unwrap();
             assert_eq!(r.inherited_memberships(c, include_implied), types);
@@ -624,11 +629,16 @@ fn private_aliases_do_not_suppress_inherited_public_features() {
     ) {
         let x = r.resolve_qualified("Base::x").unwrap();
         let xm = one(&mut r, x, "owningMembership");
+        let px = r.resolve_qualified("ProtectedBase::x").unwrap();
+        let pxm = one(&mut r, px, "owningMembership");
         for include_implied in [false, true] {
             let sub = r.resolve_qualified("Sub").unwrap();
             assert_eq!(r.inherited_memberships(sub, include_implied), [xm]);
+            // A protected alias inherits beside the owning Membership.
             let other = r.resolve_qualified("Other").unwrap();
-            assert!(r.inherited_memberships(other, include_implied).is_empty());
+            let inherited = r.inherited_memberships(other, include_implied);
+            assert_eq!(inherited.len(), 2);
+            assert!(inherited.contains(&pxm));
         }
     }
 }

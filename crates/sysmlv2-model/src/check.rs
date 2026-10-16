@@ -1,10 +1,12 @@
 //! Referential checks over a resolved multi-file model.
 
+use crate::metaclass::is_a;
 use sysmlv2_syntax::diag::Diagnostic;
 
 mod actions;
 mod chains;
 mod connectors;
+mod constructors;
 mod dimensions;
 mod directions;
 mod distinguishability;
@@ -13,7 +15,7 @@ mod expressions;
 pub(crate) mod facts;
 mod invocations;
 mod multiplicities;
-mod multiplicity_domains;
+pub(crate) mod multiplicity_domains;
 mod relationships;
 mod scalars;
 mod specialization;
@@ -392,14 +394,40 @@ pub fn validate_semantics_with(
     let used_imports = r.b.used_imports.clone();
     let mut out = Vec::new();
 
+    // The positional plan is a function of the resolved rows, and the last
+    // pass asks for it unbudgeted anyway, through the inherited-member
+    // enumerations the distinguishability check reads for every user type.
+    // Planning it first, under the same trigger, keeps the evaluating passes
+    // off the budgeted path, which a large model can exhaust on every attempt.
+    if r.b.semantic_ready && user_types_with_scopes(&r.b) {
+        r.b.ensure_positional_redefinitions();
+    }
+    // The families on threads, each on a fork of the resolved model that
+    // reads the rows it shares with the others and fills memos of its own:
+    // the same families in the same order, their findings gathered in
+    // that order, so that what follows sees what the in-line pass gives.
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let workers = worker_count(r.b.explicit_len() - r.b.lib_boundary);
+        if workers > 1 {
+            let facts = r.b.facts();
+            r.share_rows();
+            out = families_on_threads(r, model, &facts, workers);
+            out.sort_by_key(|(unit, d)| (*unit, d.span.start));
+            out.dedup_by(|a, b| a.0 == b.0 && a.1.span == b.1.span && a.1.message == b.1.message);
+            r.b.used_imports = used_imports;
+            return out;
+        }
+    }
     out.extend(multiplicities::validate(r, model));
     out.extend(specialization::validate(r, model));
     out.extend(invocations::validate(r, model));
     out.extend(scalars::validate(r, model));
+    out.extend(constructors::validate(r, model));
     out.extend(chains::validate(r, model));
     // The immutable facts already index ownership and binary relationship
     // targets for every later validator. Reuse them for connector checks too.
-    let facts = facts::Facts::new(&mut r.b);
+    let facts = r.b.facts();
     out.extend(connectors::validate(r, model, &facts));
     out.extend(structural::validate(r, model, &facts));
     out.extend(structural::validate_directions(r, model, &facts));
@@ -415,6 +443,132 @@ pub fn validate_semantics_with(
     out.dedup_by(|a, b| a.0 == b.0 && a.1.span == b.1.span && a.1.message == b.1.message);
     r.b.used_imports = used_imports;
     out
+}
+
+#[cfg(not(target_family = "wasm"))]
+type Found = Vec<(usize, Diagnostic)>;
+
+/// The user rows from which the semantic checks run on threads: below it
+/// a fork of the model costs more than the families divide.
+#[cfg(not(target_family = "wasm"))]
+const THREADED_ROWS: usize = 1_000;
+
+/// How many threads the semantic checks of a model with `user_rows` rows
+/// of its own run on.
+#[cfg(not(target_family = "wasm"))]
+fn worker_count(user_rows: usize) -> usize {
+    #[cfg(test)]
+    if let Some(workers) = crate::par::test_workers() {
+        return workers;
+    }
+    if user_rows < THREADED_ROWS {
+        1
+    } else {
+        crate::par::workers(user_rows)
+    }
+}
+
+/// The families on `workers` threads, this one among them. Each thread
+/// forks the resolved model once and takes tasks from one list — the
+/// families, largest first, and the distinguishability check in slices
+/// of the user rows — until none is left; a thread the host refuses just
+/// leaves its share to the others. The findings come back in the order
+/// the in-line pass makes them: family by family, the slices in row order.
+#[cfg(not(target_family = "wasm"))]
+fn families_on_threads(
+    r: &crate::json::ResolvedModel,
+    model: &crate::model::Model,
+    facts: &facts::Facts,
+    workers: usize,
+) -> Found {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    enum Task {
+        Family(usize),
+        Distinct(std::ops::Range<usize>),
+    }
+    const FAMILIES: usize = 16;
+    // In order of size on the models measured, the biggest first, with
+    // the distinguishability slices (the biggest family) among the first.
+    const LARGEST_FIRST: [usize; FAMILIES] = [1, 10, 7, 11, 6, 15, 13, 12, 3, 9, 2, 4, 5, 14, 8, 0];
+    let (lo, hi) = (r.b.lib_boundary, r.b.explicit_len());
+    let slices = workers * 4;
+    let step = (hi - lo).div_ceil(slices).max(1);
+    let mut tasks: Vec<(usize, Task)> = LARGEST_FIRST
+        .iter()
+        .map(|&f| (f, Task::Family(f)))
+        .collect();
+    for (k, start) in (lo..hi).step_by(step).enumerate() {
+        tasks.insert(
+            k.min(2),
+            (FAMILIES + k, Task::Distinct(start..(start + step).min(hi))),
+        );
+    }
+    let next = AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(usize, Found)>> = std::sync::Mutex::new(Vec::new());
+    let work = |_: usize| {
+        let mut f = r.fork();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some((key, task)) = tasks.get(i) else {
+                break;
+            };
+            let r = &mut f;
+            let found = match task {
+                Task::Distinct(rows) => distinguishability::validate_in(r, model, rows.clone()),
+                Task::Family(n) => match n {
+                    0 => multiplicities::validate(r, model),
+                    1 => specialization::validate(r, model),
+                    2 => invocations::validate(r, model),
+                    3 => scalars::validate(r, model),
+                    4 => constructors::validate(r, model),
+                    5 => chains::validate(r, model),
+                    6 => connectors::validate(r, model, facts),
+                    7 => structural::validate(r, model, facts),
+                    8 => structural::validate_directions(r, model, facts),
+                    9 => endpoints::validate(r, model, facts),
+                    10 => values::validate(r, model, facts),
+                    11 => relationships::validate(r, model, facts),
+                    12 => expressions::validate(r, model, facts),
+                    13 => actions::validate(r, model, facts),
+                    14 => typing::validate(r, model),
+                    _ => dimensions::validate(r, model),
+                },
+            };
+            results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((*key, found));
+        }
+    };
+    std::thread::scope(|scope| {
+        let spawned: Vec<_> = (1..workers)
+            .filter_map(|w| {
+                std::thread::Builder::new()
+                    .name("sysmlv2-check".into())
+                    .stack_size(crate::par::STACK_BYTES)
+                    .spawn_scoped(scope, move || work(w))
+                    .ok()
+            })
+            .collect();
+        work(0);
+        for handle in spawned {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    results.sort_by_key(|(key, _)| *key);
+    results.into_iter().flat_map(|(_, found)| found).collect()
+}
+
+/// Whether a user element is a type with a body scope: what the inherited-name
+/// distinguishability check enumerates, and so what makes it plan.
+fn user_types_with_scopes(b: &crate::json::Builder) -> bool {
+    (b.lib_boundary..b.explicit_len())
+        .any(|e| is_a!(b.elements[e], "Type") && b.elem_scope.contains_key(&e))
 }
 
 /// Collect the feature references of an expression, in source order: the
@@ -949,6 +1103,37 @@ mod tests {
     }
 
     #[test]
+    fn the_families_on_threads_find_what_the_in_line_pass_finds() {
+        let mut model = Model::new();
+        model.add_library_source("lib.kerml", LIBRARY);
+        model.add_source("user.kerml", USER);
+        model.add_source(
+            "more.kerml",
+            "package V { class C { feature p : L::A; feature q : L::B; } class D :> C { feature r : L::A; } class E :> C, D; }",
+        );
+        let in_line = {
+            crate::par::set_test_workers(Some(1));
+            let mut r = ResolvedModel::build(&model);
+            super::validate_semantics_with(&mut r, &model)
+        };
+        let on_threads = {
+            crate::par::set_test_workers(Some(4));
+            let mut r = ResolvedModel::build(&model);
+            let out = super::validate_semantics_with(&mut r, &model);
+            crate::par::set_test_workers(None);
+            out
+        };
+        assert!(!in_line.is_empty());
+        let shown = |found: &[(usize, super::Diagnostic)]| -> Vec<(usize, u32, String)> {
+            found
+                .iter()
+                .map(|(u, d)| (*u, d.span.start, d.message.clone()))
+                .collect()
+        };
+        assert_eq!(shown(&on_threads), shown(&in_line));
+    }
+
+    #[test]
     fn semantic_checks_walk_tables_without_copying_them() {
         // Fresh build: library rows and user rows share one storage.
         let mut cold = Model::new();
@@ -1053,5 +1238,125 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn the_semantic_pass_plans_positional_redefinitions_before_its_checks() {
+        let mut model = crate::model::Model::new();
+        model.add_source(
+            "plan-first.sysml",
+            "package P { calc def Half { in n; return result = n / 2; } calc half : Half { in n = 4; } }",
+        );
+        assert!(!model.has_errors());
+        // Without the pass, the first budgeted reader would plan.
+        let mut r = crate::json::ResolvedModel::build(&model);
+        assert!(!r.b.has_positional_plan());
+        assert!(r.b.ensure_positional_redefinitions_with_budget(&mut 0));
+        assert!(r.b.has_positional_plan());
+        // The pass plans before its checks: none of them takes the budgeted path.
+        let mut r = crate::json::ResolvedModel::build(&model);
+        let attempts = crate::json::Builder::budgeted_planning_attempts();
+        let findings = crate::check::validate_semantics_with(&mut r, &model);
+        assert!(r.b.has_positional_plan());
+        assert_eq!(crate::json::Builder::budgeted_planning_attempts(), attempts);
+        assert!(findings.is_empty(), "{findings:?}");
+        // A unit without a type plans nothing.
+        let mut model = crate::model::Model::new();
+        model.add_source(
+            "no-types.sysml",
+            "package Empty { comment /* nothing to inherit */ }",
+        );
+        let mut r = crate::json::ResolvedModel::build(&model);
+        crate::check::validate_semantics_with(&mut r, &model);
+        assert!(!r.b.has_positional_plan());
+    }
+
+    /// A view exposing many metadata bodies inherits as many same-named
+    /// features, every one a redefinition by implication of the metadata
+    /// definition's feature: no pair of them is a collision, however many
+    /// there are, and a genuine pair under another name is still reported.
+    #[test]
+    fn same_named_members_that_all_redefine_by_implication_are_no_collision() {
+        let mut source = String::from(
+            "package P { metadata def Layout { attribute x : ScalarValues::Integer; attribute y : ScalarValues::Integer; } part def A { attribute shared; } part def B { attribute shared; } package Diagrams { ",
+        );
+        for i in 0..40 {
+            source.push_str(&format!(
+                "part p{i} : A; metadata Layout about p{i} {{ x = {i}; y = {i}; }} "
+            ));
+        }
+        source.push_str("} part def V :> A, B { import Diagrams::**; } }");
+        let mut model = crate::model::Model::new();
+        let parsed = model.add_source("m.sysml", &source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut r = crate::json::ResolvedModel::build(&model);
+        let messages: Vec<String> = super::distinguishability::collisions(&mut r)
+            .into_iter()
+            .map(|c| c.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .all(|m| !m.contains("`x`") && !m.contains("`y`")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`shared`")),
+            "{messages:?}"
+        );
+    }
+
+    /// The report keeps the first pair under a name that is not cleared: a
+    /// first pair cleared by an explicit subsetting falls through to the
+    /// next one, whose declaring types the message names.
+    #[test]
+    fn the_first_uncleared_pair_under_a_name_is_the_one_reported() {
+        let mut model = crate::model::Model::new();
+        let parsed = model.add_source(
+            "m.sysml",
+            "package P { part def A { attribute x; } part def B { attribute x :> A::x; } part def C { attribute x; } part def D :> A, B, C; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut r = crate::json::ResolvedModel::build(&model);
+        let messages: Vec<String> = super::distinguishability::collisions(&mut r)
+            .into_iter()
+            .map(|c| c.message)
+            .collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("`x`")
+                && messages[0].contains("`A`")
+                && messages[0].contains("`C`"),
+            "{messages:?}"
+        );
+    }
+
+    /// The distinguishability check reports the same collisions whether or
+    /// not the builder's memos are warm: a diamond where two user types
+    /// inherit one result member and one shared feature from the same generals.
+    #[test]
+    fn collisions_are_the_same_with_warm_and_cold_memos() {
+        let mut model = crate::model::Model::new();
+        let parsed = model.add_source(
+            "diamond.kerml",
+            "function F { in a; return r; } function G specializes F; function H specializes F;
+             function D specializes G, H { in a; }
+             classifier Base { feature shared; } classifier Left specializes Base { feature shared; }
+             classifier Right specializes Base; classifier Both specializes Left, Right;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut r = crate::json::ResolvedModel::build(&model);
+        let collect = |r: &mut crate::json::ResolvedModel| -> Vec<(usize, u32, u32, String)> {
+            super::distinguishability::collisions(r)
+                .into_iter()
+                .map(|c| (c.unit, c.span.start, c.span.end, c.message))
+                .collect()
+        };
+        let cold = collect(&mut r);
+        assert!(!cold.is_empty(), "the diamond collides");
+        let warm = collect(&mut r);
+        assert_eq!(cold, warm);
+        r.b.reset_lookup_caches();
+        assert_eq!(cold, collect(&mut r));
     }
 }

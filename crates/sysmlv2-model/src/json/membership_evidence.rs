@@ -3,6 +3,7 @@
 //! owned members, materialize a semantic graph, or certify a complete family.
 use super::{Builder, structural_index::StoredStructure};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::HashSet;
 
 fn charge(steps: &mut usize, amount: usize) -> Option<()> {
@@ -20,13 +21,38 @@ pub(super) fn member(
     membership: usize,
     steps: &mut usize,
 ) -> Option<usize> {
+    // The answer is a function of the rows `raw` was scanned from, which
+    // are the current ones: made once per (owner, membership) and kept with
+    // the steps it charged, which a later read charges again.
+    if raw.ids_unique && raw.is_current(b) {
+        if let Some((answer, charged)) = raw.member_answer(owner, membership) {
+            charge(steps, charged)?;
+            return answer;
+        }
+        let before = *steps;
+        let answer = member_uncached(b, raw, owner, membership, steps);
+        if *steps <= crate::eval::MAX_STEPS {
+            raw.keep_member_answer(owner, membership, answer, *steps - before);
+        }
+        return answer;
+    }
+    member_uncached(b, raw, owner, membership, steps)
+}
+
+fn member_uncached(
+    b: &Builder,
+    raw: &StoredStructure,
+    owner: usize,
+    membership: usize,
+    steps: &mut usize,
+) -> Option<usize> {
     charge(steps, 1)?;
     if !raw.ids_unique || !raw.is_current(b) {
         return None;
     }
     let owner_id = b.elements.get(owner)?.id;
     let relation = b.elements.get(membership)?;
-    if !conforms(relation.ty, "Membership")
+    if !is_a!(relation, "Membership")
         || super::semantic_ownership::checked_relationship_carrier(b, raw, membership, steps)?
             != Some(owner)
     {
@@ -46,7 +72,7 @@ pub(super) fn member(
             return None;
         }
     }
-    let owned = conforms(relation.ty, "OwningMembership");
+    let owned = is_a!(relation, "OwningMembership");
     let member = if owned {
         if relation.children.len() != 1 {
             return None;
@@ -78,7 +104,7 @@ pub(super) fn member(
     }
     // Check the actual metaclass narrowings; unrelated optional properties are
     // not assumed to be aliases of a membership that does not declare them.
-    if conforms(relation.ty, "ParameterMembership")
+    if is_a!(relation, "ParameterMembership")
         && relation
             .props
             .get("ownedMemberParameter")
@@ -115,11 +141,11 @@ pub(super) fn member(
             ("owningMembership", true),
             (
                 "owningFeatureMembership",
-                conforms(relation.ty, "FeatureMembership"),
+                is_a!(relation, "FeatureMembership"),
             ),
             (
                 "owningParameterMembership",
-                conforms(relation.ty, "ParameterMembership"),
+                is_a!(relation, "ParameterMembership"),
             ),
         ] {
             if applicable
@@ -167,7 +193,7 @@ pub(super) fn valuation(
             return None;
         }
         let relation = b.elements.get(relationship)?;
-        if !conforms(relation.ty, "FeatureValue") {
+        if !is_a!(relation, "FeatureValue") {
             continue;
         }
         if value.is_some() {
@@ -204,12 +230,12 @@ pub(super) fn parameter_direction<'a>(
 ) -> Option<Option<&'a str>> {
     charge(steps, 1)?;
     let element = b.elements.get(feature)?;
-    if !conforms(element.ty, "Feature") {
+    if !is_a!(element, "Feature") {
         return None;
     }
     let membership = element.owning_relationship?;
     let relation = b.elements.get(membership)?;
-    if !conforms(relation.ty, "FeatureMembership") {
+    if !is_a!(relation, "FeatureMembership") {
         return None;
     }
     let owner =
@@ -218,7 +244,7 @@ pub(super) fn parameter_direction<'a>(
         return None;
     }
     if let Some(value) = element.props.get("direction") {
-        if value.is_null() && !conforms(relation.ty, "ParameterMembership") {
+        if value.is_null() && !is_a!(relation, "ParameterMembership") {
             return Some(None);
         }
         return match value.as_str() {
@@ -246,7 +272,7 @@ pub(super) fn first_unowned_member(
     steps: &mut usize,
 ) -> Option<usize> {
     charge(steps, 1)?;
-    if !raw.ids_unique || !raw.is_current(b) || owner >= b.explicit_len() {
+    if !raw.ids_unique || !raw.is_current(b) || !b.is_authored(owner) {
         return None;
     }
     let relationships = &b.elements.get(owner)?.owned_relationships;
@@ -255,23 +281,21 @@ pub(super) fn first_unowned_member(
     let mut first = None;
     for &relationship in relationships {
         let relation = b.elements.get(relationship)?;
-        if relationship >= b.explicit_len()
-            || !conforms(relation.ty, "Relationship")
+        if !b.is_authored(relationship)
+            || !is_a!(relation, "Relationship")
             || !seen.insert(relationship)
             || raw.carrier(b, relationship)? != Some(owner)
-            || reject_owned_kind.is_some_and(|kind| conforms(relation.ty, kind))
+            || reject_owned_kind.is_some_and(|kind| relation.conforms(kind))
         {
             return None;
         }
-        if first.is_none()
-            && conforms(relation.ty, "Membership")
-            && !conforms(relation.ty, excluded_kind)
+        if first.is_none() && is_a!(relation, "Membership") && !conforms(relation.ty, excluded_kind)
         {
             first = Some(relationship);
         }
     }
     let relation = b.elements.get(first?)?;
-    if conforms(relation.ty, "OwningMembership")
+    if is_a!(relation, "OwningMembership")
         || !relation.children.is_empty()
         || !relation.owned_relationships.is_empty()
         || relation.owning_relationship.is_some()
@@ -458,8 +482,8 @@ mod tests {
             .iter()
             .copied()
             .find(|&rel| {
-                conforms(r.b.elements[rel].ty, "Membership")
-                    && !conforms(r.b.elements[rel].ty, "FeatureMembership")
+                is_a!(r.b.elements[rel], "Membership")
+                    && !is_a!(r.b.elements[rel], "FeatureMembership")
             })
             .unwrap();
         let mut later = r.b.elements[first].clone();
@@ -495,8 +519,8 @@ mod tests {
                 .iter()
                 .copied()
                 .find(|&rel| {
-                    conforms(r.b.elements[rel].ty, "Membership")
-                        && !conforms(r.b.elements[rel].ty, "FeatureMembership")
+                    is_a!(r.b.elements[rel], "Membership")
+                        && !is_a!(r.b.elements[rel], "FeatureMembership")
                 })
                 .unwrap();
             let wrong = r.b.elements[package].id;

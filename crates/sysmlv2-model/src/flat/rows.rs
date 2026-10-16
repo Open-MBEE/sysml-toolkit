@@ -116,9 +116,26 @@ impl<T: Serialize> Serialize for Rows<T> {
         Slices(self.iter().collect()).serialize(s)
     }
 }
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Rows<T> {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let (lengths, values): (Vec<usize>, Vec<T>) = Deserialize::deserialize(d)?;
+
+/// [`Rows<usize>`] as two bulk columns ([`crate::bulk::Ints`]): the
+/// lengths and the values.
+pub(crate) mod index_rows {
+    use super::*;
+    use crate::bulk::Ints;
+    pub fn serialize<S: Serializer>(rows: &Rows<usize>, s: S) -> Result<S::Ok, S::Error> {
+        let lengths = Ints(rows.iter().map(<[_]>::len).collect());
+        let values = Ints(rows.iter().flat_map(|r| r.iter().copied()).collect());
+        (lengths, values).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Rows<usize>, D::Error> {
+        let (Ints(lengths), Ints(values)): (Ints, Ints) = Deserialize::deserialize(d)?;
+        Rows::from_lengths(lengths, values)
+    }
+}
+impl<T> Rows<T> {
+    /// Rows cut from `values` by their `lengths`, which must cover the
+    /// values exactly.
+    fn from_lengths<E: serde::de::Error>(lengths: Vec<usize>, values: Vec<T>) -> Result<Self, E> {
         let mut offsets = Vec::with_capacity(lengths.len() + 1);
         offsets.push(0usize);
         for length in lengths {
@@ -126,20 +143,26 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Rows<T> {
                 .last()
                 .unwrap()
                 .checked_add(length)
-                .ok_or_else(|| serde::de::Error::custom("adjacency row length overflow"))?;
+                .ok_or_else(|| E::custom("adjacency row length overflow"))?;
             if end > values.len() {
-                return Err(serde::de::Error::custom("adjacency row outside values"));
+                return Err(E::custom("adjacency row outside values"));
             }
             offsets.push(end);
         }
         if offsets.last() != Some(&values.len()) {
-            return Err(serde::de::Error::custom("unused adjacency values"));
+            return Err(E::custom("unused adjacency values"));
         }
         Ok(Self {
             base: Arc::new(Table { offsets, values }),
             edits: Vec::new(),
             tail: Vec::new(),
         })
+    }
+}
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Rows<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let (lengths, values): (Vec<usize>, Vec<T>) = Deserialize::deserialize(d)?;
+        Self::from_lengths(lengths, values)
     }
 }
 #[cfg(test)]

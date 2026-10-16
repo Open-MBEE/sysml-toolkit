@@ -39,7 +39,8 @@
 
 use crate::cbor::{Head, Reader, Writer};
 use crate::decode::{Tables, gate_flags, read_element_body, read_units, read_uuid_table};
-use crate::encode::{Interner, elems_of, table_set, write_element};
+use crate::encode::{Interner, RawIds, elem_of, elems_of, id_references, table_set, write_element};
+use crate::stream::canonical_uuid;
 use crate::{Error, ErrorKind};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -203,6 +204,9 @@ fn views(arr: &[Value]) -> Vec<&Value> {
     arr.iter().collect()
 }
 
+/// The two ownership lists the canonical order walks, by slot.
+const OWNERSHIP_LISTS: [&str; 2] = ["ownedRelationship", "ownedRelatedElement"];
+
 /// The delta-canonical order as a permutation of the payload's own
 /// positions — the shape [`delta_canonical`] materializes.
 fn canonical_order(arr: &[Value]) -> Result<Vec<usize>, Error> {
@@ -215,25 +219,34 @@ fn canonical_order(arr: &[Value]) -> Result<Vec<usize>, Error> {
             .ok_or_else(|| Error::new(format!("element {i} has a string @id")))?;
         index.insert(id, i);
     }
-    let mut owned = vec![false; n];
-    for e in arr {
-        for k in ["ownedRelationship", "ownedRelatedElement"] {
-            for t in targets(&index, e, k) {
-                owned[t] = true;
+    Ok(ownership_preorder(n, |i, slot| {
+        targets(&index, &arr[i], OWNERSHIP_LISTS[slot])
+    }))
+}
+
+/// The delta-canonical order over `n` elements, where `owned(i, slot)`
+/// lists the positions element `i`'s ownership list
+/// [`OWNERSHIP_LISTS`]`[slot]` names.
+fn ownership_preorder(n: usize, owned: impl Fn(usize, usize) -> Vec<usize>) -> Vec<usize> {
+    let mut is_owned = vec![false; n];
+    for i in 0..n {
+        for slot in 0..OWNERSHIP_LISTS.len() {
+            for t in owned(i, slot) {
+                is_owned[t] = true;
             }
         }
     }
     let mut order: Vec<usize> = Vec::with_capacity(n);
     let mut visited = vec![false; n];
-    let mut stack: Vec<usize> = (0..n).rev().filter(|&i| !owned[i]).collect();
+    let mut stack: Vec<usize> = (0..n).rev().filter(|&i| !is_owned[i]).collect();
     while let Some(i) = stack.pop() {
         if visited[i] {
             continue;
         }
         visited[i] = true;
         order.push(i);
-        let kids = targets(&index, &arr[i], "ownedRelatedElement");
-        let rels = targets(&index, &arr[i], "ownedRelationship");
+        let kids = owned(i, 1);
+        let rels = owned(i, 0);
         // Preorder: kids before the relationship's own relationships;
         // reversed pushes pop in declaration order.
         for &c in rels.iter().rev().chain(kids.iter().rev()) {
@@ -247,7 +260,7 @@ fn canonical_order(arr: &[Value]) -> Result<Vec<usize>, Error> {
             order.push(i);
         }
     }
-    Ok(order)
+    order
 }
 
 /// Content digest of a model state: `uuid5` over the canonical compact
@@ -256,6 +269,97 @@ fn canonical_order(arr: &[Value]) -> Result<Vec<usize>, Error> {
 /// the empty model (the API's "first commit" base).
 pub fn state_digest(compact: &Value) -> Result<Uuid, Error> {
     digest_of_canonical(&canonical_views(compact)?)
+}
+
+/// [`state_digest`] of the `n`-element compact array whose element `i`
+/// `element(i)` makes, without the array: each element is made once, in
+/// array order, read for its id, ownership lists and references, written
+/// as its record with its references to element identities spelled out,
+/// and dropped, so the digest holds one element's tree where
+/// [`state_digest`] takes the whole array's. The records are then put in
+/// canonical order with those references respelled as wire indices.
+///
+/// The canonical order matches ownership targets to ids as text, and this
+/// digest compares them as UUIDs, so it takes element ids only in their
+/// canonical spelling (lowercase, hyphenated — the toolkit's emitters'
+/// spelling) and refuses an array with any other, which [`state_digest`]
+/// digests.
+pub fn state_digest_streamed(
+    n: usize,
+    mut element: impl FnMut(usize) -> Value,
+) -> Result<Uuid, Error> {
+    let mut ids = Vec::with_capacity(n);
+    // Each element's ownership targets, flat, and where its lists end.
+    let mut targets = Vec::new();
+    let mut ends: Vec<[usize; 2]> = Vec::with_capacity(n);
+    let mut referenced = HashSet::new();
+    let mut records = Writer::default();
+    let mut starts = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        let value = element(i);
+        let id = value
+            .get("@id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new(format!("element {i} has a string @id")))?;
+        ids.push(canonical_uuid(id).ok_or_else(|| {
+            Error::new(format!(
+                "element {i}'s @id `{id}` is a UUID in its canonical spelling"
+            ))
+        })?);
+        let mut end = [0; 2];
+        for (slot, key) in OWNERSHIP_LISTS.into_iter().enumerate() {
+            if let Some(Value::Array(a)) = value.get(key) {
+                // A target spelled otherwise than canonically names no
+                // element, as no canonically spelled id equals it.
+                targets.extend(
+                    a.iter()
+                        .filter_map(|t| t.get("@id").and_then(Value::as_str))
+                        .filter_map(canonical_uuid),
+                );
+            }
+            end[slot] = targets.len();
+        }
+        ends.push(end);
+        let e = elem_of(&value, table_set(false))?;
+        id_references(&e, |u| {
+            referenced.insert(u);
+        })?;
+        starts.push(records.len());
+        write_element(&mut records, &RawIds, &e, None)?;
+    }
+    starts.push(records.len());
+    let mut index = HashMap::with_capacity(n);
+    for (i, &id) in ids.iter().enumerate() {
+        if index.insert(id, i).is_some() {
+            return Err(Error::new(format!("duplicate element @id `{id}`")));
+        }
+    }
+    let order = ownership_preorder(n, |i, slot| {
+        let start = match (slot, i) {
+            (0, 0) => 0,
+            (0, _) => ends[i - 1][1],
+            _ => ends[i][0],
+        };
+        targets[start..ends[i][slot]]
+            .iter()
+            .filter_map(|u| index.get(u).copied())
+            .collect()
+    });
+    let mut ext: Vec<Uuid> = referenced
+        .into_iter()
+        .filter(|u| !index.contains_key(u))
+        .collect();
+    ext.sort_unstable();
+    drop((index, targets, ends));
+    let ordered: Vec<Uuid> = order.iter().map(|&i| ids[i]).collect();
+    drop(ids);
+    let records = records.into_bytes();
+    Ok(Uuid::new_v5(
+        &delta_ns(),
+        &crate::encode::to_compact_cbor_canonical_of_records(&ordered, ext, |k| {
+            &records[starts[order[k]]..starts[order[k] + 1]]
+        })?,
+    ))
 }
 
 fn digest_of_canonical(canon: &[&Value]) -> Result<Uuid, Error> {

@@ -68,6 +68,11 @@
           "type": "string",
           "default": "sysmlv2",
           "description": "Path to the sysmlv2 binary (the server runs as `sysmlv2 lsp`)."
+        },
+        "sysmlv2.numberFormat": {
+          "type": "string",
+          "default": "exact",
+          "markdownDescription": "How value hints, hover values and range hints write a rational without a terminating decimal expansion: `exact` (`1/15`), `approx` (`≈0.06666666666666667`), `overline` (`0.06̅`), `parens` (`0.0(6)`) or `unicode` (`¹/₁₅`), then optional settings after commas, e.g. `overline,period=3` or `unicode,mixed=false` (see `sysmlv2 lsp --help`). Applies when the server starts; a spec the server cannot read shows a warning and keeps `exact`."
         }
       }
     }

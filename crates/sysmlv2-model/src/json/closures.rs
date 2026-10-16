@@ -23,7 +23,7 @@
 //! [`ResolvedModel::inheritance_incomplete`].
 
 use super::{ElementRef, InheritedBindings, LookupAccess, ResolvedModel};
-use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::HashSet;
 
 /// How the inheritance-aware families are answered.
@@ -118,7 +118,7 @@ impl ResolvedModel {
     pub(super) fn d_inherited_features(&mut self, e: ElementRef) -> Vec<ElementRef> {
         self.d_inherited_memberships(e)
             .into_iter()
-            .filter(|&m| conforms(self.b.elements[m.0].ty, "FeatureMembership"))
+            .filter(|&m| is_a!(self.b.elements[m.0], "FeatureMembership"))
             .filter_map(|m| self.d_owned_member_element(m))
             .collect()
     }
@@ -183,7 +183,7 @@ impl ResolvedModel {
         if self.closure_policy != ClosurePolicy::Passthrough {
             let inherited = self.d_inherited_memberships(e);
             for m in inherited {
-                if conforms(self.b.elements[m.0].ty, "FeatureMembership") && !out.contains(&m) {
+                if is_a!(self.b.elements[m.0], "FeatureMembership") && !out.contains(&m) {
                     out.push(m);
                 }
             }

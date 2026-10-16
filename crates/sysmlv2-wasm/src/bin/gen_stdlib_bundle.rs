@@ -13,7 +13,8 @@
 //! - `sysml-library.prepared.gz` — `PreparedLibrary::to_bytes`, gzip: the
 //!   library resolved and frozen, keyed by the bundle's content, for the
 //!   binding's `PreparedLibrary.fromSnapshot(prepared, bundle, libcache)`,
-//!   which decodes it instead of resolving at boot.
+//!   which decodes it instead of resolving at boot. It carries the
+//!   language server's library symbol table too.
 //! - `manifest.json` — toolkit version, unit count, raw/compressed sizes.
 //!
 //! Browsers decompress with `DecompressionStream("gzip")`, node with
@@ -141,6 +142,10 @@ fn main() {
             .expect("the recording just made decodes");
         model.set_library_cache(cache);
         let library = model.prepare_library().expect("the library prepares");
+        library.make_plans();
+        // The language server's library symbol table is walked here, once,
+        // and ships in the snapshot: no server parses the units for it.
+        sysmlv2_lsp::ship_library_table(&library).expect("the library's symbols encode");
         let key = sysmlv2_model::libcache::hash_units(
             units
                 .iter()

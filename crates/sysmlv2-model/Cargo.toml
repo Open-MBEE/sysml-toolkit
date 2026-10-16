@@ -12,7 +12,7 @@ repository.workspace = true
 include = ["src/**", "build.rs", "Cargo.toml"]
 
 [dependencies]
-sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.10.2", features = ["serde"] }
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.10.10", features = ["serde"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 uuid = { workspace = true, features = ["serde"] }
@@ -21,3 +21,8 @@ num-bigint.workspace = true
 num-integer.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
+
+# A snapshot file is mapped where the target maps files; a wasm target
+# reads it whole. (Target blocks stay after the plain dependencies.)
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2.workspace = true

@@ -4,6 +4,7 @@
 //! definition is also a predicate, and an interface definition is also an
 //! association structure. This is separate from user-model specialization.
 
+use crate::metaclass::is_a;
 use crate::{
     json::{ElementRef, ResolvedModel},
     metaclass,
@@ -111,7 +112,7 @@ fn typing_groups(r: &ResolvedModel, model: Option<&Model>) -> Vec<TypingGroup> {
         if ty == "AttributeUsage"
             && targets
                 .iter()
-                .any(|(t, _)| metaclass::conforms(r.b.elements[*t].ty, "EnumerationDefinition"))
+                .any(|(t, _)| is_a!(r.b.elements[*t], "EnumerationDefinition"))
         {
             single = true;
         }

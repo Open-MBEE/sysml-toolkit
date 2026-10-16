@@ -4,9 +4,11 @@
 //! certifies only ownership of nodes produced by the materializer; it does not
 //! certify that every normative implied family has been implemented.
 use super::Builder;
+use crate::metaclass::is_a;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct GeneratedNode {
     /// Relationships have a carrier; ordinary elements use their row backlink.
     relationship_owner: Option<usize>,
@@ -19,19 +21,28 @@ struct GeneratedNode {
 
 /// Immutable after publication on Builder. There is one ownership view, shared
 /// by derived reads, interchange emission and structural proof adapters.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct SemanticOwnership {
     from: usize,
     nodes: Vec<GeneratedNode>,
     /// Relationships added to an unchanged source row. Relationships physically
     /// owned by generated rows are NOT added here a second time.
+    #[serde(serialize_with = "crate::prepared::sorted_map")]
     additions: HashMap<usize, Vec<usize>>,
     /// Positive owned-result projections only. Absence is unsupported/unknown,
     /// never proof that a normative result is absent or a family is complete.
+    #[serde(serialize_with = "crate::prepared::sorted_map")]
     results: HashMap<usize, OwnedResult>,
+    /// The prepared library's own view, over its materialized rows below
+    /// `from` (`Builder::lib_implied_from..lib_boundary`): a lookup of a row
+    /// below `from` reads it, and an owner's relationships list the rows it
+    /// added before this view's. A prefix view has none, and a snapshot
+    /// carries the prefix view alone.
+    #[serde(skip)]
+    prefix: Option<Arc<SemanticOwnership>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(super) struct OwnedResult {
     pub(super) membership: usize,
     pub(super) feature: usize,
@@ -41,14 +52,24 @@ pub(super) struct OwnedResult {
 /// allocating an output. Merely obtaining a row never clones its contents.
 pub(super) struct Relationships<'a> {
     stored: &'a [usize],
+    /// The rows the prepared library's view added to the owner, before any
+    /// this build's did.
+    prefix_additions: &'a [usize],
     additions: &'a [usize],
 }
 impl Relationships<'_> {
     pub(super) fn len(&self) -> usize {
-        self.stored.len().saturating_add(self.additions.len())
+        self.stored
+            .len()
+            .saturating_add(self.prefix_additions.len())
+            .saturating_add(self.additions.len())
     }
     pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.stored.iter().chain(self.additions).copied()
+        self.stored
+            .iter()
+            .chain(self.prefix_additions)
+            .chain(self.additions)
+            .copied()
     }
 }
 
@@ -58,6 +79,11 @@ pub(super) fn owned_relationships(b: &Builder, owner: usize) -> Option<Relations
     match (&b.semantic_ownership, b.implied_from) {
         (None, None) => Some(Relationships {
             stored: &b.elements.get(owner)?.owned_relationships,
+            prefix_additions: b
+                .prefix_ownership
+                .as_ref()
+                .filter(|_| !b.planning())
+                .map_or(&[], |prefix| prefix.additions(owner)),
             additions: &[],
         }),
         (Some(view), Some(_)) if view.matches_suffix(b) => view.relationships(b, owner),
@@ -85,6 +111,13 @@ pub(super) fn checked_relationship_carrier(
             view.effective_carrier(b, raw, relationship, steps)
         }
         (None, None) => {
+            if let Some(prefix) = b
+                .prefix_ownership
+                .as_ref()
+                .filter(|prefix| prefix.contains(relationship))
+            {
+                return prefix.effective_carrier(b, raw, relationship, steps);
+            }
             *steps = steps.saturating_add(1);
             if *steps > crate::eval::MAX_STEPS {
                 return None;
@@ -105,7 +138,7 @@ pub(super) fn checked_relationship_carrier(
 pub(super) fn owned_feature_projection_complete(b: &Builder, owner: usize) -> bool {
     b.elements
         .get(owner)
-        .is_some_and(|e| !crate::metaclass::conforms(e.ty, "FeatureReferenceExpression"))
+        .is_some_and(|e| !is_a!(e, "FeatureReferenceExpression"))
 }
 
 impl SemanticOwnership {
@@ -128,12 +161,15 @@ impl SemanticOwnership {
         Some(self.clone())
     }
 
-    pub(super) fn new(from: usize) -> Self {
+    /// A view over the rows appended from `from`, layered over the prepared
+    /// library's `prefix` view when the build has one.
+    pub(super) fn new(from: usize, prefix: Option<Arc<SemanticOwnership>>) -> Self {
         Self {
             from,
             nodes: Vec::new(),
             additions: HashMap::new(),
             results: HashMap::new(),
+            prefix,
         }
     }
 
@@ -226,7 +262,10 @@ impl SemanticOwnership {
     }
 
     pub(super) fn result(&self, expression: usize) -> Option<OwnedResult> {
-        self.results.get(&expression).copied()
+        self.results
+            .get(&expression)
+            .copied()
+            .or_else(|| self.prefix.as_ref()?.result(expression))
     }
 
     pub(super) fn relationships<'a>(
@@ -236,6 +275,11 @@ impl SemanticOwnership {
     ) -> Option<Relationships<'a>> {
         Some(Relationships {
             stored: &b.elements.get(owner)?.owned_relationships,
+            prefix_additions: self
+                .prefix
+                .as_ref()
+                .filter(|_| !b.planning())
+                .map_or(&[], |prefix| prefix.additions(owner)),
             additions: self.additions(owner),
         })
     }
@@ -247,6 +291,9 @@ impl SemanticOwnership {
     /// Does not confuse a generated Feature with a Relationship. Proof adapters
     /// can distinguish a trusted generated carrier from malformed raw ownership.
     pub(super) fn generated_relationship_owner(&self, element: usize) -> Option<usize> {
+        if element < self.from {
+            return self.prefix.as_ref()?.generated_relationship_owner(element);
+        }
         self.nodes
             .get(element.checked_sub(self.from)?)?
             .relationship_owner
@@ -268,6 +315,16 @@ impl SemanticOwnership {
         }
         if !raw.ids_unique {
             return None;
+        }
+        if relationship < self.from {
+            return match self
+                .prefix
+                .as_ref()
+                .filter(|prefix| prefix.contains(relationship))
+            {
+                Some(prefix) => prefix.effective_carrier(b, raw, relationship, steps),
+                None => raw.carrier(b, relationship),
+            };
         }
         let Some(owner) = self.generated_relationship_owner(relationship) else {
             return raw.carrier(b, relationship);
@@ -307,13 +364,35 @@ impl SemanticOwnership {
     }
 
     pub(super) fn relationship_owners(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        self.nodes.iter().enumerate().filter_map(|(offset, node)| {
-            node.relationship_owner
-                .map(|owner| (self.from + offset, owner))
-        })
+        self.prefix
+            .iter()
+            .flat_map(|prefix| prefix.prefix_relationship_owners())
+            .chain(self.nodes.iter().enumerate().filter_map(|(offset, node)| {
+                node.relationship_owner
+                    .map(|owner| (self.from + offset, owner))
+            }))
+    }
+
+    /// [`Self::relationship_owners`] of this view's own rows, as a prefix
+    /// view lists them (a prefix view has no prefix of its own).
+    fn prefix_relationship_owners(&self) -> Vec<(usize, usize)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, node)| {
+                node.relationship_owner
+                    .map(|owner| (self.from + offset, owner))
+            })
+            .collect()
     }
 
     pub(super) fn source_anchor(&self, element: usize) -> usize {
+        if element < self.from {
+            return self
+                .prefix
+                .as_ref()
+                .map_or(element, |prefix| prefix.source_anchor(element));
+        }
         element
             .checked_sub(self.from)
             .and_then(|offset| self.nodes.get(offset))
@@ -321,6 +400,12 @@ impl SemanticOwnership {
     }
 
     pub(super) fn contains(&self, element: usize) -> bool {
+        if element < self.from {
+            return self
+                .prefix
+                .as_ref()
+                .is_some_and(|prefix| prefix.contains(element));
+        }
         element
             .checked_sub(self.from)
             .is_some_and(|offset| offset < self.nodes.len())
@@ -333,7 +418,7 @@ mod tests {
 
     #[test]
     fn generated_nodes_have_distinct_carrier_and_source_roles() {
-        let mut view = SemanticOwnership::new(10);
+        let mut view = SemanticOwnership::new(10, None);
         assert_eq!(view.register(10, Some(2), 2, true), Some(()));
         assert_eq!(view.register(11, None, 2, false), Some(()));
         assert_eq!(view.register(12, Some(11), 2, false), Some(()));
@@ -352,7 +437,7 @@ mod tests {
 
     #[test]
     fn malformed_registration_is_atomic() {
-        let mut view = SemanticOwnership::new(10);
+        let mut view = SemanticOwnership::new(10, None);
         assert_eq!(view.register(11, Some(2), 2, true), None);
         assert_eq!(view.register(10, Some(10), 2, true), None);
         assert_eq!(view.register(10, None, 2, true), None);

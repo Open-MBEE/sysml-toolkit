@@ -1,6 +1,7 @@
 //! Read-side provenance for explicit redefinition headers.
 use super::provider_completeness::ProviderCompleteness;
 use super::{LookupAccess, LookupResult, RefSite, ResolvedModel, recorded_lookup};
+use crate::metaclass::is_a;
 use std::collections::HashMap;
 
 impl ResolvedModel {
@@ -107,7 +108,7 @@ impl ResolvedModel {
             for base in bases {
                 let hit = b.resolve_result(base, &qn, 0, false);
                 if let LookupResult::Found(target, _, _) = hit {
-                    if !crate::metaclass::conforms(b.elements[target].ty, "Feature") {
+                    if !is_a!(b.elements[target], "Feature") {
                         continue;
                     }
                     // If the model no longer reproduces the stored endpoint,

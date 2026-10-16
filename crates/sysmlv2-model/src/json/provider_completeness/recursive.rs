@@ -1,7 +1,7 @@
 //! Recursive lookup certificates for literal named package trees.
 use super::{Builder, ProviderCompleteness};
 use crate::json::{Binding, LookupAccess, structural_index::StoredStructure};
-use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::{collections::HashMap, sync::Arc};
 
 mod qualified;
@@ -109,12 +109,12 @@ impl ProviderCompleteness {
         charge(steps, b.elements[owner].owned_relationships.len())?;
         for &relationship in &b.elements[owner].owned_relationships {
             if !literal_package
-                && conforms(b.elements[relationship].ty, "Membership")
-                && !conforms(b.elements[relationship].ty, "OwningMembership")
+                && is_a!(b.elements[relationship], "Membership")
+                && !is_a!(b.elements[relationship], "OwningMembership")
             {
                 return None;
             }
-            if !conforms(b.elements[relationship].ty, "Import") {
+            if !is_a!(b.elements[relationship], "Import") {
                 continue;
             }
             let target = crate::json::import_memberships::checked_import_target(
@@ -343,8 +343,7 @@ impl ProviderCompleteness {
         .ok()?;
         charge(steps, b.elements[owner].owned_relationships.len())?;
         if b.elements[owner].owned_relationships.iter().any(|&r| {
-            conforms(b.elements[r].ty, "Specialization")
-                || b.elements[r].ty == "ElementFilterMembership"
+            is_a!(b.elements[r], "Specialization") || b.elements[r].ty == "ElementFilterMembership"
         }) {
             return None;
         }
@@ -353,7 +352,7 @@ impl ProviderCompleteness {
         let mut children = Vec::new();
         for m in members {
             charge(steps, 1)?;
-            if !conforms(b.elements[m.relationship].ty, "OwningMembership") {
+            if !is_a!(b.elements[m.relationship], "OwningMembership") {
                 if b.elements[m.relationship].ty != "Membership" {
                     return None;
                 }
@@ -372,7 +371,7 @@ impl ProviderCompleteness {
             }
             let element = &b.elements[m.member];
             let sub_scope = b.elem_scope.get(&m.member).copied();
-            let namespace = conforms(element.ty, "Namespace");
+            let namespace = is_a!(element, "Namespace");
             if namespace {
                 if !matches!(element.ty, "Namespace" | "Package" | "LibraryPackage") {
                     return None;
@@ -476,7 +475,7 @@ impl ProviderCompleteness {
                 )
                 .ok()?
                 {
-                    if !conforms(b.elements[m.relationship].ty, "OwningMembership") {
+                    if !is_a!(b.elements[m.relationship], "OwningMembership") {
                         continue;
                     }
                     for key in ["declaredName", "declaredShortName"] {
@@ -493,7 +492,7 @@ impl ProviderCompleteness {
             self.recursive.roots = Some((Arc::clone(raw), names));
         }
         charge(steps, name.len())?;
-        if conforms(b.elements[member].ty, "Namespace") && b.elem_scope.get(&member).is_none() {
+        if is_a!(b.elements[member], "Namespace") && b.elem_scope.get(&member).is_none() {
             return None;
         }
         let expected = self.recursive.roots.as_ref()?.1.get(name)?;

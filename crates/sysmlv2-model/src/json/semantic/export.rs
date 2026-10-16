@@ -5,6 +5,7 @@ use super::{
     CheckedRow, ElementRef, PropertyError, PropertyIssue, ResolvedModel, SemanticExportError,
 };
 use crate::json::{publication, semantic_ownership, structural_index::StoredStructure};
+use crate::metaclass::is_a;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -126,7 +127,7 @@ impl Snapshot {
                         )
                     })?;
                 charge(&mut steps, owner.1.children.len(), row.id)?;
-                if !crate::metaclass::conforms(owner.1.ty, "Relationship")
+                if !is_a!(owner.1, "Relationship")
                     || owner
                         .1
                         .children

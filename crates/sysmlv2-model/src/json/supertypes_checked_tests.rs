@@ -1,4 +1,5 @@
 use super::*;
+use crate::metaclass::is_a;
 use crate::{json::ResolvedModel, model::Model};
 fn fixture(source: &str) -> ResolvedModel {
     let mut model = Model::new();
@@ -38,7 +39,7 @@ fn explicit_supertypes_exclude_implied_and_validate_the_complete_owned_projectio
         .owned_relationships
         .iter()
         .copied()
-        .filter(|&e| conforms(r.b.elements[e].ty, "Specialization"))
+        .filter(|&e| is_a!(r.b.elements[e], "Specialization"))
         .collect();
     r.b.set(relations[1], "isImplied", serde_json::json!(true));
     assert_eq!(
@@ -112,9 +113,7 @@ fn conjugation_and_feature_target_are_not_filtered_as_implied_specializations() 
     let chain = r.resolve_qualified("chainEnd").unwrap().0;
     let relations = r.b.elements[c].owned_relationships.to_vec();
     for &rel in &relations {
-        if conforms(r.b.elements[rel].ty, "Conjugation")
-            || conforms(r.b.elements[rel].ty, "FeatureChaining")
-        {
+        if is_a!(r.b.elements[rel], "Conjugation") || is_a!(r.b.elements[rel], "FeatureChaining") {
             r.b.elements[rel]
                 .props
                 .insert("isImplied", serde_json::json!(true));
@@ -126,7 +125,7 @@ fn conjugation_and_feature_target_are_not_filtered_as_implied_specializations() 
     );
     let last = *relations
         .iter()
-        .find(|&&rel| conforms(r.b.elements[rel].ty, "FeatureChaining"))
+        .find(|&&rel| is_a!(r.b.elements[rel], "FeatureChaining"))
         .unwrap();
     let wrong = r.b.elements[original].id;
     r.b.elements[last]
@@ -223,7 +222,7 @@ fn conjugated_supertypes_ignore_flag_but_preserve_complete_feature_append_and_li
         .owned_relationships
         .iter()
         .copied()
-        .find(|&rel| conforms(r.b.elements[rel].ty, "Conjugation"))
+        .find(|&rel| is_a!(r.b.elements[rel], "Conjugation"))
         .unwrap();
     r.b.elements[rel].props.insert(
         "originalType",

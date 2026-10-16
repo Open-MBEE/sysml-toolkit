@@ -5,10 +5,12 @@
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{DidOpenTextDocument, Exit, Initialized};
-use lsp_types::request::{CodeLensRequest, Completion, Initialize, InlayHintRequest, Shutdown};
+use lsp_types::request::{
+    CodeLensRequest, Completion, HoverRequest, Initialize, InlayHintRequest, Shutdown,
+};
 use lsp_types::{
     CodeLensParams, CompletionItemKind, CompletionParams, CompletionResponse,
-    DidOpenTextDocumentParams, InitializeParams, InlayHintLabel, InlayHintParams,
+    DidOpenTextDocumentParams, HoverParams, InitializeParams, InlayHintLabel, InlayHintParams,
     PartialResultParams, Position, Range, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Uri, WorkDoneProgressParams,
 };
@@ -31,8 +33,20 @@ impl Client {
     }
 
     fn start_with(init: InitializeParams) -> Client {
+        Self::start_on(init, None)
+    }
+
+    /// A server over the standard library (quantities, units).
+    fn start_with_library() -> Client {
+        Self::start_on(
+            InitializeParams::default(),
+            Some(sysmlv2_testkit::library_dir()),
+        )
+    }
+
+    fn start_on(init: InitializeParams, lib: Option<std::path::PathBuf>) -> Client {
         let (server_side, client_side) = Connection::memory();
-        let server = std::thread::spawn(move || sysmlv2_lsp::run(server_side));
+        let server = std::thread::spawn(move || sysmlv2_lsp::run_with_library(server_side, lib));
         let mut c = Client {
             conn: client_side,
             server: Some(server),
@@ -451,16 +465,144 @@ fn inlay_hints_show_non_terminating_rationals_as_approximate_decimals() {
         })
         .collect();
     assert!(labels.iter().any(|l| l == " = 0.3"), "{labels:?}");
-    assert!(
-        labels.iter().any(|l| l == " = ≈0.3333333333333333"),
-        "{labels:?}"
-    );
-    assert!(
-        labels.iter().any(|l| l == " = ≈0.3333333333333333 [mm]"),
-        "{labels:?}"
-    );
-    assert!(!labels.iter().any(|l| l.contains("1/3")), "{labels:?}");
+    assert!(labels.iter().any(|l| l == " = 1/3"), "{labels:?}");
+    assert!(labels.iter().any(|l| l == " = 1/3 [mm]"), "{labels:?}");
+    assert!(!labels.iter().any(|l| l.contains('≈')), "{labels:?}");
     client.shutdown();
+}
+
+/// `initializationOptions.numberFormat` re-spells non-terminating
+/// rationals in value hints, range hints and hover alike; a spec the
+/// toolkit cannot read leaves the exact default in place.
+#[test]
+fn number_format_option_respells_hints_and_hover() {
+    let text = "part def P {\n    attribute third = 2 / 6;\n    attribute mm;\n    \
+                attribute pitch = (1 / 3) [mm];\n    attribute tenth = 0.1 + 0.2;\n    \
+                attribute x;\n    assert constraint { 3 * x < 1 }\n}\n";
+    let hints = |client: &mut Client, u: &Uri| -> Vec<String> {
+        client
+            .request_ok::<InlayHintRequest>(InlayHintParams {
+                text_document: TextDocumentIdentifier { uri: u.clone() },
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 8,
+                        character: 0,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .unwrap()
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                other => panic!("unexpected label shape: {other:?}"),
+            })
+            .collect()
+    };
+    let hover = |client: &mut Client, u: &Uri| -> String {
+        let hover = client
+            .request_ok::<HoverRequest>(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: u.clone() },
+                    // On `third`.
+                    position: Position {
+                        line: 1,
+                        character: 15,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .expect("a hover on `third`");
+        let lsp_types::HoverContents::Markup(m) = hover.contents else {
+            panic!("markup hover")
+        };
+        m.value
+    };
+    let start = |spec: serde_json::Value| {
+        Client::start_with(InitializeParams {
+            initialization_options: Some(serde_json::json!({ "numberFormat": spec })),
+            ..InitializeParams::default()
+        })
+    };
+
+    for (spec, third, pitch, range) in [
+        ("parens", " = 0.(3)", " = 0.(3) [mm]", "0.(3)"),
+        ("unicode", " = ¹/₃", " = ¹/₃ [mm]", "¹/₃"),
+        ("exact", " = 1/3", " = 1/3 [mm]", "1/3"),
+        ("approx,digits=3", " = ≈0.333", " = ≈0.333 [mm]", "≈0.333"),
+    ] {
+        let mut client = start(serde_json::json!(spec));
+        let u = uri("nf.sysml");
+        client.open(&u, text);
+        let labels = hints(&mut client, &u);
+        assert!(labels.iter().any(|l| l == third), "{spec}: {labels:?}");
+        assert!(labels.iter().any(|l| l == pitch), "{spec}: {labels:?}");
+        // Terminating decimals stay exact in every style.
+        assert!(labels.iter().any(|l| l == " = 0.3"), "{spec}: {labels:?}");
+        assert!(
+            labels.iter().any(|l| l.contains('∈') && l.contains(range)),
+            "{spec}: range hint for `x`: {labels:?}"
+        );
+        let card = hover(&mut client, &u);
+        let value = third.trim_start_matches(" = ");
+        assert!(card.contains(&format!("= `{value}`")), "{spec}: {card}");
+        client.shutdown();
+    }
+
+    // A server started with a default (the command line's
+    // `lsp --number-format`) uses it; a client's option still wins.
+    let started = |spec: &str, init: Option<serde_json::Value>| {
+        let default = sysmlv2_parser::numfmt::NumberFormat::parse(spec).unwrap();
+        let (server_side, client_side) = Connection::memory();
+        let server = std::thread::spawn(move || {
+            sysmlv2_lsp::run_with_number_format(server_side, None, default)
+        });
+        let mut c = Client {
+            conn: client_side,
+            server: Some(server),
+            next_id: 0,
+        };
+        let _: lsp_types::InitializeResult = c.request_ok::<Initialize>(InitializeParams {
+            initialization_options: init,
+            ..InitializeParams::default()
+        });
+        c.notify::<Initialized>(lsp_types::InitializedParams {});
+        c
+    };
+    for (default, init, want) in [
+        ("unicode", None, " = ¹/₃"),
+        (
+            "unicode",
+            Some(serde_json::json!({"numberFormat": "parens"})),
+            " = 0.(3)",
+        ),
+        (
+            "unicode",
+            Some(serde_json::json!({"numberFormat": null})),
+            " = ¹/₃",
+        ),
+    ] {
+        let mut client = started(default, init.clone());
+        let u = uri("nf.sysml");
+        client.open(&u, text);
+        let labels = hints(&mut client, &u);
+        assert!(labels.iter().any(|l| l == want), "{init:?}: {labels:?}");
+        client.shutdown();
+    }
+
+    // Unreadable: ignored, the default stays.
+    for bad in [serde_json::json!("decimal"), serde_json::json!(3)] {
+        let mut client = start(bad.clone());
+        let u = uri("nf.sysml");
+        client.open(&u, text);
+        let labels = hints(&mut client, &u);
+        assert!(labels.iter().any(|l| l == " = 1/3"), "{bad}: {labels:?}");
+        client.shutdown();
+    }
 }
 
 #[test]
@@ -565,6 +707,53 @@ fn redundant_value_hints_hidden_by_default_and_by_option() {
             .iter()
             .any(|(line, l)| *line == 1 && l.contains("= -5")),
         "opt-out restores the verbatim hint: {labels:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn redundant_value_hints_ignore_spacing_and_name_quotes() {
+    // `m` and `a` restate their declared quantities up to spacing and
+    // a quoted unit name (` = 10 [kg]`, ` = 10 [m/s²]`); `g` computes.
+    let text = "package Q {\n    private import SI::*;\n    \
+                attribute m : ISQ::MassValue = 10[kg];\n    \
+                attribute a : ISQ::AccelerationValue = 10 ['m/s²'];\n    \
+                attribute g : ISQ::MassValue = 2 [kg] + 3[kg];\n}\n";
+    let mut client = Client::start_with_library();
+    let u = uri("spacing.sysml");
+    client.open(&u, text);
+    let hints: Option<Vec<lsp_types::InlayHint>> =
+        client.request_ok::<InlayHintRequest>(InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: u },
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 6,
+                    character: 0,
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        });
+    let labels: Vec<(u32, String)> = hints
+        .unwrap()
+        .iter()
+        .map(|h| match &h.label {
+            InlayHintLabel::String(s) => (h.position.line, s.clone()),
+            other => panic!("unexpected label shape: {other:?}"),
+        })
+        .collect();
+    assert!(
+        !labels.iter().any(|(line, _)| *line == 2 || *line == 3),
+        "respaced or quoted restatements stay unhinted: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(line, l)| *line == 4 && l.contains("= 5 [kg]")),
+        "computed value still hinted: {labels:?}"
     );
     client.shutdown();
 }

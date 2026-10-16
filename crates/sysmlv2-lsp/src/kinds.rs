@@ -21,7 +21,7 @@ use sysmlv2_parser::ast::{
 use sysmlv2_parser::span::Span;
 
 /// What a symbol's declaration is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Decl {
     /// A package or namespace.
     Namespace,

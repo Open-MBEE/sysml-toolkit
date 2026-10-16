@@ -1,6 +1,7 @@
 //! Bounded direction facts for stored feature identities.
 use super::{Builder, provider_completeness::ProviderCompleteness};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +34,7 @@ pub(crate) fn authored_direction(b: &Builder, feature: usize) -> DirectionFact {
     let Some(e) = b.elements.get(feature) else {
         return DirectionFact::Unknown;
     };
-    if !conforms(e.ty, "Feature") {
+    if !is_a!(e, "Feature") {
         return DirectionFact::Unknown;
     }
     match e.props.get("direction") {
@@ -100,24 +101,23 @@ impl DirectionProof {
         charge(steps, relationships.len())?;
         for rel in relationships {
             let relation = b.elements.get(rel)?;
-            if !conforms(relation.ty, "Specialization") {
+            if !is_a!(relation, "Specialization") {
                 continue;
             }
-            let expected = if conforms(relation.ty, "Subsetting") {
+            let expected = if is_a!(relation, "Subsetting") {
                 "Feature"
-            } else if conforms(relation.ty, "Subclassification") {
+            } else if is_a!(relation, "Subclassification") {
                 "Classifier"
             } else {
                 "Type"
             };
-            let source_kind =
-                if conforms(relation.ty, "Subsetting") || conforms(relation.ty, "FeatureTyping") {
-                    "Feature"
-                } else if conforms(relation.ty, "Subclassification") {
-                    "Classifier"
-                } else {
-                    "Type"
-                };
+            let source_kind = if is_a!(relation, "Subsetting") || is_a!(relation, "FeatureTyping") {
+                "Feature"
+            } else if is_a!(relation, "Subclassification") {
+                "Classifier"
+            } else {
+                "Type"
+            };
             if !conforms(b.elements[current].ty, source_kind) {
                 return None;
             }
@@ -190,19 +190,19 @@ impl DirectionProof {
             if is_chained(b, current, steps)?
                 || relations
                     .iter()
-                    .any(|&r| conforms(b.elements[r].ty, "FeatureChaining"))
+                    .any(|&r| is_a!(b.elements[r], "FeatureChaining"))
             {
                 return None;
             }
             let conjugated = relations
                 .iter()
-                .any(|&r| conforms(b.elements[r].ty, "Conjugation"));
+                .any(|&r| is_a!(b.elements[r], "Conjugation"));
             // The provider validates uniqueness/endpoints and gives conjugation
             // precedence. Invalid mixed declarations remain unsupported here.
             if conjugated
                 && relations
                     .iter()
-                    .any(|&r| conforms(b.elements[r].ty, "Specialization"))
+                    .any(|&r| is_a!(b.elements[r], "Specialization"))
             {
                 return None;
             }

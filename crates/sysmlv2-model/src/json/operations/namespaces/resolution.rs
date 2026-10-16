@@ -1,5 +1,6 @@
 //! Membership-valued resolution with explicit, checked multi-unit global scope.
 use super::*;
+use crate::metaclass::is_a;
 fn find(
     r: &mut ResolvedModel,
     values: Vec<Membership>,
@@ -75,7 +76,7 @@ fn parent(
         }
     }
     let result = if let Some(relationship) = row.owning_relationship {
-        if conforms(r.b.elements[relationship].ty, "OwningMembership") {
+        if is_a!(r.b.elements[relationship], "OwningMembership") {
             let parent =
                 semantic_ownership::checked_relationship_carrier(&r.b, raw, relationship, steps)
                     .flatten()
@@ -86,7 +87,7 @@ fn parent(
             Some(parent)
         } else {
             let relation = &r.b.elements[relationship];
-            if !conforms(relation.ty, "Import")
+            if !is_a!(relation, "Import")
                 || (relation.children.len() != 1 || relation.children.first() != Some(&owner))
                 || relation
                     .props
@@ -175,7 +176,7 @@ pub(super) fn invoke(
                     };
                     for name in names {
                         let Some(namespace) = selected else { break };
-                        if !conforms(r.b.elements[namespace.member].ty, "Namespace") {
+                        if !is_a!(r.b.elements[namespace.member], "Namespace") {
                             selected = None;
                             break;
                         }

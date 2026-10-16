@@ -2,6 +2,7 @@
 //! Unknown types stay unknown; no runtime value is invented to type-check an
 //! expression. The existing quantity library supplies the dimension algebra.
 
+use crate::metaclass::is_a;
 use crate::{
     eval::{self, Value},
     json::{ElementRef, ResolvedModel},
@@ -52,7 +53,7 @@ impl Inference<'_> {
             let dimension = if let Some(d) = self.types.get(&ty) {
                 d.clone()
             } else {
-                let d = if crate::metaclass::conforms(self.model.b.elements[ty].ty, "DataType") {
+                let d = if is_a!(self.model.b.elements[ty], "DataType") {
                     if let Some(d) = self.model.quantity_dims_of_type(ElementRef(ty)) {
                         Dimension::Known(d)
                     } else {

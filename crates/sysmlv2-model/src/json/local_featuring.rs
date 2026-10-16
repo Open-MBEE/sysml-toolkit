@@ -1,8 +1,8 @@
 //! Optional local featuring rows over already staged, certified result groups.
 //! Failure never mutates or rejects those groups or the dynamic Invocation tail.
 use super::{Builder, Elem, dynamic_invocations::Refusal, semantic_ownership::SemanticOwnership};
+use crate::layered::IdSet;
 use crate::properties::Properties;
-use std::collections::HashSet;
 use uuid::Uuid;
 
 #[derive(Clone, Copy)]
@@ -17,7 +17,7 @@ pub(super) struct Plan {
     rows: Vec<Elem>,
     replacements: Vec<(usize, Vec<usize>)>,
     roles: Vec<Role>,
-    sources: HashSet<usize>,
+    sources: IdSet<usize>,
 }
 fn charge(steps: &mut usize, n: usize) -> Result<(), Refusal> {
     *steps = steps.saturating_add(n);
@@ -64,7 +64,7 @@ fn valid_path(
     };
     if role.source < b.elements.len()
         || role.target >= role.source
-        || role.anchor >= b.explicit_len()
+        || !b.is_authored(role.anchor)
         || source.ty != "Feature"
         || source.props.get("isVariable").is_some()
             && source.props.get("isVariable").and_then(|v| v.as_bool()) != Some(false)
@@ -139,7 +139,7 @@ pub(super) fn prepare(
     if !raw.ids_unique {
         return Err(Refusal::Collision);
     }
-    let mut ids = HashSet::new();
+    let mut ids = IdSet::default();
     for row in rows {
         if raw.element_for_uuid(b, row.id).is_some() || !ids.insert(row.id) {
             return Err(Refusal::Collision);
@@ -151,7 +151,7 @@ pub(super) fn prepare(
         rows: Vec::new(),
         replacements: Vec::new(),
         roles: Vec::new(),
-        sources: HashSet::new(),
+        sources: IdSet::default(),
     };
     for &role in roles {
         let source = staged(b, rows, role.source).ok_or(Refusal::Stale)?;
@@ -217,6 +217,7 @@ pub(super) fn prepare(
         );
         plan.rows.push(Elem {
             ty: "TypeFeaturing",
+            meta: crate::metaclass::meta_of("TypeFeaturing"),
             id,
             path: String::new(),
             path_parent: None,
@@ -235,7 +236,7 @@ impl Plan {
         self,
         rows: &mut Vec<Elem>,
         ownership: &mut SemanticOwnership,
-    ) -> HashSet<usize> {
+    ) -> IdSet<usize> {
         assert_eq!(rows.len(), self.before);
         for (owner, relationships) in self.replacements {
             rows[owner].owned_relationships = relationships.into();
@@ -272,7 +273,7 @@ mod tests {
         let plans = super::super::owned_results::plan_reference_results(&mut r.b, &mut 0).unwrap();
         let mut rows = Vec::new();
         let mut roles = Vec::new();
-        let mut view = SemanticOwnership::new(r.b.elements.len());
+        let mut view = SemanticOwnership::new(r.b.elements.len(), None);
         for plan in plans {
             let start = r.b.elements.len() + rows.len();
             let staged = super::super::owned_results::stage_owned_result(

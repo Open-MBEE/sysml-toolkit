@@ -148,7 +148,7 @@ pub struct Model {
     /// Standard-library resolution cache state (see [`crate::libcache`]).
     /// Interior mutability: the builder consumes hints / deposits a
     /// recording through `&Model`.
-    lib_cache: std::cell::RefCell<LibCacheSlot>,
+    lib_cache: std::sync::Mutex<LibCacheSlot>,
     // Original unit ordinal + lowering path identify immutable input syntax
     // before graph-effective IDs are assigned. Empty entries still mark a
     // lifted payload unit, which must not acquire text-only defaults.
@@ -156,7 +156,7 @@ pub struct Model {
     /// The outcomes the next build starts from, and the outcomes a build
     /// settled on (see [`crate::json::settled`]). Interior mutability: the
     /// builder takes the one and deposits the other through `&Model`.
-    settled: std::cell::RefCell<SettledSlot>,
+    settled: std::sync::Mutex<SettledSlot>,
 }
 
 /// The settled-outcomes state carried by a [`Model`].
@@ -281,7 +281,10 @@ impl Model {
         // the encoded one for the build that must resolve it jointly after all.
         if library.recording.is_none() {
             if let Some(bytes) = &library.lazy_recording {
-                let mut slot = self.lib_cache.borrow_mut();
+                let mut slot = self
+                    .lib_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if matches!(*slot, LibCacheSlot::Off) {
                     *slot = LibCacheSlot::Lazy(LazyRecording::Bytes(std::sync::Arc::clone(bytes)));
                 }
@@ -304,7 +307,10 @@ impl Model {
         else {
             return;
         };
-        let mut slot = self.lib_cache.borrow_mut();
+        let mut slot = self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if matches!(*slot, LibCacheSlot::Off) {
             *slot = LibCacheSlot::Use(std::sync::Arc::clone(recording));
         }
@@ -485,7 +491,10 @@ impl Model {
     /// Keep the outcomes the next build settles on, for
     /// [`Self::settled_outcomes`].
     pub fn keep_settled_outcomes(&mut self) {
-        self.settled.get_mut().keep = true;
+        self.settled
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keep = true;
     }
 
     /// Start the next build, on a prepared library, from `outcomes`, the
@@ -498,7 +507,10 @@ impl Model {
         &mut self,
         outcomes: std::sync::Arc<crate::json::settled::SettledOutcomes>,
     ) {
-        let slot = self.settled.get_mut();
+        let slot = self
+            .settled
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         slot.start = Some(outcomes);
         slot.keep = true;
     }
@@ -508,24 +520,38 @@ impl Model {
     pub fn settled_outcomes(
         &self,
     ) -> Option<std::sync::Arc<crate::json::settled::SettledOutcomes>> {
-        self.settled.borrow().kept.clone()
+        self.settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .kept
+            .clone()
     }
 
     pub(crate) fn take_settled(
         &self,
     ) -> Option<std::sync::Arc<crate::json::settled::SettledOutcomes>> {
-        self.settled.borrow_mut().start.take()
+        self.settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .start
+            .take()
     }
 
     pub(crate) fn keeps_settled(&self) -> bool {
-        self.settled.borrow().keep
+        self.settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keep
     }
 
     pub(crate) fn deposit_settled(
         &self,
         outcomes: std::sync::Arc<crate::json::settled::SettledOutcomes>,
     ) {
-        self.settled.borrow_mut().kept = Some(outcomes);
+        self.settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .kept = Some(outcomes);
     }
 
     /// Replay `cache` on the next build of this model (library units must
@@ -533,20 +559,30 @@ impl Model {
     /// [`crate::libcache::hash_library_dir`]).
     pub fn set_library_cache(&mut self, cache: crate::libcache::LibraryCache) {
         self.prepared = None;
-        *self.lib_cache.borrow_mut() = LibCacheSlot::Use(std::sync::Arc::new(cache));
+        *self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            LibCacheSlot::Use(std::sync::Arc::new(cache));
     }
 
     /// Record library resolution outcomes during the next build; collect
     /// them with [`Model::take_recorded_library_cache`].
     pub fn record_library_cache(&mut self) {
         self.prepared = None;
-        *self.lib_cache.borrow_mut() = LibCacheSlot::Record;
+        *self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = LibCacheSlot::Record;
     }
 
     /// The outcomes recorded by the first build after
     /// [`Model::record_library_cache`], if any.
     pub fn take_recorded_library_cache(&self) -> Option<crate::libcache::LibraryCache> {
-        let mut slot = self.lib_cache.borrow_mut();
+        let mut slot = self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match std::mem::take(&mut *slot) {
             LibCacheSlot::Recorded(c) => Some(c),
             other => {
@@ -557,7 +593,10 @@ impl Model {
     }
 
     pub(crate) fn take_lib_cache_for_build(&self) -> LibCacheSlot {
-        let mut slot = self.lib_cache.borrow_mut();
+        let mut slot = self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*slot {
             // Replay survives repeated builds of the same model (a CLI
             // invocation may build more than once).
@@ -582,7 +621,11 @@ impl Model {
     pub(crate) fn library_recording(
         &self,
     ) -> Option<std::sync::Arc<crate::libcache::LibraryCache>> {
-        match &*self.lib_cache.borrow() {
+        match &*self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             LibCacheSlot::Use(cache) => Some(std::sync::Arc::clone(cache)),
             LibCacheSlot::Recorded(cache) => Some(std::sync::Arc::new(cache.clone())),
             _ => None,
@@ -592,12 +635,20 @@ impl Model {
     /// Keep a recording available for builds that fall back from the
     /// prepared graph, without reading it up front or disabling that graph.
     pub(crate) fn set_lazy_library_cache(&self, path: std::path::PathBuf) {
-        *self.lib_cache.borrow_mut() = LibCacheSlot::Lazy(LazyRecording::File(path));
+        *self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            LibCacheSlot::Lazy(LazyRecording::File(path));
     }
 
     #[cfg(test)]
     pub(crate) fn lib_cache_kind(&self) -> &'static str {
-        match &*self.lib_cache.borrow() {
+        match &*self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             LibCacheSlot::Off => "off",
             LibCacheSlot::Use(_) => "use",
             LibCacheSlot::Record => "record",
@@ -607,13 +658,19 @@ impl Model {
     }
 
     pub(crate) fn deposit_recorded(&self, cache: crate::libcache::LibraryCache) {
-        *self.lib_cache.borrow_mut() = LibCacheSlot::Recorded(cache);
+        *self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = LibCacheSlot::Recorded(cache);
     }
 
     /// Snapshot validation failed: flip the slot to Record so the rebuild
     /// records fresh state and the caller's save overwrites the stale file.
     pub(crate) fn rerecord_library_cache(&self) {
-        *self.lib_cache.borrow_mut() = LibCacheSlot::Record;
+        *self
+            .lib_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = LibCacheSlot::Record;
     }
 
     /// Diagnostics from non-library units.

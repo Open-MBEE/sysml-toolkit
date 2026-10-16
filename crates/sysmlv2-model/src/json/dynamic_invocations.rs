@@ -8,11 +8,10 @@ use super::{
     structural_index::StoredStructure,
     type_relations::{self, TypeRelations},
 };
+use crate::layered::{IdMap, IdSet};
 use crate::metaclass::conforms;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use crate::metaclass::is_a;
+use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,7 +128,7 @@ pub(super) fn capture_static_prefix(
 pub(super) fn prepare(
     b: &mut Builder,
     prefix: Arc<StaticPrefix>,
-    reserved: &HashSet<Uuid>,
+    reserved: &IdSet<Uuid>,
     physical_static_end: Option<usize>,
     steps: &mut usize,
 ) -> Result<Plan, Refusal> {
@@ -143,10 +142,250 @@ pub(super) fn prepare(
     )
 }
 
+/// Validate the authored specialization or conjugation row `relation`
+/// through the shared typed reader (see [`prepare_with_workspace`]): its
+/// carrier goes to `owner`, a conjugation's source to `conjugated`, a
+/// canonical row's unresolved source to `unresolved_sources`.
+fn validate_authored_row(
+    b: &mut Builder,
+    raw: &StoredStructure,
+    relation: usize,
+    owner: &mut Option<usize>,
+    conjugated: &mut IdSet<Uuid>,
+    unresolved_sources: &mut IdSet<usize>,
+    steps: &mut usize,
+) -> Result<(), Refusal> {
+    let node = &b.elements[relation];
+    if !is_a!(node, "Specialization") && !is_a!(node, "Conjugation") {
+        return Ok(());
+    }
+    let carrier = if b.graph_format == crate::model::GraphFormat::CanonicalV3 {
+        super::semantic_ownership::checked_relationship_carrier(b, raw, relation, steps)
+            .ok_or_else(|| incomplete(steps))?
+    } else {
+        Some(
+            raw.carrier(b, relation)
+                .flatten()
+                .ok_or_else(|| incomplete(steps))?,
+        )
+    };
+    *owner = carrier;
+    if let Some(membership) = node.owning_relationship {
+        if b.graph_format != crate::model::GraphFormat::CanonicalV3
+            || !is_a!(b.elements[membership], "OwningMembership")
+        {
+            return Err(incomplete(steps));
+        }
+        let namespace =
+            super::semantic_ownership::checked_relationship_carrier(b, raw, membership, steps)
+                .flatten()
+                .ok_or_else(|| incomplete(steps))?;
+        if !raw
+            .membership_domains(b, steps)
+            .is_some_and(|domains| domains.owner_complete(namespace))
+            || membership_evidence::member(b, raw, namespace, membership, steps) != Some(relation)
+        {
+            return Err(incomplete(steps));
+        }
+    }
+    if is_a!(node, "Conjugation") {
+        let source_id = node
+            .props
+            .get("conjugatedType")
+            .map(|v| v.as_reference())
+            .unwrap_or_else(|| carrier.map(|owner| b.elements[owner].id))
+            .ok_or_else(|| incomplete(steps))?;
+        let source = raw
+            .element_for_uuid(b, source_id)
+            .ok_or_else(|| incomplete(steps))?;
+        if !is_a!(b.elements[source], "Type") {
+            return Err(incomplete(steps));
+        }
+        type_relations::endpoint_with_carrier(
+            b,
+            source,
+            carrier,
+            relation,
+            &["conjugatedType"],
+            &["originalType"],
+            "Type",
+            steps,
+        )
+        .ok_or_else(|| incomplete(steps))?;
+        conjugated.insert(source_id);
+        return Ok(());
+    }
+    let source = [
+        "specific",
+        "subclassifier",
+        "typedFeature",
+        "subsettingFeature",
+        "redefiningFeature",
+        "referencingFeature",
+        "crossingFeature",
+    ]
+    .iter()
+    .find_map(|key| node.props.get(key))
+    .map(|v| v.as_reference())
+    .unwrap_or_else(|| carrier.map(|owner| b.elements[owner].id))
+    .ok_or_else(|| incomplete(steps))?;
+    let source = raw
+        .element_for_uuid(b, source)
+        .ok_or_else(|| incomplete(steps))?;
+    let target_kind = if is_a!(node, "Subsetting") {
+        "Feature"
+    } else if is_a!(node, "Subclassification") {
+        "Classifier"
+    } else {
+        "Type"
+    };
+    let source_kind = if is_a!(node, "Subclassification") {
+        "Classifier"
+    } else if is_a!(node, "FeatureTyping") || is_a!(node, "Subsetting") {
+        "Feature"
+    } else {
+        "Type"
+    };
+    if !conforms(b.elements[source].ty, source_kind) {
+        return Err(incomplete(steps));
+    }
+    // A local unresolved target cannot enter the minimizer's identity
+    // graph. Canonical planning may retain an unrelated complete component,
+    // but only after proving this row's source through the shared inverse
+    // domain and quarantining every dependency that reaches it.
+    if b.graph_format == crate::model::GraphFormat::CanonicalV3
+        && (is_a!(node, "Subsetting") || is_a!(node, "FeatureTyping"))
+        && super::implied::specialization_target(node).is_none()
+    {
+        if !consistent_unresolved_target(node, steps)? {
+            return Err(incomplete(steps));
+        }
+        let typing = raw.typing(b, steps).ok_or_else(|| incomplete(steps))?;
+        charge(steps, typing.relationships.get(&source).map_or(0, Vec::len))?;
+        if typing.sources_incomplete
+            || !typing
+                .relationships
+                .get(&source)
+                .is_some_and(|rows| rows.contains(&relation))
+            || super::semantic_ownership::checked_relationship_carrier(b, raw, relation, steps)
+                != Some(carrier)
+        {
+            return Err(incomplete(steps));
+        }
+        unresolved_sources.insert(source);
+
+        return Ok(());
+    }
+    type_relations::endpoint_with_carrier(
+        b,
+        source,
+        carrier,
+        relation,
+        &[
+            "specific",
+            "subclassifier",
+            "typedFeature",
+            "subsettingFeature",
+            "redefiningFeature",
+            "referencingFeature",
+            "crossingFeature",
+        ],
+        &[
+            "general",
+            "superclassifier",
+            "type",
+            "subsettedFeature",
+            "redefinedFeature",
+            "referencedFeature",
+            "crossedFeature",
+        ],
+        target_kind,
+        steps,
+    )
+    .ok_or_else(|| incomplete(steps))?;
+    Ok(())
+}
+
+/// What validating the frozen rows' specializations and conjugations
+/// yields (see [`validate_authored_row`]): the rows' carriers, the
+/// conjugations' sources, the unresolved sources, and the work charged.
+/// The library's own, the same for every build on it: made by the first
+/// build that prepares a dynamic plan and kept with the prefix.
+pub(crate) struct PrefixValidation {
+    rows: usize,
+    owners: Vec<Option<usize>>,
+    conjugated: IdSet<Uuid>,
+    unresolved_sources: IdSet<usize>,
+    steps: usize,
+}
+
+impl PrefixValidation {
+    /// The frozen rows validated: those below the prepared library's own
+    /// materialized rows.
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// Validate the frozen rows below a prepared library's own materialized
+/// rows into the three tables: from the validation kept with the prefix
+/// when the build is on such a library (its charge charged again), made
+/// and kept by the first build, else nothing. Answers the first row the
+/// build validates itself.
+fn validate_prefix_rows(
+    b: &mut Builder,
+    raw: &StoredStructure,
+    owners: &mut [Option<usize>],
+    conjugated: &mut IdSet<Uuid>,
+    unresolved_sources: &mut IdSet<usize>,
+    steps: &mut usize,
+) -> Result<usize, Refusal> {
+    // A build from source has no frozen rows; a build planning over the
+    // prefix cut to its source rows shares the cell and validates every
+    // row itself.
+    let floor = b.lib_implied_from;
+    // A frozen row written since the freeze (an identity override): the
+    // kept validation describes other rows, and every row is validated.
+    if floor == 0 || floor >= b.lib_boundary || !b.elements.base_untouched() {
+        return Ok(0);
+    }
+    let cell = Arc::clone(&b.prefix_validation);
+    if let Some(kept) = cell.get().filter(|kept| kept.rows == floor) {
+        charge(steps, kept.steps)?;
+        owners[..floor].copy_from_slice(&kept.owners);
+        conjugated.extend(kept.conjugated.iter().copied());
+        unresolved_sources.extend(kept.unresolved_sources.iter().copied());
+        return Ok(floor);
+    }
+    let before = *steps;
+    for (relation, owner) in owners.iter_mut().enumerate().take(floor) {
+        charge(steps, 1)?;
+        // (every row below the floor is authored)
+        validate_authored_row(
+            b,
+            raw,
+            relation,
+            owner,
+            conjugated,
+            unresolved_sources,
+            steps,
+        )?;
+    }
+    let _ = cell.set(Arc::new(PrefixValidation {
+        rows: floor,
+        owners: owners[..floor].to_vec(),
+        conjugated: conjugated.clone(),
+        unresolved_sources: unresolved_sources.clone(),
+        steps: *steps - before,
+    }));
+    Ok(floor)
+}
+
 pub(super) fn prepare_with_workspace(
     b: &mut Builder,
     prefix: Arc<StaticPrefix>,
-    reserved: &HashSet<Uuid>,
+    reserved: &IdSet<Uuid>,
     physical_static_end: Option<usize>,
     steps: &mut usize,
     workspace: &mut super::positional::PositionalWorkspace,
@@ -164,162 +403,36 @@ pub(super) fn prepare_with_workspace(
     let authored = b.explicit_len();
     charge(steps, b.elements.len())?;
     let mut owners = vec![None; b.elements.len()];
-    let mut conjugated = HashSet::new();
-    let mut unresolved_sources = HashSet::new();
+    let mut conjugated = IdSet::default();
+    let mut unresolved_sources = IdSet::default();
     // The legacy minimizer accepts a compatibility graph. A new positive batch
     // must not use contradictory redundant endpoints to eliminate its required
     // callee edge. Validate the authored graph through the shared typed reader.
-    for (relation, owner) in owners.iter_mut().enumerate().take(authored) {
+    // The frozen rows' validation is the library's own, the same for every
+    // build on it: taken from the prefix when kept there, else made and
+    // kept; this build's rows are validated after them.
+    let floor = validate_prefix_rows(
+        b,
+        &raw,
+        &mut owners,
+        &mut conjugated,
+        &mut unresolved_sources,
+        steps,
+    )?;
+    for (relation, owner) in owners.iter_mut().enumerate().take(authored).skip(floor) {
         charge(steps, 1)?;
-        let node = &b.elements[relation];
-        if !conforms(node.ty, "Specialization") && !conforms(node.ty, "Conjugation") {
+        if !b.is_authored(relation) {
             continue;
         }
-        let carrier = if b.graph_format == crate::model::GraphFormat::CanonicalV3 {
-            super::semantic_ownership::checked_relationship_carrier(b, &raw, relation, steps)
-                .ok_or_else(|| incomplete(steps))?
-        } else {
-            Some(
-                raw.carrier(b, relation)
-                    .flatten()
-                    .ok_or_else(|| incomplete(steps))?,
-            )
-        };
-        *owner = carrier;
-        if let Some(membership) = node.owning_relationship {
-            if b.graph_format != crate::model::GraphFormat::CanonicalV3
-                || !conforms(b.elements[membership].ty, "OwningMembership")
-            {
-                return Err(incomplete(steps));
-            }
-            let namespace =
-                super::semantic_ownership::checked_relationship_carrier(b, &raw, membership, steps)
-                    .flatten()
-                    .ok_or_else(|| incomplete(steps))?;
-            if !raw
-                .membership_domains(b, steps)
-                .is_some_and(|domains| domains.owner_complete(namespace))
-                || membership_evidence::member(b, &raw, namespace, membership, steps)
-                    != Some(relation)
-            {
-                return Err(incomplete(steps));
-            }
-        }
-        if conforms(node.ty, "Conjugation") {
-            let source_id = node
-                .props
-                .get("conjugatedType")
-                .map(|v| v.as_reference())
-                .unwrap_or_else(|| carrier.map(|owner| b.elements[owner].id))
-                .ok_or_else(|| incomplete(steps))?;
-            let source = raw
-                .element_for_uuid(b, source_id)
-                .ok_or_else(|| incomplete(steps))?;
-            if !conforms(b.elements[source].ty, "Type") {
-                return Err(incomplete(steps));
-            }
-            type_relations::endpoint_with_carrier(
-                b,
-                source,
-                carrier,
-                relation,
-                &["conjugatedType"],
-                &["originalType"],
-                "Type",
-                steps,
-            )
-            .ok_or_else(|| incomplete(steps))?;
-            conjugated.insert(source_id);
-            continue;
-        }
-        let source = [
-            "specific",
-            "subclassifier",
-            "typedFeature",
-            "subsettingFeature",
-            "redefiningFeature",
-            "referencingFeature",
-            "crossingFeature",
-        ]
-        .iter()
-        .find_map(|key| node.props.get(key))
-        .map(|v| v.as_reference())
-        .unwrap_or_else(|| carrier.map(|owner| b.elements[owner].id))
-        .ok_or_else(|| incomplete(steps))?;
-        let source = raw
-            .element_for_uuid(b, source)
-            .ok_or_else(|| incomplete(steps))?;
-        let target_kind = if conforms(node.ty, "Subsetting") {
-            "Feature"
-        } else if conforms(node.ty, "Subclassification") {
-            "Classifier"
-        } else {
-            "Type"
-        };
-        let source_kind = if conforms(node.ty, "Subclassification") {
-            "Classifier"
-        } else if conforms(node.ty, "FeatureTyping") || conforms(node.ty, "Subsetting") {
-            "Feature"
-        } else {
-            "Type"
-        };
-        if !conforms(b.elements[source].ty, source_kind) {
-            return Err(incomplete(steps));
-        }
-        // A local unresolved target cannot enter the minimizer's identity
-        // graph. Canonical planning may retain an unrelated complete component,
-        // but only after proving this row's source through the shared inverse
-        // domain and quarantining every dependency that reaches it.
-        if b.graph_format == crate::model::GraphFormat::CanonicalV3
-            && (conforms(node.ty, "Subsetting") || conforms(node.ty, "FeatureTyping"))
-            && super::implied::specialization_target(node).is_none()
-        {
-            if !consistent_unresolved_target(node, steps)? {
-                return Err(incomplete(steps));
-            }
-            let typing = raw.typing(b, steps).ok_or_else(|| incomplete(steps))?;
-            charge(steps, typing.relationships.get(&source).map_or(0, Vec::len))?;
-            if typing.sources_incomplete
-                || !typing
-                    .relationships
-                    .get(&source)
-                    .is_some_and(|rows| rows.contains(&relation))
-                || super::semantic_ownership::checked_relationship_carrier(b, &raw, relation, steps)
-                    != Some(carrier)
-            {
-                return Err(incomplete(steps));
-            }
-            unresolved_sources.insert(source);
-
-            continue;
-        }
-        type_relations::endpoint_with_carrier(
+        validate_authored_row(
             b,
-            source,
-            carrier,
+            &raw,
             relation,
-            &[
-                "specific",
-                "subclassifier",
-                "typedFeature",
-                "subsettingFeature",
-                "redefiningFeature",
-                "referencingFeature",
-                "crossingFeature",
-            ],
-            &[
-                "general",
-                "superclassifier",
-                "type",
-                "subsettedFeature",
-                "redefinedFeature",
-                "referencedFeature",
-                "crossedFeature",
-            ],
-            target_kind,
+            owner,
+            &mut conjugated,
+            &mut unresolved_sources,
             steps,
-        )
-        .ok_or_else(|| incomplete(steps))?;
+        )?;
     }
     let mut owning = TypeRelations::default();
     charge(steps, unresolved_sources.len())?;
@@ -331,7 +444,7 @@ pub(super) fn prepare_with_workspace(
         // feature's signature is not the outer owner's own specialization or
         // slot direction. Actual nested consumers remain checked by the final
         // specialization/delta dependency audit.
-        if !conforms(b.elements[source].ty, "Feature") {
+        if !is_a!(b.elements[source], "Feature") {
             continue;
         }
         if let Some(owner) = owning
@@ -348,10 +461,15 @@ pub(super) fn prepare_with_workspace(
         .iter()
         .map(|r| (r.owner, (r.kind, r.source_key, r.target_key, r.target)))
         .collect();
+    // The prepared library's own static rows, which a build from source has
+    // among its fixed recipes: they take part in the minimization the same.
+    let library = b.prefix_static_candidates();
+    charge(steps, library.len())?;
+    candidates.extend(library.iter().copied());
     let fixed = candidates.len();
     let mut required = Vec::new();
-    let mut constructor_positional = HashMap::new();
-    let mut unadmitted = HashSet::new();
+    let mut constructor_positional = IdMap::default();
+    let mut unadmitted = IdSet::default();
     let mut constructor_batch = super::constructor_bindings::ConstructorBatchEvidence::default();
     for invocation in 0..authored {
         charge(steps, 1)?;
@@ -422,7 +540,7 @@ pub(super) fn prepare_with_workspace(
             }
         };
         let id = b.elements[target].id;
-        let edge = if conforms(b.elements[target].ty, "Feature") {
+        let edge = if is_a!(b.elements[target], "Feature") {
             ("Subsetting", "subsettingFeature", "subsettedFeature", id)
         } else {
             ("FeatureTyping", "typedFeature", "type", id)
@@ -459,10 +577,11 @@ pub(super) fn prepare_with_workspace(
             Some(steps),
         )
         .ok_or_else(|| incomplete(steps))?;
-    let mut bases = HashMap::new();
-    for (&owner, targets) in &prefix.planner_bases {
+    // The prefix's direct bases, its own rows over the frozen table under
+    // them: the own rows are charged, the frozen table is shared.
+    let mut bases = prefix.planner_bases.clone();
+    for (_, targets) in bases.local_iter() {
         charge(steps, targets.len().saturating_add(1))?;
-        bases.insert(owner, targets.clone());
     }
     charge(steps, prefix.planner_incomplete.len())?;
     let mut incomplete_bases = prefix.planner_incomplete.clone();
@@ -474,7 +593,7 @@ pub(super) fn prepare_with_workspace(
             continue;
         }
         let target = raw.element_for_uuid(b, edge.3).ok_or(Refusal::Incomplete)?;
-        let targets = bases.entry(source).or_insert_with(Vec::new);
+        let targets = bases.entry(source).or_default();
         charge(steps, targets.len().saturating_add(1))?;
         if !targets.contains(&target) {
             targets.push(target);
@@ -514,18 +633,18 @@ pub(super) fn prepare_with_workspace(
     }
     let mut stable = None;
     for _ in 0..64 {
-        let mut next_bases = HashMap::new();
-        for (&owner, targets) in &foundation {
+        let mut next_bases = foundation.clone();
+        for (_, targets) in next_bases.local_iter() {
             charge(steps, targets.len().saturating_add(1))?;
-            next_bases.insert(owner, targets.clone());
         }
         for (&source, targets) in &prior.targets {
             charge(steps, targets.len().saturating_add(1))?;
-            let direct = next_bases.entry(source).or_insert_with(Vec::new);
             for &target in targets {
-                charge(steps, direct.len().saturating_add(1))?;
-                if !direct.contains(&target) {
-                    direct.push(target);
+                // A base already there leaves the frozen table's row shared.
+                let direct = next_bases.get(&source);
+                charge(steps, direct.map_or(0, Vec::len).saturating_add(1))?;
+                if !direct.is_some_and(|direct| direct.contains(&target)) {
+                    next_bases.entry(source).or_default().push(target);
                 }
             }
         }
@@ -635,10 +754,10 @@ pub(super) fn prepare_with_workspace(
     for (&source, targets) in &positional.targets {
         for &target in targets {
             charge(steps, 1)?;
-            let direct = bases.entry(source).or_insert_with(Vec::new);
-            charge(steps, direct.len().saturating_add(1))?;
-            if !direct.contains(&target) {
-                direct.push(target);
+            let direct = bases.get(&source);
+            charge(steps, direct.map_or(0, Vec::len).saturating_add(1))?;
+            if !direct.is_some_and(|direct| direct.contains(&target)) {
+                bases.entry(source).or_insert_with(Vec::new).push(target);
             }
             let direct_ids = graph.entry(b.elements[source].id).or_insert_with(Vec::new);
             charge(steps, direct_ids.len().saturating_add(1))?;
@@ -653,7 +772,7 @@ pub(super) fn prepare_with_workspace(
     // Conjugation changes specialization reachability. Until the minimizer's
     // graph models that override, refuse a reachable such context rather than
     // accepting a callee obligation via the legacy raw-specialization path.
-    let mut seen = HashSet::new();
+    let mut seen = IdSet::default();
     let mut todo = Vec::new();
     for &source in &required {
         charge(steps, 1)?;
@@ -691,7 +810,7 @@ pub(super) fn prepare_with_workspace(
             charge(steps, relationships.len())?;
             for &relationship in relationships {
                 let relation = b.elements.get(relationship).ok_or(Refusal::Incomplete)?;
-                if conforms(relation.ty, "FeatureChaining") {
+                if is_a!(relation, "FeatureChaining") {
                     return Err(Refusal::Incomplete);
                 }
             }
@@ -709,7 +828,7 @@ pub(super) fn prepare_with_workspace(
     )?;
     incomplete_bases.extend(unresolved_sources);
     incomplete_bases.extend(unadmitted);
-    let mut assigned = HashSet::new();
+    let mut assigned = IdSet::default();
     for row in &prefix.rows {
         charge(steps, 1)?;
         if !assigned.insert(row.id) {
@@ -733,7 +852,7 @@ pub(super) fn prepare_with_workspace(
     {
         return Err(Refusal::Stale);
     }
-    let mut added_bases = HashMap::<usize, Vec<usize>>::new();
+    let mut added_bases = IdMap::<usize, Vec<usize>>::default();
     for edge in &tail {
         charge(steps, 1)?;
         let target = raw
@@ -753,7 +872,7 @@ pub(super) fn prepare_with_workspace(
         static_prefix: prefix,
         direct_bases: bases,
         incomplete_bases,
-        specializations: graph,
+        specializations: graph.into(),
         positional,
         tail,
     })
@@ -805,7 +924,7 @@ fn validate_fixed_prefix(
     if materialized.is_none() && b.elements.len() != authored {
         return Err(Refusal::StaticMismatch);
     }
-    let mut ids = HashSet::new();
+    let mut ids = IdSet::default();
     for (offset, edge) in prefix.rows.iter().enumerate() {
         charge(steps, 1)?;
         if edge.owner >= authored || b.elements[edge.owner].id != edge.owner_id {
@@ -907,7 +1026,7 @@ mod tests {
             let mut r = ResolvedModel::build(&model);
             let prefix = static_prefix(&mut r);
             assert_eq!(
-                prepare(&mut r.b, prefix, &HashSet::new(), None, &mut 0).is_ok(),
+                prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0).is_ok(),
                 succeeds,
                 "{source}"
             );
@@ -931,7 +1050,7 @@ mod tests {
                 .filter(|&e| r.element_type(e) == "InvocationExpression")
                 .collect();
             let prefix = static_prefix(&mut r);
-            let plan = prepare(&mut r.b, prefix, &HashSet::new(), None, &mut 0);
+            let plan = prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0);
             if format == crate::model::GraphFormat::CanonicalV3 {
                 let plan = plan.unwrap();
                 assert!(plan.incomplete_bases.contains(&calls[1].0));
@@ -956,7 +1075,7 @@ mod tests {
             let mut r = ResolvedModel::build(&model);
             let prefix = static_prefix(&mut r);
             assert!(
-                prepare(&mut r.b, prefix, &HashSet::new(), None, &mut 0).is_err(),
+                prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0).is_err(),
                 "{source}"
             );
         }
@@ -989,7 +1108,7 @@ mod tests {
             r.b.elements[relationship].props.insert(key, value);
             let prefix = static_prefix(&mut r);
             assert!(
-                prepare(&mut r.b, prefix, &HashSet::new(), None, &mut 0).is_err(),
+                prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0).is_err(),
                 "corruption {corruption}"
             );
         }
@@ -1010,15 +1129,21 @@ mod tests {
             let prefix = static_prefix(&mut r);
             let n = r.b.elements.len();
             let old = r.b.positional_redefinitions.clone();
-            let plan =
-                prepare(&mut r.b, Arc::clone(&prefix), &HashSet::new(), None, &mut 0).unwrap();
+            let plan = prepare(
+                &mut r.b,
+                Arc::clone(&prefix),
+                &IdSet::default(),
+                None,
+                &mut 0,
+            )
+            .unwrap();
             assert_eq!(r.b.elements.len(), n);
             assert!(r.b.implied.is_none());
             assert_eq!(
                 r.b.positional_redefinitions.as_ref().map(|p| &p.targets),
                 old.as_ref().map(|p| &p.targets)
             );
-            assert!(plan.direct_bases[&inv].contains(&f));
+            assert!(plan.direct_bases.get(&inv).unwrap().contains(&f));
             assert!(
                 plan.tail
                     .iter()
@@ -1041,9 +1166,16 @@ mod tests {
     fn failure_and_colliding_other_tail_ids_never_publish_a_prefix() {
         let mut r = fixture("function F {return result;} feature call=F();");
         let prefix = static_prefix(&mut r);
-        let plan = prepare(&mut r.b, Arc::clone(&prefix), &HashSet::new(), None, &mut 0).unwrap();
+        let plan = prepare(
+            &mut r.b,
+            Arc::clone(&prefix),
+            &IdSet::default(),
+            None,
+            &mut 0,
+        )
+        .unwrap();
         let n = r.b.elements.len();
-        let collision = HashSet::from([plan.tail[0].id]);
+        let collision = IdSet::from_iter([plan.tail[0].id]);
         assert!(matches!(
             prepare(&mut r.b, Arc::clone(&prefix), &collision, None, &mut 0),
             Err(Refusal::Collision)
@@ -1053,7 +1185,7 @@ mod tests {
             prepare(
                 &mut r.b,
                 Arc::clone(&prefix),
-                &HashSet::new(),
+                &IdSet::default(),
                 None,
                 &mut exhausted
             ),
@@ -1061,14 +1193,14 @@ mod tests {
         ));
         assert_eq!(r.b.elements.len(), n);
         assert!(r.b.implied.is_none());
-        assert!(prepare(&mut r.b, prefix, &HashSet::new(), None, &mut 0).is_ok());
+        assert!(prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0).is_ok());
         let mut bad = fixture(
             "function F {return result;} feature firstCall=F(); feature otherCall=missing();",
         );
         let p = static_prefix(&mut bad);
         let n = bad.b.elements.len();
         assert!(matches!(
-            prepare(&mut bad.b, p, &HashSet::new(), None, &mut 0),
+            prepare(&mut bad.b, p, &IdSet::default(), None, &mut 0),
             Err(Refusal::Incomplete)
         ));
         assert_eq!(bad.b.elements.len(), n);
@@ -1086,14 +1218,14 @@ mod tests {
             prepare(
                 &mut r.b,
                 Arc::clone(&p),
-                &HashSet::new(),
+                &IdSet::default(),
                 Some(boundary),
                 &mut 0
             )
             .is_ok()
         );
         assert!(matches!(
-            prepare(&mut r.b, p, &HashSet::new(), Some(boundary + 1), &mut 0),
+            prepare(&mut r.b, p, &IdSet::default(), Some(boundary + 1), &mut 0),
             Err(Refusal::StaticMismatch)
         ));
     }
@@ -1108,14 +1240,14 @@ mod tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&i| conforms(r.b.elements[i].ty, "Specialization"))
+            .find(|&i| is_a!(r.b.elements[i], "Specialization"))
             .unwrap();
         let conflicting = r.b.elements[b].id.to_string();
         r.b.elements[relation]
             .props
             .insert("target", serde_json::json!([{"@id":conflicting}]));
         assert!(matches!(
-            prepare(&mut r.b, p, &HashSet::new(), None, &mut 0),
+            prepare(&mut r.b, p, &IdSet::default(), None, &mut 0),
             Err(Refusal::Incomplete)
         ));
     }
@@ -1168,6 +1300,7 @@ mod indirect_tests {
         let relation = r.b.elements.len();
         r.b.elements.push(Elem {
             ty: "Subsetting",
+            meta: crate::metaclass::meta_of("Subsetting"),
             id: Uuid::new_v5(&Uuid::NAMESPACE_OID, b"dynamic indirect test"),
             path: String::new(),
             path_parent: None,
@@ -1191,7 +1324,7 @@ mod indirect_tests {
                 .is_some_and(|targets| targets.contains(&p))
         );
         let n = r.b.elements.len();
-        let plan = prepare(&mut r.b, prefix, &HashSet::new(), None, &mut 0).unwrap();
+        let plan = prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0).unwrap();
         assert!(
             !plan
                 .tail
@@ -1252,7 +1385,16 @@ mod warm_prefix_tests {
         let captured = capture_static_prefix(&mut r.b, proposed, Some(boundary), &mut 0).unwrap();
         assert_eq!(captured.rows[0].id, new);
         assert_eq!(r.b.elements[captured.authored_end].id, new);
-        assert!(prepare(&mut r.b, captured, &HashSet::new(), Some(boundary), &mut 0).is_ok());
+        assert!(
+            prepare(
+                &mut r.b,
+                captured,
+                &IdSet::default(),
+                Some(boundary),
+                &mut 0
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn warm_generic_alias_corruption_cannot_be_recaptured() {
@@ -1280,7 +1422,7 @@ mod warm_prefix_tests {
         let mut r = ResolvedModel::build(&model);
         let prefix = predicted(&mut r);
         assert!(matches!(
-            prepare(&mut r.b, prefix, &HashSet::new(), None, &mut 0),
+            prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0),
             Err(Refusal::Incomplete)
         ));
         assert!(r.b.implied.is_none());
@@ -1307,7 +1449,7 @@ mod named_callee_chain_gap_tests {
         let prefix =
             r.b.static_specialization_prefix(&HashMap::new(), true, Some(&mut 0))
                 .unwrap();
-        prepare(&mut r.b, prefix, &HashSet::new(), None, steps)
+        prepare(&mut r.b, prefix, &IdSet::default(), None, steps)
     }
     #[test]
     fn named_chain_callee_cannot_certify_empty_inputs() {
@@ -1408,7 +1550,7 @@ mod input_direction_tests {
         let prefix =
             r.b.static_specialization_prefix(&HashMap::new(), true, Some(&mut 0))
                 .unwrap();
-        prepare(&mut r.b, prefix, &HashSet::new(), None, steps)
+        prepare(&mut r.b, prefix, &IdSet::default(), None, steps)
     }
     #[test]
     fn output_before_input_refuses_entire_new_batch() {
@@ -1463,7 +1605,7 @@ mod input_direction_tests {
             let mut r = fixture("in p;", "1");
             let p = r.resolve_qualified("F::p").unwrap().0;
             let membership = r.b.elements[p].owning_relationship.unwrap();
-            r.b.elements[membership].ty = "ParameterMembership";
+            r.b.elements[membership].set_ty("ParameterMembership");
             match bad {
                 0 => {
                     r.b.elements[p]

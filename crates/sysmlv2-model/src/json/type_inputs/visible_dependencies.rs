@@ -1,5 +1,6 @@
 //! Visible foreign-owner imports share selectors without adding inheritance.
 use super::*;
+use crate::metaclass::is_a;
 use crate::model::{GraphFormat, Model};
 const LIB: &str = "standard library package Base {classifier Anything; feature things:Anything;} standard library package Occurrences {class Occurrence specializes Base::Anything; feature occurrences:Occurrence subsets Base::things;} standard library package Performances {behavior Performance specializes Occurrences::Occurrence; function Evaluation specializes Performance {return result;} step performances:Performance subsets Occurrences::occurrences; expr evaluations:Evaluation subsets performances;}";
 fn fixture(source: &str, format: GraphFormat) -> ResolvedModel {
@@ -152,7 +153,7 @@ fn foreign_import_endpoint_inverse_and_visibility_mutations_are_observed() {
     let import = *r.b.elements[foreign]
         .owned_relationships
         .iter()
-        .find(|&&e| conforms(r.b.elements[e].ty, "Import"))
+        .find(|&&e| is_a!(r.b.elements[e], "Import"))
         .unwrap();
     let props = r.b.elements[import].props.clone();
     let wrong = r.b.elements[selected].id.to_string();

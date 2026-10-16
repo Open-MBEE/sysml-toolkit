@@ -1,6 +1,7 @@
 //! Declaration identities used to admit runtime parameter bindings.
 use super::{Builder, ElementRef, ResolvedModel, ScopeRef};
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 use sysmlv2_syntax::ast::{Expr, ExprKind, FeatureDirection, MemberKind, QualifiedName};
 
@@ -147,7 +148,7 @@ impl Builder {
     fn is_subject(&self, feature: usize) -> bool {
         self.elements[feature]
             .owning_relationship
-            .is_some_and(|r| conforms(self.elements[r].ty, "SubjectMembership"))
+            .is_some_and(|r| is_a!(self.elements[r], "SubjectMembership"))
     }
 
     fn is_private_member(&self, feature: usize) -> bool {
@@ -366,7 +367,7 @@ impl Builder {
     fn names_its_redefined_parameter(&self, feature: usize, owner_ty: &str) -> bool {
         conforms(owner_ty, "InvocationExpression")
             && self.elements[feature].owned_relationships.iter().any(|&r| {
-                conforms(self.elements[r].ty, "Redefinition")
+                is_a!(self.elements[r], "Redefinition")
                     && self.elements[r]
                         .props
                         .get("isImplied")
@@ -738,7 +739,7 @@ impl Builder {
         let own_scope = self.values.get(&element)?.0;
         let featured = self
             .owner_elem(element)
-            .is_some_and(|owner| crate::metaclass::conforms(self.elements[owner].ty, "Type"));
+            .is_some_and(|owner| is_a!(self.elements[owner], "Type"));
         (!featured || receiver.is_none_or(|scope| scope == own_scope)).then_some(own_scope)
     }
 

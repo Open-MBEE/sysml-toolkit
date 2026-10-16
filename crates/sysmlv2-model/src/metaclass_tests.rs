@@ -63,3 +63,24 @@ fn conformance_samples_and_unknown_names() {
             .all(|(n, _)| canonical_name(n) == Some(*n))
     );
 }
+
+#[test]
+fn the_feature_membership_test_follows_the_hierarchy() {
+    // `is_feature_membership` reads the schema's property table; the hot
+    // owned-member read tests the hierarchy instead, and the two agree.
+    // The name-suffix test beside it stays a suffix test: `FeatureValue`
+    // is a membership by metaclass and not by name, and that read leaves
+    // it out.
+    for (name, _) in ANCESTOR_NAMES {
+        assert_eq!(
+            crate::json::is_feature_membership(name),
+            conforms(name, "FeatureMembership"),
+            "{name}"
+        );
+        assert_eq!(
+            name.ends_with("Membership"),
+            conforms(name, "Membership") && name != "FeatureValue",
+            "{name}"
+        );
+    }
+}

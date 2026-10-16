@@ -13,8 +13,9 @@
 //! [`graph_normalize`] is the mirror twin in the opposite direction:
 //! it re-spells a compact document the way a graph-backed store
 //! materializes it from triples (defaults elided, `elementId` and
-//! first-claimant ownership backpointers spelled, elements id-sorted),
-//! so `state_digest` over the two spellings can meet in one domain.
+//! first-claimant ownership backpointers spelled, each literal's number
+//! spelled as its value type spells it, elements id-sorted), so
+//! `state_digest` over the two spellings can meet in one domain.
 
 use std::collections::HashMap;
 
@@ -107,6 +108,11 @@ fn canonicalize_element(e: &Value) -> Result<Value, Error> {
 ///   the same rule the wire-elision flag and a store's read-side
 ///   reconstruction use; explicitly spelled backpointers stay
 ///   verbatim;
+/// - each literal's number is spelled as its metaclass's value type
+///   spells it: a `LiteralRational`'s whole value as a float (`150.0`,
+///   which a JSON round trip through JavaScript prints `150`), a
+///   `LiteralInteger`'s as an integer (`150`, however written), so
+///   every spelling of one value digests alike;
 /// - elements are sorted by `@id`, the deterministic listing order a
 ///   store serves (root order is digest-relevant).
 ///
@@ -117,12 +123,25 @@ fn canonicalize_element(e: &Value) -> Result<Value, Error> {
 /// verification. Idempotent; strict like the encoder on unknown
 /// `@type`s and missing `@id`s.
 pub fn graph_normalize(doc: &Value) -> Result<Value, Error> {
+    normalize(doc, true)
+}
+
+/// [`graph_normalize`] with each literal's number kept as the document
+/// spells it, as graph normalization left it before every spelling of
+/// a value was one. A digest recorded then over a document that spells
+/// a whole real without its fraction is reproduced here, and only
+/// here: the way to check such a record.
+pub fn graph_normalize_as_spelled(doc: &Value) -> Result<Value, Error> {
+    normalize(doc, false)
+}
+
+fn normalize(doc: &Value, respell: bool) -> Result<Value, Error> {
     let arr = doc
         .as_array()
         .ok_or_else(|| Error::new("interchange payload is a flat element array"))?;
     let mut out = Vec::with_capacity(arr.len());
     for e in arr {
-        out.push(normalize_element(e)?);
+        out.push(normalize_element(e, respell)?);
     }
     // First-claimant ownership backpointer derivation, in payload
     // element order: a member of some `ownedRelatedElement` list is
@@ -179,9 +198,18 @@ pub fn graph_normalize(doc: &Value) -> Result<Value, Error> {
 /// String-level [`graph_normalize`], the ergonomic twin of
 /// [`canonicalize_compact`].
 pub fn graph_normalize_compact(text: &str) -> Result<String, Error> {
+    normalize_text(text, true)
+}
+
+/// String-level [`graph_normalize_as_spelled`].
+pub fn graph_normalize_compact_as_spelled(text: &str) -> Result<String, Error> {
+    normalize_text(text, false)
+}
+
+fn normalize_text(text: &str, respell: bool) -> Result<String, Error> {
     let doc: Value =
         serde_json::from_str(text).map_err(|e| Error::new(format!("invalid JSON: {e}")))?;
-    serde_json::to_string(&graph_normalize(&doc)?).map_err(|e| Error::new(e.to_string()))
+    serde_json::to_string(&normalize(&doc, respell)?).map_err(|e| Error::new(e.to_string()))
 }
 
 fn compact_fields(ty: &str) -> Option<&'static [CborField]> {
@@ -191,7 +219,7 @@ fn compact_fields(ty: &str) -> Option<&'static [CborField]> {
         .map(|i| METACLASS_FIELDS[i].1)
 }
 
-fn normalize_element(e: &Value) -> Result<Value, Error> {
+fn normalize_element(e: &Value, respell: bool) -> Result<Value, Error> {
     let obj = e
         .as_object()
         .ok_or_else(|| Error::new("element is an object"))?;
@@ -218,8 +246,13 @@ fn normalize_element(e: &Value) -> Result<Value, Error> {
         }
         match ordinal(fields, key) {
             Some(i) => {
-                if !is_wire_default(&fields[i as usize], value) {
-                    wire.insert(key.clone(), value.clone());
+                let field = &fields[i as usize];
+                if !is_wire_default(field, value) {
+                    let spelled = match field.1 {
+                        K_LITERAL if respell => literal_number(ty, value),
+                        _ => None,
+                    };
+                    wire.insert(key.clone(), spelled.unwrap_or_else(|| value.clone()));
                 }
             }
             // A derived canonical property (present in the full form
@@ -235,6 +268,46 @@ fn normalize_element(e: &Value) -> Result<Value, Error> {
         }
     }
     Ok(Value::Object(wire))
+}
+
+/// A literal's number as its metaclass's value type spells it, where
+/// the document spells it otherwise: a `LiteralRational`'s value is a
+/// real, so a whole number written as an integer is the float the
+/// kernel emits; a `LiteralInteger`'s written as a float (`150.0`,
+/// `1.5e2`) is the integer. `None` keeps the value as written: a number
+/// spelled so already, one the other spelling does not hold exactly,
+/// and anything not a number (a decimal no float holds is text).
+// Each float-to-integer cast is of a whole number its range check pins
+// inside the target type, or is compared back against the integer it
+// came from — the narrowing is exact or refused.
+#[allow(clippy::cast_possible_truncation)]
+fn literal_number(ty: &str, value: &Value) -> Option<Value> {
+    // 2^63 and 2^64, exactly: the integer ranges' ends as floats
+    const I64_END: f64 = 9_223_372_036_854_775_808.0;
+    const U64_END: f64 = 18_446_744_073_709_551_616.0;
+    let n = value.as_number()?;
+    match ty {
+        "LiteralRational" if !n.is_f64() => {
+            // the float only where it is the integer exactly
+            let x = match (n.as_u64(), n.as_i64()) {
+                (Some(u), _) => Some(u as f64).filter(|&x| x < U64_END && x as u64 == u),
+                (None, Some(i)) => Some(i as f64).filter(|&x| x as i64 == i),
+                (None, None) => None,
+            }?;
+            serde_json::Number::from_f64(x).map(Value::Number)
+        }
+        "LiteralInteger" if n.is_f64() => {
+            let x = n.as_f64().filter(|x| x.fract() == 0.0)?;
+            if (-I64_END..0.0).contains(&x) {
+                Some(Value::from(x as i64))
+            } else if (0.0..U64_END).contains(&x) {
+                Some(Value::from(x as u64))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Is `value` the metaclass default the graph-normal spelling elides?

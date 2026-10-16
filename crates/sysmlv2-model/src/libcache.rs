@@ -43,7 +43,7 @@ use uuid::Uuid;
 // replay can re-resolve exactly the entries a model's root additions reach.
 // v7: include the authored graph format so resolution recordings cannot cross it.
 // v8: whether the outcomes are the library's own fixed point.
-const MAGIC: &[u8; 8] = b"SYSML8LC";
+const MAGIC: &[u8; 8] = b"SYSML9LC";
 
 /// Toolkit build identity stamped into every serialized cache: the crate
 /// version plus a fingerprint of the semantics-bearing crate sources
@@ -111,18 +111,87 @@ pub(crate) const MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// would otherwise interleave their writes into one sibling file, and a
 /// crash would strand a partial file exactly where the next writer looks.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomically_parts(path, &[bytes])
+}
+
+/// [`write_atomically`] of `parts` written one after the other, so that a
+/// file made of a small header and a large payload is not joined in memory
+/// first.
+pub(crate) fn write_atomically_parts(path: &Path, parts: &[&[u8]]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
     let result = (|| {
-        std::fs::File::create(&temporary)?.write_all(bytes)?;
+        let mut file = std::fs::File::create(&temporary)?;
+        for part in parts {
+            file.write_all(part)?;
+        }
         std::fs::rename(&temporary, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// A snapshot's bytes as a load holds them: the file mapped in place where
+/// the target maps files, else read whole. Read only ever as a byte slice,
+/// through the decoder's bounds checks.
+pub(crate) enum SnapshotBytes {
+    #[cfg(not(target_family = "wasm"))]
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+impl AsRef<[u8]> for SnapshotBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            Self::Mapped(map) => map,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+/// A snapshot file mapped into memory, refusing one past [`MAX_BYTES`];
+/// read whole where the target cannot map a file or the map is refused.
+///
+/// The cache's files and the shipped snapshots are written under a
+/// temporary name and renamed into place (`write_atomically_parts`), never
+/// rewritten where they lie, so what a map shows does not change under the
+/// decoder; a snapshot written again gets a file of its own, and the one
+/// mapped stays whole until the map is dropped. A file another process
+/// rewrites in place while it is mapped is outside that contract: the
+/// decoder reads a changed one as corrupt through the part checksums, and
+/// a truncated one faults at the missing pages, which the process does not
+/// survive. Where the platform refuses to replace a mapped file (Windows),
+/// another process writing the same key while this one holds the map gets
+/// the cache's "could not save" warning and prepares from source; nothing
+/// in this process writes a file it has mapped, since a save follows a
+/// miss.
+pub(crate) fn map_capped(path: &Path) -> Option<SnapshotBytes> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_BYTES {
+        return None;
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        // SAFETY: the file is a snapshot this toolkit wrote by rename, or
+        // one shipped beside it; nothing in this process writes to it, and
+        // a change by another process is outside the cache's contract
+        // (above). The map is read as a byte slice only.
+        if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+            // The whole file is read once, soon, by several threads: let
+            // the pages come in ahead of them (a hint the unix targets
+            // take; the map reads the same everywhere).
+            #[cfg(unix)]
+            let _ = map.advise(memmap2::Advice::WillNeed);
+            return Some(SnapshotBytes::Mapped(map));
+        }
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX_BYTES).then_some(SnapshotBytes::Owned(buf))
 }
 
 /// Read a cache file whole, refusing one past [`MAX_BYTES`].
@@ -373,6 +442,51 @@ pub fn hash_library_dir(dir: &Path) -> io::Result<u64> {
     let mut files = Vec::new();
     crate::model::collect_model_files(dir, &mut files)?;
     files.sort();
+    let listing = file_stamps(&files)?;
+    let keys = DIRECTORY_KEYS.get_or_init(Default::default);
+    if let Some(key) = memoized_key(keys, dir, &listing) {
+        return Ok(key);
+    }
+    let key = hash_files(&files)?;
+    keys.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), (listing, key));
+    Ok(key)
+}
+
+/// A model file's path, length and modification time: what a directory's
+/// listing is compared by between two hashes of it.
+type FileStamp = (PathBuf, u64, Option<std::time::SystemTime>);
+
+/// The content keys of the library directories this process hashed, each
+/// with the listing it was hashed over, so that a directory whose files
+/// have not changed answers its key again without reading them. A later
+/// load of the same directory in a long-lived process (a language server,
+/// an SDK opening sessions in turn) reads nothing but the directory's
+/// metadata.
+type DirectoryKeys = std::sync::Mutex<std::collections::HashMap<PathBuf, (Vec<FileStamp>, u64)>>;
+static DIRECTORY_KEYS: std::sync::OnceLock<DirectoryKeys> = std::sync::OnceLock::new();
+
+fn file_stamps(files: &[PathBuf]) -> io::Result<Vec<FileStamp>> {
+    files
+        .iter()
+        .map(|path| {
+            let meta = std::fs::metadata(path)?;
+            Ok((path.clone(), meta.len(), meta.modified().ok()))
+        })
+        .collect()
+}
+
+/// The key `dir` hashed to while its listing was `listing`, if this process
+/// hashed it and no file's length or modification time has changed since.
+fn memoized_key(keys: &DirectoryKeys, dir: &Path, listing: &[FileStamp]) -> Option<u64> {
+    let keys = keys.lock().unwrap_or_else(|e| e.into_inner());
+    let (known, key) = keys.get(dir)?;
+    (known.as_slice() == listing).then_some(*key)
+}
+
+/// The content hash of `files` (sorted), as [`hash_library_dir`] defines it.
+fn hash_files(files: &[PathBuf]) -> io::Result<u64> {
     let mut h = Fnv::new();
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
     for path in files {
@@ -382,7 +496,7 @@ pub fn hash_library_dir(dir: &Path) -> io::Result<u64> {
                 .unwrap_or_default()
                 .as_bytes(),
         );
-        h.update(&std::fs::read(&path)?);
+        h.update(&std::fs::read(path)?);
     }
     Ok(h.finish())
 }
@@ -403,33 +517,309 @@ pub fn hash_units<'a>(units: impl IntoIterator<Item = (&'a str, &'a str)>) -> u6
     h.finish()
 }
 
-/// Default cache file path for a library keyed by `key`:
-/// `$SYSMLV2_CACHE_DIR`, else `$XDG_CACHE_HOME/sysmlv2`, else
-/// `$HOME/.cache/sysmlv2`. `None` when no base directory can be determined.
-pub fn default_cache_path(key: u64) -> Option<PathBuf> {
-    let base = std::env::var_os("SYSMLV2_CACHE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(|c| PathBuf::from(c).join("sysmlv2")))
+/// Where a snapshot shipped with the toolkit may lie, as recording paths
+/// (`stdlib-<key>.libcache`; the snapshot is the `.prepared` sibling of
+/// each): under `$SYSMLV2_LIB_SNAPSHOT_DIR`, then under the directory named
+/// `prepared` beside the executable. Written there by
+/// `prepare_library_into`; read in place by a load whose cache has no
+/// snapshot. [`shipped_cache_paths_for`] also looks beside the library.
+pub fn shipped_cache_paths(key: u64) -> Vec<PathBuf> {
+    shipped_cache_paths_for(key, None)
+}
+
+/// [`shipped_cache_paths`] for a load of the library directory `library`:
+/// the directory named `prepared` beside the library directory is looked
+/// in after `$SYSMLV2_LIB_SNAPSHOT_DIR` and before the one beside the
+/// executable — a library packaged with a host (a Python extension, a
+/// web bundle) ships its snapshot beside itself, where the executable is
+/// the host's.
+pub fn shipped_cache_paths_for(key: u64, library: Option<&Path>) -> Vec<PathBuf> {
+    let name = format!("stdlib-{key:016x}.libcache");
+    shipped_dirs(
+        std::env::var_os("SYSMLV2_LIB_SNAPSHOT_DIR").map(PathBuf::from),
+        library,
+        std::env::current_exe().ok(),
+    )
+    .into_iter()
+    .map(|dir| dir.join(&name))
+    .collect()
+}
+
+/// The directories [`shipped_cache_paths_for`] looks in, in order:
+/// `snapshot_dir` (`$SYSMLV2_LIB_SNAPSHOT_DIR`), `prepared` beside the
+/// library directory, `prepared` beside the executable.
+fn shipped_dirs(
+    snapshot_dir: Option<PathBuf>,
+    library: Option<&Path>,
+    exe: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let beside = |path: Option<&Path>| Some(path?.parent()?.join("prepared"));
+    snapshot_dir
+        .into_iter()
+        .chain(beside(library))
+        .chain(beside(exe.as_deref()))
+        .collect()
+}
+
+/// The directory the library cache lives in: `$SYSMLV2_CACHE_DIR`, else
+/// `$XDG_CACHE_HOME/sysmlv2`, else `$HOME/.cache/sysmlv2`; on Windows, which
+/// sets neither of the last two, `%LOCALAPPDATA%\sysmlv2`, else
+/// `%USERPROFILE%\.cache\sysmlv2`. `None` when no base directory can be
+/// determined.
+pub fn default_cache_dir() -> Option<PathBuf> {
+    cache_dir_from(|name| std::env::var_os(name), cfg!(windows))
+}
+
+/// [`default_cache_dir`] over the variables `var` answers, on Windows when
+/// `windows`.
+fn cache_dir_from(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    windows: bool,
+) -> Option<PathBuf> {
+    let under = |name: &str, tail: &[&str]| {
+        var(name).map(|base| tail.iter().fold(PathBuf::from(base), |p, s| p.join(s)))
+    };
+    under("SYSMLV2_CACHE_DIR", &[])
+        .or_else(|| under("XDG_CACHE_HOME", &["sysmlv2"]))
+        .or_else(|| under("HOME", &[".cache", "sysmlv2"]))
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("sysmlv2"))
-        })?;
-    Some(base.join(format!("stdlib-{key:016x}.libcache")))
+            windows
+                .then(|| under("LOCALAPPDATA", &["sysmlv2"]))
+                .flatten()
+        })
+        .or_else(|| {
+            windows
+                .then(|| under("USERPROFILE", &[".cache", "sysmlv2"]))
+                .flatten()
+        })
+}
+
+/// The recording path of the library keyed by `key` in the cache
+/// directory `dir`, `stdlib-<key>.libcache`; its complete snapshot is the
+/// `prepared` sibling.
+pub(crate) fn cache_path_in(dir: &Path, key: u64) -> PathBuf {
+    dir.join(format!("stdlib-{key:016x}.libcache"))
+}
+
+/// Default cache file path for a library keyed by `key`
+/// (`stdlib-<key>.libcache` under [`default_cache_dir`]); `None` when no base
+/// directory can be determined.
+pub fn default_cache_path(key: u64) -> Option<PathBuf> {
+    Some(cache_path_in(&default_cache_dir()?, key))
 }
 
 /// FNV-1a, 64-bit — tiny, dependency-free, deterministic across platforms.
-pub(crate) struct Fnv(u64);
+/// FNV-1a over bytes, folded eight bytes at a time: a snapshot is tens of
+/// megabytes, and the byte-at-a-time fold cost as much as decoding a
+/// fifth of it. A partial word is kept until the next bytes complete it,
+/// so the sum does not depend on how the bytes are fed (the streamed
+/// snapshot reader hashes what it takes, piece by piece); the tail is
+/// folded byte by byte at the end.
+pub(crate) struct Fnv {
+    hash: u64,
+    pending: [u8; 8],
+    pending_len: usize,
+}
+
+const FNV_PRIME: u64 = 0x100000001b3;
 
 impl Fnv {
     pub(crate) fn new() -> Fnv {
-        Fnv(0xcbf29ce484222325)
-    }
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
+        Fnv {
+            hash: 0xcbf29ce484222325,
+            pending: [0; 8],
+            pending_len: 0,
         }
     }
+    pub(crate) fn update(&mut self, mut bytes: &[u8]) {
+        if self.pending_len > 0 {
+            let take = bytes.len().min(8 - self.pending_len);
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
+            self.pending_len += take;
+            bytes = &bytes[take..];
+            if self.pending_len < 8 {
+                return;
+            }
+            self.fold(u64::from_le_bytes(self.pending));
+            self.pending_len = 0;
+        }
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.fold(u64::from_le_bytes(*chunk));
+        }
+        self.pending[..rest.len()].copy_from_slice(rest);
+        self.pending_len = rest.len();
+    }
+    #[inline]
+    fn fold(&mut self, word: u64) {
+        self.hash ^= word;
+        self.hash = self.hash.wrapping_mul(FNV_PRIME);
+    }
     pub(crate) fn finish(&self) -> u64 {
-        self.0
+        let mut hash = self.hash;
+        for &b in &self.pending[..self.pending_len] {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped-snapshot directories, in the order they are tried: the
+    /// given directory, `prepared` beside the library, `prepared` beside
+    /// the executable; a missing one is left out.
+    #[test]
+    fn shipped_snapshots_are_looked_for_beside_the_library_too() {
+        let p = PathBuf::from;
+        assert_eq!(
+            shipped_dirs(
+                Some(p("/s")),
+                Some(Path::new("/pkg/sysml.library")),
+                Some(p("/usr/bin/python3")),
+            ),
+            vec![p("/s"), p("/pkg/prepared"), p("/usr/bin/prepared")]
+        );
+        assert_eq!(
+            shipped_dirs(None, Some(Path::new("/pkg/sysml.library")), None),
+            vec![p("/pkg/prepared")]
+        );
+        assert_eq!(
+            shipped_dirs(None, None, Some(p("/opt/sysmlv2"))),
+            vec![p("/opt/prepared")]
+        );
+        let for_library = shipped_cache_paths_for(0x1234, Some(Path::new("/pkg/sysml.library")));
+        assert!(for_library.contains(&p("/pkg/prepared/stdlib-0000000000001234.libcache")));
+    }
+
+    /// A directory hashed once answers its key from its listing while no
+    /// file's length or modification time changed; a changed file is read
+    /// again and keys differently, and the same content keys the same.
+    #[test]
+    fn the_directory_key_is_answered_from_its_listing_until_a_file_changes() {
+        let dir = std::env::temp_dir().join(format!("sysmlv2-dirkey-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.sysml");
+        std::fs::write(&file, "standard library package L { part def A; }").unwrap();
+        let first = hash_library_dir(&dir).unwrap();
+        let mut files = vec![file.clone()];
+        files.sort();
+        let listing = file_stamps(&files).unwrap();
+        let keys = DIRECTORY_KEYS.get_or_init(Default::default);
+        assert_eq!(memoized_key(keys, &dir, &listing), Some(first));
+        assert_eq!(hash_library_dir(&dir).unwrap(), first);
+
+        std::fs::write(
+            &file,
+            "standard library package L { part def A; part def B; }",
+        )
+        .unwrap();
+        let changed = file_stamps(&files).unwrap();
+        assert_eq!(
+            memoized_key(keys, &dir, &changed),
+            None,
+            "the listing changed"
+        );
+        let second = hash_library_dir(&dir).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(memoized_key(keys, &dir, &changed), Some(second));
+
+        std::fs::write(&file, "standard library package L { part def A; }").unwrap();
+        assert_eq!(hash_library_dir(&dir).unwrap(), first, "keyed by content");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `SYSMLV2_CACHE_DIR` wins, then the two POSIX variables; on Windows,
+    /// which sets neither, the platform's own locations follow.
+    #[test]
+    fn the_cache_directory_falls_back_to_the_platforms_on_windows() {
+        let vars = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        let p = |s: &str| Some(PathBuf::from(s));
+        assert_eq!(
+            cache_dir_from(vars(&[("SYSMLV2_CACHE_DIR", "/c"), ("HOME", "/h")]), false),
+            p("/c")
+        );
+        assert_eq!(
+            cache_dir_from(vars(&[("XDG_CACHE_HOME", "/x"), ("HOME", "/h")]), false),
+            p("/x/sysmlv2")
+        );
+        assert_eq!(
+            cache_dir_from(vars(&[("HOME", "/h")]), false),
+            p("/h/.cache/sysmlv2")
+        );
+        assert_eq!(
+            cache_dir_from(
+                vars(&[("LOCALAPPDATA", "/l"), ("USERPROFILE", "/u")]),
+                false
+            ),
+            None,
+            "the platform locations are Windows's"
+        );
+        assert_eq!(
+            cache_dir_from(vars(&[("LOCALAPPDATA", "/l"), ("USERPROFILE", "/u")]), true),
+            p("/l/sysmlv2")
+        );
+        assert_eq!(
+            cache_dir_from(vars(&[("USERPROFILE", "/u")]), true),
+            p("/u/.cache/sysmlv2")
+        );
+        assert_eq!(
+            cache_dir_from(vars(&[("HOME", "/h"), ("LOCALAPPDATA", "/l")]), true),
+            p("/h/.cache/sysmlv2"),
+            "a set HOME keeps its place"
+        );
+        assert_eq!(cache_dir_from(vars(&[]), true), None);
+    }
+
+    /// The checksum does not depend on how the bytes are fed: any
+    /// chunking gives the one-shot sum, and an input under eight bytes
+    /// hashes as byte-wise FNV-1a does.
+    #[test]
+    fn the_checksum_is_the_same_however_the_bytes_are_fed() {
+        let bytes: Vec<u8> = (0..1000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        let one_shot = {
+            let mut h = super::Fnv::new();
+            h.update(&bytes);
+            h.finish()
+        };
+        for window in [1, 3, 7, 8, 9, 13, 64, 1000] {
+            let mut h = super::Fnv::new();
+            for chunk in bytes.chunks(window) {
+                h.update(chunk);
+            }
+            assert_eq!(h.finish(), one_shot, "window {window}");
+        }
+        let byte_wise = |bytes: &[u8]| {
+            let mut hash: u64 = 0xcbf29ce484222325;
+            for &b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash
+        };
+        for len in 0..8 {
+            let mut h = super::Fnv::new();
+            h.update(&bytes[..len]);
+            assert_eq!(h.finish(), byte_wise(&bytes[..len]), "{len} bytes");
+        }
+        let mut h = super::Fnv::new();
+        h.update(&bytes[..5]);
+        let mid = h.finish();
+        h.update(&bytes[5..]);
+        assert_eq!(
+            h.finish(),
+            one_shot,
+            "finishing midway reads the pending tail without consuming it"
+        );
+        assert_eq!(mid, byte_wise(&bytes[..5]));
     }
 }

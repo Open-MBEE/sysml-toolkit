@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::fmt::Write as _;
 use sysmlv2_cbor::{
     DeltaOptions, apply_delta_cbor, apply_delta_cbor_lenient, delta_canonical, delta_compact_cbor,
-    empty_base_digest, rebase_ids, state_digest,
+    empty_base_digest, rebase_ids, state_digest, state_digest_streamed,
 };
 use sysmlv2_parser::json::model_to_compact_json;
 use sysmlv2_parser::model::Model;
@@ -1116,4 +1116,71 @@ fn previous_id_scheme_refuses_elided_deltas_but_accepts_explicit_ids() {
             delta_canonical(&target).unwrap()
         );
     }
+}
+
+fn goldens() -> Vec<(String, Value)> {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../sysmlv2-parser/tests/goldens/expected");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("goldens/expected exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let v = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        out.push((path.file_name().unwrap().to_string_lossy().into_owned(), v));
+    }
+    assert!(out.len() >= 150, "corpus present");
+    out
+}
+
+/// The digest of a payload's elements taken in turn, each cloned out of it.
+fn streamed_digest(payload: &Value) -> Option<uuid::Uuid> {
+    let elements = payload.as_array().unwrap();
+    state_digest_streamed(elements.len(), |i| elements[i].clone()).ok()
+}
+
+#[test]
+fn a_digest_of_the_elements_in_turn_is_the_whole_arrays() {
+    let mut payloads = goldens();
+    // With its last element gone, a model refers outside itself.
+    let mut partial = compact_of(&[("m.sysml", BASE_UNIT)]);
+    partial.as_array_mut().unwrap().pop();
+    let described =
+        sysmlv2_cbor::describe(&sysmlv2_cbor::to_compact_cbor(&partial).unwrap()).unwrap();
+    assert!(described["externals"].as_u64().unwrap() > 0);
+    payloads.push(("a model missing an element".into(), partial));
+    payloads.push(("the empty model".into(), Value::Array(Vec::new())));
+    for (name, payload) in payloads {
+        let mut reversed = payload.clone();
+        reversed.as_array_mut().unwrap().reverse();
+        for payload in [payload, reversed] {
+            assert_eq!(
+                streamed_digest(&payload),
+                Some(state_digest(&payload).unwrap()),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_digest_of_the_elements_in_turn_refuses_what_the_whole_arrays_does_and_ids_spelled_otherwise() {
+    let model = compact_of(&[("m.sysml", BASE_UNIT)]);
+    let mut unknown = model.clone();
+    unknown[0]["@type"] = "NoSuchMetaclass".into();
+    assert!(state_digest(&unknown).is_err());
+    assert_eq!(streamed_digest(&unknown), None, "an unknown metaclass");
+    let mut twice = model.clone();
+    let first = twice[0].clone();
+    twice.as_array_mut().unwrap().push(first);
+    assert!(state_digest(&twice).is_err());
+    assert_eq!(streamed_digest(&twice), None, "an element twice");
+    // An id spelled in capitals, everywhere it is named: the whole
+    // array's digest takes it, and the digest in turn refuses it.
+    let id = model[0]["@id"].as_str().unwrap().to_owned();
+    let capitals =
+        serde_json::from_str::<Value>(&model.to_string().replace(&id, &id.to_uppercase())).unwrap();
+    assert!(state_digest(&capitals).is_ok());
+    assert_eq!(streamed_digest(&capitals), None, "an id in capitals");
 }

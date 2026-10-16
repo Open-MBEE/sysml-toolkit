@@ -1,5 +1,6 @@
 //! Conditional implementation capabilities, separate from the normative catalog.
 use super::PropertyError;
+use crate::metaclass::is_a;
 use crate::{
     json::{
         ClosurePolicy, DerivedValue, ElementRef, FeatureTypeIssue, FeatureTypeReport, Reference,
@@ -142,24 +143,99 @@ impl Stamp {
             && self.positional_ready == b.positional_redefinitions.is_some()
     }
 }
-struct Cached {
-    receiver: ElementRef,
-    stamp: Stamp,
-    report: FeatureTypeReport,
-}
-struct CachedFeatures {
-    receiver: ElementRef,
-    stamp: Stamp,
-    projections: crate::json::TypeFeatures,
-}
+/// The receivers whose type reports or variability verdicts a row keeps at
+/// most; past it the table starts over, so a long-lived model's row stays
+/// bounded.
+const KEPT_RECEIVERS: usize = 2048;
+/// The receivers whose type features — the larger certificate, a dozen
+/// element lists each — a row keeps at most.
+const KEPT_FEATURES: usize = 256;
+/// The certificates a sequence of checked reads shares: each receiver's
+/// complete type report, type features and usage-variability verdict, all
+/// made at the model state `stamp` records — one stale stamp stales them
+/// all — and the namespace row; a work allowance runs over the reads of
+/// one row, or of one public read (see [`ResolvedModel::property`]).
 #[derive(Default)]
-pub(super) struct CheckedRow {
+pub(in crate::json) struct CheckedRow {
     namespaces: crate::json::operations::namespaces::NamespaceRow,
-    cached: Option<Cached>,
-    features: Option<CachedFeatures>,
+    /// The state the kept certificates were made at; `None` while none are.
+    stamp: Option<Stamp>,
+    /// The certificates by receiver row.
+    cached: crate::layered::IdMap<usize, FeatureTypeReport>,
+    features: crate::layered::IdMap<usize, crate::json::TypeFeatures>,
+    variability: crate::layered::IdMap<usize, Result<bool, crate::json::UsageVariabilityIssue>>,
     steps: usize,
 }
+#[cfg(test)]
+thread_local! {
+    static CERTIFICATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// How many type reports, type features and variability verdicts rows have
+/// made on this thread.
+#[cfg(test)]
+pub(in crate::json) fn certificates_made() -> usize {
+    CERTIFICATES.with(|c| c.get())
+}
+fn note_certificate() {
+    #[cfg(test)]
+    CERTIFICATES.with(|c| c.set(c.get() + 1));
+}
 impl CheckedRow {
+    /// Begin a public read on a kept row: its certificates stay, its work
+    /// allowance starts over.
+    pub(in crate::json) fn begin(&mut self) {
+        self.steps = 0;
+    }
+    /// Drop every kept certificate unless the model is still at the state
+    /// they were made at.
+    fn keep_current(&mut self, r: &ResolvedModel) {
+        if !self.stamp.as_ref().is_some_and(|stamp| stamp.current(r)) {
+            self.cached.clear();
+            self.features.clear();
+            self.variability.clear();
+            self.stamp = None;
+        }
+    }
+    /// Stamp the row for a certificate made just now: the stamp it has when
+    /// the making left the model where it was, else — the making planned
+    /// or materialized something — a new one, and the earlier certificates
+    /// go with the state they were made at.
+    fn stamp_now(&mut self, r: &mut ResolvedModel) {
+        if !self.stamp.as_ref().is_some_and(|stamp| stamp.current(r)) {
+            self.cached.clear();
+            self.features.clear();
+            self.variability.clear();
+            self.stamp = Some(Stamp::capture(r));
+        }
+    }
+    /// `Usage::mayTimeVary` of `e` — `isVariable` reads the same verdict —
+    /// from the kept verdict, else certified now and kept unless the
+    /// allowance ran out on it; a read charges one step.
+    fn usage_variability(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<bool, crate::json::UsageVariabilityIssue> {
+        self.steps = self.steps.saturating_add(1);
+        if self.steps > crate::eval::MAX_STEPS {
+            return Err(crate::json::UsageVariabilityIssue::WorkLimit);
+        }
+        self.keep_current(r);
+        if let Some(&value) = self.variability.get(&e.0) {
+            return value;
+        }
+        let report = r.usage_variability_report_with_budget(e, self.steps);
+        self.steps = report.steps;
+        if report.value != Err(crate::json::UsageVariabilityIssue::WorkLimit) {
+            self.stamp_now(r);
+            if self.variability.len() >= KEPT_RECEIVERS {
+                self.variability.clear();
+            }
+            self.variability.insert(e.0, report.value);
+            note_certificate();
+        }
+        report.value
+    }
     pub(in crate::json) fn read_namespace(
         &mut self,
         r: &mut ResolvedModel,
@@ -193,20 +269,17 @@ impl CheckedRow {
         if self.steps > crate::eval::MAX_STEPS {
             return Err(crate::json::TypeInputIssue::WorkLimit);
         }
-        if !self
-            .features
-            .as_ref()
-            .is_some_and(|c| c.receiver == receiver && c.stamp.current(r))
-        {
-            self.features = None;
+        self.keep_current(r);
+        if !self.features.contains_key(&receiver.0) {
             let report = r.type_feature_report_with_budget(receiver, self.steps);
             self.steps = report.steps;
             let projections = report.projections?;
-            self.features = Some(CachedFeatures {
-                receiver,
-                stamp: Stamp::capture(r),
-                projections,
-            });
+            self.stamp_now(r);
+            if self.features.len() >= KEPT_FEATURES {
+                self.features.clear();
+            }
+            self.features.insert(receiver.0, projections);
+            note_certificate();
         }
         Ok(())
     }
@@ -224,11 +297,10 @@ impl CheckedRow {
             }
         };
         self.ensure_features(r, receiver).map_err(error)?;
-        let p = &self
+        let p = self
             .features
-            .as_ref()
-            .expect("complete current certificate")
-            .projections;
+            .get(&receiver.0)
+            .expect("complete current certificate");
         let refs = match declaration {
             "Core-Types-Type-input" => &p.inputs,
             "Core-Types-Type-output" => &p.outputs,
@@ -272,6 +344,12 @@ impl CheckedRow {
     ) -> Option<Result<serde_json::Value, PropertyError>> {
         if effective.id == "Root-Elements-Element-ownedRelationship" {
             return Some(self.owned_relationships(r, e));
+        }
+        if matches!(
+            effective.id,
+            "Core-Features-Feature-isConstant" | "Core-Features-TypeFeaturing-featureOfType"
+        ) {
+            r.make_deferred_implied();
         }
         if effective.id == "Core-Features-Feature-isConstant" {
             if let Some(report) = r.canonical_end_constant_with_budget(e, self.steps) {
@@ -416,11 +494,12 @@ impl CheckedRow {
         {
             return Err(PropertyError::Approximate);
         }
+        // These read the implied relationships without making them: a
+        // deferred demand is met first, as for any derived read.
+        r.make_deferred_implied();
         if effective.id == "Systems-DefinitionAndUsage-Usage-mayTimeVary" {
-            let report = r.usage_variability_report_with_budget(e, self.steps);
-            self.steps = report.steps;
-            return report
-                .value
+            return self
+                .usage_variability(r, e)
                 .map(DerivedValue::Bool)
                 .map_err(PropertyError::IncompleteUsageVariability);
         }
@@ -458,9 +537,8 @@ impl CheckedRow {
                 .map_err(PropertyError::IncompleteFunctionResult)?;
             let features = &self
                 .features
-                .as_ref()
+                .get(&e.0)
                 .expect("complete current certificate")
-                .projections
                 .features;
             self.steps = self.steps.saturating_add(features.len()).saturating_add(12);
             if self.steps > crate::eval::MAX_STEPS {
@@ -472,9 +550,9 @@ impl CheckedRow {
                 .iter()
                 .copied()
                 .find(|f| {
-                    r.b.elements[f.0].owning_relationship.is_some_and(|m| {
-                        crate::metaclass::conforms(r.b.elements[m].ty, "ReturnParameterMembership")
-                    })
+                    r.b.elements[f.0]
+                        .owning_relationship
+                        .is_some_and(|m| is_a!(r.b.elements[m], "ReturnParameterMembership"))
                 })
                 .ok_or(PropertyError::MissingRequiredValue)?;
             validate_references(r, effective, &[result])?;
@@ -575,27 +653,19 @@ impl CheckedRow {
                 FeatureTypeIssue::UnsupportedProjection,
             ));
         }
-        if !self
-            .cached
-            .as_ref()
-            .is_some_and(|v| v.receiver == e && v.stamp.current(r))
-        {
-            self.cached = None;
+        self.keep_current(r);
+        if !self.cached.contains_key(&e.0) {
             let report = r.feature_type_report_with_budget(e, self.steps);
             self.steps = report.steps;
             self.charge(0)?;
-            let stamp = Stamp::capture(r);
-            self.cached = Some(Cached {
-                receiver: e,
-                stamp,
-                report,
-            });
+            self.stamp_now(r);
+            if self.cached.len() >= KEPT_RECEIVERS {
+                self.cached.clear();
+            }
+            self.cached.insert(e.0, report);
+            note_certificate();
         }
-        let report = &self
-            .cached
-            .as_ref()
-            .expect("established current report")
-            .report;
+        let report = self.cached.get(&e.0).expect("established current report");
         let refs: Result<&[ElementRef], FeatureTypeIssue> = match effective.id {
             "Core-Features-Feature-type"
             | "Systems-DefinitionAndUsage-Usage-definition"
@@ -775,6 +845,81 @@ mod tests {
         assert!(r.property(f, "result").is_ok());
         assert!(r.property(call, "argument").is_ok());
     }
+    /// The public reads share one kept row: a receiver's certificate answers
+    /// its later reads of the same or another type-dependent property, a
+    /// stale stamp drops every certificate before the next is made, and the
+    /// work allowance starts over with each public read.
+    #[test]
+    fn public_reads_keep_a_receivers_certificate_between_calls() {
+        let mut r = fixture(
+            "function F specializes Performances::Evaluation; \
+             expr f : F subsets Performances::evaluations; \
+             expr g : F subsets Performances::evaluations;",
+        );
+        full(&mut r);
+        let f = r.resolve_qualified("f").unwrap();
+        let g = r.resolve_qualified("g").unwrap();
+        let before = certificates_made();
+        let first = r.property(f, "type").unwrap();
+        assert_eq!(certificates_made(), before + 1);
+        assert_eq!(r.property(f, "type").unwrap(), first);
+        assert_eq!(
+            certificates_made(),
+            before + 1,
+            "the kept certificate answered"
+        );
+        assert!(r.property(g, "type").is_ok());
+        assert_eq!(certificates_made(), before + 2);
+        assert_eq!(r.checked_row.cached.len(), 2);
+        assert_eq!(r.property(f, "type").unwrap(), first);
+        assert_eq!(certificates_made(), before + 2, "both receivers are kept");
+        // A stale stamp drops every certificate; the read makes its own again.
+        r.checked_row.stamp.as_mut().unwrap().len += 1;
+        assert_eq!(r.property(f, "type").unwrap(), first);
+        assert_eq!(certificates_made(), before + 3);
+        assert_eq!(r.checked_row.cached.len(), 1);
+        // The allowance is per public read, not per row.
+        r.checked_row.steps = crate::eval::MAX_STEPS;
+        assert_eq!(r.property(f, "type").unwrap(), first);
+        assert!(r.checked_row.steps < crate::eval::MAX_STEPS);
+        // The derived-exact read shares the row.
+        assert_eq!(certificates_made(), before + 3);
+        assert!(r.derived_exact(f, "type").is_ok());
+        assert_eq!(certificates_made(), before + 3);
+    }
+    /// A usage's variability verdict is kept too: `mayTimeVary` and
+    /// `isVariable` read one verdict, and a second read of either costs a
+    /// step, not a certification.
+    #[test]
+    fn public_reads_keep_a_usages_variability_verdict() {
+        let mut model = Model::new();
+        model.add_source("usage.sysml", "ref x; ref y;");
+        let mut r = ResolvedModel::build(&model);
+        full(&mut r);
+        let x = r.resolve_qualified("x").unwrap();
+        let y = r.resolve_qualified("y").unwrap();
+        let before = certificates_made();
+        assert_eq!(r.property(x, "mayTimeVary"), Ok(serde_json::json!(false)));
+        assert_eq!(certificates_made(), before + 1);
+        assert_eq!(r.property(x, "isVariable"), Ok(serde_json::json!(false)));
+        assert_eq!(r.property(x, "mayTimeVary"), Ok(serde_json::json!(false)));
+        assert_eq!(
+            certificates_made(),
+            before + 1,
+            "one verdict serves both reads"
+        );
+        assert_eq!(r.property(y, "isVariable"), Ok(serde_json::json!(false)));
+        assert_eq!(certificates_made(), before + 2);
+        assert_eq!(r.checked_row.variability.len(), 2);
+        r.checked_row.stamp.as_mut().unwrap().len += 1;
+        assert_eq!(r.property(x, "isVariable"), Ok(serde_json::json!(false)));
+        assert_eq!(
+            certificates_made(),
+            before + 3,
+            "a stale verdict is made again"
+        );
+        assert_eq!(r.checked_row.variability.len(), 1);
+    }
     #[test]
     fn input_checked_row_budget_is_cumulative_and_retryable() {
         let mut r = fixture("function F { in a; }");
@@ -833,7 +978,7 @@ mod tests {
         assert!(row.read(&mut r, e, "function").unwrap().is_ok());
         let plan = r.b.positional_redefinitions.replace(Default::default());
         r.b.positional_planning = true;
-        assert!(!row.cached.as_ref().unwrap().stamp.current(&r));
+        assert!(!row.stamp.as_ref().unwrap().current(&r));
         assert_eq!(
             row.read(&mut r, e, "function").unwrap(),
             Err(PropertyError::IncompleteTypeProjection(
@@ -1354,7 +1499,7 @@ mod owned_source_tests {
                     r.b.elements[y.0].id = r.element_id(x);
                 }
                 _ => {
-                    r.b.elements[x.0].ty = "Package";
+                    r.b.elements[x.0].set_ty("Package");
                 }
             }
             assert!(r.property(e, "featureOfType").is_err(), "case {kind}");

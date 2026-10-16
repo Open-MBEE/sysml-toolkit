@@ -3,8 +3,9 @@
 //! contextual resolver until those dependencies share a complete recorded plan.
 
 use super::{Builder, LookupAccess, LookupResult, MissTable};
-use crate::layered::{LayeredMap, LayeredVec};
-use crate::metaclass::conforms;
+use crate::bulk::{Bytes, Flags, IndexLists, Ints};
+use crate::layered::{IdMap, LayeredMap, LayeredVec};
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -49,6 +50,89 @@ pub(super) struct Graph {
     /// Root misses behind each memoized inherited projection (`inherited`),
     /// complete or not.
     collected_misses: MissTable,
+}
+
+/// A frozen graph as a snapshot carries it: every table as columns over
+/// the element and scope indices of the rows the graph was built on, each
+/// map as its rows sorted by key, so the same graph is written the same way
+/// every time. The id map is left out — the rows carry their ids already —
+/// and made from them when the graph is read (see [`Graph::from_wire`]).
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GraphWire {
+    elements: usize,
+    scopes: usize,
+    has_ordered_headers: bool,
+    /// The scopes with a node, each with its bases (scopes), its owned
+    /// Memberships and its owned Features (rows): three lists under one
+    /// sequence of scopes.
+    node_bases: IndexLists,
+    node_owned: IndexLists,
+    node_features: IndexLists,
+    /// The Memberships the nodes own: each one's row, its member's row, the
+    /// member's scope (the scope count for none), its visibility, whether
+    /// it is an alias, and how many of `member_names` are its names.
+    member_rows: Ints,
+    member_targets: Ints,
+    member_scopes: Ints,
+    member_visibility: Bytes,
+    member_aliases: Flags,
+    member_name_counts: Ints,
+    member_names: Vec<String>,
+    /// The header bases by scope.
+    header_bases: IndexLists,
+    /// The rows that are Features.
+    features: Ints,
+    /// The recorded redefinition targets by redefining Feature, and the
+    /// Features whose targets are left to the resolver.
+    redefinitions: IndexLists,
+    redefinitions_open: Ints,
+    /// The memoized inherited projections by scope and the scopes whose
+    /// projection is memoized as unavailable; the suppressed Memberships by
+    /// scope.
+    inherited: IndexLists,
+    inherited_open: Ints,
+    suppressed: IndexLists,
+    /// The implied root names the nodes take as absent, sorted.
+    absent_roots: Vec<String>,
+}
+
+#[cfg(test)]
+impl GraphWire {
+    /// The names of the tables in which `other` differs from this wire.
+    pub(crate) fn differences(&self, other: &Self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        macro_rules! compare {
+            ($($field:ident),*) => {
+                $(if self.$field != other.$field {
+                    names.push(stringify!($field));
+                })*
+            };
+        }
+        compare!(
+            elements,
+            scopes,
+            has_ordered_headers,
+            node_bases,
+            node_owned,
+            node_features,
+            member_rows,
+            member_targets,
+            member_scopes,
+            member_visibility,
+            member_aliases,
+            member_name_counts,
+            member_names,
+            header_bases,
+            features,
+            redefinitions,
+            redefinitions_open,
+            inherited,
+            inherited_open,
+            suppressed,
+            absent_roots
+        );
+        names
+    }
 }
 
 /// Note the misses behind the graph entry `key` of `table` among `misses`.
@@ -247,7 +331,7 @@ impl Graph {
     /// A single-base chain with no redeclarations, aliases or redefinitions
     /// cannot change when selection moves before name matching.
     pub(super) fn needed(b: &Builder) -> bool {
-        let has_redefinition = b.elements.iter().any(|e| conforms(e.ty, "Redefinition"));
+        let has_redefinition = b.elements.iter().any(|e| is_a!(e, "Redefinition"));
         let candidate = b.scopes.iter().any(|s| {
             !s.aliases.is_empty()
                 || s.bases.len() > 1
@@ -256,7 +340,7 @@ impl Graph {
                         b.elements[owner]
                             .owned_relationships
                             .iter()
-                            .any(|&r| conforms(b.elements[r].ty, "Membership"))
+                            .any(|&r| is_a!(b.elements[r], "Membership"))
                     }))
         });
         has_redefinition
@@ -276,9 +360,9 @@ impl Graph {
         }) {
             return None;
         }
-        if !conforms(b.elements[owner].ty, "Type")
-            || conforms(b.elements[owner].ty, "Definition")
-            || conforms(b.elements[owner].ty, "Usage")
+        if !is_a!(b.elements[owner], "Type")
+            || is_a!(b.elements[owner], "Definition")
+            || is_a!(b.elements[owner], "Usage")
             || !scope.imports.is_empty()
             || !scope.member_imports.is_empty()
             || !scope.filters.is_empty()
@@ -304,8 +388,8 @@ impl Graph {
                 .and_then(|v| v.as_bool())
                 == Some(true)
                 || b.elements[feature].owning_relationship.is_some_and(|r| {
-                    conforms(b.elements[r].ty, "ParameterMembership")
-                        || conforms(b.elements[r].ty, "ReturnParameterMembership")
+                    is_a!(b.elements[r], "ParameterMembership")
+                        || is_a!(b.elements[r], "ReturnParameterMembership")
                 })
         }) {
             return None;
@@ -379,14 +463,14 @@ impl Graph {
         graph.nodes.resize(b.scopes.len(), None);
         graph.element_count = b.elements.len();
         for (e, element) in b.elements.iter().enumerate().skip(start_element) {
-            if conforms(element.ty, "Feature") {
+            if is_a!(element, "Feature") {
                 graph.features.insert(e, ());
             }
-            let positional_source = conforms(element.ty, "Usage")
+            let positional_source = is_a!(element, "Usage")
                 || element.props.get("isEnd").and_then(|v| v.as_bool()) == Some(true)
                 || element.owning_relationship.is_some_and(|r| {
-                    conforms(b.elements[r].ty, "ParameterMembership")
-                        || conforms(b.elements[r].ty, "ReturnParameterMembership")
+                    is_a!(b.elements[r], "ParameterMembership")
+                        || is_a!(b.elements[r], "ReturnParameterMembership")
                 });
             let positional_source = positional_source
                 || element
@@ -401,7 +485,7 @@ impl Graph {
             };
             let mut misses = Vec::new();
             for &r in &element.owned_relationships {
-                if conforms(b.elements[r].ty, "Redefinition") {
+                if is_a!(b.elements[r], "Redefinition") {
                     note(&mut misses, &b.ref_misses, r);
                     match (targets.as_mut(), target(r, "redefinedFeature")) {
                         (Some(targets), Some(t)) => targets.push(t),
@@ -419,10 +503,10 @@ impl Graph {
         // imports, implied heritage or positional lookup. Freeze their stored
         // explicit endpoints with the rest of this pass's snapshot.
         for (s, scope) in b.scopes.iter().enumerate().skip(start_scope) {
-            if let Some(owner) = scope.owner.filter(|&e| conforms(b.elements[e].ty, "Type")) {
+            if let Some(owner) = scope.owner.filter(|&e| is_a!(b.elements[e], "Type")) {
                 let mut misses = Vec::new();
                 for &r in &b.elements[owner].owned_relationships {
-                    if conforms(b.elements[r].ty, "Specialization") {
+                    if is_a!(b.elements[r], "Specialization") {
                         note(&mut misses, &b.ref_misses, r);
                     }
                 }
@@ -430,7 +514,7 @@ impl Graph {
                     .owned_relationships
                     .iter()
                     .copied()
-                    .filter(|&r| conforms(b.elements[r].ty, "Specialization"))
+                    .filter(|&r| is_a!(b.elements[r], "Specialization"))
                     .map(|r| {
                         [
                             "general",
@@ -461,9 +545,8 @@ impl Graph {
                 let mut inputs = implied.clone();
                 for &r in &b.elements[owner].owned_relationships {
                     let relation = &b.elements[r];
-                    if conforms(relation.ty, "Specialization")
-                        || (conforms(relation.ty, "Membership")
-                            && !conforms(relation.ty, "OwningMembership"))
+                    if is_a!(relation, "Specialization")
+                        || (is_a!(relation, "Membership") && !is_a!(relation, "OwningMembership"))
                     {
                         note(&mut inputs, &b.ref_misses, r);
                     }
@@ -480,7 +563,7 @@ impl Graph {
             let mut written_bases = 0;
             for &r in &b.elements[owner].owned_relationships {
                 let relation = &b.elements[r];
-                if conforms(relation.ty, "Specialization") {
+                if is_a!(relation, "Specialization") {
                     written_bases += 1;
                     let general = [
                         "general",
@@ -503,7 +586,7 @@ impl Graph {
                         complete = false;
                     }
                 }
-                if !conforms(relation.ty, "Membership") {
+                if !is_a!(relation, "Membership") {
                     continue;
                 }
                 let visibility = match relation.props.get("visibility").and_then(|v| v.as_str()) {
@@ -511,7 +594,7 @@ impl Graph {
                     Some("protected") => LookupAccess::Protected,
                     _ => LookupAccess::Public,
                 };
-                let member = if conforms(relation.ty, "OwningMembership") {
+                let member = if is_a!(relation, "OwningMembership") {
                     relation.children.first().copied()
                 } else {
                     target(r, "memberElement")
@@ -520,21 +603,21 @@ impl Graph {
                     complete = false;
                     continue;
                 };
-                let alias = !conforms(relation.ty, "OwningMembership");
-                let props = if alias {
-                    &relation.props
-                } else {
-                    &b.elements[member].props
-                };
-                let keys = if alias {
+                let alias = !is_a!(relation, "OwningMembership");
+                let names: Vec<String> = if alias {
                     ["memberName", "memberShortName"]
+                        .iter()
+                        .filter_map(|key| relation.props.get(key).and_then(|v| v.as_str()))
+                        .map(str::to_owned)
+                        .collect()
                 } else {
-                    ["declaredName", "declaredShortName"]
+                    let (name, short) = b.elements[member].props.declared_names();
+                    [name, short]
+                        .into_iter()
+                        .flatten()
+                        .map(str::to_owned)
+                        .collect()
                 };
-                let names: Vec<_> = keys
-                    .iter()
-                    .filter_map(|key| props.get(key).and_then(|v| v.as_str()).map(str::to_owned))
-                    .collect();
                 // Unnamed Features can acquire effective names through several
                 // specialization rules. Leave those contexts to the resolver.
                 if names.is_empty() && graph.features.contains_key(&member) {
@@ -637,7 +720,7 @@ impl Graph {
                     element
                         .owned_relationships
                         .iter()
-                        .any(|&r| conforms(b.elements[r].ty, "Redefinition"))
+                        .any(|&r| is_a!(b.elements[r], "Redefinition"))
                         && b.owner_elem(feature)
                             .and_then(|owner| b.elem_scope.get(&owner))
                             .is_some_and(|&scope| {
@@ -679,6 +762,282 @@ impl Graph {
         note_settled();
     }
 
+    /// The graph as a snapshot carries it (see [`GraphWire`]).
+    pub(super) fn to_wire(&self) -> GraphWire {
+        let scopes = self.nodes.len();
+        fn sorted<V>(map: &LayeredMap<usize, V>) -> Vec<(usize, &V)> {
+            let mut rows: Vec<(usize, &V)> = map.iter().map(|(&k, v)| (k, v)).collect();
+            rows.sort_unstable_by_key(|&(k, _)| k);
+            rows
+        }
+        // a table of lists as the lists it has and the keys of the rows
+        // without one
+        fn split<V>(
+            rows: Vec<(usize, &V)>,
+            list: impl Fn(&V) -> Option<&[usize]>,
+        ) -> (IndexLists, Ints) {
+            let mut lists = Vec::new();
+            let mut open = Vec::new();
+            for (k, v) in rows {
+                match list(v) {
+                    Some(values) => lists.push((k, values.to_vec())),
+                    None => open.push(k),
+                }
+            }
+            (lists.into(), Ints(open))
+        }
+        let nodes: Vec<(usize, &Node)> = (0..scopes)
+            .filter_map(|s| self.nodes[s].as_ref().map(|node| (s, node)))
+            .collect();
+        let node_lists = |list: fn(&Node) -> &[usize]| -> IndexLists {
+            nodes
+                .iter()
+                .map(|&(s, node)| (s, list(node).to_vec()))
+                .collect::<Vec<_>>()
+                .into()
+        };
+        let members = sorted(&self.members);
+        let (redefinitions, redefinitions_open) =
+            split(sorted(&self.redefinitions), |targets| targets.as_deref());
+        let (inherited, inherited_open) = split(sorted(&self.inherited), |rows| {
+            rows.as_deref().map(|rows| rows.as_slice())
+        });
+        let (suppressed, _) = split(sorted(&self.suppressed), |rows| Some(rows.as_slice()));
+        let (header_bases, _) = split(sorted(&self.header_bases), |bases| Some(bases.as_slice()));
+        let mut features: Vec<usize> = self.features.keys().copied().collect();
+        features.sort_unstable();
+        let mut absent_roots: Vec<String> = self.absent_roots.iter().cloned().collect();
+        absent_roots.sort_unstable();
+        GraphWire {
+            elements: self.element_count,
+            scopes,
+            has_ordered_headers: self.has_ordered_headers,
+            node_bases: node_lists(|node| node.bases.as_slice()),
+            node_owned: node_lists(|node| node.owned.as_slice()),
+            node_features: node_lists(|node| node.owned_features.as_slice()),
+            member_rows: Ints(members.iter().map(|&(r, _)| r).collect()),
+            member_targets: Ints(members.iter().map(|&(_, m)| m.target).collect()),
+            member_scopes: Ints(
+                members
+                    .iter()
+                    .map(|&(_, m)| m.scope.unwrap_or(scopes))
+                    .collect(),
+            ),
+            member_visibility: Bytes(members.iter().map(|&(_, m)| m.visibility as u8).collect()),
+            member_aliases: members
+                .iter()
+                .map(|&(_, m)| m.alias)
+                .collect::<Vec<bool>>()
+                .into(),
+            member_name_counts: Ints(members.iter().map(|&(_, m)| m.names.len()).collect()),
+            member_names: members
+                .iter()
+                .flat_map(|&(_, m)| m.names.iter().cloned())
+                .collect(),
+            header_bases,
+            features: Ints(features),
+            redefinitions,
+            redefinitions_open,
+            inherited,
+            inherited_open,
+            suppressed,
+            absent_roots,
+        }
+    }
+
+    /// The graph read back from its wire form for the rows of `b`; `None`
+    /// when the wire does not fit them — a row or scope count, an index or a
+    /// visibility the rows do not have, a table with a key twice, a node's
+    /// owned row or a memoized projection's row that is no Membership of the
+    /// graph — in which case the caller builds one. The id map is made from
+    /// the rows.
+    pub(super) fn from_wire(wire: GraphWire, b: &Builder) -> Option<Self> {
+        let elements = b.elements.len();
+        let scopes = b.scopes.len();
+        if wire.elements != elements || wire.scopes != scopes {
+            return None;
+        }
+        let fits_row = |i: usize| (i < elements).then_some(i);
+        let fits_scope = |i: usize| (i < scopes).then_some(i);
+        // keyed lists as a table: every key once, every index fitting
+        fn table<V>(
+            lists: IndexLists,
+            key: impl Fn(usize) -> Option<usize>,
+            value: impl Fn(usize) -> Option<usize>,
+            wrap: impl Fn(Vec<usize>) -> V,
+        ) -> Option<IdMap<usize, V>> {
+            let lists = lists.into_lists()?;
+            let mut table = IdMap::with_capacity_and_hasher(lists.len(), Default::default());
+            for (k, values) in lists {
+                if !values.iter().all(|&v| value(v).is_some()) {
+                    return None;
+                }
+                if table.insert(key(k)?, wrap(values)).is_some() {
+                    return None;
+                }
+            }
+            Some(table)
+        }
+        // the rows of a table without a list, once each
+        fn open<V: Clone>(
+            table: &mut IdMap<usize, V>,
+            keys: Ints,
+            key: impl Fn(usize) -> Option<usize>,
+            value: V,
+        ) -> Option<()> {
+            for k in keys.0 {
+                if table.insert(key(k)?, value.clone()).is_some() {
+                    return None;
+                }
+            }
+            Some(())
+        }
+        let n = wire.member_rows.0.len();
+        let aliases = wire.member_aliases.into_flags()?;
+        let name_count = wire
+            .member_name_counts
+            .0
+            .iter()
+            .try_fold(0usize, |sum, &c| sum.checked_add(c))?;
+        if wire.member_targets.0.len() != n
+            || wire.member_scopes.0.len() != n
+            || wire.member_visibility.0.len() != n
+            || aliases.len() != n
+            || wire.member_name_counts.0.len() != n
+            || name_count != wire.member_names.len()
+        {
+            return None;
+        }
+        let mut names = wire.member_names.into_iter();
+        let mut members = IdMap::with_capacity_and_hasher(n, Default::default());
+        let columns = wire
+            .member_rows
+            .0
+            .into_iter()
+            .zip(wire.member_targets.0)
+            .zip(wire.member_scopes.0)
+            .zip(wire.member_visibility.0)
+            .zip(aliases)
+            .zip(wire.member_name_counts.0);
+        for (((((r, target), scope), visibility), alias), count) in columns {
+            let visibility = match visibility {
+                0 => LookupAccess::Public,
+                1 => LookupAccess::Protected,
+                2 => LookupAccess::All,
+                _ => return None,
+            };
+            let member = Member {
+                target: fits_row(target)?,
+                scope: if scope == scopes {
+                    None
+                } else {
+                    Some(fits_scope(scope)?)
+                },
+                names: names.by_ref().take(count).collect(),
+                visibility,
+                alias,
+            };
+            if members.insert(fits_row(r)?, member).is_some() {
+                return None;
+            }
+        }
+        // the rows the lookups take as Memberships of the graph
+        let is_member = |r: usize| members.contains_key(&r).then_some(r);
+        let bases = wire.node_bases.into_lists()?;
+        let owned = wire.node_owned.into_lists()?;
+        let owned_features = wire.node_features.into_lists()?;
+        if bases.len() != owned.len() || bases.len() != owned_features.len() {
+            return None;
+        }
+        let mut nodes: Vec<Option<Node>> = vec![None; scopes];
+        for (((s, bases), (s2, owned)), (s3, owned_features)) in
+            bases.into_iter().zip(owned).zip(owned_features)
+        {
+            if s != s2 || s != s3 || fits_scope(s).is_none() || nodes[s].is_some() {
+                return None;
+            }
+            if !bases.iter().all(|&x| fits_scope(x).is_some())
+                || !owned.iter().all(|&x| is_member(x).is_some())
+                || !owned_features.iter().all(|&x| fits_row(x).is_some())
+            {
+                return None;
+            }
+            nodes[s] = Some(Node {
+                bases,
+                owned,
+                owned_features,
+            });
+        }
+        let mut redefinitions = table(wire.redefinitions, fits_row, fits_row, Some)?;
+        open(&mut redefinitions, wire.redefinitions_open, fits_row, None)?;
+        let mut inherited = table(wire.inherited, fits_scope, is_member, |rows| {
+            Some(Arc::new(rows))
+        })?;
+        open(&mut inherited, wire.inherited_open, fits_scope, None)?;
+        let suppressed = table(wire.suppressed, fits_scope, is_member, Arc::new)?;
+        let header_bases = table(wire.header_bases, fits_scope, fits_scope, |bases| bases)?;
+        let mut features =
+            IdMap::with_capacity_and_hasher(wire.features.0.len(), Default::default());
+        for e in wire.features.0 {
+            if features.insert(fits_row(e)?, ()).is_some() {
+                return None;
+            }
+        }
+        let mut ids = IdMap::with_capacity_and_hasher(elements, Default::default());
+        for (e, element) in b.elements.iter().enumerate() {
+            ids.insert(element.id, e);
+        }
+        Some(Self {
+            nodes: LayeredVec::over(Arc::new(nodes)),
+            members: LayeredMap::over(Arc::new(members)),
+            header_bases: LayeredMap::over(Arc::new(header_bases)),
+            has_ordered_headers: wire.has_ordered_headers,
+            features: LayeredMap::over(Arc::new(features)),
+            redefinitions: LayeredMap::over(Arc::new(redefinitions)),
+            inherited: LayeredMap::over(Arc::new(inherited)),
+            suppressed: LayeredMap::over(Arc::new(suppressed)),
+            ids: LayeredMap::over(Arc::new(ids)),
+            element_count: elements,
+            absent_roots: wire.absent_roots.into_iter().collect(),
+            ..Self::default()
+        })
+    }
+
+    /// Cover the rows appended to `b` since this graph was built, from row
+    /// `from`: the prepared library's own materialized rows (see
+    /// `Builder::seal_prefix_semantics`), which are relationships without
+    /// owned relationships of their own, so they join the id map and the
+    /// row count and no other table; a snapshot's wire then fits the rows
+    /// the library has, and a build on them reads the rows by id.
+    /// This graph read over its first `rows` rows only: the frozen graph of
+    /// a prepared library whose own materialized rows a build leaves out
+    /// (see `Builder::truncate_prefix_to_source_rows`). Its tables were made
+    /// over those rows before the materialized rows were added (see
+    /// [`Self::cover_rows`]), which added their ids alone; the ids stay,
+    /// as no source row names one.
+    pub(super) fn over_rows(&self, rows: usize) -> Self {
+        debug_assert!(rows <= self.element_count);
+        let mut graph = self.clone();
+        graph.element_count = rows;
+        graph
+    }
+
+    pub(super) fn cover_rows(&mut self, b: &Builder, from: usize) {
+        debug_assert_eq!(
+            self.element_count, from,
+            "the graph covers the rows before `from`"
+        );
+        debug_assert_eq!(self.nodes.len(), b.scopes.len(), "the rows add no scope");
+        for (e, element) in b.elements.iter().enumerate().skip(from) {
+            debug_assert!(
+                is_a!(element, "Relationship") && element.owned_relationships.is_empty(),
+                "row {e} is a materialized relationship"
+            );
+            self.ids.insert(element.id, e);
+        }
+        self.element_count = b.elements.len();
+    }
+
     pub(super) fn freeze(&mut self) {
         self.nodes.freeze();
         self.members.freeze();
@@ -698,6 +1057,14 @@ impl Graph {
     /// The rows by id, when the table is frozen whole.
     pub(super) fn frozen_ids(&self) -> Option<Arc<crate::layered::IdMap<uuid::Uuid, usize>>> {
         self.ids.frozen_arc().cloned()
+    }
+
+    /// [`Self::frozen_ids`] when the graph tables exactly `rows` rows.
+    pub(super) fn frozen_ids_over(
+        &self,
+        rows: usize,
+    ) -> Option<Arc<crate::layered::IdMap<uuid::Uuid, usize>>> {
+        (self.element_count == rows).then(|| self.frozen_ids())?
     }
 
     pub(super) fn has_replay_context(&mut self) -> bool {
@@ -853,20 +1220,23 @@ impl Graph {
                     }
                 }
             }
-            let mut counts = HashMap::new();
+            let mut inherited_features = HashSet::new();
             for &m in &rows {
                 let e = self.members.get(&m)?.target;
                 if self.features.contains_key(&e) {
-                    *counts.entry(e).or_insert(0usize) += 1;
+                    inherited_features.insert(e);
                 }
             }
+            // As the projection reducer: a Feature's Memberships are removed
+            // by another inherited Feature's redefinition closure or by an
+            // owned redefinition, never by another Membership of itself.
             let mut removed = HashSet::new();
-            for (&e, &count) in &counts {
+            for &e in &inherited_features {
                 let Some(closure) = self.closure(e, &mut here) else {
                     super::note_misses(read, &here);
                     return None;
                 };
-                removed.extend(closure.iter().copied().filter(|&t| t != e || count > 1));
+                removed.extend(closure.iter().copied().filter(|&t| t != e));
                 if !closure.is_disjoint(&owned_direct) {
                     removed.insert(e);
                 }
@@ -1228,5 +1598,83 @@ mod settle_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::{json::ResolvedModel, model::Model};
+
+    /// A frozen graph written as a snapshot carries it reads back as the
+    /// same graph, with the rows' ids; a wire whose indices, visibilities or
+    /// keys do not fit the rows is refused.
+    #[test]
+    fn a_graph_round_trips_through_its_wire_and_a_misfit_is_refused() {
+        let mut model = Model::new();
+        let parsed = model.add_source(
+            "graph.kerml",
+            "class A { feature x; protected feature y; } \
+             class B :> A { feature :>> x; alias z for x; } \
+             package N { class C; } alias D for N::C;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let r = ResolvedModel::build(&model);
+        let mut graph = Graph::build(&r.b);
+        graph.freeze();
+        let wire = graph.to_wire();
+        assert!(!wire.member_rows.0.is_empty(), "the model has Memberships");
+        assert!(
+            !wire.node_bases.clone().into_lists().unwrap().is_empty(),
+            "the model has nodes"
+        );
+        let read = Graph::from_wire(wire.clone(), &r.b).expect("the wire fits its rows");
+        assert_eq!(read.to_wire(), wire);
+        assert_eq!(read.ids.get(&r.b.elements[0].id), Some(&0));
+        assert_eq!(read.ids.iter().count(), r.b.elements.len());
+        let elements = r.b.elements.len();
+        let mut misfit = wire.clone();
+        misfit.member_targets.0[0] = elements;
+        assert!(
+            Graph::from_wire(misfit, &r.b).is_none(),
+            "a member beyond the rows"
+        );
+        let mut misfit = wire.clone();
+        misfit.member_visibility.0[0] = 3;
+        assert!(
+            Graph::from_wire(misfit, &r.b).is_none(),
+            "a visibility there is not"
+        );
+        let mut misfit = wire.clone();
+        misfit.features.0.push(misfit.features.0[0]);
+        assert!(Graph::from_wire(misfit, &r.b).is_none(), "a Feature twice");
+        let mut misfit = wire.clone();
+        misfit.member_name_counts.0[0] += 1;
+        assert!(
+            Graph::from_wire(misfit, &r.b).is_none(),
+            "names not covered"
+        );
+        let feature = wire.features.0[0];
+        assert!(!wire.member_rows.0.contains(&feature));
+        let mut misfit = wire.clone();
+        let mut owned = misfit.node_owned.into_lists().unwrap();
+        owned[0].1.push(feature);
+        misfit.node_owned = owned.into();
+        assert!(
+            Graph::from_wire(misfit, &r.b).is_none(),
+            "an owned row that is no Membership"
+        );
+        let mut misfit = wire.clone();
+        misfit.suppressed = vec![(0, vec![feature])].into();
+        assert!(
+            Graph::from_wire(misfit, &r.b).is_none(),
+            "a suppressed row that is no Membership"
+        );
+        let mut misfit = wire;
+        misfit.scopes += 1;
+        assert!(
+            Graph::from_wire(misfit, &r.b).is_none(),
+            "another scope count"
+        );
     }
 }

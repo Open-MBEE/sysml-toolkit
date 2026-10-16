@@ -633,9 +633,20 @@ fn qn_from_segments(segments: &[String]) -> QualifiedName {
 
 /// Root-qualified name from an ownership path: printed with `$::` so it
 /// cannot be shadowed by local members at the reference site.
+///
+/// Never called with an empty path: `$::` with nothing after it is a
+/// dangling global marker the parser rejects, and the unrooted empty
+/// name returned instead (`part x : ;`) does not parse either. The call
+/// sites filter empty paths out and spell the target another way; the
+/// guard here only keeps a missed site from printing the marker, and the
+/// debug assertion makes such a site fail in tests.
 fn qn_global(segments: &[String]) -> QualifiedName {
+    debug_assert!(
+        !segments.is_empty(),
+        "qn_global: empty path; filter it at the call site"
+    );
     QualifiedName {
-        is_global: true,
+        is_global: !segments.is_empty(),
         ..qn_from_segments(segments)
     }
 }
@@ -712,7 +723,9 @@ fn target_from_ref_string(s: &str) -> TargetRef {
 fn ref_segments_to_qn(segments: &[(String, bool)]) -> QualifiedName {
     let strings = |segs: &[(String, bool)]| segs.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
     match segments.first() {
-        Some((s, false)) if s == "$" => qn_global(&strings(&segments[1..])),
+        // A lone bare `$` is not a global marker — nothing follows it to
+        // qualify — so it keeps its place as an ordinary name segment.
+        Some((s, false)) if s == "$" && segments.len() > 1 => qn_global(&strings(&segments[1..])),
         _ => qn_from_segments(&strings(segments)),
     }
 }
@@ -1343,10 +1356,19 @@ impl<'a> Lifter<'a> {
     /// then a recovery spelling. Records an error and returns `None`
     /// when nothing names the id.
     fn name_for_id(&mut self, id: &'a str) -> Option<TargetRef> {
-        if let Some(segments) = self.qnames.get(id).cloned().flatten() {
+        // An empty path names nothing: `$::` alone is a dangling global
+        // marker that does not parse. Fall through to the strategies
+        // below, which always spell something.
+        if let Some(segments) = self
+            .qnames
+            .get(id)
+            .cloned()
+            .flatten()
+            .filter(|s| !s.is_empty())
+        {
             return Some(TargetRef::Name(qn_global(&segments)));
         }
-        if let Some(segments) = self.extra_names.get(id) {
+        if let Some(segments) = self.extra_names.get(id).filter(|s| !s.is_empty()) {
             return Some(TargetRef::Name(qn_global(segments)));
         }
         // Unnameable ancestry (anonymous parents): fall back to the longest
@@ -1405,10 +1427,11 @@ impl<'a> Lifter<'a> {
             }
             let id = ref_id(v)?;
             if links.is_empty() {
-                // First link: an absolute path keeps it unambiguous.
-                if let Some(segments) = self.qname_of(id) {
+                // First link: an absolute path keeps it unambiguous. An
+                // empty path is not a path — `$::` alone does not parse.
+                if let Some(segments) = self.qname_of(id).filter(|s| !s.is_empty()) {
                     links.push(qn_global(&segments));
-                } else if let Some(segments) = self.extra_names.get(id) {
+                } else if let Some(segments) = self.extra_names.get(id).filter(|s| !s.is_empty()) {
                     links.push(qn_global(segments));
                 } else if let Some(name) = self.unresolved_names.get(id) {
                     // A dangling link id with a recovery annotation (the
@@ -4102,6 +4125,91 @@ mod tests {
             "{:?}",
             u.detail
         );
+    }
+}
+
+/// Empty name paths and bare `$` markers: a reference whose only rooted
+/// spelling would be `$::` with nothing after it falls through to another
+/// spelling, so the lifted text parses. None of the lift's own name maps
+/// produce an empty path; these guard an external caller's map.
+#[cfg(test)]
+mod empty_path_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `part x : <target>;` under a root namespace.
+    fn typed_by(target: Value) -> Value {
+        json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+             "ownedRelatedElement":[{"@id":"p"}],"memberElement":{"@id":"p"}},
+            {"@id":"p","@type":"PartUsage","declaredName":"x",
+             "owningRelationship":{"@id":"m"},"ownedRelationship":[{"@id":"ft"}]},
+            {"@id":"ft","@type":"FeatureTyping","owningRelatedElement":{"@id":"p"},
+             "typedFeature":{"@id":"p"},"type":target,"general":target}
+        ])
+    }
+
+    /// Lift, print, and require text without any `$::` that parses.
+    fn lift_and_parse(document: &Value, names: &HashMap<String, Vec<String>>) -> String {
+        let lifted = from_compact_json_with_names(document, names).unwrap();
+        let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+        assert!(!text.contains("$::"), "no global marker expected: {text}");
+        let parsed = sysmlv2_syntax::parser::parse_source(&text);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "lifted text must parse: {text} {:?}",
+            parsed.diagnostics
+        );
+        text
+    }
+
+    /// An `extra_names` entry with an empty path names nothing. Rooting it
+    /// would print a bare `$::`; the reference falls through to a spelling
+    /// instead.
+    #[test]
+    fn empty_extra_name_path_does_not_print_a_bare_global_marker() {
+        let mut names = HashMap::new();
+        names.insert("outside".to_string(), Vec::<String>::new());
+        lift_and_parse(&typed_by(json!({"@id":"outside"})), &names);
+    }
+
+    /// A decoded `@ref` of a lone bare `$` has nothing to root; it stays an
+    /// ordinary name segment, quoted.
+    #[test]
+    fn lone_bare_dollar_ref_is_an_ordinary_name() {
+        let text = lift_and_parse(&typed_by(json!({"@ref":"$"})), &HashMap::new());
+        assert!(text.contains("'$'"), "{text}");
+    }
+
+    /// The first link of an owned feature chain is spelled from its path
+    /// too; an empty one must not print `$::` ahead of the chain.
+    #[test]
+    fn empty_first_chain_link_path_does_not_print_a_bare_global_marker() {
+        let document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+             "ownedRelatedElement":[{"@id":"p"}],"memberElement":{"@id":"p"}},
+            {"@id":"p","@type":"PartUsage","declaredName":"x",
+             "owningRelationship":{"@id":"m"},"ownedRelationship":[{"@id":"sub"}]},
+            {"@id":"sub","@type":"Subsetting","owningRelatedElement":{"@id":"p"},
+             "subsettingFeature":{"@id":"p"},"subsettedFeature":{"@id":"cf"},
+             "general":{"@id":"cf"},"specific":{"@id":"p"},
+             "ownedRelatedElement":[{"@id":"cf"}]},
+            {"@id":"cf","@type":"Feature","owningRelationship":{"@id":"sub"},
+             "ownedRelationship":[{"@id":"fc1"},{"@id":"fc2"}]},
+            {"@id":"fc1","@type":"FeatureChaining","owningRelatedElement":{"@id":"cf"},
+             "chainingFeature":{"@id":"outside"}},
+            {"@id":"fc2","@type":"FeatureChaining","owningRelatedElement":{"@id":"cf"},
+             "chainingFeature":{"@id":"outside2"}}
+        ]);
+        let mut names = HashMap::new();
+        names.insert("outside".to_string(), Vec::<String>::new());
+        names.insert(
+            "outside2".to_string(),
+            vec!["Q".to_string(), "b".to_string()],
+        );
+        lift_and_parse(&document, &names);
     }
 }
 

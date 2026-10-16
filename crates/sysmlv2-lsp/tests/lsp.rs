@@ -26,6 +26,11 @@ impl Client {
     /// Start a server thread and complete the initialize handshake.
     /// `utf8` opts the client into the utf-8 position encoding.
     fn start(utf8: bool) -> (Client, InitializeResult) {
+        Client::start_with(utf8, None)
+    }
+
+    /// [`Self::start`] sending `options` as the `initializationOptions`.
+    fn start_with(utf8: bool, options: Option<serde_json::Value>) -> (Client, InitializeResult) {
         let (server_side, client_side) = Connection::memory();
         let server = std::thread::spawn(move || sysmlv2_lsp::run(server_side));
         let mut client = Client {
@@ -44,6 +49,7 @@ impl Client {
                 }),
                 ..Default::default()
             },
+            initialization_options: options,
             ..Default::default()
         };
         let init: InitializeResult = client.request::<Initialize>(params);
@@ -169,6 +175,51 @@ fn initialize_negotiates_encoding_and_capabilities() {
         init.capabilities.position_encoding,
         Some(PositionEncodingKind::UTF8)
     );
+    client.shutdown();
+}
+
+/// `initializationOptions.publishDiagnostics: false`: no diagnostics
+/// reach the client — not the syntax tier's on open and change, nor the
+/// workspace tier's a debounce later — while requests answer as before.
+#[test]
+fn publish_diagnostics_false_publishes_nothing() {
+    let (mut client, _) = Client::start_with(
+        false,
+        Some(serde_json::json!({"publishDiagnostics": false})),
+    );
+    let uri = uri("quiet.sysml");
+    client.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: uri.clone(),
+            language_id: "sysml".to_string(),
+            version: 1,
+            text: "part def P {\n    part q\n}\n".to_string(),
+        },
+    });
+    client.notify::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: uri.clone(),
+            version: 2,
+        },
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "part def P {\n part q;\n}\n".to_string(),
+        }],
+    });
+    // The syntax tier publishes as the notifications arrive, the
+    // workspace tier a debounce (300 ms) after the change.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let published: Vec<Message> = client
+        .conn
+        .receiver
+        .try_iter()
+        .filter(|m| {
+            matches!(m, Message::Notification(n) if n.method == "textDocument/publishDiagnostics")
+        })
+        .collect();
+    assert!(published.is_empty(), "{published:?}");
+    assert!(client.format(&uri).is_some_and(|edits| !edits.is_empty()));
     client.shutdown();
 }
 
@@ -354,6 +405,8 @@ fn document_symbols_form_the_expected_tree() {
          \x20       attribute mass : Real [1];\n\
          \x20       part wheels : Wheel [4];\n\
          \x20       part ;\n\
+         \x20       attribute :>> mass = 2;\n\
+         \x20       part :>> wheels.hub : Real;\n\
          \x20   }\n\
          \x20   enum def Phase { halt; mid; }\n\
          }\n",
@@ -391,6 +444,9 @@ fn document_symbols_form_the_expected_tree() {
             ("wheels", SymbolKind::FIELD, Some(": Wheel [4]")),
             // Anonymous member: labeled by keyword, still present.
             ("«part»", SymbolKind::FIELD, None),
+            // An anonymous redefinition's detail leads with what it redefines.
+            ("«attribute»", SymbolKind::PROPERTY, Some(":>> mass")),
+            ("«part»", SymbolKind::FIELD, Some(":>> wheels.hub : Real")),
         ]
     );
 

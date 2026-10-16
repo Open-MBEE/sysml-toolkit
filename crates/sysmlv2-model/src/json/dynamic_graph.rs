@@ -6,9 +6,10 @@ use super::{
     semantic_batch::Plan,
     semantic_ownership::SemanticOwnership,
 };
+use crate::layered::IdSet;
 use crate::properties::Properties;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, OnceLock},
 };
 use uuid::Uuid;
@@ -28,7 +29,7 @@ pub(super) struct Snapshot {
     rows: crate::layered::Revision,
     names: crate::layered::Revision,
     pub typing: OnceLock<Arc<super::implied::RetainedTypings>>,
-    pub local_featuring: Option<Arc<HashSet<usize>>>,
+    pub local_featuring: Option<Arc<IdSet<usize>>>,
     pub local_featuring_outcome: Outcome,
     pub result_redefinition: Option<Arc<super::result_redefinition::Evidence>>,
     pub result_redefinition_outcome: Outcome,
@@ -59,7 +60,7 @@ impl Snapshot {
             result_redefinition_outcome: Outcome::NotApplicable,
         }
     }
-    pub(super) fn with_local(mut self, result: Result<HashSet<usize>, Refusal>) -> Self {
+    pub(super) fn with_local(mut self, result: Result<IdSet<usize>, Refusal>) -> Self {
         match result {
             Ok(owners) if !owners.is_empty() => {
                 self.local_featuring = Some(Arc::new(owners));
@@ -115,6 +116,11 @@ impl Snapshot {
 }
 impl Builder {
     /// Observation only. Construction routines retain their explicit static inputs.
+    /// Whether a dynamic plan is in effect (see [`Self::effective_dynamic_plan`]).
+    pub(crate) fn dynamic_plan_in_effect(&self) -> bool {
+        self.effective_dynamic_plan().is_some()
+    }
+
     pub(super) fn effective_dynamic_plan(&self) -> Option<&Plan> {
         if self.static_planning {
             return None;
@@ -200,7 +206,7 @@ impl Builder {
         if *steps > crate::eval::MAX_STEPS {
             return None;
         }
-        let mut values = super::implied::RetainedTypings::new();
+        let mut values = super::implied::RetainedTypings::default();
         for edge in plan.static_prefix.rows.iter().chain(&plan.tail) {
             if crate::metaclass::conforms(edge.kind, "FeatureTyping")
                 || crate::metaclass::conforms(edge.kind, "Subsetting")
@@ -216,7 +222,7 @@ impl Builder {
     }
     pub(super) fn prepare_dynamic_graph(
         &mut self,
-        reserved: &HashSet<Uuid>,
+        reserved: &IdSet<Uuid>,
         steps: &mut usize,
         produced_prefix: Option<Arc<super::semantic_batch::StaticPrefix>>,
     ) -> Result<Option<Plan>, Refusal> {
@@ -224,7 +230,7 @@ impl Builder {
         if *steps > crate::eval::MAX_STEPS {
             return Err(Refusal::WorkLimit);
         }
-        if !self.elements.iter().take(self.explicit_len()).any(|e| {
+        if !self.authored_rows().map(|i| &self.elements[i]).any(|e| {
             e.ty == "InvocationExpression"
                 || (self.graph_format == crate::model::GraphFormat::CanonicalV3
                     && matches!(e.ty, "ConstructorExpression" | "OperatorExpression"))
@@ -246,16 +252,7 @@ impl Builder {
                 return Err(Refusal::WorkLimit);
             }
         }
-        let names: HashMap<_, _> = self
-            .lib_qnames
-            .iter()
-            .map(|(id, parts)| (parts.join("::"), *id))
-            .chain(
-                self.external_implied_names
-                    .iter()
-                    .map(|(name, id)| (name.clone(), *id)),
-            )
-            .collect();
+        let names = self.implied_names();
         let metadata = self.metadata_association_generation.clone();
         let mut positional_workspace = super::positional::PositionalWorkspace::default();
         let prefix = if let Some(prefix) = produced_prefix {
@@ -311,7 +308,7 @@ pub(super) fn stage_dynamic_rows(
         if *steps > crate::eval::MAX_STEPS {
             return Err(Refusal::WorkLimit);
         }
-        if edge.owner >= b.explicit_len() || b.elements[edge.owner].id != edge.owner_id {
+        if !b.is_authored(edge.owner) || b.elements[edge.owner].id != edge.owner_id {
             return Err(Refusal::Stale);
         }
         let mut props = Properties::new();
@@ -333,6 +330,7 @@ pub(super) fn stage_dynamic_rows(
             .ok_or(Refusal::Stale)?;
         rows.push(Elem {
             ty: edge.kind,
+            meta: crate::metaclass::meta_of(edge.kind),
             id: edge.id,
             path: String::new(),
             path_parent: None,
@@ -552,9 +550,9 @@ impl Builder {
             return;
         };
         fn graph(
-            values: &HashMap<Uuid, Vec<Uuid>>,
+            values: &crate::id_graph::IdGraph,
             ids: &HashMap<Uuid, Uuid>,
-        ) -> HashMap<Uuid, Vec<Uuid>> {
+        ) -> crate::id_graph::IdGraph {
             values
                 .iter()
                 .map(|(s, t)| {
@@ -626,12 +624,14 @@ impl Builder {
 pub(super) fn stage_dynamic_adjacency(
     plan: &Plan,
     steps: &mut usize,
-) -> Result<HashMap<Uuid, Vec<Uuid>>, Refusal> {
-    *steps = steps.saturating_add(plan.specializations.capacity());
+) -> Result<crate::id_graph::IdGraph, Refusal> {
+    // The plan's own rows are charged: the frozen table under them is the
+    // prepared library's, shared.
+    *steps = steps.saturating_add(plan.specializations.local_capacity());
     if *steps > crate::eval::MAX_STEPS {
         return Err(Refusal::WorkLimit);
     }
-    for targets in plan.specializations.values() {
+    for (_, targets) in plan.specializations.local_iter() {
         *steps = steps.saturating_add(targets.len());
         if *steps > crate::eval::MAX_STEPS {
             return Err(Refusal::WorkLimit);

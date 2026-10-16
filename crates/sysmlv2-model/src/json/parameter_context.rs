@@ -2,6 +2,7 @@
 use super::{
     Builder, ElementRef, ResolvedModel, ScopeRef, provider_completeness::ProviderCompleteness,
 };
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 /// The runtime input declaration selected within one active calculation frame.
@@ -97,7 +98,7 @@ impl Redefinitions {
             return None;
         }
         let result = (|| {
-            if !crate::metaclass::conforms(b.elements[element].ty, "Feature") {
+            if !is_a!(b.elements[element], "Feature") {
                 return None;
             }
             let targets = b.cardinality_redefinition_targets(element, steps)?;

@@ -496,7 +496,7 @@ pub(crate) fn overlay_source(out: &mut Vec<(String, String)>, uri: &str, text: &
 /// — and with each other — on which characters of a path they escape,
 /// and a unit that only *looks* new joins the model a second time, so
 /// everything it declares is reported as declared twice.
-fn same_unit(a: &str, b: &str) -> bool {
+pub(crate) fn same_unit(a: &str, b: &str) -> bool {
     a == b || matches!((decode(a), decode(b)), (Some(a), Some(b)) if a == b)
 }
 
@@ -512,6 +512,15 @@ pub(crate) fn uri_for_path(path: &std::path::Path) -> String {
         path.insert(0, '/');
     }
     format!("file://{}", encode_uri_path(&path))
+}
+
+/// The uri of a library unit held in memory: `sysmlv2-lib:/<unit name>`,
+/// the name percent-encoded as a uri path. A host serves the unit's
+/// text as a read-only document under it. Navigation answers that land
+/// in a library unit carry it, and so does the session binding's
+/// find-usages, so both name the same unit the same way.
+pub fn library_uri(unit_name: &str) -> String {
+    format!("sysmlv2-lib:/{}", encode_uri_path(unit_name))
 }
 
 /// Percent-encode a uri path. Everything RFC 3986 allows in a path

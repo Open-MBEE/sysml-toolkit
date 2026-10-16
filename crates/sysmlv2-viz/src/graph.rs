@@ -13,6 +13,9 @@
 //!     "id", "qname"?, "label", "stereo", "metaclass",
 //!     "kind": "package" | "node" | "enum",
 //!     "nodeKind"?: "def" | "usage" | "ref",  // notation shape triad
+//!     "redefining"?: true,                   // nameless `:>> x`: label borrowed
+//!     "chain"?: ["chassis", "mass"],         // … from this redefined chain
+//!     "typeDerived"?: true,                  // label type not written
 //!     "prefixes"?: ["abstract", …],          // header prefix keywords
 //!     "portion"?: "timeslice" | "snapshot",
 //!     "aliases"?: ["name", …],               // «alias» list
@@ -21,6 +24,8 @@
 //!     "lib"?: true,                       // library element (show_lib)
 //!     "direction"?, "conjugated"?: true,  // ports
 //!     "rows": [{ "id", "qname"?, "label", "inherited"?: true,
+//!                "redefining"?: true, "chain"?: [...], // as on nodes
+//!                "typeDerived"?: true,  // label type not written
 //!                "prefixes"?: [...], "detail"?: "ordered subsets x",
 //!                "file"?, "line"?, "col"? }]
 //!   }],
@@ -57,6 +62,7 @@
 //! container's own overflow, distinct from `summary.notes` below it).
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use serde_json::{Value as Json, json};
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
@@ -85,6 +91,57 @@ impl std::fmt::Display for GraphError {
 }
 
 impl std::error::Error for GraphError {}
+
+/// A summary's count of what the full picture of its scope would draw:
+/// its nodes plus the drawable elements every summary node hides below
+/// it (`summary.hidden`; the notes hidden there are not counted). A
+/// host weighs this against its layout budget to choose between the
+/// summary and the full picture. Read off an emitted document; zero for
+/// one without nodes, and the node count for one without summary nodes.
+pub fn summary_would_draw(graph: &Json) -> usize {
+    let Some(nodes) = graph.get("nodes").and_then(Json::as_array) else {
+        return 0;
+    };
+    let hidden: u64 = nodes
+        .iter()
+        .filter_map(|n| n.get("summary")?.get("hidden")?.as_u64())
+        .sum();
+    nodes
+        .len()
+        .saturating_add(usize::try_from(hidden).unwrap_or(usize::MAX))
+}
+
+/// [`summary_would_draw`] of the document [`graph`] emits for the same
+/// scope and options, counted without emitting it, up to `limit`:
+/// `Some(total)` when the total is at most `limit`, `None` once the
+/// count passes it. The count stops there, so weighing a scope against a
+/// budget walks little more of it than the budget. The tree view walks
+/// what the document would draw and hide, its note and on-demand
+/// library nodes included; the other views draw no summary and count
+/// the nodes they emit, erring as [`graph`] does where it draws none.
+///
+/// A walk that stops early has counted by element, where the document
+/// keys a container's counts by id: in a scope where two elements share
+/// an id (same-named units), the document can total less than the walk,
+/// and its own [`summary_would_draw`] has the last word.
+pub fn summary_would_draw_within(
+    r: &mut ResolvedModel,
+    root: Option<ElementRef>,
+    opts: &VizOptions,
+    limit: usize,
+) -> Result<Option<usize>, GraphError> {
+    if opts.view != View::Tree {
+        let total = summary_would_draw(&graph(r, root, opts)?);
+        return Ok((total <= limit).then_some(total));
+    }
+    let tops = roots_of(r, root, opts);
+    let mut count = DrawCount::new(r, opts, limit);
+    if count.walk(tops).is_break() {
+        return Ok(None);
+    }
+    let total = count.total();
+    Ok((total <= limit).then_some(total))
+}
 
 /// Emit the structured graph for a view. Tree, interconnection, state
 /// and action so far — other views stay on the PlantUML path until they
@@ -340,33 +397,38 @@ impl SummaryState {
     }
 }
 
-impl GraphEmitter<'_> {
-    /// Members of `e` that would draw as nodes: everything but metadata
-    /// and skipped kinds; on a non-package, compartment lines are rows,
-    /// not members.
-    fn drawable_children(&mut self, e: ElementRef, is_package: bool) -> Vec<ElementRef> {
-        // Enumerations draw their literals as rows and nothing else.
-        if matches!(
-            self.r.element_type(e),
-            "EnumerationDefinition" | "EnumerationUsage"
-        ) {
-            return Vec::new();
-        }
-        let metas = self.r.metadata_of(e);
-        let mut out = Vec::new();
-        for m in self.r.owned_members(e) {
-            if metas.contains(&m) {
-                continue;
-            }
-            match classify(self.r, self.opts.show_metadata, m) {
-                Kind::Skip => {}
-                Kind::Line if !is_package => {}
-                _ => out.push(m),
-            }
-        }
-        out
+/// Members of `e` that would draw as nodes: everything but metadata
+/// and skipped kinds; on a non-package, compartment lines are rows, not
+/// members.
+fn drawable_children(
+    r: &ResolvedModel,
+    show_metadata: bool,
+    e: ElementRef,
+    is_package: bool,
+) -> Vec<ElementRef> {
+    // Enumerations draw their literals as rows and nothing else.
+    if matches!(
+        r.element_type(e),
+        "EnumerationDefinition" | "EnumerationUsage"
+    ) {
+        return Vec::new();
     }
+    let metas = r.metadata_of(e);
+    let mut out = Vec::new();
+    for m in r.owned_members(e) {
+        if metas.contains(&m) {
+            continue;
+        }
+        match classify(r, show_metadata, m) {
+            Kind::Skip => {}
+            Kind::Line if !is_package => {}
+            _ => out.push(m),
+        }
+    }
+    out
+}
 
+impl GraphEmitter<'_> {
     /// Hide `e` and its drawable subtree under the container `cid`:
     /// every hidden element maps to the container for the reference
     /// pass, and the notes below it join the container's count. Returns
@@ -389,7 +451,7 @@ impl GraphEmitter<'_> {
                 s.hidden_order.push((e, is_usage));
             }
         }
-        let children = self.drawable_children(e, is_package);
+        let children = drawable_children(self.r, self.opts.show_metadata, e, is_package);
         let n = children.len();
         for c in children {
             self.hide_subtree(c, cid, counts);
@@ -406,7 +468,7 @@ impl GraphEmitter<'_> {
         let Some(open) = self.summary.as_ref().map(|s| s.open.contains(&e)) else {
             return false;
         };
-        let children = self.drawable_children(e, is_package);
+        let children = drawable_children(self.r, self.opts.show_metadata, e, is_package);
         // An empty package is a leaf, not an openable box.
         if !children.is_empty() {
             self.summary_children(e, id, open, children, Some(id));
@@ -610,6 +672,19 @@ impl GraphEmitter<'_> {
         if inherited {
             obj.insert("inherited".into(), json!(true));
         }
+        // A nameless redefinition borrows its label's name: say so, with the
+        // chain's links when it redefines a chain (`["chassis", "mass"]`), and
+        // whether the label's type was derived rather than written — a host
+        // draws the borrowed name and the derived type as such.
+        if crate::is_nameless_redefinition(self.r, m) {
+            obj.insert("redefining".into(), json!(true));
+            if let Some(links) = crate::redefined_chain(self.r, m) {
+                obj.insert("chain".into(), json!(links));
+            }
+        }
+        if crate::label_types(self.r, m).1 {
+            obj.insert("typeDerived".into(), json!(true));
+        }
         let prefixes = self.r.prefix_keywords(m);
         if !prefixes.is_empty() {
             obj.insert("prefixes".into(), json!(prefixes));
@@ -678,10 +753,9 @@ impl GraphEmitter<'_> {
                     if !matches!(classify(self.r, self.opts.show_metadata, m), Kind::Line) {
                         continue;
                     }
-                    let shadowed = self
-                        .r
-                        .element_name(m)
-                        .is_some_and(|n| own_names.iter().any(|o| o == n));
+                    // by the names the lines read, borrowed ones included
+                    let shadowed =
+                        crate::display_name(self.r, m).is_some_and(|n| own_names.contains(&n));
                     if !shadowed {
                         rows.extend(self.row(m, true));
                     }
@@ -1027,6 +1101,221 @@ impl GraphEmitter<'_> {
         self.nodes.push(Json::Object(obj));
         self.drawn.insert(target, id.clone());
         Some((id, false))
+    }
+}
+
+/// The tree emitter's walk with nothing emitted, for
+/// [`summary_would_draw_within`]: the nodes the document would carry and
+/// the elements its containers would hide, stopping once the running
+/// count passes the limit. Node identity is the element id as a number,
+/// keyed as the document keys it.
+struct DrawCount<'a> {
+    r: &'a mut ResolvedModel,
+    opts: &'a VizOptions,
+    /// Summary mode: the open containers, those drawing every member,
+    /// and the leaf budget; `None` draws everything.
+    summary: Option<(HashSet<ElementRef>, HashSet<ElementRef>, usize)>,
+    limit: usize,
+    /// Nodes and hidden elements walked so far: what the walk stops on.
+    walked: usize,
+    /// Node id → how many nodes carry it, and the parent id its first
+    /// node names (the cluster a note on it joins).
+    nodes: HashMap<u128, (usize, Option<u128>)>,
+    /// Container id → the hidden count of the last container to record
+    /// under it; every node with that id carries it.
+    hidden: HashMap<u128, usize>,
+    /// Elements drawn as nodes.
+    drawn: HashSet<ElementRef>,
+    /// `show_lib` only: the elements hidden under containers, and the
+    /// drawn and hidden elements with their usage-likeness — a library
+    /// node draws for a target neither drawn nor hidden.
+    hidden_elements: HashSet<ElementRef>,
+    referrers: Vec<(ElementRef, bool)>,
+}
+
+impl DrawCount<'_> {
+    fn new<'a>(r: &'a mut ResolvedModel, opts: &'a VizOptions, limit: usize) -> DrawCount<'a> {
+        DrawCount {
+            r,
+            opts,
+            summary: opts.summary.as_ref().map(|s| {
+                (
+                    s.open.iter().copied().collect(),
+                    s.unbounded.iter().copied().collect(),
+                    s.leaf_budget,
+                )
+            }),
+            limit,
+            walked: 0,
+            nodes: HashMap::new(),
+            hidden: HashMap::new(),
+            drawn: HashSet::new(),
+            hidden_elements: HashSet::new(),
+            referrers: Vec::new(),
+        }
+    }
+
+    /// The emitter's passes in its order: the scope's roots, then the
+    /// library nodes the reference pass adds, then the note nodes.
+    fn walk(&mut self, tops: Vec<ElementRef>) -> ControlFlow<()> {
+        for e in tops {
+            self.draw(e, None)?;
+        }
+        self.library_nodes()?;
+        self.note_nodes()
+    }
+
+    /// One more node or hidden element; breaks once past the limit.
+    fn tally(&mut self) -> ControlFlow<()> {
+        self.walked += 1;
+        if self.walked > self.limit {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// A node with id `id` in the cluster `parent`.
+    fn node(&mut self, id: u128, parent: Option<u128>) -> ControlFlow<()> {
+        self.nodes.entry(id).or_insert((0, parent)).0 += 1;
+        self.tally()
+    }
+
+    /// [`GraphEmitter::render`]: `e` draws as a node unless skipped, and
+    /// its drawable members draw or hide as the summary says — a
+    /// package's inside it, an owner card's beside it under `parent`.
+    fn draw(&mut self, e: ElementRef, parent: Option<u128>) -> ControlFlow<()> {
+        let kind = classify(self.r, self.opts.show_metadata, e);
+        if matches!(kind, Kind::Skip) {
+            return ControlFlow::Continue(());
+        }
+        let is_package = matches!(kind, Kind::Package);
+        let id = self.r.element_id(e).as_u128();
+        self.drawn.insert(e);
+        if self.opts.show_lib {
+            self.referrers
+                .push((e, matches!(kind, Kind::UsageNode | Kind::Line)));
+        }
+        self.node(id, parent)?;
+        let children = drawable_children(self.r, self.opts.show_metadata, e, is_package);
+        // An element without drawable members is a leaf, not a container.
+        if children.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        let inner = if is_package { Some(id) } else { parent };
+        let (open, leaf_budget) = match &self.summary {
+            None => (true, usize::MAX),
+            Some((open, unbounded, leaf_budget)) => (
+                open.contains(&e),
+                if unbounded.contains(&e) {
+                    usize::MAX
+                } else {
+                    *leaf_budget
+                },
+            ),
+        };
+        let mut hidden = 0;
+        for (i, c) in children.into_iter().enumerate() {
+            if open && i < leaf_budget {
+                self.draw(c, inner)?;
+            } else {
+                hidden += self.hide(c)?;
+            }
+        }
+        if self.summary.is_some() {
+            self.hidden.insert(id, hidden);
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// [`GraphEmitter::hide_subtree`]: `e` and its drawable subtree hide
+    /// under a container. Continues with how many elements hid.
+    fn hide(&mut self, e: ElementRef) -> ControlFlow<(), usize> {
+        self.tally()?;
+        let kind = classify(self.r, self.opts.show_metadata, e);
+        if self.opts.show_lib && self.hidden_elements.insert(e) {
+            self.referrers
+                .push((e, matches!(kind, Kind::UsageNode | Kind::Line)));
+        }
+        let is_package = matches!(kind, Kind::Package);
+        let mut hidden = 1;
+        for c in drawable_children(self.r, self.opts.show_metadata, e, is_package) {
+            hidden += self.hide(c)?;
+        }
+        ControlFlow::Continue(hidden)
+    }
+
+    /// [`GraphEmitter::target_id`] under `show_lib`: a node for each
+    /// library element a drawn or hidden element types or specializes
+    /// that is itself neither drawn nor hidden.
+    fn library_nodes(&mut self) -> ControlFlow<()> {
+        for (e, is_usage) in std::mem::take(&mut self.referrers) {
+            let typings = if is_usage {
+                self.r.typings(e)
+            } else {
+                Vec::new()
+            };
+            let mut targets = typings.clone();
+            for (rel, target) in self.r.explicit_specializations(e) {
+                let drawn_rel = matches!(
+                    rel,
+                    "Subclassification" | "Subsetting" | "Redefinition" | "FeatureTyping"
+                );
+                if drawn_rel && !typings.contains(&target) {
+                    targets.push(target);
+                }
+            }
+            for t in targets {
+                if self.drawn.contains(&t)
+                    || self.hidden_elements.contains(&t)
+                    || !self.r.is_library_element(t)
+                {
+                    continue;
+                }
+                self.drawn.insert(t);
+                let id = self.r.element_id(t).as_u128();
+                self.node(id, None)?;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// [`emit_note_nodes`] under `show_notes`: a node for each note on a
+    /// drawn element, up to the note budget per cluster in summary mode.
+    fn note_nodes(&mut self) -> ControlFlow<()> {
+        if !self.opts.show_notes {
+            return ControlFlow::Continue(());
+        }
+        let budget = self
+            .opts
+            .summary
+            .as_ref()
+            .map_or(usize::MAX, |s| s.note_budget);
+        let mut per_cluster: HashMap<Option<u128>, usize> = HashMap::new();
+        for (note, target, _, _) in self.r.annotation_notes() {
+            if !self.drawn.contains(&target) {
+                continue;
+            }
+            let target_id = self.r.element_id(target).as_u128();
+            let cluster = self.nodes.get(&target_id).and_then(|&(_, parent)| parent);
+            let slot = per_cluster.entry(cluster).or_insert(0);
+            if *slot >= budget {
+                continue;
+            }
+            *slot += 1;
+            let id = self.r.element_id(note).as_u128();
+            self.node(id, cluster)?;
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// [`summary_would_draw`] of the document: every node, plus for each
+    /// node the hidden count its id carries.
+    fn total(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|(id, &(n, _))| n + n * self.hidden.get(id).copied().unwrap_or(0))
+            .sum()
     }
 }
 
@@ -1770,6 +2059,19 @@ fn notation_fields(
     is_usage: bool,
 ) {
     obj.insert("nodeKind".into(), json!(node_kind_of(r, e, is_usage)));
+    // A nameless redefinition (`part :>> chassis { … }`) borrows its
+    // label's name, as a row does.
+    if is_usage && crate::is_nameless_redefinition(r, e) {
+        obj.insert("redefining".into(), json!(true));
+        if let Some(links) = crate::redefined_chain(r, e) {
+            obj.insert("chain".into(), json!(links));
+        }
+    }
+    // A type the node has without writing one (through what it
+    // redefines), as on a row.
+    if is_usage && crate::label_types(r, e).1 {
+        obj.insert("typeDerived".into(), json!(true));
+    }
     let mut prefixes = r.prefix_keywords(e);
     // Enumerations are variations by construction (their literals are
     // the variants) — the notation header spells just «enum def».

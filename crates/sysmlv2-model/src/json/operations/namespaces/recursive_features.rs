@@ -1,5 +1,6 @@
 //! Recursive visibility traverses admitted Feature namespaces with full Type evidence.
 use super::*;
+use crate::metaclass::is_a;
 use crate::model::{GraphFormat, Model};
 
 const LIB: &str = "standard library package Base {classifier Anything; feature things:Anything;} standard library package Occurrences {class Occurrence specializes Base::Anything; feature occurrences:Occurrence subsets Base::things;}";
@@ -164,7 +165,7 @@ fn recursive_feature_import_and_resolution_admit_cold_entry_points() {
                     .owned_relationships
                     .iter()
                     .copied()
-                    .find(|&rel| conforms(r.b.elements[rel].ty, "Import"))
+                    .find(|&rel| is_a!(r.b.elements[rel], "Import"))
                     .unwrap();
                 let expected = memberships_for(
                     &mut r,

@@ -26,8 +26,12 @@ mod describe;
 mod encode;
 pub mod index;
 pub mod resolver;
+mod stream;
 
-pub use canonical::{canonicalize_compact, graph_normalize, graph_normalize_compact};
+pub use canonical::{
+    canonicalize_compact, graph_normalize, graph_normalize_as_spelled, graph_normalize_compact,
+    graph_normalize_compact_as_spelled,
+};
 pub use decode::{DecodedCompactGraph, from_cbor_with_format};
 pub use decode::{
     assert_graph_format, from_cbor, from_cbor_with, from_cbor_with_units, from_compact_cbor,
@@ -37,7 +41,7 @@ pub use delta::{
     ApplyReport, Claim, DeltaOptions, FLAG_DELTA, FLAG_DELTA_PORTABLE, apply_delta_cbor,
     apply_delta_cbor_lenient, apply_delta_cbor_report, apply_delta_cbor_report_with,
     apply_delta_cbor_with, delta_canonical, delta_compact_cbor, delta_compact_cbor_elided,
-    empty_base_digest, rebase_ids, state_digest,
+    empty_base_digest, rebase_ids, state_digest, state_digest_streamed,
 };
 pub use describe::describe;
 pub use encode::{
@@ -47,6 +51,7 @@ pub use encode::{
     to_compact_cbor_with_format, to_compact_cbor_with_units, to_compact_cbor_with_units_explicit,
     to_full_cbor, to_full_cbor_with_format, to_full_cbor_with_units,
 };
+pub use stream::ElementRecords;
 pub use sysmlv2_model::cbor_tables as tables;
 
 use std::fmt;

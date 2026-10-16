@@ -5,11 +5,11 @@ use super::super::{
     Builder, ElementRef, ResolvedModel,
     type_relations::{RelationFact, TypeRelations},
 };
-use super::super::{semantic_ownership, structural_index::StoredStructure};
+use super::super::{RowsById, semantic_ownership, structural_index::StoredStructure};
 use super::*;
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::sync::Arc;
-use uuid::Uuid;
 /// Forward the report's remaining budget into readers bounded by MAX_STEPS.
 /// This preserves smaller private proof limits before the reader allocates.
 fn structural_read<T>(
@@ -68,7 +68,7 @@ impl ResolvedModel {
 /// feature-value fallback is used; malformed graph entries remain visible.
 struct StoredGraph {
     publication: crate::json::publication::Revision,
-    ids: Arc<crate::layered::IdMap<Uuid, usize>>,
+    ids: Arc<RowsById>,
     structure: Arc<StoredStructure>,
     ownership: Option<Arc<semantic_ownership::SemanticOwnership>>,
 }
@@ -100,7 +100,7 @@ impl StoredGraph {
         // certificate without allocating another whole-model carrier vector.
         budget.charge(b.elements.len())?;
         for (index, element) in b.elements.iter().enumerate() {
-            let carrier = if conforms(element.ty, "Relationship") {
+            let carrier = if is_a!(element, "Relationship") {
                 structural_read(budget, |steps| {
                     semantic_ownership::checked_relationship_carrier(b, &structure, index, steps)
                 })?
@@ -118,7 +118,7 @@ impl StoredGraph {
             // certificate merely because both families share an ownership view.
             if (generic_from..generic_to).contains(&index)
                 && (carrier.is_none_or(|owner| owner >= generic_from)
-                    || !conforms(element.ty, "Relationship")
+                    || !is_a!(element, "Relationship")
                     || element.owning_relationship.is_some()
                     || !element.children.is_empty()
                     || !element.owned_relationships.is_empty())
@@ -200,11 +200,11 @@ impl StoredGraph {
         }
         let mut features = Vec::new();
         for rel in self.relationships(b, owner, budget)? {
-            if !conforms(b.elements[rel].ty, "FeatureMembership") {
+            if !is_a!(b.elements[rel], "FeatureMembership") {
                 continue;
             }
             let feature = self.member(b, owner, rel, budget)?;
-            if !conforms(b.elements[feature].ty, "Feature") {
+            if !is_a!(b.elements[feature], "Feature") {
                 return Err(MissingOrMalformedMembership);
             }
             features.push((rel, feature));
@@ -223,7 +223,7 @@ impl StoredGraph {
             let ty = b.elements[rel].ty;
             if conforms(ty, "Membership") && !conforms(ty, excluded_kind) {
                 let member = self.member(b, owner, rel, budget)?;
-                if kind.is_some_and(|kind| !conforms(b.elements[member].ty, kind)) {
+                if kind.is_some_and(|kind| !b.elements[member].conforms(kind)) {
                     return Err(MissingOrMalformedMembership);
                 }
                 return Ok(member);
@@ -297,7 +297,7 @@ impl<'a> RepositoryEvidence<'a> {
                     {
                         Some(element)
                             if element < self.model.b.lib_boundary
-                                && conforms(self.model.b.elements[element].ty, "Feature") =>
+                                && is_a!(self.model.b.elements[element], "Feature") =>
                         {
                             if target.is_some_and(|old| old != element) {
                                 ambiguous = true;
@@ -330,13 +330,13 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
     fn kind(&mut self, node: usize, budget: &mut Budget) -> Evidence<Kind> {
         budget.charge(1)?;
         let e = self.model.b.elements.get(node).ok_or(InvalidElement)?;
-        if !conforms(e.ty, "Expression") {
+        if !is_a!(e, "Expression") {
             return Err(InvalidElement);
         }
-        if conforms(e.ty, "CalculationUsage") || conforms(e.ty, "ConstraintUsage") {
+        if is_a!(e, "CalculationUsage") || is_a!(e, "ConstraintUsage") {
             return Ok(Kind::Forbidden);
         }
-        if conforms(e.ty, "LiteralExpression")
+        if is_a!(e, "LiteralExpression")
             || matches!(e.ty, "NullExpression" | "MetadataAccessExpression")
         {
             return Ok(Kind::Leaf);
@@ -344,10 +344,10 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
         if e.ty == "FeatureReferenceExpression" {
             return Ok(Kind::Reference);
         }
-        if conforms(e.ty, "ConstructorExpression") {
+        if is_a!(e, "ConstructorExpression") {
             return Ok(Kind::Constructor);
         }
-        if conforms(e.ty, "InvocationExpression") {
+        if is_a!(e, "InvocationExpression") {
             return Ok(Kind::Invocation);
         }
         if matches!(e.ty, "Expression" | "BooleanExpression") {
@@ -383,8 +383,8 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
                 .owning_type(&mut self.model.b, referent, steps)
         }) {
             Ok(Some(owner))
-                if conforms(self.model.b.elements[owner].ty, "Metaclass")
-                    || conforms(self.model.b.elements[owner].ty, "MetadataFeature") =>
+                if is_a!(self.model.b.elements[owner], "Metaclass")
+                    || is_a!(self.model.b.elements[owner], "MetadataFeature") =>
             {
                 Yes
             }
@@ -415,7 +415,7 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
         Ok(ReferenceEvidence {
             referent,
             self_conformance,
-            expression: conforms(self.model.b.elements[referent].ty, "Expression"),
+            expression: is_a!(self.model.b.elements[referent], "Expression"),
             metadata_owner,
             unfeatured,
             valuation,
@@ -485,8 +485,7 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
         self.prepare(budget)?;
         // Operator/trigger overrides need a unique designated-name resolver;
         // the older ordered compatibility lookup is not complete evidence.
-        if (conforms(self.model.b.elements[node].ty, "OperatorExpression")
-            && numeric_callee.is_none())
+        if (is_a!(self.model.b.elements[node], "OperatorExpression") && numeric_callee.is_none())
             || self.model.b.elements[node].ty == "TriggerInvocationExpression"
         {
             return Err(IncompleteCallee);
@@ -537,7 +536,7 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
         let graph = self.graph.as_ref().unwrap();
         let mut arguments = supplied.unwrap_or(Err(IncompleteArgumentMapping));
         for (membership, parameter) in graph.features(&self.model.b, node, budget)? {
-            if !conforms(self.model.b.elements[membership].ty, "ParameterMembership")
+            if !is_a!(self.model.b.elements[membership], "ParameterMembership")
                 || conforms(
                     self.model.b.elements[membership].ty,
                     "ReturnParameterMembership",
@@ -564,7 +563,7 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
         let mut all_implied = Yes;
         for rel in graph.relationships(&self.model.b, node, budget)? {
             let relation = &self.model.b.elements[rel];
-            if !conforms(relation.ty, "Specialization") {
+            if !is_a!(relation, "Specialization") {
                 continue;
             }
             let implied = match relation.props.get("isImplied") {
@@ -634,7 +633,7 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
                 self.model.b.elements[membership].ty,
                 "ResultExpressionMembership",
             ) {
-                if conforms(self.model.b.elements[feature].ty, "Expression") {
+                if is_a!(self.model.b.elements[feature], "Expression") {
                     Ok(Some(feature))
                 } else {
                     Err(MissingOrMalformedMembership)
@@ -679,7 +678,7 @@ mod tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&rel| conforms(r.b.elements[rel].ty, "FeatureValue"))
+            .find(|&rel| is_a!(r.b.elements[rel], "FeatureValue"))
             .unwrap();
         (owner, rel, r.b.elements[rel].children[0])
     }
@@ -742,7 +741,7 @@ mod tests {
             r.model_level_evaluability(call).classification,
             Unknown(_)
         ));
-        r.b.elements[binding.value.0].ty = "CalculationUsage";
+        r.b.elements[binding.value.0].set_ty("CalculationUsage");
         assert_eq!(r.model_level_evaluability(call).classification, No);
     }
     #[test]
@@ -828,7 +827,7 @@ mod tests {
             .owned_relationships
             .iter()
             .copied()
-            .find(|&rel| conforms(r.b.elements[rel].ty, "FeatureValue"))
+            .find(|&rel| is_a!(r.b.elements[rel], "FeatureValue"))
             .unwrap();
         r.b.elements[valuation].children.make_mut().clear();
         assert!(matches!(
@@ -1318,7 +1317,7 @@ mod tests {
                     .owned_relationships
                     .iter()
                     .copied()
-                    .find(|&rel| conforms(r.b.elements[rel].ty, "Subclassification"))
+                    .find(|&rel| is_a!(r.b.elements[rel], "Subclassification"))
                     .unwrap();
                 r.b.elements[b]
                     .owned_relationships

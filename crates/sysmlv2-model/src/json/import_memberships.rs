@@ -2,6 +2,7 @@
 
 use super::Builder;
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 /// Raw Import endpoint evidence shared by namespace operations and Type
@@ -144,7 +145,7 @@ impl Builder {
             .owned_relationships
             .iter()
             .copied()
-            .filter(|&r| conforms(self.elements[r].ty, "Membership"))
+            .filter(|&r| is_a!(self.elements[r], "Membership"))
             .collect();
         let owned: HashSet<_> = owned.into_iter().collect();
         let mut signatures = HashMap::new();
@@ -189,7 +190,7 @@ impl Builder {
     fn import_membership_signature(&mut self, rel: usize) -> Option<Signature> {
         let member = self.stored_membership_member(rel)?;
         let member_type = self.elements[member].ty;
-        let names = if conforms(self.elements[rel].ty, "OwningMembership") {
+        let names = if is_a!(self.elements[rel], "OwningMembership") {
             self.stored_import_member_names(member, &mut HashSet::new())?
         } else {
             ["memberName", "memberShortName"]
@@ -207,7 +208,7 @@ impl Builder {
     }
 
     pub(super) fn stored_membership_member(&mut self, rel: usize) -> Option<usize> {
-        if conforms(self.elements[rel].ty, "OwningMembership") {
+        if is_a!(self.elements[rel], "OwningMembership") {
             if let Some(&member) = self.elements[rel].children.first() {
                 return Some(member);
             }
@@ -243,7 +244,7 @@ impl Builder {
             if self.elements[member].ty == "ConjugatedPortDefinition" {
                 return None;
             }
-            if !names.is_empty() || !conforms(self.elements[member].ty, "Feature") {
+            if !names.is_empty() || !is_a!(self.elements[member], "Feature") {
                 return Some(names);
             }
             if self.reference_locator_has_no_semantic_name(member) {

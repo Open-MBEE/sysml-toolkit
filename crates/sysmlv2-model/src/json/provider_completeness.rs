@@ -1,6 +1,6 @@
 //! Query-local proofs for supported inheritance and import providers.
 use super::Builder;
-use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -324,7 +324,7 @@ impl ProviderCompleteness {
             || inverse_recursive
             || namespaces.iter().any(|&(_, _, recursive)| recursive);
         for r in relationships {
-            if conforms(b.elements[r].ty, "Import")
+            if is_a!(b.elements[r], "Import")
                 && b.elements[r]
                     .props
                     .get("isRecursive")
@@ -332,10 +332,10 @@ impl ProviderCompleteness {
             {
                 recursive_domain = true;
             }
-            if conforms(b.elements[r].ty, "Specialization") {
+            if is_a!(b.elements[r], "Specialization") {
                 let id = super::implied::specialization_target(&b.elements[r])?;
                 let target = b.element_index_of_uuid(id)?;
-                if !conforms(b.elements[target].ty, "Type") {
+                if !is_a!(b.elements[target], "Type") {
                     return None;
                 }
                 dependencies.push(Dependency::Scope(*b.elem_scope.get(&target)?));
@@ -364,14 +364,14 @@ impl ProviderCompleteness {
                 return None;
             }
             let target = Self::reference(b, r, "importedNamespace")?;
-            if !conforms(b.elements[target].ty, "Namespace") {
+            if !is_a!(b.elements[target], "Namespace") {
                 return None;
             }
             dependencies.push(Dependency::Scope(*b.elem_scope.get(&target)?));
         }
         for r in members {
             let membership = Self::reference(b, r, "importedMembership")?;
-            if !conforms(b.elements[membership].ty, "Membership") {
+            if !is_a!(b.elements[membership], "Membership") {
                 return None;
             }
             b.stored_membership_member(membership)?;
@@ -515,9 +515,12 @@ fn neutral<T>(b: &mut Builder, f: impl FnOnce(&mut Builder) -> T) -> T {
         std::mem::replace(&mut b.probing, false),
         b.widen.take(),
     );
-    let used = b.used_imports.clone();
+    // Taken rather than copied: what the work adds to them is discarded
+    // with its own, and nothing it does reads what was there (the root
+    // misses it does read, so those are copied).
+    let used = std::mem::take(&mut b.used_imports);
     let imports = std::mem::take(&mut b.query_imports);
-    let misses = b.current_misses.clone();
+    let misses = std::mem::take(&mut b.current_misses);
     let roots = b.root_misses.clone();
     let result = f(b);
     (

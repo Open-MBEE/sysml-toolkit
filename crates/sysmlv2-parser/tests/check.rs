@@ -2387,3 +2387,240 @@ fn exact_multiplicity_findings_preserve_replay_and_source_provenance() {
         }
     }
 }
+
+/// Constructor arguments bind the instantiated type's public features in
+/// sequence — the standard library's ISO 8601 date-time value takes its
+/// first argument as the encoding string, its second as the elapsed-time
+/// number it already binds — and are checked as the feature values they
+/// are: a scalar of the wrong partition, or an override of a non-default
+/// value, is reported at the argument.
+#[test]
+fn constructor_arguments_are_checked_against_the_bound_library_feature() {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .expect("library");
+    model.add_source(
+        "t.sysml",
+        "package T {\n    private import Time::*;\n    part def P {\n        \
+         attribute ok : Iso8601DateTime = new Iso8601DateTime(\"1969-07-20T20:17:00Z\");\n        \
+         attribute text : Iso8601DateTime = new Iso8601DateTime(\"1926-04-3\");\n        \
+         attribute number : Iso8601DateTime = new Iso8601DateTime(3);\n        \
+         attribute flag : Iso8601DateTime = new Iso8601DateTime(val = true);\n        \
+         attribute rebound : Iso8601DateTime = new Iso8601DateTime(num = 1.5);\n        \
+         attribute second : Iso8601DateTime = new Iso8601DateTime(\"a\", \"b\");\n    }\n}\n",
+    );
+    assert!(!model.has_errors(), "test source must parse cleanly");
+    let msgs: Vec<String> = sysmlv2_parser::check::validate_semantics(&model)
+        .into_iter()
+        .map(|(_, d)| d.message)
+        .collect();
+    assert_eq!(msgs.len(), 4, "{msgs:#?}");
+    assert!(
+        msgs[0].contains(
+            "constructor argument for `val` evaluates to a number, which can never conform to \
+             the declared type `Iso8601DateTimeEncoding`"
+        ),
+        "{}",
+        msgs[0]
+    );
+    assert!(
+        msgs[1].contains("constructor argument for `val` evaluates to a Boolean"),
+        "{}",
+        msgs[1]
+    );
+    assert!(
+        msgs[2].contains("Constructor argument for `num` cannot override the non-default value of")
+            && msgs[2].contains("Time.sysml:")
+            && msgs[2].contains("[validateFeatureValueOverriding]"),
+        "{}",
+        msgs[2]
+    );
+    assert!(
+        msgs[3].contains("Constructor argument for `num` cannot override the non-default value of"),
+        "{}",
+        msgs[3]
+    );
+}
+
+#[test]
+fn a_chain_redefinition_cannot_override_a_bound_value_either() {
+    // `:>> chassis.mass = 2` overrides `mass` as the nested form does: a
+    // bound `= 1` refuses both, a `default` takes both.
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+    part def Chassis { attribute mass = 1; attribute spare default 1; }
+    part def Crawler { part chassis : Chassis; }
+    part med : Crawler { attribute :>> chassis.mass = 2; attribute :>> chassis.spare = 2; }
+    part tiny : Crawler { part :>> chassis { attribute :>> mass = 3; attribute :>> spare = 3; } }
+}",
+    );
+    let msgs: Vec<String> = sysmlv2_parser::check::validate_semantics(&model)
+        .into_iter()
+        .map(|(_, d)| d.message)
+        .collect();
+    let overrides: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.contains("[validateFeatureValueOverriding]"))
+        .collect();
+    assert_eq!(overrides.len(), 2, "{msgs:#?}");
+    assert!(
+        overrides
+            .iter()
+            .all(|m| m.contains("Cannot override the non-default value of `P::Chassis::mass`")),
+        "{overrides:#?}"
+    );
+}
+
+/// A receiver's inherited bound is read in the receiver even where the
+/// feature reaches it through a membership import in a base, not through
+/// the scope that declares it; an alias in a base is no inherited feature
+/// of the receiver and reports nothing.
+#[test]
+fn an_inherited_expression_bound_is_read_through_a_membership_import() {
+    for (middle, findings) in [
+        ("class Mid specializes Root { alias xx for Holder::x; }", 0),
+        ("class Mid specializes Root { import Holder::x; }", 1),
+        ("class Mid specializes Holder;", 1),
+    ] {
+        let mut model = Model::new();
+        model.add_source(
+            "t.kerml",
+            &format!(
+                "class Root {{ feature n default = 3; }}
+class Holder specializes Root {{ feature x[0..n]; }}
+{middle}
+class Child specializes Mid {{ feature n redefines Root::n = -1; }}
+class Fine specializes Mid {{ feature n redefines Root::n = 2; }}"
+            ),
+        );
+        assert!(!model.has_errors(), "{middle}");
+        let msgs: Vec<String> = sysmlv2_parser::check::validate_semantics(&model)
+            .into_iter()
+            .map(|(_, d)| d.message)
+            .collect();
+        let invalid: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.contains("inherited multiplicity of"))
+            .collect();
+        assert_eq!(invalid.len(), findings, "{middle}: {msgs:#?}");
+        assert!(
+            invalid.iter().all(|m| {
+                m.contains("inherited multiplicity of `x` is invalid")
+                    && m.contains("upper bound -1")
+            }),
+            "{middle}: {invalid:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_overridden_nameless_redefinition_is_named_by_what_it_redefines() {
+    // `Mid`'s `:>> x = 2` declares no name: the finding names it by the
+    // name it takes from `x`, under its owner, not by its id.
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+    part def Base { attribute x default 1; }
+    part def Mid :> Base { attribute :>> x = 2; }
+    part def Leaf :> Mid { attribute :>> x = 3; }
+}",
+    );
+    let msgs: Vec<String> = sysmlv2_parser::check::validate_semantics(&model)
+        .into_iter()
+        .map(|(_, d)| d.message)
+        .collect();
+    let overrides: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.contains("[validateFeatureValueOverriding]"))
+        .collect();
+    assert_eq!(overrides.len(), 1, "{msgs:#?}");
+    assert!(
+        overrides[0]
+            .contains("Cannot override the non-default value of `P::Mid::x`, bound at t.sysml:3:"),
+        "{overrides:#?}"
+    );
+}
+
+#[test]
+fn an_inherited_chain_redefinition_binds_its_path_for_both_forms() {
+    // `M2` binds `chassis.mass` through a chain; a subtype overriding that
+    // path, as a chain or nested, overrides a bound value.
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+    part def Chassis { attribute mass default 1; }
+    part def M { part chassis : Chassis; }
+    part def M2 :> M { attribute :>> chassis.mass = 2; }
+    part chained : M2 { attribute :>> chassis.mass = 5; }
+    part nested : M2 { part :>> chassis { attribute :>> mass = 6; } }
+    part fine : M { attribute :>> chassis.mass = 7; }
+}",
+    );
+    let msgs: Vec<String> = sysmlv2_parser::check::validate_semantics(&model)
+        .into_iter()
+        .map(|(_, d)| d.message)
+        .collect();
+    let overrides: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.contains("[validateFeatureValueOverriding]"))
+        .collect();
+    assert_eq!(overrides.len(), 2, "{msgs:#?}");
+    assert!(
+        overrides
+            .iter()
+            .all(|m| m.contains("`P::M2::chassis.mass`")),
+        "{overrides:#?}"
+    );
+}
+
+#[test]
+fn inherited_chain_bindings_match_through_blocks_and_named_blocks() {
+    // The binding M2 gives `chassis.mass` reaches a subtype whose first
+    // link a type in between redefines in a block (M3), and one whose own
+    // block is named (`ch2 :>> chassis`); a binding inside an inherited
+    // block reaches a chain too.
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package P {
+    part def Chassis { attribute mass default 1; attribute w default 1; }
+    part def M { part chassis : Chassis; }
+    part def M2 :> M { attribute :>> chassis.mass = 2; }
+    part def M3 :> M2 { part :>> chassis { attribute :>> w default 2; } }
+    part a : M3 { attribute :>> chassis.mass = 5; }
+    part b : M3 { part :>> chassis { attribute :>> mass = 6; } }
+    part c : M2 { part ch2 :>> chassis { attribute :>> mass = 7; } }
+    part def M4 :> M { part :>> chassis { attribute :>> mass = 3; } }
+    part d : M4 { attribute :>> chassis.mass = 8; }
+    part fine : M3 { attribute :>> chassis.w = 9; }
+}",
+    );
+    let msgs: Vec<String> = sysmlv2_parser::check::validate_semantics(&model)
+        .into_iter()
+        .map(|(_, d)| d.message)
+        .collect();
+    let overrides: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.contains("[validateFeatureValueOverriding]"))
+        .collect();
+    assert_eq!(overrides.len(), 4, "{msgs:#?}");
+    assert_eq!(
+        overrides
+            .iter()
+            .filter(|m| m.contains("`P::M2::chassis.mass`"))
+            .count(),
+        3,
+        "{overrides:#?}"
+    );
+    assert!(
+        overrides
+            .iter()
+            .any(|m| m.contains("`P::M4::chassis::mass`")),
+        "{overrides:#?}"
+    );
+}

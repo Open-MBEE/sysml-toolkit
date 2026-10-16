@@ -34,8 +34,8 @@ fn inverse_typing_invalidates_direct_filters_and_generated_compositions() {
         let mut r = model("classifier T; feature x; typing x typed by T;");
         let x = r.resolve_qualified("x").unwrap();
         let t = r.resolve_qualified("T").unwrap();
-        r.b.elements[x.0].ty = receiver;
-        r.b.elements[t.0].ty = target;
+        r.b.elements[x.0].set_ty(receiver);
+        r.b.elements[t.0].set_ty(target);
         let compatibility = r.derived(x, property);
         assert!(
             matches!(compatibility,Derived::Value(DerivedValue::References(ref values)) if values.is_empty())
@@ -69,8 +69,8 @@ fn individual_predicate_does_not_turn_missing_inverse_type_into_exact_null() {
     let mut r = model("classifier T; feature x; typing x typed by T;");
     let x = r.resolve_qualified("x").unwrap();
     let t = r.resolve_qualified("T").unwrap();
-    r.b.elements[x.0].ty = "OccurrenceUsage";
-    r.b.elements[t.0].ty = "OccurrenceDefinition";
+    r.b.elements[x.0].set_ty("OccurrenceUsage");
+    r.b.elements[t.0].set_ty("OccurrenceDefinition");
     r.b.elements[t.0]
         .props
         .insert("isIndividual", serde_json::json!(true));
@@ -93,8 +93,8 @@ fn payload_type_dereference_preserves_dependency_qualification() {
         model("classifier T; feature holder {feature payload;} typing holder::payload typed by T;");
     let holder = r.resolve_qualified("holder").unwrap();
     let payload = r.resolve_qualified("holder::payload").unwrap();
-    r.b.elements[holder.0].ty = "Flow";
-    r.b.elements[payload.0].ty = "PayloadFeature";
+    r.b.elements[holder.0].set_ty("Flow");
+    r.b.elements[payload.0].set_ty("PayloadFeature");
     assert_eq!(r.d_payload_feature(holder), Some(payload));
     let compatibility = r.derived(holder, "payloadType");
     assert_eq!(

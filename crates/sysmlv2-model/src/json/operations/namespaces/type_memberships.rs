@@ -1,5 +1,6 @@
 //! Checked Type operation cases share the complete membership provider.
 use super::*;
+use crate::metaclass::is_a;
 use crate::model::{GraphFormat, Model};
 const LIB: &str = "standard library package Base { classifier Anything; feature things:Anything; } standard library package Occurrences { class Occurrence specializes Base::Anything; feature occurrences:Occurrence subsets Base::things; } standard library package Performances { behavior Performance specializes Occurrences::Occurrence; function Evaluation specializes Performance { return result; } step performances:Performance subsets Occurrences::occurrences; expr evaluations:Evaluation subsets performances; }";
 fn fixture(source: &str, format: GraphFormat) -> ResolvedModel {
@@ -179,7 +180,7 @@ fn type_alias_memberships_remain_distinct_and_private_imports_never_inherit() {
             .owned_relationships
             .iter()
             .copied()
-            .filter(|&rel| conforms(r.b.elements[rel].ty, "Membership"))
+            .filter(|&rel| is_a!(r.b.elements[rel], "Membership"))
             .map(|rel| Reference::Element(ElementRef(rel)))
             .collect();
         assert_eq!(rels.len(), 3);
@@ -190,7 +191,7 @@ fn type_alias_memberships_remain_distinct_and_private_imports_never_inherit() {
                 .owned_relationships
                 .iter()
                 .copied()
-                .find(|&rel| conforms(r.b.elements[rel].ty, "Import"))
+                .find(|&rel| is_a!(r.b.elements[rel], "Import"))
                 .unwrap();
             r.b.set(import, "visibility", serde_json::json!(access));
             let mut excluded = args(vec![a], true);

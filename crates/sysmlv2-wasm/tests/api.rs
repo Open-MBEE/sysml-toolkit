@@ -117,6 +117,105 @@ fn units_and_interchange_roundtrip() {
     assert!(compact.contains("\"@type\""));
 }
 
+/// The units `describeCbor` reports for the session's compact CBOR
+/// payload, as `[[index, path], …]`; `[]` for a payload that carries none.
+fn described_units(s: &Session) -> serde_json::Value {
+    let described: serde_json::Value =
+        serde_json::from_str(&sysmlv2_wasm::describe_cbor(&s.to_compact_cbor()).unwrap()).unwrap();
+    described
+        .get("units")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|u| serde_json::json!([u["index"], u["path"]]))
+        .collect()
+}
+
+#[test]
+fn the_unit_table_is_the_units_the_compact_payload_carries() {
+    let assert_table = |s: &Session, what: &str| {
+        let table: serde_json::Value = serde_json::from_str(&s.unit_table()).unwrap();
+        assert_eq!(table, described_units(s), "{what}");
+        table
+    };
+    let one = Session::from_sources(&sources(&[("flashlight.sysml", FLASHLIGHT)])).unwrap();
+    assert_eq!(
+        assert_table(&one, "one unit"),
+        serde_json::json!([[0, "flashlight.sysml"]])
+    );
+    let units = [
+        ("model/a.sysml", "package A { part def P; }"),
+        ("model/empty.sysml", ""),
+        (
+            "model/b.sysml",
+            "package B { part p : A::P; part q : A::P; }",
+        ),
+        ("c.sysml", "package C { attribute def K; }"),
+    ];
+    let several = Session::from_sources(&sources(&units)).unwrap();
+    let table = assert_table(&several, "several units");
+    let paths: Vec<&str> = table
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry[1].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, units.map(|(name, _)| name));
+    let library = sources(&[(
+        "lib.sysml",
+        "standard library package Lib { part def Base; }",
+    )]);
+    let on_library = Session::from_sources_with_library(
+        &sources(&[
+            ("u.sysml", "package U { part def Car :> Lib::Base; }"),
+            ("v.sysml", "package V { part car : U::Car; }"),
+        ]),
+        Some(library.clone()),
+        None,
+    )
+    .unwrap();
+    assert_table(&on_library, "on a library");
+    let lifted =
+        Session::from_interchange_json(&several.to_compact_json(), None, None, None).unwrap();
+    assert_table(&lifted, "lifted from compact JSON");
+    let decoded = Session::from_compact_cbor(&several.to_compact_cbor(), None, None, None).unwrap();
+    assert_eq!(
+        assert_table(&decoded, "decoded from compact CBOR"),
+        table,
+        "a payload's units survive its decode"
+    );
+    // A payload in the canonical graph format opens a session in it.
+    let canonical = sysmlv2_transform::Session::from_sources_with_graph_format(
+        units
+            .iter()
+            .map(|(name, text)| (name.to_string(), text.to_string()))
+            .collect(),
+        None,
+        sysmlv2_model::model::GraphFormat::CanonicalV3,
+    )
+    .unwrap();
+    let canonical =
+        Session::from_compact_cbor(&canonical.to_compact_cbor(), None, None, None).unwrap();
+    assert_eq!(
+        sysmlv2_cbor::graph_format(&canonical.to_compact_cbor()).unwrap(),
+        sysmlv2_model::model::GraphFormat::CanonicalV3
+    );
+    assert_table(&canonical, "the canonical graph format");
+    // A document whose every id is respelled keeps its ids as explicit.
+    let mut document = several.to_compact_json();
+    let compact: serde_json::Value = serde_json::from_str(&document).unwrap();
+    for (k, element) in compact.as_array().unwrap().iter().enumerate() {
+        let id = element["@id"].as_str().unwrap();
+        document = document.replace(id, &format!("{k:08x}{}", &id[8..]));
+    }
+    let explicit = Session::from_interchange_json(&document, None, None, None).unwrap();
+    let described: serde_json::Value =
+        serde_json::from_str(&sysmlv2_wasm::describe_cbor(&explicit.to_compact_cbor()).unwrap())
+            .unwrap();
+    assert_eq!(described["explicitIds"], true);
+    assert_table(&explicit, "explicit ids");
+}
+
 #[test]
 fn annotation_targets_are_navigable() {
     let src = "package P {
@@ -173,6 +272,39 @@ fn canonicalize_compact_bridges_default_elision() {
 }
 
 #[test]
+fn graph_normalize_compact_digests_a_javascript_print_as_the_kernel_document() {
+    // `JSON.parse` + `JSON.stringify` print the kernel's `150.0` as
+    // `150`: the session's document and that print graph-normalize to
+    // one document, so a state digests alike from either; the
+    // as-spelled normalization still tells them apart.
+    let s = Session::from_sources(&sources(&[(
+        "values.sysml",
+        "package Values { attribute power = 150.0; attribute ratio = 2.5; attribute count = 3; }",
+    )]))
+    .unwrap();
+    let compact = s.to_compact_json();
+    assert!(
+        compact.contains("150.0"),
+        "the kernel spells the real as a float"
+    );
+    let printed = compact.replace("150.0", "150");
+    let digest = |json: &str, as_spelled| {
+        state_digest_of(&graph_normalize_compact(json, as_spelled).unwrap()).unwrap()
+    };
+    assert_eq!(
+        graph_normalize_compact(&printed, None).unwrap(),
+        graph_normalize_compact(&compact, None).unwrap()
+    );
+    assert_eq!(digest(&printed, None), digest(&compact, None));
+    assert_eq!(
+        digest(&compact, Some(true)),
+        digest(&compact, None),
+        "the kernel's own spelling normalizes as before"
+    );
+    assert_ne!(digest(&printed, Some(true)), digest(&compact, None));
+}
+
+#[test]
 fn graph_normalize_compact_lands_in_the_stored_digest_cell() {
     // The mirror twin: a session document (kernel spelling) and its
     // canonicalized (maximally spelled) form graph-normalize to the
@@ -180,20 +312,20 @@ fn graph_normalize_compact_lands_in_the_stored_digest_cell() {
     // reconstructs — so one state digest covers both spellings.
     let s = Session::from_sources(&sources(&[("flashlight.sysml", FLASHLIGHT)])).unwrap();
     let compact = s.to_compact_json();
-    let normal = graph_normalize_compact(&compact).unwrap();
+    let normal = graph_normalize_compact(&compact, None).unwrap();
     let spelled = canonicalize_compact(&compact).unwrap();
     assert_eq!(
-        graph_normalize_compact(&spelled).unwrap(),
+        graph_normalize_compact(&spelled, None).unwrap(),
         normal,
         "spelling domains collapse"
     );
     assert_eq!(
-        graph_normalize_compact(&normal).unwrap(),
+        graph_normalize_compact(&normal, None).unwrap(),
         normal,
         "idempotent"
     );
     assert_eq!(
-        state_digest_of(&graph_normalize_compact(&spelled).unwrap()).unwrap(),
+        state_digest_of(&graph_normalize_compact(&spelled, None).unwrap()).unwrap(),
         state_digest_of(&normal).unwrap(),
         "one digest cell"
     );
@@ -214,7 +346,7 @@ fn graph_normalize_compact_lands_in_the_stored_digest_cell() {
             .all(|e| e.as_object().unwrap().get("isUnique") != Some(&serde_json::json!(true))),
         "true-default isUnique elided"
     );
-    assert!(graph_normalize_compact("[{\"@type\": \"Nope\", \"@id\": \"x\"}]").is_err());
+    assert!(graph_normalize_compact("[{\"@type\": \"Nope\", \"@id\": \"x\"}]", None).is_err());
 }
 
 #[test]
@@ -756,6 +888,351 @@ fn value_source_reports_the_bound_expression() {
     let src = s.source(unit).unwrap();
     let text = &src[offset(&site["start"])..offset(&site["end"])];
     assert_eq!(text, "v");
+}
+
+/// Two units: a part definition declared in one and referenced from
+/// the other by an import, a specialization and a typing. The typed
+/// usage's quoted name is one character of three bytes, so the byte
+/// column of the `Wheel` after it (18) differs from its UTF-16 column
+/// (16).
+const WHEEL_DEFS: &str = "package Defs {\n    part def Wheel;\n    part def Hub;\n}\n";
+const WHEEL_USES: &str = "package Rig {\n    import Defs::Wheel;\n    part def BigWheel :> Wheel;\n    part '☃' : Wheel;\n}\n";
+
+/// A site as `references` reports it: unit, line, col, endLine, endCol.
+fn site(v: &serde_json::Value) -> (String, u64, u64, u64, u64) {
+    let n = |k: &str| v[k].as_u64().unwrap_or_else(|| panic!("{k} of {v}"));
+    (
+        v["unit"].as_str().expect("unit").to_string(),
+        n("line"),
+        n("col"),
+        n("endLine"),
+        n("endCol"),
+    )
+}
+
+#[test]
+fn references_report_every_site_and_the_declaration() {
+    let mut s = Session::from_sources(&sources(&[
+        ("defs.sysml", WHEEL_DEFS),
+        ("uses.sysml", WHEEL_USES),
+    ]))
+    .unwrap();
+    let before = (s.units(), s.state_digest());
+    let wheel = s.resolve("Defs::Wheel").unwrap();
+
+    let report: serde_json::Value =
+        serde_json::from_str(&s.references("Defs::Wheel").unwrap()).unwrap();
+    assert_eq!(
+        site(&report["declaration"]),
+        ("defs.sysml".to_string(), 2, 14, 2, 19)
+    );
+    assert_eq!(report["declaration"]["site"], "name");
+    let refs = report["references"].as_array().expect("references");
+    let sites: Vec<_> = refs.iter().map(site).collect();
+    assert_eq!(
+        sites,
+        vec![
+            // `import Defs::Wheel;` — the range is the `Wheel` segment,
+            // not the whole qualified name.
+            ("uses.sysml".to_string(), 2, 18, 2, 23),
+            // `part def BigWheel :> Wheel;`
+            ("uses.sysml".to_string(), 3, 26, 3, 31),
+            // `part '☃' : Wheel;` — UTF-16 columns.
+            ("uses.sysml".to_string(), 4, 16, 4, 21),
+        ]
+    );
+    let kinds: Vec<&str> = refs.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, vec!["importedMembership", "superclassifier", "type"]);
+    // Each is named for the nearest element above it with a qualified
+    // name: the package the import sits in, the definition that
+    // specializes, the usage that is typed.
+    let owners: Vec<&str> = refs
+        .iter()
+        .map(|r| r["owner"]["qualifiedName"].as_str().unwrap())
+        .collect();
+    assert_eq!(owners, vec!["Rig", "Rig::BigWheel", "Rig::'☃'"]);
+    let big = s.resolve("Rig::BigWheel").unwrap();
+    assert_eq!(refs[1]["owner"]["id"], s.element_id(&big).unwrap());
+
+    // The selector takes the forms `revealPath` takes.
+    let as_json: serde_json::Value =
+        serde_json::from_str(&s.references(r#""Defs::Wheel""#).unwrap()).unwrap();
+    assert_eq!(as_json, report);
+    let id = s.element_id(&wheel).unwrap();
+    let by_id: serde_json::Value =
+        serde_json::from_str(&s.references(&format!(r#"{{"elementId":"{id}"}}"#)).unwrap())
+            .unwrap();
+    assert_eq!(by_id, report);
+
+    // An element nothing refers to still has its declaration.
+    let hub: serde_json::Value = serde_json::from_str(&s.references("Defs::Hub").unwrap()).unwrap();
+    assert_eq!(
+        site(&hub["declaration"]),
+        ("defs.sysml".to_string(), 3, 14, 3, 17)
+    );
+    assert_eq!(hub["references"], serde_json::json!([]));
+
+    let err = s.references("Nope").unwrap_err();
+    assert!(err.contains("element not found"), "{err}");
+
+    // Reading usages writes nothing: the sources and the state are as
+    // they were, and handles minted before are still good.
+    assert_eq!((s.units(), s.state_digest()), before);
+    assert_eq!(s.metaclass(&wheel).unwrap(), "PartDefinition");
+}
+
+/// The session's answer is the language server's references answer
+/// with the declaration included, one-based: same units, same lines,
+/// same UTF-16 columns.
+#[test]
+fn references_agree_with_the_language_server() {
+    let defs = "file:///w/defs.sysml";
+    let uses = "file:///w/uses.sysml";
+    let mut s = Session::from_sources(&sources(&[(defs, WHEEL_DEFS), (uses, WHEEL_USES)])).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&s.references("Defs::Wheel").unwrap()).unwrap();
+    let mut from_session = vec![site(&report["declaration"])];
+    from_session.extend(report["references"].as_array().unwrap().iter().map(site));
+    assert_eq!(from_session.len(), 4);
+
+    let mut lsp = sysmlv2_wasm::LspServer::new();
+    let open = |uri: &str, text: &str| {
+        serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            "textDocument": {"uri": uri, "languageId": "sysml", "version": 1, "text": text}}})
+        .to_string()
+    };
+    // No position encoding offered: the server answers in UTF-16.
+    lsp.handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#)
+        .unwrap();
+    lsp.handle(&open(defs, WHEEL_DEFS)).unwrap();
+    lsp.handle(&open(uses, WHEEL_USES)).unwrap();
+    // Asked from the declaration (`Wheel` on the second line of defs).
+    let request =
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/references",
+        "params": {"textDocument": {"uri": defs}, "position": {"line": 1, "character": 14},
+            "context": {"includeDeclaration": true}}})
+        .to_string();
+    let response = lsp
+        .handle(&request)
+        .unwrap()
+        .into_iter()
+        .map(|m| serde_json::from_str::<serde_json::Value>(&m).unwrap())
+        .find(|m| m["id"] == 2)
+        .expect("a response");
+    let from_server: Vec<(String, u64, u64, u64, u64)> = response["result"]
+        .as_array()
+        .expect("locations")
+        .iter()
+        .map(|l| {
+            let (start, end) = (&l["range"]["start"], &l["range"]["end"]);
+            let n = |p: &serde_json::Value, k: &str| p[k].as_u64().unwrap() + 1;
+            (
+                l["uri"].as_str().unwrap().to_string(),
+                n(start, "line"),
+                n(start, "character"),
+                n(end, "line"),
+                n(end, "character"),
+            )
+        })
+        .collect();
+    assert_eq!(from_session, from_server);
+}
+
+/// The owner of a site is the nearest enclosing element that has a
+/// qualified name, a KerML namespace among them; a site at the top level
+/// of a unit has none. Kinds follow the notation: a namespace import
+/// against a membership import, the qualifier of a qualified name,
+/// connection ends as chain links, and the requirement a `satisfy`
+/// names.
+#[test]
+fn references_name_the_enclosing_element_of_each_site() {
+    let lib = "package L {\n    part def W { port p; }\n    requirement def R;\n}\n";
+    let user = "import L::*;\npackage U {\n    import L::W;\n    part a : W;\n    part b : W;\n    connect a.p to b.p;\n    requirement r : R;\n    satisfy r by a;\n}\n";
+    let kerml = "namespace N {\n    classifier K;\n    private import K::*;\n}\n";
+    let mut s = Session::from_sources(&sources(&[
+        ("lib.sysml", lib),
+        ("u.sysml", user),
+        ("n.kerml", kerml),
+    ]))
+    .unwrap();
+    let sites = |s: &mut Session, target: &str| -> Vec<(u64, u64, String, Option<String>)> {
+        let report: serde_json::Value =
+            serde_json::from_str(&s.references(target).unwrap()).unwrap();
+        report["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["line"].as_u64().unwrap(),
+                    r["col"].as_u64().unwrap(),
+                    r["kind"].as_str().unwrap().to_string(),
+                    r["owner"]["qualifiedName"].as_str().map(str::to_string),
+                )
+            })
+            .collect()
+    };
+    let owned = |o: &str| Some(o.to_string());
+    assert_eq!(
+        sites(&mut s, "L"),
+        vec![
+            // `import L::*;` at the top of the unit: nothing encloses it.
+            (1, 8, "importedNamespace".to_string(), None),
+            // the `L` of `import L::W;`
+            (3, 12, "qualifier".to_string(), owned("U")),
+        ]
+    );
+    assert_eq!(
+        sites(&mut s, "L::W"),
+        vec![
+            (3, 15, "importedMembership".to_string(), owned("U")),
+            (4, 14, "type".to_string(), owned("U::a")),
+            (5, 14, "type".to_string(), owned("U::b")),
+        ]
+    );
+    // The connection is nameless: its ends are named for the package.
+    assert_eq!(
+        sites(&mut s, "U::a"),
+        vec![
+            (6, 13, "chainingFeature".to_string(), owned("U")),
+            (8, 18, "memberElement".to_string(), owned("U")),
+        ]
+    );
+    assert_eq!(
+        sites(&mut s, "U::r"),
+        vec![(8, 13, "referencedFeature".to_string(), owned("U"))]
+    );
+    // A KerML namespace has a qualified name like a package does.
+    assert_eq!(
+        sites(&mut s, "N::K"),
+        vec![(3, 20, "importedNamespace".to_string(), owned("N"))]
+    );
+
+    // Inside a nameless element at the top of a unit nothing around
+    // the reference has a qualified name, the named `z` included.
+    let mut s = Session::from_sources(&sources(&[
+        ("lib.sysml", lib),
+        ("t.sysml", "part : L::W {\n    attribute z = L::W;\n}\n"),
+    ]))
+    .unwrap();
+    assert_eq!(
+        sites(&mut s, "L::W"),
+        vec![
+            (1, 11, "type".to_string(), None),
+            (2, 22, "memberElement".to_string(), None),
+        ]
+    );
+}
+
+/// A nameless redefinition is reached through a chain (`med.chassis`
+/// steps into `med`'s own `part :>> chassis`), yet declares no name to
+/// range over: its declaration falls back to the member's whole
+/// extent, and says so.
+#[test]
+fn references_fall_back_to_the_extent_of_a_nameless_declaration() {
+    let model = "package P {\n    part def Chassis { attribute mass; }\n    part def Crawler { part chassis : Chassis; }\n    part med : Crawler { part :>> chassis { attribute :>> mass = 2; } }\n    attribute m = med.chassis.mass;\n}\n";
+    let mut s = Session::from_sources(&sources(&[("p.sysml", model)])).unwrap();
+    let redefining = s
+        .resolve("P::med::chassis")
+        .expect("the redefinition answers to the name it takes");
+    assert_eq!(s.name(&redefining).unwrap(), None);
+    let report: serde_json::Value =
+        serde_json::from_str(&s.references("P::med::chassis").unwrap()).unwrap();
+    assert_eq!(
+        site(&report["declaration"]),
+        ("p.sysml".to_string(), 4, 26, 4, 70),
+        "`part :>> chassis {{ … }}`, body included"
+    );
+    assert_eq!(report["declaration"]["site"], "extent");
+    let refs = report["references"].as_array().unwrap();
+    assert_eq!(
+        refs.iter().map(site).collect::<Vec<_>>(),
+        vec![("p.sysml".to_string(), 5, 23, 5, 30)],
+        "the `chassis` step of `med.chassis.mass`"
+    );
+    assert_eq!(refs[0]["kind"], "chainingFeature");
+    // The chain is written in `m`'s value, which names the site.
+    assert_eq!(refs[0]["owner"]["qualifiedName"], "P::m");
+    // The named declaration it redefines is found by its name.
+    let base: serde_json::Value =
+        serde_json::from_str(&s.references("P::Crawler::chassis").unwrap()).unwrap();
+    assert_eq!(base["declaration"]["site"], "name");
+    assert_eq!(
+        site(&base["declaration"]),
+        ("p.sysml".to_string(), 3, 29, 3, 36)
+    );
+}
+
+/// A declaration in a library unit is reported under the uri the
+/// language server gives the unit, and the two answers agree there too.
+#[test]
+fn references_name_library_units_as_the_language_server_does() {
+    let lib_unit = (
+        "Mini Lib/MiniLib.sysml",
+        "package MiniLib {\n    part def Widget;\n    part def Gadget :> Widget;\n}\n",
+    );
+    let user = "file:///w/m.sysml";
+    let user_text = "package P {\n    part g : MiniLib::Widget;\n}\n";
+    let library = sources(&[lib_unit]);
+    let mut s = Session::from_sources(&sources(&[(user, user_text)])).unwrap();
+    s.load_library_sources(&library, None).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&s.references("MiniLib::Widget").unwrap()).unwrap();
+    let lib_uri = "sysmlv2-lib:/Mini%20Lib/MiniLib.sysml".to_string();
+    assert_eq!(
+        site(&report["declaration"]),
+        (lib_uri.clone(), 2, 14, 2, 20)
+    );
+    assert_eq!(report["declaration"]["site"], "name");
+    // The library's own `Gadget :> Widget` is no site: a library's
+    // references are not recorded, only the model's into it.
+    let refs = report["references"].as_array().unwrap();
+    let sites: Vec<_> = refs.iter().map(site).collect();
+    assert_eq!(sites, vec![(user.to_string(), 2, 23, 2, 29)]);
+    assert_eq!(refs[0]["kind"], "type");
+    assert_eq!(refs[0]["owner"]["qualifiedName"], "P::g");
+
+    let mut from_session = vec![site(&report["declaration"])];
+    from_session.extend(sites);
+    let mut lsp = sysmlv2_wasm::LspServer::with_library(&library, None).unwrap();
+    lsp.handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#)
+        .unwrap();
+    lsp.handle(
+        &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            "textDocument": {"uri": user, "languageId": "sysml", "version": 1, "text": user_text}}})
+        .to_string(),
+    )
+    .unwrap();
+    // Asked from the user's `Widget` reference.
+    let request =
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/references",
+        "params": {"textDocument": {"uri": user}, "position": {"line": 1, "character": 23},
+            "context": {"includeDeclaration": true}}})
+        .to_string();
+    let response = lsp
+        .handle(&request)
+        .unwrap()
+        .into_iter()
+        .map(|m| serde_json::from_str::<serde_json::Value>(&m).unwrap())
+        .find(|m| m["id"] == 2)
+        .expect("a response");
+    let from_server: Vec<(String, u64, u64, u64, u64)> = response["result"]
+        .as_array()
+        .expect("locations")
+        .iter()
+        .map(|l| {
+            let (start, end) = (&l["range"]["start"], &l["range"]["end"]);
+            let n = |p: &serde_json::Value, k: &str| p[k].as_u64().unwrap() + 1;
+            (
+                l["uri"].as_str().unwrap().to_string(),
+                n(start, "line"),
+                n(start, "character"),
+                n(end, "line"),
+                n(end, "character"),
+            )
+        })
+        .collect();
+    assert_eq!(from_session, from_server);
 }
 
 #[test]
@@ -2087,4 +2564,80 @@ fn reveal_path_walks_owners_root_first() {
     let root: serde_json::Value = serde_json::from_str(&s.reveal_path("P").unwrap()).unwrap();
     assert_eq!(root.as_array().unwrap().len(), 0);
     assert!(s.reveal_path("Nope").is_err());
+}
+
+#[test]
+fn redefined_chain_reads_the_links_of_a_nameless_chain_redefinition() {
+    let model = "package P {\n    attribute def MassValue;\n    part def Chassis { attribute mass : MassValue; attribute wheelbase : MassValue; }\n    part def Crawler { part chassis : Chassis; }\n    part med : Crawler { attribute :>> chassis.mass; }\n    part tiny : Crawler { part :>> chassis { attribute :>> mass; } }\n}\n";
+    let mut s = Session::from_sources(&sources(&[("m.sysml", model)])).unwrap();
+    let med = s.resolve("P::med").unwrap();
+    let row = s.members(&med).unwrap().remove(0);
+    let links = s.redefined_chain(&row).unwrap();
+    let names: Vec<_> = links.iter().map(|l| s.qualified_name(l).unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            Some("P::Crawler::chassis".into()),
+            Some("P::Chassis::mass".into())
+        ]
+    );
+    let tiny = s.resolve("P::tiny").unwrap();
+    let chassis = s.members(&tiny).unwrap().remove(0);
+    assert!(s.redefined_chain(&chassis).unwrap().is_empty());
+    let nested = s.members(&chassis).unwrap().remove(0);
+    assert!(s.redefined_chain(&nested).unwrap().is_empty());
+    // the link of a chain resolves through the feature that redefines it on the way
+    let model = "package P {\n    attribute def MassValue;\n    part def Chassis { attribute mass : MassValue; }\n    part def Crawler { part chassis : Chassis { attribute :>> mass = 1; } }\n    part med : Crawler { attribute :>> chassis.mass; }\n}\n";
+    let mut s = Session::from_sources(&sources(&[("m.sysml", model)])).unwrap();
+    let med = s.resolve("P::med").unwrap();
+    let row = s.members(&med).unwrap().remove(0);
+    let links = s.redefined_chain(&row).unwrap();
+    let names: Vec<_> = links.iter().map(|l| s.qualified_name(l).unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            Some("P::Crawler::chassis".into()),
+            Some("P::Crawler::chassis::mass".into())
+        ]
+    );
+}
+
+#[test]
+fn edit_batch_sets_a_comment_body_by_its_graph_id() {
+    // A diagram note carries its comment's id; the body edit addresses it
+    // by `@id` and rewrites only the `/* … */` token.
+    const SRC: &str = "package Lamp {\n    part def Bulb {\n        doc /* old */\n    }\n    comment about Bulb /* first */\n}\n";
+    let mut s = Session::from_sources(&sources(&[("lamp.sysml", SRC)])).unwrap();
+    let g: serde_json::Value =
+        serde_json::from_str(&s.to_graph(Some(r#"{"showNotes":true}"#.into())).unwrap()).unwrap();
+    let notes: Vec<&serde_json::Value> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "note")
+        .collect();
+    let id_of = |label: &str| {
+        notes
+            .iter()
+            .find(|n| n["label"] == label)
+            .map(|n| format!("@{}", n["id"].as_str().unwrap()))
+            .unwrap()
+    };
+    let (doc, comment) = (id_of("old"), id_of("first"));
+    s.edit(
+        &serde_json::json!([
+            {"op": "setCommentBody", "target": doc, "body": "line one\nline two"},
+            {"op": "setCommentBody", "target": comment, "body": "second"},
+        ])
+        .to_string(),
+    )
+    .expect("edit commits");
+    assert_eq!(
+        s.source(0).unwrap(),
+        "package Lamp {\n    part def Bulb {\n        doc /*\n         * line one\n         * line two\n         */\n    }\n    comment about Bulb /* second */\n}\n"
+    );
+    let err = s
+        .edit(r#"[{"op": "setCommentBody", "target": "Lamp::Bulb", "body": "x"}]"#)
+        .unwrap_err();
+    assert!(err.contains("no comment body"), "{err}");
 }

@@ -1,6 +1,7 @@
 //! Detached static and dynamic specialization recipes.
 use super::positional::PositionalRedefinitions;
-use std::{collections::HashMap, sync::Arc};
+use crate::layered::{IdMap, IdSet, LayeredMap};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Exact materialization recipe, including the surviving legacy UUID. A recipe
@@ -29,9 +30,13 @@ pub(super) struct StaticPrefix {
     pub rows: Vec<Edge>,
     pub positional: Arc<PositionalRedefinitions>,
     pub chain_bases: Arc<super::type_relations::FeatureChainBases>,
-    pub planner_bases: HashMap<usize, Vec<usize>>,
-    pub planner_incomplete: std::collections::HashSet<usize>,
-    pub specializations: HashMap<Uuid, Vec<Uuid>>,
+    /// The direct bases and the planned specialization graph, each a
+    /// build's own rows over the frozen table its prepared library's plans
+    /// give (see `Builder::planned_direct_bases` and
+    /// `Builder::planned_specializations`).
+    pub planner_bases: LayeredMap<usize, Vec<usize>>,
+    pub planner_incomplete: IdSet<usize>,
+    pub specializations: crate::id_graph::IdGraph,
 }
 
 /// The immutable accepted batch. All vectors/maps are fully constructed before
@@ -42,11 +47,11 @@ pub(super) struct StaticPrefix {
 #[derive(Clone)]
 pub(super) struct Plan {
     pub static_prefix: Arc<StaticPrefix>,
-    pub direct_bases: HashMap<usize, Vec<usize>>,
-    pub added_bases: HashMap<usize, Vec<usize>>,
-    pub affected_owners: std::collections::HashSet<usize>,
-    pub incomplete_bases: std::collections::HashSet<usize>,
-    pub specializations: HashMap<Uuid, Vec<Uuid>>,
+    pub direct_bases: LayeredMap<usize, Vec<usize>>,
+    pub added_bases: IdMap<usize, Vec<usize>>,
+    pub affected_owners: IdSet<usize>,
+    pub incomplete_bases: IdSet<usize>,
+    pub specializations: crate::id_graph::IdGraph,
     pub positional: PositionalRedefinitions,
     pub tail: Vec<Edge>,
 }

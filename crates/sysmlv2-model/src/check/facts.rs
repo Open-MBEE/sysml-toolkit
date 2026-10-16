@@ -2,8 +2,9 @@
 //! analysis, so edits and library replay cannot leave stale semantic facts.
 mod id_index;
 
-use crate::{json::Builder, layered::LayeredVec, metaclass};
-use std::{collections::HashSet, sync::OnceLock};
+use crate::metaclass::is_a;
+use crate::{json::Builder, layered::LayeredVec};
+use std::sync::{Arc, OnceLock};
 use sysmlv2_syntax::Span;
 
 #[cfg(test)]
@@ -30,10 +31,15 @@ fn note_span_step() {}
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Facts {
     ids: id_index::IdIndex,
+    #[serde(with = "crate::bulk::opt_index_vec")]
     pub owner: LayeredVec<Option<usize>>,
+    #[serde(with = "crate::flat::index_rows")]
     pub members: crate::flat::Rows<usize>,
+    #[serde(with = "crate::flat::index_rows")]
     pub supers: crate::flat::Rows<usize>,
+    #[serde(with = "crate::flat::index_rows")]
     contexts: crate::flat::Rows<usize>,
+    #[serde(with = "crate::flat::index_rows")]
     outgoing: crate::flat::Rows<usize>,
     targets: crate::flat::Rows<(crate::properties::Key, usize)>,
     /// The first element this analysis added; [`Facts::span`] answers
@@ -44,6 +50,44 @@ pub(crate) struct Facts {
     /// of them on the first query.
     #[serde(skip)]
     spans: OnceLock<Box<[Span]>>,
+    /// Each element's specialization closure and redefinition closure
+    /// ([`Self::closure`], [`Self::redefined`]), kept once walked: the
+    /// checks ask for the same elements' over and over.
+    #[serde(skip)]
+    closures: Memo,
+    #[serde(skip)]
+    redefinitions: Memo,
+}
+
+/// Walks kept by the element they start from. The facts never change
+/// once made, so a kept walk is the walk; a clone of the facts starts
+/// with none kept.
+#[derive(Default)]
+struct Memo(std::sync::Mutex<crate::layered::IdMap<usize, Arc<[usize]>>>);
+
+impl Clone for Memo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl Memo {
+    fn get(&self, e: usize) -> Option<Arc<[usize]>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&e)
+            .cloned()
+    }
+
+    fn keep(&self, e: usize, walk: Vec<usize>) -> Arc<[usize]> {
+        let walk: Arc<[usize]> = walk.into();
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(e, Arc::clone(&walk));
+        walk
+    }
 }
 impl Facts {
     pub(super) fn outgoing_relationships(&self, e: usize) -> &[usize] {
@@ -53,22 +97,31 @@ impl Facts {
             &[]
         }
     }
-    pub(crate) fn contains_id(&self, id: &uuid::Uuid) -> bool {
-        self.ids.get(id).is_some()
-    }
     pub fn new(b: &mut Builder) -> Self {
+        #[cfg(test)]
+        MADE.with(|count| count.set(count.get() + 1));
         // The explicit elements only: the implied relationships the
         // derivation layer may have appended are not the model the checks
         // read.
         let n = b.explicit_len();
-        let mut facts = b.library_facts.as_deref().cloned().unwrap_or_default();
+        // The library's facts, read on first use; none when they could not
+        // be read: every row is tabled here then.
+        let library = b.library_facts.as_ref().and_then(|facts| facts.get());
+        let mut facts = library.as_deref().cloned().unwrap_or_default();
         let start = facts.owner.len();
         let mut ids = std::mem::take(&mut facts.ids);
         for i in start..n {
             ids.insert(b.elem_id(i), i);
         }
         let mut targets = facts.targets;
-        for e in b.elements.iter().take(n).skip(start) {
+        for (i, e) in b.elements.iter().enumerate().take(n).skip(start) {
+            // A prepared library's own materialized rows are implied
+            // relationships, which the checks do not read: no targets, so
+            // they add no edge either.
+            if !b.is_authored(i) {
+                targets.push(Vec::new());
+                continue;
+            }
             targets.push(
                 e.props
                     .references()
@@ -105,7 +158,7 @@ impl Facts {
         members.resize(n);
         for (i, e) in b.elements.iter().enumerate().take(n).skip(start) {
             if e.owning_relationship
-                .is_some_and(|rel| is(b, rel, "Membership"))
+                .is_some_and(|rel| is_a!(b.elements[rel], "Membership"))
             {
                 if let Some(o) = owner[i] {
                     members.row_mut(o).push(i);
@@ -121,7 +174,7 @@ impl Facts {
         // Explicit about may add/remove semantic bases on a library target
         // without adding a source specialization. Empty values preserve touched
         // target history, so removals also refresh the prepared direct context.
-        let mut changed: HashSet<usize> = b
+        let mut changed: crate::layered::IdSet<usize> = b
             .metadata_about
             .keys()
             .copied()
@@ -155,7 +208,7 @@ impl Facts {
                 }
             }
             if let (Some(e), Some(t)) = (target(keys.0), target(keys.1)) {
-                if metaclass::conforms(rel.ty, "Specialization") && !supers[e].contains(&t) {
+                if is_a!(rel, "Specialization") && !supers[e].contains(&t) {
                     supers.row_mut(e).push(t);
                     if e < start {
                         changed.insert(e);
@@ -182,6 +235,8 @@ impl Facts {
             supers,
             span_start: start,
             spans: OnceLock::new(),
+            closures: Memo::default(),
+            redefinitions: Memo::default(),
         }
     }
     pub(crate) fn freeze(&mut self) {
@@ -229,10 +284,17 @@ impl Facts {
         self.walk(e, &self.contexts)
     }
     pub fn closure(&self, e: usize) -> Vec<usize> {
-        self.walk(e, &self.supers)
+        self.closure_shared(e).to_vec()
+    }
+    /// [`Self::closure`], the walk kept and shared.
+    pub fn closure_shared(&self, e: usize) -> Arc<[usize]> {
+        match self.closures.get(e) {
+            Some(walk) => walk,
+            None => self.closures.keep(e, self.walk(e, &self.supers)),
+        }
     }
     fn walk(&self, e: usize, edges: &crate::flat::Rows<usize>) -> Vec<usize> {
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         let mut out = Vec::new();
         let mut stack = vec![e];
         while let Some(e) = stack.pop() {
@@ -244,7 +306,7 @@ impl Facts {
         out
     }
     pub fn effective_kind(&self, b: &Builder, e: usize, kind: &str) -> bool {
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         let mut stack = vec![e];
         while let Some(e) = stack.pop() {
             if !seen.insert(e) {
@@ -257,12 +319,12 @@ impl Facts {
                 self.supers[e]
                     .iter()
                     .copied()
-                    .filter(|&t| is(b, t, "Feature")),
+                    .filter(|&t| is_a!(b.elements[t], "Feature")),
             );
             let chain: Vec<_> = self.outgoing[e]
                 .iter()
                 .copied()
-                .filter(|&r| is(b, r, "FeatureChaining"))
+                .filter(|&r| is_a!(b.elements[r], "FeatureChaining"))
                 .collect();
             if chain
                 .iter()
@@ -280,28 +342,28 @@ impl Facts {
     }
     pub fn typed(&self, b: &Builder, e: usize) -> Vec<usize> {
         let mut result = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         let mut stack = vec![e];
         while let Some(e) = stack.pop() {
             if !seen.insert(e) {
                 continue;
             }
             for &r in &self.outgoing[e] {
-                if is(b, r, "FeatureTyping") {
+                if is_a!(b.elements[r], "FeatureTyping") {
                     if let Some(t) = self.target(b, r, "type") {
                         if !result.contains(&t) {
                             result.push(t);
                         }
                     }
-                } else if is(b, r, "Subsetting") {
+                } else if is_a!(b.elements[r], "Subsetting") {
                     for key in ["subsettedFeature", "redefinedFeature", "referencedFeature"] {
                         if let Some(t) = self.target(b, r, key) {
                             stack.push(t);
                         }
                     }
-                } else if is(b, r, "Conjugation") {
+                } else if is_a!(b.elements[r], "Conjugation") {
                     if let Some(t) = self.target(b, r, "originalType") {
-                        if is(b, t, "Feature") {
+                        if is_a!(b.elements[t], "Feature") {
                             stack.push(t);
                         }
                     }
@@ -312,7 +374,7 @@ impl Facts {
                 .owned_relationships
                 .iter()
                 .copied()
-                .filter(|&rel| is(b, rel, "FeatureChaining"))
+                .filter(|&rel| is_a!(b.elements[rel], "FeatureChaining"))
                 .collect();
             if chain
                 .iter()
@@ -378,14 +440,23 @@ impl Facts {
                 })
             })
             .collect();
-        let hidden: HashSet<_> = all.iter().flat_map(|&m| self.redefined(b, m)).collect();
-        let mut seen = HashSet::new();
+        let hidden: crate::layered::IdSet<_> =
+            all.iter().flat_map(|&m| self.redefined(b, m)).collect();
+        let mut seen = crate::layered::IdSet::default();
         all.into_iter()
             .filter(|m| !hidden.contains(m) && seen.insert(*m))
             .collect()
     }
     pub fn redefined(&self, b: &Builder, e: usize) -> Vec<usize> {
-        let mut seen = HashSet::from([e]);
+        if let Some(walk) = self.redefinitions.get(e) {
+            return walk.to_vec();
+        }
+        let walk = self.redefined_walk(b, e);
+        self.redefinitions.keep(e, walk).to_vec()
+    }
+    fn redefined_walk(&self, b: &Builder, e: usize) -> Vec<usize> {
+        let mut seen = crate::layered::IdSet::default();
+        seen.insert(e);
         let mut stack = self.relations(b, e, "Redefinition", "redefinedFeature");
         let mut out = Vec::new();
         while let Some(t) = stack.pop() {
@@ -398,7 +469,7 @@ impl Facts {
     }
     pub fn feature_target(&self, b: &Builder, e: usize) -> usize {
         let mut e = e;
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         while seen.insert(e) {
             let next = self.relations(b, e, "ReferenceSubsetting", "referencedFeature");
             if let [t] = next.as_slice() {
@@ -429,7 +500,7 @@ impl Facts {
     }
     pub fn featuring(&self, b: &Builder, e: usize) -> Option<usize> {
         let rel = b.elements[e].owning_relationship?;
-        if is(b, rel, "FeatureMembership") {
+        if is_a!(b.elements[rel], "FeatureMembership") {
             self.owner[e]
         } else {
             None
@@ -494,7 +565,7 @@ impl Facts {
     /// [`Facts::span`] by walking up from `e` alone.
     fn walk_span(&self, b: &Builder, e: usize) -> Span {
         let mut current = Some(e);
-        let mut seen = HashSet::new();
+        let mut seen = crate::layered::IdSet::default();
         while let Some(e) = current {
             if !seen.insert(e) {
                 break;
@@ -509,15 +580,142 @@ impl Facts {
     }
 }
 pub(super) fn is(b: &Builder, e: usize, kind: &str) -> bool {
-    metaclass::conforms(b.elements[e].ty, kind)
+    b.elements[e].conforms(kind)
 }
 pub(super) fn flag(b: &Builder, e: usize, key: &str) -> bool {
     b.elements[e].props.get(key).and_then(|x| x.as_bool()) == Some(true)
 }
 
+// How many times the facts were made in this thread, for the tests that
+// tell a shared memo from a construction.
+#[cfg(test)]
+thread_local!(static MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
+/// How many times [`Facts::new`] ran in this thread.
+#[cfg(test)]
+pub(crate) fn made() -> usize {
+    MADE.with(std::cell::Cell::get)
+}
+
+/// The facts a builder made last, with the state they were made of: the
+/// revision of the rows, the metadata-association generation and the
+/// explicit length.
+#[derive(Clone)]
+pub(crate) struct FactsMemo {
+    rows: crate::layered::Revision,
+    metadata: Option<Arc<()>>,
+    explicit: usize,
+    facts: Arc<Facts>,
+}
+
+impl Builder {
+    /// The static facts of the rows as they are now, shared: made once per
+    /// state of the rows, the metadata associations and the explicit length
+    /// (the semantic pass and the checks it runs read one set of facts).
+    /// While a dynamic plan is in effect the facts carry its bases, which
+    /// can be withdrawn without a row or metadata change, so they are made
+    /// afresh for every request and never kept.
+    pub(crate) fn facts(&mut self) -> Arc<Facts> {
+        if self.dynamic_plan_in_effect() {
+            return Arc::new(Facts::new(self));
+        }
+        let same_generation =
+            |memo: &FactsMemo| match (&memo.metadata, &self.metadata_association_generation) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+        let rows = self.elements.observe_revision();
+        if let Some(memo) = &self.facts_memo {
+            if memo.rows.same_as(&rows)
+                && same_generation(memo)
+                && memo.explicit == self.explicit_len()
+            {
+                return Arc::clone(&memo.facts);
+            }
+        }
+        let facts = Arc::new(Facts::new(self));
+        self.facts_memo = Some(FactsMemo {
+            rows: self.elements.observe_revision(),
+            metadata: self.metadata_association_generation.clone(),
+            explicit: self.explicit_len(),
+            facts: Arc::clone(&facts),
+        });
+        facts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Facts;
+    use std::sync::Arc;
+
+    /// The facts are shared until the rows or the metadata associations
+    /// change, and the semantic pass makes them once.
+    #[test]
+    fn the_facts_are_made_once_per_state_of_the_rows() {
+        let mut model = crate::model::Model::new();
+        model.add_source(
+            "m.sysml",
+            "package P { part def A { attribute x; attribute y; } part def B :> A { attribute x; attribute :>> y = 1; } part b : B; }",
+        );
+        let mut r = crate::json::ResolvedModel::build(&model);
+        let made = super::made();
+        let first = r.b.facts();
+        let again = r.b.facts();
+        assert!(Arc::ptr_eq(&first, &again), "shared");
+        assert_eq!(super::made() - made, 1, "made once");
+        let a = r.resolve_qualified("P::A").expect("A").0;
+        r.b.elements[a]
+            .props
+            .insert("isAbstract", serde_json::json!(true));
+        let changed = r.b.facts();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &changed),
+            "the rows changed"
+        );
+        assert_eq!(super::made() - made, 2);
+        r.b.metadata_association_generation = Some(Arc::new(()));
+        let refreshed = r.b.facts();
+        assert!(
+            !std::sync::Arc::ptr_eq(&changed, &refreshed),
+            "the metadata changed"
+        );
+        let made = super::made();
+        crate::check::validate_semantics_with(&mut r, &model);
+        assert!(
+            super::made() - made <= 1,
+            "the semantic pass makes the facts at most once"
+        );
+    }
+
+    /// While a dynamic plan is in effect the facts carry its bases, so they
+    /// are made afresh for every request and never kept.
+    #[test]
+    fn the_facts_are_not_kept_while_a_dynamic_plan_is_in_effect() {
+        let mut model = crate::model::Model::new();
+        model.add_library_source(
+            "lib.kerml",
+            "standard library package Base { classifier Anything; feature things : Anything; } standard library package Occurrences { class Occurrence specializes Base::Anything; feature occurrences : Occurrence subsets Base::things; } standard library package Performances { behavior Performance specializes Occurrences::Occurrence; function Evaluation specializes Performance; step performances : Performance subsets Occurrences::occurrences; expr evaluations : Evaluation subsets performances; }",
+        );
+        model.add_source(
+            "m.kerml",
+            "function F specializes Performances::Evaluation { return result; } expr e : F; feature call = F();",
+        );
+        let mut r = crate::json::ResolvedModel::build(&model);
+        let invocation = r
+            .user_elements()
+            .find(|&e| r.element_type(e) == "InvocationExpression")
+            .expect("the call");
+        r.implied_relationships(invocation);
+        assert!(r.b.dynamic_plan_in_effect(), "a plan is in effect");
+        let made = super::made();
+        let first = r.b.facts();
+        let again = r.b.facts();
+        assert!(!Arc::ptr_eq(&first, &again), "made afresh");
+        assert_eq!(super::made() - made, 2);
+        assert!(r.b.facts_memo.is_none(), "nothing kept");
+    }
     use crate::{json::ResolvedModel, model::Model};
 
     /// The spans resolved together answer exactly as a walk up from each

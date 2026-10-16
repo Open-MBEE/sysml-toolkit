@@ -1,8 +1,9 @@
 //! Declared and implied relationship contracts over resolved graph facts.
 use super::{
     expressions,
-    facts::{Facts, flag, is},
+    facts::{Facts, flag},
 };
+use crate::metaclass::is_a;
 use crate::{
     json::{Builder, ResolvedModel},
     model::Model,
@@ -55,7 +56,7 @@ fn subject(b: &Builder, g: &Facts, e: usize) -> Option<usize> {
     g.effective_members(b, e).into_iter().find(|&m| {
         b.elements[m]
             .owning_relationship
-            .is_some_and(|r| is(b, r, "SubjectMembership"))
+            .is_some_and(|r| is_a!(b.elements[r], "SubjectMembership"))
     })
 }
 pub(super) fn validate(
@@ -74,15 +75,16 @@ pub(super) fn validate(
         }
         let span = g.span(b, e);
         let mut report = |rule, msg| errors.push((unit, span, rule, msg));
-        let ends: Vec<_> = if is(b, e, "Association") || is(b, e, "Connector") {
-            g.effective_members(b, e)
-                .into_iter()
-                .filter(|&m| flag(b, m, "isEnd"))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if is(b, e, "BindingConnector") {
+        let ends: Vec<_> =
+            if is_a!(b.elements[e], "Association") || is_a!(b.elements[e], "Connector") {
+                g.effective_members(b, e)
+                    .into_iter()
+                    .filter(|&m| flag(b, m, "isEnd"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        if is_a!(b.elements[e], "BindingConnector") {
             if !ends.is_empty() && ends.len() != 2 {
                 report(
                     "validateBindingConnectorIsBinary",
@@ -93,13 +95,13 @@ pub(super) fn validate(
                 bindings.push((unit, span, g.typed(b, *a), g.typed(b, *z)));
             }
         }
-        if is(b, e, "Connector") && !flag(b, e, "isAbstract") && ends.len() == 1 {
+        if is_a!(b.elements[e], "Connector") && !flag(b, e, "isAbstract") && ends.len() == 1 {
             report(
                 "validateConnectorRelatedFeatures",
                 "A concrete connector must relate at least two features",
             );
         }
-        if is(b, e, "Association")
+        if is_a!(b.elements[e], "Association")
             && ends.len() > 2
             && g.closure(e)
                 .iter()
@@ -201,7 +203,7 @@ pub(super) fn validate(
         }
         let chain = g.relations(b, e, "FeatureChaining", "chainingFeature");
         for pair in chain.windows(2) {
-            if !is(b, pair[1], "Feature") || !featured_within(b, g, pair[1], pair[0]) {
+            if !is_a!(b.elements[pair[1]], "Feature") || !featured_within(b, g, pair[1], pair[0]) {
                 report(
                     "validateFeatureChainingFeatureConformance",
                     "Each chain member must be a feature accessible through the preceding feature",
@@ -209,13 +211,20 @@ pub(super) fn validate(
             }
         }
         for original in g.relations(b, e, "Conjugation", "originalType") {
-            if is(b, e, "Feature") && is(b, original, "Classifier") && g.typed(b, e).is_empty() {
+            if is_a!(b.elements[e], "Feature")
+                && is_a!(b.elements[original], "Classifier")
+                && g.typed(b, e).is_empty()
+            {
                 report(
                     "validateFeatureHasType",
                     "Conjugating a classifier does not provide a feature type",
                 );
             }
-            if is(b, e, "Structure") && !g.closure(original).iter().any(|&t| is(b, t, "Structure"))
+            if is_a!(b.elements[e], "Structure")
+                && !g
+                    .closure(original)
+                    .iter()
+                    .any(|&t| is_a!(b.elements[t], "Structure"))
             {
                 report(
                     "validateClassifierDefaultSupertype",
@@ -223,7 +232,7 @@ pub(super) fn validate(
                 );
             }
         }
-        if is(b, e, "Specialization") {
+        if is_a!(b.elements[e], "Specialization") {
             let specific = [
                 "specific",
                 "subclassifier",
@@ -275,7 +284,7 @@ pub(super) fn validate(
     for end in r.b.lib_boundary..r.b.explicit_len() {
         let b = &r.b;
         let unit = b.unit_of_elem(end);
-        if model.is_library_unit(unit) || !is(b, end, "FlowEnd") {
+        if model.is_library_unit(unit) || !is_a!(b.elements[end], "FlowEnd") {
             continue;
         }
         if !g
@@ -299,7 +308,7 @@ pub(super) fn validate(
                         }
                         errors.push((unit, g.span(b, flow), "validateFlowEndSubsetting", "A flow end must identify a participant's payload feature using dot notation"));
                     } else {
-                        let rule = if is(b, featuring, "Classifier") {
+                        let rule = if is_a!(b.elements[featuring], "Classifier") {
                             "validateFlowEndSubsetting"
                         } else {
                             "validateFlowEndImplicitSubsetting"
@@ -336,7 +345,7 @@ pub(super) fn validate(
             .filter(|&m| {
                 r.b.elements[m]
                     .owning_relationship
-                    .is_some_and(|rel| is(&r.b, rel, "ReturnParameterMembership"))
+                    .is_some_and(|rel| is_a!(r.b.elements[rel], "ReturnParameterMembership"))
             })
             .collect();
         if let [ret] = returns.as_slice() {

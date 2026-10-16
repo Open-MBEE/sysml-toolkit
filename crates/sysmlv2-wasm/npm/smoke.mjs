@@ -13,7 +13,9 @@ import assert from "node:assert/strict";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const { PreparedLibrary, Session, check, version } = require(join(here, "pkg-node", "sysmlv2.js"));
+const { LspServer, PreparedLibrary, Session, check, version } = require(
+  join(here, "pkg-node", "sysmlv2.js"),
+);
 
 console.log(`sysmlv2-wasm ${version()}`);
 
@@ -55,6 +57,12 @@ assert.equal(JSON.parse(session.query("2 ** 200"))["@rational"], `${2n ** 200n}/
 const uml = session.toPlantuml(JSON.stringify({ view: "tree" }));
 assert.ok(uml.startsWith("@startuml"), "PlantUML emission");
 
+// Find usages: the declaration and the typing that names it, in editor positions.
+const usages = JSON.parse(session.references("Flashlight::Body"));
+assert.deepEqual(usages.declaration, { unit: "flashlight.sysml", line: 1, col: 31, endLine: 1, endCol: 35, site: "name" });
+assert.deepEqual(usages.references.map(r => [r.col, r.kind, r.owner.qualifiedName]), [[67, "type", "Flashlight::flashlight::body"]]);
+assert.throws(() => session.references("Flashlight::Nope"), /element not found/);
+
 // Interchange round-trip.
 const back = Session.fromInterchangeJson(session.toFullJson(true));
 assert.ok(back.resolve("Flashlight::flashlight::body"), "round-trip resolve");
@@ -75,6 +83,34 @@ for (const kind of ["ConstraintUsage", "SuccessionAsUsage"]) {
 }
 assert.equal(anonymous.elementById("not-an-id"), undefined);
 assert.equal(anonymous.elementById("00000000-0000-0000-0000-000000000000"), undefined);
+
+// Batch reads across the boundary: the outline with no options, rows for
+// many ids in one call, and a summary request answered with the full graph.
+const outline = JSON.parse(session.outline());
+assert.deepEqual(outline.outline.map(n => [n.name, n.metaclass]), [["Flashlight", "Package"]]);
+assert.deepEqual(outline.shape.nodes.map(n => [n.qualifiedName, n.owner]), [
+  ["Flashlight", -1], ["Flashlight::Body", 0], ["Flashlight::flashlight", 0], ["Flashlight::flashlight::body", 2],
+]);
+assert.equal(outline.shape.truncated, false);
+const bodyId = outline.shape.nodes[3].id;
+const rows = JSON.parse(session.rows(JSON.stringify([bodyId, "not-an-id"]), JSON.stringify(["qualifiedName", "metaclass", "owner", "property:isComposite", "property:nope"])));
+assert.equal(rows.length, 2);
+assert.equal(rows[0].qualifiedName, "Flashlight::flashlight::body");
+assert.equal(rows[0].metaclass, "PartUsage");
+assert.equal(rows[0].owner, outline.shape.nodes[2].id);
+assert.equal(rows[0]["property:isComposite"], true);
+assert.ok(rows[0].errors["property:nope"], "a failed read is reported, not thrown");
+assert.equal(rows[1], null);
+assert.throws(() => session.rows("[]", JSON.stringify(["nope"])), /unknown row field/);
+const fullGraph = session.toGraph(JSON.stringify({ view: "tree" }));
+const within = JSON.parse(session.toGraph(JSON.stringify({ view: "tree", summary: { open: [], fullWithin: 1000 } })));
+assert.equal(within.full, true);
+assert.equal(within.summary, undefined);
+delete within.full;
+assert.deepEqual(within, JSON.parse(fullGraph), "within the budget the reply is the full graph");
+const above = JSON.parse(session.toGraph(JSON.stringify({ view: "tree", summary: { open: [], fullWithin: 0 } })));
+assert.equal(above.full, undefined);
+assert.ok(above.summary, "above the budget the reply is the summary");
 
 // Real standard library: bundle + sealed snapshot. The library-typed
 // source below only checks clean when stdlib resolution works, and the
@@ -231,5 +267,25 @@ assert.equal(sibling.toCompactJson(), s2.toCompactJson());
 assert.deepEqual(JSON.parse(shared.check()), []);
 shared.free();
 sibling.free();
+
+// Number formats: the language server's setter reads a spec and refuses
+// a bad one by name; verify's display ranges follow its own option while
+// the exact range stays exact.
+const named = (re) => (err) => re.test(String(err));
+const lsp = new LspServer();
+assert.deepEqual(lsp.setNumberFormat("parens"), []);
+assert.throws(() => lsp.setNumberFormat("overline,width=3"), named(/unknown setting `width`/));
+lsp.free();
+const ranged = Session.fromSources(JSON.stringify([{
+  name: "r.sysml",
+  text: "package R { attribute x[1]; assert constraint lo { x >= 0 } assert constraint hi { 3 * x <= 1 } }",
+}]));
+const rangeOf = (opts) => JSON.parse(ranged.verify(opts)).ranges.find((r) => r.feature === "x");
+assert.equal(rangeOf(JSON.stringify({ numberFormat: "unicode" })).rangeApprox, "[0, ¹/₃]");
+assert.equal(rangeOf(JSON.stringify({ numberFormat: "unicode" })).range, "[0, 1/3]");
+assert.equal(rangeOf(null).rangeApprox, "[0, 1/3]");
+assert.equal(rangeOf(JSON.stringify({ numberFormat: "approx" })).rangeApprox, "[0, ≈0.3333333333333333]");
+assert.throws(() => ranged.verify(JSON.stringify({ numberFormat: "decimal" })), named(/numberFormat/));
+ranged.free();
 
 console.log("smoke: ok");

@@ -103,6 +103,7 @@ jobs:
         run: |
           python3 tools/semantic_catalog.py --check
           python3 tools/operation_catalog.py --check
+          python3 tools/gen_metaclass_hierarchy.py --check
       - name: Run the full test suite
         run: cargo test --release
       - name: Clippy
@@ -118,7 +119,8 @@ jobs:
         # check so the two cannot collide.
         run: |
           SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/TransformMeta.sysml
-          printf 'package V {\n    #TransformMeta::Generated part def G;\n}\n' > /tmp/ambient.sysml
+          SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/StringPatterns.sysml
+          printf 'package V {\n    #TransformMeta::Generated part def G;\n    attribute def E :> ScalarValues::String {\n        @StringPatterns::Pattern { regex = "[a-z]+"; }\n    }\n}\n' > /tmp/ambient.sysml
           cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library /tmp/ambient.sysml
 
   msrv:

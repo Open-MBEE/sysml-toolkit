@@ -3,6 +3,7 @@ use super::{
     Builder, ElementRef, ResolvedModel, ScopeRef, provider_completeness::ProviderCompleteness,
 };
 use crate::metaclass::conforms;
+use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
 
 /// Proven evaluation context for a stored value expression.
@@ -196,11 +197,11 @@ impl ValueScopeResolver {
             charge(steps, relationships.len())?;
             let conjugated = relationships
                 .iter()
-                .any(|&r| conforms(b.elements[r].ty, "Conjugation"));
+                .any(|&r| is_a!(b.elements[r], "Conjugation"));
             if conjugated
                 && relationships
                     .iter()
-                    .any(|&r| conforms(b.elements[r].ty, "Specialization"))
+                    .any(|&r| is_a!(b.elements[r], "Specialization"))
             {
                 return None;
             }
@@ -370,7 +371,7 @@ mod tests {
         let relationship = *r.b.elements[donor.0]
             .owned_relationships
             .iter()
-            .find(|&&rel| conforms(r.b.elements[rel].ty, "Specialization"))
+            .find(|&&rel| is_a!(r.b.elements[rel], "Specialization"))
             .unwrap();
         r.b.elements[context.0]
             .owned_relationships

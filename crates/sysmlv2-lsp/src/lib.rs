@@ -81,6 +81,57 @@ pub fn run_stdio(library: Option<std::path::PathBuf>) -> Result<(), Error> {
     run_stdio_with_number_format(library, sysmlv2_parser::numfmt::NumberFormat::exact())
 }
 
+/// The server's settings when the client's initialization options name
+/// none: the command line's `lsp --number-format` and
+/// `lsp --value-hint-units`, for editors that cannot send initialization
+/// options. A client's `initializationOptions.numberFormat` and
+/// `initializationOptions.valueHintUnits` override them.
+///
+/// Build one from [`ServerDefaults::default`] (exact numbers, the
+/// evaluator's units) and the `with_…` setters, so that a later setting
+/// does not break callers.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ServerDefaults {
+    /// How value hints, hover values and range hints write a rational
+    /// without a terminating decimal expansion.
+    pub number_format: sysmlv2_parser::numfmt::NumberFormat,
+    /// Which units value hints, range hints, verdict lenses and hover
+    /// values show quantities in.
+    pub value_hint_units: sysmlv2_parser::eval::UnitDisplay,
+}
+
+impl Default for ServerDefaults {
+    fn default() -> ServerDefaults {
+        ServerDefaults {
+            number_format: sysmlv2_parser::numfmt::NumberFormat::exact(),
+            value_hint_units: sysmlv2_parser::eval::UnitDisplay::Si,
+        }
+    }
+}
+
+impl ServerDefaults {
+    /// These defaults with `number_format`.
+    #[must_use]
+    pub fn with_number_format(
+        mut self,
+        number_format: sysmlv2_parser::numfmt::NumberFormat,
+    ) -> ServerDefaults {
+        self.number_format = number_format;
+        self
+    }
+
+    /// These defaults with `value_hint_units`.
+    #[must_use]
+    pub fn with_value_hint_units(
+        mut self,
+        value_hint_units: sysmlv2_parser::eval::UnitDisplay,
+    ) -> ServerDefaults {
+        self.value_hint_units = value_hint_units;
+        self
+    }
+}
+
 /// [`run_stdio`] whose value hints, hover values and range hints write
 /// non-terminating rationals in `number_format` unless the client's
 /// `initializationOptions.numberFormat` says otherwise — the command
@@ -90,8 +141,20 @@ pub fn run_stdio_with_number_format(
     library: Option<std::path::PathBuf>,
     number_format: sysmlv2_parser::numfmt::NumberFormat,
 ) -> Result<(), Error> {
+    run_stdio_with_defaults(
+        library,
+        ServerDefaults::default().with_number_format(number_format),
+    )
+}
+
+/// [`run_stdio`] with `defaults` for what the client's initialization
+/// options leave unsaid (see [`ServerDefaults`]).
+pub fn run_stdio_with_defaults(
+    library: Option<std::path::PathBuf>,
+    defaults: ServerDefaults,
+) -> Result<(), Error> {
     let (connection, io_threads) = Connection::stdio();
-    run_with_number_format(connection, library, number_format)?;
+    run_with_defaults(connection, library, defaults)?;
     io_threads.join()?;
     Ok(())
 }
@@ -103,11 +166,24 @@ pub fn run_with_number_format(
     library: Option<std::path::PathBuf>,
     number_format: sysmlv2_parser::numfmt::NumberFormat,
 ) -> Result<(), Error> {
+    run_with_defaults(
+        connection,
+        library,
+        ServerDefaults::default().with_number_format(number_format),
+    )
+}
+
+/// [`run_with_library`] with `defaults`, as [`run_stdio_with_defaults`].
+pub fn run_with_defaults(
+    connection: Connection,
+    library: Option<std::path::PathBuf>,
+    defaults: ServerDefaults,
+) -> Result<(), Error> {
     serve(
         connection,
         library,
         std::time::Duration::from_millis(300),
-        number_format,
+        defaults,
     )
 }
 
@@ -138,19 +214,14 @@ pub fn run_with_options(
     library: Option<std::path::PathBuf>,
     debounce: std::time::Duration,
 ) -> Result<(), Error> {
-    serve(
-        connection,
-        library,
-        debounce,
-        sysmlv2_parser::numfmt::NumberFormat::exact(),
-    )
+    serve(connection, library, debounce, ServerDefaults::default())
 }
 
 fn serve(
     connection: Connection,
     library: Option<std::path::PathBuf>,
     debounce: std::time::Duration,
-    number_format: sysmlv2_parser::numfmt::NumberFormat,
+    defaults: ServerDefaults,
 ) -> Result<(), Error> {
     let (init_id, init_params) = connection.initialize_start()?;
     let init: InitializeParams = serde_json::from_value(init_params)?;
@@ -185,11 +256,19 @@ fn serve(
     };
     let mut nav = nav::Nav::new(library, root.clone());
     nav.set_hide_redundant_value_hints(hide_redundant_value_hints(&init).unwrap_or(true));
-    nav.set_number_format(number_format);
+    nav.set_number_format(defaults.number_format);
+    nav.set_value_hint_units(defaults.value_hint_units);
     match crate::number_format(&init) {
         Some(Ok(format)) => nav.set_number_format(format),
         Some(Err(err)) => {
             let _ = connection.sender.send(number_format_refused(&err));
+        }
+        None => {}
+    }
+    match crate::value_hint_units(&init) {
+        Some(Ok(units)) => nav.set_value_hint_units(units),
+        Some(Err(err)) => {
+            let _ = connection.sender.send(value_hint_units_refused(&err));
         }
         None => {}
     }
@@ -283,6 +362,41 @@ pub(crate) fn hide_redundant_value_hints(init: &InitializeParams) -> Option<bool
         .as_ref()
         .and_then(|o| o.get("hideRedundantValueHints"))
         .and_then(|v| v.as_bool())
+}
+
+/// `initializationOptions.valueHintUnits`: which units evaluated-value
+/// inlay hints and hover values show quantities in — `"si"` (the
+/// evaluator's own, the default) or `"asWritten"` (the units each value
+/// was written in). `None` when the client sent none or `null`; an
+/// error when the value is neither.
+pub(crate) fn value_hint_units(
+    init: &InitializeParams,
+) -> Option<Result<sysmlv2_parser::eval::UnitDisplay, String>> {
+    let value = init
+        .initialization_options
+        .as_ref()
+        .and_then(|o| o.get("valueHintUnits"))
+        .filter(|v| !v.is_null())?;
+    Some(
+        value
+            .as_str()
+            .ok_or_else(|| "expected `si` or `asWritten`".to_string())
+            .and_then(sysmlv2_parser::eval::UnitDisplay::parse),
+    )
+}
+
+/// The warning for an `initializationOptions.valueHintUnits` the server
+/// could not use: hints keep the server's default units (the evaluator's,
+/// unless [`ServerDefaults::value_hint_units`] says otherwise). Shown,
+/// like a refused number format.
+pub(crate) fn value_hint_units_refused(err: &str) -> Message {
+    Message::Notification(Notification::new(
+        lsp_types::notification::ShowMessage::METHOD.to_string(),
+        lsp_types::ShowMessageParams {
+            typ: lsp_types::MessageType::WARNING,
+            message: format!("sysmlv2: value hint units ignored: {err}"),
+        },
+    ))
 }
 
 /// `initializationOptions.publishDiagnostics`: whether the server
@@ -980,6 +1094,9 @@ impl Server {
                     sysmlv2_parser::diag::Severity::Error => DiagnosticSeverity::ERROR,
                     sysmlv2_parser::diag::Severity::Warning => DiagnosticSeverity::WARNING,
                 }),
+                code: d
+                    .code
+                    .map(|c| lsp_types::NumberOrString::String(c.to_string())),
                 source: Some("sysmlv2".to_string()),
                 message: d.message.clone(),
                 ..Default::default()

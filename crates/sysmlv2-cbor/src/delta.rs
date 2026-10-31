@@ -204,23 +204,51 @@ fn views(arr: &[Value]) -> Vec<&Value> {
     arr.iter().collect()
 }
 
+/// The target state in the order applying a delta to `base` reproduces
+/// it: the elements `base` holds in base order, then the created ones in
+/// `target` order, in delta-canonical order. Only root order can differ
+/// from `target`'s own: a delta cannot move roots, so a created root
+/// follows every surviving one — and the result digest, the unit
+/// indices and the create order are all spelled in this order.
+fn applied_order<'a>(base: &[&Value], target: Vec<&'a Value>) -> Result<Vec<&'a Value>, Error> {
+    let base_pos: HashMap<&str, usize> = base
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| Some((e.get("@id")?.as_str()?, i)))
+        .collect();
+    let pos = |e: &Value| {
+        e.get("@id")
+            .and_then(Value::as_str)
+            .and_then(|id| base_pos.get(id).copied())
+    };
+    let (mut arranged, created): (Vec<&Value>, Vec<&Value>) =
+        target.into_iter().partition(|e| pos(e).is_some());
+    arranged.sort_by_key(|e| pos(e));
+    arranged.extend(created);
+    Ok(canonical_order(&arranged)?
+        .into_iter()
+        .map(|i| arranged[i])
+        .collect())
+}
+
 /// The two ownership lists the canonical order walks, by slot.
 const OWNERSHIP_LISTS: [&str; 2] = ["ownedRelationship", "ownedRelatedElement"];
 
 /// The delta-canonical order as a permutation of the payload's own
 /// positions — the shape [`delta_canonical`] materializes.
-fn canonical_order(arr: &[Value]) -> Result<Vec<usize>, Error> {
+fn canonical_order<V: std::borrow::Borrow<Value>>(arr: &[V]) -> Result<Vec<usize>, Error> {
     let n = arr.len();
     let mut index: HashMap<&str, usize> = HashMap::with_capacity(n);
     for (i, e) in arr.iter().enumerate() {
         let id = e
+            .borrow()
             .get("@id")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(format!("element {i} has a string @id")))?;
         index.insert(id, i);
     }
     Ok(ownership_preorder(n, |i, slot| {
-        targets(&index, &arr[i], OWNERSHIP_LISTS[slot])
+        targets(&index, arr[i].borrow(), OWNERSHIP_LISTS[slot])
     }))
 }
 
@@ -636,6 +664,122 @@ pub fn rebase_ids(base: &Value, target: &Value) -> Result<Value, Error> {
     Ok(Value::Array(out))
 }
 
+/// A strict delta between two graph stores' states, as
+/// [`store_delta_cbor`] makes it.
+#[derive(Debug, Clone)]
+pub struct StoreDelta {
+    /// The s2c delta payload.
+    pub bytes: Vec<u8>,
+    /// The state digest of the base with the delta applied, in the store's
+    /// (graph-normal) spelling: the digest the receiving store reports for
+    /// its new head. Record it as the expected head, not the sender's own.
+    pub result_digest: Uuid,
+    /// Why the target's ids were not rebased onto the base by ownership
+    /// path, or `None` when they were. When the rebase collided or its
+    /// delta did not apply, the delta keeps the target's own ids, which is
+    /// correct but replaces every element whose id differs.
+    pub fallback: Option<String>,
+}
+
+/// The strict delta that turns one graph store's state into another's:
+/// what a push (or pull) between two stores sends. `base` is the
+/// receiving branch's head and `target` the sending side's state, each
+/// an s2c snapshot as a store serves it, in one graph format (read from
+/// their headers; the delta is encoded in it, and an empty base takes the
+/// target's, since a format-unaware encoder stamps any snapshot legacy).
+/// Both are graph-normalized —
+/// the spelling stores verify digests in — and the target's ids are
+/// rebased onto the base by ownership path ([`rebase_ids`]), so states
+/// the two stores derived independently diff by structure.
+///
+/// The delta is applied to the base before it is returned, so the bytes
+/// are ones the receiver accepts: when the rebase collides or its delta
+/// does not apply, the delta keeps the target's own ids instead (larger,
+/// still correct), and when that does not apply either the error is
+/// returned. The target's unit structure rides along; whether the
+/// receiver keeps it is up to the receiver.
+pub fn store_delta_cbor(base: &[u8], target: &[u8]) -> Result<StoreDelta, Error> {
+    let base_format = crate::decode::graph_format(base)?;
+    let format = crate::decode::graph_format(target)?;
+    let none = |_: &str| None;
+    let (base, _) = crate::decode::from_cbor_with_units(base, &none)?;
+    let base_is_empty = base.as_array().is_none_or(Vec::is_empty);
+    if base_format != format && !base_is_empty {
+        return Err(Error::new(format!(
+            "the base is a graph-format {} state and the target a graph-format {} one; \
+             migrate one to the other's format first",
+            base_format.version(),
+            format.version()
+        )));
+    }
+    let base = crate::graph_normalize(&base)?;
+    let (target, units) = crate::decode::from_cbor_with_units(target, &none)?;
+    let ids = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| e["@id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    // Each unit's root by id: normalization reorders the elements.
+    let target_ids = ids(&target);
+    let root_paths: Vec<(String, String)> = units
+        .into_iter()
+        .filter_map(|(i, path)| Some((target_ids.get(usize::try_from(i).ok()?)?.clone(), path)))
+        .collect();
+    let target = crate::graph_normalize(&target)?;
+
+    // Encode `target` (whose ids `renamed` maps from the normalized
+    // target's) and apply it to the base, which checks both digests.
+    let attempt = |target: &Value,
+                   renamed: &HashMap<String, String>,
+                   fallback: Option<String>|
+     -> Result<StoreDelta, Error> {
+        let position: HashMap<String, usize> = ids(target)
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
+        let mut units: Vec<(usize, String)> = root_paths
+            .iter()
+            .filter_map(|(id, path)| {
+                let id = renamed.get(id).unwrap_or(id);
+                Some((*position.get(id)?, path.clone()))
+            })
+            .collect();
+        units.sort_by_key(|(i, _)| *i);
+        let options = DeltaOptions::new()
+            .with_graph_format(format)
+            .with_units(units);
+        let bytes = delta_compact_cbor(&base, target, &options)?;
+        let applied = apply_delta_cbor(&bytes, &base)?;
+        let result_digest = state_digest(&crate::graph_normalize(&applied)?)?;
+        Ok(StoreDelta {
+            bytes,
+            result_digest,
+            fallback,
+        })
+    };
+
+    let why = match rebase_ids(&base, &target) {
+        Ok(rebased) => {
+            // rebase keeps the array order, so ids pair up by position
+            let renamed: HashMap<String, String> =
+                ids(&target).into_iter().zip(ids(&rebased)).collect();
+            match crate::graph_normalize(&rebased)
+                .and_then(|rebased| attempt(&rebased, &renamed, None))
+            {
+                Ok(delta) => return Ok(delta),
+                Err(e) => {
+                    format!("the rebased state does not normalize or its delta does not apply: {e}")
+                }
+            }
+        }
+        Err(e) => format!("the rebase is refused: {e}"),
+    };
+    attempt(&target, &HashMap::new(), Some(why))
+}
+
 /// Compute and encode the delta from `base` to `target` (both compact
 /// element arrays; order-insensitive — both canonicalize first).
 pub fn delta_compact_cbor(
@@ -916,7 +1060,7 @@ fn delta_encode(
             .map_err(Error::new)?;
     }
     let base_arr = canonical_views(base)?;
-    let target_arr = canonical_views(target)?;
+    let target_arr = applied_order(&base_arr, canonical_views(target)?)?;
     let base_digest = digest_of_canonical(&base_arr)?;
     let result_digest = digest_of_canonical(&target_arr)?;
 

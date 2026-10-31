@@ -2056,7 +2056,10 @@ fn redefinition_provenance_requires_complete_transitive_providers() {
             false,
         ),
     ];
-    cases.push(("class Container { feature item; } feature root : Container; feature Base subsets root.item;", false));
+    // A chain subsetting's scope is proved through the chain's last link,
+    // so the provider is complete and `mass`, which `root.item` does not
+    // carry, is redefined outside inheritance.
+    cases.push(("class Container { feature item; } feature root : Container; feature Base subsets root.item;", true));
     cases.push(("class Root; class Left specializes Root; class Right specializes Root; class Base specializes Left, Right;", true));
     let mut deep = String::from("class Level0; ");
     for i in 1..32 {

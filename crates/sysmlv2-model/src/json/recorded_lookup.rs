@@ -334,8 +334,8 @@ impl Graph {
         let has_redefinition = b.elements.iter().any(|e| is_a!(e, "Redefinition"));
         let candidate = b.scopes.iter().any(|s| {
             !s.aliases.is_empty()
-                || s.bases.len() > 1
-                || (!s.bases.is_empty()
+                || s.written_base_count() > 1
+                || (s.written_base_count() > 0
                     && s.owner.is_some_and(|owner| {
                         b.elements[owner]
                             .owned_relationships
@@ -532,7 +532,7 @@ impl Graph {
                     .collect();
                 keep(&mut graph.header_misses, s, misses);
                 if let Some(bases) = bases {
-                    if scope.chain_bases.is_empty() && bases.len() == scope.bases.len() {
+                    if scope.chain_bases.is_empty() && bases.len() == scope.written_base_count() {
                         graph.header_bases.insert(s, bases);
                     }
                 }
@@ -635,7 +635,7 @@ impl Graph {
                 );
                 node.owned.push(r);
             }
-            if complete && written_bases == scope.bases.len() {
+            if complete && written_bases == scope.written_base_count() {
                 graph.nodes[s] = Some(node);
             }
         }

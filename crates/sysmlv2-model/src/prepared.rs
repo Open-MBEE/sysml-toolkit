@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{io, path::Path, sync::Arc};
-use sysmlv2_syntax::ast::QualifiedName;
+use sysmlv2_syntax::ast::{QualifiedName, UsageKind};
 
 type Specialization = (usize, &'static str, usize, QualifiedName);
 
@@ -27,17 +27,26 @@ pub(crate) fn specializations<'de, D: Deserializer<'de>>(
         })
         .collect()
 }
+/// A scope's recorded implied end names, admitted only when
+/// [`crate::json::binary_end_names`] knows them (one usage kind per row of
+/// that table stands for the kinds sharing the row), so a snapshot holds
+/// the `&'static str` the builder would have registered.
 pub(crate) fn implied_ends<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Vec<(&'static str, usize, usize)>, D::Error> {
     Vec::<(String, usize, usize)>::deserialize(d)?
         .into_iter()
         .map(|(n, e, s)| {
-            let name = match n.as_str() {
-                "source" => "source",
-                "target" => "target",
-                _ => return Err(serde::de::Error::custom("invalid implicit end")),
-            };
+            let name = [
+                UsageKind::Connection,
+                UsageKind::Succession,
+                UsageKind::Binding,
+            ]
+            .into_iter()
+            .filter_map(crate::json::binary_end_names)
+            .flatten()
+            .find(|&name| name == n)
+            .ok_or_else(|| serde::de::Error::custom("invalid implicit end"))?;
             Ok((name, e, s))
         })
         .collect()

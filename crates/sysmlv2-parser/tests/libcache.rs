@@ -561,7 +561,8 @@ fn generated_model(rng: &mut Rng, d: &Dialect) -> String {
 /// and whether resolution runs its later passes must not depend on
 /// whether the library resolves alone. Each seed generates one pair per
 /// dialect. Deeper runs:
-/// `REPLAY_FUZZ_ITERS=100000 cargo test --release --test libcache`.
+/// `REPLAY_FUZZ_ITERS=100000 cargo test --release -p sysmlv2-parser --test integration
+/// libcache::`.
 #[test]
 fn replayed_generated_libraries_match_cold_builds() {
     let iters: u64 = std::env::var("REPLAY_FUZZ_ITERS")

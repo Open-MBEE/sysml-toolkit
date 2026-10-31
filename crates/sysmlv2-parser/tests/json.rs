@@ -277,6 +277,53 @@ fn variant_membership() {
 }
 
 #[test]
+fn enum_body_metadata_is_an_annotating_member() {
+    // An enumeration body admits metadata usages beside its enumerated
+    // values: each is a MetadataUsage owned by an OwningMembership of the
+    // enumeration, and only the values are variants.
+    for member in [
+        "@M;",
+        "@M { }",
+        "metadata m : M;",
+        "@M about a;",
+        "private @M;",
+        "#M @M;",
+    ] {
+        let elements = emit(&format!(
+            "package P {{ metadata def M; enum def E {{ {member} enum a; }} }}"
+        ));
+        let def = find(&elements, "EnumerationDefinition");
+        let usage = find(&elements, "MetadataUsage");
+        let rel = by_id(&elements, &usage["owningRelationship"]);
+        assert_eq!(rel["@type"], "OwningMembership", "{member}");
+        assert_eq!(rel["owningRelatedElement"]["@id"], def["@id"], "{member}");
+        assert_eq!(all(&elements, "EnumerationUsage").len(), 1, "{member}");
+        let variants = all(&elements, "VariantMembership");
+        assert_eq!(variants.len(), 1, "{member}");
+        let literal = by_id(&elements, &variants[0]["ownedRelatedElement"][0]);
+        assert_eq!(literal["declaredName"], "a", "{member}");
+    }
+}
+
+#[test]
+fn enum_body_extended_values_stay_literals() {
+    // `#M` is the extension keyword an enumerated value may carry, so an
+    // extended value, with or without the `enum` keyword or a name, is
+    // still a literal: a variant EnumerationUsage annotated by `M`.
+    for member in ["#M;", "#M enum b;", "#M b;"] {
+        let elements = emit(&format!(
+            "package P {{ metadata def M; enum def E {{ {member} enum a; }} }}"
+        ));
+        assert_eq!(all(&elements, "EnumerationUsage").len(), 2, "{member}");
+        assert_eq!(all(&elements, "VariantMembership").len(), 2, "{member}");
+        let usage = find(&elements, "MetadataUsage");
+        let rel = by_id(&elements, &usage["owningRelationship"]);
+        let annotated = by_id(&elements, &rel["owningRelatedElement"]);
+        assert_eq!(annotated["@type"], "EnumerationUsage", "{member}");
+    }
+}
+
+#[test]
 fn state_machine_lowering() {
     let elements = emit(
         "package P {

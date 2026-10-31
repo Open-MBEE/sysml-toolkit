@@ -962,8 +962,7 @@ fn quantified_scalar_instances_do_not_inherit_root_collection_arity() {
     }
 }
 
-#[path = "common/collection_identity.rs"]
-mod collection_identity;
+use crate::collection_identity;
 
 #[test]
 fn contextual_member_formulas_do_not_capture_quantifier_bindings() {
@@ -1033,4 +1032,39 @@ fn scalar_admission_respects_body_and_named_multiplicity() {
             );
         }
     }
+}
+
+/// A bound that folds through a product is in SI-coherent units; the
+/// range also reads in the units the bound was written in, as the same
+/// set of values. A bound written in one unit is already as written.
+#[test]
+fn ranges_also_read_in_the_units_their_bounds_were_written_in() {
+    let p = prop(
+        "package P {
+            attribute m; attribute g;
+            attribute 'in' {
+                attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; }
+            }
+            attribute lb {
+                attribute unitConversion { attribute referenceUnit = g; attribute conversionFactor = 453.59237; }
+            }
+            part def Board {
+                attribute footprint : Real;
+                attribute load : Real;
+                assert constraint { footprint <= 2 ['in'] * (3 ['in']) }
+                assert constraint { footprint >= 1 ['in'] * (1 ['in']) }
+                assert constraint { load <= 10 [lb] }
+            }
+        }",
+    );
+    let footprint = range_of(&p, "footprint");
+    assert_eq!(footprint.unit.as_deref(), Some("m**2"));
+    assert_eq!(footprint.range, "[0.00064516, 0.00387096]");
+    let written = footprint.as_written.as_ref().expect("a written reading");
+    assert_eq!(written.unit, "in**2");
+    assert_eq!(written.range, "[1, 6]");
+    assert_eq!(written.range_approx, "[1, 6]");
+    let load = range_of(&p, "load");
+    assert_eq!(load.unit.as_deref(), Some("lb"));
+    assert!(load.as_written.is_none(), "{load:?}");
 }

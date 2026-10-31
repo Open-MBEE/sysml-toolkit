@@ -692,6 +692,102 @@ fn convert_flexo_payload_round_trips_through_split() {
 }
 
 #[test]
+fn convert_flexo_derives_the_ownership_back_references_flexo_omits() {
+    // Flexo MMS returns elements without `owningRelationship` and
+    // `owningRelatedElement`. Under --flexo every JSON target reads such
+    // a payload as it reads one carrying them; without it the payload is
+    // refused rather than lifted with every owned element as a root.
+    let dir = std::env::temp_dir().join(format!("sysmlv2-flexo-owning-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("alpha.sysml"),
+        "package Alpha { part def P { part q; } part p : P; part r :> p.q; }",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("beta.sysml"),
+        "package Beta { private import Alpha::*; part b : P; }",
+    )
+    .unwrap();
+    let out = sysmlv2(&[
+        "convert",
+        "--to",
+        "compact-json",
+        "--flexo",
+        dir.join("alpha.sysml").to_str().unwrap(),
+        dir.join("beta.sysml").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let records: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let mut stripped = records.clone();
+    for record in stripped.as_array_mut().unwrap() {
+        let payload = record["payload"].as_object_mut().unwrap();
+        payload.remove("owningRelationship");
+        payload.remove("owningRelatedElement");
+    }
+    let full_path = dir.join("full.json");
+    let stripped_path = dir.join("stripped.json");
+    fs::write(&full_path, records.to_string()).unwrap();
+    fs::write(&stripped_path, stripped.to_string()).unwrap();
+
+    let plain: Vec<&serde_json::Value> = stripped
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| &r["payload"])
+        .collect();
+    let plain_path = dir.join("plain.json");
+    fs::write(&plain_path, serde_json::to_string(&plain).unwrap()).unwrap();
+    for to in ["text", "compact-json", "full-json", "compact-cbor"] {
+        let out = sysmlv2(&["convert", "--to", to, plain_path.to_str().unwrap()]);
+        assert!(!out.status.success(), "--to {to}: {}", stdout(&out));
+        assert!(
+            stderr(&out).contains("omits the inverse ownership ends"),
+            "--to {to}: {}",
+            stderr(&out)
+        );
+    }
+
+    for to in ["compact-json", "full-json", "compact-cbor"] {
+        let read = |input: &Path| {
+            let out = sysmlv2(&["convert", "--to", to, "--flexo", input.to_str().unwrap()]);
+            assert!(out.status.success(), "--to {to}: {}", stderr(&out));
+            out.stdout
+        };
+        assert_eq!(read(&stripped_path), read(&full_path), "--to {to}");
+    }
+    let split = |input: &Path, name: &str| {
+        let outdir = dir.join(name);
+        fs::create_dir_all(&outdir).unwrap();
+        let out = sysmlv2(&[
+            "convert",
+            "--to",
+            "text",
+            "--flexo",
+            input.to_str().unwrap(),
+            "-o",
+            outdir.to_str().unwrap(),
+        ]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        ["alpha.sysml", "beta.sysml"].map(|f| fs::read_to_string(outdir.join(f)).unwrap())
+    };
+    let from_stripped = split(&stripped_path, "from-stripped");
+    assert_eq!(from_stripped, split(&full_path, "from-full"));
+    assert!(
+        from_stripped[0].contains("part r :> "),
+        "{}",
+        from_stripped[0]
+    );
+    let out = sysmlv2(&[
+        "check",
+        dir.join("from-stripped/alpha.sysml").to_str().unwrap(),
+        dir.join("from-stripped/beta.sysml").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn lift_drops_is_variable_on_usage_metaclasses() {
     // Some producers mark plain attribute usages `isVariable: true`;
     // `var` is a KerML-only prefix, so the lifted SysML must not print it.
@@ -701,14 +797,18 @@ fn lift_drops_is_variable_on_usage_metaclasses() {
         { "@type": "Namespace", "@id": "00000000-0000-0000-0000-00000000000a",
           "ownedRelationship": [ {"@id": "00000000-0000-0000-0000-00000000000b"} ] },
         { "@type": "OwningMembership", "@id": "00000000-0000-0000-0000-00000000000b",
+          "owningRelatedElement": {"@id": "00000000-0000-0000-0000-00000000000a"},
           "ownedRelatedElement": [ {"@id": "00000000-0000-0000-0000-00000000000c"} ] },
         { "@type": "Package", "@id": "00000000-0000-0000-0000-00000000000c",
           "declaredName": "P",
+          "owningRelationship": {"@id": "00000000-0000-0000-0000-00000000000b"},
           "ownedRelationship": [ {"@id": "00000000-0000-0000-0000-00000000000d"} ] },
         { "@type": "OwningMembership", "@id": "00000000-0000-0000-0000-00000000000d",
+          "owningRelatedElement": {"@id": "00000000-0000-0000-0000-00000000000c"},
           "ownedRelatedElement": [ {"@id": "00000000-0000-0000-0000-00000000000e"} ] },
         { "@type": "AttributeUsage", "@id": "00000000-0000-0000-0000-00000000000e",
-          "declaredName": "a", "isVariable": true }
+          "declaredName": "a", "isVariable": true,
+          "owningRelationship": {"@id": "00000000-0000-0000-0000-00000000000d"} }
     ]);
     let path = dir.join("foreign-producer.json");
     fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
@@ -2412,6 +2512,7 @@ fn payload_tables_exports_the_versioned_codec_artifact() {
         assert!(doc["versions"][axis].as_u64().unwrap() >= 1, "{axis}");
     }
     assert_eq!(doc["flags"]["delta"], 4);
+    assert_eq!(doc["flags"]["explicitIds"], 64);
     assert_eq!(doc["kinds"]["bool"], 0);
     let metaclasses = doc["metaclasses"].as_array().unwrap();
     assert!(metaclasses.len() > 100);
@@ -3307,6 +3408,42 @@ fn check_format_json_reports_stages_with_the_same_exit_codes() {
 }
 
 #[test]
+fn check_format_json_names_the_rule_a_semantic_finding_reports() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-check-json-rule-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("model.sysml");
+    fs::write(
+        &model,
+        "constraint c;\npart q : Missing;\npart p { satisfy c; }\n",
+    )
+    .unwrap();
+
+    let out = sysmlv2(&["check", "--format", "json", model.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    let at_stage = |stage: &str| {
+        doc["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["stage"] == stage)
+            .unwrap_or_else(|| panic!("no {stage} finding: {doc}"))
+    };
+    // The rule the semantic finding's message names is its `rule`; the
+    // unresolved reference names none.
+    let semantic = at_stage("semantic");
+    assert_eq!(
+        semantic["rule"], "validateSatisfyRequirementUsageReference",
+        "{semantic}"
+    );
+    assert!(at_stage("referential")["rule"].is_null(), "{doc}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn lint_format_json_locates_findings_past_a_parse_failure() {
     let dir = std::env::temp_dir().join(format!(
         "sysmlv2-cli-test-lint-json-mixed-{}",
@@ -3641,4 +3778,449 @@ fn number_format_respells_printed_values() {
     ]);
     assert_eq!(stdout(&out), "B::huge = ≈3.33e399\n", "{}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
+}
+
+/// `--value-units as-written` prints quantities in the units they were
+/// written in: `eval` and `query` values (inside sequences too),
+/// `verify --ranges` ranges and the values behind a violated verdict,
+/// `verify --solve` witnesses, and `viz`'s `= value` lines. Without it, or
+/// with `si`, the output is the evaluator's units as before; a value the
+/// flag does not take is a usage error listing the possible ones.
+#[test]
+fn value_units_respell_printed_quantities() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-units-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("b.sysml");
+    fs::write(
+        &file,
+        "package B {\n    attribute m; attribute s;\n    \
+         attribute 'in' { attribute unitConversion { attribute referenceUnit = m; \
+         attribute conversionFactor = 0.0254; } }\n    \
+         part def Board {\n        attribute w = 10 ['in'];\n        \
+         attribute area = w * (4 ['in']);\n        attribute speed = w / (2 [s]);\n        \
+         attribute footprint[1];\n        \
+         assert constraint fits { footprint <= w * (3 ['in']) }\n        \
+         assert constraint slow { speed <= 1 ['in'] / (1 [s]) }\n    }\n}\n",
+    )
+    .unwrap();
+    let file = file.to_str().unwrap();
+    let run = |args: &[&str], units: Option<&str>| -> String {
+        let mut args = args.to_vec();
+        if let Some(units) = units {
+            args.extend(["--value-units", units]);
+        }
+        let out = sysmlv2(&args);
+        assert!(
+            out.status.code().is_some_and(|c| c <= 1),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        stdout(&out)
+    };
+    let eval = [
+        "eval",
+        file,
+        "B::Board::speed",
+        "B::Board::area",
+        "B::Board::w",
+    ];
+    let si_eval =
+        "B::Board::speed = 0.127 [m/s]\nB::Board::area = 0.0258064 [m**2]\nB::Board::w = 10 [in]\n";
+    assert_eq!(run(&eval, None), si_eval);
+    assert_eq!(run(&eval, Some("si")), si_eval);
+    assert_eq!(
+        run(&eval, Some("as-written")),
+        "B::Board::speed = 5 [in/s]\nB::Board::area = 40 [in**2]\nB::Board::w = 10 [in]\n"
+    );
+    let query = ["query", file, "(B::Board::speed, B::Board::area, 3)"];
+    assert_eq!(run(&query, None), "0.127 [m/s]\n0.0258064 [m**2]\n3\n");
+    assert_eq!(run(&query, Some("as-written")), "5 [in/s]\n40 [in**2]\n3\n");
+
+    let verify = ["verify", "--ranges", file];
+    let si = run(&verify, None);
+    assert_eq!(
+        si,
+        format!(
+            "{file}:9:34  fits (AssertConstraintUsage): satisfied (propagation: holds for all values in the narrowed ranges)\n\
+             {file}:10:34  slow (AssertConstraintUsage): VIOLATED (with speed = 0.127 [m/s])\n\
+             1 satisfied, 1 violated, 0 undecided\n\n\
+             narrowed ranges:\n  footprint ∈ [\u{2212}∞, 0.0193548] [m**2]\n"
+        )
+    );
+    assert_eq!(run(&verify, Some("si")), si);
+    let written = run(&verify, Some("as-written"));
+    assert!(
+        written.contains("VIOLATED (with speed = 5 [in/s])"),
+        "{written}"
+    );
+    assert!(
+        written.contains("footprint ∈ [\u{2212}∞, 30] [in**2]"),
+        "{written}"
+    );
+    // The verdicts are the same either way.
+    assert!(
+        written.contains("1 satisfied, 1 violated, 0 undecided"),
+        "{written}"
+    );
+    assert!(si.contains("1 satisfied, 1 violated, 0 undecided"), "{si}");
+
+    let viz = ["viz", file];
+    let si = run(&viz, None);
+    assert!(
+        si.contains("area = 0.0258064 [m**2]") && si.contains("speed = 0.127 [m/s]"),
+        "{si}"
+    );
+    let written = run(&viz, Some("as-written"));
+    assert!(
+        written.contains("area = 40 [in**2]") && written.contains("speed = 5 [in/s]"),
+        "{written}"
+    );
+    assert!(written.contains("w = 10 [in]"), "{written}");
+
+    // A witness z3 finds for a constraint propagation cannot decide.
+    if Command::new("z3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        let open = dir.join("open.sysml");
+        fs::write(
+            &open,
+            "package O {\n    attribute m;\n    \
+             attribute 'in' { attribute unitConversion { attribute referenceUnit = m; \
+             attribute conversionFactor = 0.0254; } }\n    \
+             attribute x[1]; attribute y[1];\n    \
+             assert constraint sum { x + y == 2 ['in'] * (3 ['in']) }\n}\n",
+        )
+        .unwrap();
+        let solve = ["verify", "--solve", open.to_str().unwrap()];
+        let si = run(&solve, None);
+        assert!(
+            si.contains("z3: satisfiable") && si.contains("[m**2]"),
+            "{si}"
+        );
+        let written = run(&solve, Some("as-written"));
+        assert!(written.contains("z3: satisfiable"), "{written}");
+        assert!(
+            written.contains("[in**2]") && !written.contains("[m**2]"),
+            "{written}"
+        );
+    }
+
+    // A violated verdict's sequence value, and the number format alongside.
+    let seq = dir.join("seq.sysml");
+    fs::write(
+        &seq,
+        "package S {\n    attribute m; attribute s;\n    \
+         attribute 'in' { attribute unitConversion { attribute referenceUnit = m; \
+         attribute conversionFactor = 0.0254; } }\n    attribute w = 10 ['in'];\n    \
+         attribute pair = (w * (4 ['in']), w / (2 [s]));\n    \
+         attribute third = 1 ['in'] / (3 [s]);\n    \
+         assert constraint same { pair == (w * (3 ['in']), w / (2 [s])) }\n}\n",
+    )
+    .unwrap();
+    let seq = seq.to_str().unwrap();
+    let si = run(&["verify", seq], None);
+    assert!(
+        si.contains("VIOLATED (with pair = (0.0258064 [m**2], 0.127 [m/s]), w = 10 [in])"),
+        "{si}"
+    );
+    let written = run(&["verify", seq], Some("as-written"));
+    assert!(
+        written.contains("VIOLATED (with pair = (40 [in**2], 5 [in/s]), w = 10 [in])"),
+        "{written}"
+    );
+    let third = [
+        "eval",
+        seq,
+        "S::third",
+        "--number-format",
+        "approx,digits=3",
+    ];
+    assert_eq!(run(&third, None), "S::third = ≈0.00847 [m/s]\n");
+    assert_eq!(
+        run(&third, Some("as-written")),
+        "S::third = ≈0.333 [in/s]\n"
+    );
+
+    // The CLI spells it in kebab case; the wire spelling is a usage error.
+    let out = sysmlv2(&[
+        "eval",
+        file,
+        "B::Board::speed",
+        "--value-units",
+        "asWritten",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[possible values: si, as-written]"),
+        "{}",
+        stderr(&out)
+    );
+    // A command that prints no values does not take it.
+    let out = sysmlv2(&["parse", "--value-units", "as-written", file]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `sysmlv2 lsp --value-hint-units as-written` starts the server with
+/// value and range hints in the units they were written in; a client's
+/// `initializationOptions.valueHintUnits` still wins.
+#[test]
+fn lsp_value_hint_units_sets_the_server_default() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let text = "package U {\n    attribute m; attribute s;\n    \
+                attribute 'in' { attribute unitConversion { attribute referenceUnit = m; \
+                attribute conversionFactor = 0.0254; } }\n    \
+                attribute d = 10 ['in'];\n    attribute v = d / (2 [s]);\n}\n";
+    let hints = |flag: Option<&str>, init: serde_json::Value| -> Vec<String> {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sysmlv2"));
+        cmd.env_remove("SYSMLV2_MODEL_DIR")
+            .env_remove("SYSMLV2_LIB_DIR")
+            .arg("lsp");
+        if let Some(flag) = flag {
+            cmd.args(["--value-hint-units", flag]);
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("lsp starts");
+        let mut stdin = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut send = |msg: serde_json::Value| {
+            let body = msg.to_string();
+            write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            stdin.flush().unwrap();
+        };
+        let mut recv_id = |id: i64| -> serde_json::Value {
+            loop {
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(n) = line.strip_prefix("Content-Length: ") {
+                        len = n.parse().unwrap();
+                    }
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                let msg: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if msg["id"] == id && msg.get("method").is_none() {
+                    return msg;
+                }
+            }
+        };
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"capabilities": {}, "initializationOptions": init}}),
+        );
+        recv_id(1);
+        send(serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": {"textDocument": {"uri": "file:///w/u.sysml", "languageId": "sysml",
+                "version": 1, "text": text}}}),
+        );
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/inlayHint",
+            "params": {"textDocument": {"uri": "file:///w/u.sysml"},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 6, "character": 0}}}}),
+        );
+        let reply = recv_id(2);
+        send(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
+        recv_id(3);
+        send(serde_json::json!({"jsonrpc": "2.0", "method": "exit"}));
+        drop(stdin);
+        child.wait().unwrap();
+        reply["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["label"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let none = serde_json::Value::Null;
+    assert!(hints(None, none.clone()).contains(&" = 0.127 [m/s]".to_string()));
+    assert!(hints(Some("as-written"), none.clone()).contains(&" = 5 [in/s]".to_string()));
+    assert!(hints(Some("si"), none).contains(&" = 0.127 [m/s]".to_string()));
+    assert!(
+        hints(
+            Some("as-written"),
+            serde_json::json!({"valueHintUnits": "si"})
+        )
+        .contains(&" = 0.127 [m/s]".to_string())
+    );
+    let out = sysmlv2(&["lsp", "--value-hint-units", "asWritten"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    // `--value-units`, the other commands' spelling, names the same flag.
+    let out = sysmlv2(&["lsp", "--value-units", "bogus"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--value-hint-units"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn json_text_exports_use_and_validate_the_output_dialect() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-lift-dialect-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("source.kerml");
+    fs::write(&source, "package P { class A; feature f : A; }").unwrap();
+    let input = dir.join("input.json");
+    let result = sysmlv2(&[
+        "convert",
+        source.to_str().unwrap(),
+        "--to",
+        "compact-json",
+        "-o",
+        input.to_str().unwrap(),
+    ]);
+    assert!(result.status.success(), "{}", stderr(&result));
+    for minimal in [false, true] {
+        let outdir = dir.join(if minimal { "minimal" } else { "ordinary" });
+        fs::create_dir_all(&outdir).unwrap();
+        let mut args = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "--to",
+            "text",
+            "-o",
+            outdir.to_str().unwrap(),
+        ];
+        if minimal {
+            args.push("--min-qual");
+        }
+        let result = sysmlv2(&args);
+        assert!(result.status.success(), "{}", stderr(&result));
+        let path = outdir.join("document-1.kerml");
+        assert!(path.exists());
+        let checked = sysmlv2(&["check", path.to_str().unwrap()]);
+        assert!(checked.status.success(), "{}", stderr(&checked));
+    }
+    for (metaclass, declaration) in [("Feature", "feature f;\n"), ("Type", "type f;\n")] {
+        let slice = dir.join("slice.json");
+        fs::write(&slice, r#"[{"@id":"00000000-0000-0000-0000-000000000001","@type":"Feature","declaredName":"f","owningRelationship":{"@id":"00000000-0000-0000-0000-000000000002"}}]"#.replace("Feature", metaclass)).unwrap();
+        for minimal in [false, true] {
+            for extension in ["KerML", "sysml"] {
+                let target = dir.join(format!("slice-{metaclass}-{minimal}.{extension}"));
+                let mut args = vec![
+                    "convert",
+                    slice.to_str().unwrap(),
+                    "--to",
+                    "text",
+                    "-o",
+                    target.to_str().unwrap(),
+                ];
+                if minimal {
+                    args.push("--min-qual");
+                }
+                let result = sysmlv2(&args);
+                if extension == "KerML" {
+                    assert!(result.status.success(), "{}", stderr(&result));
+                    assert_eq!(fs::read_to_string(&target).unwrap(), declaration);
+                } else {
+                    assert!(!result.status.success());
+                    assert!(!target.exists(), "refusal must not write partial text");
+                }
+            }
+        }
+        let outdir = dir.join(format!("refused-{metaclass}"));
+        fs::create_dir_all(&outdir).unwrap();
+        let result = sysmlv2(&[
+            "convert",
+            slice.to_str().unwrap(),
+            "--to",
+            "text",
+            "-o",
+            outdir.to_str().unwrap(),
+        ]);
+        assert!(!result.status.success());
+        assert_eq!(fs::read_dir(&outdir).unwrap().count(), 0);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Foreign producers' payloads, which the corpus cannot stand in for:
+/// with `SYSMLV2_FOREIGN_EXPORTS` naming a directory of interchange JSON
+/// (pilot exports, Flexo retrievals), every file read with `--flexo` must
+/// get past ownership repair, dialect detection and the SysML-only guard.
+/// Failures of other kinds are reported but do not fail the test; the
+/// payloads are not the toolkit's to ship, so the test skips without them.
+#[test]
+fn foreign_exports_get_past_ownership_and_dialect_handling() {
+    let Some(root) = std::env::var_os("SYSMLV2_FOREIGN_EXPORTS") else {
+        eprintln!("skipping: SYSMLV2_FOREIGN_EXPORTS not set");
+        return;
+    };
+    let lib = sysmlv2_testkit::library_dir();
+    fn json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                json_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "json") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    json_files(Path::new(&root), &mut files);
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no .json under {}",
+        Path::new(&root).display()
+    );
+    let (mut converted, mut other) = (0, Vec::new());
+    let mut regressions = Vec::new();
+    for path in &files {
+        let out = sysmlv2(&[
+            "convert",
+            path.to_str().unwrap(),
+            "--flexo",
+            "--to",
+            "full-json",
+            "--lib",
+            lib.to_str().unwrap(),
+            "-o",
+            "/dev/null",
+        ]);
+        if out.status.success() {
+            converted += 1;
+            continue;
+        }
+        let error = stderr(&out);
+        let first = error
+            .lines()
+            .find(|l| l.starts_with("error"))
+            .unwrap_or("")
+            .to_string();
+        if [
+            "omits the inverse ownership ends",
+            "has no SysML declaration of its own",
+            ".kerml does not parse",
+        ]
+        .iter()
+        .any(|needle| error.contains(needle))
+        {
+            regressions.push(format!("{}: {first}", path.display()));
+        } else {
+            other.push(format!("{}: {first}", path.display()));
+        }
+    }
+    eprintln!(
+        "{converted} of {} converted; other failures:\n{}",
+        files.len(),
+        other.join("\n")
+    );
+    assert!(regressions.is_empty(), "{}", regressions.join("\n"));
 }

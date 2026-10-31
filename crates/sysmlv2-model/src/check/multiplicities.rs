@@ -75,7 +75,8 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
             ),
         ] {
             let invalid = match value {
-                None | Some(Value::Indeterminate | Value::Unbound(_) | Value::UnboundMember(_)) => {
+                None
+                | Some(Value::Indeterminate | Value::Unbound(..) | Value::UnboundMember(..)) => {
                     false
                 }
                 Some(Value::Integer(_)) => false,

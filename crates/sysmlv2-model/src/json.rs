@@ -970,6 +970,28 @@ impl FromIterator<(Uuid, usize)> for RowsById {
 
 /// Valued chain redefinitions by owning type: (redefining feature, resolved
 /// chain links) — see [`Builder::chain_redefinitions`].
+/// The model's features by each feature they subset or redefine, alone or
+/// as a chain link, with the chain's links (see
+/// [`Builder::feature_specializers`]).
+pub(crate) type FeatureSpecializers = Arc<HashMap<usize, Vec<(usize, Vec<usize>)>>>;
+/// The model's binding connectors whose two ends both resolved (see
+/// [`Builder::binding_ends`]).
+pub(crate) type BindingEnds = Arc<BindingIndex>;
+
+/// Binding connectors by the namespace that owns each, with the features
+/// their ends name.
+#[derive(Default)]
+pub(crate) struct BindingIndex {
+    /// (the connector, the first end's links, the second end's links), each
+    /// end the feature chain as written.
+    pub(crate) by_owner: HashMap<usize, Vec<BindingLinks>>,
+    /// Every link of every end: a feature none of them names is bound by
+    /// nothing, whatever it is read for.
+    pub(crate) named: HashSet<usize>,
+}
+/// One indexed binding connector: the connector, then its two ends' links.
+pub(crate) type BindingLinks = (usize, Vec<usize>, Vec<usize>);
+
 pub(crate) type ChainRedefinitions =
     Arc<crate::layered::LayeredMap<usize, Vec<(usize, Vec<usize>)>>>;
 
@@ -1041,6 +1063,14 @@ impl Builder {
         self.scopes = scopes.0;
     }
 }
+
+/// The memo of [`Builder::semantically_annotated`]: the metadata association
+/// generation and row revision it was built for, and the set.
+type SemanticAnnotatedMemo = (
+    Option<std::sync::Arc<()>>,
+    crate::layered::Revision,
+    std::sync::Arc<crate::layered::IdSet<usize>>,
+);
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Builder {
@@ -1145,6 +1175,14 @@ pub(crate) struct Builder {
     /// for.
     #[serde(skip)]
     chain_redefinitions: Option<(usize, ChainRedefinitions)>,
+    /// [`Self::feature_specializers`]' index, with the element count it
+    /// was built for.
+    #[serde(skip)]
+    feature_specializers: Option<(usize, FeatureSpecializers)>,
+    /// [`Self::binding_ends`]' index, with the element count it was built
+    /// for.
+    #[serde(skip)]
+    binding_ends: Option<(usize, BindingEnds)>,
     /// Import relationships a lookup actually resolved a name through
     /// (admitted hits only) — the unused-import check's evidence.
     #[serde(with = "crate::bulk::index_set")]
@@ -1621,7 +1659,8 @@ pub(crate) struct Builder {
     /// Source storage and prepared snapshots never serialize this view.
     #[serde(skip)]
     semantic_ownership: Option<Arc<semantic_ownership::SemanticOwnership>>,
-    /// Set while building an enum definition's direct body members.
+    /// Set while building an enum definition's enumerated values: its
+    /// direct body members other than metadata usages.
     in_enum_body: bool,
     /// Usage elements with an expected featuring type (owned by a Type via
     /// a FeatureMembership, or a variant of such a variation usage) — the
@@ -1640,6 +1679,29 @@ pub(crate) struct Builder {
     /// (same lifetime discipline) — drives the port-usage composite rule.
     #[serde(skip)]
     pending_owner_ty: Option<&'static str>,
+    /// The `kind` of the membership about to be created for a usage
+    /// (`entry`, `do`, `exit`), set on it before the usage is built so
+    /// that the usage's owner roles read it.
+    #[serde(skip)]
+    pending_membership_kind: Option<&'static str>,
+    /// Per owner, the implicit source a target transition (`then t;`,
+    /// `if g then t;`, `accept … then t;`, `else t;`) built next would take
+    /// (SysML 8.2.2.21, `implied::Anchor`): the last action member built
+    /// that is no transition, or the written source of the last transition
+    /// built (`None` while that source is not one of the owner's members so
+    /// far).
+    #[serde(skip)]
+    transition_anchor: crate::layered::IdMap<usize, Option<usize>>,
+    /// The implicit source of the usage about to be built, when it is a
+    /// transition whose text writes none: its owner's anchor so far.
+    #[serde(skip)]
+    pending_implicit_source: Option<Option<usize>>,
+    /// Per state owner, whether the member built last opens a run of
+    /// target transitions (`check::opens_target_transition_run`: a
+    /// behavior usage or a transition, a bare `then` built as one
+    /// included), so that a bare `then t;` built next is a transition.
+    #[serde(skip)]
+    target_transition_run: crate::layered::IdMap<usize, bool>,
     /// Per-owner count of `prefixmeta{n}` segments handed out — prefix
     /// metadata and canonicalized bare `@M;` members share one sequence.
     prefix_meta_next: crate::layered::LayeredMap<usize, usize>,
@@ -1687,6 +1749,11 @@ pub(crate) struct Builder {
     /// stay inert).
     #[serde(skip)]
     semantic_metadata: Option<Option<usize>>,
+    /// The elements a semantic metadata annotation gives an implied base
+    /// ([`Self::semantically_annotated`]), per metadata association
+    /// generation.
+    #[serde(skip)]
+    semantic_annotated_memo: Option<SemanticAnnotatedMemo>,
     /// Membership-import entries currently resolving their own target —
     /// `(scope, index into member_imports)`. A membership import must not
     /// resolve its target through itself (`import vehicle::**;` — the
@@ -2252,19 +2319,31 @@ struct Scope {
     filters: Vec<usize>,
     /// `alias a for X` members.
     aliases: Vec<(String, QualifiedName, usize)>,
-    /// Implied end-feature names of a binary connector-family usage: its two
-    /// ends implicitly redefine `source`/`target` (SysML 8.4.2, the ends of
-    /// `Connections::BinaryConnection`), so those names resolve — in the
-    /// usage's body — to the usage's own end features. Each entry is
-    /// (name, end element, end scope); the end scope bases on the end's
-    /// connected feature, so chain members (`source.x`) resolve through it.
-    /// Lift names these ends positionally (`implied_end_name`) — the two
-    /// must stay in sync or the round-trip gate trips.
+    /// Implied end-feature names of a binary connector-family usage: the
+    /// two ends it declares implicitly redefine the library's binary ends
+    /// by position ([`binary_end_names`]: a connection's, interface's,
+    /// allocation's or flow's `source`/`target`, a succession's
+    /// `earlierOccurrence`/`laterOccurrence`, a binding's
+    /// `thisThing`/`sameThing`), so those names resolve — in the usage's
+    /// body, after its declared names — to the usage's own end features.
+    /// Each entry is (name, end element, end scope); the end scope bases on
+    /// the end's connected feature, so chain members (`source.x`) resolve
+    /// through it. Lift names these ends positionally (`implied_end_name`)
+    /// — the two must stay in sync or the round-trip gate trips.
     #[serde(deserialize_with = "crate::prepared::implied_ends")]
     implied_ends: Vec<(&'static str, usize, usize)>,
     /// Specialization/typing targets of the element owning this scope —
     /// members of these resolve as inherited members.
     bases: Vec<QualifiedName>,
+    /// Written bases resolved one scope further out than [`Self::bases`]:
+    /// the `references` target of an end feature owned by a connector.
+    /// KerML 8.2.3.5.2 resolves such a ReferenceSubsetting in the
+    /// connector's owning namespace, where the connector's body finds
+    /// first an end the connector inherits from its own type
+    /// (`Links::BinaryLink::source`) under the name of the owner's
+    /// feature. Explicit heritage, like [`Self::bases`].
+    #[serde(default)]
+    outer_bases: Vec<QualifiedName>,
     /// *Implied* heritage (resolution only, never emitted to JSON): the SysML
     /// Tables 31/32 library bases of the owner's kind and the binary
     /// connector/interface library base (the scopes of what a parameter,
@@ -2278,6 +2357,13 @@ struct Scope {
     /// plain-name base (`part m :> a.b { attribute :>> x; }` finds `x`
     /// among `b`'s members).
     chain_bases: Vec<Vec<QualifiedName>>,
+}
+
+impl Scope {
+    /// How many written bases the scope has, wherever they resolve.
+    fn written_base_count(&self) -> usize {
+        self.bases.len() + self.outer_bases.len()
+    }
 }
 
 /// The largest same-name group the implicit-redefinition step of
@@ -4326,9 +4412,72 @@ impl Builder {
         self.record_intrinsic_metadata(owner, e);
     }
 
+    /// Whether `u`, a member of `owner`'s body, is a bare `then t;` that
+    /// the grammar reads as a target transition: `owner` is a state
+    /// definition or usage and the member built before it opens a run of
+    /// target transitions (`target_transition_run`). A `then [1] t;` keeps
+    /// its multiplicity and stays a succession.
+    fn bare_then_is_transition(&self, u: &Usage, member: &Member, owner: usize) -> bool {
+        u.kind == UsageKind::Succession
+            && !member.leading_then
+            && matches!(&u.detail, UsageDetail::Succession { source: None, .. })
+            && (crate::metaclass::conforms(self.elements[owner].ty, "StateDefinition")
+                || crate::metaclass::conforms(self.elements[owner].ty, "StateUsage"))
+            && self
+                .target_transition_run
+                .get(&owner)
+                .copied()
+                .unwrap_or(false)
+    }
+
     fn build_member(&mut self, member: &Member, owner: usize, scope: usize, index: usize) {
         let watermark = self.elements.len();
+        self.pending_implicit_source = self.transition_anchor.get(&owner).copied();
+        let bare_then_transition = matches!(&member.kind, MemberKind::Usage(u)
+            if self.bare_then_is_transition(u, member, owner));
         self.build_member_inner(member, owner, scope, index);
+        self.pending_implicit_source = None;
+        self.target_transition_run.insert(
+            owner,
+            bare_then_transition || sysmlv2_syntax::check::opens_target_transition_run(member),
+        );
+        // The member's own element is the child of the last membership it
+        // added to its owner: an action that is no transition, or the
+        // written source of a transition, is the implicit source of the
+        // target transitions built after it.
+        if let Some(&rel) = self.elements[owner].owned_relationships.last() {
+            if rel >= watermark && is_a!(self.elements[rel], "FeatureMembership") {
+                if let Some(&elem) = self.elements[rel].children.first() {
+                    if self.elements[elem].ty == "TransitionUsage" {
+                        if let MemberKind::Usage(Usage {
+                            detail:
+                                UsageDetail::Transition {
+                                    source: Some(source),
+                                    ..
+                                },
+                            ..
+                        }) = &member.kind
+                        {
+                            let written = match source {
+                                TargetRef::Name(qn) if !qn.is_global && qn.segments.len() == 1 => {
+                                    self.scopes[scope]
+                                        .names
+                                        .get(&qn.segments[0].value)
+                                        .and_then(|bindings| bindings.first())
+                                        .map(|binding| binding.elem)
+                                }
+                                _ => None,
+                            };
+                            self.transition_anchor.insert(owner, written);
+                        }
+                    } else if is_a!(self.elements[elem], "ActionUsage")
+                        && implied::is_previous_candidate(self, owner, rel, elem)
+                    {
+                        self.transition_anchor.insert(owner, Some(elem));
+                    }
+                }
+            }
+        }
         // Record the member's full source extent (keyword through body or
         // terminator) on the first element it owns — the transformation
         // SDK's remove/insert anchor. Nested members record their own
@@ -4573,6 +4722,29 @@ impl Builder {
                 self.scopes[scope].filters.extend(fids);
             }
             MemberKind::Definition(d) => self.build_definition(d, member, owner, scope, index),
+            // A bare `then t;` in a state body after a behavior usage or a
+            // transition is a target transition (SysML.xtext
+            // `TargetTransitionUsage`), which the parser spells as the
+            // succession it is everywhere else; it is built as the
+            // transition, its source the owner's anchor.
+            MemberKind::Usage(u) if self.bare_then_is_transition(u, member, owner) => {
+                let UsageDetail::Succession { target, .. } = &u.detail else {
+                    unreachable!("a bare then is a succession")
+                };
+                let transition = Usage {
+                    kind: UsageKind::Transition,
+                    detail: UsageDetail::Transition {
+                        source: None,
+                        trigger: None,
+                        guard: None,
+                        effect: None,
+                        target: Some(target.clone()),
+                        is_default: false,
+                    },
+                    ..u.clone()
+                };
+                self.build_usage(&transition, member, owner, scope, index)
+            }
             MemberKind::Usage(u) => self.build_usage(u, member, owner, scope, index),
             MemberKind::Dependency(d) => {
                 let rel = self.new_relationship("OwningMembership", owner, &format!("m{index}"));
@@ -4650,8 +4822,14 @@ impl Builder {
                     Some("RequirementUsage"),
                 );
             }
+            // The membership kinds are set before the usages are built: the
+            // usages' owner roles read them.
             MemberKind::RequirementConstraint { kind, usage } => {
-                let (rel, _) = self.build_usage_with(
+                self.pending_membership_kind = Some(match kind {
+                    RequirementConstraintKind::Assumption => "assumption",
+                    RequirementConstraintKind::Requirement => "requirement",
+                });
+                self.build_usage_with(
                     usage,
                     member.visibility,
                     owner,
@@ -4660,14 +4838,10 @@ impl Builder {
                     "RequirementConstraintMembership",
                     Some("ConstraintUsage"),
                 );
-                let kind_str = match kind {
-                    RequirementConstraintKind::Assumption => "assumption",
-                    RequirementConstraintKind::Requirement => "requirement",
-                };
-                self.set(rel, "kind", json!(kind_str));
             }
             MemberKind::FramedConcern(u) => {
-                let (rel, _) = self.build_usage_with(
+                self.pending_membership_kind = Some("requirement");
+                self.build_usage_with(
                     u,
                     member.visibility,
                     owner,
@@ -4676,10 +4850,10 @@ impl Builder {
                     "FramedConcernMembership",
                     Some("ConcernUsage"),
                 );
-                self.set(rel, "kind", json!("requirement"));
             }
             MemberKind::RequirementVerification(u) => {
-                let (rel, _) = self.build_usage_with(
+                self.pending_membership_kind = Some("requirement");
+                self.build_usage_with(
                     u,
                     member.visibility,
                     owner,
@@ -4688,7 +4862,6 @@ impl Builder {
                     "RequirementVerificationMembership",
                     Some("RequirementUsage"),
                 );
-                self.set(rel, "kind", json!("requirement"));
             }
             MemberKind::StateSubaction { kind, action } => {
                 let kind_str = match kind {
@@ -4698,7 +4871,10 @@ impl Builder {
                 };
                 match action {
                     Some(u) => {
-                        let (rel, _) = self.build_usage_with(
+                        // The membership's kind is set before the usage is
+                        // built: the action's owner roles read it.
+                        self.pending_membership_kind = Some(kind_str);
+                        self.build_usage_with(
                             u,
                             member.visibility,
                             owner,
@@ -4707,7 +4883,6 @@ impl Builder {
                             "StateSubactionMembership",
                             None,
                         );
-                        self.set(rel, "kind", json!(kind_str));
                     }
                     None => {
                         let rel = self.new_relationship(
@@ -4720,6 +4895,26 @@ impl Builder {
                         self.set(rel, "kind", json!(kind_str));
                         let a = self.new_owned_element("ActionUsage", rel, kind_str);
                         self.set(a, "isVariation", json!(false));
+                        // The empty action is named by the state action
+                        // feature it redefines (`entry;` is `entryAction`),
+                        // findable in its owner like an unnamed subject.
+                        if let Some(name) = naming::membership_implied_name_of(
+                            "StateSubactionMembership",
+                            Some(kind_str),
+                        ) {
+                            self.scopes[scope].effective_names.push(
+                                name.to_string(),
+                                Binding {
+                                    elem: a,
+                                    sub_scope: None,
+                                    visibility: match member.visibility {
+                                        Some(Visibility::Private) => LookupAccess::All,
+                                        Some(Visibility::Protected) => LookupAccess::Protected,
+                                        _ => LookupAccess::Public,
+                                    },
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -4925,6 +5120,11 @@ impl Builder {
         for base in implicit_def_bases(d.kind) {
             self.scopes[body_scope].implied_bases.push(lib_qn(base));
         }
+        if d.prefix.is_individual {
+            self.scopes[body_scope]
+                .implied_bases
+                .push(lib_qn(implied::INDIVIDUAL_BASE));
+        }
         for (i, target) in d.specializes.iter().enumerate() {
             if let TargetRef::Name(qn) = target {
                 self.spec_targets
@@ -4943,7 +5143,7 @@ impl Builder {
         }
         if let Some(body) = &d.body {
             for (i, m) in body.iter().enumerate() {
-                self.in_enum_body = d.kind == DefKind::Enum;
+                self.in_enum_body = d.kind == DefKind::Enum && !is_metadata_member(m);
                 self.build_member(m, e, body_scope, i);
             }
             self.in_enum_body = false;
@@ -4982,6 +5182,20 @@ impl Builder {
             let cpd_id = self.elements[cpd].id;
             self.set(pc, "conjugatedType", id_ref(cpd_id));
             self.conjugated_defs.insert(e, cpd);
+            // The conjugate is a member of the port definition, so its
+            // qualified name (`P::'~P'`) resolves to it as any member's
+            // does. Nothing resolves *through* it: a `~P` typing
+            // substitutes it without a lookup.
+            if let (Some(value), Some(declared)) = (name, d.id.name.as_ref()) {
+                let id = Identification {
+                    short_name: None,
+                    name: Some(Name {
+                        value,
+                        span: declared.span,
+                    }),
+                };
+                self.register_leaf(body_scope, &id, cpd);
+            }
         }
     }
 
@@ -4998,7 +5212,6 @@ impl Builder {
         // the prefix shape (same segments, same bare element).
         if self.dialect != Dialect::Kerml
             && u.kind == UsageKind::Metadata
-            && !self.in_enum_body
             && member.visibility.is_none()
             && u.prefix == UsagePrefix::default()
             && u.value.is_none()
@@ -5036,7 +5249,7 @@ impl Builder {
             "InterfaceDefinition" | "InterfaceUsage"
         );
         let rel_ty = if self.in_enum_body || u.prefix.is_variant {
-            // Direct enum-body members are enum literals: variant
+            // An enum body's enumerated values are its literals: variant
             // memberships of the enumeration (SysML 8.3), like explicit
             // `variant` members of a variation.
             "VariantMembership"
@@ -5095,6 +5308,9 @@ impl Builder {
         let rel = self.new_relationship(rel_ty, owner, &format!("m{index}"));
         self.set(rel, "visibility", Self::visibility_value(visibility));
         self.set(rel, "isImplied", json!(false));
+        if let Some(kind) = self.pending_membership_kind.take() {
+            self.set(rel, "kind", json!(kind));
+        }
         // Expected featuring type (pilot `UsageUtil.getExpectedFeaturingTypeOf`):
         // FeatureMembership-family ownership features the usage in the
         // owning Type; a variant is featured iff its variation usage is.
@@ -5119,7 +5335,7 @@ impl Builder {
             .as_ref()
             .map(|n| n.value.clone())
             .unwrap_or_else(|| format!("#{index}"));
-        let e = self.build_usage_element(u, rel, scope, &seg, class_override);
+        let e = self.build_usage_element(u, rel, owner, scope, &seg, class_override);
         // An about-less metadata member annotates its owner (import filters
         // test these annotations; `@M about x;` annotates `x` instead).
         if u.kind == UsageKind::Metadata
@@ -5131,16 +5347,20 @@ impl Builder {
     }
 
     /// Build a usage element owned by an existing relationship.
+    /// `carrier` is the element owning `rel`, whose place the usage's owner
+    /// roles read.
     fn build_usage_element(
         &mut self,
         u: &Usage,
         rel: usize,
+        carrier: usize,
         scope: usize,
         seg: &str,
         class_override: Option<&'static str>,
     ) -> usize {
-        // Direct enum-body members are enum literals (EnumerationUsage);
-        // the flag is consumed here so nested members are not marked.
+        // An enum body's enumerated values are its literals
+        // (EnumerationUsage); the flag is consumed here so nested members
+        // are not marked.
         let enum_literal = std::mem::take(&mut self.in_enum_body);
         let ty = if enum_literal {
             "EnumerationUsage"
@@ -5152,6 +5372,7 @@ impl Builder {
         let featuring = self.pending_featuring;
         let forced_direction = self.pending_direction.take();
         let owner_ty = self.pending_owner_ty.take();
+        let implicit_source = self.pending_implicit_source.take();
         self.set_identification(e, &u.declaration.id);
         self.emit_prefix_metadata(e, &u.prefix.metadata, scope);
         let body_scope = self.push_scope(Some(scope));
@@ -5196,7 +5417,7 @@ impl Builder {
             self.set_identification(cf, &cross.decl.id);
             // The cross feature is an owned member of the end feature, so
             // its references see that end's members and inherited types.
-            self.emit_specializations(cf, &cross.decl, body_scope);
+            self.emit_specializations(cf, &cross.decl, body_scope, body_scope);
             if let Some(mult) = &cross.decl.multiplicity {
                 self.emit_multiplicity(cf, mult, body_scope);
             }
@@ -5283,32 +5504,71 @@ impl Builder {
         // `:>> mass = 5;` are findable by those names. Resolution-only —
         // declaredName stays null.
         if u.declaration.id.name.is_none() && u.declaration.id.short_name.is_none() {
-            if let Some(name) = effective_ref_name(
+            let binding = Binding {
+                elem: e,
+                sub_scope: Some(body_scope),
+                visibility: match self.elements[rel]
+                    .props
+                    .get("visibility")
+                    .and_then(|v| v.as_str())
+                {
+                    Some("private") => LookupAccess::All,
+                    Some("protected") => LookupAccess::Protected,
+                    _ => LookupAccess::Public,
+                },
+            };
+            let hint = effective_ref_name(
                 &u.declaration,
                 naming::reference_names_feature_target(ty, Some(self.elements[rel].ty)),
                 self.elements[rel].ty == "VariantMembership",
-            ) {
+            );
+            if let Some(name) = &hint {
                 self.effective_hint.insert(e, name.clone());
-                self.scopes[scope].effective_names.push(
-                    name,
-                    Binding {
-                        elem: e,
-                        sub_scope: Some(body_scope),
-                        visibility: match self.elements[rel]
-                            .props
-                            .get("visibility")
-                            .and_then(|v| v.as_str())
-                        {
-                            Some("private") => LookupAccess::All,
-                            Some("protected") => LookupAccess::Protected,
-                            _ => LookupAccess::Public,
-                        },
-                    },
-                );
+                self.scopes[scope]
+                    .effective_names
+                    .push(name.clone(), binding);
+            }
+            // An unnamed subject, objective, return parameter or view
+            // rendering that redefines nothing explicitly implicitly
+            // redefines its library feature, whose name is its effective
+            // name and so its membership's name (KerML 8.2.3.5):
+            // `subject : V;` is findable as `subj` in its owner, ahead of
+            // the inherited `subj`. Not an id name — `effective_hint`
+            // stays the syntactic one. A SysML reference rule names ahead
+            // of it (`PerformActionUsage::namingFeature`): a state's `do
+            // refuel;` is `refuel`, its performed action, never `doAction`.
+            if let Some(name) = naming::membership_implied_name_of(
+                self.elements[rel].ty,
+                self.elements[rel]
+                    .props
+                    .get("kind")
+                    .and_then(|v| v.as_str()),
+            ) {
+                let redefines = u
+                    .declaration
+                    .specializations
+                    .iter()
+                    .any(|s| matches!(s, FeatureSpecialization::Redefines(_)));
+                if !redefines && hint.is_none() {
+                    self.scopes[scope]
+                        .effective_names
+                        .push(name.to_string(), binding);
+                }
             }
         }
         // Typing/subsetting/redefinition targets provide inherited-member
         // resolution within this usage's body.
+        // An end feature owned by a connector resolves its `references`
+        // target in the connector's owning namespace (KerML 8.2.3.5.2):
+        // the connector's body finds first an end the connector inherits
+        // from its own type (`connector link : BinaryLink { end feature
+        // ts references source; }` named `BinaryLink::source`, not the
+        // owner's `source`). The SysML connector-part form (`connect a
+        // to b`) already resolves its ends there.
+        let connector_end = u.prefix.is_end
+            && self.scopes[scope].owner.is_some_and(|owner| {
+                crate::metaclass::conforms(self.elements[owner].ty, "Connector")
+            });
         for spec in &u.declaration.specializations {
             let (targets, subsets): (Vec<&TargetRef>, bool) = match spec {
                 FeatureSpecialization::TypedBy(types) => {
@@ -5333,7 +5593,11 @@ impl Builder {
                                     .insert(qn.segments[0].value.clone());
                             }
                         }
-                        self.scopes[body_scope].bases.push(qn.clone());
+                        if connector_end && matches!(spec, FeatureSpecialization::References(_)) {
+                            self.scopes[body_scope].outer_bases.push(qn.clone());
+                        } else {
+                            self.scopes[body_scope].bases.push(qn.clone());
+                        }
                     }
                     TargetRef::Chain(links) if !links.is_empty() => {
                         self.scopes[body_scope].chain_bases.push(links.clone());
@@ -5356,7 +5620,92 @@ impl Builder {
             } else {
                 u.kind
             };
-            for base in implicit_usage_bases(base_kind) {
+            // The kind roles and the owner roles (`implied::roles_of`), read
+            // here off the syntax tree and the rows so far, as the planner
+            // reads them off the finished rows: a usage inherits through
+            // every base the planner writes for it. A transition's source
+            // is unresolved here; its owner's kind stands in.
+            let roles = {
+                let flag = |e: usize, key: &str| {
+                    self.elements[e].props.get(key).and_then(|v| v.as_bool()) == Some(true)
+                };
+                let facts = implied::RoleFacts {
+                    ty,
+                    composite: flag(e, "isComposite"),
+                    if_else: matches!(
+                        &u.detail,
+                        UsageDetail::IfNode {
+                            else_body: Some(_),
+                            ..
+                        }
+                    ),
+                    portion_kind: match u.prefix.portion {
+                        Some(PortionKind::Snapshot) => Some("snapshot"),
+                        Some(PortionKind::Timeslice) => Some("timeslice"),
+                        None => None,
+                    },
+                    owner: Some(implied::OwnerFacts {
+                        membership_kind: self.elements[rel].ty,
+                        membership_role: self.elements[rel]
+                            .props
+                            .get("kind")
+                            .and_then(|v| v.as_str()),
+                        owner_kind: self.elements[carrier].ty,
+                        parallel: flag(carrier, "isParallel"),
+                    }),
+                    // A target transition's source is the owner's last
+                    // action so far; a written source naming one of the
+                    // owner's members so far is read by kind; any other
+                    // written source is unresolved here.
+                    source: match &u.detail {
+                        UsageDetail::Transition {
+                            source: None,
+                            target: Some(_),
+                            ..
+                        } => match implicit_source {
+                            Some(Some(previous))
+                                if is_a!(self.elements[previous], "StateUsage") =>
+                            {
+                                implied::TransitionSource::State
+                            }
+                            Some(Some(_)) => implied::TransitionSource::Other,
+                            Some(None) => implied::TransitionSource::Unresolved,
+                            None => implied::TransitionSource::None,
+                        },
+                        UsageDetail::Transition {
+                            source: Some(TargetRef::Name(qn)),
+                            ..
+                        } if !qn.is_global && qn.segments.len() == 1 => {
+                            match self.scopes[scope]
+                                .names
+                                .get(&qn.segments[0].value)
+                                .and_then(|bindings| bindings.first())
+                            {
+                                Some(binding)
+                                    if is_a!(self.elements[binding.elem], "StateUsage") =>
+                                {
+                                    implied::TransitionSource::State
+                                }
+                                Some(binding)
+                                    if is_a!(self.elements[binding.elem], "ActionUsage") =>
+                                {
+                                    implied::TransitionSource::Other
+                                }
+                                Some(_) => implied::TransitionSource::None,
+                                None => implied::TransitionSource::Unresolved,
+                            }
+                        }
+                        UsageDetail::Transition {
+                            source: Some(_), ..
+                        } => implied::TransitionSource::Unresolved,
+                        _ => implied::TransitionSource::None,
+                    },
+                };
+                let mut roles = implied::roles_of(base_kind, &facts);
+                roles.extend(implied::redefinition_roles_of(&facts));
+                roles
+            };
+            for base in roles {
                 self.scopes[body_scope].implied_bases.push(lib_qn(base));
             }
         }
@@ -5373,7 +5722,12 @@ impl Builder {
         self.scopes[body_scope]
             .implied_bases
             .push(lib_qn("Base::things"));
-        self.emit_specializations(e, &u.declaration, scope);
+        let reference_scope = if connector_end {
+            self.scopes[scope].parent.unwrap_or(scope)
+        } else {
+            scope
+        };
+        self.emit_specializations(e, &u.declaration, scope, reference_scope);
 
         if let Some(mult) = &u.declaration.multiplicity {
             self.emit_multiplicity(e, mult, scope);
@@ -5383,7 +5737,17 @@ impl Builder {
 
     /// Specialization clauses of a feature declaration → relationship
     /// elements owned by `e`.
-    fn emit_specializations(&mut self, e: usize, decl: &FeatureDeclaration, scope: usize) {
+    /// Emit the declaration's specializations, resolving their targets
+    /// from `scope`; a `references` target resolves from
+    /// `reference_scope` (the connector's owner for a connector end, else
+    /// `scope`).
+    fn emit_specializations(
+        &mut self,
+        e: usize,
+        decl: &FeatureDeclaration,
+        scope: usize,
+        reference_scope: usize,
+    ) {
         // `spec_targets` (semantic-check side table) records alongside each
         // relationship; the pending ref reports its resolution outcome back
         // into `spec_resolved` via `pending_spec_idx`.
@@ -5459,7 +5823,7 @@ impl Builder {
                     );
                     spec_counter += 1;
                     self.set(r, "isImplied", json!(false));
-                    self.set_ref_excluding(r, "referencedFeature", scope, t, Some(e));
+                    self.set_ref_excluding(r, "referencedFeature", reference_scope, t, Some(e));
                     let e_id = self.elements[e].id;
                     self.set(r, "subsettingFeature", id_ref(e_id));
                 }
@@ -5617,55 +5981,76 @@ impl Builder {
         if matches!(u.kind, UsageKind::Flow | UsageKind::SuccessionFlow) {
             self.payload_flows.insert(e);
         }
-        let end_elems = self.build_usage_detail(e, &detail, scope);
+        let end_elems = self.build_usage_detail(e, &detail, scope, body_scope);
 
         // Connector-part end declarations own the same lookup bindings as
         // ordinary end members. Their scopes inherit the connected feature,
         // with target names resolved outside the connector's body to avoid
-        // capturing the end currently being declared.
-        if matches!(
-            u.kind,
-            UsageKind::Connection
-                | UsageKind::Interface
-                | UsageKind::Allocation
-                | UsageKind::Connector
-        ) {
-            if let UsageDetail::Connector { ends } = &detail {
-                let binary = end_elems.len() == 2;
-                if binary && self.dialect == Dialect::Sysml {
-                    let base = match u.kind {
-                        UsageKind::Connection => Some("Connections::binaryConnections"),
-                        UsageKind::Interface => Some("Interfaces::binaryInterfaces"),
-                        _ => None,
-                    };
-                    if let Some(base) = base {
-                        self.scopes[body_scope].implied_bases.push(lib_qn(base));
-                    }
-                }
-                for (i, (&end_elem, end)) in end_elems.iter().zip(ends).enumerate() {
-                    let end_scope = self.push_scope(Some(scope));
-                    if let Some(qn) = flat_target_qn(&end.target) {
-                        self.scopes[end_scope].bases.push(qn);
-                    }
-                    self.register(
-                        body_scope,
-                        &Identification {
-                            name: end.name.clone(),
-                            short_name: None,
-                        },
-                        end_elem,
-                        end_scope,
-                    );
-                    // The binary positional aliases remain a fallback after
-                    // declared names, including a declared source or target.
-                    if binary {
-                        self.scopes[body_scope].implied_ends.push((
-                            ["source", "target"][i],
-                            end_elem,
-                            end_scope,
-                        ));
-                    }
-                }
+        // capturing the end currently being declared. A succession's
+        // unspelled source end (`then b;`) inherits nothing.
+        let unspelled = Self::empty_connector_end();
+        let declared_ends: Vec<&ConnectorEnd> = match &detail {
+            UsageDetail::Connector { ends }
+                if matches!(
+                    u.kind,
+                    UsageKind::Connection
+                        | UsageKind::Interface
+                        | UsageKind::Allocation
+                        | UsageKind::Connector
+                ) =>
+            {
+                ends.iter().collect()
+            }
+            UsageDetail::Binding { ends } => ends.iter().collect(),
+            UsageDetail::Succession { source, target } => {
+                vec![source.as_deref().unwrap_or(&unspelled), target]
+            }
+            _ => Vec::new(),
+        };
+        if end_elems.len() == 2 && self.dialect == Dialect::Sysml {
+            let base = match u.kind {
+                UsageKind::Connection => Some("Connections::binaryConnections"),
+                UsageKind::Interface => Some("Interfaces::binaryInterfaces"),
+                _ => None,
+            };
+            if let Some(base) = base {
+                self.scopes[body_scope].implied_bases.push(lib_qn(base));
+            }
+        }
+        let mut end_scopes = Vec::new();
+        for (&end_elem, end) in end_elems.iter().zip(declared_ends) {
+            let end_scope = self.push_scope(Some(scope));
+            if let Some(qn) = flat_target_qn(&end.target) {
+                self.scopes[end_scope].bases.push(qn);
+            }
+            self.register(
+                body_scope,
+                &Identification {
+                    name: end.name.clone(),
+                    short_name: None,
+                },
+                end_elem,
+                end_scope,
+            );
+            end_scopes.push(end_scope);
+        }
+        // A flow's ends got their scopes from the detail.
+        if matches!(detail, UsageDetail::Flow { .. }) {
+            end_scopes.extend(
+                end_elems
+                    .iter()
+                    .filter_map(|f| self.elem_scope.get(f).copied()),
+            );
+        }
+        // The two ends of a binary connector-family usage implicitly
+        // redefine the library's binary ends by position, so those names
+        // find them in the usage's body — after declared names, including
+        // a declared `source` or `target`.
+        if let (Some(names), [_, _]) = (binary_end_names(u.kind), end_scopes.as_slice()) {
+            for (i, (&end_elem, &end_scope)) in end_elems.iter().zip(&end_scopes).enumerate() {
+                self.scopes[body_scope]
+                    .implied_ends
+                    .push((names[i], end_elem, end_scope));
             }
         }
 
@@ -5866,7 +6251,7 @@ impl Builder {
             is_nonunique: payload.is_nonunique,
             ..Default::default()
         };
-        self.emit_specializations(e, &decl, scope);
+        self.emit_specializations(e, &decl, scope, scope);
         if let Some(mult) = &payload.multiplicity {
             self.emit_multiplicity(e, mult, scope);
         }
@@ -5896,12 +6281,24 @@ impl Builder {
         let pm = self.new_relationship("ParameterMembership", parent, seg);
         self.set(pm, "isImplied", json!(false));
         let inner_scope = self.push_scope(Some(scope));
-        self.build_usage_element_scoped(u, pm, inner_scope, seg, None);
+        let parameter = self.build_usage_element_scoped(u, pm, parent, inner_scope, seg, None);
+        // A parameter's direction is its membership's (KerML
+        // `validateParameterMembershipParameterDirection`): a loop or if
+        // body is an `in` parameter of its action, as the grammar's
+        // ActionBodyParameterMember makes it.
+        self.set(parameter, "direction", json!("in"));
     }
 
     /// Kind-specific lowering of usage details. Returns the end features of
-    /// a `Connector` detail (for implied `source`/`target` registration).
-    fn build_usage_detail(&mut self, e: usize, detail: &UsageDetail, scope: usize) -> Vec<usize> {
+    /// a connector, binding, succession or flow detail, in order (for their
+    /// lookup registration); a flow end comes back with its scope set.
+    fn build_usage_detail(
+        &mut self,
+        e: usize,
+        detail: &UsageDetail,
+        scope: usize,
+        body_scope: usize,
+    ) -> Vec<usize> {
         match detail {
             UsageDetail::None => {}
             UsageDetail::Connector { ends } => {
@@ -5912,19 +6309,21 @@ impl Builder {
                     .collect();
             }
             UsageDetail::Binding { ends } => {
-                for (i, end) in ends.iter().enumerate() {
-                    self.emit_connector_end(e, end, scope, i);
-                }
+                return ends
+                    .iter()
+                    .enumerate()
+                    .map(|(i, end)| self.emit_connector_end(e, end, scope, i))
+                    .collect();
             }
             UsageDetail::Succession { source, target } => {
                 // A succession always owns both ends (SysML.xtext
                 // SuccessionAsUsage / TargetSuccession): a source the text
                 // doesn't spell is a bare source end.
-                match source {
+                let source = match source {
                     Some(s) => self.emit_connector_end(e, s, scope, 0),
                     None => self.emit_connector_end(e, &Self::empty_connector_end(), scope, 0),
                 };
-                self.emit_connector_end(e, target, scope, 1);
+                return vec![source, self.emit_connector_end(e, target, scope, 1)];
             }
             UsageDetail::Flow {
                 payload,
@@ -5934,6 +6333,7 @@ impl Builder {
                 if let Some(p) = payload {
                     self.emit_payload(e, p, scope, "PayloadFeature");
                 }
+                let mut ends = Vec::new();
                 for (i, end) in [source, target].into_iter().flatten().enumerate() {
                     let rel =
                         self.new_relationship("EndFeatureMembership", e, &format!("flowend{i}"));
@@ -5978,6 +6378,43 @@ impl Builder {
                     self.set(rd, "isImplied", json!(false));
                     let ru_id = self.elements[ru].id;
                     self.set(rd, "redefiningFeature", id_ref(ru_id));
+                    // The end's scope inherits the prefix it subsets and
+                    // holds the flow feature under the name it redefines,
+                    // so `f.source.p` is this end's own feature; the flow
+                    // feature's scope inherits the whole chain.
+                    let end_scope = self.push_scope(Some(scope));
+                    let feature_scope = self.push_scope(Some(scope));
+                    if let Some(qn) = prefix
+                        .as_ref()
+                        .and_then(|links| flat_target_qn(&TargetRef::Chain(links.clone())))
+                    {
+                        self.scopes[end_scope].bases.push(qn);
+                    }
+                    if let Some(qn) = flat_target_qn(&end.target) {
+                        self.scopes[feature_scope].bases.push(qn);
+                    }
+                    if let Some(name) = last.segments.last() {
+                        self.scopes[end_scope].effective_names.push(
+                            name.value.clone(),
+                            Binding {
+                                elem: ru,
+                                sub_scope: Some(feature_scope),
+                                visibility: LookupAccess::Public,
+                            },
+                        );
+                    }
+                    for (elem, s) in [(fe, end_scope), (ru, feature_scope)] {
+                        self.elem_scope.insert(elem, s);
+                        self.scopes[s].owner = Some(elem);
+                    }
+                    ends.push(fe);
+                    // The flow feature's redefinition is a written one for
+                    // the positional check's side table too: the end's
+                    // positional certificate compares the stored
+                    // redefinitions with the recorded resolutions.
+                    self.spec_targets
+                        .push((ru, "Redefinition", scope, last.clone()));
+                    let spec_idx = Some(self.spec_targets.len() - 1);
                     self.pending.push(PendingRef {
                         elem: rd,
                         key: "redefinedFeature".to_string(),
@@ -5985,10 +6422,11 @@ impl Builder {
                         qn: last,
                         exclude: None,
                         declared_only: false,
-                        spec_idx: None,
+                        spec_idx,
                         chain: prefix,
                     });
                 }
+                return ends;
             }
             UsageDetail::Metadata { about } => {
                 for (i, target) in about.iter().enumerate() {
@@ -6010,7 +6448,14 @@ impl Builder {
             } => {
                 self.set(e, "isNegated", json!(*negated));
                 if let Some(by) = by {
-                    self.satisfy_by.push((e, scope, by.clone()));
+                    // The `by` target resolves from the claim's own body
+                    // (KerML 8.2.3.5.2: the subject parameter's feature
+                    // reference expression resolves from the parameter,
+                    // then the satisfy usage, then outward), so the
+                    // features every usage inherits — `Base::things::that`
+                    // among them — are in reach inside a definition's body
+                    // as they are inside a usage's.
+                    self.satisfy_by.push((e, body_scope, by.clone()));
                     let rel = self.new_relationship("SubjectMembership", e, "by");
                     self.set(rel, "isImplied", json!(false));
                     let ru = self.new_owned_element("ReferenceUsage", rel, "satisfactionSubject");
@@ -6024,7 +6469,7 @@ impl Builder {
                     let fre = self.new_owned_element("FeatureReferenceExpression", fv, "expr");
                     let m = self.new_relationship("Membership", fre, "ref");
                     self.set(m, "isImplied", json!(false));
-                    self.set_ref(m, "memberElement", scope, by);
+                    self.set_ref(m, "memberElement", body_scope, by);
                 }
             }
             UsageDetail::Assert { negated } => {
@@ -6123,7 +6568,7 @@ impl Builder {
                 let ve = self.new_owned_element("ReferenceUsage", fm, &seg);
                 self.set(ve, "isVariation", json!(false));
                 self.set_identification(ve, &var.id);
-                self.emit_specializations(ve, var, scope);
+                self.emit_specializations(ve, var, scope, scope);
                 self.emit_expr_param(e, "seq", seq, scope);
                 self.emit_usage_param(e, "body", body, scope);
             }
@@ -6140,6 +6585,18 @@ impl Builder {
                     self.set(m, "isImplied", json!(false));
                     self.set_ref(m, "memberElement", scope, source);
                 }
+                // The grammar's first EmptyParameterMember: every transition
+                // owns an unnamed `in` parameter first, the slot of
+                // `TransitionAction::transitionLinkSource`, so that a trigger
+                // payload is its second parameter (`inputParameter(2)`) and
+                // pairs with `StateTransitionAction::payload`. The lift
+                // reads nothing from it.
+                let lm = self.new_relationship("ParameterMembership", e, "linkparam");
+                self.set(lm, "isImplied", json!(false));
+                let link = self.new_owned_element("ReferenceUsage", lm, "linkparam");
+                self.set(link, "isVariation", json!(false));
+                self.set(link, "direction", json!("in"));
+                self.set(link, "isComposite", json!(false));
                 // Trigger payload parameters (`accept pub : Publish`) are
                 // referencable from the guard and effect: give the
                 // transition its own scope for those parts.
@@ -6184,7 +6641,9 @@ impl Builder {
                     let ae = self.new_owned_element("AcceptActionUsage", tm, "trigger");
                     self.set(ae, "isComposite", json!(true));
                     self.set(ae, "isVariation", json!(false));
-                    self.build_usage_detail(ae, trigger, t_scope);
+                    // The trigger's accept action owns no body scope of
+                    // its own; the transition's trigger scope stands in.
+                    self.build_usage_detail(ae, trigger, t_scope, t_scope);
                 }
                 if let Some(guard) = guard {
                     let gm = self.new_relationship("TransitionFeatureMembership", e, "guard");
@@ -6199,7 +6658,7 @@ impl Builder {
                     self.set(em, "isImplied", json!(false));
                     self.set(em, "kind", json!("effect"));
                     let inner_scope = self.push_scope(Some(t_scope));
-                    self.build_usage_element_scoped(effect, em, inner_scope, "effect", None);
+                    self.build_usage_element_scoped(effect, em, e, inner_scope, "effect", None);
                 }
                 if let Some(target) = target {
                     let sm = self.new_relationship("OwningMembership", e, "succession");
@@ -6223,6 +6682,7 @@ impl Builder {
         &mut self,
         u: &Usage,
         rel: usize,
+        carrier: usize,
         scope: usize,
         seg: &str,
         class_override: Option<&'static str>,
@@ -6232,7 +6692,8 @@ impl Builder {
         self.pending_featuring = true;
         self.pending_direction = None;
         self.pending_owner_ty = None;
-        self.build_usage_element(u, rel, scope, seg, class_override)
+        self.pending_implicit_source = None;
+        self.build_usage_element(u, rel, carrier, scope, seg, class_override)
     }
 
     // ---- expressions ----
@@ -7404,6 +7865,25 @@ impl Builder {
         }
     }
 
+    /// The element-id index as built, when it covers the current rows: the
+    /// planners read the rows without changing them and resolve a
+    /// transition's written source through it, so a planning entry point
+    /// builds it first ([`Self::ensure_ids`]).
+    pub(super) fn built_ids(&self) -> Option<&RowsById> {
+        self.id_index
+            .as_deref()
+            .filter(|_| self.id_index_built_for == self.elements.len())
+    }
+
+    /// Build the element-id index over the current rows unless it covers
+    /// them already.
+    pub(super) fn ensure_ids(&mut self) {
+        if self.built_ids().is_none() && !self.elements.is_empty() {
+            let id = self.elements[0].id;
+            self.element_index_of_uuid(id);
+        }
+    }
+
     /// Element index for a binary interchange identity.
     pub(crate) fn element_index_of_uuid(&mut self, id: Uuid) -> Option<usize> {
         let stale = self.id_index.is_none() || self.id_index_built_for != self.elements.len();
@@ -8247,6 +8727,192 @@ impl Builder {
         let index = Arc::new(index);
         self.chain_redefinitions = Some((self.elements.len(), Arc::clone(&index)));
         index
+    }
+
+    /// The model's features by each feature they subset or redefine
+    /// (`part m1 :> motors;`, `part :>> motors;`, `part q2 :> q;`), or name
+    /// as a link of a subsetted or redefined chain (`part m1 :> q.motors;`
+    /// names `q` and `motors`), each with the chain's links when it names
+    /// the feature in one: what says something about some of a feature's
+    /// values. Includes library features: a loaded definition can subset
+    /// or redefine its members just as a user definition can. Built on
+    /// first use, for the elements present then, and shared.
+    pub(crate) fn feature_specializers(&mut self) -> FeatureSpecializers {
+        let stale = self
+            .feature_specializers
+            .as_ref()
+            .is_none_or(|(built_for, _)| *built_for != self.elements.len());
+        if stale {
+            // Indexing the whole model is not a use of its imports by
+            // the caller. Cold and cached index reads must contribute
+            // the same import evidence to an enclosing semantic query.
+            let used_imports = self.used_imports.clone();
+            let query_imports = std::mem::take(&mut self.query_imports);
+            let mut index: HashMap<usize, Vec<(usize, Vec<usize>)>> = HashMap::new();
+            for f in 0..self.elements.len() {
+                if !crate::metaclass::conforms(self.elements[f].ty, "Feature") {
+                    continue;
+                }
+                let mut targets: Vec<(usize, Vec<usize>)> = self
+                    .explicit_specialization_elems(f)
+                    .into_iter()
+                    .filter(|(kind, _)| !matches!(*kind, "FeatureTyping" | "Subclassification"))
+                    .map(|(_, t)| (t, Vec::new()))
+                    .collect();
+                let relationships: Vec<usize> = self.elements[f]
+                    .owned_relationships
+                    .iter()
+                    .copied()
+                    .filter(|&r| {
+                        matches!(
+                            self.elements[r].ty,
+                            "Subsetting" | "Redefinition" | "ReferenceSubsetting"
+                        )
+                    })
+                    .collect();
+                for relationship in relationships {
+                    // A reference subsetting's target is read from the
+                    // relationship itself, not from the specialization rows.
+                    if self.elements[relationship].ty == "ReferenceSubsetting" {
+                        if let Some(target) = self.elements[relationship]
+                            .props
+                            .get("referencedFeature")
+                            .and_then(|v| v.as_reference())
+                            .and_then(|id| self.element_index_of_uuid(id))
+                        {
+                            targets.push((target, Vec::new()));
+                        }
+                    }
+                    let chains: Vec<usize> = self.elements[relationship]
+                        .children
+                        .iter()
+                        .copied()
+                        .collect();
+                    for chain in chains {
+                        let chainings: Vec<usize> = self.elements[chain]
+                            .owned_relationships
+                            .iter()
+                            .copied()
+                            .filter(|&r| self.elements[r].ty == "FeatureChaining")
+                            .collect();
+                        let links: Vec<usize> = chainings
+                            .into_iter()
+                            .filter_map(|chaining| {
+                                self.elements[chaining]
+                                    .props
+                                    .get("chainingFeature")
+                                    .and_then(|v| v.as_reference())
+                                    .and_then(|id| self.element_index_of_uuid(id))
+                            })
+                            .collect();
+                        for &link in &links {
+                            targets.push((link, links.clone()));
+                        }
+                    }
+                }
+                for (t, links) in targets {
+                    let specializers = index.entry(t).or_default();
+                    if t != f && !specializers.iter().any(|(g, _)| *g == f) {
+                        specializers.push((f, links));
+                    }
+                }
+            }
+            self.used_imports = used_imports;
+            self.query_imports = query_imports;
+            self.feature_specializers = Some((self.elements.len(), Arc::new(index)));
+        }
+        self.feature_specializers
+            .as_ref()
+            .map(|(_, index)| Arc::clone(index))
+            .unwrap_or_default()
+    }
+
+    /// The model's binding connectors (`bind a = b.c;`) with both ends
+    /// resolved, by the namespace that owns each, each end its links in
+    /// order. A connector with an unresolved or unspelled end, or other than
+    /// two ends, is left out. Built on first use, for the elements present
+    /// then, and shared.
+    pub(crate) fn binding_ends(&mut self) -> BindingEnds {
+        let stale = self
+            .binding_ends
+            .as_ref()
+            .is_none_or(|(built_for, _)| *built_for != self.elements.len());
+        if stale {
+            let mut index = BindingIndex::default();
+            for c in 0..self.elements.len() {
+                if !is_a!(self.elements[c], "BindingConnector") {
+                    continue;
+                }
+                let end_rels: Vec<usize> = self.elements[c]
+                    .owned_relationships
+                    .iter()
+                    .copied()
+                    .filter(|&r| self.elements[r].ty == "EndFeatureMembership")
+                    .collect();
+                let mut ends = Vec::with_capacity(2);
+                for rel in end_rels {
+                    let Some(&end) = self.elements[rel].children.first() else {
+                        break;
+                    };
+                    let Some(links) = self.end_links(end) else {
+                        break;
+                    };
+                    ends.push(links);
+                }
+                if ends.len() != 2 {
+                    continue;
+                }
+                let second = ends.pop().expect("two ends");
+                let first = ends.pop().expect("two ends");
+                if let Some(owner) = self.owner_elem(c) {
+                    index.named.extend(first.iter().chain(&second).copied());
+                    index
+                        .by_owner
+                        .entry(owner)
+                        .or_default()
+                        .push((c, first, second));
+                }
+            }
+            self.binding_ends = Some((self.elements.len(), Arc::new(index)));
+        }
+        self.binding_ends
+            .as_ref()
+            .map(|(_, index)| Arc::clone(index))
+            .unwrap_or_default()
+    }
+
+    /// The resolved links of a connector end feature's reference subsetting
+    /// target, as written (`a.b` → `[a, b]`; a simple end names one link);
+    /// `None` when the end is unspelled or any link did not resolve.
+    fn end_links(&mut self, end: usize) -> Option<Vec<usize>> {
+        let rel = *self.elements[end]
+            .owned_relationships
+            .iter()
+            .find(|&&r| self.elements[r].ty == "ReferenceSubsetting")?;
+        let id = self.elements[rel]
+            .props
+            .get("referencedFeature")
+            .and_then(|v| v.as_reference())?;
+        let target = self.element_index_of_uuid(id)?;
+        let chainings: Vec<usize> = self.elements[target]
+            .owned_relationships
+            .iter()
+            .copied()
+            .filter(|&r| self.elements[r].ty == "FeatureChaining")
+            .collect();
+        if chainings.is_empty() {
+            return Some(vec![target]);
+        }
+        let mut links = Vec::with_capacity(chainings.len());
+        for chaining in &chainings {
+            let link = self.elements[*chaining]
+                .props
+                .get("chainingFeature")
+                .and_then(|v| v.as_reference())
+                .and_then(|id| self.element_index_of_uuid(id))?;
+            links.push(link);
+        }
+        Some(links)
     }
 
     /// The prepared library's valued chain redefinitions, when this build
@@ -9127,10 +9793,11 @@ impl Builder {
         self.drop_redefined_hits(&mut hits);
         let mut inherited = LookupResult::Missing;
         for hit in hits {
+            let hit = self.owned_end_redefining(s, hit, access);
             inherited = self.merge_lookup(inherited, hit);
         }
         if inherited != LookupResult::Missing {
-            return inherited;
+            return self.owned_role_redefining(s, inherited, access);
         }
         let mut imported = LookupResult::Missing;
         let imports = self.import_scopes(s);
@@ -9189,6 +9856,53 @@ impl Builder {
             }
         }
         imported
+    }
+
+    /// An inherited subject, objective, return parameter or view rendering
+    /// found in `s` is redefined by the owner's unnamed member of the same
+    /// kind (its implied positional redefinition), which takes the
+    /// inherited member's name as its effective name (KerML 8.2.3.5), so
+    /// that name finds the owned member instead: in `requirement def R2 :>
+    /// R1 { subject : W; }`, `s` names R2's subject when R1 declares
+    /// `subject s : V;`. A hit through an alias keeps its target.
+    fn owned_role_redefining(
+        &self,
+        s: usize,
+        inherited: LookupResult,
+        access: LookupAccess,
+    ) -> LookupResult {
+        let LookupResult::Found(found, _, None) = inherited else {
+            return inherited;
+        };
+        if self.declared_only {
+            return inherited;
+        }
+        let Some(name) = self.elements[found].owning_relationship.and_then(|rel| {
+            naming::membership_implied_name_of(
+                self.elements[rel].ty,
+                self.elements[rel]
+                    .props
+                    .get("kind")
+                    .and_then(|v| v.as_str()),
+            )
+        }) else {
+            return inherited;
+        };
+        let owned = self.scopes[s]
+            .effective_names
+            .get(name)
+            .into_iter()
+            .flatten()
+            .find(|b| {
+                b.elem != found
+                    && Some(b.elem) != self.exclude
+                    && access.admits(b.visibility)
+                    && self.implied_role_name(b.elem) == Some(name)
+            });
+        match owned {
+            Some(b) => LookupResult::Found(b.elem, b.sub_scope, None),
+            None => inherited,
+        }
     }
 
     /// Recursive-import lookup: `name` in `s` or any transitively nested
@@ -9884,6 +10598,23 @@ impl Builder {
         }
         self.redefinition_lookup_owner = None;
         self.redefinition_lookup_base = None;
+        // Written bases resolved one scope further out: a connector end's
+        // `references` target, in the connector's owning namespace. The
+        // owner stays excluded.
+        let n_outer = self.scopes[s].outer_bases.len();
+        if n_outer > 0 {
+            let outer_from = self.scopes[from].parent.unwrap_or(from);
+            for k in 0..n_outer {
+                let qn = self.scopes[s].outer_bases[k].clone();
+                if let Some(elem) = self.resolve(outer_from, &qn, 0) {
+                    if let Some(&sc) = self.elem_scope.get(&elem) {
+                        if sc != s && !result.contains(&sc) {
+                            result.push(sc);
+                        }
+                    }
+                }
+            }
+        }
         if has_chains {
             let chain_bases = self.scopes[s].chain_bases.clone();
             for links in &chain_bases {
@@ -11464,6 +12195,89 @@ impl Builder {
         out
     }
 
+    /// The elements a semantic metadata annotation gives an implied base
+    /// (KerML 9.2 metaobject semantics): each element annotated by a
+    /// metadata usage whose definition conforms to
+    /// `Metaobjects::SemanticMetadata`. The planner does not write that
+    /// base (it is resolution-only, [`Self::semantic_base_targets`]), so the
+    /// checked audit keeps such elements out; plain metadata adds no base
+    /// and keeps nothing out. Memoized per metadata association generation.
+    pub(crate) fn semantically_annotated(
+        &mut self,
+    ) -> std::sync::Arc<crate::layered::IdSet<usize>> {
+        let rows = self.elements.observe_revision();
+        if let Some((generation, seen, set)) = &self.semantic_annotated_memo {
+            let current = match (generation, &self.metadata_association_generation) {
+                (None, None) => true,
+                (Some(a), Some(z)) => std::sync::Arc::ptr_eq(a, z),
+                _ => false,
+            };
+            if current && seen.same_as(&rows) {
+                return std::sync::Arc::clone(set);
+            }
+        }
+        let (saved_ex, saved_dm) = (self.exclude, self.declared_only);
+        (self.exclude, self.declared_only) = (None, false);
+        let mut set = crate::layered::IdSet::default();
+        if let Some(sem) = self.semantic_metadata_elem() {
+            // The resolved associations, and the stored annotation rows as
+            // they stand (a retargeted row counts before the associations
+            // are refreshed).
+            let mut entries: Vec<(usize, Vec<usize>)> = self
+                .metadata_of
+                .iter()
+                .map(|(owner, metas)| (*owner, metas.clone()))
+                .collect();
+            if let Some(raw) = structural_index::StoredStructure::for_annotations(self, &mut 0) {
+                entries.extend(
+                    raw.metadata_annotation_sources
+                        .iter()
+                        .map(|(target, metas)| (*target, metas.clone())),
+                );
+            }
+            for (owner, metas) in entries {
+                if set.contains(&owner) {
+                    continue;
+                }
+                let semantic = metas.iter().any(|&m| {
+                    self.direct_typing_elems(m)
+                        .into_iter()
+                        .any(|def| self.conforms_upward(def, sem))
+                });
+                if semantic {
+                    set.insert(owner);
+                }
+            }
+        }
+        (self.exclude, self.declared_only) = (saved_ex, saved_dm);
+        let set = std::sync::Arc::new(set);
+        self.semantic_annotated_memo = Some((
+            self.metadata_association_generation.clone(),
+            rows,
+            std::sync::Arc::clone(&set),
+        ));
+        set
+    }
+
+    /// The memoized [`Self::semantically_annotated`] set while it is current,
+    /// read without resolving (for the readers that hold the builder
+    /// immutably); `None` when it was never built, or a row or an
+    /// association changed since.
+    pub(crate) fn semantically_annotated_now(&self) -> Option<&crate::layered::IdSet<usize>> {
+        let (generation, seen, set) = self.semantic_annotated_memo.as_ref()?;
+        let current = match (generation, &self.metadata_association_generation) {
+            (None, None) => true,
+            (Some(a), Some(z)) => std::sync::Arc::ptr_eq(a, z),
+            _ => false,
+        };
+        (current
+            && self
+                .elements
+                .revision()
+                .is_some_and(|rows| rows.same_as(seen)))
+        .then_some(set.as_ref())
+    }
+
     /// `Metaobjects::SemanticMetadata`, resolved from the global namespace
     /// once and memoized. Callers must have neutralized `exclude` /
     /// `declared_only` (the memo must not capture a mode-dependent miss).
@@ -12045,6 +12859,14 @@ fn id_value(id: Uuid) -> Value {
     json!({ "@id": id.to_string() })
 }
 
+/// A metadata usage member (`@M;`, `@M { }`, `metadata m : M;`). An
+/// enumeration body admits it as an annotating member beside its
+/// enumerated values, owned by an OwningMembership as in any other body,
+/// so it is not one of the enumeration's literals.
+fn is_metadata_member(m: &Member) -> bool {
+    matches!(&m.kind, MemberKind::Usage(u) if u.kind == UsageKind::Metadata)
+}
+
 /// Non-Type namespaces: owners whose usage members lower as
 /// OwningMembership rather than FeatureMembership (the document root
 /// Namespace, packages, and library packages).
@@ -12447,6 +13269,41 @@ fn effective_ref_name(
     None
 }
 
+/// The names of the library ends that the two ends of a binary
+/// connector-family usage implicitly redefine, by position: `BinaryLink`'s
+/// `source`/`target` (connections, interfaces, allocations, flows, KerML
+/// connectors), `HappensBefore`'s `earlierOccurrence`/`laterOccurrence`
+/// (successions) and `SelfLink`'s `thisThing`/`sameThing` (bindings).
+/// The one table: the emitter registers these names for the two ends a
+/// usage declares (`implied_ends`), the lift spells such an end by them
+/// (`implied_end_name`), the derivation layer and the full form's fallback
+/// name an end by them through [`binary_end_names_of`], and a prepared
+/// library snapshot admits only these names for its recorded ends.
+pub(crate) fn binary_end_names(kind: UsageKind) -> Option<[&'static str; 2]> {
+    match kind {
+        UsageKind::Connection
+        | UsageKind::Interface
+        | UsageKind::Allocation
+        | UsageKind::Connector
+        | UsageKind::Flow
+        | UsageKind::SuccessionFlow
+        | UsageKind::Message => Some(["source", "target"]),
+        UsageKind::Succession => Some(["earlierOccurrence", "laterOccurrence"]),
+        UsageKind::Binding => Some(["thisThing", "sameThing"]),
+        _ => None,
+    }
+}
+
+/// [`binary_end_names`] for the metaclass of the element that owns the
+/// ends, as a document spells it (`ConnectionUsage`, `SuccessionAsUsage`,
+/// `BindingConnectorAsUsage`, the KerML `Connector`, `Succession`,
+/// `BindingConnector`, …): what reads an element rather than a written
+/// usage asks. A transition owns its succession, which owns the ends, so
+/// `TransitionUsage` names none.
+pub(crate) fn binary_end_names_of(metaclass: &str) -> Option<[&'static str; 2]> {
+    binary_end_names(crate::lift::usage_kind_of(metaclass, Dialect::Sysml)?)
+}
+
 /// A connector-end target as one flat qualified name (chain links
 /// concatenated): member steps resolve through each element's scope like
 /// chain steps do, so the flattening preserves the target element.
@@ -12548,11 +13405,18 @@ pub(crate) fn implicit_def_bases(kind: DefKind) -> &'static [&'static str] {
     }
 }
 
-/// The library bases a usage of `kind` implicitly subsets (SysML 8.4.2
-/// Table 32), read as [`implicit_def_bases`] is.
+/// The library bases a usage of `kind` implicitly subsets by its kind alone
+/// (SysML 8.4.2 Table 32), read as [`implicit_def_bases`] is.
 ///
 /// Named as in [`implicit_def_bases`]: `Base::dataValues`, which the SysML
-/// `Attributes::attributeValues` aliases.
+/// `Attributes::attributeValues` aliases. The control nodes' bases are the
+/// `Action` roles the library nests (`Actions::Action::merges`, …), which
+/// every control node takes since an action owns it. The bases a usage
+/// takes from its owner — a subaction's `Actions::Action::subactions`, a
+/// substate's `States::StateAction::substates`, a state's transition's
+/// `States::StateAction::stateTransitions`, an action's
+/// `Actions::Action::decisionTransitions` — are not kind roles and are not
+/// here.
 pub(crate) fn implicit_usage_bases(kind: UsageKind) -> &'static [&'static str] {
     match kind {
         UsageKind::Attribute | UsageKind::Enum => &["Base::dataValues"],
@@ -12572,13 +13436,14 @@ pub(crate) fn implicit_usage_bases(kind: UsageKind) -> &'static [&'static str] {
         UsageKind::Assign => &["Actions::assignmentActions"],
         UsageKind::Terminate => &["Actions::terminateActions"],
         UsageKind::IfNode => &["Actions::ifThenActions"],
-        UsageKind::WhileLoop => &["Actions::whileLoops"],
+        UsageKind::WhileLoop => &["Actions::whileLoopActions"],
         UsageKind::ForLoop => &["Actions::forLoopActions"],
-        UsageKind::Merge | UsageKind::Decide | UsageKind::Join | UsageKind::Fork => {
-            &["Actions::controls"]
-        }
+        UsageKind::Merge => &["Actions::Action::merges"],
+        UsageKind::Decide => &["Actions::Action::decisions"],
+        UsageKind::Join => &["Actions::Action::joins"],
+        UsageKind::Fork => &["Actions::Action::forks"],
         UsageKind::State | UsageKind::Exhibit => &["States::stateActions"],
-        UsageKind::Transition => &["Actions::transitionActions", "States::stateTransitions"],
+        UsageKind::Transition => &["Actions::transitionActions"],
         UsageKind::Calc => &["Calculations::calculations"],
         UsageKind::Constraint | UsageKind::AssertConstraint => &["Constraints::constraintChecks"],
         UsageKind::Requirement | UsageKind::Satisfy => &["Requirements::requirementChecks"],
@@ -12588,6 +13453,9 @@ pub(crate) fn implicit_usage_bases(kind: UsageKind) -> &'static [&'static str] {
         UsageKind::Verification => &["VerificationCases::verificationCases"],
         UsageKind::UseCase | UsageKind::Include => &["UseCases::useCases"],
         UsageKind::View => &["Views::views"],
+        // The specification names `Views::viewpoints`; the library declares
+        // `viewpointChecks` as the base of every viewpoint usage.
+        UsageKind::Viewpoint => &["Views::viewpointChecks"],
         UsageKind::Rendering => &["Views::renderings"],
         _ => &[],
     }
@@ -13030,7 +13898,10 @@ pub struct ResolvedModel {
     pub(crate) quantity_index: Option<QuantityIndex>,
     /// Element index → its effective name (`Element::effectiveName()`),
     /// memoized by `naming.rs` (empty until first use).
-    name_memo: Vec<Option<Option<String>>>,
+    name_memo: Vec<Option<naming::NameMemo>>,
+    /// Element index → its effective short name
+    /// (`Element::effectiveShortName()`), memoized as `name_memo` is.
+    short_name_memo: Vec<Option<naming::NameMemo>>,
     /// Names of elements outside the model, by id — a library name table
     /// the caller supplied ([`Self::set_library_names`]) for a model built
     /// without its library. The naming rule reads it for a naming feature
@@ -13198,6 +14069,16 @@ pub(crate) struct QuantityIndex {
     pub(crate) by_unit_def: HashMap<usize, Vec<usize>>,
 }
 
+impl Builder {
+    /// [`ResolvedModel::is_library_element`] on the builder.
+    pub(crate) fn is_library_elem(&self, e: usize) -> bool {
+        self.semantic_ownership
+            .as_ref()
+            .map_or(e, |view| view.source_anchor(e))
+            < self.lib_boundary
+    }
+}
+
 impl ResolvedModel {
     /// Share the rows of the user's elements and scopes between this model
     /// and its forks: a fork then copies the memos, not the rows.
@@ -13222,6 +14103,7 @@ impl ResolvedModel {
             unit_meta: self.unit_meta.clone(),
             quantity_index: self.quantity_index.clone(),
             name_memo: self.name_memo.clone(),
+            short_name_memo: self.short_name_memo.clone(),
             external_names: self.external_names.clone(),
             external_by_name: self.external_by_name.clone(),
             external_ambiguous_names: self.external_ambiguous_names.clone(),
@@ -13459,6 +14341,7 @@ impl ResolvedModel {
                 .collect(),
             quantity_index: None,
             name_memo: Vec::new(),
+            short_name_memo: Vec::new(),
             external_names: HashMap::new(),
             external_by_name: HashMap::new(),
             external_ambiguous_names: HashSet::new(),
@@ -13547,13 +14430,19 @@ impl ResolvedModel {
         self.b
             .library_names_changed(self.b.implied.is_some(), dynamic_was_current);
         self.name_memo.clear();
+        self.short_name_memo.clear();
     }
 
     /// Resolve a `::`-separated qualified name (quoted segments allowed)
-    /// from the model's root namespace. This compatibility lookup also accepts
-    /// anonymous reference locators used by interchange replay; finding an
-    /// element does not imply it has a semantic `name` or `qualifiedName`.
-    /// Use [`Self::resolve_semantic_qualified`] to exclude those locators.
+    /// from the model's root namespace: the lookup of an element by its
+    /// qualified name whatever its visibility — protected and private
+    /// members included — which is not KerML name resolution and stays
+    /// this way; `Namespace::resolve`, `resolveGlobal`, `resolveLocal` and
+    /// `resolveVisible` through [`Self::invoke_operation`] are the
+    /// visibility-respecting lookups. This lookup also accepts anonymous
+    /// reference locators used by interchange replay; finding an element
+    /// does not imply it has a semantic `name` or `qualifiedName`. Use
+    /// [`Self::resolve_semantic_qualified`] to exclude those locators.
     pub fn resolve_qualified(&mut self, name: &str) -> Option<ElementRef> {
         self.resolve_segments(&split_qualified(name))
     }
@@ -13642,8 +14531,14 @@ impl ResolvedModel {
     /// Resolve and evaluate a `::`-qualified name, with the last
     /// segment evaluated as a chain step off the path prefix: in
     /// `P::t::volume` the usage `t` establishes the featuring context
-    /// exactly as the chain form `t.volume` would, so redefinitions
-    /// under `t` shadow the values inherited from its definition. When
+    /// as the chain form `t.volume` would, so redefinitions under `t`
+    /// shadow the values inherited from its definition. A prefix with no
+    /// value stands for one instance whatever its multiplicity but `[0]`,
+    /// so `P::t::volume` is the volume of each `t`, where `t.volume` reads
+    /// every value of a `t` of several or unknown count. That needs each
+    /// segment to be read where its instances read it: declared in the
+    /// segment before it, or inherited from generals that redefine nothing
+    /// (otherwise the prefix reads as the chain does). When
     /// the chain shape does not apply (a single segment, a prefix that
     /// evaluates to a scalar, or a member only qualified lookup can
     /// reach), the element evaluates in its own scope as
@@ -13659,7 +14554,10 @@ impl ResolvedModel {
     ) -> Result<crate::eval::Value, crate::eval::EvalError> {
         let segments = split_qualified(name);
         if segments.len() >= 2 {
-            if let Some(receiver) = self.resolve_segments(&segments[..segments.len() - 1]) {
+            let path: Option<Vec<ElementRef>> = (1..segments.len())
+                .map(|n| self.resolve_segments(&segments[..n]))
+                .collect();
+            if let Some(path) = path {
                 let member = QualifiedName {
                     is_global: false,
                     segments: vec![Name {
@@ -13668,7 +14566,7 @@ impl ResolvedModel {
                     }],
                     span: sysmlv2_syntax::span::Span::default(),
                 };
-                if let Some(out) = crate::eval::evaluate_member_of(self, receiver, &member) {
+                if let Some(out) = crate::eval::evaluate_member_of(self, &path, &member) {
                     return out;
                 }
             }
@@ -13743,14 +14641,18 @@ impl ResolvedModel {
     /// declared short name, else the syntactic effective name recorded at
     /// lowering — the last segment of the first redefined or referenced
     /// feature's written path (`attribute :>> mass` → `mass`), whether or
-    /// not that reference resolved. Structural projections that must
-    /// re-resolve the names they spell use this
+    /// not that reference resolved — else, for an unnamed subject,
+    /// objective, return parameter or view rendering that redefines
+    /// nothing explicitly, the positional name of the library feature it
+    /// implicitly redefines (`subject : V;` → `subj`). Structural
+    /// projections that must re-resolve the names they spell use this
     /// ([`Self::element_reference_spelling`] joins it); the
     /// specification's `name` is [`Self::element_effective_name`].
     pub fn element_lookup_name(&self, e: ElementRef) -> Option<String> {
         self.b
             .effective_name(e.0)
             .or_else(|| self.b.effective_hint.get(&e.0).cloned())
+            .or_else(|| self.b.implied_role_name(e.0).map(str::to_string))
     }
 
     /// The specification's `Element::name` — `effectiveName()` (KerML
@@ -13857,7 +14759,11 @@ impl ResolvedModel {
     /// `<element>`, recursively through quantities, instances, and
     /// sequences. Everything else matches the value's own `Display`.
     pub fn render_value(&self, v: &crate::eval::Value) -> String {
-        self.render_value_with(v, &crate::numfmt::NumberFormat::exact())
+        self.render_value_with(
+            v,
+            &crate::numfmt::NumberFormat::exact(),
+            crate::eval::UnitDisplay::Si,
+        )
     }
 
     /// [`Self::render_value`] for glanceable surfaces (editor hints and
@@ -13876,35 +14782,121 @@ impl ResolvedModel {
         v: &crate::eval::Value,
         format: &crate::numfmt::NumberFormat,
     ) -> String {
-        self.render_value_with(v, format)
+        self.render_value_with(v, format, crate::eval::UnitDisplay::Si)
+    }
+
+    /// A quantity re-expressed in the units its value was written in: an
+    /// equal value, converted by the evaluator's exact factors, or `None`
+    /// for anything else, for a quantity already in those units, and for
+    /// one the written units do not reach.
+    ///
+    /// A bracket's unit, kept through additive and scalar operations, is
+    /// already as written. Products, quotients and powers fold into
+    /// SI-coherent units (`10 ['in'] / (2 [s])` is `0.127 [m/s]`); this
+    /// re-expresses them from the units their operands were written in,
+    /// first match wins:
+    ///
+    /// 1. a written unit, or an integer power of one, with exactly the
+    ///    value's dimensions (`30 [mi]` for `60 [mi] / (1 [h]) * (30
+    ///    [min])`, `100 [in**2]` for an area of inches, `[1/h]`);
+    /// 2. a written named unit with several dimensions times written
+    ///    single-dimension units for the rest (`20 [N*ft]`);
+    /// 3. a written single-dimension unit for every dimension that has
+    ///    one, and for the others the unit an SI-coherent result writes
+    ///    them in (`5 [in/s]`, `64.348 [ft*lb/s**2]`).
+    ///
+    /// Each dimension takes the first unit written for it, so a value
+    /// never mixes two units of one dimension (`60 [km/h] / (10 [s])` is
+    /// `21600 [km/h**2]`), and a unit equal to the value's own keeps the
+    /// evaluator's spelling: values written in SI units alone read as SI
+    /// writes them (`10 [N] * (2 [m])` stays `20 [J]`).
+    pub fn value_as_written(&self, v: &crate::eval::Value) -> Option<crate::eval::Value> {
+        v.as_written(&self.b)
+    }
+
+    /// `v` with every quantity in it — `v` itself, a sequence's items, an
+    /// instance's fields — re-expressed in the units it was written in
+    /// ([`Self::value_as_written`]); everything else as it is.
+    pub fn quantities_as_written(&self, v: &crate::eval::Value) -> crate::eval::Value {
+        use crate::eval::Value;
+        match v {
+            Value::Quantity(..) => self.value_as_written(v).unwrap_or_else(|| v.clone()),
+            Value::Sequence(items) => Value::Sequence(
+                items
+                    .iter()
+                    .map(|item| self.quantities_as_written(item))
+                    .collect(),
+            ),
+            Value::Instance {
+                ty,
+                ty_name,
+                fields,
+            } => Value::Instance {
+                ty: *ty,
+                ty_name: ty_name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), self.quantities_as_written(field)))
+                    .collect(),
+            },
+            _ => v.clone(),
+        }
+    }
+
+    /// [`Self::render_value_as`] with quantities in the units `units`
+    /// chooses: [`UnitDisplay::AsWritten`](crate::eval::UnitDisplay::AsWritten)
+    /// re-expresses each quantity in the units its value was written in
+    /// (see [`Self::value_as_written`]).
+    pub fn render_value_in(
+        &self,
+        v: &crate::eval::Value,
+        format: &crate::numfmt::NumberFormat,
+        units: crate::eval::UnitDisplay,
+    ) -> String {
+        self.render_value_with(v, format, units)
     }
 
     fn render_value_with(
         &self,
         v: &crate::eval::Value,
         format: &crate::numfmt::NumberFormat,
+        units: crate::eval::UnitDisplay,
     ) -> String {
         use crate::eval::Value;
         let leaf = |v: &Value| v.to_string_with(format);
         match v {
-            Value::Element(e) | Value::Unbound(e) | Value::UnboundMember(e) => {
+            Value::Element(e) | Value::Unbound(e, _) | Value::UnboundMember(e, _) => {
                 let el = &self.b.elements[e.0];
                 el.props
                     .get("declaredName")
-                    .or_else(|| el.props.get("declaredShortName"))
                     .and_then(|n| n.as_str())
+                    .or_else(|| el.props.get("declaredShortName").and_then(|n| n.as_str()))
                     .map(str::to_string)
                     .unwrap_or_else(|| v.to_string())
             }
-            Value::Quantity(n, u) => {
-                format!("{} [{}]", self.render_value_with(n, format), u.display())
-            }
+            Value::Quantity(n, u) => match (units == crate::eval::UnitDisplay::AsWritten)
+                .then(|| v.as_written(&self.b))
+                .flatten()
+            {
+                Some(Value::Quantity(n, u)) => format!(
+                    "{} [{}]",
+                    self.render_value_with(&n, format, units),
+                    u.display()
+                ),
+                _ => format!(
+                    "{} [{}]",
+                    self.render_value_with(n, format, units),
+                    u.display()
+                ),
+            },
             Value::Instance {
                 ty_name, fields, ..
             } => {
                 let fields = fields
                     .iter()
-                    .map(|(name, v)| format!("{name} = {}", self.render_value_with(v, format)))
+                    .map(|(name, v)| {
+                        format!("{name} = {}", self.render_value_with(v, format, units))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{ty_name}({fields})")
@@ -13913,7 +14905,7 @@ impl ResolvedModel {
             Value::Sequence(s) => {
                 let items = s
                     .iter()
-                    .map(|v| self.render_value_with(v, format))
+                    .map(|v| self.render_value_with(v, format, units))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({items})")
@@ -14143,7 +15135,8 @@ impl ResolvedModel {
     /// than the specification's name, so an unnamed feature is spelled by
     /// the name it was written under — the segment name resolution finds
     /// it by — even where the specification's `qualifiedName` would give
-    /// another (an implied positional name) or none (an unresolved naming
+    /// another (a connector end's positional name, or a name taken from a
+    /// general's member by position) or none (an unresolved naming
     /// reference). Text going into a known unit can use its own table
     /// instead: [`Self::unit_dialect`] with
     /// [`sysmlv2_syntax::name::spell_path`].
@@ -14939,9 +15932,13 @@ impl ResolvedModel {
         self.prop_target(m.0, "memberElement").map(ElementRef)
     }
 
-    /// The name a Membership binds its member under: the membership's
-    /// declared `memberName` (an alias's own name), else the member's
-    /// effective name.
+    /// The name a Membership binds its member under — the specification's
+    /// `memberName`: the membership's declared `memberName` (an alias's
+    /// own name), else the member's effective name
+    /// ([`Self::element_effective_name`]): a binary connector's ends are
+    /// `source` and `target`, an unnamed `satisfy r by a` has none. The
+    /// syntactic locator lookup also accepts (`r` for that claim) is
+    /// [`Self::element_lookup_name`].
     pub fn membership_member_name(&mut self, m: ElementRef) -> Option<String> {
         if let Some(n) = self.b.elements[m.0]
             .props
@@ -14951,7 +15948,7 @@ impl ResolvedModel {
             return Some(n.to_string());
         }
         let member = self.membership_member(m)?;
-        self.element_lookup_name(member)
+        self.element_effective_name(member)
     }
 
     /// Whether `m` is an alias Membership: a plain `Membership` carrying
@@ -15001,11 +15998,35 @@ impl ResolvedModel {
     /// Whether `e` belongs to a loaded library unit (resolution target
     /// only — never serialized, never a transformation target).
     pub fn is_library_element(&self, e: ElementRef) -> bool {
-        self.b
-            .semantic_ownership
-            .as_ref()
-            .map_or(e.0, |view| view.source_anchor(e.0))
-            < self.b.lib_boundary
+        self.b.is_library_elem(e.0)
+    }
+
+    /// `Element::libraryNamespace()`: the library package that owns `e`,
+    /// directly or through its owning relationships, or `None` outside one.
+    /// A library package
+    /// is its own (`LibraryPackage::libraryNamespace()`); an element goes up
+    /// through its owning relationship (`Element::libraryNamespace()`), a
+    /// relationship through its carrier (`owningRelatedElement`), else its
+    /// own owning relationship (`Relationship::libraryNamespace()`). The
+    /// derived `isLibraryElement` and the operation through
+    /// [`Self::invoke_operation`] take this walk. Compare
+    /// [`Self::is_library_element`], which answers whether `e` was read from
+    /// a library unit.
+    pub fn library_namespace(&mut self, e: ElementRef) -> Option<ElementRef> {
+        self.ensure_rel_owner();
+        let mut at = Some(e.0);
+        let mut steps = 0usize;
+        while let Some(i) = at {
+            if self.b.elements[i].ty == "LibraryPackage" {
+                return Some(ElementRef(i));
+            }
+            steps += 1;
+            if steps > 2 * self.b.elements.len() {
+                return None; // malformed ownership cycle
+            }
+            at = self.rel_owner[i].or(self.b.elements[i].owning_relationship);
+        }
+        None
     }
 
     /// `Type::isAbstract` as declared: the `abstract` keyword, or a
@@ -15247,6 +16268,7 @@ impl ResolvedModel {
         if metadata_changed {
             self.quantity_index = None;
             self.name_memo.clear();
+            self.short_name_memo.clear();
             self.redefiner_index = None;
             self.import_truncated.clear();
         }
@@ -15488,6 +16510,7 @@ impl ResolvedModel {
             self.b.semantic_memo = Default::default();
             self.quantity_index = None;
             self.name_memo.clear();
+            self.short_name_memo.clear();
             self.redefiner_index = None;
             self.import_truncated.clear();
             let pending = std::mem::take(&mut self.b.id_binding_pending);
@@ -16134,6 +17157,22 @@ impl ResolvedModel {
         crate::eval::evaluate_expr_with(&mut self.b, scope.0, expr, overrides.clone())
     }
 
+    /// [`Self::evaluate_in_with`], with the receivers whose count left a
+    /// chain step unknown (placeholders of unknown or open multiplicity),
+    /// in the order evaluation met them: what an indeterminate result may
+    /// owe to.
+    pub(crate) fn evaluate_in_explained(
+        &mut self,
+        scope: ScopeRef,
+        expr: &Expr,
+        overrides: &std::collections::HashMap<usize, crate::eval::Value>,
+    ) -> (
+        Result<crate::eval::Value, crate::eval::EvalError>,
+        Vec<ElementRef>,
+    ) {
+        crate::eval::evaluate_expr_explained(&mut self.b, scope.0, expr, overrides.clone())
+    }
+
     /// One entry of [`Self::body_flow_members`]: an owned member in
     /// declaration order, or a `first X;` initial-node marker.
     #[allow(missing_docs)]
@@ -16622,6 +17661,41 @@ impl ResolvedModel {
             .map(|r| self.b.elements[r].ty)
     }
 
+    /// The `kind` of `e`'s owning membership, for the membership
+    /// metaclasses that carry one: `assumption` / `requirement` on a
+    /// `RequirementConstraintMembership` (`assume` / `require`), `entry`
+    /// / `do` / `exit` on a `StateSubactionMembership`, `trigger` /
+    /// `guard` / `effect` on a `TransitionFeatureMembership`. `None`
+    /// for every other membership and for document roots.
+    pub fn owning_membership_kind(&self, e: ElementRef) -> Option<&str> {
+        let rel = self.b.elements[e.0].owning_relationship?;
+        self.b.elements[rel].props.get("kind")?.as_str()
+    }
+
+    /// The trailing result expression `e`'s body ends with — a
+    /// calculation's, constraint's, requirement's or case's body
+    /// expression (`a + b`, `vehicle.mass <= limit`) — when it writes one.
+    /// `None` for a body without one (a reference `require fueled;`, a
+    /// constraint typed by its definition alone).
+    pub fn result_expression(&self, e: ElementRef) -> Option<Expr> {
+        // Only an owner of a result-expression membership has an entry; the
+        // test is a scan of its own relationships, the lookup one of every
+        // body in the model.
+        let owns = self.b.elements[e.0]
+            .owned_relationships
+            .iter()
+            .any(|&r| self.b.elements[r].ty == "ResultExpressionMembership");
+        if !owns {
+            return None;
+        }
+        self.b
+            .result_exprs
+            .iter()
+            .rev()
+            .find(|(owner, _, _)| *owner == e.0)
+            .map(|(_, _, expr)| expr.clone())
+    }
+
     /// Members owned by `e` through memberships of one specific
     /// metaclass (`ActorMembership`, `SubjectMembership`,
     /// `ObjectiveMembership`, …), in declaration order.
@@ -16961,7 +18035,13 @@ impl ResolvedModel {
             .owned_relationships
             .iter()
             .find(|&&r| self.b.elements[r].ty == rel_ty)?;
-        self.b.elements[*rel]
+        self.rel_spelling(*rel, key)
+    }
+
+    /// The `@ref` spelling of relationship `rel`'s property `key` — the
+    /// qualified name as written of a reference that did not resolve.
+    fn rel_spelling(&self, rel: usize, key: &str) -> Option<String> {
+        self.b.elements[rel]
             .props
             .get(key)?
             .get("@ref")?
@@ -17074,10 +18154,74 @@ impl ResolvedModel {
             .collect()
     }
 
+    /// The written spelling of `e`'s `ReferenceSubsetting` target when it
+    /// did not resolve in full, which [`Self::referenced_features`] lists
+    /// not at all or cut short: a name that resolved to nothing as
+    /// written (`do 'provide power';` → `'provide power'`, `exit
+    /// Ops::park;` → `Ops::park`), and a feature chain cut short at an
+    /// unresolved link as its links joined by `.`, a resolved link by
+    /// its name and an unresolved one as written (`do tank.drain;` →
+    /// `tank.drain`). `None` when the reference resolved in full, and
+    /// when `e` references nothing.
+    pub fn unresolved_referenced_feature(&mut self, e: ElementRef) -> Option<String> {
+        self.ensure_by_id();
+        let rel = self.b.elements[e.0]
+            .owned_relationships
+            .iter()
+            .copied()
+            .find(|&r| self.b.elements[r].ty == "ReferenceSubsetting")?;
+        if let Some(spelling) = self.rel_spelling(rel, "referencedFeature") {
+            return Some(spelling);
+        }
+        let chain = self.prop_target(rel, "referencedFeature")?;
+        let chainings: Vec<usize> = self.b.elements[chain]
+            .owned_relationships
+            .iter()
+            .copied()
+            .filter(|&r| self.b.elements[r].ty == "FeatureChaining")
+            .collect();
+        let mut links = Vec::with_capacity(chainings.len());
+        let mut cut = false;
+        for rel in chainings {
+            match self.prop_target(rel, "chainingFeature") {
+                Some(link) => links.push(sysmlv2_syntax::name::spell_name_in(
+                    None,
+                    &self.element_lookup_name(ElementRef(link))?,
+                )),
+                None => {
+                    cut = true;
+                    links.push(self.rel_spelling(rel, "chainingFeature")?);
+                }
+            }
+        }
+        cut.then(|| links.join("."))
+    }
+
     /// A transition's constituent parts (SysML 7.16 TransitionUsage
     /// lowering): resolved source state, trigger accept action, guard
     /// expression (as written), effect action, and the target state (the
     /// last link of its transition succession's target end).
+    /// The source a transition takes when its text writes none, a target
+    /// transition (`then t;`, `if g then t;`, `accept … then t;`, `else t;`,
+    /// SysML 8.2.2.21): the last action among its owner's members before it
+    /// that can stand as a predecessor (no parameter, no transition, no
+    /// connector but a flow or message), or the written source of the last
+    /// transition before it, whichever comes later (`if g then a; else b;`
+    /// after `first x` both leave `x`). `None` for a transition with a
+    /// written source, or with none before it. The model carries it as an
+    /// implied Membership of the transition, after its written
+    /// relationships, so `source`, `sourceFeature()` and the transition
+    /// succession's source end agree.
+    pub fn implicit_transition_source(&mut self, e: ElementRef) -> Option<ElementRef> {
+        if self.b.elements[e.0].ty != "TransitionUsage"
+            || implied::written_transition_source(&self.b, e.0) != implied::TransitionSource::None
+        {
+            return None;
+        }
+        let carrier = self.owner(e)?;
+        implied::implicit_transition_source(&self.b, e.0, carrier.0).map(ElementRef)
+    }
+
     pub fn transition_parts(&mut self, e: ElementRef) -> TransitionParts {
         self.ensure_by_id();
         let rels: Vec<(usize, &'static str)> = self.b.elements[e.0]
@@ -17143,6 +18287,9 @@ impl ResolvedModel {
                 }
                 _ => {}
             }
+        }
+        if parts.source.is_none() && parts.target.is_some() {
+            parts.source = self.implicit_transition_source(e);
         }
         parts
     }
@@ -17878,7 +19025,7 @@ mod source_query_tests {
         ]);
         assert_eq!(
             r.evaluate_value_chain(repeated, &[&name]),
-            Ok(Value::Integer(7))
+            Ok(Value::Sequence(vec![Value::Integer(7), Value::Integer(7)]))
         );
         let mut empty = name.clone();
         empty.segments.clear();
@@ -17886,11 +19033,12 @@ mod source_query_tests {
             r.evaluate_value_chain(instance(Value::Integer(7)), &[&empty]),
             Err(EvalError::Unsupported(_))
         ));
+        // A long sequence costs one pass: no step compares its values.
         let many = Value::Sequence((0..4000).map(|i| instance(Value::Integer(i))).collect());
-        assert!(matches!(
+        assert_eq!(
             r.evaluate_value_chain(many, &[&name]),
-            Err(EvalError::Budget(_))
-        ));
+            Ok(Value::Sequence((0..4000).map(Value::Integer).collect()))
+        );
         let mut deep = Value::Integer(1);
         for _ in 0..=crate::eval::MAX_CALL_DEPTH {
             deep = Value::Quantity(Box::new(deep), crate::eval::Unit::from_dims(Vec::new()));
@@ -17905,6 +19053,59 @@ mod source_query_tests {
             r.evaluate_value_chain(instance(Value::Integer(8)), &[&name]),
             Ok(Value::Integer(8))
         );
+    }
+}
+
+#[cfg(test)]
+mod unresolved_reference_tests {
+    use super::*;
+    use crate::model::Model;
+
+    #[test]
+    fn a_reference_that_does_not_resolve_in_full_keeps_its_spelling() {
+        let mut m = Model::new();
+        m.add_source(
+            "model.sysml",
+            "package P {
+                part def Tank { action fill; }
+                part tank : Tank;
+                state def Broken {
+                    entry 'provide power';
+                    do tank.drain;
+                    exit Ops::park;
+                }
+                state def Whole { do tank.fill; }
+            }",
+        );
+        let mut r = ResolvedModel::build(&m);
+        let broken = r.resolve_qualified("P::Broken").unwrap();
+        let actions: Vec<ElementRef> = r
+            .state_subactions(broken)
+            .into_iter()
+            .map(|(_, a)| a)
+            .collect();
+        let spellings: Vec<Option<String>> = actions
+            .iter()
+            .map(|&a| r.unresolved_referenced_feature(a))
+            .collect();
+        assert_eq!(
+            spellings,
+            [
+                Some("'provide power'".to_string()),
+                Some("tank.drain".to_string()),
+                Some("Ops::park".to_string()),
+            ]
+        );
+        // The resolved chains list the first not at all, and the second
+        // cut short at its unresolved link.
+        let tank = r.resolve_qualified("P::tank").unwrap();
+        assert!(r.referenced_features(actions[0]).is_empty());
+        assert_eq!(r.referenced_features(actions[1]), [vec![tank]]);
+        let whole = r.resolve_qualified("P::Whole").unwrap();
+        let (_, done) = r.state_subactions(whole).remove(0);
+        assert_eq!(r.unresolved_referenced_feature(done), None);
+        assert_eq!(r.referenced_features(done)[0].len(), 2);
+        assert_eq!(r.unresolved_referenced_feature(tank), None);
     }
 }
 

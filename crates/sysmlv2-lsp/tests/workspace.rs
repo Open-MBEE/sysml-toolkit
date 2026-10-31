@@ -544,6 +544,48 @@ fn worker_reports_user_roots_shadowing_library_roots() {
 }
 
 #[test]
+fn worker_reports_the_rule_a_semantic_finding_names_as_its_code() {
+    // The model tier's semantic finding carries its rule as the
+    // diagnostic's code, under the checker's source (not the linter's,
+    // so no lint quick fix takes it for a lint rule); the unresolved
+    // reference names no rule and has no code.
+    let lib = std::env::temp_dir().join(format!(
+        "sysmlv2-lsp-rule-code-lib-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&lib);
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(
+        lib.join("MiniLib.sysml"),
+        "standard library package MiniLib { part def Thing; }\n",
+    )
+    .unwrap();
+
+    let client = Client::start_with_library(None, Some(lib));
+    let u = uri("rule-code.sysml");
+    client.open(
+        &u,
+        "constraint c;\npart q : Missing;\npart p { satisfy c; }\n",
+    );
+    let semantic = |d: &lsp_types::Diagnostic| d.message.starts_with("SatisfyRequirementUsage");
+    let unresolved = |d: &lsp_types::Diagnostic| d.message.starts_with("unresolved reference");
+    let p = client.await_publish(&u, |p| {
+        p.diagnostics.iter().any(semantic) && p.diagnostics.iter().any(unresolved)
+    });
+    let diag = p.diagnostics.iter().find(|d| semantic(d)).unwrap();
+    assert_eq!(
+        diag.code,
+        Some(lsp_types::NumberOrString::String(
+            "validateSatisfyRequirementUsageReference".into()
+        ))
+    );
+    assert_eq!(diag.source.as_deref(), Some("sysmlv2"));
+    let diag = p.diagnostics.iter().find(|d| unresolved(d)).unwrap();
+    assert_eq!(diag.code, None);
+    client.shutdown();
+}
+
+#[test]
 fn visibility_quickfix_rides_the_m11a_finding() {
     let mut client = Client::start(None);
     let u = uri("vis.sysml");

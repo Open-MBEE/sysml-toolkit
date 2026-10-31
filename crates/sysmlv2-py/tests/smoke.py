@@ -166,6 +166,23 @@ assert j.id_map_from(json.dumps(elements)) == []
 full = json.loads(j.to_full_json())
 assert len(full) >= len(elements)
 
+# Flexo MMS returns change records without owningRelationship and
+# owningRelatedElement: refused as they are, read with flexo=True.
+records = [
+    {"payload": {k: v for k, v in e.items()
+                 if k not in ("owningRelationship", "owningRelatedElement")},
+     "identity": {"@id": e["@id"]}}
+    for e in elements
+]
+try:
+    sysmlv2.Session.from_interchange_json(json.dumps(records))
+    raise AssertionError("a payload omitting the back-references is refused")
+except sysmlv2.Error as e:
+    assert "omits the inverse ownership ends" in str(e), e
+f = sysmlv2.Session.from_interchange_json(json.dumps(records), flexo=True)
+assert f.units() == j.units()
+assert f.to_compact_json() == j.to_compact_json()
+
 # recover_refs: dangling references survive full-form emit -> reload
 p = sysmlv2.Session.from_sources([("p.sysml", "package P { part x : Missing; }")])
 r = sysmlv2.Session.from_interchange_json(p.to_full_json(recover_refs=True))
@@ -195,6 +212,7 @@ except sysmlv2.Error as e:
 bad = sysmlv2.check([("bad.sysml", "package Bad {\n  part p : ;\n}")])
 assert bad and bad[0].severity == "error" and bad[0].stage == "parse"
 assert (bad[0].unit, bad[0].line, bad[0].col) == ("bad.sysml", 2, 12)
+assert bad[0].rule is None, "a parse finding names no rule"
 assert sysmlv2.check([("ok.sysml", "package Ok { part def A; part a : A; }")]) == []
 
 # --- to_plantuml: PlantUML emission, one call per view ---
@@ -346,6 +364,83 @@ if LIBRARY.is_dir():
     assert "attribute x : ScalarValues::Real;" in lb.units()[0][2]
 else:
     print("smoke: no standard library checkout — library refusals not exercised")
+
+# --- binary delta: an edit ships as its changes against a store's head ---
+head = sysmlv2.Session.from_sources([("t.sysml", DEMO)])
+head_json = head.decode_cbor(head.to_compact_cbor())
+assert isinstance(json.loads(head_json), list)
+edited = sysmlv2.Session.from_sources([("t.sysml", DEMO.replace("part v : Vehicle;", "part v : Vehicle;\n    part w : Vehicle;"))])
+for portable in (False, True):
+    delta = edited.delta_cbor_from_head(head_json, portable=portable)
+    assert isinstance(delta, bytes) and 0 < len(delta) < len(edited.to_compact_cbor()), (portable, len(delta))
+# --- a push between two stores: the receiver's head to the sender's state ---
+push, pushed_digest, fallback = sysmlv2.store_delta_cbor(head.to_compact_cbor(), edited.to_compact_cbor())
+assert isinstance(push, bytes) and 0 < len(push) < len(edited.to_compact_cbor())
+assert fallback is None and len(pushed_digest) == 36
+try:
+    sysmlv2.store_delta_cbor(b"not s2c", edited.to_compact_cbor())
+    raise AssertionError("a malformed base is refused")
+except sysmlv2.FailedError:
+    pass
+
+try:
+    edited.delta_cbor_from_head("not json")
+    raise AssertionError("a malformed head is refused")
+except sysmlv2.RefusedError:
+    pass
+
+# --- units as written ---
+UNITS = """package U {
+    attribute m; attribute s;
+    attribute 'in' { attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; } }
+    attribute d = 10 ['in'];
+    attribute v = d / (2 [s]);
+}
+"""
+u = sysmlv2.Session.from_sources([("u.sysml", UNITS)])
+assert sysmlv2.value_units() == "si"
+assert u.query("U::v") == (Fraction(127, 1000), "m/s")
+assert "v = 0.127 [m/s]" in u.to_plantuml()
+assert "v = 5 [in/s]" in u.to_plantuml(value_units="asWritten")
+try:
+    u.to_plantuml(value_units="as-written")
+    raise AssertionError("an unknown value_units must raise")
+except sysmlv2.RefusedError as e:
+    assert "asWritten" in str(e), e
+sysmlv2.set_value_units("asWritten")
+try:
+    assert sysmlv2.value_units() == "asWritten"
+    assert u.query("U::v") == (5, "in/s")
+    assert u.query("(U::v, U::d, 3)") == [(5, "in/s"), (10, "in"), 3]
+    assert u.evaluate(u.resolve("U::v")) == (5, "in/s")
+    assert "v = 5 [in/s]" in u.to_plantuml()
+    assert "v = 0.127 [m/s]" in u.to_plantuml(value_units="si")
+    try:
+        sysmlv2.set_value_units("SI")
+        raise AssertionError("an unknown mode must raise")
+    except ValueError:
+        pass
+    assert sysmlv2.value_units() == "asWritten"
+finally:
+    sysmlv2.set_value_units("si")
+assert u.query("U::v") == (Fraction(127, 1000), "m/s")
+
+server = sysmlv2.LspServer()
+server.handle(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}}))
+server.handle(json.dumps({"jsonrpc": "2.0", "method": "initialized", "params": {}}))
+server.handle(json.dumps({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": "file:///w/u.sysml", "languageId": "sysml", "version": 1, "text": UNITS}}}))
+def unit_hints():
+    out = server.handle(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "textDocument/inlayHint", "params": {"textDocument": {"uri": "file:///w/u.sysml"}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 6, "character": 0}}}}))
+    reply = next(json.loads(m) for m in out if json.loads(m).get("id") == 2)
+    return [h["label"] for h in reply["result"]]
+assert " = 0.127 [m/s]" in unit_hints()
+server.set_value_hint_units("asWritten")
+assert " = 5 [in/s]" in unit_hints()
+try:
+    server.set_value_hint_units("as-written")
+    raise AssertionError("an unknown mode must raise")
+except ValueError:
+    pass
 
 assert tuple(int(x) for x in sysmlv2.__version__.split(".")) >= (0, 1, 0)
 

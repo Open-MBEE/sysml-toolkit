@@ -156,23 +156,29 @@ fn existing_required_name_without_a_source_path_is_not_completeness() {
 
 #[test]
 fn metadata_valuation_owned_context_and_invocation_remain_outside_bounded_domain() {
-    for user in [
+    // A feature value adds no typing obligation and a type of any kind is
+    // an audited owner context, so a valued feature and an expression in a
+    // class are inside the domain now, and so is a feature plain metadata
+    // annotates (plain metadata adds no base); semantic metadata keeps one
+    // out (`checked_metadata_receivers`).
+    let mut r = fixture(
         "function F specializes Performances::Evaluation; metaclass Mark; expr e:F subsets Performances::evaluations; @Mark about e;",
-        "function F specializes Performances::Evaluation; feature e:F subsets Performances::evaluations=1;",
+    );
+    let feature = r.resolve_qualified("e").unwrap().0;
+    let mut proof = RepositoryTyping::new(&mut r.b, &mut 0).unwrap();
+    assert!(proof.project(feature, &mut 0).function(&proof).is_ok());
+    let mut r = fixture(
         "function F specializes Performances::Evaluation; class C {expr e:F subsets Performances::evaluations;}",
-    ] {
-        let mut r = fixture(user);
-        let feature = r
-            .resolve_qualified("e")
-            .or_else(|| r.resolve_qualified("C::e"))
-            .unwrap()
-            .0;
-        let mut proof = RepositoryTyping::new(&mut r.b, &mut 0).unwrap();
-        assert!(proof.project(feature, &mut 0).function(&proof).is_err());
-    }
+    );
+    let feature = r.resolve_qualified("C::e").unwrap().0;
+    let mut proof = RepositoryTyping::new(&mut r.b, &mut 0).unwrap();
+    assert!(proof.project(feature, &mut 0).function(&proof).is_ok());
 }
 #[test]
 fn invocation_waits_for_accepted_dynamic_typing_lifecycle() {
+    // A feature value's expression is inside the domain, but an invocation's
+    // typing by its callee is dynamic evidence: without it the static audit
+    // would certify the generic evaluation as its function, so it refuses.
     let mut r = fixture("function F specializes Performances::Evaluation; feature call=F();");
     let invocation =
         r.b.elements

@@ -262,7 +262,7 @@ fn recursive_feature_visibility_rejects_incomplete_ownership_metadata_and_featur
         let outer = r.resolve_qualified("Outer").unwrap();
         let typed = r.resolve_qualified("Outer::typedSlot").unwrap();
         let local = r.resolve_qualified("Outer::typedSlot::Local").unwrap();
-        assert!(visible(&mut r, outer, false).is_ok());
+        let before = visible(&mut r, outer, false).unwrap();
         let membership = r.b.elements[local.0].owning_relationship.unwrap();
         match mutation {
             0 => r.b.elements[typed.0]
@@ -279,25 +279,35 @@ fn recursive_feature_visibility_rejects_incomplete_ownership_metadata_and_featur
                 r.b.set(typed.0, "isEnd", serde_json::json!(true));
             }
         }
-        assert!(
-            matches!(
-                visible(&mut r, outer, false),
-                Err(OperationError::Incomplete { .. })
-            ),
-            "mutation {mutation}"
-        );
+        let after = visible(&mut r, outer, false);
+        if mutation == 0 {
+            assert!(
+                matches!(after, Err(OperationError::Incomplete { .. })),
+                "mutation {mutation}"
+            );
+        } else {
+            // Plain metadata adds no base (semantic metadata keeps a feature
+            // out: `checked_metadata_receivers`); a directed or end feature
+            // is inside the domain: its positional targets come from its
+            // owner's certificate, and the memberships it owns are the same.
+            assert_eq!(after, Ok(before), "mutation {mutation}");
+        }
     }
-    for source in [
-        "class Outer {feature valued=1;}",
+    // A nested feature's own features are inside the domain now (a member
+    // of a type of any kind); a feature value's expression is a member whose
+    // own namespace the recursive visibility does not certify yet.
+    let mut r = fixture(
+        GraphFormat::CanonicalV3,
         "class Outer {feature nested {feature child;}}",
-    ] {
-        let mut r = fixture(GraphFormat::CanonicalV3, source);
-        let outer = r.resolve_qualified("Outer").unwrap();
-        assert!(matches!(
-            visible(&mut r, outer, false),
-            Err(OperationError::Incomplete { .. })
-        ));
-    }
+    );
+    let outer = r.resolve_qualified("Outer").unwrap();
+    assert!(visible(&mut r, outer, false).is_ok());
+    let mut r = fixture(GraphFormat::CanonicalV3, "class Outer {feature valued=1;}");
+    let outer = r.resolve_qualified("Outer").unwrap();
+    assert!(matches!(
+        visible(&mut r, outer, false),
+        Err(OperationError::Incomplete { .. })
+    ));
 }
 #[test]
 fn recursive_feature_visibility_observes_mutations_and_budget_retry() {
@@ -332,7 +342,10 @@ fn recursive_feature_visibility_observes_mutations_and_budget_retry() {
 }
 
 #[test]
-fn package_owned_feature_roots_keep_the_same_narrow_flag_boundary() {
+fn package_owned_feature_roots_keep_the_same_flag_boundary_as_owned_ones() {
+    // A package-owned feature has no owner certificate to take positional
+    // targets from and needs none: its end or direction flag changes nothing
+    // in its memberships.
     for (key, value) in [
         ("isEnd", serde_json::json!(true)),
         ("direction", serde_json::json!("in")),
@@ -344,11 +357,9 @@ fn package_owned_feature_roots_keep_the_same_narrow_flag_boundary() {
             Ok(DerivedValue::References(vec![]))
         );
         r.b.set(feature.0, key, value);
-        assert!(
-            matches!(
-                visible(&mut r, feature, false),
-                Err(OperationError::Incomplete { .. })
-            ),
+        assert_eq!(
+            visible(&mut r, feature, false),
+            Ok(DerivedValue::References(vec![])),
             "{key}"
         );
     }

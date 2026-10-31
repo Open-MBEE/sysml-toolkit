@@ -1175,7 +1175,7 @@
       "Usage"
      ],
      "corpus_elements": 8045,
-     "corpus_nonempty": 4476,
+     "corpus_nonempty": 4472,
      "class": "structural"
     }
    ],
@@ -1183,7 +1183,7 @@
    "also_owned_elsewhere": false,
    "rules": {},
    "corpus_elements": 8045,
-   "corpus_nonempty": 4476
+   "corpus_nonempty": 4472
   },
   {
    "name": "differencingType",
@@ -1373,7 +1373,7 @@
      "redefines": [],
      "doc": "The Documentation owned by this Element.",
      "doc_refs": [],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 156,
      "class": "structural"
     }
@@ -1383,7 +1383,7 @@
    "rules": {
     "Element": "documentation = ownedElement->selectByKind(Documentation)"
    },
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 156
   },
   {
@@ -2788,8 +2788,8 @@
      "redefines": [],
      "doc": "Whether this Element is contained in the ownership tree of a library model.",
      "doc_refs": [],
-     "corpus_elements": 91191,
-     "corpus_nonempty": 1376,
+     "corpus_elements": 91492,
+     "corpus_nonempty": 1378,
      "class": "structural"
     }
    ],
@@ -2798,8 +2798,8 @@
    "rules": {
     "Element": "isLibraryElement = libraryNamespace() <> null "
    },
-   "corpus_elements": 91191,
-   "corpus_nonempty": 1376
+   "corpus_elements": 91492,
+   "corpus_nonempty": 1378
   },
   {
    "name": "isModelLevelEvaluable",
@@ -3305,8 +3305,8 @@
       "name",
       "owningNamespace"
      ],
-     "corpus_elements": 91191,
-     "corpus_nonempty": 14342,
+     "corpus_elements": 91492,
+     "corpus_nonempty": 14354,
      "class": "structural"
     }
    ],
@@ -3315,8 +3315,8 @@
    "rules": {
     "Element": "name = effectiveName()"
    },
-   "corpus_elements": 91191,
-   "corpus_nonempty": 14342
+   "corpus_elements": 91492,
+   "corpus_nonempty": 14354
   },
   {
    "name": "nestedAction",
@@ -3751,7 +3751,7 @@
   {
    "name": "nestedMetadata",
    "class": "structural",
-   "status": "absent",
+   "status": "derived",
    "declaring": [
     {
      "metaclass": "Usage",
@@ -3769,7 +3769,7 @@
       "nestedUsages"
      ],
      "corpus_elements": 8045,
-     "corpus_nonempty": 0,
+     "corpus_nonempty": 153,
      "class": "structural"
     }
    ],
@@ -3779,7 +3779,7 @@
     "Usage": "nestedMetadata = nestedUsage->selectByKind(MetadataUsage)"
    },
    "corpus_elements": 8045,
-   "corpus_nonempty": 0
+   "corpus_nonempty": 153
   },
   {
    "name": "nestedOccurrence",
@@ -4579,7 +4579,7 @@
       "annotatedElement",
       "ownedRelationships"
      ],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 0,
      "class": "structural"
     }
@@ -4589,7 +4589,7 @@
    "rules": {
     "Element": "ownedAnnotation = ownedRelationship-> selectByKind(Annotation)-> select(a | a.annotatedElement = self)"
    },
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 0
   },
   {
@@ -4982,7 +4982,7 @@
      "redefines": [],
      "doc": "The Elements owned by this Element, derived as the ownedRelatedElements of the ownedRelationships of this Element.",
      "doc_refs": [],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 14481,
      "class": "structural"
     }
@@ -4992,7 +4992,7 @@
    "rules": {
     "Element": "ownedElement = ownedRelationship.ownedRelatedElement"
    },
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 14481
   },
   {
@@ -5536,7 +5536,7 @@
       "ownedMemberElement"
      ],
      "corpus_elements": 25371,
-     "corpus_nonempty": 14342,
+     "corpus_nonempty": 14354,
      "class": "structural"
     }
    ],
@@ -5546,7 +5546,7 @@
     "OwningMembership": "ownedMemberName = ownedMemberElement.name"
    },
    "corpus_elements": 25371,
-   "corpus_nonempty": 14342
+   "corpus_nonempty": 14354
   },
   {
    "name": "ownedMemberParameter",
@@ -5650,7 +5650,7 @@
   {
    "name": "ownedMetadata",
    "class": "structural",
-   "status": "absent",
+   "status": "derived",
    "declaring": [
     {
      "metaclass": "Definition",
@@ -5668,7 +5668,7 @@
       "ownedUsages"
      ],
      "corpus_elements": 1354,
-     "corpus_nonempty": 0,
+     "corpus_nonempty": 12,
      "class": "structural"
     }
    ],
@@ -5678,7 +5678,7 @@
     "Definition": "ownedMetadata = ownedUsage->selectByKind(MetadataUsage)"
    },
    "corpus_elements": 1354,
-   "corpus_nonempty": 0
+   "corpus_nonempty": 12
   },
   {
    "name": "ownedObjectiveRequirement",
@@ -6098,7 +6098,7 @@
       "specific"
      ],
      "corpus_elements": 24993,
-     "corpus_nonempty": 22536,
+     "corpus_nonempty": 22647,
      "class": "structural"
     }
    ],
@@ -6108,7 +6108,7 @@
     "Type": "ownedSpecialization = ownedRelationship->selectByKind(Specialization)-> select(s | s.special = self) "
    },
    "corpus_elements": 24993,
-   "corpus_nonempty": 22536
+   "corpus_nonempty": 22647
   },
   {
    "name": "ownedStakeholderParameter",
@@ -6194,7 +6194,7 @@
       "subclassifier"
      ],
      "corpus_elements": 1354,
-     "corpus_nonempty": 1150,
+     "corpus_nonempty": 1261,
      "class": "structural"
     }
    ],
@@ -6204,7 +6204,7 @@
     "Classifier": "ownedSubclassification = ownedSpecialization->selectByKind(Subclassification)"
    },
    "corpus_elements": 1354,
-   "corpus_nonempty": 1150
+   "corpus_nonempty": 1261
   },
   {
    "name": "ownedSubjectParameter",
@@ -6623,7 +6623,7 @@
       "owningRelatedElement",
       "owningRelationship"
      ],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 25892,
      "class": "structural"
     }
@@ -6633,7 +6633,7 @@
    "rules": {
     "Element": "owner = owningRelationship.owningRelatedElement"
    },
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 25892
   },
   {
@@ -6752,16 +6752,16 @@
       "Subclassification",
       "subclassifier"
      ],
-     "corpus_elements": 1183,
-     "corpus_nonempty": 1183,
+     "corpus_elements": 1294,
+     "corpus_nonempty": 1294,
      "class": "structural"
     }
    ],
    "concrete_carriers": 1,
    "also_owned_elsewhere": false,
    "rules": {},
-   "corpus_elements": 1183,
-   "corpus_nonempty": 1183
+   "corpus_elements": 1294,
+   "corpus_nonempty": 1294
   },
   {
    "name": "owningDefinition",
@@ -6836,8 +6836,8 @@
       "owningRelatedElement",
       "subsettingFeature"
      ],
-     "corpus_elements": 25908,
-     "corpus_nonempty": 25908,
+     "corpus_elements": 26098,
+     "corpus_nonempty": 26098,
      "class": "structural"
     },
     {
@@ -6865,8 +6865,8 @@
    "concrete_carriers": 7,
    "also_owned_elsewhere": false,
    "rules": {},
-   "corpus_elements": 29133,
-   "corpus_nonempty": 29133
+   "corpus_elements": 29323,
+   "corpus_nonempty": 29323
   },
   {
    "name": "owningFeatureMembership",
@@ -6954,7 +6954,7 @@
       "Relationship",
       "owningRelationship"
      ],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 25371,
      "class": "structural"
     }
@@ -6962,7 +6962,7 @@
    "concrete_carriers": 167,
    "also_owned_elsewhere": false,
    "rules": {},
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 25371
   },
   {
@@ -6986,7 +6986,7 @@
       "membershipOwningNamespace",
       "owningMembership"
      ],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 25371,
      "class": "structural"
     }
@@ -6996,7 +6996,7 @@
    "rules": {
     "Element": "owningNamespace = if owningMembership = null then null else owningMembership.membershipOwningNamespace endif"
    },
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 25371
   },
   {
@@ -7080,8 +7080,8 @@
       "owningRelatedElement",
       "specific"
      ],
-     "corpus_elements": 30316,
-     "corpus_nonempty": 30316,
+     "corpus_elements": 30617,
+     "corpus_nonempty": 30617,
      "class": "structural"
     },
     {
@@ -7110,8 +7110,8 @@
    "concrete_carriers": 105,
    "also_owned_elsewhere": false,
    "rules": {},
-   "corpus_elements": 69265,
-   "corpus_nonempty": 60845
+   "corpus_elements": 69566,
+   "corpus_nonempty": 61146
   },
   {
    "name": "owningUsage",
@@ -7501,8 +7501,8 @@
       "owningNamespace",
       "qualifiedName"
      ],
-     "corpus_elements": 91191,
-     "corpus_nonempty": 7313,
+     "corpus_elements": 91492,
+     "corpus_nonempty": 7321,
      "class": "structural"
     }
    ],
@@ -7511,8 +7511,8 @@
    "rules": {
     "Element": "qualifiedName =     if owningNamespace = null then null     else if name <> null and          owningNamespace.ownedMember->         select(m | m.name = name).indexOf(self) <> 1 then null     else if owningNamespace.owner = null then escapedName()     else if owningNamespace.qualifiedName = null or              escapedName() = null then null     else owningNamespace.qualifiedName + '::' + escapedName()     endif endif endif endif"
    },
-   "corpus_elements": 91191,
-   "corpus_nonempty": 7313
+   "corpus_elements": 91492,
+   "corpus_nonempty": 7321
   },
   {
    "name": "receiverArgument",
@@ -7795,8 +7795,8 @@
       "source",
       "target"
      ],
-     "corpus_elements": 67469,
-     "corpus_nonempty": 67399,
+     "corpus_elements": 67770,
+     "corpus_nonempty": 67700,
      "class": "structural"
     }
    ],
@@ -7805,8 +7805,8 @@
    "rules": {
     "Relationship": "relatedElement = source->union(target)"
    },
-   "corpus_elements": 67469,
-   "corpus_nonempty": 67399
+   "corpus_elements": 67770,
+   "corpus_nonempty": 67700
   },
   {
    "name": "relatedFeature",
@@ -8380,7 +8380,7 @@
       "owningNamespace",
       "shortName"
      ],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 74,
      "class": "structural"
     }
@@ -8390,7 +8390,7 @@
    "rules": {
     "Element": "shortName = effectiveShortName()"
    },
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 74
   },
   {
@@ -9091,7 +9091,7 @@
       "Element",
       "TextualRepresentations"
      ],
-     "corpus_elements": 91191,
+     "corpus_elements": 91492,
      "corpus_nonempty": 46,
      "class": "structural"
     }
@@ -9101,7 +9101,7 @@
    "rules": {
     "Element": "textualRepresentation = ownedElement->selectByKind(TextualRepresentation)"
    },
-   "corpus_elements": 91191,
+   "corpus_elements": 91492,
    "corpus_nonempty": 46
   },
   {
@@ -9221,7 +9221,7 @@
       "typings"
      ],
      "corpus_elements": 23639,
-     "corpus_nonempty": 10387,
+     "corpus_nonempty": 10383,
      "class": "structural"
     }
    ],
@@ -9231,7 +9231,7 @@
     "Feature": "type =      let types : OrderedSet(Types) = OrderedSet{self}->         -- Note: The closure operation automatically handles circular relationships.         closure(typingFeatures()).typing.type->asOrderedSet() in     types->reject(t1 | types->exist(t2 | t2 <> t1 and t2.specializes(t1)))"
    },
    "corpus_elements": 23639,
-   "corpus_nonempty": 10387
+   "corpus_nonempty": 10383
   },
   {
    "name": "typeDifferenced",

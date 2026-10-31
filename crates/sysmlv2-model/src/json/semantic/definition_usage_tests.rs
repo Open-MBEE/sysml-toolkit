@@ -100,11 +100,20 @@ fn definition_usage_filters_complete_sequences_in_order_across_replay() {
                 )))
             );
             assert!(r.property(b, "usage").is_ok());
-            for path in ["Broken", "Unsupported", "outer"] {
+            for path in ["Broken", "Unsupported"] {
                 let e = r.resolve_qualified(path).unwrap();
                 assert!(r.property(e, "usage").is_err(), "{path}");
                 assert!(r.property(e, "directedUsage").is_err(), "{path}");
             }
+            // A usage's own `usage` and `directedUsage` filter its complete
+            // feature sequence the same way.
+            let outer = r.resolve_qualified("outer").unwrap();
+            let child = r.resolve_qualified("outer::child").unwrap();
+            assert_eq!(
+                r.property(outer, "usage"),
+                Ok(json!([{"@id": r.element_id(child)}]))
+            );
+            assert_eq!(r.property(outer, "directedUsage"), Ok(json!([])));
             for policy in [
                 ClosurePolicy::Passthrough,
                 ClosurePolicy::Closure {

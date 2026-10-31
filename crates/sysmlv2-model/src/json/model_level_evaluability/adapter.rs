@@ -5,7 +5,10 @@ use super::super::{
     Builder, ElementRef, ResolvedModel,
     type_relations::{RelationFact, TypeRelations},
 };
-use super::super::{RowsById, semantic_ownership, structural_index::StoredStructure};
+use super::super::{
+    RowsById, operations::namespaces::resolution, semantic_ownership,
+    structural_index::StoredStructure,
+};
 use super::*;
 use crate::metaclass::conforms;
 use crate::metaclass::is_a;
@@ -280,6 +283,39 @@ impl<'a> RepositoryEvidence<'a> {
         }
         budget.charge(1)
     }
+    /// The designated library function an operator names, in the base,
+    /// data or control function library, through the checked global
+    /// resolution.
+    fn operator_callee(&mut self, node: usize, budget: &mut Budget) -> Evidence<usize> {
+        const EFFECTIVE: &str = "Kernel-Functions-Expression-modelLevelEvaluable_Feature";
+        let operator = self.model.b.elements[node]
+            .props
+            .get("operator")
+            .and_then(|v| v.as_str())
+            .ok_or(IncompleteCallee)?
+            .to_owned();
+        for package in ["BaseFunctions", "DataFunctions", "ControlFunctions"] {
+            let names = [package.to_owned(), operator.clone()];
+            let model = &mut *self.model;
+            let found = structural_read(budget, |steps| {
+                let raw = StoredStructure::for_query(&mut model.b, steps)?;
+                resolution::resolve_segments(model, &raw, true, node, &names, steps, EFFECTIVE)
+                    .ok()
+                    .map(|found| found.map(|m| m.member))
+            })
+            .map_err(|reason| {
+                if reason == WorkLimit {
+                    reason
+                } else {
+                    IncompleteCallee
+                }
+            })?;
+            if let Some(callee) = found {
+                return Ok(callee);
+            }
+        }
+        Err(IncompleteCallee)
+    }
     fn self_conformance(&mut self, referent: usize, budget: &mut Budget) -> ModelLevelEvaluability {
         if self.self_target.is_none() {
             if let Err(reason) = budget.charge(self.model.b.lib_qnames.len()) {
@@ -391,11 +427,17 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
             Ok(_) => No,
             Err(reason) => Unknown(reason),
         };
+        // Whether the referent has a featuring type at all. The audited
+        // featuring domain names the exact featuring types of ordinary
+        // Kernel features; outside it (a usage, a variable feature, whose
+        // featuring type is a snapshots feature rather than the owner) the
+        // checked featuring types still answer whether there is one.
         let unfeatured = match structural_read(budget, |steps| {
             self.relations
                 .audited_featuring_domain(&mut self.model.b, &[referent], steps)
         }) {
-            Ok(true) => match structural_read(budget, |steps| {
+            Err(WorkLimit) => Unknown(WorkLimit),
+            Ok(_) | Err(_) => match structural_read(budget, |steps| {
                 self.relations
                     .featuring_types(&mut self.model.b, referent, steps)
             }) {
@@ -404,8 +446,6 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
                 Err(WorkLimit) => Unknown(WorkLimit),
                 Err(_) => Unknown(IncompleteFeaturing),
             },
-            Err(WorkLimit) => Unknown(WorkLimit),
-            _ => Unknown(IncompleteFeaturing),
         };
         let valuation = self
             .graph
@@ -483,12 +523,20 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
                 None
             };
         self.prepare(budget)?;
-        // Operator/trigger overrides need a unique designated-name resolver;
-        // the older ordered compatibility lookup is not complete evidence.
-        if (is_a!(self.model.b.elements[node], "OperatorExpression") && numeric_callee.is_none())
-            || self.model.b.elements[node].ty == "TriggerInvocationExpression"
-        {
+        // A trigger override needs a designated function the evaluable list
+        // does not name; it is not admitted.
+        if self.model.b.elements[node].ty == "TriggerInvocationExpression" {
             return Err(IncompleteCallee);
+        }
+        // An operator's callee is its operator's designated library function:
+        // where the binding provider has not named it, the checked global
+        // resolution does, whatever the graph format, and the operands are
+        // then the values of the expression's own parameters, which the
+        // checked feature walk below lists completely.
+        let designated =
+            is_a!(self.model.b.elements[node], "OperatorExpression") && numeric_callee.is_none();
+        if designated {
+            numeric_callee = Some(ElementRef(self.operator_callee(node, budget)?));
         }
         if numeric_callee.is_none() {
             self.graph
@@ -534,7 +582,11 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
         // Complete call mapping remains a shared-provider prerequisite: no
         // private positional fallback or execution-only mapper is introduced.
         let graph = self.graph.as_ref().unwrap();
-        let mut arguments = supplied.unwrap_or(Err(IncompleteArgumentMapping));
+        let mut arguments = match supplied {
+            Some(supplied) if !designated => supplied,
+            _ if designated => Ok(Vec::new()),
+            _ => Err(IncompleteArgumentMapping),
+        };
         for (membership, parameter) in graph.features(&self.model.b, node, budget)? {
             if !is_a!(self.model.b.elements[membership], "ParameterMembership")
                 || conforms(
@@ -544,12 +596,21 @@ impl EvidenceProvider for RepositoryEvidence<'_> {
             {
                 continue;
             }
-            if let Err(reason) = graph
+            match graph
                 .valuation(&self.model.b, parameter, budget)
                 .and_then(|value| value.ok_or(MissingOrMalformedValuation))
             {
-                arguments = Err(reason);
-                break;
+                Ok(value) => {
+                    if designated {
+                        if let Ok(operands) = arguments.as_mut() {
+                            operands.push(value);
+                        }
+                    }
+                }
+                Err(reason) => {
+                    arguments = Err(reason);
+                    break;
+                }
             }
         }
         Ok(CallEvidence {

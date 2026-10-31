@@ -90,8 +90,11 @@ fn checked_collection_bounds_preserve_actual_library_and_prepared_results() {
                 assert_eq!(report.implicit_singletons, vec![e]);
             }
             let sequence = Value::Sequence(vec![
-                Value::Unbound(fixed),
-                Value::Sequence(vec![Value::Unbound(zero), Value::Integer(7)]),
+                Value::Unbound(fixed, Default::default()),
+                Value::Sequence(vec![
+                    Value::Unbound(zero, Default::default()),
+                    Value::Integer(7),
+                ]),
                 Value::Element(fixed),
             ]);
             let bounds = r.collection_cardinality_report(&sequence).bounds.unwrap();
@@ -100,14 +103,17 @@ fn checked_collection_bounds_preserve_actual_library_and_prepared_results() {
             assert_eq!(bounds.contains_index(5), Some(true));
             assert_eq!(bounds.contains_index(6), Some(false));
             assert_eq!(
-                r.collection_cardinality_report(&Value::UnboundMember(fixed))
+                r.collection_cardinality_report(&Value::UnboundMember(fixed, Default::default()))
                     .bounds,
                 Err(CardinalityIssue::IncompleteProvider)
             );
             let dependent = r.resolve_qualified("referenceBound").unwrap();
             assert_eq!(
-                r.collection_cardinality_report(&Value::UnboundMember(dependent))
-                    .bounds,
+                r.collection_cardinality_report(&Value::UnboundMember(
+                    dependent,
+                    Default::default()
+                ))
+                .bounds,
                 Err(CardinalityIssue::IncompleteProvider)
             );
             for name in ["referenceBound", "formulaBound"] {
@@ -157,7 +163,7 @@ fn unknown_receiver_members_do_not_fabricate_outer_collection_cardinality() {
     let mut r = ResolvedModel::build(&model);
     let items = r.resolve_qualified("C::items").unwrap();
     assert_eq!(
-        r.collection_cardinality_report(&Value::UnboundMember(items))
+        r.collection_cardinality_report(&Value::UnboundMember(items, Default::default()))
             .bounds,
         Err(CardinalityIssue::IncompleteProvider)
     );

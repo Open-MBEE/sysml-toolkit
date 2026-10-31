@@ -13,7 +13,7 @@ use crate::{
 };
 use std::collections::HashSet;
 pub(in crate::json) mod imports;
-mod resolution;
+pub(in crate::json) mod resolution;
 use sysmlv2_syntax::{
     ast::Dialect,
     lexer::{tokenize, unescape},
@@ -39,6 +39,13 @@ pub(super) enum Body {
     Resolve,
     ResolveLocal,
     ResolveGlobal,
+}
+/// A refusal naming the element the evidence stopped at.
+pub(in crate::json) fn blocked(effective: &'static str, element: usize) -> OperationError {
+    OperationError::Incomplete {
+        effective,
+        blocker: Some(ElementRef(element)),
+    }
 }
 fn charge(steps: &mut usize, n: usize, effective: &'static str) -> Result<(), OperationError> {
     *steps = steps.saturating_add(n);
@@ -74,7 +81,7 @@ fn syntax(
         prefix
     }))
 }
-fn qualified_names(
+pub(super) fn qualified_names(
     source: &str,
     effective: &'static str,
     signature: &OperationExecutionSignature,
@@ -133,7 +140,7 @@ pub(in crate::json) struct Membership {
     pub(in crate::json) member: usize,
     pub(in crate::json) visibility: &'static str,
 }
-fn visibility(r: &ResolvedModel, relationship: usize) -> Option<&'static str> {
+pub(super) fn visibility(r: &ResolvedModel, relationship: usize) -> Option<&'static str> {
     visibility_builder(&r.b, relationship)
 }
 fn visibility_builder(b: &crate::json::Builder, relationship: usize) -> Option<&'static str> {
@@ -158,7 +165,7 @@ pub(in crate::json) fn memberships_builder(
     steps: &mut usize,
     effective: &'static str,
 ) -> Result<Vec<Membership>, OperationError> {
-    let incomplete = || OperationError::Incomplete { effective };
+    let incomplete = || blocked(effective, owner);
     if !matches!(
         b.elements[owner].ty,
         "Namespace" | "Package" | "LibraryPackage"
@@ -166,11 +173,41 @@ pub(in crate::json) fn memberships_builder(
     {
         return Err(incomplete());
     }
+    // Semantic metadata adds a base the planner does not write (KerML 9.2);
+    // plain metadata adds none. Without a current set (an immutable reader
+    // before a checked read built it), any metadata keeps the owner out.
+    let annotated = match b.semantically_annotated_now() {
+        Some(semantic) => semantic.contains(&owner),
+        None => {
+            raw.metadata_annotation_targets.contains(&owner)
+                || b.metadata_of.get(&owner).is_some_and(|v| !v.is_empty())
+        }
+    };
+    if annotated {
+        return Err(incomplete());
+    }
+    owned_memberships_of_namespace(b, raw, owner, steps, effective)
+}
+/// The owned Memberships of any Namespace whose membership domain is
+/// complete, in order, before the root-kind and metadata gates of
+/// [`memberships_builder`]: an owned member hides an inherited or imported
+/// one of the same name (KerML 8.2.3.5.1), so the resolution bodies answer
+/// from these alone when one matches, whatever evidence the rest of the
+/// namespace would need. The semantic ownership view's generated rows
+/// count among the owned relationships.
+pub(in crate::json) fn owned_memberships_of_namespace(
+    b: &crate::json::Builder,
+    raw: &StoredStructure,
+    owner: usize,
+    steps: &mut usize,
+    effective: &'static str,
+) -> Result<Vec<Membership>, OperationError> {
+    let incomplete = || blocked(effective, owner);
+    if !is_a!(b.elements[owner], "Namespace") {
+        return Err(incomplete());
+    }
     let domains = raw.membership_domains(b, steps).ok_or_else(incomplete)?;
-    if !domains.owner_complete(owner)
-        || raw.metadata_annotation_targets.contains(&owner)
-        || b.metadata_of.get(&owner).is_some_and(|v| !v.is_empty())
-    {
+    if !domains.owner_complete(owner) {
         return Err(incomplete());
     }
     let relationships = semantic_ownership::owned_relationships(b, owner).ok_or_else(incomplete)?;
@@ -178,32 +215,32 @@ pub(in crate::json) fn memberships_builder(
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for relationship in relationships.iter() {
+        let malformed = || blocked(effective, relationship);
         if !seen.insert(relationship)
             || semantic_ownership::checked_relationship_carrier(b, raw, relationship, steps)
                 != Some(Some(owner))
         {
-            return Err(incomplete());
+            return Err(malformed());
         }
         if !is_a!(b.elements[relationship], "Membership") {
             continue;
         }
         let member = membership_evidence::member(b, raw, owner, relationship, steps)
-            .ok_or_else(incomplete)?;
+            .ok_or_else(malformed)?;
         result.push(Membership {
             relationship,
             member,
-            visibility: visibility_builder(b, relationship).ok_or_else(incomplete)?,
+            visibility: visibility_builder(b, relationship).ok_or_else(malformed)?,
         });
     }
     Ok(result)
 }
-fn member_names(
+pub(super) fn member_names(
     r: &mut ResolvedModel,
     membership: &Membership,
     steps: &mut usize,
     effective: &'static str,
 ) -> Result<Vec<String>, OperationError> {
-    let incomplete = || OperationError::Incomplete { effective };
     charge(steps, 4, effective)?;
     let owned = is_a!(r.b.elements[membership.relationship], "OwningMembership");
     let mut names = Vec::new();
@@ -221,13 +258,39 @@ fn member_names(
             charge(steps, value.len().saturating_mul(3), effective)?;
         }
     }
-    for (key, operation) in [
+    for name in member_name_pair(r, membership, steps, effective)?
+        .into_iter()
+        .flatten()
+    {
+        charge(steps, name.len().saturating_add(1), effective)?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+/// A Membership's `memberShortName` and `memberName`, in that order: the
+/// member's effective names for an OwningMembership, the alias's declared
+/// ones otherwise.
+pub(super) fn member_name_pair(
+    r: &mut ResolvedModel,
+    membership: &Membership,
+    steps: &mut usize,
+    effective: &'static str,
+) -> Result<[Option<String>; 2], OperationError> {
+    let incomplete = || blocked(effective, membership.relationship);
+    let owned = is_a!(r.b.elements[membership.relationship], "OwningMembership");
+    let mut names = [None, None];
+    for (slot, (key, operation)) in [
         (
             "memberShortName",
             "Root-Elements-Element-effectiveShortName_",
         ),
         ("memberName", "Root-Elements-Element-effectiveName_"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let value = if owned {
             super::checked_name(r, ElementRef(membership.member), operation, steps)?
         } else {
@@ -237,16 +300,11 @@ fn member_names(
                 Some(v) => DerivedValue::Str(v.as_str().ok_or_else(incomplete)?.to_owned()),
             }
         };
-        match value {
-            DerivedValue::Null => {}
-            DerivedValue::Str(name) => {
-                charge(steps, name.len().saturating_add(1), effective)?;
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
+        names[slot] = match value {
+            DerivedValue::Null => None,
+            DerivedValue::Str(name) => Some(name),
             _ => return Err(incomplete()),
-        }
+        };
     }
     Ok(names)
 }
@@ -255,14 +313,17 @@ fn member_names(
 // Discard the whole successful attempt in that case and reacquire its evidence;
 // never return a value computed across two publication states. The one retry
 // shares the original allowance and leaves ordinary Namespace reads cold.
-fn with_stable_evidence<T>(
+pub(super) fn with_stable_evidence<T>(
     r: &mut ResolvedModel,
     receiver: ElementRef,
     steps: &mut usize,
     effective: &'static str,
     mut query: impl FnMut(&mut ResolvedModel, &StoredStructure, &mut usize) -> Result<T, OperationError>,
 ) -> Result<(std::sync::Arc<StoredStructure>, Stamp, T), OperationError> {
-    let incomplete = || OperationError::Incomplete { effective };
+    let incomplete = || OperationError::Incomplete {
+        effective,
+        blocker: None,
+    };
     if r.b.positional_planning {
         return Err(incomplete());
     }
@@ -316,6 +377,8 @@ impl NamespaceRow {
             "Root-Namespaces-Namespace-member" => 2,
             _ => return Err(PropertyError::NotComputed),
         };
+        // The semantic-metadata set the immutable membership builder reads.
+        r.b.semantically_annotated();
         let result = (|| {
             charge(steps, 1, declaration)?;
             if !self
@@ -351,6 +414,7 @@ impl NamespaceRow {
             if !stamp.current(r) {
                 return Err(OperationError::Incomplete {
                     effective: declaration,
+                    blocker: None,
                 });
             }
             Ok(DerivedValue::References(result))
@@ -385,7 +449,10 @@ pub(super) fn invoke(
             steps,
         );
     }
-    let incomplete = || OperationError::Incomplete { effective };
+    let incomplete = || OperationError::Incomplete {
+        effective,
+        blocker: None,
+    };
     let result = (|| {
         if matches!(
             body,
@@ -910,7 +977,8 @@ mod tests {
                 ]
             ),
             Err(OperationError::Incomplete {
-                effective: "Core-Types-Type-visibleMemberships_Namespace_Boolean_Boolean"
+                effective: "Core-Types-Type-visibleMemberships_Namespace_Boolean_Boolean",
+                ..
             })
         ));
     }

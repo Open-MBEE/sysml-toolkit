@@ -4,11 +4,20 @@
 //! CBOR encoding of the compact interchange form: concrete
 //! metaclasses sorted by name (position = wire type code), fields
 //! sorted by name (position = wire ordinal), closed enum
-//! vocabularies in schema declaration order.
+//! vocabularies in schema declaration order. The same tables as
+//! data: `spec-refs/cbor-tables.json`.
 
 /// Table layout version carried in the payload header; decoders
-/// refuse a version they were not generated for.
+/// refuse a version they were not generated for. The tables are a
+/// pure function of the spec inputs, so this changes only when they
+/// do: the generator refuses to keep it over a changed
+/// `CBOR_TABLES_SOURCE_DIGEST` without `--tables-version`.
 pub const CBOR_TABLES_VERSION: u16 = 1;
+
+/// SHA-256 over the four spec inputs the tables were generated from
+/// (CRLF folded to LF; see `source_digest` in the generator).
+pub const CBOR_TABLES_SOURCE_DIGEST: &str =
+    "4c49ebd93f892879b0a71b438f4c938866d526cf7c57a807cf512f94ab030166";
 
 /// Boolean; default byte is 0 or 1.
 pub const K_BOOL: u8 = 0;

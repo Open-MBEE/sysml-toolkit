@@ -262,6 +262,61 @@ fn qualified_names_include_effective_names_of_redefined_ancestors() {
     assert_eq!(r.element_qualified_name(child), None);
 }
 
+/// An unnamed subject, objective or return parameter is findable in its
+/// owner by the name of the feature it implicitly redefines — the
+/// membership's positional name (`subj`, `obj`, `result`) ahead of the
+/// inherited feature of that name, or a general's subject named by
+/// position — so its qualified name resolves back to it, and so do the
+/// members nested under it. (`Requirements` stands in for the library
+/// package the implied requirement base names.)
+#[test]
+fn implied_role_names_resolve_to_the_owned_member() {
+    let mut r = resolved(
+        "package Requirements { requirement def RequirementCheck { subject subj; } }
+        package P {
+            part def V { attribute mass; }
+            requirement def R { subject : V; require constraint { subj.mass > 0 } }
+            verification def VD { subject : V; objective { verify requirement r; } }
+            calc def C { in x; return : V; }
+            requirement def R1 { subject s : V; }
+            requirement def R2 :> R1 { subject : V; require constraint { s.mass > 0 } }
+            requirement def R3 :> R { require constraint { subj.mass > 0 } }
+            requirement def D { subject : V; attribute subj; }
+        }",
+    );
+    assert!(
+        r.unresolved_references().is_empty(),
+        "{:?}",
+        r.unresolved_references()
+    );
+    for name in [
+        "P::R::subj",
+        "P::VD::subj",
+        "P::VD::obj",
+        "P::VD::obj::r",
+        "P::C::result",
+        "P::R2::s",
+    ] {
+        let e = r.resolve_qualified(name).expect(name);
+        assert_eq!(r.element_qualified_name(e).as_deref(), Some(name));
+    }
+    // The positional name finds R2's subject too, and a specialization
+    // without a subject of its own inherits R's.
+    let r2 = r.resolve_qualified("P::R2::s").unwrap();
+    assert_eq!(r.resolve_qualified("P::R2::subj"), Some(r2));
+    let rs = r.resolve_qualified("P::R::subj").unwrap();
+    assert_eq!(r.resolve_qualified("P::R3::subj"), Some(rs));
+    // The name re-resolves as spelled.
+    assert_eq!(r.element_lookup_name(rs).as_deref(), Some("subj"));
+    assert_eq!(
+        r.element_reference_spelling(rs).as_deref(),
+        Some("P::R::subj")
+    );
+    // A declared member of that name comes first.
+    let d = r.resolve_qualified("P::D::subj").unwrap();
+    assert_eq!(r.element_type(d), "AttributeUsage");
+}
+
 /// Classification follows semantic-metadata implied specializations: an
 /// element annotated with a `SemanticMetadata` subtype conforms to the
 /// metadata's `baseType` value — for annotated *definitions* as well as
@@ -502,17 +557,20 @@ fn unbound_redefined_collections_do_not_become_query_declarations() {
         part rack : Rack[1] { part <slot> :>> motors; }
         ref part unknown : Rack;
     }";
-    for expression in [
-        "P::rack.slot.mass",
-        "P::rack.motors.mass",
-        "P::unknown.motors.mass",
-    ] {
+    // Four unknown motors each have the declared mass: the chain repeats
+    // it once per motor rather than reading the declaration as one value.
+    let mass = Value::Rational(sysmlv2_parser::rational::Rational::new(11, 20).unwrap());
+    for expression in ["P::rack.slot.mass", "P::rack.motors.mass"] {
         assert_eq!(
             query(source, expression),
-            Ok(Value::Indeterminate),
+            Ok(Value::Sequence(vec![mass.clone(); 4])),
             "{expression}"
         );
     }
+    assert_eq!(
+        query(source, "P::unknown.motors.mass"),
+        Ok(Value::Indeterminate)
+    );
     assert_eq!(query(source, "size(P::rack.slot)"), Ok(Value::Integer(4)));
 }
 

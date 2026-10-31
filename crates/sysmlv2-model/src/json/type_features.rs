@@ -1,10 +1,10 @@
 //! Ordered Type projections over the shared checked Membership provider.
 use super::{
     ElementRef, ResolvedModel, TypeInputIssue, membership_evidence,
-    membership_projection::Membership, semantic::certified_types::Stamp,
+    membership_projection::Membership, semantic::certified_types::Stamp, semantic_ownership,
     structural_index::StoredStructure, type_relations::TypeRelations,
 };
-use crate::layered::IdMap;
+use crate::layered::{IdMap, IdSet};
 use crate::metaclass::conforms;
 use std::collections::HashSet;
 
@@ -45,25 +45,33 @@ pub(super) struct MembershipSequence {
     pub non_private: Vec<Membership>,
     pub root_import: bool,
     pub required_positional: IdMap<usize, Vec<usize>>,
+    /// The ancestors reached through an odd number of conjugations: the
+    /// directions of their features flip between `in` and `out` seen from
+    /// the receiver (KerML `Type::directionOf`).
+    pub conjugated_owners: IdSet<usize>,
+    /// The ancestors reached both through a conjugation and not: a directed
+    /// feature of theirs has no one direction seen from the receiver.
+    pub ambiguous_owners: IdSet<usize>,
 }
+/// The receiver kinds whose checked membership provider is certified: every
+/// Definition kind and plain Kernel type kind whose implied library heritage
+/// `TypeRelations::required_bases` audits (`definition_chain`), and every
+/// Feature kind, whose family roles `TypeRelations::feature_requirements`
+/// audits as the planner plans them (their heritage through typings,
+/// subsettings and the implied library roles enters the complete direct
+/// bases as a plain Feature's does), ends and parameters included; and a
+/// port definition's conjugated definition, whose members are its
+/// original's with their directions flipped. A kind the audits do not know
+/// — a multiplicity — leaves the receiver's bases incomplete rather than
+/// answering; so do a variation, a portion, a type that owns or inherits
+/// metadata, and a receiver whose implied roles the loaded library does not
+/// declare.
 pub(super) fn supported_root(ty: &str) -> bool {
-    matches!(
-        ty,
-        "Type"
-            | "Feature"
-            | "Classifier"
-            | "Class"
-            | "Structure"
-            | "DataType"
-            | "Behavior"
-            | "Function"
-            | "Definition"
-            | "AttributeDefinition"
-            | "OccurrenceDefinition"
-            | "ItemDefinition"
-            | "PartDefinition"
-    )
+    crate::lift::def_kind_of(ty).is_some()
+        || conforms(ty, "Feature")
+        || ty == "ConjugatedPortDefinition"
 }
+
 fn charge(steps: &mut usize, n: usize) -> Result<(), TypeInputIssue> {
     *steps = steps.saturating_add(n);
     if *steps > crate::eval::MAX_STEPS {
@@ -73,9 +81,10 @@ fn charge(steps: &mut usize, n: usize) -> Result<(), TypeInputIssue> {
     }
 }
 impl ResolvedModel {
-    /// Prove feature and membership projections for ordinary Kernel Types and
-    /// nonindividual, nonvariation Definition, AttributeDefinition,
-    /// OccurrenceDefinition, ItemDefinition and PartDefinition receivers.
+    /// Prove feature and membership projections for the Kernel type kinds,
+    /// the nonindividual, nonvariation Definition kinds and the Feature
+    /// kinds whose family roles are audited (the receiver kinds
+    /// `supported_root` names), ends and parameters included.
     /// Required library roles, complete ancestry and inverse ownership are checked.
     /// Public/protected leaf-package imports share the central positional proof.
     /// Conjugation, broader import dependencies and contextual subclasses stay qualified.
@@ -177,8 +186,34 @@ impl super::Builder {
                 continue;
             }
             features.push(feature);
-            let direction = membership_evidence::parameter_direction(self, &raw, feature.0, steps)
+            let mut direction =
+                membership_evidence::parameter_direction(self, &raw, feature.0, steps)
+                    .ok_or(TypeInputIssue::InvalidRelationship)?;
+            // A feature inherited through a conjugated type turns around;
+            // one inherited both through a conjugation and not has no one
+            // direction.
+            if direction.is_some()
+                && !(sequence.conjugated_owners.is_empty() && sequence.ambiguous_owners.is_empty())
+            {
+                let owner = semantic_ownership::checked_relationship_carrier(
+                    self,
+                    &raw,
+                    membership.relationship,
+                    steps,
+                )
+                .flatten()
                 .ok_or(TypeInputIssue::InvalidRelationship)?;
+                if sequence.ambiguous_owners.contains(&owner) {
+                    return Err(TypeInputIssue::UnsupportedConfiguration);
+                }
+                if sequence.conjugated_owners.contains(&owner) {
+                    direction = match direction {
+                        Some("in") => Some("out"),
+                        Some("out") => Some("in"),
+                        other => other,
+                    };
+                }
+            }
             if matches!(direction, Some("in" | "inout")) {
                 inputs.push(feature);
             }
@@ -585,14 +620,25 @@ mod tests {
         // namespace projection. The same-ID kind edit must revalidate it.
         r.b.elements[e.0].set_ty("Feature");
         assert_eq!(r.type_feature_report(e).projections, Ok(complete));
-        for kind in ["Association", "Expression", "PartUsage", "Predicate"] {
+        // Every definition and feature kind is a receiver: an expression's
+        // heritage the fixture library declares, so it answers (the
+        // evaluation role's features inherited); the kinds whose heritage
+        // it does not declare have incomplete bases rather than empty ones.
+        r.b.elements[e.0].set_ty("Expression");
+        assert!(r.type_feature_report(e).projections.is_ok());
+        for kind in ["Association", "PortUsage", "Predicate"] {
             r.b.elements[e.0].set_ty(kind);
             assert_eq!(
                 r.type_feature_report(e).projections,
-                Err(TypeInputIssue::UnsupportedConfiguration),
+                Err(TypeInputIssue::IncompleteProvider),
                 "{kind}"
             );
         }
+        r.b.elements[e.0].set_ty("PartUsage");
+        assert_eq!(
+            r.type_feature_report(e).projections,
+            Err(TypeInputIssue::IncompleteProvider)
+        );
         assert_eq!(
             r.type_feature_report(ElementRef(usize::MAX)).projections,
             Err(TypeInputIssue::InvalidElement)

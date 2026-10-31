@@ -6,7 +6,7 @@
 
 use sysmlv2_wasm::{
     Session, canonical_name_js, canonicalize_compact, check, graph_normalize_compact,
-    spell_reference_js, state_digest_of, version,
+    set_value_units, spell_reference_js, state_digest_of, value_units, version,
 };
 
 fn sources(pairs: &[(&str, &str)]) -> String {
@@ -107,7 +107,7 @@ fn units_and_interchange_roundtrip() {
     );
 
     let full = s.to_full_json(true);
-    let mut back = Session::from_interchange_json(&full, None, None, None).unwrap();
+    let mut back = Session::from_interchange_json(&full, None, None, None, None).unwrap();
     assert!(back.resolve("Flashlight::flashlight::battery").is_some());
     assert_eq!(back.unresolved_count(), 0);
     let warnings: serde_json::Value = serde_json::from_str(&back.warnings()).unwrap();
@@ -115,6 +115,42 @@ fn units_and_interchange_roundtrip() {
 
     let compact = s.to_compact_json();
     assert!(compact.contains("\"@type\""));
+}
+
+#[test]
+fn flexo_option_derives_the_ownership_back_references_flexo_omits() {
+    let s = Session::from_sources(&sources(&[("flashlight.sysml", FLASHLIGHT)])).unwrap();
+    let compact: serde_json::Value = serde_json::from_str(&s.to_compact_json()).unwrap();
+    // Change records the way Flexo MMS returns them: no back-references.
+    let records = serde_json::Value::Array(
+        compact
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let mut payload = e.clone();
+                let fields = payload.as_object_mut().unwrap();
+                fields.remove("owningRelationship");
+                fields.remove("owningRelatedElement");
+                serde_json::json!({"payload": payload, "identity": {"@id": e["@id"]}})
+            })
+            .collect(),
+    )
+    .to_string();
+    for flexo in [None, Some(false)] {
+        let refused = Session::from_interchange_json(&records, None, None, None, flexo)
+            .err()
+            .expect("refused without the flexo option");
+        assert!(
+            refused.contains("omits the inverse ownership ends"),
+            "{refused}"
+        );
+    }
+    let derived = Session::from_interchange_json(&records, None, None, None, Some(true)).unwrap();
+    let complete =
+        Session::from_interchange_json(&compact.to_string(), None, None, None, None).unwrap();
+    assert_eq!(derived.units(), complete.units());
+    assert_eq!(derived.to_compact_json(), complete.to_compact_json());
 }
 
 /// The units `describeCbor` reports for the session's compact CBOR
@@ -176,7 +212,7 @@ fn the_unit_table_is_the_units_the_compact_payload_carries() {
     .unwrap();
     assert_table(&on_library, "on a library");
     let lifted =
-        Session::from_interchange_json(&several.to_compact_json(), None, None, None).unwrap();
+        Session::from_interchange_json(&several.to_compact_json(), None, None, None, None).unwrap();
     assert_table(&lifted, "lifted from compact JSON");
     let decoded = Session::from_compact_cbor(&several.to_compact_cbor(), None, None, None).unwrap();
     assert_eq!(
@@ -208,7 +244,7 @@ fn the_unit_table_is_the_units_the_compact_payload_carries() {
         let id = element["@id"].as_str().unwrap();
         document = document.replace(id, &format!("{k:08x}{}", &id[8..]));
     }
-    let explicit = Session::from_interchange_json(&document, None, None, None).unwrap();
+    let explicit = Session::from_interchange_json(&document, None, None, None, None).unwrap();
     let described: serde_json::Value =
         serde_json::from_str(&sysmlv2_wasm::describe_cbor(&explicit.to_compact_cbor()).unwrap())
             .unwrap();
@@ -431,6 +467,42 @@ fn check_findings_shape() {
         f["endCol"].as_u64().unwrap(),
         f["col"].as_u64().unwrap() + "Missing".len() as u64
     );
+}
+
+/// A semantic finding names the rule it reports in `rule`; a finding
+/// that names none has no `rule` key. The session reads the same
+/// findings off its own build.
+#[test]
+fn check_findings_name_the_rule_a_semantic_finding_reports() {
+    let lib = sources(&[(
+        "MiniLib.kerml",
+        "standard library package MiniLib { class Thing; }",
+    )]);
+    let user = sources(&[(
+        "model.sysml",
+        "constraint c;\npart q : Missing;\npart p { satisfy c; }\n",
+    )]);
+    let findings: serde_json::Value =
+        serde_json::from_str(&check(&user, Some(lib.clone()), None).unwrap()).unwrap();
+    let at_stage = |stage: &str| {
+        findings
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["stage"] == stage)
+            .unwrap_or_else(|| panic!("no {stage} finding: {findings}"))
+            .clone()
+    };
+    assert_eq!(
+        at_stage("semantic")["rule"],
+        "validateSatisfyRequirementUsageReference"
+    );
+    assert!(at_stage("referential").get("rule").is_none(), "{findings}");
+
+    let mut s = Session::from_sources(&user).unwrap();
+    s.load_library_sources(&lib, None).unwrap();
+    let session: serde_json::Value = serde_json::from_str(&s.check()).unwrap();
+    assert_eq!(session, findings);
 }
 
 /// A user root package named like a standard-library root: `check`
@@ -716,6 +788,34 @@ fn edit_batch_moves_members() {
     s.edit(r#"[{"op": "moveMember", "target": "Flashlight::Body", "newOwner": "Flashlight::flashlight"}]"#)
         .expect("in-scope re-parent commits");
     assert!(s.resolve("Flashlight::flashlight::Body").is_some());
+}
+
+#[test]
+fn edit_batch_inserts_members_at_a_slot() {
+    let mut s = Session::from_sources(&sources(&[("flashlight.sysml", FLASHLIGHT)])).unwrap();
+    // After `body`, ahead of `battery`: slot 1 among the part's members.
+    s.edit(r#"[{"op": "insertMember", "owner": "Flashlight::flashlight", "text": "part body2 : Body;", "index": 1}]"#)
+        .expect("slot insert commits");
+    let post = s.source(0).unwrap();
+    assert!(
+        post.contains("        part body : Body;\n        part body2 : Body;\n        part battery : Battery;\n"),
+        "not after body:\n{post}"
+    );
+
+    // A unit's root namespace (by id) writes at the unit's top level, here right after `Flashlight`.
+    s.edit(r#"[{"op": "insertMember", "owner": "Flashlight", "text": "package Spare;"}]"#)
+        .expect("package insert commits");
+    let flashlight = s.resolve("Flashlight").unwrap();
+    let root = s.owner(&flashlight).unwrap().unwrap();
+    let ops = serde_json::json!([{ "op": "insertMember", "owner": format!("@{}", s.element_id(&root).unwrap()), "text": "package Copy;", "index": 1 }]);
+    s.edit(&ops.to_string())
+        .expect("top-level slot insert commits");
+    let post = s.source(0).unwrap();
+    assert!(
+        post.ends_with("}\npackage Copy;\n"),
+        "not at the top level after Flashlight:\n{post}"
+    );
+    assert!(s.resolve("Copy").is_some() && s.resolve("Flashlight::Spare").is_some());
 }
 
 #[test]
@@ -1623,7 +1723,7 @@ fn foreign_payload_base_digests_and_applies_raw() {
     // Raw digest of the payload document = the delta's base digest = the
     // loaded session's digest.
     assert_eq!(state_digest_of(&base_json).unwrap(), base_digest);
-    let receiver = Session::from_interchange_json(&base_json, None, None, None).unwrap();
+    let receiver = Session::from_interchange_json(&base_json, None, None, None, None).unwrap();
     assert_eq!(
         receiver.state_digest(),
         base_digest,
@@ -2640,4 +2740,135 @@ fn edit_batch_sets_a_comment_body_by_its_graph_id() {
         .edit(r#"[{"op": "setCommentBody", "target": "Lamp::Bulb", "body": "x"}]"#)
         .unwrap_err();
     assert!(err.contains("no comment body"), "{err}");
+}
+
+/// `setValueUnits` picks the units the module's values show quantities
+/// in: the `{value, unit}` answers of `query` and `evaluate`, and the
+/// default of the `valueUnits` option of `toGraph` and `verify`, where a
+/// request's own `valueUnits` wins. Native tests run one per thread, so
+/// the module-wide choice stays inside this test.
+#[test]
+fn value_units_choose_how_quantities_read() {
+    const BOARD: &str = "package P {
+    attribute m; attribute s;
+    attribute 'in' {
+        attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; }
+    }
+    part def Board {
+        attribute w = 10 ['in'];
+        attribute area = w * (4 ['in']);
+        attribute speed = w / (2 [s]);
+        attribute footprint : Real;
+        assert constraint { footprint <= w * (3 ['in']) }
+        attribute limit = 1 ['in'] * (1 ['in']);
+        assert constraint tooBig { area <= limit }
+    }
+}
+";
+    let json = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
+    let graph_text = |s: &mut Session, opts: Option<&str>| -> String {
+        s.to_graph(opts.map(str::to_string)).unwrap()
+    };
+    let footprint = |s: &mut Session, opts: Option<&str>| -> (String, String) {
+        let report = json(&s.verify(opts.map(str::to_string)).unwrap());
+        let r = report["ranges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["feature"] == "footprint")
+            .cloned()
+            .expect("a footprint range");
+        (
+            r["unit"].as_str().unwrap().to_string(),
+            r["range"].as_str().unwrap().to_string(),
+        )
+    };
+    let violated = |s: &mut Session, opts: Option<&str>| -> (String, serde_json::Value) {
+        let report = json(&s.verify(opts.map(str::to_string)).unwrap());
+        let c = report["constraints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "tooBig")
+            .cloned()
+            .expect("the tooBig verdict");
+        assert_eq!(c["status"], "violated");
+        let values = c["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["value"].clone())
+            .collect();
+        (c["detail"].as_str().unwrap().to_string(), values)
+    };
+    let mut s = Session::from_sources(&sources(&[("m.sysml", BOARD)])).unwrap();
+    assert_eq!(value_units(), "si");
+    let (detail, values) = violated(&mut s, None);
+    assert!(
+        detail.ends_with("(with area = 0.0258064 [m**2], limit = 0.00064516 [m**2])"),
+        "{detail}"
+    );
+    assert_eq!(
+        values,
+        serde_json::json!(["0.0258064 [m**2]", "0.00064516 [m**2]"])
+    );
+    assert_eq!(
+        json(&s.query("P::Board::speed").unwrap()),
+        serde_json::json!({"value": 0.127, "unit": "m/s"})
+    );
+    assert!(graph_text(&mut s, None).contains("speed = 0.127 [m/s]"));
+    assert_eq!(
+        footprint(&mut s, None),
+        ("m**2".to_string(), "[\u{2212}∞, 0.0193548]".to_string())
+    );
+
+    // A request's own choice.
+    let written = graph_text(&mut s, Some(r#"{"valueUnits": "asWritten"}"#));
+    assert!(written.contains("speed = 5 [in/s]"), "{written}");
+    assert!(written.contains("area = 40 [in**2]"), "{written}");
+    assert!(written.contains("w = 10 [in]"), "{written}");
+    assert_eq!(
+        footprint(&mut s, Some(r#"{"valueUnits": "asWritten"}"#)),
+        ("in**2".to_string(), "[\u{2212}∞, 30]".to_string())
+    );
+    let (detail, values) = violated(&mut s, Some(r#"{"valueUnits": "asWritten"}"#));
+    assert!(
+        detail.ends_with("(with area = 40 [in**2], limit = 1 [in**2])"),
+        "{detail}"
+    );
+    assert_eq!(values, serde_json::json!(["40 [in**2]", "1 [in**2]"]));
+    for bad in [r#"{"valueUnits": "SI"}"#, r#"{"valueUnits": true}"#] {
+        assert!(s.to_graph(Some(bad.into())).is_err(), "{bad}");
+        assert!(s.verify(Some(bad.into())).is_err(), "{bad}");
+    }
+    assert!(set_value_units("SI").is_err());
+    assert_eq!(value_units(), "si");
+
+    // The module's choice.
+    set_value_units("asWritten").unwrap();
+    assert_eq!(value_units(), "asWritten");
+    assert_eq!(
+        json(&s.query("P::Board::speed").unwrap()),
+        serde_json::json!({"value": 5, "unit": "in/s"})
+    );
+    let area = s.resolve("P::Board::area").unwrap();
+    assert_eq!(
+        json(&s.evaluate(&area).unwrap()),
+        serde_json::json!({"value": 40, "unit": "in**2"})
+    );
+    // Already as written: the bracket's own unit.
+    assert_eq!(
+        json(&s.query("P::Board::w").unwrap()),
+        serde_json::json!({"value": 10, "unit": "in"})
+    );
+    assert!(graph_text(&mut s, None).contains("speed = 5 [in/s]"));
+    assert_eq!(footprint(&mut s, None).0, "in**2");
+    assert!(violated(&mut s, None).0.ends_with("limit = 1 [in**2])"));
+    assert!(graph_text(&mut s, Some(r#"{"valueUnits": "si"}"#)).contains("speed = 0.127 [m/s]"));
+    assert_eq!(footprint(&mut s, Some(r#"{"valueUnits": "si"}"#)).0, "m**2");
+    set_value_units("si").unwrap();
+    assert_eq!(
+        json(&s.query("P::Board::speed").unwrap()),
+        serde_json::json!({"value": 0.127, "unit": "m/s"})
+    );
 }

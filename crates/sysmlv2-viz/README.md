@@ -4,7 +4,7 @@ PlantUML emission for OMG SysML v2 / KerML models, over the [sysmlv2](https://gi
 
 | View | Renders |
 |---|---|
-| `tree` (default) | structure: packages, definitions, usages with attribute compartments (evaluated `= value`), composition / typing / specialization edges |
+| `tree` (default) | structure: packages, definitions, usages with attribute compartments (evaluated `= value`, or a bound feature reference as written when that feature has no value), members in a role of their own as keyword-led compartment lines (`subject v : Vehicle`, `require c { x < 2 }`, `entry warm`, `end car : Car`, a body's result expression), a port's directed features (`in fuel : Fuel`), composition / typing / specialization edges |
 | `interconnection` | parts as nested blocks with ports (definition ports render per usage box); connection / interface / binding / allocation / flow edges between resolved ends |
 | `state` | state machines: composite states, `[*]` entry, transitions labelled `trigger [guard] / effect`, entry/do/exit lines |
 | `action` | action flows: actions, fork/join/choice control nodes, successions, dashed payload-labelled flows |
@@ -35,6 +35,8 @@ views. Interconnection endpoints retain their occurrence context: a flow through
 `sourcePath` / `targetPath` retain the complete feature-chain labels; PlantUML
 emits the same information as end labels. Unresolved connector ends do not form
 shortcut edges between the remaining ends.
+
+A card's `rows` say more than their labels. A member introduced into its owner in a role of its own (a subject, actor, stakeholder, objective, return parameter, result expression, assumed or required constraint, framed concern, verified requirement, included use case, state `entry`/`do`/`exit` action, or a non-port `end`) carries its `role` and the role's `section`; a constraint or result row carries its expression as `expr`; a port's directed feature carries its `direction`; and a row or node that goes by a name the specification gives it rather than one it declares (`subj`, `obj`, what `do refuel;` references) says `impliedName`, so a host edits it by its `id`. An empty member of a role an owner has one of at most (`entry;`, `subject;`) is a row of the graph with its role and no label, so a host can tell the owner has one, but no line of the PlantUML tree or state view. The `graph` module documentation gives the JSON shape with every field.
 
 Behavior successions use the declaration order of their owning body, including
 parts and packages that are transparent in the view. Bare `then` members follow

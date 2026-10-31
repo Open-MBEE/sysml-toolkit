@@ -4,8 +4,10 @@
 //! non-library corpus file emits a balanced diagram for every view
 //! without panicking, with a floor on how many are non-empty).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use sysmlv2_model::eval::UnitDisplay;
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
 use sysmlv2_model::model::Model;
 use sysmlv2_viz::{Direction, LineStyle, View, VizOptions, plantuml};
@@ -56,6 +58,57 @@ fn graph_redefined_nodes_and_rows_have_resolvable_qualified_names() {
         assert_eq!(item["qname"], name);
         assert_eq!(item["file"], "demo.sysml");
         assert!(item["line"].as_u64().unwrap() > 0);
+    }
+}
+
+#[test]
+fn graph_says_which_qualified_names_end_in_an_implied_name() {
+    let mut r = resolved(
+        "package P {
+        part def V;
+        action refuel;
+        verification def Test {
+            subject : V;
+            objective { verify requirement r; }
+        }
+        verification def Named { subject v : V; objective goal; }
+        state def Engine { do refuel; exit action cool; }
+        part def Tank { attribute mass = 1; }
+        part def Big :> Tank { attribute :>> mass = 2; }
+    }",
+    );
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let rows = all_rows(&g);
+    let row = |qname: &str| {
+        *rows
+            .iter()
+            .find(|row| row["qname"] == qname)
+            .unwrap_or_else(|| panic!("no row {qname}: {rows:#?}"))
+    };
+    // A name the element is given: a subject's or an objective's by its
+    // role, a `do` action's by the action it performs (ahead of the
+    // `doAction` it redefines), a redefinition's by what it redefines.
+    for qname in [
+        "P::Test::subj",
+        "P::Test::obj",
+        "P::Engine::refuel",
+        "P::Big::mass",
+    ] {
+        assert_eq!(row(qname)["impliedName"], true, "{qname}");
+    }
+    // A declared name is no implied one, under an implied one too.
+    for qname in [
+        "P::Test::obj::r",
+        "P::Named::v",
+        "P::Named::goal",
+        "P::Engine::cool",
+        "P::Tank::mass",
+    ] {
+        assert!(row(qname).get("impliedName").is_none(), "{qname}");
+    }
+    // The cards declare their names.
+    for n in g["nodes"].as_array().unwrap() {
+        assert!(n.get("impliedName").is_none(), "{n}");
     }
 }
 
@@ -114,6 +167,39 @@ fn values_toggle_off() {
 }
 
 #[test]
+fn value_units_choose_how_a_quantity_reads() {
+    // A product folds into SI units; `AsWritten` shows it in the units
+    // it was written in, and a bracket's own unit reads the same either
+    // way.
+    let mut r = resolved(
+        "package P {
+    attribute m; attribute s;
+    attribute 'in' {
+        attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; }
+    }
+    part def Board {
+        attribute w = 10 ['in'];
+        attribute area = w * (4 ['in']);
+        attribute speed = w / (2 [s]);
+    }
+}
+",
+    );
+    let si = plantuml(&mut r, None, &VizOptions::default());
+    assert!(si.contains("area = 0.0258064 [m**2]"), "{si}");
+    assert!(si.contains("speed = 0.127 [m/s]"), "{si}");
+    let opts = VizOptions::default().with_value_units(UnitDisplay::AsWritten);
+    let written = plantuml(&mut r, None, &opts);
+    assert!(written.contains("w = 10 [in]"), "{written}");
+    assert!(written.contains("area = 40 [in**2]"), "{written}");
+    assert!(written.contains("speed = 5 [in/s]"), "{written}");
+    let graph = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let text = serde_json::to_string(&graph).unwrap();
+    assert!(text.contains("area = 40 [in**2]"), "{text}");
+    assert!(text.contains("speed = 5 [in/s]"), "{text}");
+}
+
+#[test]
 fn enum_defaults_render_by_literal_name() {
     let mut r = resolved(
         "package P {
@@ -134,6 +220,21 @@ fn enum_defaults_render_by_literal_name() {
     let graph = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
     let text = serde_json::to_string(&graph).unwrap();
     assert!(text.contains("m : Mode = fast"), "{text}");
+}
+
+#[test]
+fn enum_metadata_members_are_not_literal_rows() {
+    // A metadata usage in an enum body annotates the enumeration; only
+    // the enumerated values are drawn as its literals.
+    let mut r = resolved(
+        "package P {
+    metadata def M;
+    enum def E { metadata m : M; enum a; b; }
+}
+",
+    );
+    let out = plantuml(&mut r, None, &VizOptions::default());
+    assert!(out.contains("<<enum def>> {\n    a\n    b\n  }"), "{out}");
 }
 
 #[test]
@@ -1200,6 +1301,72 @@ fn graph_state_view_pseudostates_and_transition_identity() {
     assert_eq!(t["directed"], true);
 }
 
+/// `toGraph` in the action view draws transitions as edges, as the
+/// PlantUML action view has: a decision node's guarded branches (`if g
+/// then b;`, `else c;`) leave the decision node, their implicit source, a
+/// `then` after a branch leaves it too, and a guarded succession with a
+/// written source (`first a if g then b;`) leaves that source.
+#[test]
+fn graph_action_view_draws_decision_branches_and_guarded_successions() {
+    const SRC: &str = "package Repro {
+    action def Basic {
+        attribute x = 1;
+        action a; action b; action c; action e;
+        first a then d;
+        decide d;
+            if x > 0 then b;
+            then c;
+            else e;
+    }
+    action def Router {
+        attribute ok : Boolean;
+        action ingest; action fast; action slow;
+        first ingest if ok then fast;
+        else slow;
+    }
+}
+";
+    let mut r = resolved(SRC);
+    let opts = VizOptions::default().with_view(View::Action);
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).expect("action graph");
+    let nodes = g["nodes"].as_array().unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    let id_of = |label: &str| {
+        nodes
+            .iter()
+            .find(|n| n["label"] == label)
+            .unwrap_or_else(|| panic!("no node {label}: {nodes:?}"))["id"]
+            .clone()
+    };
+    let edge = |source: &str, target: &str| {
+        let (s, t) = (id_of(source), id_of(target));
+        edges
+            .iter()
+            .find(|e| e["source"] == s && e["target"] == t)
+            .unwrap_or_else(|| panic!("no edge {source} -> {target}: {edges:?}"))
+    };
+    // The written succession, the decision's branches, the `then` past
+    // the guarded branch.
+    assert_ne!(edge("a", "d")["kind"], "transition");
+    let guarded = edge("d", "b");
+    assert_eq!(guarded["kind"], "transition");
+    assert_eq!(guarded["metaclass"], "TransitionUsage");
+    assert_eq!(guarded["label"], "[x > 0]");
+    assert_eq!(guarded["directed"], true);
+    assert_ne!(edge("d", "c")["kind"], "transition");
+    let otherwise = edge("d", "e");
+    assert_eq!(otherwise["kind"], "transition");
+    assert!(otherwise.get("label").is_none(), "{otherwise:?}");
+    // A guarded succession with a written source.
+    let fast = edge("ingest", "fast");
+    assert_eq!(fast["kind"], "transition");
+    assert_eq!(fast["label"], "[ok]");
+    assert_eq!(edge("ingest", "slow")["kind"], "transition");
+    // Every transition drew: none was dropped for want of a source.
+    let transitions = edges.iter().filter(|e| e["kind"] == "transition").count();
+    assert_eq!(transitions, 4, "{edges:?}");
+}
+
 /// A view usage directs its own diagram: `expose`/`filter` pick the
 /// elements (finest exposed granularity — the exposed container defers
 /// to its individually exposed members, so filtered-out siblings stay
@@ -2108,6 +2275,51 @@ fn summary_would_draw_counts_the_nodes_and_what_they_hide() {
 }
 
 #[test]
+fn summary_counts_hidden_port_copies_at_every_depth() {
+    let mut r = resolved(
+        "package P {
+            port def Signal;
+            port def Loop { port again : Loop; }
+            port def Bank { port pin : Signal; }
+            part def Device { port bank : Bank { port localPin : Signal; } port recursivePort : Loop; }
+            part a : Device; part b : Device;
+            package Q { part c : Device; }
+        }",
+    );
+    let opts = VizOptions::default().with_show_notes(false);
+    let full = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let total = full["nodes"].as_array().unwrap().len();
+    for (open, budget) in [
+        (vec![], usize::MAX),
+        (vec!["P"], usize::MAX),
+        (vec!["P", "P::Device", "P::Q"], 2),
+        (vec!["P", "P::Device", "P::Q"], usize::MAX),
+    ] {
+        let opts = opts.clone().with_summary(Some(sysmlv2_viz::SummaryOptions {
+            open: open
+                .iter()
+                .map(|name| r.resolve_qualified(name).unwrap())
+                .collect(),
+            leaf_budget: budget,
+            ..Default::default()
+        }));
+        let summary = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+        assert_eq!(
+            sysmlv2_viz::summary_would_draw(&summary),
+            total,
+            "{open:?}, budget {budget}"
+        );
+        for limit in [0, total - 1, total, total + 1] {
+            assert_eq!(
+                sysmlv2_viz::summary_would_draw_within(&mut r, None, &opts, limit).unwrap(),
+                (limit >= total).then_some(total),
+                "{open:?}, budget {budget}, limit {limit}"
+            );
+        }
+    }
+}
+
+#[test]
 fn summary_unbounded_container_draws_every_member() {
     let mut r = resolved(SUMMARY_MODEL);
     let q = r.resolve_qualified("P::Q").expect("P::Q");
@@ -2475,4 +2687,1212 @@ fn full_emission_matches_pre_summary_goldens() {
         g,
         include_str!("golden/graph-overlapping-roots.json").trim_end()
     );
+}
+
+#[test]
+fn graph_rows_carry_their_nested_attribute_rows() {
+    let mut r = resolved(
+        "package P {
+        part def Body {
+            attribute mass : Real = 120;
+            attribute dimension {
+                attribute x : Real = 32;
+                attribute y : Real = 140;
+                attribute inner { attribute z : Real; }
+            }
+            attribute colour;
+        }
+    }",
+    );
+    let graph = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let body = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["qname"] == "P::Body")
+        .expect("Body");
+    let rows = body["rows"].as_array().unwrap();
+    let labels: Vec<_> = rows.iter().map(|r| r["label"].as_str().unwrap()).collect();
+    assert_eq!(labels, ["mass = 120", "dimension", "colour"]);
+    assert!(rows[0].get("rows").is_none(), "a leaf row carries no rows");
+    let nested = rows[1]["rows"].as_array().expect("dimension's rows");
+    let nested_labels: Vec<_> = nested
+        .iter()
+        .map(|r| r["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(nested_labels, ["x = 32", "y = 140", "inner"]);
+    assert_eq!(nested[0]["qname"], "P::Body::dimension::x");
+    assert_eq!(nested[0]["section"], "attributes");
+    let deeper = nested[2]["rows"].as_array().expect("inner's rows");
+    assert_eq!(deeper[0]["qname"], "P::Body::dimension::inner::z");
+    assert!(deeper[0].get("rows").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Role members: a member introduced into its owner in a role of its own
+// (subject, actor, objective, result, state action, end, …) is a row of
+// the owner's card that says the role.
+// ---------------------------------------------------------------------------
+
+/// Every role a body can introduce a member in, beside a satisfaction,
+/// an interface's port ends and a port's directed feature.
+const BODY_MEMBERS: &str = include_str!("fixtures/body_members.sysml");
+
+/// A state definition with every shape of state action: named, a
+/// reference, a block, one that only says what it does (`exit send …`),
+/// and empty ones; beside it, empty members of the other one-of roles.
+const STATE_ACTIONS: &str = include_str!("fixtures/state_actions.sysml");
+
+fn state_actions() -> ResolvedModel {
+    resolved_named("state_actions.sysml", STATE_ACTIONS)
+}
+
+/// References that do not resolve in full (an unresolved name, a chain
+/// cut short at `tank.drain`), one package per view under test; a test
+/// scopes its diagram to its package. Each package owns its own `tank`,
+/// so the chain is cut short in the owner's scope.
+const UNRESOLVED_REFERENCES: &str = include_str!("fixtures/unresolved_references.sysml");
+
+fn unresolved_references(package: &str) -> (ResolvedModel, ElementRef) {
+    let mut r = resolved_named("unresolved_references.sysml", UNRESOLVED_REFERENCES);
+    let root = r.resolve_qualified(package).expect("package resolves");
+    (r, root)
+}
+
+fn body_members() -> ResolvedModel {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .expect("library loads");
+    let unit = model.add_source("body_members.sysml".to_string(), BODY_MEMBERS);
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    ResolvedModel::build(&model)
+}
+
+/// A row's `[role, section, label, expr]`, `-` for an absent field.
+fn row_shape(row: &serde_json::Value) -> [&str; 4] {
+    [
+        row["role"].as_str().unwrap_or("-"),
+        row["section"].as_str().unwrap(),
+        row["label"].as_str().unwrap(),
+        row["expr"].as_str().unwrap_or("-"),
+    ]
+}
+
+/// The shapes of a node's rows, in order.
+fn row_shapes<'a>(g: &'a serde_json::Value, qname: &str) -> Vec<[&'a str; 4]> {
+    node(g, qname)["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(row_shape)
+        .collect()
+}
+
+/// Every row of a graph with the rows nested under it, depth first.
+fn all_rows(g: &serde_json::Value) -> Vec<&serde_json::Value> {
+    fn walk<'a>(rows: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        for row in rows.as_array().into_iter().flatten() {
+            out.push(row);
+            walk(&row["rows"], out);
+        }
+    }
+    let mut out = Vec::new();
+    for n in g["nodes"].as_array().unwrap() {
+        walk(&n["rows"], &mut out);
+    }
+    out
+}
+
+#[test]
+fn graph_role_members_are_rows_that_say_their_role() {
+    let mut r = body_members();
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::MassLimit"),
+        [
+            ["subject", "subject", "vehicle : Vehicle", "-"],
+            ["actor", "actors", "operator : Driver", "-"],
+            ["stakeholder", "stakeholders", "owner : Driver", "-"],
+            ["-", "attributes", "in limit : Real", "-"],
+            ["-", "attributes", "margin : Real", "-"],
+            ["assume", "assume constraints", "fueled", "vehicle.mass > 0"],
+            [
+                "require",
+                "require constraints",
+                "underLimit",
+                "vehicle.mass <= limit"
+            ],
+            ["frame", "frames", "worry : Safety", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::Safety"),
+        [
+            ["subject", "subject", "v : Vehicle", "-"],
+            ["stakeholder", "stakeholders", "driver : Driver", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::massReq"),
+        [["subject", "subject", "vehicle : Vehicle", "-"]]
+    );
+    // A body's result expression is a row of its own, spelled by its
+    // expression; the return parameter is led by no direction.
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::UnderLimit"),
+        [
+            ["-", "attributes", "in m : Real", "-"],
+            ["-", "attributes", "in limit : Real", "-"],
+            ["result", "result", "", "m <= limit"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::Total"),
+        [
+            ["-", "attributes", "in a : Real", "-"],
+            ["-", "attributes", "in b : Real", "-"],
+            ["return", "return", "sum : Real", "-"],
+            ["result", "result", "", "a + b"],
+        ]
+    );
+    // An objective with nothing but its doc is still the case's one: its keyword alone.
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::Drive"),
+        [
+            ["subject", "subject", "vehicle : Vehicle", "-"],
+            ["actor", "actors", "driver : Driver", "-"],
+            ["objective", "objective", "", "-"],
+            ["include", "includes", "park", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::MassAnalysis"),
+        [
+            ["subject", "subject", "vehicle : Vehicle", "-"],
+            ["objective", "objective", "massObjective", "-"],
+            ["return", "return", "totalMass : Real", "-"],
+            ["result", "result", "", "vehicle.mass"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::MassTest"),
+        [
+            ["subject", "subject", "vehicle : Vehicle", "-"],
+            ["objective", "objective", "", "-"],
+            ["return", "return", "verdict : VerdictKind", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::Engine"),
+        [
+            ["entry", "state actions", "warm", "-"],
+            ["do", "state actions", "refuel", "-"],
+            ["exit", "state actions", "cool", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::Mount"),
+        [
+            ["end", "ends", "car : Vehicle", "-"],
+            ["end", "ends", "sensor : Sensor", "-"],
+        ]
+    );
+    // A reference form names what it references.
+    assert_eq!(
+        row_shapes(&g, "BodyMembers::Ops"),
+        [
+            ["frame", "frames", "safety", "-"],
+            ["stakeholder", "stakeholders", "driver : Driver", "-"],
+        ]
+    );
+    // Role rows keep a row's identity and notation fields.
+    let rows = node(&g, "BodyMembers::Mount")["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["qname"], "BodyMembers::Mount::car");
+    assert_eq!(rows[0]["file"], "body_members.sysml");
+    assert_eq!(rows[0]["line"], 42);
+    assert_eq!(rows[0]["prefixes"], serde_json::json!(["end"]));
+    let result = &node(&g, "BodyMembers::Total")["rows"][3];
+    assert!(result["id"].is_string(), "{result}");
+    assert_eq!(result["line"], 24);
+    // No role row reads as a parameter row.
+    for row in all_rows(&g) {
+        if row.get("role").is_some() {
+            let label = row["label"].as_str().unwrap();
+            for direction in ["in ", "out ", "inout "] {
+                assert!(!label.starts_with(direction), "{row}");
+            }
+            assert!(row.get("direction").is_none(), "{row}");
+        }
+    }
+}
+
+#[test]
+fn graph_objective_rows_nest_their_own_role_members() {
+    let mut r = body_members();
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let analysis = &node(&g, "BodyMembers::MassAnalysis")["rows"][1];
+    assert_eq!(
+        analysis["qname"],
+        "BodyMembers::MassAnalysis::massObjective"
+    );
+    let nested: Vec<_> = analysis["rows"]
+        .as_array()
+        .expect("the objective's rows")
+        .iter()
+        .map(row_shape)
+        .collect();
+    // The require constraint carries its expression, not its result row.
+    assert_eq!(
+        nested,
+        [["require", "require constraints", "", "vehicle.mass < 2000"]]
+    );
+    assert!(analysis["rows"][0].get("rows").is_none());
+    let test = &node(&g, "BodyMembers::MassTest")["rows"][1];
+    let nested: Vec<_> = test["rows"]
+        .as_array()
+        .expect("the objective's rows")
+        .iter()
+        .map(row_shape)
+        .collect();
+    assert_eq!(nested, [["verify", "verifies", "massReq", "-"]]);
+}
+
+#[test]
+fn graph_role_members_draw_no_nodes_and_no_edges() {
+    let mut r = body_members();
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let role_ids: Vec<&str> = all_rows(&g)
+        .into_iter()
+        .filter(|row| row.get("role").is_some())
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(role_ids.len(), 32, "{role_ids:?}");
+    let nodes = g["nodes"].as_array().unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    for id in &role_ids {
+        assert!(nodes.iter().all(|n| n["id"] != *id), "node {id}");
+        assert!(
+            edges
+                .iter()
+                .all(|e| e["source"] != *id && e["target"] != *id),
+            "edge at {id}"
+        );
+    }
+    // The named cards left: definitions (the conjugated port definition
+    // among them), plain usages, states, and the interface's port ends;
+    // the transition and the satisfaction draw unnamed.
+    let mut drawn: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["kind"] != "note")
+        .filter_map(|n| n["qname"].as_str())
+        .collect();
+    drawn.sort_unstable();
+    let expected = [
+        "BodyMembers",
+        "BodyMembers::Driver",
+        "BodyMembers::Drive",
+        "BodyMembers::Engine",
+        "BodyMembers::Engine::off",
+        "BodyMembers::Engine::on",
+        "BodyMembers::Fuel",
+        "BodyMembers::FuelLine",
+        "BodyMembers::FuelLine::dst",
+        "BodyMembers::FuelLine::src",
+        "BodyMembers::FuelPort",
+        "BodyMembers::FuelPort::'~FuelPort'",
+        "BodyMembers::Mount",
+        "BodyMembers::MassAnalysis",
+        "BodyMembers::MassLimit",
+        "BodyMembers::MassLimit::sub",
+        "BodyMembers::MassTest",
+        "BodyMembers::MassTest::weigh",
+        "BodyMembers::Ops",
+        "BodyMembers::Safety",
+        "BodyMembers::Sensor",
+        "BodyMembers::Total",
+        "BodyMembers::UnderLimit",
+        "BodyMembers::Vehicle",
+        "BodyMembers::car",
+        "BodyMembers::massReq",
+        "BodyMembers::park",
+        "BodyMembers::refuel",
+        "BodyMembers::safety",
+    ];
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(drawn, expected);
+    // No «keyword» edge from a role member: the `do refuel` perform edge
+    // went with its node.
+    let kinds: Vec<&str> = edges.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    for kind in ["perform", "frame", "verify", "include"] {
+        assert!(!kinds.contains(&kind), "{kind} edge in {kinds:?}");
+    }
+    // The doc of an objective that is no node attaches to nothing; the
+    // requirement definition's own doc still does.
+    let notes: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["kind"] == "note")
+        .map(|n| n["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(notes, ["The vehicle mass shall not exceed the limit."]);
+}
+
+#[test]
+fn graph_satisfactions_and_port_ends_keep_their_nodes() {
+    let mut r = body_members();
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let nodes = g["nodes"].as_array().unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    let has_edge = |kind: &str, s: &serde_json::Value, t: &serde_json::Value| {
+        edges
+            .iter()
+            .any(|e| e["kind"] == kind && e["source"] == s["id"] && e["target"] == t["id"])
+    };
+    // `satisfy massReq by car;`: its own node, its subject no row.
+    let car = node(&g, "BodyMembers::car");
+    assert!(car["rows"].as_array().unwrap().is_empty(), "{car}");
+    let satisfy = nodes
+        .iter()
+        .find(|n| n["metaclass"] == "SatisfyRequirementUsage")
+        .expect("the satisfaction's node");
+    assert_eq!(satisfy["label"], "(satisfy requirement)");
+    assert!(satisfy["rows"].as_array().unwrap().is_empty(), "{satisfy}");
+    assert!(has_edge("composition", car, satisfy));
+    assert!(has_edge(
+        "satisfy",
+        satisfy,
+        node(&g, "BodyMembers::massReq")
+    ));
+    // An interface's port ends stay port nodes with their `end` prefix.
+    let line = node(&g, "BodyMembers::FuelLine");
+    assert!(line["rows"].as_array().unwrap().is_empty(), "{line}");
+    for (end, label) in [("src", "src : FuelPort"), ("dst", "dst : ~FuelPort")] {
+        let port = node(&g, &format!("BodyMembers::FuelLine::{end}"));
+        assert_eq!(port["label"], label);
+        assert_eq!(port["stereo"], "port");
+        assert_eq!(port["prefixes"], serde_json::json!(["end"]));
+        assert!(has_edge("composition", line, port));
+    }
+}
+
+#[test]
+fn graph_port_directed_features_are_rows_with_their_direction() {
+    let mut r = body_members();
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let rows = node(&g, "BodyMembers::FuelPort")["rows"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let fuel = &rows[0];
+    assert_eq!(fuel["qname"], "BodyMembers::FuelPort::fuel");
+    assert_eq!(fuel["label"], "fuel : Fuel");
+    assert_eq!(fuel["section"], "directed features");
+    assert_eq!(fuel["direction"], "in");
+    assert!(fuel.get("role").is_none(), "{fuel}");
+    assert!(
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["qname"] != "BodyMembers::FuelPort::fuel")
+    );
+    // Every direction, attributes included, on a port usage as on a port
+    // definition; a nested port stays a port, and the directed features
+    // of anything but a port keep their parameter rows.
+    let mut r = resolved(
+        "package P {
+        part def Fluid;
+        port def Inner;
+        port def Valve {
+            in item fluid : Fluid;
+            out attribute pressure;
+            inout part p;
+            in port inner : Inner;
+        }
+        part def Pump { port v : Valve { out attribute rate; } }
+        action def Act { in item fluid : Fluid; }
+    }",
+    );
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let valve: Vec<_> = node(&g, "P::Valve")["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["section"].as_str().unwrap(),
+                row["label"].as_str().unwrap(),
+                row["direction"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        valve,
+        [
+            ("directed features", "fluid : Fluid", "in"),
+            ("directed features", "pressure", "out"),
+            ("directed features", "p", "inout"),
+        ]
+    );
+    assert_eq!(node(&g, "P::Valve::inner")["stereo"], "port");
+    let rate = &node(&g, "P::Pump::v")["rows"][0];
+    assert_eq!(
+        (&rate["section"], &rate["label"], &rate["direction"]),
+        (
+            &serde_json::json!("directed features"),
+            &serde_json::json!("rate"),
+            &serde_json::json!("out")
+        )
+    );
+    // An action's parameter is no port feature.
+    assert!(node(&g, "P::Act")["rows"].as_array().unwrap().is_empty());
+    assert_eq!(node(&g, "P::Act::fluid")["stereo"], "item");
+}
+
+#[test]
+fn graph_anonymous_state_actions_say_what_they_do() {
+    let mut r = state_actions();
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    // `entry;` (the initial step a succession leaves) is the state's entry
+    // action: a row with its role and no label.
+    assert_eq!(
+        row_shapes(&g, "S::Machine"),
+        [["entry", "state actions", "", "-"]]
+    );
+    let entry = &node(&g, "S::Machine")["rows"][0];
+    assert!(entry["id"].is_string(), "{entry}");
+    assert_eq!(entry["line"], 8);
+    // No state action draws as a node: the only action node is the
+    // package's own `action refuel;`.
+    let actions: Vec<&serde_json::Value> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["stereo"] == "action" || n["stereo"] == "send action")
+        .collect();
+    assert_eq!(actions.len(), 1, "{g}");
+    assert_eq!(actions[0]["qname"], "S::refuel");
+    assert_eq!(
+        row_shapes(&g, "S::Machine::busy"),
+        [
+            ["do", "state actions", "sweep : Chore; polish", "-"],
+            ["exit", "state actions", "send action", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&g, "S::Machine::waiting"),
+        [
+            ["do", "state actions", "", "-"],
+            ["exit", "state actions", "", "-"],
+        ]
+    );
+}
+
+/// The state view draws a state's `entry` / `do` / `exit` actions as the
+/// tree view does: rows with the subaction's identity, its `role` and the
+/// "state actions" section, labelled without the kind (a host reads the
+/// role), an anonymous one by what it does, an empty `entry;` by its role
+/// alone.
+#[test]
+fn graph_state_view_state_actions_are_role_rows() {
+    let mut r = state_actions();
+    let state =
+        sysmlv2_viz::graph(&mut r, None, &VizOptions::default().with_view(View::State)).unwrap();
+    assert_eq!(
+        row_shapes(&state, "S::Machine::idle"),
+        [
+            ["entry", "state actions", "warm", "-"],
+            ["do", "state actions", "refuel", "-"],
+            ["exit", "state actions", "bye : Log", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&state, "S::Machine::busy"),
+        [
+            ["do", "state actions", "sweep : Chore; polish", "-"],
+            ["exit", "state actions", "send action", "-"],
+        ]
+    );
+    let warm = &node(&state, "S::Machine::idle")["rows"][0];
+    assert_eq!(warm["qname"], "S::Machine::idle::warm");
+    assert_eq!(warm["line"], 10);
+    assert!(warm["id"].is_string(), "{warm}");
+    // Row for row, the tree view's state actions.
+    let tree = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    for qname in [
+        "S::Machine",
+        "S::Machine::idle",
+        "S::Machine::busy",
+        "S::Machine::waiting",
+    ] {
+        let actions: Vec<&serde_json::Value> = node(&tree, qname)["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["section"] == "state actions")
+            .collect();
+        let rows: Vec<&serde_json::Value> = node(&state, qname)["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(rows, actions, "{qname}");
+    }
+}
+
+/// The PlantUML state view labels its `entry / …`, `do / …` and `exit /
+/// …` lines as the graph's state-action rows are: an anonymous action
+/// that only says what it does reads as its kind (`exit send …` → `exit
+/// / send action`), where it drew no line; a block still lists its
+/// steps, and an empty one (`do;`) still draws none.
+#[test]
+fn state_view_anonymous_state_actions_read_as_their_kind() {
+    let mut r = state_actions();
+    let out = plantuml(&mut r, None, &view_opts(View::State));
+    let busy = out
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("state \"busy\" as "))
+        .and_then(|rest| rest.split(' ').next())
+        .expect("busy state");
+    assert!(
+        out.contains(&format!("{busy} : do / sweep : Chore; polish\n")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("{busy} : exit / send action\n")),
+        "{out}"
+    );
+    let waiting = out
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("state \"waiting\" as "))
+        .and_then(|rest| rest.split(' ').next())
+        .expect("waiting state");
+    assert!(!out.contains(&format!("{waiting} : ")), "{out}");
+}
+
+/// An owner has one member at most of some roles (a subject, an
+/// objective, a return, a result, an entry, do or exit action), and an
+/// empty one is still the one: the graph draws its keyword alone, so a
+/// host reading the owner's rows sees that it has one. An empty member of
+/// a role an owner may have many of draws nothing, and the PlantUML tree
+/// draws neither.
+#[test]
+fn graph_empty_one_of_role_members_keep_their_rows() {
+    let mut r = state_actions();
+    let tree = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    assert_eq!(
+        row_shapes(&tree, "S::Idle"),
+        [
+            ["do", "state actions", "", "-"],
+            ["exit", "state actions", "", "-"],
+        ]
+    );
+    assert_eq!(
+        row_shapes(&tree, "S::Bare"),
+        [["subject", "subject", "", "-"]]
+    );
+    // The state view draws the same rows, beside the initial pseudostate
+    // the entry's succession leaves from.
+    let state =
+        sysmlv2_viz::graph(&mut r, None, &VizOptions::default().with_view(View::State)).unwrap();
+    assert_eq!(
+        node(&state, "S::Idle")["rows"],
+        node(&tree, "S::Idle")["rows"]
+    );
+    assert!(
+        state["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["kind"] == "pseudo" && n["stereo"] == "initial"),
+        "{state}"
+    );
+    // PlantUML leaves them out, in both views: no keyword stands alone
+    // as a tree line, and no state line ends at its kind.
+    let out = plantuml(&mut r, None, &VizOptions::default());
+    for line in out.lines().map(str::trim) {
+        assert!(
+            !matches!(line, "entry" | "do" | "exit" | "subject" | "actor"),
+            "{out}"
+        );
+    }
+    let out = plantuml(&mut r, None, &view_opts(View::State));
+    for line in out.lines().map(str::trim_end) {
+        assert!(
+            !(line.ends_with(": entry") || line.ends_with(": do") || line.ends_with(": exit")),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn inherited_role_rows_yield_to_an_own_member_of_the_role() {
+    let src = "package I {
+        calc def Total { in attribute a; in attribute b; return attribute sum; a + b }
+        calc def Product :> Total { a * b }
+        requirement def R { subject s; require constraint c { true } }
+        requirement def R2 :> R { subject t; }
+    }";
+    let mut r = resolved(src);
+    let opts = VizOptions::default().with_show_inherited(true);
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let shapes = |qname: &str| -> Vec<(String, bool)> {
+        node(&g, qname)["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let [role, _, label, expr] = row_shape(row);
+                (format!("{role} {label} {expr}"), row["inherited"] == true)
+            })
+            .collect()
+    };
+    assert_eq!(
+        shapes("I::Product"),
+        [
+            ("result  a * b".to_string(), false),
+            ("- in a -".to_string(), true),
+            ("- in b -".to_string(), true),
+            ("return sum -".to_string(), true),
+        ]
+    );
+    assert_eq!(
+        shapes("I::R2"),
+        [
+            ("subject t -".to_string(), false),
+            ("require c true".to_string(), true),
+        ]
+    );
+    let out = plantuml(&mut r, None, &opts);
+    assert!(
+        out.contains("    a * b\n    ^a\n    ^b\n    ^return sum\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("    subject t\n    ^require c { true }\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn tree_role_members_are_keyword_lines() {
+    let mut r = body_members();
+    let out = plantuml(&mut r, None, &VizOptions::default());
+    for block in [
+        "<<requirement def>> {
+    subject vehicle : Vehicle
+    actor operator : Driver
+    stakeholder owner : Driver
+    limit : Real
+    margin : Real
+    assume fueled { vehicle.mass > 0 }
+    require underLimit { vehicle.mass <= limit }
+    frame worry : Safety
+  }",
+        "<<port def>> {
+    in fuel : Fuel
+  }",
+        "<<constraint def>> {
+    m : Real
+    limit : Real
+    m <= limit
+  }",
+        "<<calculation def>> {
+    a : Real
+    b : Real
+    return sum : Real
+    a + b
+  }",
+        "<<use case def>> {
+    subject vehicle : Vehicle
+    actor driver : Driver
+    objective
+    include park
+  }",
+        "<<analysis case def>> {
+    subject vehicle : Vehicle
+    objective massObjective { require { vehicle.mass < 2000 } }
+    return totalMass : Real
+    vehicle.mass
+  }",
+        "<<verification case def>> {
+    subject vehicle : Vehicle
+    objective { verify massReq }
+    return verdict : VerdictKind
+  }",
+        "<<state def>> {
+    entry warm
+    do refuel
+    exit cool
+  }",
+        "<<connection def>> {
+    end car : Vehicle
+    end sensor : Sensor
+  }",
+        "<<viewpoint def>> {
+    frame safety
+    stakeholder driver : Driver
+  }",
+    ] {
+        assert!(out.contains(block), "{block}\nnot in\n{out}");
+    }
+    for gone in [
+        "<<perform action>>",
+        "<<include use case>>",
+        "\"operator : Driver\"",
+        "\"worry : Safety\"",
+        "\"fuel : Fuel\"",
+        "\"(requirement)\"",
+    ] {
+        assert!(!out.contains(gone), "{gone} in\n{out}");
+    }
+    // The satisfaction and the interface's port ends keep their nodes.
+    assert!(out.contains("\"(satisfy requirement)\""), "{out}");
+    assert!(out.contains("\"src : FuelPort\""), "{out}");
+    // Every role row of the graph has its line.
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    for row in all_rows(&g) {
+        let (Some(role), Some(label)) = (row["role"].as_str(), row["label"].as_str()) else {
+            continue;
+        };
+        if !label.is_empty() {
+            assert!(out.contains(&format!("{role} {label}")), "{row}");
+        }
+    }
+}
+
+#[test]
+fn graph_role_references_name_what_they_reference() {
+    let mut r = resolved(
+        "package U {
+        use case park;
+        constraint fueled;
+        constraint dry;
+        concern safety;
+        requirement massReq;
+        action refuel;
+        use case def Drive { include park[0..*]; }
+        requirement def Limit { assume fueled; require dry; frame safety; }
+        verification def Test { objective { verify massReq; } }
+        state def Engine { do refuel; }
+    }",
+    );
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    assert_eq!(
+        row_shapes(&g, "U::Drive"),
+        [["include", "includes", "park [0..*]", "-"]]
+    );
+    // A reference has no expression of its own.
+    assert_eq!(
+        row_shapes(&g, "U::Limit"),
+        [
+            ["assume", "assume constraints", "fueled", "-"],
+            ["require", "require constraints", "dry", "-"],
+            ["frame", "frames", "safety", "-"],
+        ]
+    );
+    let objective = &node(&g, "U::Test")["rows"][0];
+    assert_eq!(row_shape(objective), ["objective", "objective", "", "-"]);
+    assert_eq!(
+        row_shape(&objective["rows"][0]),
+        ["verify", "verifies", "massReq", "-"]
+    );
+    assert_eq!(
+        row_shapes(&g, "U::Engine"),
+        [["do", "state actions", "refuel", "-"]]
+    );
+    let out = plantuml(&mut r, None, &VizOptions::default());
+    for line in [
+        "    include park [0..*]\n",
+        "    assume fueled\n",
+        "    require dry\n",
+        "    frame safety\n",
+        "    objective { verify massReq }\n",
+        "    do refuel\n",
+    ] {
+        assert!(out.contains(line), "{line:?} not in\n{out}");
+    }
+}
+
+/// A role member whose reference does not resolve in full reads as
+/// written, in both views and in the PlantUML tree, where it used to
+/// draw nothing (an unresolved name) or the chain's resolved prefix
+/// (`tank` for `tank.drain`).
+#[test]
+fn graph_unresolved_role_references_read_as_written() {
+    let (mut r, root) = unresolved_references("U");
+    let g = sysmlv2_viz::graph(&mut r, Some(root), &VizOptions::default()).unwrap();
+    let actions = [
+        ["entry", "state actions", "provide power", "-"],
+        ["do", "state actions", "tank.drain", "-"],
+        ["exit", "state actions", "Ops::park", "-"],
+    ];
+    assert_eq!(row_shapes(&g, "U::Engine"), actions);
+    assert_eq!(
+        row_shapes(&g, "U::Limit"),
+        [["require", "require constraints", "mass limit", "-"]]
+    );
+    let opts = VizOptions::default().with_view(View::State);
+    let g = sysmlv2_viz::graph(&mut r, Some(root), &opts).unwrap();
+    assert_eq!(row_shapes(&g, "U::Engine"), actions);
+    let out = plantuml(&mut r, Some(root), &VizOptions::default());
+    for line in [
+        "    entry provide power\n",
+        "    do tank.drain\n",
+        "    exit Ops::park\n",
+        "    require mass limit\n",
+    ] {
+        assert!(out.contains(line), "{line:?} not in\n{out}");
+    }
+}
+
+/// A binding to a feature that has no value to give reads as written
+/// (`subject = result`, `a = vv.m`), where it used to read as the name
+/// alone or, for an anonymous subject, not at all; a binding that
+/// evaluates still reads as its value.
+#[test]
+fn graph_reference_bindings_read_as_written() {
+    let src = "package B {
+        part def V { attribute m; }
+        part vv : V;
+        requirement def Obj { subject s : V; }
+        analysis def Case {
+            subject v : V;
+            objective obj : Obj { subject = result; }
+            v.m
+        }
+        analysis def Plan {
+            subject v : V;
+            analysis c : Case { subject = v; }
+        }
+        enum def Color { red; green; }
+        part ctx {
+            analysis plan : Plan { subject v = vv; }
+            attribute a = vv.m;
+            attribute n = 3;
+            attribute k = n;
+            attribute color : Color = Color::red;
+            attribute q = 'no such calc'(n);
+            out attribute :>> missing = n2;
+            attribute n2;
+        }
+    }";
+    let mut r = resolved(src);
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let objective = &node(&g, "B::Case")["rows"][1];
+    assert_eq!(objective["label"], "obj : Obj");
+    // The anonymous subject's label leads with the space a host splits
+    // the value off at.
+    assert_eq!(
+        row_shape(&objective["rows"][0]),
+        ["subject", "subject", " = result", "-"]
+    );
+    assert_eq!(
+        row_shapes(&g, "B::Plan::c"),
+        [["subject", "subject", " = v", "-"]]
+    );
+    assert_eq!(
+        row_shapes(&g, "B::ctx::plan"),
+        [["subject", "subject", "v = vv", "-"]]
+    );
+    assert_eq!(
+        row_shapes(&g, "B::ctx"),
+        [
+            ["-", "attributes", "a = vv.m", "-"],
+            ["-", "attributes", "n = 3", "-"],
+            ["-", "attributes", "k = 3", "-"],
+            ["-", "attributes", "color : Color = red", "-"],
+            ["-", "attributes", "q", "-"],
+            // a nameless row's direction and value, one space apart
+            ["-", "attributes", "out = n2", "-"],
+            ["-", "attributes", "n2", "-"],
+        ]
+    );
+    let out = plantuml(&mut r, None, &VizOptions::default());
+    for line in [
+        "    objective obj : Obj { subject = result }\n",
+        "    subject = v\n",
+        "    subject v = vv\n",
+        "    a = vv.m\n",
+        "    k = 3\n",
+    ] {
+        assert!(out.contains(line), "{line:?} not in\n{out}");
+    }
+    // Values off: no binding either.
+    let quiet = VizOptions::default().with_show_values(false);
+    let g = sysmlv2_viz::graph(&mut r, None, &quiet).unwrap();
+    assert_eq!(
+        row_shapes(&g, "B::ctx::plan"),
+        [["subject", "subject", "v", "-"]]
+    );
+}
+
+/// The succession of a state's entry transition (`entry; then idle;`)
+/// draws no node in the structure tree, in the graph or in PlantUML; the
+/// state view still draws it as the edge from the initial pseudostate. A
+/// succession written as one (`succession first a then b;`) and an action
+/// flow's `then` still draw.
+#[test]
+fn tree_draws_no_node_for_an_entry_transition() {
+    let src = "package T {
+        action a;
+        action b;
+        succession first a then b;
+        state def Boot {
+            entry; then idle;
+            state idle;
+        }
+        state def Warm {
+            entry warm; then idle;
+            action warm;
+            state idle;
+        }
+        action def Flow {
+            first start;
+            then action x;
+        }
+    }";
+    let mut r = resolved(src);
+    let g = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let nodes = g["nodes"].as_array().unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    // The package's own succession and the action flow's `then` draw;
+    // the two entry transitions' successions do not.
+    let successions: Vec<&serde_json::Value> = nodes
+        .iter()
+        .filter(|n| n["metaclass"] == "SuccessionAsUsage")
+        .collect();
+    assert_eq!(successions.len(), 2, "{g}");
+    let flow = &node(&g, "T::Flow")["id"];
+    assert!(
+        successions.iter().any(|s| edges
+            .iter()
+            .any(|e| e["source"] == *flow && e["target"] == s["id"])),
+        "{g}"
+    );
+    for (state, members) in [
+        ("T::Boot", &["T::Boot::idle"][..]),
+        ("T::Warm", &["T::Warm::warm", "T::Warm::idle"]),
+    ] {
+        let id = &node(&g, state)["id"];
+        let targets: Vec<&serde_json::Value> = edges
+            .iter()
+            .filter(|e| e["source"] == *id)
+            .map(|e| &e["target"])
+            .collect();
+        let expected: Vec<&serde_json::Value> =
+            members.iter().map(|m| &node(&g, m)["id"]).collect();
+        assert_eq!(targets, expected, "{state}");
+    }
+    let out = plantuml(&mut r, None, &VizOptions::default());
+    assert_eq!(out.matches("<<succession as>>").count(), 2, "{out}");
+    let opts = VizOptions::default().with_view(View::State);
+    let g = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    let nodes = g["nodes"].as_array().unwrap();
+    let initials = nodes.iter().filter(|n| n["kind"] == "pseudo").count();
+    assert_eq!(initials, 2, "{g}");
+}
+
+/// The state view reads an unresolved state action, transition effect
+/// or `exhibit` as written, its names unquoted: `do 'provide power';`
+/// draws `do / provide power` where it drew no line, a chain cut short
+/// reads whole (`do / tank.drain`, not `do / tank`), and `exhibit 'car
+/// states';` is no longer `(exhibit state)`.
+#[test]
+fn state_view_unresolved_references_read_as_written() {
+    let (mut r, root) = unresolved_references("U");
+    let out = plantuml(&mut r, Some(root), &view_opts(View::State));
+    let expected = "@startuml
+state \"Engine\" as n1 <<state def>> {
+  state \"on\" as n2 <<state>>
+  state \"off\" as n3 <<state>>
+  n2 --> n3 : Go / shut down
+  n3 --> n2 : Go / tank.fill
+}
+n1 : entry / provide power
+n1 : do / tank.drain
+n1 : exit / Ops::park
+state \"car states\" as n4 <<exhibit state>>
+@enduml
+";
+    assert_eq!(out, expected);
+    let opts = VizOptions::default().with_view(View::State);
+    let g = sysmlv2_viz::graph(&mut r, Some(root), &opts).unwrap();
+    let labels: Vec<&str> = g["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["label"].as_str())
+        .collect();
+    assert_eq!(labels, ["Go / shut down", "Go / tank.fill"], "{g}");
+    let exhibit = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["metaclass"] == "ExhibitStateUsage")
+        .expect("exhibit node");
+    assert_eq!(exhibit["label"], "car states");
+}
+
+/// The action view labels an anonymous `perform` by what it performs as
+/// written when that did not resolve in full, where it drew `(perform
+/// action)` (an unresolved name) or the chain's resolved prefix (`tank`
+/// for `tank.drain`).
+#[test]
+fn action_view_unresolved_performs_read_as_written() {
+    let (mut r, root) = unresolved_references("A");
+    let out = plantuml(&mut r, Some(root), &view_opts(View::Action));
+    let expected = "@startuml
+state \"fill\" as n1 <<action>>
+state \"Run\" as n2 <<action def>> {
+  state \"warm up\" as n3 <<perform action>>
+  state \"tank.drain\" as n4 <<perform action>>
+  state \"tank.fill\" as n5 <<perform action>>
+}
+@enduml
+";
+    assert_eq!(out, expected);
+    let opts = VizOptions::default().with_view(View::Action);
+    let g = sysmlv2_viz::graph(&mut r, Some(root), &opts).unwrap();
+    let mut labels: Vec<&str> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["metaclass"] == "PerformActionUsage")
+        .map(|n| n["label"].as_str().unwrap())
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(labels, ["tank.drain", "tank.fill", "warm up"], "{g}");
+}
+
+/// A `perform`, `exhibit` or `include` whose chain is cut short at an
+/// unresolved link draws no «keyword» edge to the chain's resolved
+/// prefix, in the graph, the mixed view or the case view; a resolved
+/// chain still does. The case view draws such an include, as it draws
+/// one naming nothing, as a node of its own, labelled as written.
+#[test]
+fn reference_edges_skip_a_chain_cut_short() {
+    let (mut r, root) = unresolved_references("E");
+    let g = sysmlv2_viz::graph(&mut r, Some(root), &VizOptions::default()).unwrap();
+    let ids: HashMap<&str, &str> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| Some((n["qname"].as_str()?, n["id"].as_str()?)))
+        .collect();
+    let edges: Vec<(&str, &str)> = g["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| ["perform", "exhibit", "include"].contains(&e["kind"].as_str().unwrap()))
+        .map(|e| (e["kind"].as_str().unwrap(), e["target"].as_str().unwrap()))
+        .collect();
+    assert_eq!(edges, [("perform", ids["E::Tank::fill"])], "{g}");
+    let out = plantuml(&mut r, Some(root), &view_opts(View::Mixed));
+    assert_eq!(out.matches(" : «perform»\n").count(), 1, "{out}");
+    assert!(!out.contains("«exhibit»"), "{out}");
+    assert!(!out.contains("«include»"), "{out}");
+    let out = plantuml(&mut r, Some(root), &view_opts(View::Case));
+    assert!(!out.contains("«include»"), "{out}");
+    for line in [
+        "usecase \"add fuel\" as n3 <<include use case>>\n",
+        "usecase \"trip.missing\" as n4 <<include use case>>\n",
+    ] {
+        assert!(out.contains(line), "{line:?} not in\n{out}");
+    }
+}
+
+/// An anonymous `perform`, `exhibit`, `satisfy` or `event` drawn as a
+/// node of its own, and an anonymous part that references (`::>`), reads
+/// as written when its reference does not resolve in full, in the graph
+/// (structure tree and interconnection), the PlantUML tree and the
+/// mixed view: no «keyword» edge says what it references. A resolved
+/// reference reads as before, and so does a connector's end, resolved
+/// or not.
+#[test]
+fn unresolved_reference_nodes_read_as_written() {
+    let (mut r, root) = unresolved_references("N");
+    // The members of the last `part car`, the one in this package.
+    let car_from = UNRESOLVED_REFERENCES
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("part car {"))
+        .last()
+        .expect("part car")
+        .0 as u64
+        + 1;
+    let labels = |g: &serde_json::Value, metaclass: &str| {
+        let mut labels: Vec<String> = g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["metaclass"] == metaclass && n["inherited"].is_null())
+            .filter(|n| n["line"].as_u64().is_some_and(|line| line > car_from))
+            .map(|n| n["label"].as_str().unwrap().to_string())
+            .collect();
+        labels.sort_unstable();
+        labels
+    };
+    let g = sysmlv2_viz::graph(&mut r, Some(root), &VizOptions::default()).unwrap();
+    for (metaclass, expected) in [
+        (
+            "PerformActionUsage",
+            &["(perform action)", "cool down [2]", "tank.drain", "warm up"][..],
+        ),
+        ("ExhibitStateUsage", &["some state"]),
+        (
+            "SatisfyRequirementUsage",
+            &["(satisfy requirement)", "missing spec"],
+        ),
+        ("EventOccurrenceUsage", &["some event"]),
+        ("PartUsage", &["(part)", "spare tank"]),
+    ] {
+        assert_eq!(labels(&g, metaclass), expected, "{g}");
+    }
+    let ends: Vec<&str> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["metaclass"] == "PortUsage" && n["qname"].is_null())
+        .map(|n| n["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(ends, ["(port)", "(port)"], "{g}");
+    let g = sysmlv2_viz::graph(&mut r, Some(root), &view_opts(View::Interconnection)).unwrap();
+    assert_eq!(labels(&g, "PartUsage"), ["(part)", "spare tank"], "{g}");
+    let out = plantuml(&mut r, Some(root), &VizOptions::default());
+    for line in [
+        "class \"(perform action)\" as n13 <<perform action>>\n",
+        "class \"tank.drain\" as n14 <<perform action>>\n",
+        "class \"warm up\" as n15 <<perform action>>\n",
+        "class \"cool down [2]\" as n16 <<perform action>>\n",
+        "class \"some state\" as n17 <<exhibit state>>\n",
+        "class \"(satisfy requirement)\" as n18 <<satisfy requirement>>\n",
+        "class \"missing spec\" as n19 <<satisfy requirement>>\n",
+        "class \"some event\" as n20 <<event occurrence>>\n",
+        "class \"(part)\" as n21 <<part>>\n",
+        "class \"spare tank\" as n22 <<part>>\n",
+    ] {
+        assert!(out.contains(line), "{line:?} not in\n{out}");
+    }
+    assert_eq!(out.matches("class \"(port)\"").count(), 2, "{out}");
+    let out = plantuml(&mut r, Some(root), &view_opts(View::Mixed));
+    for label in [
+        "(perform action)",
+        "tank.drain",
+        "warm up",
+        "cool down [2]",
+        "some state",
+        "(satisfy requirement)",
+        "missing spec",
+        "some event",
+        "spare tank",
+    ] {
+        assert!(
+            out.contains(&format!("rectangle \"{label}\" as ")),
+            "{label:?} not in\n{out}"
+        );
+    }
+    let out = plantuml(&mut r, Some(root), &view_opts(View::Interconnection));
+    assert!(out.contains("rectangle \"spare tank\" as "), "{out}");
 }

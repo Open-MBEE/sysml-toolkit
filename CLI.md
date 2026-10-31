@@ -1,6 +1,6 @@
 # `sysmlv2` CLI tour
 
-A tour of every `sysmlv2` subcommand using real models from the OMG SysML-v2-Release corpus vendored under `spec-refs/`. Every output shown here is the actual output of the command above it.
+A tour of every `sysmlv2` subcommand using real models from the OMG SysML-v2-Release corpus vendored under `spec-refs/`. Every output shown here is the actual output of the command above it: `tools/cli_doctour.py` runs the tour in order, in one shell session, and CI fails when an output drifts. (A block that needs another tool, the network or a step done by hand is shown, not run.)
 
 Setup — build the CLI and set two shell variables used throughout:
 
@@ -44,13 +44,24 @@ SourceUnit {
         Member {
             visibility: None,
             leading_then: false,
+            leading_then_multiplicity: None,
             kind: Definition(
                 Definition {
-                    prefix: DefPrefix { ... },
+                    prefix: DefPrefix {
+                        is_abstract: false,
+                        is_variation: false,
+                        is_individual: false,
+                        metadata: [],
+                    },
                     kind: Part,
                     id: Identification {
                         short_name: None,
-                        name: Some(Name { value: "Vehicle", span: 9..16 }),
+                        name: Some(
+                            Name {
+                                value: "Vehicle",
+                                span: 9..16,
+                            },
+                        ),
                     },
                     ...
 ```
@@ -72,7 +83,7 @@ $ echo $?
 
 A file that parses fine but breaks context rules:
 
-```sysml
+```sysml broken.sysml
 package Demo {
     import Definitions::*;
 
@@ -144,7 +155,7 @@ The legality matrix is transcribed from the normative Xtext grammars' `*BodyItem
 
 With `--lib`, all input files form one model resolved against the standard library, and unresolved references, missing alias targets and import cycles are **warnings**; ambiguous references are **errors**. Without `--lib`, local references are still checked and missing standard-library dependencies may produce warnings. Warnings affect the exit code only with `--strict`:
 
-```sysml
+```sysml refs.sysml
 package Demo {
     private import ScalarValues::*;
     private import Missing::*;
@@ -200,7 +211,7 @@ $ echo $?
 
 A root package (or any other root declaration) named like a standard-library root package is reported at its declaration: the diagnostic states whether references resolve to the library or the name is ambiguous. In the following package collision, the library wins qualified lookup.
 
-```sysml
+```sysml shadow.sysml
 package Requirements {
     requirement def Speed;
 }
@@ -234,7 +245,7 @@ Constructor arguments are checked as the feature values they are. `new T(…)` b
 
 Semantic checks run with or without a library; `--lib` supplies additional type and relationship information. The example below exercises multiplicity bounds (evaluated with the expression evaluator, so a bound can be an expression), self/circular specialization (errors), and duplicate specialization targets (warnings). Errors are raised only for what is *provably* wrong — a symbolic bound the evaluator cannot compute stays silent:
 
-```sysml
+```sysml sem.sysml
 package Demo {
     part def Wheel;
     part def Cyclic :> Cyclic;
@@ -295,7 +306,7 @@ With `--lib`, the CLI also reports unused private imports. The analysis combines
 
 ### `--format json` — one report document
 
-`--format json` writes the findings as one JSON document on stdout instead of the text above on stderr; the exit code is unchanged and the count lines are not printed. Every item carries the same keys whichever verb produced it — `lint --format json` ([2a](#2a-lint--project-policy-rules)) emits the same shape: `stage` (`parse`, `context`, `referential` or `semantic`), `severity` in the lint config spelling (`error` / `warn` / `info` / `hint`), the `message`, the input's index and name (`unit`, `unitName`), byte offsets (`start`, `end`), 1-based positions (`line`, `col`, `endLine`, `endCol`), and the lint-only fields (`rule`, `element`, `suggest`, `fix`, `alternatives`) as null or empty:
+`--format json` writes the findings as one JSON document on stdout instead of the text above on stderr; the exit code is unchanged and the count lines are not printed. Every item carries the same keys whichever verb produced it — `lint --format json` ([2a](#2a-lint--project-policy-rules)) emits the same shape: `stage` (`parse`, `context`, `referential` or `semantic`), `severity` in the lint config spelling (`error` / `warn` / `info` / `hint`), the `message`, the input's index and name (`unit`, `unitName`), byte offsets (`start`, `end`), 1-based positions (`line`, `col`, `endLine`, `endCol`), `rule` (the normative rule a semantic finding reports, such as `validateSatisfyRequirementUsageReference`, and null when the finding names none), and the lint-only fields (`element`, `suggest`, `fix`, `alternatives`) as null or empty:
 
 ```console
 $ printf 'package Q { part x : ; }\n' > broken.sysml
@@ -359,7 +370,7 @@ Operational failures — an unreadable input, a library that fails to load — s
 
 `lint` reports what `check` deliberately does not: style, hygiene and dead-model findings that are project policy rather than language law. It runs beside `check` and never changes its verdicts, sees only the user units (library elements are never linted, even with `--lib`), and sorts findings by unit, position and rule. Given `rig.sysml`:
 
-```sysml
+```sysml rig.sysml
 package Rig {
     part def Wheel;
     part def spare_wheel;
@@ -494,7 +505,9 @@ $ echo $?
 
 A finding a project accepts at one site is silenced where it sits, in a note that names the rule. Notes — `// …` to the end of a line, `//* … */` across lines — are the hidden channel of the textual notation: they are not model elements, so a directive never reaches the interchange form, and a `/* … */` body, which is a `Comment` element, is never read as one. `sysmlint-disable-next-line <rules>` above a line governs that line (strictly the next one), `sysmlint-disable-line <rules>` trailing a line governs its own, and `sysmlint-disable <rules>` opens a range that `sysmlint-enable <rules>` closes on its own line, or that runs to the end of the file; the rule ids are comma-separated, and ` -- <reason>` may follow them. Given `site.sysml`:
 
-```sysml
+In `notes/site.sysml`, a directory of its own, so the default rules apply rather than the `sysmlint.json` above:
+
+```sysml notes/site.sysml
 package Site {
     // sysmlint-disable-next-line naming-convention -- the name the field crews use
     part def spare_wheel;
@@ -508,9 +521,9 @@ package Site {
 ```
 
 ```console
-$ $sysmlv2 lint site.sysml
+$ $sysmlv2 lint notes/site.sysml
 warning: `naming-convention` is not reported on line 9; the directive suppresses nothing [lint-directive]
-  --> site.sysml:9:44
+  --> notes/site.sysml:9:44
    |
    |     part def Hub; // sysmlint-disable-line naming-convention
    |                                            ^^^^^^^^^^^^^^^^^
@@ -541,22 +554,23 @@ warning: input parameter `radius` of `Torque` is never used [unused-parameter]
 
 1 deletion fix(es) available but not applied — deleting model text needs --fix --fix-deletes
 2 warning(s)
-$ $sysmlv2 lint --fix --fix-deletes rig.sysml
+$ cp rig.sysml fixed.sysml
+$ $sysmlv2 lint --fix --fix-deletes fixed.sysml
 warning: `spare_wheel` is never referenced in these units (closed world: outside consumers are not visible to lint) [unused-definition]
-  --> rig.sysml:3:14
+  --> fixed.sysml:3:14
    |
    |     part def spare_wheel;
    |              ^^^^^^^^^^^
 
 warning: input parameter `radius` of `Torque` is never used [unused-parameter]
-  --> rig.sysml:7:12
+  --> fixed.sysml:7:12
    |
    |         in radius : Real;
    |            ^^^^^^
 
-fixed: rig.sysml
+fixed: fixed.sysml
 2 warning(s)
-$ cat rig.sysml
+$ cat fixed.sysml
 package Rig {
     part def Wheel;
     part def spare_wheel;
@@ -679,7 +693,7 @@ rig.sysml:7:12 warn unused-parameter
 
 Given a messy source:
 
-```sysml
+```sysml messy.sysml
 package  VehicleConfig   {   private   import   ScalarValues :: * ;
   // engine sizing options
   variation  part  def  EngineChoices { variant part '4cyl' ; variant part '6cyl';}
@@ -737,9 +751,14 @@ $ printf 'part def Vehicle { attribute mass : Real; }\n' | $sysmlv2 convert - --
   {
     "@id": "9893c716-bf98-5972-a9b2-b6fd34afe8ca",
     "@type": "OwningMembership",
-    "ownedRelatedElement": [ { "@id": "77309b84-f72f-5845-a3e5-d958ebf1b702" } ],
-    "visibility": "public",
     ...
+    "ownedRelatedElement": [
+      {
+        "@id": "77309b84-f72f-5845-a3e5-d958ebf1b702"
+      }
+    ],
+    ...
+    "visibility": "public"
   },
   {
     "@id": "77309b84-f72f-5845-a3e5-d958ebf1b702",
@@ -763,12 +782,12 @@ doc = json.load(open('vehicle.json'))
 print(len(doc), 'elements')
 for t, n in collections.Counter(e['@type'] for e in doc).most_common(5):
     print(f'{n:>6}  {t}')"
-5452 elements
-   684  FeatureMembership
-   470  OwningMembership
-   393  ParameterMembership
-   315  FeatureChaining
-   311  Membership
+6435 elements
+   696  FeatureMembership
+   521  OwningMembership
+   496  FeatureValue
+   487  Feature
+   418  ParameterMembership
 ```
 
 ---
@@ -783,7 +802,6 @@ $ printf 'package M { private import ScalarValues::*; attribute mass : Real; }\n
 $ $sysmlv2 convert m.sysml --to compact-json --lib "$lib" | grep -A1 '"type"'
     "type": {
       "@id": "14c0aa22-5489-59b5-b438-ded26e83ba31"
-    },
 ```
 
 Library elements participate in resolution but are not serialized — the output stays scoped to your model.
@@ -796,8 +814,8 @@ The first run against a library prepares it from source, about 0.8 s for the sta
 
 ```console
 $ $sysmlv2 prepare --lib "$lib" --out dist/prepared
-dist/prepared/stdlib-930ea712a6b7cf51.prepared
-dist/prepared/stdlib-930ea712a6b7cf51.libcache
+dist/prepared/stdlib-...prepared
+dist/prepared/stdlib-...libcache
 ```
 
 A run whose cache has no snapshot for that library reads the two files from `dist/prepared` in place when the directory is given as `SYSMLV2_LIB_SNAPSHOT_DIR`, or is named `prepared` and lies beside the library directory (a library packaged with a host — a Python extension, a web bundle — ships its snapshot beside itself) or beside the executable:
@@ -812,7 +830,7 @@ Nothing is copied into the cache. The files are for the toolkit build that wrote
 
 `--lib` (and `SYSMLV2_LIB_DIR`) may name a library bundle file instead of a directory: the JSON array of `{name, text}` units the WebAssembly package ships as `stdlib/sysml-library.json.gz`, decompressed. Its units load in array order under their bundle names and are keyed by their content as the package's `PreparedLibrary.fromSnapshot` keys them, so the prepared snapshot generated with the bundle (`sysml-library.prepared.gz`, decompressed, beside the bundle under its stem) is decoded instead of the library being prepared from source:
 
-```console
+```console ignore
 $ ls stdlib/
 sysml-library.json  sysml-library.libcache  sysml-library.prepared
 $ $sysmlv2 check --lib stdlib/sysml-library.json m.sysml
@@ -843,6 +861,7 @@ The full form adds every derived property and the implied relationships the publ
 
 ```console
 $ printf 'part def Vehicle { attribute mass : Real; }\n' | $sysmlv2 convert - --to full-json > full.json
+note: no --lib given — implied relationships are omitted (isImpliedIncluded: false); derived properties are included
 $ python3 -c "
 import json
 pd = [e for e in json.load(open('full.json')) if e['@type'] == 'PartDefinition'][0]
@@ -873,12 +892,12 @@ package M {
 }
 ```
 
-Lifted references print as `$::`-rooted qualified names (`$::` roots resolution at the global namespace), so the regenerated text is unambiguous regardless of import context — and it re-parses and re-checks cleanly:
+Lifted references print as `$::`-rooted qualified names (`$::` roots resolution at the global namespace), so the regenerated text is unambiguous regardless of import context — and it re-parses cleanly:
 
 ```console
 $ $sysmlv2 convert vehicle.json --to text -o vehicle-regen.sysml
-$ $sysmlv2 check vehicle-regen.sysml && echo clean
-clean
+$ $sysmlv2 parse vehicle-regen.sysml
+vehicle-regen.sysml: 1 top-level member(s), 0 diagnostic(s)
 ```
 
 ### `--min-qual` — shortest reference spellings
@@ -888,12 +907,12 @@ The `$::`-rooted printing is the always-correct default; `--min-qual` respells e
 ```console
 $ $sysmlv2 convert m.json --to text --lib "$lib" --min-qual
 package M {
-    private import $::ScalarValues::*;
+    private import ScalarValues::*;
     attribute mass : Real;
 }
 ```
 
-The emitted interchange JSON of the minimized text is byte-identical to the `$::`-rooted form's — respelling references moves no declarations, so every element keeps its id. Import targets keep their printed form (their resolution rules differ), and a shadowed name keeps exactly the qualification it needs.
+The emitted interchange JSON of the minimized text is byte-identical to the `$::`-rooted form's — respelling references moves no declarations, so every element keeps its id. A namespace import shortens like any other reference. A member import keeps at least two segments, because it binds its last segment into the importing scope and `import Member;` could only resolve through itself: `import $::Pkg::Member;` becomes `import Pkg::Member;`. It also keeps its written last segment, so an alias import still names the alias. A shadowed name keeps exactly the qualification it needs.
 
 ### Full-form input is normalized automatically
 
@@ -901,7 +920,7 @@ Feeding full-form JSON anywhere accepts JSON works — implied relationships are
 
 ```console
 $ $sysmlv2 convert full.json --to compact-json | python3 -c "import json,sys; print(len(json.load(sys.stdin)), 'compact elements')"
-5 compact elements
+6 compact elements
 ```
 
 (The one warning this can print — `cannot name reference target …` — flags an implied-relationship target outside the document; the implied relationship is dropped by normalization anyway.)
@@ -910,31 +929,36 @@ $ $sysmlv2 convert full.json --to compact-json | python3 -c "import json,sys; pr
 
 ## 8. Multi-file models — many files ⇄ one JSON
 
-Several textual inputs form **one model** — one root namespace per file, cross-file references resolved:
+Several textual inputs form **one model** — one root namespace per file, cross-file references resolved. Given `definitions.sysml`:
 
-```console
-$ cat definitions.sysml
+```sysml definitions.sysml
 package Definitions {
     part def Wheel;
     part def Chassis;
 }
-$ cat vehicle.sysml
+```
+
+and `vehicle.sysml`:
+
+```sysml vehicle.sysml
 package Vehicle {
     private import Definitions::*;
     part chassis : Chassis;
     part wheels : Wheel [4];
 }
+```
 
+```console
 $ $sysmlv2 convert definitions.sysml vehicle.sysml --to compact-json -o model.json
 ```
 
 (`model.json` holds 21 elements under two root namespaces, one per file.) The cross-file resolution is easiest to see by asking the model directly — `query` (section 11) takes the same multi-file input:
 
 ```console
-$ $sysmlv2 query definitions.sysml vehicle.sysml 'Vehicle::wheels istype Definitions::Wheel'
-true
 $ $sysmlv2 query definitions.sysml vehicle.sysml 'ownedMember(Vehicle)'
 Vehicle::chassis (PartUsage)
+Vehicle::wheels (PartUsage)
+$ $sysmlv2 query definitions.sysml vehicle.sysml 'ownedMember(Vehicle)->select { in p; p istype Definitions::Wheel }'
 Vehicle::wheels (PartUsage)
 ```
 
@@ -969,6 +993,10 @@ clean
 
 The full circle — N files → one Flexo JSON → split → the original file names, re-checked at 0 findings — is gated in `tests/cli.rs`. In library terms the split is `lift::split_documents` (forward ownership closure from each root) and `lift::document_name_map` (cross-document reference naming).
 
+Interchange JSON states each ownership edge twice: on the owner (`ownedRelationship`, `ownedRelatedElement`) and on the owned element (`owningRelatedElement`, `owningRelationship`). Both are stored metamodel properties. `--flexo` unwraps change records and reconstructs missing inverses from the forward ends for every JSON conversion target. Without that option, missing inverses are refused. Contradictory owners, missing in-document forward ends and ownership cycles are refused in either mode, before document splitting. Existing inverses are never overwritten. Owners outside the input are allowed for ownership slices.
+
+For text output, an explicit `.kerml` or `.sysml` output filename selects the dialect (case-insensitively), including with `--min-qual`. Recorded root filenames take precedence over metaclass inference otherwise. Directory exports use the inferred dialect's extension for unnamed documents. An incompatible dialect is refused; for example, a standalone `Feature` slice needs a `.kerml` output rather than being silently omitted from SysML text.
+
 ---
 
 ## 9. Round-trip fidelity
@@ -991,7 +1019,7 @@ This invariant is gated over all 345 corpus files (`tests/roundtrip.rs`).
 
 The expression evaluator computes bound feature values against the resolved model: operators, sequences, feature references (following values, redefinition-aware), and Kernel Function Library intrinsics including lambda-bodied control functions. Numbers are exact: decimal literals are rationals, arithmetic never rounds (`0.1 + 0.2` is `0.3`, `100 * 1.1` is `110`), integers grow past the machine word instead of wrapping, and unit conversion factors are exact. A result whose decimal expansion terminates prints as that decimal; any other rational prints as a reduced fraction (`1/3`), which is itself a valid expression. Only transcendental functions (`sqrt` of a non-square, `ln`, `exp`, trigonometry) and non-exact powers produce approximate doubles, and any operation over such a value stays approximate.
 
-```sysml
+```sysml demo.sysml
 package Demo {
     part def Vehicle {
         attribute baseMass = 1000.5;
@@ -1004,7 +1032,7 @@ package Demo {
         attribute doubled = wheelMasses->collect { in m; m * 2 };
         attribute biggest = max(wheelMasses);
     }
-    part car : Vehicle { attribute :>> baseMass = 1200.0; }
+    part car : Vehicle[1] { attribute :>> baseMass = 1200.0; }
     attribute carTotal = car.totalMass;
 
     attribute mm;
@@ -1029,7 +1057,7 @@ label = "car-4"
 evens = (2, 4, 6, 8, 10)
 doubled = (46, 46, 48, 48)
 biggest = 24
-<anonymous> = 1200
+baseMass = 1200
 carTotal = 1294
 wheelbase = 2700 [mm]
 overhangs = 900 [mm]
@@ -1047,6 +1075,8 @@ $ $sysmlv2 eval demo.sysml Demo::carTotal Demo::Vehicle::totalMass
 Demo::carTotal = 1294
 Demo::Vehicle::totalMass = 1094.5
 ```
+
+A part that a package owns is a collection of any size unless it declares a multiplicity, which is why `car` declares `[1]`: without it, the chain `car.totalMass` reads every `car` there might be and is indeterminate. A qualified name still evaluates through it, because its prefix stands for one instance whatever the multiplicity: `Demo::car::totalMass` is `1294` either way.
 
 ### `--number-format` — how non-terminating results print
 
@@ -1069,7 +1099,7 @@ Demo::Vehicle::totalMass = 1094.5
 
 A setting the style does not use is an error, as is an unknown style or setting. Given `gear.sysml`:
 
-```sysml
+```sysml gear.sysml
 package Gear {
     attribute ratio = 7 / 3;
     attribute share = 1 / 15;
@@ -1100,13 +1130,44 @@ share = 0.0(6)
 step = ≈51.4286
 ```
 
-The language server takes the same spec for its value hints, hover values and range hints, where the default is also `exact`: `sysmlv2 lsp --number-format <SPEC>` sets the server's default, and a client's `initializationOptions.numberFormat` overrides it. Commands that print no values do not accept the flag.
+The language server takes the same spec for its value hints, hover values and range hints: `sysmlv2 lsp --number-format <SPEC>` sets the server's default (`approx` without the flag), and a client's `initializationOptions.numberFormat` overrides it. Commands that print no values do not accept the flag.
 
 The `examples/evalstats` run computes 3,306/3,993 feature values (82.8%); 614 are indeterminate over unbound inputs and 73 return errors. Seventeen errors explicitly reject calculations requiring statement execution. These categories distinguish a computed value from a successful indeterminate result; `tests/eval.rs` gates evaluation without panics.
+
+### `--value-units` — which units quantities print in
+
+`--value-units si|as-written` chooses the units a computed quantity prints in: `eval` and `query` values, `verify`'s narrowed ranges, the values behind a violated verdict and solver witnesses, and `viz`'s `= value` on compartment lines. `si`, the default, prints the evaluator's units: a bracket's unit, kept through sums and scaling, and SI units for a product, quotient or power. `as-written` prints each value in the units it was written in, where those cover its dimensions, by the rules the language server's value hints follow ([19](#19-lsp--the-language-server)). The value is the same either way, converted by exact factors, and so are the verdicts. Given `board.sysml`:
+
+```sysml board.sysml
+package Board {
+    private import SI::*;
+    private import USCustomaryUnits::*;
+    attribute w = 10 ['in'];
+    attribute area = w * (4 ['in']);
+    attribute speed = w / (2 [s]);
+}
+```
+
+```console
+$ $sysmlv2 eval board.sysml --lib "$lib" Board::w Board::area Board::speed
+Board::w = 10 [in]
+Board::area = 0.0258064 [m**2]
+Board::speed = 0.127 [m/s]
+$ $sysmlv2 eval board.sysml --lib "$lib" Board::w Board::area Board::speed --value-units as-written
+Board::w = 10 [in]
+Board::area = 40 [in**2]
+Board::speed = 5 [in/s]
+$ $sysmlv2 query board.sysml --lib "$lib" 'Board::speed * (3 [SI::min])' --value-units as-written
+900 [in]
+```
+
+`sysmlv2 lsp --value-hint-units si|as-written` sets the language server's default for value hints, range hints, violated-verdict code lenses and hover values, and a client's `initializationOptions.valueHintUnits` (`"si"` or `"asWritten"`) overrides it. Commands that print no values do not accept either flag.
 
 ## 11. `query` — ask the model questions
 
 `query` evaluates an ad-hoc KerML expression against the root namespace — the same expression language and evaluator as `eval`, pointed at the model from the outside. Two extensions apply only here (never to feature values in model files): `istype`/`as` classify a model element **closed-world** (a miss against a user-defined type answers `false` instead of undecided — the operand is the declaration itself, not a possibly-more-specific instance), and the reflection functions `ownedMember(x)` / `ownedFeature(x)` — the KerML derived properties, as functions — enumerate an element's owned members. Elements print as qualified name plus metaclass, sequences one item per line.
+
+`--number-format` and `--value-units` apply to a query's answer as they do to `eval`'s values ([number formats](#--number-format--how-non-terminating-results-print), [units](#--value-units--which-units-quantities-print-in)).
 
 A structural tour of the Annex A vehicle model:
 
@@ -1135,13 +1196,15 @@ SimpleVehicleModel::VehicleConfigurations::VehicleConfiguration_b::PartsTree::ve
 SimpleVehicleModel::VehicleConfigurations::VehicleConfiguration_b::PartsTree::vehicle_b::rearAxleAssembly (PartUsage)
 ```
 
-References in a query resolve from the *root* namespace, so type names are spelled fully qualified. `ownedFeature` follows the KerML derived property exactly: a usage owned by a *package* is an owned member but not an owned feature. The argument can itself be a chain — `vehicle_b`'s rear wheels:
+References in a query resolve from the *root* namespace, so type names are spelled fully qualified. `ownedFeature` follows the KerML derived property exactly: a usage owned by a *package* is an owned member but not an owned feature. The argument names any element, a nested one by its qualified name — `vehicle_b`'s rear wheels:
 
 ```console
-$ $sysmlv2 query "$vehicle" "ownedFeature($vb.rearAxleAssembly)->select { in p; p istype SimpleVehicleModel::Definitions::PartDefinitions::Wheel }"
+$ $sysmlv2 query "$vehicle" "ownedFeature($vb::rearAxleAssembly)->select { in p; p istype SimpleVehicleModel::Definitions::PartDefinitions::Wheel }"
 SimpleVehicleModel::VehicleConfigurations::VehicleConfiguration_b::PartsTree::vehicle_b::rearAxleAssembly::rearWheel1 (PartUsage)
 SimpleVehicleModel::VehicleConfigurations::VehicleConfiguration_b::PartsTree::vehicle_b::rearAxleAssembly::rearWheel2 (PartUsage)
 ```
+
+A feature chain is evaluated like any other expression, so it names one element only through single-valued receivers: `vehicle_b` is a package-owned usage that declares no multiplicity, a collection of any size, and `$vb.rearAxleAssembly` names no single element to reflect on.
 
 Reflection composes with evaluation: chain into the enumerated parts and collect their quantity-valued masses (the `[kg]` brackets need the standard library):
 
@@ -1160,9 +1223,9 @@ $ $sysmlv2 query "$vehicle" "size(ownedFeature($vb))"
 
 ## 12. `verify` — constraint verdicts, witnesses, proofs
 
-`verify` evaluates every constraint, requirement, and invariant body that carries its own result expression to a verdict — satisfied, VIOLATED (exit 1), or undecided with the reason:
+`verify` evaluates every constraint, requirement, and invariant body that carries its own result expression to a verdict — satisfied, VIOLATED (exit 1), or undecided with the reason. `--value-units as-written` writes the values behind a violated verdict, the narrowed ranges and the solver's witnesses in the units they were written in ([units](#--value-units--which-units-quantities-print-in)); the verdicts are the same:
 
-```sysml
+```sysml wing.sysml
 package FlightCheck {
     attribute wingArea = 52.5;
     attribute maxLoad = 4200;
@@ -1177,20 +1240,20 @@ package FlightCheck {
 ```console
 $ $sysmlv2 verify wing.sysml
 wing.sysml:6:34  capacity (AssertConstraintUsage): satisfied
-wing.sysml:7:32  strict (AssertConstraintUsage): VIOLATED
+wing.sysml:7:32  strict (AssertConstraintUsage): VIOLATED (with loading = 80)
 wing.sysml:8:37  unknownSpan (AssertConstraintUsage): undecided (unresolved reference `wingSpan`)
 1 satisfied, 1 violated, 1 undecided
 $ echo $?
 1
 ```
 
-Verdicts are deliberately cautious: a comparison involving an *unbound* feature is undecided, never a false `false` — which keeps the corpus at **0 violated** (ratcheted by `tests/check.rs`). A type default read through an unbound parameter or featured reference — a requirement's `subject` or `ref part`, an actor, a calculation input — is undecided because the instance bound later may override it. A fixed literal still decides; a fixed formula decides only when its inputs are known. This uncertainty survives aliases, conditionals, nested members and calculation calls, while concrete receivers still read their defaults. The same discipline covers cardinality: `size(xs)` over an unbound feature answers only what the declared multiplicity proves (an exact `[3]` answers 3, `[1..*]` settles `notEmpty`, anything else stays undecided). Propagation keeps unknown receiver members free; nested unknown receiver paths stay outside the supported fragment rather than conflating distinct instances. A feature with no value of its own reads the value of a feature it subsets when the two must be equal: it has at least one value and the subsetted feature at most one, so `subject :>> crawler :> tinycrawler;` reads `tinycrawler` when both are single-valued. It keeps its own reading when it says more than the subsetted feature, with members of its own or a type the subsetted feature does not have. An action, calculation or analysis usage written without a multiplicity stands for any number of performances, so a result read through it stays undecided until it declares `[1]`.
+Verdicts are deliberately cautious: a comparison involving an *unbound* feature is undecided, never a false `false` — which keeps the corpus at **0 violated** (ratcheted by `tests/check.rs`). A type default read through an unbound parameter or featured reference — a requirement's `subject` or `ref part`, an actor, a calculation input — is undecided because the instance bound later may override it. A fixed literal still decides; a fixed formula decides only when its inputs are known. This uncertainty survives aliases, conditionals, nested members and calculation calls, while concrete receivers still read their defaults. The same discipline covers cardinality: `size(xs)` over an unbound feature answers only what the declared multiplicity proves (an exact `[3]` answers 3, `[1..*]` settles `notEmpty`, anything else stays undecided). Propagation keeps unknown receiver members free; nested unknown receiver paths stay outside the supported fragment rather than conflating distinct instances. A feature with no value of its own reads the value of a feature it subsets when the two must be equal: it has at least one value and the subsetted feature at most one, so `subject :>> crawler :> tinycrawler;` reads `tinycrawler` when both are single-valued. It keeps its own reading when it says more than the subsetted feature, with members of its own or a type the subsetted feature does not have. An action, calculation or analysis usage written without a multiplicity stands for any number of performances, so a result read through it stays undecided until it declares `[1]`. So does a part, item, attribute or port that a package owns: when a chain through one leaves a constraint undecided, the reason names it and says to declare `[1]`. A chain through a feature of exact multiplicity reads each instance's value, read for the instance the chain goes through: with `part wheels : Wheel[4];`, `sum(wheels.mass)` adds four masses, and an instance that redefines by name what the wheels' values read (`attribute :>> rim = 18;`) is read with its redefinition. A result that is itself an instance (`wheels.tire`) stays undecided, and so does a rollup that a subsetting, a reference or a redefinition under another name would change. A binding connector (`bind each = six;`) gives a feature with no value of its own the other end's value, read for the instance the binding belongs to.
 
 ### Satisfaction claims — subject-bound verdicts
 
 A `satisfy R by x;` member claims that `x` satisfies requirement `R` — so `verify` binds `R`'s subject to `x` and evaluates every constraint reachable through the requirement's composition: nested `require` references with their parameter bindings, bodies inherited from requirement definitions, and assumption constraints. The claim gets one verdict, reported at the `satisfy` statement. The verdicts combine the way a requirement check does: each requirement's `assume` constraints imply its `require` constraints and the requirements it composes. A false assumption therefore satisfies the claim vacuously, and a claim stays undecided only when the known verdicts do not settle it. A plain `constraint` member of a requirement is not part of the check, `not satisfy R by x;` inverts the verdict, and `satisfy requirement : R by x;`, which declares its own requirement, is checked like a reference to one. When a claim is not satisfied, the constraints behind it follow, indented, with the values that decided them. The unbound originals keep their honest undecideds:
 
-```sysml
+```sysml freight.sysml
 package Freight {
     private import ISQ::*;
     private import SI::*;
@@ -1228,7 +1291,7 @@ package Freight {
 ```
 
 ```console
-$ $sysmlv2 verify freight.sysml --lib sysml.library
+$ $sysmlv2 verify freight.sysml --lib "$lib"
 freight.sysml:21:30  <anonymous> (ConstraintUsage): undecided (result is indeterminate over unbound features)
 freight.sysml:26:29  <anonymous> (ConstraintUsage): undecided (result is indeterminate over unbound features)
 freight.sysml:11:9  <anonymous> (SatisfyRequirementUsage, satisfies Freight::wagonSpec by wagon1): VIOLATED
@@ -1244,12 +1307,12 @@ The wagon's 950 kg is inside the 1000 kg laden cap but over the 900 kg empty cap
 
 With `--ranges`, every unbound feature gets an interval domain that the asserted constraints contract by bidirectional propagation. There is no external solver — it is ~300 lines of interval arithmetic in `sysmlv2-solve`. The result is a **finite range per feature** plus verdict upgrades that are definitive (a range holds for *every* consistent assignment): a body that is true over the whole narrowed domain is satisfied, one that is false everywhere is VIOLATED, and a domain that contracts to empty (`∅`) proves the constraint unsatisfiable. If a feature definition is outside the supported fragment, narrowed ranges remain useful, but a positive propagation verdict must also hold over the original declaration domains. Otherwise propagation reports the approximation and leaves verification to the solver.
 
-```sysml
+```sysml demo.sysml
 package Demo {
     attribute def Real;
     attribute def Integer;
-    attribute wingSpan : Real;
-    attribute count : Integer;
+    attribute wingSpan : Real[1];
+    attribute count : Integer[1];
 
     assert constraint span_lo { wingSpan >= 10 }
     assert constraint span_hi { wingSpan <= 200 }
@@ -1259,9 +1322,9 @@ package Demo {
 
 ```console
 $ $sysmlv2 verify demo.sysml --ranges
-demo.sysml:6:33  span_lo (AssertConstraintUsage): satisfied (propagation: holds for all values in the narrowed ranges)
-demo.sysml:7:33  span_hi (AssertConstraintUsage): satisfied (propagation: holds for all values in the narrowed ranges)
-demo.sysml:8:29  bad (AssertConstraintUsage): VIOLATED (propagation: domains contract to empty — unsatisfiable)
+demo.sysml:7:33  span_lo (AssertConstraintUsage): satisfied (propagation: holds for all values in the narrowed ranges)
+demo.sysml:8:33  span_hi (AssertConstraintUsage): satisfied (propagation: holds for all values in the narrowed ranges)
+demo.sysml:9:29  bad (AssertConstraintUsage): VIOLATED (propagation: domains contract to empty — unsatisfiable)
 2 satisfied, 1 violated, 0 undecided
 
 narrowed ranges:
@@ -1277,12 +1340,12 @@ With `--solve` (and a `z3` binary on `PATH`, or `--z3 <path>`), propagation runs
 
 Bound features *inline their defining expressions*, so a constraint over derived values solves in terms of the underlying unknowns — here Z3 handles the nonlinear volume of a tank whose height is tied to its radius, and the witness names only the free variable:
 
-```sysml
+```sysml tank.sysml
 package Tank {
     attribute def Real;
-    attribute radius : Real;
-    attribute height : Real = radius * 2.0;
-    attribute volume : Real = 3.14159 * radius * radius * height;
+    attribute radius : Real[1];
+    attribute height : Real[1] = radius * 2.0;
+    attribute volume : Real[1] = 3.14159 * radius * radius * height;
 
     assert constraint fits { volume <= 50.0 & radius >= 1.0 }
 }
@@ -1355,6 +1418,24 @@ n6 -- n8 : c1
 
 The **state** and **action** views render behavior in the PlantUML state-diagram dialect. States and actions become (composite) `state` nodes; transitions become edges labelled `trigger [guard] / effect`; a succession from an unspelled or `start`/`done` end becomes the `[*]` initial/final pseudostate; entry/do/exit subactions become description lines; fork/join nodes map to the built-in bar shapes and decision/merge to `<<choice>>`; flows inside actions draw dashed. Packages and parts are transparent containers here — a `state def` in a package or an `exhibit state` inside a part is found wherever it lives.
 
+Given `doors.sysml`:
+
+```sysml doors.sysml
+package Ctrl {
+    item def OpenCmd;
+    item def CloseCmd;
+    attribute ready : Boolean;
+    action def Notify;
+    state def DoorStates {
+        entry; then Closed;
+        state Closed;
+        state Open;
+        transition t1 first Closed accept OpenCmd if ready then Open;
+        transition first Open accept CloseCmd do action notifier : Notify then Closed;
+    }
+}
+```
+
 ```console
 $ $sysmlv2 viz doors.sysml --view state
 @startuml
@@ -1369,6 +1450,30 @@ state "DoorStates" as n1 <<state def>> {
 ```
 
 The **sequence** view mirrors the Pilot's SEQUENCE mode: lifelines for the parts that exchange messages, `->>` arrows for flow-family usages (the `message` spelling included). Message ends spelled through events (`message m from producer.pub_evt to server.rcv_evt`) attach to the event's owning part; plain part ends still render. Messages sort by the events' succession partial order — `event occurrence a; then event occurrence b;` orders a lifeline, and that order wins over message declaration order. Participants group `box "Owner" … end box` per owning definition. (`--horizontal` is ignored — the sequence dialect has no direction line.)
+
+Given `pubsub.sysml`, where `publish_message` is declared first but the server's events order `subscribe_message` before it:
+
+```sysml pubsub.sysml
+package Seq {
+    part def PubSubSequence {
+        part producer {
+            event occurrence publish_source;
+        }
+        message publish_message from producer.publish_source to server.publish_target;
+        part server {
+            event occurrence subscribe_target;
+            then event occurrence publish_target;
+            then event occurrence deliver_source;
+        }
+        message subscribe_message from consumer.subscribe_source to server.subscribe_target;
+        message deliver_message from server.deliver_source to consumer.deliver_target;
+        part consumer {
+            event occurrence subscribe_source;
+            then event occurrence deliver_target;
+        }
+    }
+}
+```
 
 ```console
 $ $sysmlv2 viz pubsub.sysml --view sequence
@@ -1398,9 +1503,9 @@ Cross-view options:
 - `--line-style polyline|ortho` picks edge routing; `--color` keys node backgrounds on the metaclass family.
 - `--link-template "vscode://file/{file}:{line}"` embeds `[[url]]` hyperlinks on every node (placeholders `{file}`, `{line}`, `{col}`, `{qname}`, `{id}`) — PlantUML carries them into rendered SVG, so diagram nodes click through to their source declarations.
 
-`--element <qualified::name>` roots the diagram at one element, `--horizontal` lays it out left-to-right, `--no-values` drops the `= value` suffixes (tree view), and `--lib` names standard-library references in labels (library elements never render as nodes by default; their ports still render on the usages they type). In the tree view, attribute-family usages become compartment lines on their owner; everything else usage-shaped becomes a node with a composition edge.
+`--element <qualified::name>` roots the diagram at one element, `--horizontal` lays it out left-to-right, `--no-values` drops the `= value` suffixes (tree view) and `--value-units as-written` writes their quantities in the units they were written in ([`--value-units`](#--value-units--which-units-quantities-print-in)), and `--lib` names standard-library references in labels (library elements never render as nodes by default; their ports still render on the usages they type). In the tree view, attribute-family usages become compartment lines on their owner, and so does a member introduced in a role of its own, led by the role's keyword: a requirement's or case's `subject`, `actor`, `stakeholder`, `objective` (its own `require` and `verify` members in braces), `return` parameter, `assume` and `require` constraints (`require underLimit { vehicle.mass <= limit }`), `frame`d concerns and `verify`d requirements, an `include`d use case, a state's `entry`, `do` and `exit` actions, and an `end` feature that is not a port. A calculation's, constraint's or case's result expression is a line spelled by the expression alone, and a port's directed features lead with their direction (`in fuel : Fuel`). Everything else usage-shaped becomes a node with a composition edge.
 
-```console
+```console ignore
 $ $sysmlv2 viz model.sysml --lib "$lib" --element Vehicles::Vehicle -o vehicle.puml
 $ java -jar plantuml.jar -tsvg vehicle.puml
 ```
@@ -1411,7 +1516,7 @@ Every non-library corpus file emits a balanced diagram for every view (`sysmlv2-
 
 A *view usage* carries its own diagram definition: `expose` picks the elements (with the model's `filter` conditions applied through the same machinery that governs import visibility), and `render` picks the style. A view without a `render` member of its own takes the rendering it inherits, so `view wiring : Wiring;` over `view def Wiring { render Views::asInterconnectionDiagram; }` draws an interconnection diagram, and its own `render` member would win over the inherited one. Pointing `--element` at a view renders exactly that slice — `--view` is only needed to override the view's own choice:
 
-```sysml
+```sysml slice.sysml
 package Stage {
     metadata def LOUD;
     port def Jack;
@@ -1434,7 +1539,7 @@ package Stage {
 ```
 
 ```console
-$ $sysmlv2 viz slice.sysml --element Stage::quiet --lib sysml.library
+$ $sysmlv2 viz slice.sysml --element Stage::quiet --lib "$lib"
 @startuml
 rectangle "amp : Amp" as n1 <<part>> {
   port "line : Jack" as n2
@@ -1462,7 +1567,9 @@ package M {
     private import ScalarValues::*;
     attribute mass : Real;
 }
+```
 
+```console ignore
 $ git show HEAD:model.sysml | $sysmlv2 check -            # check a past revision
 $ curl -s https://example.org/model.json | $sysmlv2 convert - --to text
 $ $sysmlv2 lint --format json src/*.sysml | jq '.summary'  # machine-readable findings (check too)
@@ -1479,7 +1586,7 @@ The compact element array also serializes as **s2c**, a deterministic CBOR encod
 ```console
 $ $sysmlv2 convert "$vehicle" --to compact-cbor -o vehicle.s2c
 $ xxd -l 16 vehicle.s2c
-00000000: d9d9 f7da 2453 3243 841b 0000 0001 0001  ....$S2C........
+00000000: d9d9 f7da 2453 3243 861b 0000 0001 0001  ....$S2C........
 ```
 
 The first eight bytes are the file magic (self-described-CBOR tag 55799 wrapping application tag `0x24533243`, "`$S2C`"); the payload is one valid CBOR item, so generic CBOR tooling reads it too. On the vehicle model (6,405 elements):
@@ -1513,8 +1620,8 @@ $ printf 'package Drive { part def Motor; part m : Motor; part def Battery { att
 $ $sysmlv2 convert v1.sysml --to compact-cbor -o base.s2c
 $ $sysmlv2 convert v2.sysml --to compact-cbor --delta-base base.s2c -o commit.s2c
 $ ls -l base.s2c commit.s2c | awk '{print $5, $9}'
-278 base.s2c
-208 commit.s2c
+265 base.s2c
+212 commit.s2c
 ```
 
 The delta names its base by content digest and refuses a wrong base hard; applying it reproduces the target exactly:
@@ -1567,13 +1674,22 @@ Every mode of the `payload` verb works **at payload identity**: files are read e
 
 ```console
 $ $sysmlv2 convert v1.sysml --to compact-json -o state1.json
-$ # …rename Motor to TractionMotor in place, every @id untouched…
+$ sed 's/"declaredName": "Motor"/"declaredName": "TractionMotor"/' state1.json > state2.json   # rename in place, every @id untouched
 $ $sysmlv2 payload state2.json --delta-from state1.json \
     --claim-commit 8c56a141-4dbd-4c4a-b3dc-6a05e2eb4bd0 -o commit.s2c
 $ $sysmlv2 payload commit.s2c | jq '.delta | {changes, claims}'
 {
-  "changes": { "creates": 0, "deletes": 0, "updates": 1 },
-  "claims": [ { "id": "8c56a141-4dbd-4c4a-b3dc-6a05e2eb4bd0", "key": 1 } ]
+  "changes": {
+    "creates": 0,
+    "deletes": 0,
+    "updates": 1
+  },
+  "claims": [
+    {
+      "id": "8c56a141-4dbd-4c4a-b3dc-6a05e2eb4bd0",
+      "key": 1
+    }
+  ]
 }
 ```
 
@@ -1621,8 +1737,20 @@ $ $sysmlv2 payload --tables -o s2c-tables.json
 $ jq '{magic, versions, flags}' s2c-tables.json
 {
   "magic": "d9d9f7da24533243",
-  "versions": { "layout": 1, "scheme": 2, "tables": 1 },
-  "flags": { "delta": 4, "deltaPortable": 8, "elideIds": 1, "explicitIds": 64, "fullForm": 2, "impliedOwners": 32, "unitPaths": 16 }
+  "versions": {
+    "layout": 1,
+    "scheme": 2,
+    "tables": 1
+  },
+  "flags": {
+    "delta": 4,
+    "deltaPortable": 8,
+    "elideIds": 1,
+    "explicitIds": 64,
+    "fullForm": 2,
+    "impliedOwners": 32,
+    "unitPaths": 16
+  }
 }
 $ jq '.metaclasses[] | select(.name == "AcceptActionUsage") | .fields[15]' s2c-tables.json
 {
@@ -1644,10 +1772,10 @@ $ export SYSMLV2_AMBIENT=off  # measure the 94-unit official library alone
 $ $sysmlv2 convert --library --lib "$lib" --to compact-json -o stdlib.json
 $ $sysmlv2 convert --library --lib "$lib" --to compact-cbor -o stdlib.s2c
 $ jq length stdlib.json
-91405
+91407
 $ ls -l stdlib.json stdlib.s2c | awk '{print $5, $9}'
-45432383 stdlib.json
-3586617 stdlib.s2c
+45435243 stdlib.json
+3586034 stdlib.s2c
 ```
 
 (The binary form also benefits from implied ownership backpointers — `CBOR.md`, flag 0x20: backpointers that match their derivation from the forward ownership lists never reach the wire, ~10% of this payload.)
@@ -1656,34 +1784,37 @@ The export is deterministic, internally complete (no dangling references; its on
 
 ```console
 $ $sysmlv2 payload stdlib.json | jq .stateDigest
-"c64e4daa-4a49-5052-8adb-d038c3ac6202"
+"940eb782-e7b9-545d-a547-e4355ae1da97"
 $ $sysmlv2 payload stdlib.s2c | jq .stateDigest
-"c64e4daa-4a49-5052-8adb-d038c3ac6202"
+"940eb782-e7b9-545d-a547-e4355ae1da97"
 ```
 
-Named library elements carry ids derived from their qualified names (KerML 9.1 — identical across conforming implementations, stable across releases while the name is stable). Truly unnamed elements keep this toolkit's deterministic path-based ids: the norm's positional ids count an implementation's implied-relationship closure, so no portable spelling exists for them — and being unnamed, they are never the target of a cross-model reference. Unset `SYSMLV2_AMBIENT` after reproducing these official-library-only numbers to restore ambient libraries. Byte counts and digests above use the pinned library. `--library` takes no inputs (the `--lib` directory is the input) and targets `compact-json` and `compact-cbor`.
+Named library elements carry ids derived from their qualified names (KerML 9.1 — identical across conforming implementations, stable across releases while the name is stable). Truly unnamed elements keep this toolkit's deterministic path-based ids: the norm's positional ids count an implementation's implied-relationship closure, so no portable spelling exists for them — and most are never the target of a cross-model reference; text reaches the others only by the name their membership implies (a `return : T;` is `result`, a `subject : V;` is `subj`). Unset `SYSMLV2_AMBIENT` after reproducing these official-library-only numbers to restore ambient libraries. Byte counts and digests above use the pinned library. `--library` takes no inputs (the `--lib` directory is the input) and targets `compact-json` and `compact-cbor`.
 
 ## 16. Ambient model and library directories
 
-Every section above named its input files explicitly. When `SYSMLV2_MODEL_DIR` names a directory, its `.sysml`/`.kerml` files (collected depth-first with siblings in name order; hidden entries skipped) stand in for omitted inputs. Explicit files always win — the variable only fills an absence — and a stderr note records when it did, so output never silently depends on ambient state:
+Every section above named its input files explicitly. When `SYSMLV2_MODEL_DIR` names a directory, its `.sysml`/`.kerml` files (collected depth-first with siblings in name order; hidden entries skipped) stand in for omitted inputs. Explicit files always win — the variable only fills an absence — and a stderr note records when it did, so output never silently depends on ambient state. Given a directory `rover/` holding `chassis.sysml`:
 
-```console
-$ ls rover/
-chassis.sysml   power.sysml
-$ cat rover/chassis.sysml
+```sysml rover/chassis.sysml
 package Chassis {
     part def Frame {
         attribute mass = 42.0;
     }
 }
-$ cat rover/power.sysml
+```
+
+and `power.sysml`:
+
+```sysml rover/power.sysml
 package Rover {
     private import Chassis::*;
-    part base : Frame;
+    part base : Frame[1];
     attribute payload = 8.5;
     attribute totalMass = base.mass + payload;
 }
+```
 
+```console
 $ export SYSMLV2_MODEL_DIR=rover
 $ $sysmlv2 check
 sysmlv2: model = 2 files from rover (SYSMLV2_MODEL_DIR)
@@ -1758,7 +1889,7 @@ mass                         AttributeUsage
 
 `extract` and `inline` move a model between the usage-oriented and definition-oriented styles. Both directions run the transformation engine's verified commit: every carried reference is checked at its new home, and a refusal names its reason and leaves every file untouched. Given `model.sysml`:
 
-```sysml
+```sysml model.sysml
 package Rig {
     part def A;
     part engine : A {
@@ -1770,7 +1901,7 @@ package Rig {
 `--dry-run` prints the would-be changes as one trimmed hunk per file and writes nothing:
 
 ```console
-$ sysmlv2 refactor extract model.sysml Rig::engine --dry-run
+$ $sysmlv2 refactor extract model.sysml Rig::engine --dry-run
 --- model.sysml
 @@ -3,3 +3,4 @@
 -    part engine : A {
@@ -1785,7 +1916,7 @@ $ sysmlv2 refactor extract model.sysml Rig::engine --dry-run
 Without it, changed files are rewritten in place (the summary goes to stderr; `--name` overrides the UpperCamel default). A multi-file edit preflights every target, stages same-directory replacement and rollback copies, and restores already-replaced files if a later replacement fails. Before rollback it rechecks each source; if one changed after replacement, the external edit is preserved and the error names the retained recovery copy instead. Native Unix writes retain the source's owner, group, mode, and extended attributes, and refuse files with multiple hard links rather than silently splitting their contents. Success summaries appear only after the whole write completes:
 
 ```console
-$ sysmlv2 refactor extract model.sysml Rig::engine
+$ $sysmlv2 refactor extract model.sysml Rig::engine
 extracted 'Engine' from `Rig::engine` — rewrote model.sysml
 $ cat model.sysml
 package Rig {
@@ -1800,14 +1931,14 @@ package Rig {
 Inlining the definition just produced restores the original file byte-for-byte (the one-sided inverse the engine gates promise):
 
 ```console
-$ sysmlv2 refactor inline model.sysml Rig::Engine
+$ $sysmlv2 refactor inline model.sysml Rig::Engine
 inlined `Rig::Engine` — rewrote model.sysml
 ```
 
 Refusals are named, not stack traces — an ineligible target, a taken name, outside references through a definition:
 
 ```console
-$ sysmlv2 refactor extract model.sysml Rig::A
+$ $sysmlv2 refactor extract model.sysml Rig::A
 error: extract refused: not an extractable usage (metaclass PartDefinition)
 ```
 
@@ -1817,7 +1948,7 @@ Inline reports imports its deletion leaves unused as `note:` lines on stderr and
 
 `refactor split` takes a package apart: every nested package moves to its own file under a directory named after the root file (`--dir` overrides it; `--slug` restricts file names to letters, digits, `.`, `_` and `-`), dedented, with every reference to something outside it spelled in full, and the root package re-exports each one with a `public import` (or a public alias when a package had to be renamed to avoid a root-level collision), so every qualified reference through the root keeps resolving. Given `model.sysml`:
 
-```sysml
+```sysml model.sysml
 package Root {
     part def Frame;
     package Chassis {
@@ -1889,6 +2020,14 @@ clean
 $ $sysmlv2 lsp --help | head -1
 Run the Language Server Protocol server over stdio
 ```
+
+Value hints and hover values show a quantity in the evaluator's units by default: a bracket's unit, kept through sums and scaling (`d + 1 [ft]` with `d = 10 ['in']` is `22 [in]`), and SI units for a product, quotient or power (`d / (2 [s])` is `0.127 [m/s]`). A client that sends `initializationOptions.valueHintUnits: "asWritten"` gets each value in the units it was written in instead, where those units cover its dimensions. The first rule that applies picks the unit:
+
+1. a unit the value was written with, or an integer power of one, that has the value's dimensions (`60 [mi] / (1 [h]) * (30 [min])` is `30 [mi]`, `d * d` is `100 [in**2]`);
+2. a named unit with several dimensions the value was written with, times written units for the dimensions it leaves (`10 [N] * (2 [ft])` is `20 [N*ft]`, `10 [N] / (2 ['in'] * (1 ['in']))` is `5 [N/in**2]`);
+3. a written unit for each dimension that has one and the SI unit for the others, mass in kilograms (`d / (2 [s])` is `5 [in/s]`, `2 [lb] * 32.174 [ft] / (1 [s]) ** 2` is `64.348 [ft*lb/s**2]`).
+
+Each dimension takes the first unit written for it, so a value never mixes two units of one dimension: `60 [km/h] / (10 [s])` is `21600 [km/h**2]`. A unit that converts with the SI unit's own factor keeps the evaluator's spelling, so `10 [N] / (5 [kg])` stays `2 [m/s**2]`, and a value written in SI units alone reads as SI writes it: `10 [N] * (2 [m])` stays `20 [J]`. The conversion factors are exact, so the re-expressed magnitude is as exact as the original. `"si"` asks for the evaluator's units; a value that is neither is ignored with a warning, and the server's default stays. Hover shows the other reading alongside when the two differ: `= 0.127 [m/s] (as written: 5 [in/s])`. The same choice applies to propagated range hints (`∈ [−∞, 30] [in**2]` for a bound written `d * (3 ['in'])`, `∈ [−∞, 0.0193548] [m**2]` by default) and to the values in a violated verdict's code lens (`✗ VIOLATED (with v = 5 [in/s])`). For an editor that cannot send initialization options, `sysmlv2 lsp --value-hint-units as-written` makes the written units the server's default; the client's option still wins.
 
 ---
 

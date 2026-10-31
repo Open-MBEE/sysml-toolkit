@@ -88,42 +88,6 @@ fn warn_library_cache(warnings: &[String]) {
     }
 }
 
-/// Inverse of [`flexo_payload`] for Flexo *responses*: unwrap
-/// `{payload, identity}` change records when present and normalize the
-/// server's empty-string property values back to null, so the element
-/// list lifts like ordinary interchange JSON.
-fn flexo_unwrap(value: serde_json::Value) -> serde_json::Value {
-    fn empties_to_null(v: &mut serde_json::Value) {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (_, val) in map.iter_mut() {
-                    if val.as_str() == Some("") {
-                        *val = serde_json::Value::Null;
-                    } else {
-                        empties_to_null(val);
-                    }
-                }
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(empties_to_null),
-            _ => {}
-        }
-    }
-    let serde_json::Value::Array(items) = value else {
-        return value;
-    };
-    let wrapped = !items.is_empty()
-        && items
-            .iter()
-            .all(|r| r.get("payload").is_some() && r.get("identity").is_some());
-    let mut elements: Vec<serde_json::Value> = if wrapped {
-        items.into_iter().map(|mut r| r["payload"].take()).collect()
-    } else {
-        items
-    };
-    elements.iter_mut().for_each(empties_to_null);
-    serde_json::Value::Array(elements)
-}
-
 /// Flexo MMS commit conventions: name each root namespace after its source
 /// file (Flexo stores the file name in the root's `qualifiedName` and
 /// splits documents on it when reading back), then wrap every element as a
@@ -233,26 +197,6 @@ fn has_extension(name: impl AsRef<Path>, ext: &str) -> bool {
 fn is_model_source(name: impl AsRef<Path>) -> bool {
     let name = name.as_ref();
     has_extension(name, "sysml") || has_extension(name, "kerml")
-}
-
-/// File name for one split document: the root namespace's recorded name
-/// when it is a plain model file name (the Flexo convention), else a
-/// numbered fallback.
-fn doc_file_name(root_name: Option<&str>, index: usize) -> String {
-    if let Some(name) = root_name {
-        let base = Path::new(name)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let safe = !base.is_empty()
-            && base
-                .chars()
-                .all(|c| c != ':' && c != '*' && c != '?' && c != '"');
-        if safe && is_model_source(&base) {
-            return base;
-        }
-    }
-    format!("document-{}.sysml", index + 1)
 }
 
 /// Persist the outcomes recorded by the first build after [`load_library`]
@@ -378,6 +322,76 @@ fn with_number_format<T>(
     let out = body();
     NUMBER_FORMAT.with(|slot| slot.set(previous));
     out
+}
+
+/// Which units a printed quantity is written in: `--value-units` and
+/// `lsp --value-hint-units`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ValueUnits {
+    /// The evaluator's units: a bracket's unit, kept through sums and
+    /// scaling, and SI units for a product, quotient or power
+    Si,
+    /// The units each value was written in, where they cover its
+    /// dimensions
+    AsWritten,
+}
+
+impl From<ValueUnits> for sysmlv2_parser::eval::UnitDisplay {
+    fn from(units: ValueUnits) -> Self {
+        match units {
+            ValueUnits::Si => sysmlv2_parser::eval::UnitDisplay::Si,
+            ValueUnits::AsWritten => sysmlv2_parser::eval::UnitDisplay::AsWritten,
+        }
+    }
+}
+
+/// `--value-units` for the commands that print computed values.
+#[derive(clap::Args, Clone, Debug, Default)]
+struct ValueUnitsArg {
+    /// Which units a computed quantity prints in: si (the default) keeps
+    /// the evaluator's units, SI for a product, quotient or power
+    /// (`10 ['in'] / (2 [s])` prints `0.127 [m/s]`); as-written uses the
+    /// units the value was written in where they cover its dimensions
+    /// (`5 [in/s]`). The values are the same either way
+    #[arg(long = "value-units", value_enum, value_name = "UNITS")]
+    value_units: Option<ValueUnits>,
+}
+
+thread_local! {
+    /// The `--value-units` of the command running on this thread, set by
+    /// [`with_value_units`] around its dispatch only; anything else
+    /// (library callers of the `run_*` functions) prints the evaluator's
+    /// units.
+    static VALUE_UNITS: std::cell::Cell<sysmlv2_parser::eval::UnitDisplay> =
+        const { std::cell::Cell::new(sysmlv2_parser::eval::UnitDisplay::Si) };
+}
+
+fn value_units() -> sysmlv2_parser::eval::UnitDisplay {
+    VALUE_UNITS.with(std::cell::Cell::get)
+}
+
+/// Run `body` with `units` as this thread's value units (the evaluator's
+/// when `None`), restoring the previous ones after.
+fn with_value_units<T>(units: Option<ValueUnits>, body: impl FnOnce() -> T) -> T {
+    let units = units.map_or(sysmlv2_parser::eval::UnitDisplay::Si, Into::into);
+    let previous = VALUE_UNITS.with(|slot| slot.replace(units));
+    let out = body();
+    VALUE_UNITS.with(|slot| slot.set(previous));
+    out
+}
+
+/// `v` as printed: in this thread's value units, then its own display in
+/// this thread's number format.
+fn print_value(
+    resolved: &sysmlv2_parser::json::ResolvedModel,
+    v: &sysmlv2_parser::eval::Value,
+) -> String {
+    match value_units() {
+        sysmlv2_parser::eval::UnitDisplay::AsWritten => resolved
+            .quantities_as_written(v)
+            .to_string_with(&number_format()),
+        sysmlv2_parser::eval::UnitDisplay::Si => v.to_string_with(&number_format()),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -511,9 +525,14 @@ enum Command {
         /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
-        /// Flexo MMS conventions on JSON output: each root namespace's
+        /// Flexo MMS conventions. On JSON output, each root namespace's
         /// qualifiedName is set to its source file name and every element
-        /// is wrapped as a `{payload, identity}` change record
+        /// is wrapped as a `{payload, identity}` change record. On JSON
+        /// input, change records are unwrapped, empty-string values read
+        /// as null, and the ownership back-references Flexo omits
+        /// (`owningRelationship`, `owningRelatedElement`) derived from the
+        /// owners' `ownedRelationship` and `ownedRelatedElement`; without
+        /// it, a payload omitting them is refused
         #[arg(long)]
         flexo: bool,
         /// JSON → text only: respell every reference with the shortest
@@ -859,10 +878,13 @@ enum Command {
                             \x20 sysmlv2 verify model.sysml\n\
                             \x20 sysmlv2 verify model.sysml --ranges\n\
                             \x20 sysmlv2 verify model.sysml --solve\n\
+                            \x20 sysmlv2 verify model.sysml --ranges --value-units as-written\n\
                             \x20 sysmlv2 verify src/*.sysml --lib spec-refs/SysML-v2-Release/sysml.library")]
     Verify {
         #[command(flatten)]
         number_format: NumberFormatArg,
+        #[command(flatten)]
+        value_units: ValueUnitsArg,
         /// Input files (.sysml or .kerml) forming one model; `-` reads
         /// stdin; optional when SYSMLV2_MODEL_DIR is set
         files: Vec<PathBuf>,
@@ -893,10 +915,13 @@ enum Command {
                             \x20 sysmlv2 eval model.sysml Demo::car::mass\n\
                             \x20 sysmlv2 eval model.sysml --all --lib spec-refs/SysML-v2-Release/sysml.library\n\
                             \x20 sysmlv2 eval a.sysml b.sysml --all\n\
-                            \x20 sysmlv2 eval model.sysml 'Pkg::totalMass' 'Pkg::cost'")]
+                            \x20 sysmlv2 eval model.sysml 'Pkg::totalMass' 'Pkg::cost'\n\
+                            \x20 sysmlv2 eval model.sysml Pkg::speed --value-units as-written")]
     Eval {
         #[command(flatten)]
         number_format: NumberFormatArg,
+        #[command(flatten)]
+        value_units: ValueUnitsArg,
         /// Input file (.sysml or .kerml), or `-` for stdin; optional when
         /// SYSMLV2_MODEL_DIR is set (a leading qualified name is then a
         /// name, not a file)
@@ -932,11 +957,14 @@ enum Command {
                       \x20 sysmlv2 query model.sysml 'ownedFeature(Vehicle)->select { in p; p istype Wheel }'\n\
                       \x20 sysmlv2 query model.sysml 'Demo::car.totalMass + 10'\n\
                       \x20 sysmlv2 query a.sysml b.sysml 'size(ownedMember(Demo))'\n\
-                      \x20 cat model.sysml | sysmlv2 query - 'ownedFeature(Vehicle)'"
+                      \x20 cat model.sysml | sysmlv2 query - 'ownedFeature(Vehicle)'\n\
+                      \x20 sysmlv2 query model.sysml 'Demo::car.range / Demo::car.time' --value-units as-written"
     )]
     Query {
         #[command(flatten)]
         number_format: NumberFormatArg,
+        #[command(flatten)]
+        value_units: ValueUnitsArg,
         /// Input file (.sysml or .kerml), or `-` for stdin; optional when
         /// SYSMLV2_MODEL_DIR is set (the expression alone then suffices)
         input: Option<PathBuf>,
@@ -1031,6 +1059,7 @@ enum Command {
                             \x20 sysmlv2 viz model.sysml --view interconnection\n\
                             \x20 sysmlv2 viz model.sysml --element Pkg::Part -o part.puml\n\
                             \x20 sysmlv2 viz model.sysml --view mixed --color --link-template \"vscode://file/{file}:{line}\"\n\
+                            \x20 sysmlv2 viz model.sysml --value-units as-written\n\
                             \x20 sysmlv2 viz src/*.sysml --lib sysml.library/ | java -jar plantuml.jar -tsvg -p > model.svg")]
     Viz {
         /// Files to render; `-` reads stdin; optional when
@@ -1054,6 +1083,8 @@ enum Command {
         /// Omit `= value` on attribute compartment lines
         #[arg(long)]
         no_values: bool,
+        #[command(flatten)]
+        value_units: ValueUnitsArg,
         /// Omit comment/doc bodies (attached as notes by default)
         #[arg(long)]
         no_notes: bool,
@@ -1119,6 +1150,7 @@ enum Command {
                             (.kerml is KerML, everything else SysML).\n\n\
                             EXAMPLES:\n\
                             \x20 sysmlv2 lsp    (as an editor's configured server command)\n\
+                            \x20 sysmlv2 lsp --value-hint-units as-written\n\
                             \x20 vim.lsp.start { cmd = { 'sysmlv2', 'lsp' } }    (Neovim config)")]
     Lsp {
         /// Standard-library directory: hover/definition/references/rename
@@ -1129,6 +1161,17 @@ enum Command {
         /// client's `initializationOptions.numberFormat` overrides it
         #[command(flatten)]
         number_format: NumberFormatArg,
+        /// Which units value hints, range hints, violated-verdict code
+        /// lenses and hover values show quantities in: si (the default)
+        /// or as-written (see --value-units on eval); a client's
+        /// `initializationOptions.valueHintUnits` overrides it
+        #[arg(
+            long = "value-hint-units",
+            alias = "value-units",
+            value_enum,
+            value_name = "UNITS"
+        )]
+        value_hint_units: Option<ValueUnits>,
     },
 }
 
@@ -1228,8 +1271,8 @@ fn render_query_value(
     v: &sysmlv2_parser::eval::Value,
 ) -> String {
     if let sysmlv2_parser::eval::Value::Element(e)
-    | sysmlv2_parser::eval::Value::Unbound(e)
-    | sysmlv2_parser::eval::Value::UnboundMember(e) = v
+    | sysmlv2_parser::eval::Value::Unbound(e, _)
+    | sysmlv2_parser::eval::Value::UnboundMember(e, _) = v
     {
         let ty = resolved.element_type(*e);
         return match resolved.element_qualified_name(*e) {
@@ -1237,7 +1280,7 @@ fn render_query_value(
             None => format!("<anonymous> ({ty})"),
         };
     }
-    v.to_string_with(&number_format())
+    print_value(resolved, v)
 }
 
 /// `--indent` values: `tabs`, or a space count 1–16.
@@ -1629,6 +1672,7 @@ fn codec_tables_doc() -> serde_json::Value {
             "deltaPortable": sysmlv2_cbor::FLAG_DELTA_PORTABLE,
             "unitPaths": sysmlv2_cbor::FLAG_UNIT_PATHS,
             "impliedOwners": sysmlv2_cbor::FLAG_IMPLIED_OWNERS,
+            "explicitIds": sysmlv2_cbor::FLAG_EXPLICIT_IDS,
         },
         "kinds": {
             "bool": tables::K_BOOL,
@@ -1878,6 +1922,24 @@ fn json_input(
     }
     serde_json::from_str(text).map_err(|e| {
         eprintln!("error: invalid JSON: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+/// Validate the whole ownership graph before splitting can hide shared children.
+fn conversion_json_input(
+    decoded: Option<serde_json::Value>,
+    text: &str,
+    flexo: bool,
+) -> Result<serde_json::Value, ExitCode> {
+    let value = json_input(decoded, text)?;
+    let result = if flexo {
+        sysmlv2_transform::unwrap_flexo(value)
+    } else {
+        sysmlv2_parser::lift::validate_ownership(&value).map(|()| value)
+    };
+    result.map_err(|e| {
+        eprintln!("error: invalid ownership: {e}");
         ExitCode::FAILURE
     })
 }
@@ -3069,9 +3131,10 @@ fn with_bindings(
     if !matches!(cat, VerdictCat::Vio) {
         return line;
     }
+    let units = value_units();
     let vals: Vec<String> = bindings
         .iter()
-        .filter_map(|b| b.value.as_ref().map(|v| format!("{} = {v}", b.feature)))
+        .filter_map(|b| b.value_in(units).map(|v| format!("{} = {v}", b.feature)))
         .collect();
     if vals.is_empty() {
         line
@@ -3161,6 +3224,7 @@ fn verify_and_report(
     } else {
         let cfg = SolverConfig {
             z3_path: z3,
+            value_units: value_units(),
             ..Default::default()
         };
         let report = match sysmlv2_solve::verify_constraints(
@@ -3254,12 +3318,20 @@ fn verify_and_report(
     ))?;
     if !narrowed.is_empty() {
         stdout_result(writeln!(out, "\nnarrowed ranges:"))?;
+        let units = value_units();
         for r in &narrowed {
-            stdout_result(match &r.unit {
-                // `range_approx` is in the `--number-format` the run
-                // was given (exact unless one was).
-                Some(u) => writeln!(out, "  {} ∈ {} [{u}]", r.feature, r.range_approx),
-                None => writeln!(out, "  {} ∈ {}", r.feature, r.range_approx),
+            // `range_approx` is in the `--number-format` the run was
+            // given (exact unless one was), and in the units its bounds
+            // were written in under `--value-units as-written`.
+            let (range, unit) = match (&r.as_written, units) {
+                (Some(w), sysmlv2_parser::eval::UnitDisplay::AsWritten) => {
+                    (&w.range_approx, Some(&w.unit))
+                }
+                _ => (&r.range_approx, r.unit.as_ref()),
+            };
+            stdout_result(match unit {
+                Some(u) => writeln!(out, "  {} ∈ {range} [{u}]", r.feature),
+                None => writeln!(out, "  {} ∈ {range}", r.feature),
             })?;
         }
     }
@@ -3335,13 +3407,6 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
         Ok(files) => files,
         Err(code) => return code,
     };
-    if flexo && matches!(to, Target::CompactCbor | Target::FullCbor) {
-        eprintln!(
-            "error: --flexo wraps JSON change records; CBOR carries \
-                     the bare element array"
-        );
-        return ExitCode::FAILURE;
-    }
     if elide_ids && !matches!(to, Target::CompactCbor) {
         eprintln!("error: --elide-ids applies to --to compact-cbor");
         return ExitCode::FAILURE;
@@ -3435,6 +3500,15 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
         eprintln!("error: convert accepts several textual inputs or one JSON input");
         return ExitCode::FAILURE;
     }
+    // On JSON input --flexo reads Flexo's conventions, which suits any
+    // target; on text input it wraps the JSON output, which CBOR is not.
+    if flexo && !is_json_input && matches!(to, Target::CompactCbor | Target::FullCbor) {
+        eprintln!(
+            "error: --flexo wraps JSON change records; CBOR carries \
+                     the bare element array"
+        );
+        return ExitCode::FAILURE;
+    }
     if min_qual && (!matches!(to, Target::Text) || !is_json_input) {
         eprintln!("error: --min-qual applies to JSON \u{2192} text conversion");
         return ExitCode::FAILURE;
@@ -3448,29 +3522,51 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            let mut value = match json_input(decoded, &sources[0].1) {
+            let value = match conversion_json_input(decoded, &sources[0].1, flexo) {
                 Ok(v) => v,
                 Err(code) => return code,
             };
-            if flexo {
-                value = flexo_unwrap(value);
-            }
             // Minimal-qualification printing: lift through a
             // transform session (same split/lift/naming path) and
             // run the reparse-verified respelling pass over the
             // whole document set, then write its units.
             if min_qual {
-                let mut session =
-                    match sysmlv2_transform::Session::from_interchange_json_with_library(
-                        &value,
-                        lib.as_deref(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("error: cannot lift JSON: {e}");
-                            return ExitCode::FAILURE;
-                        }
-                    };
+                let library = match lib.as_deref().map(session_library).transpose() {
+                    Ok(library) => library,
+                    Err(e) => {
+                        eprintln!("error: cannot load library: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                // A named output selects the language before the lift, just
+                // as it does on the ordinary text path. Directory outputs
+                // retain each document's own name and inferred language.
+                let unit_names = output
+                    .as_ref()
+                    .filter(|p| !p.is_dir())
+                    .and_then(|p| p.to_str())
+                    .filter(|name| sysmlv2_parser::lift::dialect_from_name(name).is_some())
+                    .map(|name| {
+                        let count = sysmlv2_parser::lift::split_documents(&value)
+                            .map_or(1, |docs| docs.len());
+                        let dialect =
+                            sysmlv2_parser::lift::dialect_from_name(name).expect("recognized name");
+                        (0..count)
+                            .map(|i| sysmlv2_parser::lift::document_file_name(None, i, dialect))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let mut session = match sysmlv2_transform::Session::from_interchange_json_named(
+                    &value,
+                    library.as_ref(),
+                    &unit_names,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: cannot lift JSON: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
                 for w in session.warnings() {
                     eprintln!("warning: {w}");
                 }
@@ -3519,10 +3615,15 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             // file per root namespace when the output is a
             // directory (the Flexo retrieval flow). A directory
             // always receives files — one per document, or a
-            // single document-1.sysml when no split applies.
+            // single document in its lifted dialect when no split applies.
             let split = sysmlv2_parser::lift::split_documents(&value);
             if let Some(dir) = output.as_ref().filter(|o| o.is_dir()) {
-                let docs = split.unwrap_or_else(|| vec![(None, value.clone())]);
+                let docs = split.unwrap_or_else(|| {
+                    vec![(
+                        sysmlv2_parser::lift::single_root_name(&value),
+                        value.clone(),
+                    )]
+                });
                 // Cross-document references print as $::-rooted
                 // qualified names via a whole-list name map.
                 let mut names = names;
@@ -3539,7 +3640,11 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                     for w in &lifted.errors {
                         eprintln!("warning: {w}");
                     }
-                    let file = dir.join(doc_file_name(name.as_deref(), i));
+                    let file = dir.join(sysmlv2_parser::lift::document_file_name(
+                        name.as_deref(),
+                        i,
+                        lifted.unit.dialect,
+                    ));
                     if let Err(e) = std::fs::write(
                         &file,
                         print_source_opts(
@@ -3567,13 +3672,19 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                              into one file per root namespace"
                 );
             }
-            let lifted = match from_compact_json_with_names(&value, &names) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("error: cannot lift JSON: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            let dialect = output
+                .as_deref()
+                .and_then(Path::to_str)
+                .and_then(sysmlv2_parser::lift::dialect_from_name);
+            let lifted =
+                match sysmlv2_parser::lift::from_compact_json_with_dialect(&value, &names, dialect)
+                {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("error: cannot lift JSON: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
             for w in &lifted.errors {
                 eprintln!("warning: {w}");
             }
@@ -3817,13 +3928,10 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             // implied relationships are functions of the compact
             // structure), so a stored payload upgrades without
             // breaking external references to its elements.
-            let mut value = match json_input(decoded, &sources[0].1) {
+            let value = match conversion_json_input(decoded, &sources[0].1, flexo) {
                 Ok(v) => v,
                 Err(code) => return code,
             };
-            if flexo {
-                value = flexo_unwrap(value);
-            }
             if lib.is_none() {
                 eprintln!(
                     "note: no --lib given — implied relationships are omitted \
@@ -3878,7 +3986,7 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             // JSON → compact JSON/CBOR: normalize (drop implied
             // relationships / derived properties) by lifting and
             // re-emitting.
-            let value = match json_input(decoded, &sources[0].1) {
+            let value = match conversion_json_input(decoded, &sources[0].1, flexo) {
                 Ok(v) => v,
                 Err(code) => return code,
             };
@@ -4809,7 +4917,6 @@ pub fn run_eval(
     let mut resolved = load_model(files, lib, quiet)?.into_resolved();
     let mut failed = false;
     let mut out = stdout_writer();
-    let fmt = number_format();
     let written = (|| -> io::Result<()> {
         if all {
             for e in resolved.features_with_values() {
@@ -4818,7 +4925,7 @@ pub fn run_eval(
                     .or_else(|| resolved.element_lookup_name(e))
                     .unwrap_or_else(|| "<anonymous>".to_string());
                 match resolved.evaluate(e) {
-                    Ok(v) => writeln!(out, "{label} = {}", v.to_string_with(&fmt))?,
+                    Ok(v) => writeln!(out, "{label} = {}", print_value(&resolved, &v))?,
                     Err(err) => writeln!(out, "{label}: {err}")?,
                 }
             }
@@ -4829,11 +4936,12 @@ pub fn run_eval(
                 failed = true;
                 continue;
             }
-            // Chain-step semantics: the path prefix establishes the
-            // featuring context, so `Pkg::part::attr` computes the
-            // same value as `part.attr`.
+            // The path prefix establishes the featuring context, as
+            // the chain `part.attr` does; a prefix with no value stands
+            // for one instance of it, so `Pkg::part::attr` is `attr`'s
+            // value whatever `part`'s multiplicity.
             match resolved.evaluate_qualified(name) {
-                Ok(v) => writeln!(out, "{name} = {}", v.to_string_with(&fmt))?,
+                Ok(v) => writeln!(out, "{name} = {}", print_value(&resolved, &v))?,
                 Err(err) => {
                     eprintln!("error: {name}: {err}");
                     failed = true;
@@ -5057,6 +5165,7 @@ pub fn run_viz(args: VizArgs, quiet: bool) -> Result<(), CliError> {
             sysmlv2_viz::Direction::TopToBottom
         })
         .with_show_values(!args.no_values)
+        .with_value_units(value_units())
         .with_view(view.unwrap_or(sysmlv2_viz::View::Tree))
         .with_show_notes(!args.no_notes)
         .with_show_metadata(!args.hide_metadata)
@@ -5269,31 +5378,40 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
         Command::Verify {
             files,
             number_format,
+            value_units,
             lib,
             ranges,
             solve,
             z3,
         } => with_number_format(number_format.number_format, || {
-            finish(run_verify(files, lib.as_deref(), ranges, solve, z3, quiet))
+            with_value_units(value_units.value_units, || {
+                finish(run_verify(files, lib.as_deref(), ranges, solve, z3, quiet))
+            })
         }),
 
         Command::Eval {
             input,
             names,
             number_format,
+            value_units,
             all,
             lib,
         } => with_number_format(number_format.number_format, || {
-            finish(run_eval(input, names, all, lib.as_deref(), quiet))
+            with_value_units(value_units.value_units, || {
+                finish(run_eval(input, names, all, lib.as_deref(), quiet))
+            })
         }),
 
         Command::Query {
             input,
             args,
             number_format,
+            value_units,
             lib,
         } => with_number_format(number_format.number_format, || {
-            finish(run_query(input, args, lib.as_deref(), quiet))
+            with_value_units(value_units.value_units, || {
+                finish(run_query(input, args, lib.as_deref(), quiet))
+            })
         }),
 
         Command::Describe { input, args, lib } => {
@@ -5314,6 +5432,7 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             lib,
             horizontal,
             no_values,
+            value_units,
             no_notes,
             hide_metadata,
             show_inherited,
@@ -5323,29 +5442,35 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             color,
             link_template,
             output,
-        } => finish(run_viz(
-            VizArgs {
-                files,
-                view,
-                element,
-                lib,
-                horizontal,
-                no_values,
-                no_notes,
-                hide_metadata,
-                show_inherited,
-                show_lib,
-                show_imported,
-                line_style,
-                color,
-                link_template,
-                output,
-            },
-            quiet,
-        )),
+        } => with_value_units(value_units.value_units, || {
+            finish(run_viz(
+                VizArgs {
+                    files,
+                    view,
+                    element,
+                    lib,
+                    horizontal,
+                    no_values,
+                    no_notes,
+                    hide_metadata,
+                    show_inherited,
+                    show_lib,
+                    show_imported,
+                    line_style,
+                    color,
+                    link_template,
+                    output,
+                },
+                quiet,
+            ))
+        }),
 
         #[cfg(feature = "lsp")]
-        Command::Lsp { lib, number_format } => {
+        Command::Lsp {
+            lib,
+            number_format,
+            value_hint_units,
+        } => {
             // The language server reads a library directory's files for its
             // navigation; a bundle is refused here rather than half served.
             if let Some(lib) = lib.as_deref().filter(|lib| bundle::is_bundle(lib)) {
@@ -5355,12 +5480,16 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            match sysmlv2_lsp::run_stdio_with_number_format(
-                lib,
-                number_format
-                    .number_format
-                    .unwrap_or_else(sysmlv2_parser::numfmt::NumberFormat::approx),
-            ) {
+            let defaults = sysmlv2_lsp::ServerDefaults::default()
+                .with_number_format(
+                    number_format
+                        .number_format
+                        .unwrap_or_else(sysmlv2_parser::numfmt::NumberFormat::approx),
+                )
+                .with_value_hint_units(
+                    value_hint_units.map_or(sysmlv2_parser::eval::UnitDisplay::Si, Into::into),
+                );
+            match sysmlv2_lsp::run_stdio_with_defaults(lib, defaults) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");

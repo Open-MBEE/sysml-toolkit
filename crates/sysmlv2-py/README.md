@@ -15,7 +15,7 @@ edit.set_feature_value(s.resolve("Demo::Vehicle::count"), "4")
 report = s.commit(edit)          # raises (and rolls back) on semantic breakage
 print(report.id_map)             # old -> new interchange ids for moved elements
 
-payload = sysmlv2.Session.from_interchange_json(json_text)   # Flexo MMS path
+payload = sysmlv2.Session.from_interchange_json(json_text, flexo=True)   # Flexo MMS path
 json_out = payload.to_compact_json()
 ```
 

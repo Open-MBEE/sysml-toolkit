@@ -170,6 +170,9 @@ fn library_element_follows_library_packages_not_units() {
         Derived::Value(DerivedValue::Bool(false))
     );
     assert!(!r.is_library_element(t), "not from a library unit");
+    let l = elem(&mut r, "L");
+    assert_eq!(r.library_namespace(t), Some(l));
+    assert_eq!(r.library_namespace(u), None);
 }
 
 #[test]
@@ -651,6 +654,77 @@ fn text_multiplicity_reference_and_conjugator() {
     assert_eq!(r.element_type(c), "PortConjugation");
     let orig = one(&mut r, cpd, "originalPortDefinition").expect("original");
     assert_eq!(r.element_type(orig), "PortDefinition");
+}
+
+/// A port definition's implicit conjugate is one of its members: its
+/// qualified name resolves to it, quoted or bare, and resolution finds
+/// nothing else under that name.
+#[test]
+fn conjugated_port_definition_resolves_by_its_qualified_name() {
+    let mut model = Model::new();
+    model.add_source(
+        "typing.sysml",
+        "package Typing { port def Plug; part def Box { port q : ~Plug; } }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let conjugates: Vec<_> = r
+        .elements_of_metaclass("ConjugatedPortDefinition")
+        .into_iter()
+        .filter(|&x| !r.is_library_element(x))
+        .collect();
+    let [cpd] = conjugates[..] else {
+        panic!("one conjugate, got {conjugates:?}")
+    };
+    assert_eq!(
+        r.element_qualified_name(cpd).as_deref(),
+        Some("Typing::Plug::'~Plug'")
+    );
+    assert_eq!(r.resolve_qualified("Typing::Plug::'~Plug'"), Some(cpd));
+    assert_eq!(r.resolve_qualified("Typing::Plug::~Plug"), Some(cpd));
+    assert_eq!(r.resolve_qualified("Typing::'~Plug'"), None);
+}
+
+/// `ownedMetadata` and `nestedMetadata` select the metadata usages among
+/// the owned members (SYSML21-569): a metadata usage is an annotating
+/// element owned through an OwningMembership, never an owned usage, so the
+/// published rule over `ownedUsage` answered an empty list on every model.
+#[test]
+fn owned_and_nested_metadata_select_from_the_owned_members() {
+    let mut model = Model::new();
+    model.add_source(
+        "meta.sysml",
+        "package MetaDefs {
+            metadata def N;
+            part def P { metadata m : N; attribute a; }
+            part p : P { metadata m2 : N; attribute b; }
+        }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let p = elem(&mut r, "MetaDefs::P");
+    let m = elem(&mut r, "MetaDefs::P::m");
+    assert_eq!(
+        r.derived(p, "ownedMetadata"),
+        Derived::Value(DerivedValue::Elements(vec![m]))
+    );
+    assert_eq!(
+        r.property(p, "ownedMetadata")
+            .map(|v| v.as_array().map(Vec::len)),
+        Ok(Some(1))
+    );
+    let usage = elem(&mut r, "MetaDefs::p");
+    let m2 = elem(&mut r, "MetaDefs::p::m2");
+    assert_eq!(
+        r.derived(usage, "nestedMetadata"),
+        Derived::Value(DerivedValue::Elements(vec![m2]))
+    );
+    // The owned usages are still the features alone.
+    let a = elem(&mut r, "MetaDefs::P::a");
+    assert_eq!(
+        r.derived(p, "ownedUsage"),
+        Derived::Value(DerivedValue::Elements(vec![a]))
+    );
 }
 
 fn string(r: &mut ResolvedModel, e: ElementRef, name: &str) -> Option<String> {
@@ -2508,45 +2582,54 @@ fn implied_reachability_is_independent_of_declaration_order() {
 
 #[test]
 fn multiple_required_library_bases_are_covered_individually() {
+    // A flow with owned ends takes its kind's `Flows::messages`, the
+    // transfer roles `Transfers::transfers` and `flowTransfers`, and
+    // `Flows::flows`; a written subsetting of the one leaves the three
+    // others to the planner.
     let mut model = Model::new();
     model.add_library_source(
-        "actions.kerml",
-        "standard library package Actions { feature transitionActions; }",
+        "flows.kerml",
+        "standard library package Flows { feature messages; feature flows; }",
     );
     model.add_library_source(
-        "states.kerml",
-        "standard library package States { feature stateTransitions; }",
+        "transfers.kerml",
+        "standard library package Transfers { feature transfers; feature flowTransfers; }",
     );
     let unit = model.add_source(
-        "transition.sysml",
-        "package P { state a; state b; transition t first a then b; }",
+        "flow.sysml",
+        "package P { part def D { attribute x; attribute y; flow f from x to y; } }",
     );
     assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
-    let relation = model.add_source(
-        "relation.kerml",
-        "subset P::t subsets Actions::transitionActions;",
-    );
+    let relation = model.add_source("relation.kerml", "subset P::D::f subsets Flows::messages;");
     assert!(
         relation.diagnostics.is_empty(),
         "{:?}",
         relation.diagnostics
     );
     let mut r = ResolvedModel::build(&model);
-    let t = elem(&mut r, "P::t");
-    let actions = elem(&mut r, "Actions::transitionActions");
-    let states = elem(&mut r, "States::stateTransitions");
-    let edges = r.implied_relationships(t);
+    let f = elem(&mut r, "P::D::f");
+    let messages = elem(&mut r, "Flows::messages");
+    let others = [
+        elem(&mut r, "Transfers::transfers"),
+        elem(&mut r, "Transfers::flowTransfers"),
+        elem(&mut r, "Flows::flows"),
+    ];
+    let edges = r.implied_relationships(f);
+    let mut targets: Vec<Reference> = edges
+        .iter()
+        .flat_map(|&edge| r.relationship_ends(edge).1)
+        .collect();
+    targets.sort_by_key(|target| format!("{target:?}"));
+    let mut expected: Vec<Reference> = others.iter().map(|&e| Reference::Element(e)).collect();
+    expected.sort_by_key(|target| format!("{target:?}"));
     assert_eq!(
-        edges.len(),
-        1,
-        "the written action base does not cover the state base"
+        targets, expected,
+        "the written kind base does not cover the other bases"
     );
-    assert_eq!(
-        r.relationship_ends(edges[0]).1,
-        vec![Reference::Element(states)]
-    );
-    assert!(r.conforms_with_implied(t, actions));
-    assert!(r.conforms_with_implied(t, states));
+    assert!(r.conforms_with_implied(f, messages));
+    for other in others {
+        assert!(r.conforms_with_implied(f, other));
+    }
 }
 
 #[test]

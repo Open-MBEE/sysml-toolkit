@@ -26,6 +26,31 @@ fn owned(units: &[(&str, &str)]) -> Vec<(String, String)> {
 
 const SUMMARY_MODEL: &str = "package P { package Q { part def A; part def B :> A; part q : A; } part def D { part d1 : Q::A; } part def L; comment about L /* c */ }";
 
+#[test]
+fn full_within_counts_port_copies_under_closed_containers() {
+    let model = "package P {
+        port def Signal;
+        port def Bank { port pin : Signal; }
+        part def Device { port io : Bank; }
+        part a : Device; part b : Device;
+    }";
+    let mut s = Session::from_sources(&sources(&owned(&[("ports.sysml", model)]))).unwrap();
+    let base = json!({"view": "tree", "showNotes": false});
+    let full: Value = serde_json::from_str(&graph(&mut s, &base)).unwrap();
+    let total = full["nodes"].as_array().unwrap().len();
+    for open in [json!([]), json!(["P"])] {
+        let mut request = base.clone();
+        request["summary"] = json!({"open": open, "fullWithin": total - 1});
+        let reply: Value = serde_json::from_str(&graph(&mut s, &request)).unwrap();
+        assert!(
+            reply.get("full").is_none(),
+            "must keep the summary below the actual node count"
+        );
+        request["summary"]["fullWithin"] = json!(total);
+        assert_eq!(unmarked(&graph(&mut s, &request)), full.to_string());
+    }
+}
+
 fn graph(s: &mut Session, opts: &Value) -> String {
     s.to_graph(Some(opts.to_string())).unwrap()
 }

@@ -17,6 +17,7 @@
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use sysmlv2_syntax::ast::*;
+use sysmlv2_syntax::check;
 use sysmlv2_syntax::span::Span;
 
 type El<'a> = &'a Map<String, Value>;
@@ -48,6 +49,11 @@ pub enum LiftError {
     ElementWithoutId,
     /// Following the ownership graph would lose a subtree or operand.
     Incomplete { errors: Vec<String> },
+    /// Elements an owner lists in `ownedRelationship` or
+    /// `ownedRelatedElement` omit the matching inverse property, so
+    /// reconstructing the source could lose or duplicate declarations.
+    /// [`complete_owning_references`] derives them.
+    OmittedOwnership { elements: usize, first: String },
 }
 
 impl std::fmt::Display for LiftError {
@@ -65,6 +71,15 @@ impl std::fmt::Display for LiftError {
                     errors.join("; ")
                 )
             }
+            LiftError::OmittedOwnership { elements, first } => write!(
+                f,
+                "{elements} element(s) listed in an owner's ownedRelationship or \
+                 ownedRelatedElement omit the corresponding owningRelatedElement or owningRelationship \
+                 (the first is {first}); the payload omits the inverse ownership ends, as \
+                 Flexo MMS does — derive them from the forward edges first (the CLI's \
+                 `--flexo`, the bindings' `flexo` option, or \
+                 `lift::complete_owning_references`)"
+            ),
         }
     }
 }
@@ -80,6 +95,39 @@ impl From<LiftError> for String {
 /// Lift a compact-JSON element array into a syntax AST.
 pub fn from_compact_json(value: &Value) -> Result<Lifted, LiftError> {
     from_compact_json_with_names(value, &HashMap::new())
+}
+
+/// The dialect explicitly named by a source-file extension, without case.
+/// Other names provide no dialect evidence.
+pub fn dialect_from_name(name: &str) -> Option<Dialect> {
+    let extension = std::path::Path::new(name).extension()?;
+    if extension.eq_ignore_ascii_case("kerml") {
+        Some(Dialect::Kerml)
+    } else if extension.eq_ignore_ascii_case("sysml") {
+        Some(Dialect::Sysml)
+    } else {
+        None
+    }
+}
+
+/// A safe recorded source filename, or a numbered name in the lifted dialect.
+/// Both session import and CLI directory export use this convention.
+pub fn document_file_name(root_name: Option<&str>, index: usize, dialect: Dialect) -> String {
+    if let Some(base) = root_name
+        .and_then(|name| std::path::Path::new(name).file_name())
+        .map(|name| name.to_string_lossy())
+        .filter(|name| {
+            !name.chars().any(|c| matches!(c, ':' | '*' | '?' | '"'))
+                && dialect_from_name(name).is_some()
+        })
+    {
+        return base.into_owned();
+    }
+    let extension = match dialect {
+        Dialect::Kerml => "kerml",
+        Dialect::Sysml => "sysml",
+    };
+    format!("document-{}.{extension}", index + 1)
 }
 
 /// Qualified-name map over a whole element list: element `@id` → name
@@ -124,6 +172,7 @@ pub fn document_name_map(value: &Value) -> std::collections::HashMap<String, Vec
         dialect: Dialect::Sysml,
         next_featuring: true,
         body_featuring: false,
+        body_spellings: check::BodySpellings::default(),
         errors: Vec::new(),
         reported: HashSet::new(),
         depth_reported: HashSet::new(),
@@ -133,8 +182,9 @@ pub fn document_name_map(value: &Value) -> std::collections::HashMap<String, Vec
     };
     let is_root = |e: &Value| {
         e.get("@type").and_then(|v| v.as_str()) == Some("Namespace")
-            && e.get("owningRelationship")
-                .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+            && OWNERSHIP_EDGES
+                .iter()
+                .all(|(_, back)| e.get(*back).and_then(ref_id).is_none_or(str::is_empty))
     };
     let mut seen = vec![false; elements.len()];
     // The bool marks nodes an unnamed occurrence may pass the parent
@@ -150,7 +200,13 @@ pub fn document_name_map(value: &Value) -> std::collections::HashMap<String, Vec
     // the reference site (a lambda-local `in s` prints as `s`, never
     // as a collapsed `$::…::s` that skips the anonymous level).
     let mut stack: Vec<(usize, Vec<String>, bool)> = (0..elements.len())
-        .filter(|&i| is_root(&elements[i]))
+        .filter(|&i| {
+            is_root(&elements[i])
+                && elements[i]
+                    .get("@id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| by_id.get(id) == Some(&i))
+        })
         .map(|i| (i, Vec::new(), true))
         .collect();
     while let Some((i, path, passthrough)) = stack.pop() {
@@ -215,15 +271,32 @@ pub fn document_reference_name_map(
     let Some(elements) = value.as_array() else {
         return out;
     };
-    let roots: HashSet<&str> = elements
+    let by_id: HashMap<_, _> = elements
         .iter()
+        .enumerate()
+        .filter_map(|(i, e)| Some((e.get("@id")?.as_str()?, i)))
+        .collect();
+    let effective = || {
+        elements
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| {
+                e.get("@id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| by_id.get(id) == Some(i))
+            })
+            .map(|(_, e)| e)
+    };
+    let roots: HashSet<&str> = effective()
         .filter(|e| {
             e.get("@type").and_then(Value::as_str) == Some("Namespace")
-                && e.get("owningRelationship").is_none_or(Value::is_null)
+                && OWNERSHIP_EDGES
+                    .iter()
+                    .all(|(_, back)| e.get(*back).and_then(ref_id).is_none_or(str::is_empty))
         })
         .filter_map(|e| e.get("@id").and_then(Value::as_str))
         .collect();
-    for e in elements {
+    for e in effective() {
         let t = e.get("@type").and_then(|v| v.as_str()).unwrap_or("");
         let Some(id) = e.get("@id").and_then(|v| v.as_str()) else {
             continue;
@@ -269,6 +342,34 @@ pub fn document_reference_name_map(
     out
 }
 
+/// The recorded name of a single document root, when splitting is unnecessary.
+pub fn single_root_name(value: &serde_json::Value) -> Option<String> {
+    let elements = value.as_array()?;
+    let by_id: HashMap<_, _> = elements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| Some((e.get("@id")?.as_str()?, i)))
+        .collect();
+    elements
+        .iter()
+        .enumerate()
+        .find(|(i, e)| {
+            e.get("@id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| by_id.get(id) == Some(i))
+                && e.get("@type").and_then(Value::as_str) == Some("Namespace")
+                && OWNERSHIP_EDGES
+                    .iter()
+                    .all(|(_, back)| e.get(*back).and_then(ref_id).is_none_or(str::is_empty))
+        })
+        .and_then(|(_, root)| {
+            root.get("qualifiedName")
+                .and_then(Value::as_str)
+                .or_else(|| root.get("declaredName").and_then(Value::as_str))
+        })
+        .map(str::to_owned)
+}
+
 /// Split a multi-document element list into per-root-namespace chunks.
 ///
 /// Interchange JSON holds one root `Namespace` element per document (an
@@ -295,13 +396,15 @@ pub fn split_documents(value: &Value) -> Option<Vec<(Option<String>, Value)>> {
         .enumerate()
         .filter_map(|(i, e)| id_of(e).map(|id| (id, i)))
         .collect();
+    let effective = |i: usize| id_of(&elements[i]).is_some_and(|id| by_id.get(&id) == Some(&i));
     let is_root = |e: &Value| {
         e.get("@type").and_then(|v| v.as_str()) == Some("Namespace")
-            && e.get("owningRelationship")
-                .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+            && OWNERSHIP_EDGES
+                .iter()
+                .all(|(_, back)| e.get(*back).and_then(ref_id).is_none_or(str::is_empty))
     };
     let roots: Vec<usize> = (0..elements.len())
-        .filter(|&i| is_root(&elements[i]))
+        .filter(|&i| effective(i) && is_root(&elements[i]))
         .collect();
     if roots.len() < 2 {
         return None;
@@ -335,14 +438,18 @@ pub fn split_documents(value: &Value) -> Option<Vec<(Option<String>, Value)>> {
             }
         }
     }
-    if assigned.iter().any(|a| a.is_none()) {
+    if assigned
+        .iter()
+        .enumerate()
+        .any(|(i, a)| effective(i) && a.is_none())
+    {
         return None;
     }
 
     let name_of = |e: &Value| {
         e.get("qualifiedName")
-            .or_else(|| e.get("declaredName"))
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
+            .or_else(|| e.get("declaredName").and_then(Value::as_str))
             .map(str::to_owned)
     };
     let mut docs: Vec<(Option<String>, Vec<Value>)> = roots
@@ -350,6 +457,9 @@ pub fn split_documents(value: &Value) -> Option<Vec<(Option<String>, Value)>> {
         .map(|&r| (name_of(&elements[r]), Vec::new()))
         .collect();
     for (i, e) in elements.iter().enumerate() {
+        if !effective(i) {
+            continue;
+        }
         let doc = assigned[i].expect("checked above");
         docs[doc].1.push(e.clone());
     }
@@ -360,12 +470,281 @@ pub fn split_documents(value: &Value) -> Option<Vec<(Option<String>, Value)>> {
     )
 }
 
+/// The ownership edges an element list carries forward, each with the
+/// back-reference that states the same edge on the owned element:
+/// `ownedRelationship` lists the relationships an element owns, which name
+/// it as their `owningRelatedElement`; `ownedRelatedElement` lists the
+/// elements a relationship owns, which name it as their
+/// `owningRelationship`.
+const OWNERSHIP_EDGES: [(&str, &str); 2] = [
+    ("ownedRelationship", "owningRelatedElement"),
+    ("ownedRelatedElement", "owningRelationship"),
+];
+
+/// The `@id`s an ownership edge lists: a collection, or one bare reference.
+fn edge_targets<'v>(element: &'v Value, edge: &str) -> &'v [Value] {
+    match element.get(edge) {
+        Some(Value::Array(targets)) => targets,
+        Some(one @ Value::Object(_)) => std::slice::from_ref(one),
+        _ => &[],
+    }
+}
+
+/// Check the ownership that source reconstruction follows before splitting a
+/// document. Owners outside the document are allowed; missing inverses, contradictory
+/// claims, missing in-document forward ends and cycles are refused. Implied
+/// relationships and recovery annotations (and their owned subtrees) are not
+/// reconstructed and do not participate in this check.
+pub fn validate_ownership(value: &Value) -> Result<(), LiftError> {
+    validate_ownership_impl(value, false)
+}
+
+fn validate_ownership_impl(value: &Value, allow_missing: bool) -> Result<(), LiftError> {
+    let items = value.as_array().ok_or(LiftError::NotAnElementArray)?;
+    let mut by_id = HashMap::new();
+    let mut order = Vec::new();
+    let mut seeds = Vec::new();
+    for item in items {
+        let el = item.as_object().ok_or(LiftError::NotAnElement)?;
+        let id = el
+            .get("@id")
+            .and_then(Value::as_str)
+            .ok_or(LiftError::ElementWithoutId)?;
+        collect_omission_seeds(el, &mut seeds);
+        if by_id.insert(id, el).is_none() {
+            order.push(id);
+        }
+    }
+    let omitted = omission_closure(seeds, &by_id);
+    check_ownership(&by_id, &order, &omitted)?;
+    if !allow_missing {
+        if let Some((elements, first)) = omitted_ownership(&by_id, &order, &omitted) {
+            return Err(LiftError::OmittedOwnership {
+                elements,
+                first: first.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_ownership<'a>(
+    by_id: &HashMap<&'a str, El<'a>>,
+    order: &[&'a str],
+    omitted: &HashSet<&str>,
+) -> Result<(), LiftError> {
+    let mut claims = HashMap::new();
+    let mut forward_ends = HashSet::new();
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut incoming: HashMap<&str, usize> = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+    for &id in order {
+        if omitted.contains(id) || !seen.insert(id) {
+            continue;
+        }
+        incoming.entry(id).or_default();
+        let el = by_id[id];
+        for (edge, back) in OWNERSHIP_EDGES {
+            let targets = match el.get(edge) {
+                Some(Value::Array(targets)) => targets.as_slice(),
+                Some(one @ Value::Object(_)) => std::slice::from_ref(one),
+                _ => &[],
+            };
+            for target in targets.iter().filter_map(ref_id) {
+                let Some(child) = by_id.get(target).filter(|_| !omitted.contains(target)) else {
+                    continue;
+                };
+                forward_ends.insert((id, target, back));
+                if let Some(previous) = claims.insert((target, back), id) {
+                    if previous != id {
+                        errors.push(format!("ownership conflict for {target}.{back}: {previous} and {id} both claim it"));
+                    }
+                }
+                if let Some(owner) = child.get(back).and_then(ref_id).filter(|s| !s.is_empty()) {
+                    if owner != id {
+                        errors.push(format!("ownership conflict for {target}.{back}: names {owner}, but {id}.{edge} claims it"));
+                    }
+                }
+                children.entry(id).or_default().push(target);
+                *incoming.entry(target).or_default() += 1;
+            }
+        }
+    }
+    // Check explicit inverse ends against the completed forward index. Scanning
+    // an owner's list once for every child would make flat namespaces quadratic.
+    seen.clear();
+    for &id in order {
+        if omitted.contains(id) || !seen.insert(id) {
+            continue;
+        }
+        let el = by_id[id];
+        for (edge, back) in OWNERSHIP_EDGES {
+            if let Some(owner) = el
+                .get(back)
+                .and_then(ref_id)
+                .filter(|owner| by_id.contains_key(owner) && !omitted.contains(owner))
+            {
+                if !forward_ends.contains(&(owner, id, back)) {
+                    errors.push(format!("ownership conflict for {id}.{back}: names {owner}, but {owner}.{edge} does not list it"));
+                }
+                // Keep this edge even on refusal, so a cycle through an inverse
+                // with an absent forward end is diagnosed too.
+                children.entry(owner).or_default().push(id);
+                *incoming.entry(id).or_default() += 1;
+            }
+        }
+    }
+    // Remove roots iteratively: remaining nodes belong to, or descend from,
+    // a cycle. This also catches disconnected cycles without recursive walks.
+    let mut pending: Vec<_> = incoming
+        .iter()
+        .filter_map(|(&id, &n)| (n == 0).then_some(id))
+        .collect();
+    while let Some(id) = pending.pop() {
+        for child in children.get(id).into_iter().flatten() {
+            let count = incoming.get_mut(child).expect("indexed ownership target");
+            *count -= 1;
+            if *count == 0 {
+                pending.push(*child);
+            }
+        }
+    }
+    if let Some(id) = order
+        .iter()
+        .find(|id| incoming.get(**id).is_some_and(|n| *n > 0))
+    {
+        errors.push(format!("ownership cycle reaches {id}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LiftError::Incomplete { errors })
+    }
+}
+
+/// Reconstruct omitted ownership inverses from their stated forward ends.
+///
+/// These are stored metamodel properties, not derived properties. Callers must
+/// opt in to this compatibility repair. Existing nonempty inverses are never
+/// overwritten. Ownership is validated before any mutation, so a conflict or
+/// cycle leaves the input unchanged. Each inverse property is checked separately:
+/// a Relationship can also be an Element owned by another relationship.
+///
+/// Of duplicate IDs only the last row participates, matching the lift. Implied
+/// and recovery subtrees are left alone. Bare forward references become lists.
+/// Returns the number of inverses written; complete, well-formed input is unchanged.
+pub fn complete_owning_references(value: &mut Value) -> Result<usize, LiftError> {
+    validate_ownership_impl(value, true)?;
+    let omitted: HashSet<String> = omitted_element_ids(value)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let elements = value.as_array_mut().expect("validated element array");
+    let fills = {
+        let by_id: HashMap<&str, usize> = elements
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| Some((e.get("@id")?.as_str()?, i)))
+            .collect();
+        let mut fills = HashMap::new();
+        for (i, element) in elements.iter().enumerate() {
+            let id = element["@id"].as_str().expect("validated id");
+            if by_id.get(id) != Some(&i) || omitted.contains(id) {
+                continue;
+            }
+            for (edge, back) in OWNERSHIP_EDGES {
+                for target in edge_targets(element, edge).iter().filter_map(ref_id) {
+                    let Some(&j) = by_id.get(target).filter(|_| !omitted.contains(target)) else {
+                        continue;
+                    };
+                    if elements[j]
+                        .get(back)
+                        .and_then(ref_id)
+                        .is_none_or(str::is_empty)
+                    {
+                        fills.insert((j, back), element["@id"].clone());
+                    }
+                }
+            }
+        }
+        fills
+    };
+    for element in elements.iter_mut() {
+        if omitted.contains(element["@id"].as_str().expect("validated id")) {
+            continue;
+        }
+        for (edge, _) in OWNERSHIP_EDGES {
+            if let Some(target) = element.get_mut(edge).filter(|v| v.is_object()) {
+                *target = Value::Array(vec![target.take()]);
+            }
+        }
+    }
+    let written = fills.len();
+    for ((j, back), owner) in fills {
+        elements[j]
+            .as_object_mut()
+            .expect("validated element")
+            .insert(
+                back.into(),
+                Value::Object(Map::from_iter([("@id".into(), owner)])),
+            );
+    }
+    Ok(written)
+}
+
+/// The first owned element that names no owner, and how many there are:
+/// elements an in-document owner lists in an ownership edge while
+/// omitting that edge's matching back-reference. Ownership-closure slices name owners
+/// the document does not carry; those still name one and are not counted.
+fn omitted_ownership<'a>(
+    by_id: &HashMap<&'a str, El<'a>>,
+    order: &[&'a str],
+    omitted: &HashSet<&str>,
+) -> Option<(usize, &'a str)> {
+    let mut listed = HashSet::new();
+    for id in order {
+        if omitted.contains(id) {
+            continue;
+        }
+        let owner = by_id[id];
+        for (edge, back) in OWNERSHIP_EDGES {
+            let targets = match owner.get(edge) {
+                Some(Value::Array(targets)) => targets.as_slice(),
+                Some(one @ Value::Object(_)) => std::slice::from_ref(one),
+                _ => &[],
+            };
+            for target in targets.iter().filter_map(ref_id) {
+                if let Some(child) = by_id.get(target).filter(|_| !omitted.contains(target)) {
+                    if child.get(back).and_then(ref_id).is_none_or(str::is_empty) {
+                        listed.insert(target);
+                    }
+                }
+            }
+        }
+    }
+    let first = order.iter().copied().find(|id| listed.contains(id))?;
+    Some((listed.len(), first))
+}
+
 /// Like [`from_compact_json`], with an extra `id → qualified-name segments`
 /// table for references that point outside the document (e.g. the standard
 /// library when the JSON was emitted with library resolution).
 pub fn from_compact_json_with_names(
     value: &Value,
     extra_names: &HashMap<String, Vec<String>>,
+) -> Result<Lifted, LiftError> {
+    from_compact_json_with_dialect(value, extra_names, None)
+}
+
+/// Lift with an explicit source dialect when the caller knows it (for example,
+/// from a restored unit filename). The hint takes precedence over recorded root
+/// filenames and metaclass inference. It does not translate between languages:
+/// text that cannot be represented in the selected dialect is refused.
+pub fn from_compact_json_with_dialect(
+    value: &Value,
+    extra_names: &HashMap<String, Vec<String>>,
+    dialect: Option<Dialect>,
 ) -> Result<Lifted, LiftError> {
     // The lift recurses once per membership and owned definition or
     // usage (expressions use a work stack), so its stack need is set by
@@ -391,7 +770,7 @@ pub fn from_compact_json_with_names(
             std::thread::Builder::new()
                 .name("sysmlv2-lift".into())
                 .stack_size(LIFT_STACK_BYTES)
-                .spawn_scoped(scope, || lift_document(value, extra_names))
+                .spawn_scoped(scope, || lift_document(value, extra_names, dialect))
                 .map(std::thread::ScopedJoinHandle::join)
         });
         match spawned {
@@ -400,7 +779,7 @@ pub fn from_compact_json_with_names(
             Err(_) => {}
         }
     }
-    lift_document(value, extra_names)
+    lift_document(value, extra_names, dialect)
 }
 
 /// [`from_compact_json_with_names`] without moving the lift onto a stack
@@ -412,7 +791,7 @@ pub fn from_compact_json_on_this_stack(
     value: &Value,
     extra_names: &HashMap<String, Vec<String>>,
 ) -> Result<Lifted, LiftError> {
-    lift_document(value, extra_names)
+    lift_document(value, extra_names, None)
 }
 
 /// Collect omission roots while reading a row. Every row contributes seeds,
@@ -453,9 +832,12 @@ fn omission_closure<'a>(
             continue;
         };
         for key in ["ownedRelationship", "ownedRelatedElement"] {
-            if let Some(children) = element.get(key).and_then(Value::as_array) {
-                pending.extend(children.iter().filter_map(|child| child["@id"].as_str()));
-            }
+            let children = match element.get(key) {
+                Some(Value::Array(items)) => items.as_slice(),
+                Some(one @ Value::Object(_)) => std::slice::from_ref(one),
+                _ => &[],
+            };
+            pending.extend(children.iter().filter_map(ref_id));
         }
     }
     omitted
@@ -488,6 +870,7 @@ pub(crate) fn omitted_element_ids(document: &Value) -> HashSet<&str> {
 fn lift_document(
     value: &Value,
     extra_names: &HashMap<String, Vec<String>>,
+    dialect: Option<Dialect>,
 ) -> Result<Lifted, LiftError> {
     let Value::Array(items) = value else {
         return Err(LiftError::NotAnElementArray);
@@ -503,10 +886,19 @@ fn lift_document(
             return Err(LiftError::ElementWithoutId);
         };
         collect_omission_seeds(el, &mut omission_seeds);
-        by_id.insert(id, el);
-        order.push(id);
+        if by_id.insert(id, el).is_none() {
+            order.push(id);
+        }
     }
-    let omitted = omission_closure(omission_seeds, &by_id);
+    let mut omitted = omission_closure(omission_seeds, &by_id);
+    check_ownership(&by_id, &order, &omitted)?;
+    omitted.extend(referenced_placeholders(&by_id));
+    if let Some((elements, first)) = omitted_ownership(&by_id, &order, &omitted) {
+        return Err(LiftError::OmittedOwnership {
+            elements,
+            first: first.to_owned(),
+        });
+    }
     // Unresolved-reference recovery annotations: dangling id → spelling.
     let mut unresolved_names = HashMap::new();
     for el in by_id.values() {
@@ -531,6 +923,7 @@ fn lift_document(
         dialect: Dialect::Sysml,
         next_featuring: true,
         body_featuring: false,
+        body_spellings: check::BodySpellings::default(),
         errors: Vec::new(),
         reported: HashSet::new(),
         depth_reported: HashSet::new(),
@@ -538,7 +931,37 @@ fn lift_document(
         depth: 0,
         incomplete: false,
     };
-    lifter.dialect = lifter.detect_dialect(&omitted);
+    // A source filename is stronger evidence than a metaclass heuristic. Use
+    // input order, and refuse conflicting recorded dialects instead of letting
+    // hash-map iteration decide which language a mixed document uses.
+    let mut named_dialect = dialect;
+    if named_dialect.is_none() {
+        for id in &order {
+            let el = lifter.by_id[id];
+            if ty(el) != "Namespace"
+                || omitted.contains(id)
+                || OWNERSHIP_EDGES.iter().any(|(_, back)| {
+                    el.get(*back)
+                        .and_then(ref_id)
+                        .is_some_and(|id| !id.is_empty())
+                })
+            {
+                continue;
+            }
+            let name = sval(el, "qualifiedName").or_else(|| sval(el, "declaredName"));
+            if let Some(found) = name.and_then(dialect_from_name) {
+                if named_dialect.is_some_and(|previous| previous != found) {
+                    return Err(LiftError::Incomplete {
+                        errors: vec![
+                            "conflicting source dialects; lift the documents separately".into(),
+                        ],
+                    });
+                }
+                named_dialect = Some(found);
+            }
+        }
+    }
+    lifter.dialect = named_dialect.unwrap_or_else(|| lifter.detect_dialect(&omitted));
     lifter.compute_qnames(&order);
 
     // Roots: elements with no *in-document* owner — not owned by a
@@ -587,11 +1010,33 @@ fn lift_document(
             errors: lifter.errors,
         });
     }
+    let unit = SourceUnit {
+        dialect: lifter.dialect,
+        members,
+    };
+    if named_dialect.is_some() {
+        let text = sysmlv2_syntax::print::print_source(&unit);
+        let parsed = match unit.dialect {
+            Dialect::Sysml => sysmlv2_syntax::parser::parse_source(&text),
+            Dialect::Kerml => sysmlv2_syntax::parser::parse_kerml_source(&text),
+        };
+        if !parsed.diagnostics.is_empty() {
+            return Err(LiftError::Incomplete {
+                errors: parsed
+                    .diagnostics
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "cannot represent the document as {:?}: {}",
+                            unit.dialect, d.message
+                        )
+                    })
+                    .collect(),
+            });
+        }
+    }
     Ok(Lifted {
-        unit: SourceUnit {
-            dialect: lifter.dialect,
-            members,
-        },
+        unit,
         errors: lifter.errors,
     })
 }
@@ -608,8 +1053,49 @@ fn sval<'a>(el: El<'a>, key: &str) -> Option<&'a str> {
     el.get(key).and_then(|v| v.as_str())
 }
 
+/// A boolean property as the element states it, or, where the element
+/// leaves it out, its metaclass's declared default. Compact payloads may
+/// elide a boolean at its default, and the graph-normal spelling a store
+/// reproduces always does: read as `false`, an elided `isComposite: false`
+/// lifted `ref part` as `part`, and an elided `isVariation: true` an
+/// `enum def` as `abstract enum def`. A null, or any value that is not a
+/// boolean, reads as left out.
 fn bval(el: El, key: &str) -> bool {
-    el.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+    match el.get(key) {
+        Some(Value::Bool(b)) => *b,
+        _ => boolean_default(ty(el), key),
+    }
+}
+
+/// The declared default of `metaclass`'s boolean property `key`, from the
+/// table graph normalization elides against (`cbor_tables::METACLASS_FIELDS`);
+/// `false` for a property the metaclass does not declare. Only a handful
+/// of properties ever default to `true`, so those keys and their
+/// (metaclass, key) pairs are collected from the table once: a read of
+/// any other key returns before hashing, and the rest cost one lookup.
+fn boolean_default(metaclass: &str, key: &str) -> bool {
+    use crate::cbor_tables::{K_BOOL, METACLASS_FIELDS};
+    struct TrueDefaults {
+        keys: Vec<&'static str>,
+        pairs: HashSet<(&'static str, &'static str)>,
+    }
+    static TRUE_DEFAULTS: std::sync::OnceLock<TrueDefaults> = std::sync::OnceLock::new();
+    let defaults = TRUE_DEFAULTS.get_or_init(|| {
+        let pairs: HashSet<(&str, &str)> = METACLASS_FIELDS
+            .iter()
+            .flat_map(|&(metaclass, fields)| {
+                fields
+                    .iter()
+                    .filter(|&&(_, kind, _, default)| kind == K_BOOL && default == 1)
+                    .map(move |&(key, ..)| (metaclass, key))
+            })
+            .collect();
+        let mut keys: Vec<&str> = pairs.iter().map(|&(_, key)| key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        TrueDefaults { keys, pairs }
+    });
+    defaults.keys.contains(&key) && defaults.pairs.contains(&(metaclass, key))
 }
 
 fn ref_id(v: &Value) -> Option<&str> {
@@ -773,6 +1259,97 @@ const KERML_MARKERS: &[&str] = &[
     "MetadataFeature",
 ];
 
+/// Only a referenced, otherwise empty row outside the ownership graph is a
+/// stand-in. An anonymous standalone declaration is not a placeholder merely
+/// because it lacks a name. Keep stand-ins in the name index, not source text.
+fn referenced_placeholders<'a>(by_id: &HashMap<&'a str, El<'a>>) -> HashSet<&'a str> {
+    let mut referenced = HashSet::new();
+    let mut owned = HashSet::new();
+    for el in by_id.values() {
+        for (key, value) in el.iter() {
+            let targets = match value {
+                Value::Array(items) => items.as_slice(),
+                one @ Value::Object(_) => std::slice::from_ref(one),
+                _ => continue,
+            };
+            let ownership = OWNERSHIP_EDGES
+                .iter()
+                .any(|(forward, back)| key == forward || key == back);
+            for id in targets.iter().filter_map(ref_id) {
+                if ownership {
+                    owned.insert(id);
+                } else {
+                    referenced.insert(id);
+                }
+            }
+        }
+    }
+    referenced
+        .into_iter()
+        .filter(|id| !owned.contains(id) && by_id.get(id).is_some_and(|el| is_placeholder(el)))
+        .collect()
+}
+
+/// A row standing in for an element the producer could not resolve: the
+/// declared type of the reference that names it (`Type`, `Classifier`,
+/// `Feature`, `Namespace`, …) and an id, with nothing a declaration has —
+/// no owner, no owned relationships, no name. It says nothing about the
+/// dialect of the model around it.
+fn is_placeholder(el: El) -> bool {
+    matches!(
+        ty(el),
+        "Element" | "Namespace" | "Type" | "Classifier" | "Feature" | "Membership" | "Relationship"
+    ) && !OWNERSHIP_EDGES.iter().any(|(_, back)| {
+        el.get(*back)
+            .and_then(ref_id)
+            .is_some_and(|id| !id.is_empty())
+    }) && el
+        .get("ownedRelationship")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+        && el
+            .get("ownedRelatedElement")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        && Lifter::declared_name(el).is_none()
+        && el.iter().all(|(key, value)| {
+            matches!(key.as_str(), "@id" | "@type" | "elementId")
+                || value.is_null()
+                || value.as_str() == Some("")
+                || value.as_array().is_some_and(Vec::is_empty)
+                // A full-form row spells its metaclass defaults
+                // (`isAbstract: false`, `isUnique: true`); a flag set
+                // otherwise is authored.
+                || value.as_bool() == Some(key == "isUnique")
+                // and derived references to the row itself
+                // (`featureTarget` of a feature that chains nothing).
+                || ref_id(value).is_some_and(|id| Some(id) == el.get("@id").and_then(Value::as_str))
+        })
+}
+
+/// Metaclasses KerML declares as namespace members of their own and SysML
+/// never does: a `type`, a `feature`, the standalone relationships
+/// (`specialization`, `redefinition`, …) and `multiplicity`. Only a
+/// namespace-owned one selects the dialect.
+fn declared_only_in_kerml(t: &str) -> bool {
+    matches!(
+        t,
+        "Type"
+            | "Feature"
+            | "Specialization"
+            | "Subclassification"
+            | "FeatureTyping"
+            | "Subsetting"
+            | "Redefinition"
+            | "Conjugation"
+            | "Disjoining"
+            | "FeatureInverting"
+            | "TypeFeaturing"
+            | "MultiplicityRange"
+            | "Multiplicity"
+    )
+}
+
 /// The most lift steps one ownership path may take: a step is a
 /// membership or the package, definition or usage it owns. Expressions
 /// use an iterative walk with a separate bound. Ownership pointers come from the payload, so a
@@ -829,10 +1406,8 @@ fn nests_deeper_than(items: &[Value], limit: usize) -> bool {
     fn owned_ids(el: &Value) -> impl Iterator<Item = &str> {
         ["ownedRelationship", "ownedRelatedElement"]
             .into_iter()
-            .filter_map(|key| el.get(key))
-            .filter_map(Value::as_array)
-            .flatten()
-            .filter_map(|child| child.get("@id").and_then(Value::as_str))
+            .flat_map(|key| edge_targets(el, key))
+            .filter_map(ref_id)
     }
     let mut by_id: HashMap<&str, &Value> = HashMap::with_capacity(items.len());
     for item in items {
@@ -894,6 +1469,13 @@ struct Lifter<'a> {
     /// Featuring flag of the usage whose body members are being lifted —
     /// a variant member inherits its variation's featuring.
     body_featuring: bool,
+    /// The spellings the body whose members are being lifted settles for
+    /// what the interchange form does not tell apart: a bare transition
+    /// is `else t;` in an action, calculation or case body and
+    /// `transition then t;` in a state body; a reference usage is
+    /// keyword-less except in an interface body, which has only `ref`.
+    /// The lift prints the form the body-context check accepts there.
+    body_spellings: check::BodySpellings,
     errors: Vec<String>,
     /// The messages already in `errors`, so one condition met again and
     /// again over a payload is recorded once. The list is read by a
@@ -971,10 +1553,14 @@ impl<'a> Lifter<'a> {
             if KERML_MARKERS.contains(&ty(el)) {
                 return Dialect::Kerml;
             }
-            // Ordinary namespace-owned Feature declarations are KerML. Do not
-            // let parameter/result or chained Features generated inside SysML
-            // expressions choose the dialect.
-            if ty(el) == "Feature" {
+            // Ordinary namespace-owned declarations of features, standalone
+            // relationships and multiplicities are KerML: SysML declares
+            // none of them on its own (see `no_sysml_declaration`). Do not
+            // let parameter/result or chained Features generated inside
+            // SysML expressions choose the dialect.
+            let anonymous_multiplicity = matches!(ty(el), "MultiplicityRange" | "Multiplicity")
+                && Self::declared_name(el).is_none();
+            if declared_only_in_kerml(ty(el)) && !anonymous_multiplicity {
                 let membership = el
                     .get("owningRelationship")
                     .and_then(ref_id)
@@ -990,7 +1576,7 @@ impl<'a> Lifter<'a> {
                         });
                     if owns
                         && self.owner_of(el).is_some_and(|owner| {
-                            matches!(ty(owner), "Namespace" | "Package")
+                            matches!(ty(owner), "Namespace" | "Package" | "LibraryPackage")
                                 && self
                                     .owned_rels(owner)
                                     .iter()
@@ -1034,17 +1620,24 @@ impl<'a> Lifter<'a> {
     }
 
     /// The name an element is findable by: its declared (short) name, or —
-    /// for unnamed features — the effective name taken from the first
+    /// for unnamed features — the name of the end an unnamed end redefines
+    /// by position, else the effective name taken from the first
     /// referenced or redefined feature (KerML 8.2.3.5 / SysML reference
-    /// forms), mirroring the emitter's scope registration.
+    /// forms), else the positional name of an unnamed subject, objective,
+    /// return parameter or view rendering, mirroring the emitter's scope
+    /// registration and lookup.
     ///
     /// This syntax locator preserves labels accepted by the resolver, including
     /// historical anonymous reference labels. It is not semantic name selection.
     fn effective_name(&self, el: El<'a>, depth: usize) -> Option<String> {
-        // A binary connector-family end is findable only as `source`/
-        // `target` (its implied redefinition of the BinaryConnection ends —
-        // the emitter's `implied_ends` registration); positional naming
-        // wins even over a declared end name, which is never registered.
+        // A binary connector-family end is findable by the library end it
+        // redefines by position (`source`, `thisThing`, `earlierOccurrence`,
+        // … — the emitter's `implied_ends` registration). The lift spells
+        // such an end by that name even when the end declares one
+        // (`connect left ::> a to right ::> b` lifts a reference to `left`
+        // as `source`): the emitter registers the declared name first and
+        // the positional name beside it, so either spelling resolves to the
+        // end, and only the text differs.
         if let Some(n) = self.implied_end_name(el) {
             return Some(n.to_string());
         }
@@ -1054,6 +1647,39 @@ impl<'a> Lifter<'a> {
         if depth > 8 {
             return None;
         }
+        self.positional_end_name(el, depth)
+            .or_else(|| self.referenced_name(el, depth))
+            .or_else(|| self.implied_role_name(el).map(str::to_string))
+    }
+
+    /// The positional name an unnamed subject, objective, return parameter
+    /// or view rendering that redefines nothing explicitly is findable by
+    /// in its owner (`subj`, `obj`, `result`, `viewRendering`): the name of
+    /// the library feature it implicitly redefines, which the emitter
+    /// registers beside any referenced name.
+    fn implied_role_name(&self, el: El<'a>) -> Option<&'static str> {
+        let membership = el
+            .get("owningRelationship")
+            .and_then(ref_id)
+            .and_then(|id| self.by_id.get(id))?;
+        let name = crate::json::naming::membership_implied_name_of(
+            ty(membership),
+            sval(membership, "kind"),
+        )?;
+        let rels = self.owned_rels(el);
+        // A SysML reference rule names ahead of the role: a state's `do
+        // refuel;` is `refuel`, its performed action.
+        if crate::json::naming::reference_names_feature_target(ty(el), Some(ty(membership)))
+            && rels.iter().any(|r| ty(r) == "ReferenceSubsetting")
+        {
+            return None;
+        }
+        (!rels.iter().any(|r| ty(r) == "Redefinition")).then_some(name)
+    }
+
+    /// The name an unnamed feature takes from the first feature it
+    /// references or redefines, as written or as that feature is named.
+    fn referenced_name(&self, el: El<'a>, depth: usize) -> Option<String> {
         let membership = el
             .get("owningRelationship")
             .and_then(ref_id)
@@ -1114,33 +1740,119 @@ impl<'a> Lifter<'a> {
     }
 
     /// The implied positional name of a binary connector-family end: the two
-    /// bare ends of a `connect a to b` (ConnectionUsage / InterfaceUsage /
-    /// AllocationUsage / KerML Connector) implicitly redefine the
-    /// BinaryConnection ends and are findable only as `source`/`target` —
-    /// mirroring the emitter's `implied_ends` registration exactly (same
-    /// bare-end test, same exactly-two rule, bare-end order).
+    /// ends a usage declares (`connect a to b`, `bind a = b`,
+    /// `first a then b`, a flow's `from a.p to b.p`) implicitly redefine the
+    /// library's binary ends and are findable as `source`/`target`
+    /// (bindings `thisThing`/`sameThing`, successions
+    /// `earlierOccurrence`/`laterOccurrence`) — mirroring the emitter's
+    /// `implied_ends` registration exactly: the two bare ends of a
+    /// connection, interface, allocation or KerML connector (body ends the
+    /// emitter folds in count), a binding's or succession's two ends when
+    /// they lift as its declaration, a flow's two flow ends.
     fn implied_end_name(&self, el: El<'a>) -> Option<&'static str> {
         let rel_id = el.get("owningRelationship").and_then(ref_id)?;
         if ty(self.by_id.get(rel_id)?) != "EndFeatureMembership" {
             return None;
         }
         let owner = self.owner_of(el)?;
-        if !matches!(
-            ty(owner),
-            "ConnectionUsage" | "InterfaceUsage" | "AllocationUsage" | "Connector"
-        ) {
-            return None;
-        }
-        let bare: Vec<El<'a>> = self
+        let kind = usage_kind_of(ty(owner), self.dialect)?;
+        let names = crate::json::binary_end_names(kind)?;
+        let end_rels = self
             .owned_rels(owner)
             .into_iter()
-            .filter(|r| ty(r) == "EndFeatureMembership" && self.is_bare_end(r))
-            .collect();
-        match bare.as_slice() {
-            [first, _] if id_of(first) == rel_id => Some("source"),
-            [_, second] if id_of(second) == rel_id => Some("target"),
+            .filter(|r| ty(r) == "EndFeatureMembership");
+        let ends: Vec<El<'a>> = match kind {
+            UsageKind::Binding | UsageKind::Succession => {
+                let ends: Vec<El<'a>> = end_rels.collect();
+                let detail = ends
+                    .iter()
+                    .enumerate()
+                    .all(|(i, r)| self.is_detail_end(kind, i, r));
+                if detail { ends } else { Vec::new() }
+            }
+            // A flow end the emitter left empty (no chain) has no scope.
+            UsageKind::Flow | UsageKind::SuccessionFlow => end_rels
+                .filter(|r| {
+                    self.first_related(r)
+                        .is_some_and(|f| ty(f) == "FlowEnd" && !self.owned_rels(f).is_empty())
+                })
+                .collect(),
+            _ => end_rels.filter(|r| self.is_bare_end(r)).collect(),
+        };
+        match ends.as_slice() {
+            [first, _] if id_of(first) == rel_id => Some(names[0]),
+            [_, second] if id_of(second) == rel_id => Some(names[1]),
             _ => None,
         }
+    }
+
+    /// The name an unnamed end that redefines nothing explicitly is findable
+    /// by in its owner: the name of the end it redefines by position, the
+    /// end at the same position among the ends of the first general in the
+    /// document that has one there (that general's own, then those it
+    /// inherits after them) — mirroring the emitter's lookup, which answers
+    /// that name with this end for every general it reads:
+    /// `allocation a : L2P allocate l to p;` names `a`'s ends after `L2P`'s.
+    /// A general outside the document is passed over, as the emitter passes
+    /// over a library general: its end names are not the document's to
+    /// spell. `connection def X :> LibType, U { end; end; }` names `X`'s
+    /// ends after `U`'s.
+    fn positional_end_name(&self, el: El<'a>, depth: usize) -> Option<String> {
+        if !bval(el, "isEnd") || self.owned_rels(el).iter().any(|r| ty(r) == "Redefinition") {
+            return None;
+        }
+        let owner = self.owner_of(el)?;
+        let index = self
+            .owned_ends(owner)
+            .iter()
+            .position(|end| id_of(end) == id_of(el))?;
+        let general_end = self.general_end_at(owner, index, depth)?;
+        self.effective_name(general_end, depth + 1)
+    }
+
+    /// The end at `index` among the ends `el` inherits: those of its first
+    /// general in the document (in the order its specializations are
+    /// written) that has an end there, the general's own ends first, then
+    /// those it inherits after them. A general outside the document, or
+    /// one spelled by an unresolved name, has no ends to read here and is
+    /// passed over.
+    fn general_end_at(&self, el: El<'a>, index: usize, depth: usize) -> Option<El<'a>> {
+        if depth > 8 {
+            return None;
+        }
+        for rel in self.owned_rels(el) {
+            let key = match ty(rel) {
+                "FeatureTyping" => "type",
+                "Subclassification" => "superclassifier",
+                "Subsetting" => "subsettedFeature",
+                "ReferenceSubsetting" => "referencedFeature",
+                "Redefinition" => "redefinedFeature",
+                _ => continue,
+            };
+            let Some(&general) = rel
+                .get(key)
+                .and_then(ref_id)
+                .and_then(|id| self.by_id.get(id))
+            else {
+                continue;
+            };
+            if let Some(&end) = self.owned_ends(general).get(index) {
+                return Some(end);
+            }
+            if let Some(end) = self.general_end_at(general, index, depth + 1) {
+                return Some(end);
+            }
+        }
+        None
+    }
+
+    /// The end features `el` owns, in order.
+    fn owned_ends(&self, el: El<'a>) -> Vec<El<'a>> {
+        self.owned_rels(el)
+            .into_iter()
+            .filter_map(|rel| self.first_related(rel))
+            .filter(|member| bval(member, "isEnd"))
+            .collect()
     }
 
     /// The last `FeatureChaining` link of an owned chain Feature, if `el`
@@ -1218,11 +1930,15 @@ impl<'a> Lifter<'a> {
 
     /// Owned relationships of `el`, in order, skipping implied ones.
     fn owned_rels(&self, el: El<'a>) -> Vec<El<'a>> {
-        let Some(Value::Array(rels)) = el.get("ownedRelationship") else {
-            return Vec::new();
+        let rels = match el.get("ownedRelationship") {
+            Some(Value::Array(rels)) => rels.as_slice(),
+            Some(one @ Value::Object(_)) => std::slice::from_ref(one),
+            _ => &[],
         };
+        let mut seen = HashSet::new();
         rels.iter()
             .filter_map(ref_id)
+            .filter(|id| seen.insert(*id))
             .filter_map(|id| self.by_id.get(id).copied())
             .filter(|rel| !bval(rel, "isImplied"))
             .collect()
@@ -1230,12 +1946,16 @@ impl<'a> Lifter<'a> {
 
     /// The elements owned *by* a relationship.
     fn related(&self, rel: El<'a>) -> Vec<El<'a>> {
-        let Some(Value::Array(elems)) = rel.get("ownedRelatedElement") else {
-            return Vec::new();
+        let elems = match rel.get("ownedRelatedElement") {
+            Some(Value::Array(elems)) => elems.as_slice(),
+            Some(one @ Value::Object(_)) => std::slice::from_ref(one),
+            _ => &[],
         };
+        let mut seen = HashSet::new();
         elems
             .iter()
             .filter_map(ref_id)
+            .filter(|id| seen.insert(*id))
             .filter_map(|id| self.by_id.get(id).copied())
             .collect()
     }
@@ -2004,6 +2724,9 @@ impl<'a> Lifter<'a> {
             "Specialization" | "Subclassification" | "FeatureTyping" | "Subsetting"
             | "Redefinition" | "Conjugation" | "Disjoining" | "FeatureInverting"
             | "TypeFeaturing" => {
+                if self.dialect == Dialect::Sysml {
+                    return self.no_sysml_declaration(el);
+                }
                 use RelationshipDeclKind::*;
                 let (kind, skey, tkey) = match t {
                     "Specialization" => (Specialization, "specific", "general"),
@@ -2029,6 +2752,12 @@ impl<'a> Lifter<'a> {
                 ));
             }
             "MultiplicityRange" | "Multiplicity" => {
+                // SysML parses an anonymous `multiplicity [1..2];` (and a
+                // bound-less `multiplicity ;`, as the pilot exporter writes
+                // a usage's default); only a named one is KerML's.
+                if self.dialect == Dialect::Sysml && Self::declared_name(el).is_some() {
+                    return self.no_sysml_declaration(el);
+                }
                 let mut subsets = None;
                 let mut bounds = Vec::new();
                 let mut body = Vec::new();
@@ -2071,6 +2800,9 @@ impl<'a> Lifter<'a> {
         }
         // Definitions.
         if let Some(kind) = def_kind_of(t) {
+            if t == "Type" && self.dialect == Dialect::Sysml {
+                return self.no_sysml_declaration(el);
+            }
             return Some(Self::member(
                 vis,
                 MemberKind::Definition(self.lift_definition(el, kind)?),
@@ -2080,6 +2812,9 @@ impl<'a> Lifter<'a> {
         // or KerML `member` type-members, by the owner's metaclass (or
         // prefix metadata, which the owner should have consumed).
         if usage_kind_of(t, self.dialect).is_some() {
+            if t == "Feature" && self.dialect == Dialect::Sysml {
+                return self.no_sysml_declaration(el);
+            }
             self.next_featuring = false;
             let mut usage = self.lift_usage(el, false)?;
             // The KerML `member` prefix; SysML has no such spelling —
@@ -2089,6 +2824,23 @@ impl<'a> Lifter<'a> {
             return Some(Self::member(vis, MemberKind::Usage(usage)));
         }
         self.record(format!("unsupported owned element @type {t}"));
+        None
+    }
+
+    /// Refuse a member only KerML can declare on its own — a
+    /// relationship (`specialization`, `redefinition`, …), a `multiplicity`
+    /// or a `type`/`feature` — reached as a member of a SysML unit, whose grammar
+    /// has no such declarations: printed, the unit would not parse back.
+    /// SysML writes these inside the element they belong to; this one
+    /// arrives without it, typically as the outermost element of a slice.
+    fn no_sysml_declaration(&mut self, el: El<'a>) -> Option<Member> {
+        self.incomplete = true;
+        self.record(format!(
+            "{} {} has no SysML declaration of its own (KerML declares it standalone); \
+             provide its enclosing element or select KerML for a KerML slice",
+            ty(el),
+            id_of(el)
+        ));
         None
     }
 
@@ -2211,8 +2963,13 @@ impl<'a> Lifter<'a> {
         // Variants of a variation *definition* have no featuring type
         // (pilot `getExpectedFeaturingTypeOf` requires a Usage container).
         let saved_body = std::mem::replace(&mut self.body_featuring, false);
+        let saved_spellings = std::mem::replace(
+            &mut self.body_spellings,
+            check::definition_body_spellings(self.dialect, kind),
+        );
         let members = self.lift_members(&body_rels);
         self.body_featuring = saved_body;
+        self.body_spellings = saved_spellings;
         Some(Definition {
             prefix: DefPrefix {
                 // A variation is implicitly abstract, and an enumeration
@@ -2273,6 +3030,14 @@ impl<'a> Lifter<'a> {
     }
 
     // ---- usages ----
+
+    /// A loop or if body: an `in` parameter of its action whose direction the
+    /// text never spells (the grammar's ActionBodyParameter).
+    fn lift_body_parameter(&mut self, el: El<'a>) -> Option<Usage> {
+        let mut body = self.lift_usage(el, false)?;
+        body.prefix.direction = None;
+        Some(body)
+    }
 
     fn lift_usage(&mut self, el: El<'a>, is_variant: bool) -> Option<Usage> {
         let id = id_of(el);
@@ -2367,10 +3132,23 @@ impl<'a> Lifter<'a> {
         } else {
             kind
         };
+        // `ref x : T` and `x : T` are one element, a ReferenceUsage. The
+        // keyword-less form prints wherever the grammar has it; an
+        // interface body has none besides its ends
+        // (`InterfaceNonOccurrenceUsageElement`), so there the lift
+        // spells `ref`, the form the body-context check accepts.
+        let kind = if kind == UsageKind::Default
+            && !prefix.is_end
+            && self.body_spellings.reference_keyword
+        {
+            UsageKind::Ref
+        } else {
+            kind
+        };
         if self.dialect == Dialect::Sysml
             && featuring
             && t.ends_with("Usage")
-            && el.get("isComposite").and_then(|v| v.as_bool()) == Some(false)
+            && !bval(el, "isComposite")
             && prefix.direction.is_none()
             && !prefix.is_end
             && !matches!(
@@ -2414,6 +3192,9 @@ impl<'a> Lifter<'a> {
         let mut transition_guard = None;
         let mut transition_effect = None;
         let mut transition_target = None;
+        // Any trigger, guard or effect membership, whether or not it
+        // lifted: a transition owning one is no default target succession.
+        let mut transition_features_seen = false;
         let mut satisfy_by = None;
         let mut chain_links: Vec<TargetRef> = Vec::new();
 
@@ -2440,12 +3221,10 @@ impl<'a> Lifter<'a> {
         };
         let ends_as_detail = connector_family
             && end_rels.len() >= min_detail_ends
-            && end_rels.iter().enumerate().all(|(i, r)| {
-                // A succession's source end may be unspelled (`then x;`,
-                // `then [1] x;` — no ReferenceSubsetting).
-                self.is_bare_end(r)
-                    || (kind == UsageKind::Succession && i == 0 && self.is_unreferenced_end(r))
-            });
+            && end_rels
+                .iter()
+                .enumerate()
+                .all(|(i, r)| self.is_detail_end(kind, i, r));
 
         let mut rel_iter = rels.iter().peekable();
         // Cross feature: leading OwningMembership + reference feature on an
@@ -2736,27 +3515,30 @@ impl<'a> Lifter<'a> {
                 "Membership" if matches!(t, "TransitionUsage") && transition_source.is_none() => {
                     transition_source = self.target(rel, "memberElement");
                 }
-                "TransitionFeatureMembership" => match sval(rel, "kind") {
-                    Some("trigger") => {
-                        if let Some(acc) = self.first_related(rel) {
-                            let lifted = self.lift_usage(acc, false)?;
-                            if let UsageDetail::Accept { .. } = lifted.detail {
-                                transition_trigger = Some(Box::new(lifted.detail));
+                "TransitionFeatureMembership" => {
+                    transition_features_seen = true;
+                    match sval(rel, "kind") {
+                        Some("trigger") => {
+                            if let Some(acc) = self.first_related(rel) {
+                                let lifted = self.lift_usage(acc, false)?;
+                                if let UsageDetail::Accept { .. } = lifted.detail {
+                                    transition_trigger = Some(Box::new(lifted.detail));
+                                }
                             }
                         }
-                    }
-                    Some("guard") => {
-                        if let Some(g) = self.first_related(rel) {
-                            transition_guard = self.lift_expr(g);
+                        Some("guard") => {
+                            if let Some(g) = self.first_related(rel) {
+                                transition_guard = self.lift_expr(g);
+                            }
                         }
-                    }
-                    Some("effect") => {
-                        if let Some(e) = self.first_related(rel) {
-                            transition_effect = self.lift_usage(e, false).map(Box::new);
+                        Some("effect") => {
+                            if let Some(e) = self.first_related(rel) {
+                                transition_effect = self.lift_usage(e, false).map(Box::new);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 "SubjectMembership" if t == "SatisfyRequirementUsage" => {
                     if let Some(su) = self.first_related(rel) {
                         for srel in self.owned_rels(su) {
@@ -2812,7 +3594,7 @@ impl<'a> Lifter<'a> {
         }
 
         // Kind-specific details.
-        let detail = self.assemble_detail(
+        let mut detail = self.assemble_detail(
             t,
             kind,
             el,
@@ -2828,10 +3610,60 @@ impl<'a> Lifter<'a> {
             transition_target,
             satisfy_by,
         );
+        // The default target succession (`else t;`) and a state body's
+        // `transition then t;` are one shape in the interchange form: a
+        // transition owning its empty parameter and its succession, nothing
+        // else. The owner's body tells them apart — an action, calculation
+        // or case body takes `else` and refuses the other spelling, a state
+        // body the reverse — so spell it by the owner. A declaration or a
+        // transition feature membership of any kind rules `else` out.
+        if let UsageDetail::Transition {
+            source, is_default, ..
+        } = &mut detail
+        {
+            *is_default = self.body_spellings.default_target
+                && source.is_none()
+                && !transition_features_seen
+                && declaration.is_empty();
+        }
 
+        // A state body's bare target transition (`then t;`, SysML.xtext
+        // `TargetTransitionUsage`) is the text the parser reads as a
+        // succession and the lowering builds as a transition: lifted back
+        // as that succession, so the text round-trips.
+        let (kind, detail) = match detail {
+            UsageDetail::Transition {
+                source: None,
+                trigger: None,
+                guard: None,
+                effect: None,
+                target: Some(target),
+                is_default: false,
+            } if kind == UsageKind::Transition
+                && declaration == Default::default()
+                && self.owner_of(el).is_some_and(|owner| {
+                    crate::metaclass::conforms(ty(owner), "StateDefinition")
+                        || crate::metaclass::conforms(ty(owner), "StateUsage")
+                }) =>
+            {
+                (
+                    UsageKind::Succession,
+                    UsageDetail::Succession {
+                        source: None,
+                        target,
+                    },
+                )
+            }
+            detail => (kind, detail),
+        };
         let saved_body = std::mem::replace(&mut self.body_featuring, featuring);
+        let saved_spellings = std::mem::replace(
+            &mut self.body_spellings,
+            check::usage_body_spellings(self.dialect, kind),
+        );
         let members = self.lift_members(&body_rels);
         self.body_featuring = saved_body;
+        self.body_spellings = saved_spellings;
         Some(Usage {
             prefix,
             kind,
@@ -3047,7 +3879,7 @@ impl<'a> Lifter<'a> {
                 for rel in params {
                     if let Some(inner) = self.first_related(rel) {
                         if matches!(ty(inner), "ActionUsage" | "IfActionUsage") {
-                            if let Some(u) = self.lift_usage(inner, false) {
+                            if let Some(u) = self.lift_body_parameter(inner) {
                                 bodies.push(u);
                             }
                         } else if cond.is_none() {
@@ -3080,7 +3912,7 @@ impl<'a> Lifter<'a> {
                 for rel in params {
                     if let Some(inner) = self.first_related(rel) {
                         if ty(inner) == "ActionUsage" {
-                            body = self.lift_usage(inner, false).map(Box::new);
+                            body = self.lift_body_parameter(inner).map(Box::new);
                         } else if let Some(expr) =
                             self.param_value(inner).or_else(|| self.lift_expr(inner))
                         {
@@ -3109,7 +3941,7 @@ impl<'a> Lifter<'a> {
                 for rel in params {
                     if let Some(inner) = self.first_related(rel) {
                         if ty(inner) == "ActionUsage" {
-                            body = self.lift_usage(inner, false).map(Box::new);
+                            body = self.lift_body_parameter(inner).map(Box::new);
                         } else if seq.is_none() {
                             seq = self.param_value(inner).or_else(|| self.lift_expr(inner));
                         }
@@ -3161,6 +3993,16 @@ impl<'a> Lifter<'a> {
                     .unwrap_or(false),
                 _ => false,
             })
+    }
+
+    /// Does the end membership at position `i` lift as part of a
+    /// connector-family declaration (`connect a to b`, `bind a = b`,
+    /// `first a then b`) rather than as a body member? A bare end does; so
+    /// does a succession's source end left unspelled (`then x;`,
+    /// `then [1] x;` — no ReferenceSubsetting).
+    fn is_detail_end(&self, kind: UsageKind, i: usize, rel: El<'a>) -> bool {
+        self.is_bare_end(rel)
+            || (kind == UsageKind::Succession && i == 0 && self.is_unreferenced_end(rel))
     }
 
     /// Is this end membership a completely bare end feature — no reference,
@@ -4045,6 +4887,34 @@ mod tests {
         assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
     }
 
+    #[test]
+    fn deep_bare_edges_use_the_same_stack_guard_as_lists() {
+        for depth in [IN_PLACE_DEPTH * 2, MAX_LIFT_DEPTH * 2] {
+            let mut items = chain(depth);
+            for item in &mut items {
+                for (edge, _) in OWNERSHIP_EDGES {
+                    if let Some(Value::Array(targets)) = item.get_mut(edge) {
+                        if targets.len() == 1 {
+                            item[edge] = targets.pop().unwrap();
+                        }
+                    }
+                }
+            }
+            assert!(nests_deeper_than(&items, IN_PLACE_DEPTH));
+            let lifted = std::thread::Builder::new()
+                .stack_size(1 << 20)
+                .spawn(move || from_compact_json(&Value::Array(items)))
+                .unwrap()
+                .join()
+                .unwrap();
+            if depth > MAX_LIFT_DEPTH {
+                assert!(matches!(lifted, Err(LiftError::Incomplete { .. })));
+            } else {
+                assert!(lifted.unwrap().errors.is_empty());
+            }
+        }
+    }
+
     /// A payload nesting past the bound is reported rather than followed,
     /// and reported once however far past it goes.
     #[test]
@@ -4219,6 +5089,88 @@ mod omitted_dialect_tests {
     use serde_json::json;
 
     #[test]
+    fn an_elided_true_default_and_a_null_read_as_the_default() {
+        // `EnumerationDefinition` declares `isVariation` true: elided, the
+        // enumeration must not lift as `abstract enum def`, and a null
+        // reads as left out, so even beside `isAbstract: true` it stays an
+        // `enum def`. A null `isComposite` reads as its default `false`,
+        // so the part is a reference.
+        let document = json!([
+            {"@id":"pkg","@type":"Package","declaredName":"P",
+             "ownedRelationship":[{"@id":"m1"},{"@id":"m2"},{"@id":"m3"}]},
+            {"@id":"m1","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"e"}]},
+            {"@id":"e","@type":"EnumerationDefinition","declaredName":"E",
+             "owningRelationship":{"@id":"m1"}},
+            {"@id":"m2","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"f"}]},
+            {"@id":"f","@type":"EnumerationDefinition","declaredName":"F",
+             "isAbstract":true,"isVariation":null,"owningRelationship":{"@id":"m2"}},
+            {"@id":"m3","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"a"}]},
+            {"@id":"a","@type":"PartDefinition","declaredName":"A",
+             "owningRelationship":{"@id":"m3"},"ownedRelationship":[{"@id":"m4"}]},
+            {"@id":"m4","@type":"FeatureMembership",
+             "owningRelatedElement":{"@id":"a"},"ownedRelatedElement":[{"@id":"y"}]},
+            {"@id":"y","@type":"PartUsage","declaredName":"y","isComposite":null,
+             "owningRelationship":{"@id":"m4"}}
+        ]);
+        let lifted = from_compact_json(&document).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+        assert!(
+            text.contains("enum def E") && text.contains("enum def F"),
+            "{text}"
+        );
+        assert!(!text.contains("abstract"), "{text}");
+        assert!(text.contains("ref part y"), "{text}");
+    }
+
+    #[test]
+    fn boolean_defaults_come_from_the_metaclass_table() {
+        assert!(boolean_default("EnumerationDefinition", "isVariation"));
+        assert!(!boolean_default("PartDefinition", "isVariation"));
+        assert!(boolean_default("PartUsage", "isUnique"));
+        assert!(!boolean_default("PartUsage", "isComposite"));
+        assert!(boolean_default("ConnectionDefinition", "isSufficient"));
+        // Not declared, or not a boolean: false.
+        assert!(!boolean_default("PartUsage", "isNotAProperty"));
+        assert!(!boolean_default("NotAMetaclass", "isUnique"));
+        assert!(!boolean_default("PartUsage", "declaredName"));
+    }
+
+    #[test]
+    fn elided_boolean_defaults_lift_as_the_default() {
+        // The graph-normal spelling elides `isComposite: false` (its
+        // declared default); the part must still lift as `ref`.
+        let document = json!([
+            {"@id":"pkg","@type":"Package","declaredName":"P",
+             "ownedRelationship":[{"@id":"m1"}]},
+            {"@id":"m1","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"a"}]},
+            {"@id":"a","@type":"PartDefinition","declaredName":"A",
+             "owningRelationship":{"@id":"m1"},
+             "ownedRelationship":[{"@id":"m2"},{"@id":"m3"}]},
+            {"@id":"m2","@type":"FeatureMembership",
+             "owningRelatedElement":{"@id":"a"},"ownedRelatedElement":[{"@id":"x"}]},
+            {"@id":"x","@type":"PartUsage","declaredName":"x","isComposite":true,
+             "owningRelationship":{"@id":"m2"}},
+            {"@id":"m3","@type":"FeatureMembership",
+             "owningRelatedElement":{"@id":"a"},"ownedRelatedElement":[{"@id":"y"}]},
+            {"@id":"y","@type":"PartUsage","declaredName":"y",
+             "owningRelationship":{"@id":"m3"}}
+        ]);
+        let lifted = from_compact_json(&document).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+        assert!(text.contains("ref part y"), "{text}");
+        assert!(
+            text.contains("part x") && !text.contains("ref part x"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn implied_subtrees_do_not_select_a_dialect_or_become_roots() {
         // Both a root implied marker and a marker below an implied carrier
         // with an absent owner are omitted. Child flags are not required.
@@ -4319,6 +5271,626 @@ mod omitted_dialect_tests {
         assert_eq!(
             omitted_element_ids(&document),
             HashSet::from(["a", "b", "note", "annotation"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod owning_reference_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A SysML model whose interchange form owns relationships through
+    /// relationships (the subsetting's chain feature) as well as elements
+    /// through memberships, so both kinds of back-reference occur.
+    const MODEL: &str = "package P {\n    part def A { part b; }\n    part a : A;\n    part c :> a.b;\n    alias D for a;\n}\n";
+
+    fn emitted() -> Value {
+        let parsed = sysmlv2_syntax::parser::parse_source(MODEL);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        crate::json::to_compact_json(&parsed.unit)
+    }
+
+    /// `document` with every back-reference removed, as Flexo MMS returns
+    /// it, and how many named an owner.
+    fn without_back_references(document: &Value) -> (Value, usize) {
+        let mut stripped = document.clone();
+        let mut named = 0;
+        for element in stripped.as_array_mut().unwrap() {
+            let element = element.as_object_mut().unwrap();
+            for (_, back) in OWNERSHIP_EDGES {
+                if element.remove(back).is_some_and(|v| !v.is_null()) {
+                    named += 1;
+                }
+            }
+        }
+        (stripped, named)
+    }
+
+    /// `document` with its null back-references dropped: what the
+    /// completion can give back, since it has no reason to write a null.
+    fn without_nulls(document: &Value) -> Value {
+        let mut out = document.clone();
+        for element in out.as_array_mut().unwrap() {
+            element
+                .as_object_mut()
+                .unwrap()
+                .retain(|key, value| !(key.starts_with("owning") && value.is_null()));
+        }
+        out
+    }
+
+    fn element<'v>(document: &'v Value, id: &str) -> &'v Value {
+        document
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["@id"] == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_payload_without_back_references_is_refused_rather_than_flattened() {
+        let (stripped, _) = without_back_references(&emitted());
+        match from_compact_json(&stripped) {
+            Err(LiftError::OmittedOwnership { elements, first }) => {
+                // Everything but the root namespace has an owner.
+                assert_eq!(elements, stripped.as_array().unwrap().len() - 1);
+                assert_eq!(first, stripped[1]["@id"].as_str().unwrap());
+            }
+            Err(other) => panic!("expected OmittedOwnership, got {other}"),
+            Ok(_) => panic!("expected OmittedOwnership, got a lift"),
+        }
+    }
+
+    #[test]
+    fn completion_restores_exactly_the_back_references_the_payload_omitted() {
+        let original = emitted();
+        let (mut stripped, named) = without_back_references(&original);
+        assert_eq!(complete_owning_references(&mut stripped).unwrap(), named);
+        assert_eq!(stripped, without_nulls(&original));
+
+        // What the lift makes of it is what it makes of the original.
+        let print = |document: &Value| {
+            let lifted = from_compact_json(document).unwrap();
+            assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+            sysmlv2_syntax::print::print_source(&lifted.unit)
+        };
+        assert_eq!(print(&stripped), print(&original));
+    }
+
+    #[test]
+    fn a_payload_carrying_its_own_is_left_as_it_is() {
+        let mut document = emitted();
+        let before = document.clone();
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 0);
+        assert_eq!(document, before);
+    }
+
+    #[test]
+    fn each_edge_writes_its_own_back_reference() {
+        // `ownedRelationship` is answered by `owningRelatedElement`,
+        // `ownedRelatedElement` by `owningRelationship`; a lone child may
+        // be written as a bare object rather than a list.
+        let mut document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":{"@id":"m"}},
+            {"@id":"m","@type":"OwningMembership","ownedRelatedElement":[{"@id":"p"}]},
+            {"@id":"p","@type":"PartUsage","declaredName":"p"}
+        ]);
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 2);
+        assert_eq!(
+            element(&document, "m")["owningRelatedElement"],
+            json!({"@id":"root"})
+        );
+        assert_eq!(
+            element(&document, "p")["owningRelationship"],
+            json!({"@id":"m"})
+        );
+        assert!(element(&document, "m").get("owningRelationship").is_none());
+        assert!(
+            element(&document, "p")
+                .get("owningRelatedElement")
+                .is_none()
+        );
+
+        // The lone reference becomes the list the lift follows, so the
+        // part nests under the root instead of vanishing with it.
+        assert_eq!(
+            element(&document, "root")["ownedRelationship"],
+            json!([{"@id":"m"}])
+        );
+        let lifted = from_compact_json(&document).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        assert_eq!(lifted.unit.members.len(), 1);
+        assert!(sysmlv2_syntax::print::print_source(&lifted.unit).contains("part p;"));
+    }
+
+    #[test]
+    fn null_empty_and_malformed_back_references_name_no_owner() {
+        for missing in [
+            json!(null),
+            json!(""),
+            json!({}),
+            json!({"@id":""}),
+            json!("m"),
+        ] {
+            let mut document = json!([
+                {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+                {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+                 "ownedRelatedElement":[{"@id":"p"}]},
+                {"@id":"p","@type":"PartUsage","owningRelationship":missing.clone()}
+            ]);
+            assert_eq!(
+                complete_owning_references(&mut document).unwrap(),
+                1,
+                "{missing}"
+            );
+            assert_eq!(
+                element(&document, "p")["owningRelationship"],
+                json!({"@id":"m"})
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_owners_are_refused_without_mutating_the_payload() {
+        for inverse in [json!(null), json!({"@id":"elsewhere"}), json!({"@id":"m1"})] {
+            let mut document = json!([
+                {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m1"},{"@id":"m2"}]},
+                {"@id":"m1","@type":"OwningMembership","ownedRelatedElement":[{"@id":"p"}]},
+                {"@id":"m2","@type":"OwningMembership","ownedRelatedElement":[{"@id":"p"}]},
+                {"@id":"p","@type":"PartUsage","owningRelationship":inverse}
+            ]);
+            let before = document.clone();
+            let error = complete_owning_references(&mut document).unwrap_err();
+            assert!(error.to_string().contains("ownership conflict"), "{error}");
+            assert!(
+                !error
+                    .to_string()
+                    .contains("m1.ownedRelatedElement does not list it"),
+                "{error}"
+            );
+            assert_eq!(document, before);
+            assert!(from_compact_json(&document).is_err());
+        }
+        let mut document = json!([
+            {"@id":"m","@type":"OwningMembership","ownedRelatedElement":{"@id":"p"}},
+            {"@id":"p","@type":"PartUsage","owningRelationship":{"@id":"elsewhere"}}
+        ]);
+        let before = document.clone();
+        assert!(complete_owning_references(&mut document).is_err());
+        assert_eq!(
+            document, before,
+            "not even the bare edge is normalized on refusal"
+        );
+    }
+
+    #[test]
+    fn the_two_inverse_properties_are_checked_independently() {
+        let mut document = json!([
+            {"@id":"a","@type":"Namespace","ownedRelationship":[{"@id":"r"}]},
+            {"@id":"b","@type":"Relationship","ownedRelatedElement":[{"@id":"r"}]},
+            {"@id":"r","@type":"Relationship","owningRelationship":{"@id":"b"}}
+        ]);
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 1);
+        assert_eq!(document[2]["owningRelatedElement"], json!({"@id":"a"}));
+        assert_eq!(document[2]["owningRelationship"], json!({"@id":"b"}));
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 0);
+    }
+
+    #[test]
+    fn ownership_cycles_are_refused_without_mutation() {
+        for mut document in [
+            json!([
+                {"@id":"a","@type":"OwningMembership","ownedRelatedElement":[{"@id":"b"}]},
+                {"@id":"b","@type":"PartUsage","ownedRelationship":[{"@id":"a"}]}
+            ]),
+            json!([{"@id":"self","@type":"OwningMembership","ownedRelatedElement":[{"@id":"self"}]}]),
+            json!([
+                {"@id":"a","@type":"Relationship","ownedRelatedElement":[{"@id":"b"}],"owningRelatedElement":{"@id":"b"}},
+                {"@id":"b","@type":"Feature"}
+            ]),
+        ] {
+            let before = document.clone();
+            let error = complete_owning_references(&mut document).unwrap_err();
+            assert!(error.to_string().contains("cycle"), "{error}");
+            assert_eq!(document, before);
+        }
+    }
+
+    #[test]
+    fn ignored_subtrees_do_not_create_ownership_conflicts() {
+        let mut document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"},{"@id":"implied"}]},
+            {"@id":"m","@type":"OwningMembership","ownedRelatedElement":[{"@id":"p"}]},
+            {"@id":"p","@type":"PartUsage","declaredName":"p"},
+            {"@id":"implied","@type":"Relationship","isImplied":true,"ownedRelatedElement":{"@id":"ignored"}},
+            {"@id":"ignored","@type":"Feature","ownedRelationship":[{"@id":"implied"}]}
+        ]);
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 2);
+        let lifted = from_compact_json(&document).unwrap();
+        assert_eq!(
+            sysmlv2_syntax::print::print_source(&lifted.unit),
+            "part p;\n"
+        );
+    }
+
+    #[test]
+    fn a_slice_naming_an_owner_outside_it_still_lifts() {
+        // An element-scoped export names the owner it was cut from; that
+        // is not an omission.
+        let document = json!([
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"outside"},
+             "ownedRelatedElement":[{"@id":"p"}]},
+            {"@id":"p","@type":"PartUsage","declaredName":"p",
+             "owningRelationship":{"@id":"m"}}
+        ]);
+        let lifted = from_compact_json(&document).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        assert_eq!(lifted.unit.members.len(), 1);
+    }
+
+    #[test]
+    fn of_a_repeated_id_only_the_row_the_lift_keeps_owns_anything() {
+        // The lift reads the last row for `m`, which lists `q`; the first
+        // row's `p` is no child of the `m` the lift sees.
+        let mut document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","ownedRelatedElement":[{"@id":"p"}]},
+            {"@id":"m","@type":"OwningMembership","ownedRelatedElement":[{"@id":"q"}]},
+            {"@id":"p","@type":"PartUsage","declaredName":"p"},
+            {"@id":"q","@type":"PartUsage","declaredName":"q"}
+        ]);
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 2);
+        assert_eq!(document[2]["owningRelatedElement"], json!({"@id":"root"}));
+        assert_eq!(
+            element(&document, "q")["owningRelationship"],
+            json!({"@id":"m"})
+        );
+        assert!(element(&document, "p").get("owningRelationship").is_none());
+    }
+
+    #[test]
+    fn repeated_forward_references_do_not_duplicate_members() {
+        let mut document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"},{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","ownedRelatedElement":[{"@id":"p"},{"@id":"p"}]},
+            {"@id":"p","@type":"PartUsage","declaredName":"p"}
+        ]);
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 2);
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 0);
+        assert_eq!(
+            sysmlv2_syntax::print::print_source(&from_compact_json(&document).unwrap().unit),
+            "part p;\n"
+        );
+    }
+
+    #[test]
+    fn complete_bare_edges_and_repeated_roots_preserve_one_declaration() {
+        let document = json!([
+            {"@id":"r","@type":"Namespace","ownedRelationship":[]},
+            {"@id":"r","@type":"Namespace","ownedRelationship":{"@id":"m"}},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"r"},
+             "ownedRelatedElement":{"@id":"p"}},
+            {"@id":"p","@type":"PartUsage","declaredName":"p","owningRelationship":{"@id":"m"}}
+        ]);
+        validate_ownership(&document).unwrap();
+        assert!(split_documents(&document).is_none());
+        assert_eq!(
+            sysmlv2_syntax::print::print_source(&from_compact_json(&document).unwrap().unit),
+            "part p;\n"
+        );
+        let mut multi = document.clone();
+        multi
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"@id":"r2","@type":"Namespace"}));
+        let split = split_documents(&multi).unwrap();
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            split
+                .iter()
+                .map(|(_, v)| v.as_array().unwrap().len())
+                .sum::<usize>(),
+            4
+        );
+        assert_eq!(
+            sysmlv2_syntax::print::print_source(&from_compact_json(&split[0].1).unwrap().unit),
+            "part p;\n"
+        );
+    }
+
+    #[test]
+    fn an_inverse_without_its_in_document_forward_end_is_refused() {
+        let mut document = json!([
+            {"@id":"r","@type":"Namespace","ownedRelationship":[]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"r"},
+             "ownedRelatedElement":[{"@id":"p"}]},
+            {"@id":"p","@type":"PartUsage","declaredName":"p","owningRelationship":{"@id":"m"}}
+        ]);
+        assert!(from_compact_json(&document).is_err());
+        let before = document.clone();
+        let error = complete_owning_references(&mut document).unwrap_err();
+        assert!(error.to_string().contains("does not list it"), "{error}");
+        assert_eq!(before, document);
+    }
+
+    #[test]
+    fn owned_namespaces_need_their_matching_inverse_before_splitting() {
+        let mut document = json!([
+            {"@id":"r","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"r"},
+             "ownedRelatedElement":[{"@id":"n"}]},
+            {"@id":"n","@type":"Namespace","declaredName":"N","ownedRelationship":[]}
+        ]);
+        assert!(matches!(
+            validate_ownership(&document),
+            Err(LiftError::OmittedOwnership { elements: 1, .. })
+        ));
+        assert!(matches!(
+            from_compact_json(&document),
+            Err(LiftError::OmittedOwnership { elements: 1, .. })
+        ));
+        assert_eq!(complete_owning_references(&mut document).unwrap(), 1);
+        validate_ownership(&document).unwrap();
+        assert!(split_documents(&document).is_none());
+    }
+
+    #[test]
+    fn nothing_to_complete_in_a_non_list() {
+        assert!(matches!(
+            complete_owning_references(&mut json!({})),
+            Err(LiftError::NotAnElementArray)
+        ));
+        assert_eq!(complete_owning_references(&mut json!([])).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod kerml_only_member_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Lift `document` as SysML and check its text parses back as SysML.
+    fn lift_and_reparse(document: &Value) -> (String, Vec<String>) {
+        let lifted = from_compact_json(document).unwrap();
+        assert_eq!(lifted.unit.dialect, Dialect::Sysml);
+        let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+        let reparsed = sysmlv2_syntax::parser::parse_source(&text);
+        assert!(
+            reparsed.diagnostics.is_empty(),
+            "{text}\n{:?}",
+            reparsed.diagnostics
+        );
+        (text, lifted.errors)
+    }
+
+    #[test]
+    fn a_slice_cannot_succeed_by_discarding_unrepresentable_members() {
+        for document in [
+            json!([
+                {"@id":"p","@type":"Feature","declaredName":"p","owningRelationship":{"@id":"outside"}},
+                {"@id":"r","@type":"Redefinition","owningRelatedElement":{"@id":"elsewhere"},
+                 "redefiningFeature":{"@id":"p"},"redefinedFeature":{"@id":"p"}}
+            ]),
+            json!([{"@id":"f","@type":"Feature","declaredName":"f","owningRelationship":{"@id":"outside"}}]),
+            json!([{"@id":"a","@type":"Type","declaredName":"A","owningRelationship":{"@id":"outside"}}]),
+        ] {
+            let error = from_compact_json(&document)
+                .err()
+                .expect("must refuse loss");
+            assert!(matches!(error, LiftError::Incomplete { .. }));
+            let lifted =
+                from_compact_json_with_dialect(&document, &HashMap::new(), Some(Dialect::Kerml))
+                    .unwrap();
+            let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+            assert!(!text.is_empty());
+            assert!(
+                sysmlv2_syntax::parser::parse_kerml_source(&text)
+                    .diagnostics
+                    .is_empty()
+            );
+        }
+    }
+
+    /// KerML text, through its compact JSON, lifts as KerML and keeps the
+    /// declarations SysML would leave out.
+    fn kerml_round_trip(text: &str) -> String {
+        let parsed = sysmlv2_syntax::parser::parse_kerml_source(text);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let lifted = from_compact_json(&crate::json::to_compact_json(&parsed.unit)).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        assert_eq!(lifted.unit.dialect, Dialect::Kerml, "{text}");
+        sysmlv2_syntax::print::print_source(&lifted.unit)
+    }
+
+    #[test]
+    fn namespace_members_only_kerml_declares_select_kerml() {
+        // No classifier marks these as KerML: a `type`, and a standalone
+        // relationship or multiplicity a package owns.
+        let text = kerml_round_trip(
+            "package P { type A; type B; specialization S subtype B specializes A; }",
+        );
+        assert!(text.contains("specialization S subtype"), "{text}");
+        let text = kerml_round_trip("library package L { feature f; multiplicity m [1]; }");
+        assert!(
+            text.contains("feature f;") && text.contains("multiplicity m"),
+            "{text}"
+        );
+    }
+
+    /// A part typed by an unresolved classifier, with the placeholder row
+    /// spelled as the pilot exporter writes it: full form, every metaclass
+    /// default present.
+    #[test]
+    fn a_full_form_placeholder_with_default_flags_is_still_a_placeholder() {
+        let document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+             "ownedRelatedElement":[{"@id":"p"}]},
+            {"@id":"p","@type":"PartUsage","declaredName":"p",
+             "owningRelationship":{"@id":"m"},"ownedRelationship":[{"@id":"t"}]},
+            {"@id":"t","@type":"FeatureTyping","owningRelatedElement":{"@id":"p"},
+             "typedFeature":{"@id":"p"},"type":{"@id":"proxy"}},
+            {"@id":"proxy","@type":"Classifier","elementId":"proxy","isAbstract":false,
+             "isSufficient":false,"isConjugated":false,"isLibraryElement":false,
+             "isImpliedIncluded":false,"aliasIds":[],"ownedRelationship":[],
+             "ownedElement":[],"ownedMember":[],"feature":[],"documentation":[]}
+        ]);
+        let feature = json!({"@id":"proxy","@type":"Feature","elementId":"proxy",
+            "isUnique":true,"isOrdered":false,"featureTarget":{"@id":"proxy"},
+            "ownedRelationship":[]});
+        let mut with_feature = document.clone();
+        with_feature[4] = feature;
+        for document in [document, with_feature] {
+            let lifted = from_compact_json(&document).unwrap();
+            assert!(
+                lifted
+                    .errors
+                    .iter()
+                    .all(|e| !e.contains("no SysML declaration")),
+                "{:?}",
+                lifted.errors
+            );
+            assert_eq!(lifted.unit.dialect, Dialect::Sysml);
+            let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+            assert!(
+                !text.contains("classifier") && !text.contains("feature"),
+                "{text}"
+            );
+            assert!(text.contains("part p :"), "{text}");
+        }
+    }
+
+    /// The pilot exporter gives each usage a bound-less `Multiplicity`
+    /// (its default) through an `OwningMembership`; SysML parses the
+    /// anonymous `multiplicity ;` that lifts from it.
+    #[test]
+    fn an_anonymous_multiplicity_lifts_in_sysml() {
+        let document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+             "ownedRelatedElement":[{"@id":"a"}]},
+            {"@id":"a","@type":"AttributeUsage","declaredName":"a",
+             "owningRelationship":{"@id":"m"},"ownedRelationship":[{"@id":"mm"}]},
+            {"@id":"mm","@type":"OwningMembership","owningRelatedElement":{"@id":"a"},
+             "ownedRelatedElement":[{"@id":"x"}]},
+            {"@id":"x","@type":"Multiplicity","owningRelationship":{"@id":"mm"},
+             "ownedRelationship":[],"isUnique":true,"isOrdered":false}
+        ]);
+        let (text, errors) = lift_and_reparse(&document);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(text.contains("multiplicity"), "{text}");
+        // Written as SysML text, an anonymous bounded one round-trips too.
+        let parsed = sysmlv2_syntax::parser::parse_source(
+            "package P { attribute a { multiplicity [1..2]; } }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (text, errors) = lift_and_reparse(&crate::json::to_compact_json(&parsed.unit));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(text.contains("multiplicity[1..2]"), "{text}");
+    }
+
+    #[test]
+    fn an_ownerless_placeholder_does_not_select_kerml() {
+        // A producer that could not resolve a typing writes its target as
+        // a bare row of the reference's declared type, with no owner, no
+        // name and nothing owned; the part typed by it is SysML.
+        for metaclass in ["Type", "Classifier", "Feature", "Namespace"] {
+            let document = json!([
+                {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+                {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+                 "ownedRelatedElement":[{"@id":"p"}]},
+                {"@id":"p","@type":"PartUsage","declaredName":"p",
+                 "owningRelationship":{"@id":"m"},"ownedRelationship":[{"@id":"t"}]},
+                {"@id":"t","@type":"FeatureTyping","owningRelatedElement":{"@id":"p"},
+                 "typedFeature":{"@id":"p"},"type":{"@id":"proxy"}},
+                {"@id":"proxy","@type":metaclass,"ownedRelationship":[],"declaredName":null}
+            ]);
+            let lifted = from_compact_json(&document).unwrap();
+            assert_eq!(lifted.unit.dialect, Dialect::Sysml, "{metaclass}");
+            let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+            assert!(text.contains("part p :"), "{metaclass}: {text}");
+            assert!(
+                sysmlv2_syntax::parser::parse_source(&text)
+                    .diagnostics
+                    .is_empty(),
+                "{metaclass}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn referenced_anonymous_declarations_with_authored_properties_are_preserved() {
+        for (kind, flag) in [
+            ("Classifier", "isAbstract"),
+            ("Feature", "isComposite"),
+            ("Feature", "isVariable"),
+        ] {
+            let mut document = json!([
+                {"@id":"a","@type":kind},
+                {"@id":"f","@type":"Feature","declaredName":"f","ownedRelationship":[{"@id":"t"}]},
+                {"@id":"t","@type":"FeatureTyping","owningRelatedElement":{"@id":"f"},
+                 "typedFeature":{"@id":"f"},"type":{"@id":"a"}}
+            ]);
+            document[0][flag] = json!(true);
+            let lifted =
+                from_compact_json_with_dialect(&document, &HashMap::new(), Some(Dialect::Kerml))
+                    .unwrap();
+            assert_eq!(lifted.unit.members.len(), 2, "{kind}.{flag}");
+            let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+            assert!(
+                text.contains(match flag {
+                    "isAbstract" => "abstract",
+                    "isComposite" => "composite",
+                    _ => "var",
+                }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_named_as_a_kerml_file_selects_kerml() {
+        let document = json!([
+            {"@id":"root","@type":"Namespace","qualifiedName":"model.kerml",
+             "ownedRelationship":[]}
+        ]);
+        assert_eq!(
+            from_compact_json(&document).unwrap().unit.dialect,
+            Dialect::Kerml
+        );
+    }
+
+    #[test]
+    fn named_dialects_are_case_insensitive_and_refuse_incompatible_declarations() {
+        for (name, metaclass) in [("model.SySmL", "Class"), ("model.KerML", "PartDefinition")] {
+            let document = json!([
+                {"@id":"root","@type":"Namespace","qualifiedName":name,"ownedRelationship":[{"@id":"m"}]},
+                {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},"ownedRelatedElement":[{"@id":"a"}]},
+                {"@id":"a","@type":metaclass,"declaredName":"A","owningRelationship":{"@id":"m"}}
+            ]);
+            assert!(
+                matches!(
+                    from_compact_json(&document),
+                    Err(LiftError::Incomplete { .. })
+                ),
+                "{name}"
+            );
+        }
+        assert_eq!(dialect_from_name("model.KerML"), Some(Dialect::Kerml));
+        assert_eq!(dialect_from_name("model.SySmL"), Some(Dialect::Sysml));
+        assert_eq!(dialect_from_name("model.json"), None);
+        assert_eq!(
+            document_file_name(None, 0, Dialect::Kerml),
+            "document-1.kerml"
+        );
+        let anonymous = json!([{"@id":"c","@type":"Classifier","ownedRelationship":[]}]);
+        let lifted = from_compact_json(&anonymous).unwrap();
+        assert_eq!(lifted.unit.dialect, Dialect::Kerml);
+        assert_eq!(
+            sysmlv2_syntax::print::print_source(&lifted.unit),
+            "classifier;\n"
         );
     }
 }

@@ -10,12 +10,30 @@ vocabularies, and writes crates/sysmlv2-model/src/cbor_tables.rs:
 - the concrete-metaclass type index (sorted; position = wire type code),
 - per-metaclass field lists (lexicographic; position = wire ordinal),
   each field carrying its value kind, enum table, and default,
-- the closed enum vocabularies (`*Kind`, schema declaration order).
+- the closed enum vocabularies (`*Kind`, schema declaration order),
 
-Usage: python3 tools/gen_cbor_tables.py   (from the workspace root)
+and the same tables as data, spec-refs/cbor-tables.json, for readers
+generated in other languages.
+
+The tables are a pure function of the four spec inputs, so a reader
+built from one toolkit release decodes every payload of another as long
+as those inputs did not change. The generated file records a digest of
+the inputs beside `CBOR_TABLES_VERSION`; a regeneration whose digest
+differs from the committed one is refused unless it also bumps the
+version (`--tables-version N`), so the header check stays honest.
+
+Usage (from the workspace root):
+  python3 tools/gen_cbor_tables.py                      regenerate both outputs
+  python3 tools/gen_cbor_tables.py --tables-version 2   regenerate after a spec change
+  python3 tools/gen_cbor_tables.py --check              fail when the outputs are stale (CI)
 """
 
+import argparse
+import hashlib
 import json
+import re
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -25,6 +43,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SCHEMAS = [ROOT / "spec-refs" / "SysML.schema.json",
            ROOT / "spec-refs" / "KerML.schema.json"]
 OUT = ROOT / "crates" / "sysmlv2-model" / "src" / "cbor_tables.rs"
+OUT_JSON = ROOT / "spec-refs" / "cbor-tables.json"
+KIND_NAMES = ["bool", "string", "stringList", "ref", "refList", "enum", "literal", "elementId"]
 
 K_BOOL, K_STR, K_STR_LIST, K_REF, K_REF_LIST, K_ENUM, K_LITERAL, K_ELEMENT_ID = range(8)
 NO_ENUM = 255
@@ -119,7 +139,32 @@ def classify(cls, prop, sch, enum_ids, bool_default):
     raise SystemExit(f"{cls}.{prop}: empty shape")
 
 
-def main():
+def source_digest():
+    """SHA-256 over the four spec inputs, each folded to LF line ends and
+    prefixed by its workspace-relative name, in name order."""
+    h = hashlib.sha256()
+    for path in sorted(list(XP.SOURCES) + SCHEMAS, key=lambda p: p.relative_to(ROOT).as_posix()):
+        h.update(path.relative_to(ROOT).as_posix().encode())
+        h.update(b"\0")
+        h.update(path.read_bytes().replace(b"\r\n", b"\n"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def committed_version_and_digest():
+    """(version, digest) recorded in the committed Rust file, either None
+    when the file or the constant is absent."""
+    if not OUT.exists():
+        return None, None
+    text = OUT.read_text()
+    version = re.search(r"pub const CBOR_TABLES_VERSION: u16 = (\d+);", text)
+    digest = re.search(r'pub const CBOR_TABLES_SOURCE_DIGEST: &str = "([0-9a-f]+)";', text)
+    return (int(version.group(1)) if version else None, digest.group(1) if digest else None)
+
+
+def build_tables():
+    """(rows, enum_ids): the metaclass rows `(name, compact specs, full
+    specs)` sorted by name and the enum vocabularies."""
     classes, defaults = load_classes_with_defaults()
     defs_list = [json.load(p.open())["$defs"] for p in SCHEMAS]
 
@@ -159,7 +204,24 @@ def main():
     dupes = {n for i, (n, _, _) in enumerate(rows) if i and rows[i - 1][0] == n}
     if dupes:
         raise SystemExit(f"metaclass name collision: {dupes}")
+    return rows, enum_ids
 
+
+def rustfmt(text):
+    """The text as `cargo fmt` would leave it (the workspace's rustfmt.toml
+    applies), so the committed file passes the formatting gate and `--check`
+    compares like with like."""
+    return subprocess.run(
+        ["rustfmt", "--edition", "2021"],
+        input=text,
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=ROOT,
+    ).stdout
+
+
+def render_rust(rows, enum_ids, version, digest):
     enum_names = sorted(enum_ids)
     lines = [
         "//! Generated from `spec-refs/{KerML,SysML}.xmi` +",
@@ -168,11 +230,19 @@ def main():
         "//! CBOR encoding of the compact interchange form: concrete",
         "//! metaclasses sorted by name (position = wire type code), fields",
         "//! sorted by name (position = wire ordinal), closed enum",
-        "//! vocabularies in schema declaration order.",
+        "//! vocabularies in schema declaration order. The same tables as",
+        "//! data: `spec-refs/cbor-tables.json`.",
         "",
         "/// Table layout version carried in the payload header; decoders",
-        "/// refuse a version they were not generated for.",
-        "pub const CBOR_TABLES_VERSION: u16 = 1;",
+        "/// refuse a version they were not generated for. The tables are a",
+        "/// pure function of the spec inputs, so this changes only when they",
+        "/// do: the generator refuses to keep it over a changed",
+        "/// `CBOR_TABLES_SOURCE_DIGEST` without `--tables-version`.",
+        f"pub const CBOR_TABLES_VERSION: u16 = {version};",
+        "",
+        "/// SHA-256 over the four spec inputs the tables were generated from",
+        "/// (CRLF folded to LF; see `source_digest` in the generator).",
+        f'pub const CBOR_TABLES_SOURCE_DIGEST: &str = "{digest}";',
         "",
         "/// Boolean; default byte is 0 or 1.",
         "pub const K_BOOL: u8 = 0;",
@@ -233,12 +303,97 @@ def main():
             lines.append(f'        ("{f}", {kind}, {etbl}, {dflt}),')
         lines.append("    ]),")
     lines += ["];", ""]
-    OUT.write_text("\n".join(lines))
+    return rustfmt("\n".join(lines))
+
+
+def render_json(rows, enum_ids, version, digest):
+    """The tables as data. Field entries are `[name, kind, enum, default]`
+    with `kind` a name from `kinds`, `enum` an index into `enums` or null,
+    and `default` the default byte (an enum index, 255 = null, for enum
+    fields; 0/1 for booleans; 0 otherwise). Metaclass position is the wire
+    type code; field position is the wire ordinal."""
+    enum_names = sorted(enum_ids)
+
+    def field(f, kind, etbl, dflt):
+        return json.dumps([f, KIND_NAMES[kind], None if etbl == NO_ENUM else etbl, dflt])
+
+    out = [
+        "{",
+        '  "generator": "tools/gen_cbor_tables.py",',
+        f'  "tablesVersion": {version},',
+        f'  "sourceDigest": "{digest}",',
+        '  "sources": ' + json.dumps(sorted(p.relative_to(ROOT).as_posix() for p in list(XP.SOURCES) + SCHEMAS)) + ",",
+        '  "kinds": ' + json.dumps(KIND_NAMES) + ",",
+        '  "enums": [',
+    ]
+    for i, n in enumerate(enum_names):
+        out.append(f'    {{"name": {json.dumps(n)}, "values": {json.dumps(enum_ids[n])}}}' + ("," if i + 1 < len(enum_names) else ""))
+    out += ["  ],", '  "metaclasses": [']
+    for i, (name, specs, full_specs) in enumerate(rows):
+        out.append("    {")
+        out.append(f'      "name": {json.dumps(name)},')
+        out.append(f'      "typeCode": {i},')
+        out.append('      "compactFields": [')
+        out += [f"        {field(*s)}" + ("," if j + 1 < len(specs) else "") for j, s in enumerate(specs)]
+        out.append("      ],")
+        out.append('      "fullFields": [')
+        out += [f"        {field(*s)}" + ("," if j + 1 < len(full_specs) else "") for j, s in enumerate(full_specs)]
+        out.append("      ]")
+        out.append("    }" + ("," if i + 1 < len(rows) else ""))
+    out += ["  ]", "}", ""]
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--check", action="store_true", help="compare the outputs with the committed files and exit 1 when they differ")
+    ap.add_argument("--tables-version", type=int, help="the CBOR_TABLES_VERSION to write; required when the spec inputs changed")
+    args = ap.parse_args()
+
+    committed_version, committed_digest = committed_version_and_digest()
+    digest = source_digest()
+    rows, enum_ids = build_tables()
+
+    if args.check:
+        if args.tables_version is not None:
+            raise SystemExit("--check takes no --tables-version")
+        version = committed_version if committed_version is not None else 1
+        stale = []
+        if (OUT.read_text() if OUT.exists() else None) != render_rust(rows, enum_ids, version, digest):
+            stale.append(OUT.relative_to(ROOT).as_posix())
+        if (OUT_JSON.read_text() if OUT_JSON.exists() else None) != render_json(rows, enum_ids, version, digest):
+            stale.append(OUT_JSON.relative_to(ROOT).as_posix())
+        if stale:
+            hint = ""
+            if committed_digest is not None and committed_digest != digest:
+                hint = "; the spec inputs changed, so regenerate with --tables-version " + str(version + 1)
+            print(f"stale: {', '.join(stale)} (regenerate with tools/gen_cbor_tables.py{hint})", file=sys.stderr)
+            return 1
+        print("cbor tables are fresh")
+        return 0
+
+    if args.tables_version is not None:
+        if committed_version is not None and args.tables_version <= committed_version:
+            raise SystemExit(f"--tables-version must exceed the committed version {committed_version}")
+        version = args.tables_version
+    else:
+        version = committed_version if committed_version is not None else 1
+        if committed_digest is not None and committed_digest != digest:
+            raise SystemExit(
+                "the spec inputs changed since the committed tables were generated "
+                f"(digest {committed_digest[:12]}… → {digest[:12]}…); decoders key on "
+                f"CBOR_TABLES_VERSION, so rerun with --tables-version {version + 1}"
+            )
+
+    OUT.write_text(render_rust(rows, enum_ids, version, digest))
+    OUT_JSON.write_text(render_json(rows, enum_ids, version, digest))
     n_fields = sum(len(s) for _, s, _ in rows)
     n_full = sum(len(s) for _, _, s in rows)
-    print(f"wrote {OUT.relative_to(ROOT)}: {len(rows)} metaclasses, "
-          f"{n_fields} compact + {n_full} full fields, {len(enum_names)} enums")
+    print(f"wrote {OUT.relative_to(ROOT)} and {OUT_JSON.relative_to(ROOT)}: {len(rows)} metaclasses, "
+          f"{n_fields} compact + {n_full} full fields, {len(enum_ids)} enums, "
+          f"tables version {version}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

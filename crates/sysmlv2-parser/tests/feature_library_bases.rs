@@ -1,6 +1,9 @@
 #![cfg(feature = "json")]
 
-use sysmlv2_parser::{json::ResolvedModel, model::Model};
+use sysmlv2_parser::{
+    json::{Derived, DerivedValue, Reference, ResolvedModel},
+    model::Model,
+};
 
 #[test]
 fn ordinary_features_inherit_the_kernel_base_members() {
@@ -34,6 +37,63 @@ fn occurrence_library_features_resolve_their_featuring_instance() {
                 .name
                 .ends_with("Occurrences.kerml")
                 && reference.spelling == "that"
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+/// `satisfy r by that;` resolves `that` from the claim's own body, where
+/// every usage inherits `Base::things::that`, inside a definition as
+/// inside a usage. Resolving it from the owner's scope found `that` only
+/// where the owner was itself a feature.
+#[test]
+fn satisfy_by_resolves_from_the_claim_inside_a_definition() {
+    let mut model = Model::new();
+    model.add_library_source("base.kerml", "standard library package Base { classifier Anything; feature things : Anything { feature that : Anything; } }");
+    model.add_source(
+        "that.sysml",
+        "package That {
+            requirement def R;
+            requirement r : R;
+            part def V { satisfy r by that; }
+            part v { satisfy r by that; }
+        }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let unresolved = r.unresolved_references();
+    assert!(unresolved.is_empty(), "{unresolved:?}");
+    let that = r.resolve_qualified("Base::things::that").unwrap();
+    let claims: Vec<_> = r
+        .elements_of_metaclass("SatisfyRequirementUsage")
+        .into_iter()
+        .filter(|&x| !r.is_library_element(x))
+        .collect();
+    assert_eq!(claims.len(), 2);
+    for claim in claims {
+        assert_eq!(
+            r.derived(claim, "satisfyingFeature"),
+            Derived::Value(DerivedValue::Reference(Reference::Element(that))),
+            "{:?}",
+            r.element_qualified_name(claim)
+        );
+    }
+}
+
+/// The standard library's own claim, `satisfy requirement
+/// viewpointConformance by that` in an abstract view definition, resolves.
+#[test]
+fn library_view_satisfaction_by_that_resolves() {
+    let mut model = Model::new();
+    model
+        .load_library_dir(&sysmlv2_testkit::library_dir())
+        .unwrap();
+    let r = ResolvedModel::build(&model);
+    let unresolved = r.unresolved_references();
+    let failures: Vec<_> = unresolved
+        .iter()
+        .filter(|reference| {
+            model.unit(reference.unit).name.ends_with("Views.sysml") && reference.spelling == "that"
         })
         .collect();
     assert!(failures.is_empty(), "{failures:?}");

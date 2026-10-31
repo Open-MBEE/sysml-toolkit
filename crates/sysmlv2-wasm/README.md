@@ -14,7 +14,7 @@ const sources = JSON.stringify([
   { name: "demo.sysml", text: "package Demo { part def Vehicle; part car : Vehicle; }" },
 ]);
 
-// Diagnostics: [{severity, stage, message, unit, line, col, endLine, endCol}].
+// Diagnostics: [{severity, stage, message, unit, line, col, endLine, endCol, rule?}].
 const findings = JSON.parse(check(sources));
 
 // Sessions: navigation, queries, interchange JSON, diagrams.
@@ -63,7 +63,7 @@ session.loadLibrarySources(bundle, snapshot);                    // library-awar
 
 Without a bundle, `check(sources)` runs parse and structural checks. Supplying a bundle adds referential and semantic checks; this API does not report unused private imports. Its sealed resolution snapshot is distinct from the native CLI’s directory-backed `.prepared` graph cache.
 
-`Session.fromInterchangeJson(json, bundle, snapshot)` accepts the same pair for lifting library-typed interchange payloads (Flexo `{payload, identity}` change records included).
+`Session.fromInterchangeJson(json, bundle, snapshot)` accepts the same pair for lifting library-typed interchange payloads (Flexo `{payload, identity}` change records included). Its trailing `flexo` flag, `fromInterchangeJson(json, bundle, snapshot, indent, true)`, and the one after `fromInterchangeJsonWithPreparedLibrary`'s `indent`, read a payload as Flexo MMS returns it: without `owningRelationship` and `owningRelatedElement`, which are then derived from the owners' `ownedRelationship` and `ownedRelatedElement`. Without the flag such a payload is refused.
 
 For repeated builds in a worker, prepare the final library bundle once and share
 its immutable graph. Each session keeps its own resolver state:
@@ -105,6 +105,10 @@ settled = session.settledOutcomes();
 
 `LspServer.setNumberFormat(spec)` sets how value hints, hover values and range hints write a rational without a terminating decimal expansion: `exact` (`1/15`, the default), `approx` (`≈0.06666666666666667`), `overline` (`0.06̅`), `parens` (`0.0(6)`) or `unicode` (`¹/₁₅`), then optional `key=value` settings after commas (`digits`, `period`, `mixed`, `slash`, `glyphs`, `fraction-digits`; the command line's `--number-format` documents them). It throws on a spec it cannot read and returns the refresh requests to relay. `Session.verify` takes the same spec as its `numberFormat` option for each range's `rangeApprox`; `range` stays exact.
 
+`LspServer.setValueHintUnits(mode)` sets which units value hints, range hints, a violated verdict's code lens and hover values show quantities in. `si`, the default, shows the evaluator's units: a bracket's unit, kept through sums and scaling, and SI units for a product, quotient or power, so `10 ['in'] / (2 [s])` shows `0.127 [m/s]`. `asWritten` shows each value in the units it was written in where they cover its dimensions, so the same value shows `5 [in/s]` (the rules are under the language server in the command-line guide). Hover shows the other reading alongside when the two differ. It throws on any other mode and returns the refresh requests to relay.
+
+`setValueUnits(mode)` makes the same choice for the rest of the module, `si` by default: the `{value, unit}` answers of `Session.query`, `Session.evaluate` and `Session.viewInfo`, and the default of the `valueUnits` option that `toGraph`, `toPlantuml` (the `= value` on compartment rows) and `Session.verify` (each range's `unit`, `range` and `rangeApprox`, and the bound values in `bindings` and `detail`) take. A request's own `valueUnits` wins. `valueUnits()` reads the choice back. It is module-wide, like `setUnitSpellingExpansion`, so a host sets it once per module at startup and on a settings change, and a language server keeps its own `setValueHintUnits`. Results cached under the old choice are the host's to drop. It throws on any other mode.
+
 `LspServer.withPreparedLibrary(library)` builds the language server on such a handle. A session reuses the library's prepared resolution, where `LspServer.withLibrary(bundle, snapshot)` re-parses the library's sources and rebuilds its graph for every session; a workspace that may change what the library's own names resolve to still has the library resolved together with it: a root name the library looked up and missed replays the resolution recorded in the handle's snapshot (or recorded while preparing, when the snapshot is unusable), a root filter keeps that recording's element identities but resolves the library's references again, and a root declaration named like a library package resolves the library from scratch.
 
 ## Running the command-line module
@@ -115,7 +119,7 @@ Run it under **Node 24 or newer**. Node 22 on x86_64 faults inside its own WASI 
 
 ## Building from source
 
-`node crates/sysmlv2-wasm/npm/build.mjs` (needs wasm-pack, both the `wasm32-unknown-unknown` and `wasm32-wasip1` targets, node ≥ 18 to build and ≥ 24 to run the smokes, and the SysML-v2-Release submodule for the stdlib). Output: `npm/pkg/` (the package) and `npm/dist/sysml-wasm-<version>.tgz`. The release workflow attaches the tarball to tagged releases. It also attempts registry publishing of `@sysml/wasm` on tag/manual runs when `NPM_TOKEN` is configured; otherwise that step is skipped. A local build does not publish.
+`node crates/sysmlv2-wasm/npm/build.mjs` (needs wasm-pack, both the `wasm32-unknown-unknown` and `wasm32-wasip1` targets, node ≥ 18 to build and ≥ 24 to run the smokes, and the SysML-v2-Release submodule for the stdlib). Output: `npm/pkg/` (the package) and `npm/dist/sysml-wasm-<version>.tgz`. The release workflow attaches the tarball to tagged releases and lists its digest in the release's `SHA256SUMS`. It also attempts registry publishing of `@sysml/wasm` on tag/manual runs when `NPM_TOKEN` is configured; otherwise that step is skipped. A local build does not publish.
 
 [sysmlv2]: https://github.com/Open-MBEE/sysml-toolkit
 

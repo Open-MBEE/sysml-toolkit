@@ -3436,7 +3436,9 @@ fn unit_precedence(
         match resolved.evaluate_in(scope, expr) {
             Ok(Value::Integer(_) | Value::Rational(_) | Value::Real(_)) => return Some(true),
             Ok(Value::Quantity(..)) => return Some(false),
-            Ok(Value::Unbound(e) | Value::UnboundMember(e)) => return plain_by_type(resolved, e),
+            Ok(Value::Unbound(e, _) | Value::UnboundMember(e, _)) => {
+                return plain_by_type(resolved, e);
+            }
             _ => {}
         }
         match &expr.kind {
@@ -3640,8 +3642,19 @@ fn unit_precedence(
                             meant.render(resolved)
                         ),
                         // Same base dimensions (`['°']` is dimensionless
-                        // either way): the units themselves tell them apart.
-                        _ => format!("measures `{}` rather than `{unit_text}`", read.display()),
+                        // either way): the units themselves tell them
+                        // apart, read in the units written (`1/°`, not the
+                        // `1/rad` a degree converts to).
+                        _ => {
+                            // Only the unit is re-expressed: one of it
+                            // stands for the reading.
+                            let one = Value::Quantity(Box::new(Value::Integer(1)), read.clone());
+                            let read = match resolved.value_as_written(&one) {
+                                Some(Value::Quantity(_, written)) => written,
+                                _ => read,
+                            };
+                            format!("measures `{}` rather than `{unit_text}`", read.display())
+                        }
                     }
                 }
                 // No value to measure: say what the first operator

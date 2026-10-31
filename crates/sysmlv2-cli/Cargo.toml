@@ -10,6 +10,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 include = ["src/**", "Cargo.toml"]
+autotests = false
 
 [[bin]]
 name = "sysmlv2"
@@ -44,4 +45,17 @@ xattr = "1"
 
 [dev-dependencies]
 sysmlv2-testkit.workspace = true
-sysmlv2-model = { path = "../sysmlv2-model", version = "0.10.10" }
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.11.3" }
+
+# The integration tests build as one binary: tests/integration.rs
+# declares the files under tests/ as its modules.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# Runs the command line in process and reads back the process-wide
+# unit-spelling switch it sets, so it keeps a process of its own: no other
+# run can set the switch between its run and its read.
+[[test]]
+name = "unit_spelling_switch"
+path = "tests/unit_spelling_switch.rs"

@@ -301,6 +301,9 @@ fn cycle(
                             Severity::Error => DiagnosticSeverity::ERROR,
                             Severity::Warning => DiagnosticSeverity::WARNING,
                         }),
+                        code: f
+                            .code
+                            .map(|c| lsp_types::NumberOrString::String(c.to_string())),
                         source: Some("sysmlv2".to_string()),
                         message: f.message,
                         ..Default::default()

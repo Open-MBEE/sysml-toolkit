@@ -51,7 +51,7 @@ impl Builder {
     /// conditions are selected through actual surviving ElementFilterMembership
     /// identities,
     /// not through an unfiltered walk of every ancestor's filter list.
-    fn exposure_condition_ids(
+    pub(super) fn exposure_condition_ids(
         &mut self,
         scope: usize,
         context: &mut MembershipContext,

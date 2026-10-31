@@ -332,7 +332,7 @@ impl ResolvedModel {
     /// settles on an element, else a structural read of a plain
     /// reference / member-chain spelling (`isq.L`).
     fn expr_element(&mut self, scope: ScopeRef, expr: &Expr) -> Option<ElementRef> {
-        if let Ok(Value::Element(e) | Value::Unbound(e) | Value::UnboundMember(e)) =
+        if let Ok(Value::Element(e) | Value::Unbound(e, _) | Value::UnboundMember(e, _)) =
             self.evaluate_in(scope, expr)
         {
             return Some(e);

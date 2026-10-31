@@ -169,6 +169,9 @@ fn dependency_slice(
     roots: &[usize],
     steps: &mut usize,
 ) -> Result<IdMap<usize, Vec<usize>>, Refusal> {
+    // Semantic metadata adds a base the planner does not write (KerML 9.2);
+    // plain metadata adds none.
+    let semantic = b.semantically_annotated();
     let domains = raw
         .membership_domains(b, steps)
         .ok_or_else(|| incomplete(steps))?;
@@ -204,8 +207,7 @@ fn dependency_slice(
                 .is_some_and(|v| v.as_bool() != Some(false))
             || raw.bad_bases.contains(&owner)
             || raw.bad_chains.contains(&owner)
-            || raw.metadata_annotation_targets.contains(&owner)
-            || b.metadata_of.get(&owner).is_some_and(|m| !m.is_empty())
+            || semantic.contains(&owner)
         {
             return Err(Refusal::Incomplete);
         }
@@ -277,8 +279,7 @@ fn dependency_slice(
             b.elements.get(feature).ok_or(Refusal::Incomplete)?.ty,
             "Feature",
         ) || raw.bad_bases.contains(&feature)
-            || raw.metadata_annotation_targets.contains(&feature)
-            || b.metadata_of.get(&feature).is_some_and(|m| !m.is_empty())
+            || semantic.contains(&feature)
         {
             return Err(Refusal::Incomplete);
         }

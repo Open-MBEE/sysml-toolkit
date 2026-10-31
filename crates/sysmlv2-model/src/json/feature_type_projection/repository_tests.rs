@@ -226,22 +226,39 @@ fn nested_composite_owner_proof_refuses_mutations_cycles_and_budget_then_retries
         r.b.elements[owner.0].set_ty("OccurrenceUsage");
         r.b.elements[owner.0].props = original_properties;
         let properties = r.b.elements[owner.0].props.clone();
-        for (name, value) in [
-            ("isComposite", json!("invalid")),
-            ("isVariation", json!(true)),
-            ("isPortion", json!(true)),
-            ("portionKind", json!("timeslice")),
+        r.b.elements[owner.0]
+            .props
+            .insert("isComposite", json!("invalid"));
+        assert!(
+            r.feature_type_report(child).types.is_err(),
+            "{format:?} isComposite"
+        );
+        r.b.elements[owner.0].props = properties.clone();
+        assert_eq!(r.feature_type_report(child).types, Ok(vec![ty]));
+        // A variation or portion owner keeps its member's typing complete:
+        // those families are planned. A time slice requires the library's
+        // time-slices role, which this library lacks.
+        for (name, value, expected) in [
+            ("isVariation", json!(true), Ok(vec![ty])),
+            ("isPortion", json!(true), Ok(vec![ty])),
+            (
+                "portionKind",
+                json!("timeslice"),
+                Err(FeatureTypeIssue::MissingRequiredFamilies),
+            ),
         ] {
             r.b.elements[owner.0].props.insert(name, value);
-            assert!(
-                r.feature_type_report(child).types.is_err(),
+            assert_eq!(
+                r.feature_type_report(child).types,
+                expected,
                 "{format:?} {name}"
             );
             r.b.elements[owner.0].props = properties.clone();
-            assert_eq!(r.feature_type_report(child).types, Ok(vec![ty]));
         }
+        // Plain metadata on the owner keeps nothing out (only semantic
+        // metadata adds a base the planner does not write).
         r.b.metadata_of.insert(owner.0, vec![owner.0]);
-        assert!(r.feature_type_report(child).types.is_err());
+        assert_eq!(r.feature_type_report(child).types, Ok(vec![ty]));
         r.b.metadata_of.insert(owner.0, Vec::new());
         assert_eq!(r.feature_type_report(child).types, Ok(vec![ty]));
         let membership = r.b.elements[child.0].owning_relationship.unwrap();

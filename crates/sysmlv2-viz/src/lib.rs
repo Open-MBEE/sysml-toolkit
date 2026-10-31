@@ -7,7 +7,10 @@
 //!   definitions and KerML classifiers as stereotyped `class` nodes,
 //!   enum defs as `enum` nodes, usages as `name : Type [mult]` nodes
 //!   under composition edges (attribute-family usages become
-//!   compartment lines), plus specialization (`--|>`) and typing
+//!   compartment lines, and so do members in a role of their own, led
+//!   by its keyword: `subject v : Vehicle`, `require c { x < 2 }`,
+//!   `entry warm`, `end car : Car`, and a port's directed features,
+//!   `in fuel : Fuel`), plus specialization (`--|>`) and typing
 //!   (`..>`) edges whenever both ends are on the diagram.
 //! - **Interconnection** (`interconnect`) — parts as nested
 //!   `rectangle` blocks with ports on their boundaries, and
@@ -54,8 +57,9 @@ use std::fmt::Write as _;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use sysmlv2_model::eval::Value;
+use sysmlv2_model::eval::{UnitDisplay, Value};
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
+use sysmlv2_syntax::ast::Dialect;
 
 /// Diagram layout direction. PlantUML's default is top-to-bottom.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -270,6 +274,11 @@ impl std::error::Error for ParseOptionError {}
 pub struct VizOptions {
     pub direction: Direction,
     pub show_values: bool,
+    /// Which units a `= value` quantity shows in:
+    /// [`UnitDisplay::Si`] (the default) keeps the evaluator's units,
+    /// [`UnitDisplay::AsWritten`] the units the value was written in
+    /// (see [`ResolvedModel::value_as_written`]).
+    pub value_units: UnitDisplay,
     pub view: View,
     /// Attach comment/documentation bodies as `note` blocks (views in
     /// the class/component/use-case dialects).
@@ -330,6 +339,7 @@ impl Default for VizOptions {
         VizOptions {
             direction: Direction::default(),
             show_values: true,
+            value_units: UnitDisplay::Si,
             view: View::default(),
             show_notes: true,
             show_metadata: true,
@@ -363,6 +373,12 @@ impl VizOptions {
     /// Render `= value` on attribute lines.
     pub fn with_show_values(mut self, on: bool) -> VizOptions {
         self.show_values = on;
+        self
+    }
+
+    /// Show `= value` quantities in the units `units` chooses.
+    pub fn with_value_units(mut self, units: UnitDisplay) -> VizOptions {
+        self.value_units = units;
         self
     }
 
@@ -736,7 +752,9 @@ pub(crate) enum Kind {
     EnumNode,
     /// Child node with a composition edge from the owner.
     UsageNode,
-    /// Compartment line on the owning node (attribute-family usages).
+    /// Compartment line on the owning node: an attribute-family usage,
+    /// a leaf KerML feature, and — whatever its metaclass — a member in
+    /// a role of its own or a port's directed feature ([`classify`]).
     Line,
     /// Not rendered (imports, comments, relationships, anonymous
     /// bookkeeping).
@@ -767,8 +785,49 @@ const LINE_USAGES: &[&str] = &["AttributeUsage", "ReferenceUsage", "EnumerationU
 /// Structure-view rendering role of one element — shared by the
 /// PlantUML tree emitter and the structured graph emitter, so the two
 /// backends can never disagree about what is a node, a compartment
-/// line, or invisible.
-pub(crate) fn classify(r: &ResolvedModel, show_metadata: bool, e: ElementRef) -> Kind {
+/// line, or invisible. A member whose introduction gives it a [`Role`]
+/// (`subject`, `require`, `entry`, a body's result expression, …) and a
+/// port's directed feature are compartment lines of their owner, as
+/// attributes are. The succession of a state's entry transition draws
+/// nothing ([`is_entry_transition`]).
+pub(crate) fn classify(r: &mut ResolvedModel, show_metadata: bool, e: ElementRef) -> Kind {
+    let kind = classify_metaclass(r, show_metadata, e);
+    let row = match kind {
+        Kind::UsageNode | Kind::Line => {
+            member_role(r, e).is_some() || port_feature_direction(r, e).is_some()
+        }
+        // A result expression is scaffolding everywhere else.
+        Kind::Skip => member_role(r, e) == Some(Role::Result),
+        _ => false,
+    };
+    if row {
+        Kind::Line
+    } else if matches!(kind, Kind::UsageNode) && is_entry_transition(r, e) {
+        Kind::Skip
+    } else {
+        kind
+    }
+}
+
+/// Whether `e` is the succession of a state's entry transition — `then
+/// idle;` after `entry;`, which says which state the state machine
+/// starts in: an anonymous succession a state owns, its source the
+/// entry action before it rather than a written end (the grammar admits
+/// such a `then` in a state's body only after its `entry`). The state
+/// view draws it as the edge from the initial pseudostate; in the tree,
+/// a node of its own could say neither, so it draws nothing there.
+fn is_entry_transition(r: &mut ResolvedModel, e: ElementRef) -> bool {
+    r.element_type(e) == "SuccessionAsUsage"
+        && r.element_name(e).is_none()
+        && r.owner(e)
+            .is_some_and(|o| behavior::STATES.contains(&r.element_type(o)))
+        && r.connector_end_targets(e)
+            .first()
+            .is_some_and(|end| end.chain.is_empty() && end.spelling.is_none())
+}
+
+/// [`classify`] by metaclass alone, before membership roles apply.
+fn classify_metaclass(r: &ResolvedModel, show_metadata: bool, e: ElementRef) -> Kind {
     let ty = r.element_type(e);
     match ty {
         _ if !show_metadata && matches!(ty, "MetadataUsage" | "MetadataFeature") => Kind::Skip,
@@ -789,6 +848,463 @@ pub(crate) fn classify(r: &ResolvedModel, show_metadata: bool, e: ElementRef) ->
         }
         _ => Kind::Skip,
     }
+}
+
+/// How a member was introduced into its owner, when the introduction
+/// itself is what the member is: the parameters and members a
+/// requirement, case, calculation or concern declares through its own
+/// memberships (`subject`, `actor`, `stakeholder`, `objective`,
+/// `return`, `assume`, `require`, `frame`, `verify`), the result
+/// expression a body ends with, an `include`d use case, a state's
+/// `entry` / `do` / `exit` action, and an `end` feature that is not a
+/// port. Such a member is a compartment row of its owner that says its
+/// role, in a section of its own, rather than a node of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Role {
+    Subject,
+    Actor,
+    Stakeholder,
+    Objective,
+    Return,
+    Result,
+    Assume,
+    Require,
+    Frame,
+    Verify,
+    Include,
+    Entry,
+    Do,
+    Exit,
+    End,
+}
+
+impl Role {
+    /// The structured graph's spelling of the role — also the keyword
+    /// that leads the member's compartment line, except a result's,
+    /// which its expression spells alone.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Role::Subject => "subject",
+            Role::Actor => "actor",
+            Role::Stakeholder => "stakeholder",
+            Role::Objective => "objective",
+            Role::Return => "return",
+            Role::Result => "result",
+            Role::Assume => "assume",
+            Role::Require => "require",
+            Role::Frame => "frame",
+            Role::Verify => "verify",
+            Role::Include => "include",
+            Role::Entry => "entry",
+            Role::Do => "do",
+            Role::Exit => "exit",
+            Role::End => "end",
+        }
+    }
+
+    /// The compartment a row of this role is filed under.
+    pub(crate) fn section(self) -> &'static str {
+        match self {
+            Role::Subject => "subject",
+            Role::Actor => "actors",
+            Role::Stakeholder => "stakeholders",
+            Role::Objective => "objective",
+            Role::Return => "return",
+            Role::Result => "result",
+            Role::Assume => "assume constraints",
+            Role::Require => "require constraints",
+            Role::Frame => "frames",
+            Role::Verify => "verifies",
+            Role::Include => "includes",
+            Role::Entry | Role::Do | Role::Exit => "state actions",
+            Role::End => "ends",
+        }
+    }
+
+    /// A role whose owned member hides the inherited one, whatever their
+    /// names, where a card shows inherited rows: a subject, objective,
+    /// return parameter or result expression redefines the one its owner
+    /// would inherit. A state's entry, do and exit actions are also one
+    /// each ([`Self::one_of`]), but an owned one hides no inherited one.
+    pub(crate) fn singular(self) -> bool {
+        matches!(
+            self,
+            Role::Subject | Role::Objective | Role::Return | Role::Result
+        )
+    }
+
+    /// A role an owner owns one member of at most: validation refuses a
+    /// second subject (`validate…OnlyOneSubject`), objective, return or
+    /// result (`validateFunctionResult…Membership`), and a second entry,
+    /// do or exit action (`validateState…SubactionKind`). An empty member
+    /// of such a role is still a row of the graph ([`RowParts::draws`]).
+    pub(crate) fn one_of(self) -> bool {
+        self.singular() || matches!(self, Role::Entry | Role::Do | Role::Exit)
+    }
+}
+
+/// The [`Role`] that `e`'s introduction into its owner gives it — read
+/// off its owning membership, its metaclass (`include`), or its `end`
+/// flag. A satisfaction's members keep their own rendering: the subject
+/// of `satisfy R by x` binds the satisfying feature rather than
+/// declaring one.
+pub(crate) fn member_role(r: &mut ResolvedModel, e: ElementRef) -> Option<Role> {
+    let role = match r.owning_membership_type(e)? {
+        "SubjectMembership" => Role::Subject,
+        "ActorMembership" => Role::Actor,
+        "StakeholderMembership" => Role::Stakeholder,
+        "ObjectiveMembership" => Role::Objective,
+        "ReturnParameterMembership" => Role::Return,
+        "ResultExpressionMembership" => Role::Result,
+        "RequirementConstraintMembership" => match r.owning_membership_kind(e) {
+            Some("assumption") => Role::Assume,
+            _ => Role::Require,
+        },
+        "FramedConcernMembership" => Role::Frame,
+        "RequirementVerificationMembership" => Role::Verify,
+        "StateSubactionMembership" => match r.owning_membership_kind(e) {
+            Some("entry") => Role::Entry,
+            Some("do") => Role::Do,
+            Some("exit") => Role::Exit,
+            _ => return None,
+        },
+        _ if r.element_type(e) == "IncludeUseCaseUsage" => Role::Include,
+        // Port ends draw as the ports they are.
+        _ if r.element_type(e) != "PortUsage" && r.prefix_keywords(e).contains(&"end") => Role::End,
+        _ => return None,
+    };
+    let satisfied = r
+        .owner(e)
+        .is_some_and(|o| r.element_type(o) == "SatisfyRequirementUsage");
+    (!satisfied).then_some(role)
+}
+
+/// The declared direction of a port's directed feature (`in item fuel`,
+/// `out attribute pressure`), which is a row of the port's card in a
+/// compartment of its own; `None` for every other member. A nested port
+/// stays a port, and the directed features of anything but a port keep
+/// the rows they have.
+pub(crate) fn port_feature_direction(r: &mut ResolvedModel, e: ElementRef) -> Option<&'static str> {
+    if r.element_type(e) == "PortUsage" {
+        return None;
+    }
+    let direction = match r.declared_direction(e)? {
+        "in" => "in",
+        "out" => "out",
+        "inout" => "inout",
+        _ => return None,
+    };
+    let owner = r.owner(e)?;
+    matches!(
+        r.element_type(owner),
+        "PortDefinition" | "PortUsage" | "ConjugatedPortDefinition"
+    )
+    .then_some(direction)
+}
+
+/// How many levels of nested rows a compartment line carries under it
+/// (`attribute a { attribute b { attribute c; } }`, an objective's
+/// `require` members): a line's members that are lines themselves, to
+/// this depth.
+pub(crate) const ROW_DEPTH_CAP: usize = 4;
+
+/// What one compartment row says, shared by both backends: its
+/// [`Role`], a port feature's direction, its label, and the expression
+/// it carries.
+pub(crate) struct RowParts {
+    pub(crate) role: Option<Role>,
+    /// [`port_feature_direction`].
+    pub(crate) direction: Option<&'static str>,
+    /// `name : Type [mult]`, with its `= value` suffix when asked for and
+    /// shown; a reference written as a role member (`require fueled;`,
+    /// `frame safety;`, `do refuel;`) names what it references; an
+    /// anonymous state action that does something (`do send …`) says
+    /// what it does; a result row has none (its expression is the row).
+    /// Never led by a direction: a role or a port feature's direction
+    /// says it.
+    pub(crate) label: String,
+    /// The expression an `assume` / `require` constraint's body is (none
+    /// for a reference to one), and a result row's expression.
+    pub(crate) expr: Option<String>,
+}
+
+impl RowParts {
+    /// Whether the row draws: with a label, or — a role member, which may
+    /// be anonymous — with an expression or rows of its own. An objective
+    /// always draws, its keyword alone when it is empty (`objective { doc
+    /// … }`): a case has one at most, and an empty one is still the one.
+    pub(crate) fn keeps(&self, nests: bool) -> bool {
+        !self.label.trim().is_empty()
+            || self.role == Some(Role::Objective)
+            || (self.role.is_some() && (self.expr.is_some() || nests))
+    }
+
+    /// Whether the graph draws the row: as [`Self::keeps`] has it, and an
+    /// empty member of a [`Role::one_of`] role too, its keyword alone: a
+    /// state's `entry;` (the initial step a succession leaves), an empty
+    /// `do;` or `exit;`, an untyped `subject;`. It is still the one its
+    /// owner has, and an editor tells which it has by their rows. The
+    /// compartment text leaves an empty one out (but for the objective),
+    /// as the notation prints a state's action by what it does.
+    pub(crate) fn draws(&self, nests: bool) -> bool {
+        self.keeps(nests) || self.role.is_some_and(Role::one_of)
+    }
+}
+
+/// [`RowParts`] of the compartment row `e`; `values` asks for the `= value`
+/// suffix (still subject to [`VizOptions::show_values`]).
+pub(crate) fn row_parts(
+    r: &mut ResolvedModel,
+    opts: &VizOptions,
+    e: ElementRef,
+    values: bool,
+) -> RowParts {
+    let role = member_role(r, e);
+    let direction = port_feature_direction(r, e);
+    let mut label = if role == Some(Role::Result) {
+        String::new()
+    } else {
+        usage_label(r, e)
+    };
+    // An `end` names no reference: a connector's own ends (`connect a to
+    // b`, `first a then b`) are anonymous references, rows of nothing.
+    let references = role.is_some_and(|role| !matches!(role, Role::Result | Role::End));
+    if references && display_name(r, e).is_none() {
+        if let Some(name) = referenced_name(r, e) {
+            label = named_label(name, &label);
+        }
+    }
+    if references && label.trim().is_empty() {
+        label = state_action_label(r, e).unwrap_or_default();
+    }
+    if values && opts.show_values && role != Some(Role::Result) {
+        if let Some(value) = value_suffix(r, e, opts.value_units) {
+            label.push(' ');
+            label.push_str(&value);
+        }
+    }
+    let expr = role.and_then(|role| role_expr(r, e, role));
+    RowParts {
+        role,
+        direction,
+        label,
+        expr,
+    }
+}
+
+/// The name an anonymous role member or reference goes by: the feature
+/// it references, as a dotted chain (`require fueled;` → `fueled`, `do
+/// a.b;` → `a.b`), or — a reference that did not resolve in full — as
+/// written, its names spelled as labels spell names (`do 'provide
+/// power';` → `provide power`, `perform tank.drain;` → `tank.drain`).
+pub(crate) fn referenced_name(r: &mut ResolvedModel, e: ElementRef) -> Option<String> {
+    if let Some(spelling) = r.unresolved_referenced_feature(e) {
+        let label = spelling_label(&spelling);
+        return (!label.is_empty()).then_some(label);
+    }
+    for chain in r.referenced_features(e) {
+        let label = chain_label(r, &chain);
+        if !label.is_empty() {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// The feature chains `e` references (`perform a.b`, `exhibit s`), one
+/// per reference, when its reference resolved in full. A chain cut short
+/// at an unresolved link gives none: its resolved prefix (`tank` of
+/// `perform tank.drain;`) is not what it references, so no edge goes
+/// there; [`referenced_name`] reads it as written.
+pub(crate) fn resolved_references(r: &mut ResolvedModel, e: ElementRef) -> Vec<Vec<ElementRef>> {
+    if r.unresolved_referenced_feature(e).is_some() {
+        return Vec::new();
+    }
+    r.referenced_features(e)
+}
+
+/// [`usage_label`] for a usage drawn as a node of its own. An anonymous
+/// one whose reference did not resolve in full is named as written
+/// (`perform 'warm up';` → `warm up`, `perform tank.drain;` →
+/// `tank.drain`): no «keyword» edge can say what it references
+/// ([`resolved_references`]), so its label does. One whose reference
+/// resolved reads as before, as does a connector's end, which names no
+/// reference resolved or not (`connect a.p to b.q`), as its row would
+/// not.
+pub(crate) fn node_usage_label(r: &mut ResolvedModel, e: ElementRef) -> String {
+    let label = usage_label(r, e);
+    if display_name(r, e).is_some() || r.owning_membership_type(e) == Some("EndFeatureMembership") {
+        return label;
+    }
+    match r
+        .unresolved_referenced_feature(e)
+        .map(|s| spelling_label(&s))
+    {
+        Some(name) if !name.is_empty() => named_label(name, &label),
+        _ => label,
+    }
+}
+
+/// An anonymous member's `label` with the name it goes by standing where
+/// its own name would, before the rest of the label (`include 'add
+/// fuel'[0..*]` → `add fuel [0..*]`, `: Fuel` → `fuel : Fuel`).
+fn named_label(name: String, label: &str) -> String {
+    match label.chars().next() {
+        None => name,
+        Some(':') => format!("{name} {label}"),
+        Some(_) => format!("{name}{label}"),
+    }
+}
+
+/// A reference's written spelling with its names unquoted, as labels
+/// spell names: `::` between the segments of a qualified name, `.`
+/// between the links of a feature chain (`'provide power'` → `provide
+/// power`, `tank.'fuel level'` → `tank.fuel level`).
+fn spelling_label(spelling: &str) -> String {
+    let mut links = Vec::new();
+    let mut link = String::new();
+    let mut quoted = false;
+    let mut chars = spelling.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if quoted => {
+                link.push(c);
+                link.extend(chars.next());
+            }
+            '\'' => {
+                quoted = !quoted;
+                link.push(c);
+            }
+            '.' if !quoted => links.push(std::mem::take(&mut link)),
+            _ => link.push(c),
+        }
+    }
+    links.push(link);
+    links
+        .iter()
+        .map(|link| sysmlv2_syntax::name::split_canonical(link.trim()).join("::"))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The label of an anonymous state action that references nothing: what
+/// it does — the steps of a block (`do action { sweep; polish; }` →
+/// `sweep; polish`), or its kind (`do send …` → `send action`). An empty
+/// one (`entry;`) has none. The graph's state-action rows and the
+/// PlantUML state view's `entry / …` lines share it.
+pub(crate) fn state_action_label(r: &mut ResolvedModel, e: ElementRef) -> Option<String> {
+    if r.owning_membership_type(e) != Some("StateSubactionMembership") {
+        return None;
+    }
+    let steps = inline_label(&behavior::subaction_steps(r, e));
+    if !steps.is_empty() {
+        return Some(steps);
+    }
+    let ty = r.element_type(e);
+    (!matches!(ty, "ActionUsage" | "PerformActionUsage")).then(|| stereotype(ty))
+}
+
+/// The expression a role row carries, printed as written (units in their
+/// brackets) on one line: an `assume` / `require` constraint's own body
+/// expression, and a result row's expression — the result expression its
+/// owner's body ends with.
+fn role_expr(r: &mut ResolvedModel, e: ElementRef, role: Role) -> Option<String> {
+    let body = match role {
+        Role::Assume | Role::Require => e,
+        Role::Result => r.owner(e)?,
+        _ => return None,
+    };
+    let expr = r.result_expression(body)?;
+    let dialect = r.unit_dialect(r.unit_of(e)).unwrap_or(Dialect::Sysml);
+    let text = inline_label(&sysmlv2_syntax::print::print_expr_source(&expr, dialect));
+    (!text.is_empty()).then_some(text)
+}
+
+/// The members row `e` nests under it: its owned members that are rows
+/// themselves (an attribute's attributes, an objective's `require` and
+/// `verify` members), metadata left out. An `assume` / `require` row
+/// carries its body's result expression as its expression, not as a row;
+/// a result row is its expression and nests nothing.
+pub(crate) fn nested_row_members(
+    r: &mut ResolvedModel,
+    show_metadata: bool,
+    e: ElementRef,
+    role: Option<Role>,
+) -> Vec<ElementRef> {
+    if role == Some(Role::Result) {
+        return Vec::new();
+    }
+    let carries_body = matches!(role, Some(Role::Assume | Role::Require));
+    let metas = r.metadata_of(e);
+    let mut out = Vec::new();
+    for c in r.owned_members(e) {
+        if metas.contains(&c) || !matches!(classify(r, show_metadata, c), Kind::Line) {
+            continue;
+        }
+        if carries_body && member_role(r, c) == Some(Role::Result) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The text of `e`'s compartment line in the PlantUML tree, its pieces
+/// sanitized but the line not yet finished ([`finish_line`]): a plain
+/// row reads as its label (`mass : Real = 3`), a port's directed feature
+/// leads with its direction (`in fuel : Fuel`), and a role member with
+/// its keyword (`subject vehicle : Vehicle`, `entry warm`, `end car :
+/// Vehicle`), spelling the rows it nests and a constraint's expression
+/// in braces (`require underLimit { vehicle.mass <= limit }`, `objective
+/// { verify massReq }`); a result is spelled by its expression alone.
+/// `None` when the row does not draw.
+fn line_text(
+    r: &mut ResolvedModel,
+    opts: &VizOptions,
+    e: ElementRef,
+    values: bool,
+    depth: usize,
+) -> Option<String> {
+    let parts = row_parts(r, opts, e, values);
+    let Some(role) = parts.role else {
+        if parts.label.trim().is_empty() {
+            return None;
+        }
+        let text = clean_text(&parts.label);
+        return Some(match parts.direction {
+            Some(direction) => format!("{direction} {text}"),
+            None => text,
+        });
+    };
+    let mut body = Vec::new();
+    if depth < ROW_DEPTH_CAP {
+        for c in nested_row_members(r, opts.show_metadata, e, Some(role)) {
+            if let Some(text) = line_text(r, opts, c, values, depth + 1) {
+                body.push(text.trim().to_string());
+            }
+        }
+    }
+    if !parts.keeps(!body.is_empty()) {
+        return None;
+    }
+    if role == Role::Result {
+        return parts.expr.map(|expr| clean_text(&expr));
+    }
+    if let Some(expr) = &parts.expr {
+        body.push(clean_text(expr));
+    }
+    let mut line = role.as_str().to_string();
+    let label = clean_text(&parts.label);
+    if !label.trim().is_empty() {
+        line.push(' ');
+        line.push_str(label.trim());
+    }
+    if !body.is_empty() {
+        line.push_str(" { ");
+        line.push_str(&body.join("; "));
+        line.push_str(" }");
+    }
+    Some(line)
 }
 
 struct Emitter<'a> {
@@ -813,7 +1329,7 @@ impl Emitter<'_> {
         a
     }
 
-    fn classify(&self, e: ElementRef) -> Kind {
+    fn classify(&mut self, e: ElementRef) -> Kind {
         classify(self.r, self.opts.show_metadata, e)
     }
 
@@ -823,26 +1339,24 @@ impl Emitter<'_> {
         }
     }
 
-    fn usage_label(&mut self, e: ElementRef) -> String {
-        usage_label(self.r, e)
-    }
-
     fn value_suffix(&mut self, e: ElementRef) -> Option<String> {
         if !self.opts.show_values {
             return None;
         }
-        value_suffix(self.r, e)
+        value_suffix(self.r, e, self.opts.value_units)
     }
 
-    /// Compartment lines for a node: attribute-family members plus
-    /// enum literals; returns the members that need their own nodes.
-    /// With `show_inherited`, members one explicit typing /
-    /// specialization hop away add `^`-prefixed lines (own names
-    /// shadow).
+    /// Compartment lines for a node, sanitized: attribute-family members,
+    /// role members and a port's directed features (see [`line_text`]);
+    /// returns the members that need their own nodes. With
+    /// `show_inherited`, members one explicit typing / specialization hop
+    /// away add `^`-prefixed lines without values (own names shadow, and
+    /// so does an own member of a role the owner has one of).
     fn split_members(&mut self, e: ElementRef) -> (Vec<String>, Vec<ElementRef>) {
         let mut lines = Vec::new();
         let mut children = Vec::new();
         let mut own_names: Vec<String> = Vec::new();
+        let mut own_roles: Vec<Role> = Vec::new();
         let metas = self.r.metadata_of(e);
         for m in self.r.owned_members(e) {
             // Prefix metadata renders as the owner's stereotype.
@@ -854,13 +1368,9 @@ impl Emitter<'_> {
                     if let Some(n) = display_name(self.r, m) {
                         own_names.push(n);
                     }
-                    let mut line = self.usage_label(m);
-                    if let Some(value) = self.value_suffix(m) {
-                        line.push(' ');
-                        line.push_str(&value);
-                    }
-                    if !line.trim().is_empty() {
-                        lines.push(line);
+                    own_roles.extend(member_role(self.r, m).filter(|role| role.singular()));
+                    if let Some(text) = line_text(self.r, self.opts, m, true, 0) {
+                        lines.push(finish_line(&text));
                     }
                 }
                 Kind::Skip => {}
@@ -880,13 +1390,13 @@ impl Emitter<'_> {
                         continue;
                     }
                     // by the names the lines read, borrowed ones included
-                    let shadowed = display_name(self.r, m).is_some_and(|n| own_names.contains(&n));
+                    let shadowed = display_name(self.r, m).is_some_and(|n| own_names.contains(&n))
+                        || member_role(self.r, m).is_some_and(|role| own_roles.contains(&role));
                     if shadowed {
                         continue;
                     }
-                    let line = self.usage_label(m);
-                    if !line.trim().is_empty() {
-                        lines.push(format!("^{line}"));
+                    if let Some(text) = line_text(self.r, self.opts, m, false, 0) {
+                        lines.push(finish_line(&format!("^{text}")));
                     }
                 }
             }
@@ -930,7 +1440,7 @@ impl Emitter<'_> {
         let ty = self.r.element_type(e);
         let stereo = stereotype(ty);
         let label = if is_usage {
-            self.usage_label(e)
+            node_usage_label(self.r, e)
         } else {
             self.r.element_name(e).unwrap_or("").to_string()
         };
@@ -963,7 +1473,7 @@ impl Emitter<'_> {
             self.body.push_str(" {\n");
             for line in &lines {
                 self.indent(depth + 1);
-                let _ = writeln!(self.body, "{}", sanitize_line(line));
+                let _ = writeln!(self.body, "{line}");
             }
             self.indent(depth);
             self.body.push_str("}\n");
@@ -1233,14 +1743,54 @@ pub(crate) fn usage_label(r: &mut ResolvedModel, e: ElementRef) -> String {
 }
 
 /// `= value` suffix for a compartment line: scalar results render
-/// literally, element results (enum literals, referenced usages) by
-/// name — an anonymous element or the feature itself (the unbound
-/// case) says nothing. Shared by the PlantUML and graph backends.
-pub(crate) fn value_suffix(r: &mut ResolvedModel, e: ElementRef) -> Option<String> {
+/// literally, quantities in the units `units` chooses, element results
+/// (enum literals, referenced usages) by name. A binding to a feature
+/// that has no value to give (`subject = result;`, `= vehicle.mass`
+/// unvalued) reads as written instead ([`bound_reference`]); any other
+/// value that does not evaluate, an anonymous element, and the feature
+/// itself (the unbound case) say nothing. Shared by the PlantUML and
+/// graph backends.
+pub(crate) fn value_suffix(
+    r: &mut ResolvedModel,
+    e: ElementRef,
+    units: UnitDisplay,
+) -> Option<String> {
     if !r.has_value(e) {
         return None;
     }
-    let rendered = match r.evaluate(e).ok()? {
+    let rendered = evaluated_value(r, e, units).or_else(|| bound_reference(r, e))?;
+    Some(format!("= {rendered}"))
+}
+
+/// The bound value of `e` as a reference to a feature (`result`,
+/// `vehicle.mass`, `Ops::'fuel level'`), printed as written on one line;
+/// `None` for any other expression.
+fn bound_reference(r: &mut ResolvedModel, e: ElementRef) -> Option<String> {
+    fn is_reference(expr: &sysmlv2_syntax::ast::Expr) -> bool {
+        match &expr.kind {
+            sysmlv2_syntax::ast::ExprKind::Ref(_) => true,
+            sysmlv2_syntax::ast::ExprKind::ChainStep { target, .. } => is_reference(target),
+            _ => false,
+        }
+    }
+    let (_, expr) = r.value_expr(e)?;
+    if !is_reference(&expr) {
+        return None;
+    }
+    let dialect = r.unit_dialect(r.unit_of(e)).unwrap_or(Dialect::Sysml);
+    let text = inline_label(&sysmlv2_syntax::print::print_expr_source(&expr, dialect));
+    (!text.is_empty()).then_some(text)
+}
+
+/// `e`'s evaluated value as [`value_suffix`] spells it, when it has one
+/// worth labeling.
+fn evaluated_value(r: &mut ResolvedModel, e: ElementRef, units: UnitDisplay) -> Option<String> {
+    let value = r.evaluate(e).ok()?;
+    let value = match units {
+        UnitDisplay::AsWritten => r.value_as_written(&value).unwrap_or(value),
+        _ => value,
+    };
+    let rendered = match value {
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Rational(r) => r.to_string(),
@@ -1260,7 +1810,7 @@ pub(crate) fn value_suffix(r: &mut ResolvedModel, e: ElementRef) -> Option<Strin
         // nothing worth labeling.
         _ => return None,
     };
-    Some(format!("= {rendered}"))
+    Some(rendered)
 }
 
 pub(crate) fn multiplicity_suffix(r: &mut ResolvedModel, e: ElementRef) -> Option<String> {
@@ -1532,12 +2082,23 @@ pub(crate) fn note_text(body: &str) -> String {
 /// leading `-`/`+`/`#` set visibility, a line break ends the member —
 /// it becomes a space; a carriage return is dropped).
 fn sanitize_line(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
+    finish_line(&clean_text(s))
+}
+
+/// The text of one piece of a compartment line ([`sanitize_line`]): no
+/// braces — a role line's own braces are the only ones it has, always
+/// balanced and never leading — and no line breaks.
+fn clean_text(s: &str) -> String {
+    s.chars()
         .filter(|c| !matches!(c, '{' | '}' | '\r'))
         .map(|c| if c == '\n' { ' ' } else { c })
-        .collect();
-    let trimmed = cleaned.trim().to_string();
+        .collect()
+}
+
+/// A compartment line's text, trimmed, with a leading visibility
+/// character escaped ([`sanitize_line`]).
+fn finish_line(s: &str) -> String {
+    let trimmed = s.trim().to_string();
     match trimmed.chars().next() {
         Some('-') | Some('+') | Some('#') | Some('~') => format!("\\{trimmed}"),
         _ => trimmed,

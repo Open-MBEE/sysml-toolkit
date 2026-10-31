@@ -605,6 +605,199 @@ fn number_format_option_respells_hints_and_hover() {
     }
 }
 
+/// `initializationOptions.valueHintUnits`: `asWritten` re-expresses a
+/// folded quantity in the units it was written in, in the inlay hint, the
+/// propagated range hint, a violated verdict's values and the hover (which
+/// shows the other reading alongside); `si`, `null`, no option or an
+/// unreadable one keep the evaluator's units.
+#[test]
+fn value_hint_units_option_respells_hints_and_hover() {
+    let text = "package U {\n    attribute s;\n    attribute m;\n    \
+                attribute 'in' { attribute unitConversion { attribute referenceUnit = m; \
+                attribute conversionFactor = 0.0254; } }\n    \
+                attribute d = 10 ['in'];\n    attribute v = d / (2 [s]);\n    \
+                attribute sum = d + 1 ['in'];\n    attribute area : Real[1];\n    \
+                assert constraint { area <= d * (3 ['in']) }\n    \
+                assert constraint { v <= 1 ['in'] / (1 [s]) }\n}\n";
+    let hints = |client: &mut Client, u: &Uri| -> Vec<String> {
+        client
+            .request_ok::<InlayHintRequest>(InlayHintParams {
+                text_document: TextDocumentIdentifier { uri: u.clone() },
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 0,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .unwrap()
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                other => panic!("unexpected label shape: {other:?}"),
+            })
+            .collect()
+    };
+    let hover = |client: &mut Client, u: &Uri| -> String {
+        let hover = client
+            .request_ok::<HoverRequest>(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: u.clone() },
+                    // On `v`.
+                    position: Position {
+                        line: 5,
+                        character: 14,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .expect("a hover on `v`");
+        let lsp_types::HoverContents::Markup(m) = hover.contents else {
+            panic!("markup hover")
+        };
+        m.value
+    };
+    let lenses = |client: &mut Client, u: &Uri| -> Vec<String> {
+        client
+            .request_ok::<CodeLensRequest>(CodeLensParams {
+                text_document: TextDocumentIdentifier { uri: u.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .unwrap()
+            .iter()
+            .map(|l| l.command.as_ref().unwrap().title.clone())
+            .collect()
+    };
+    let start = |init: Option<serde_json::Value>| {
+        Client::start_with(InitializeParams {
+            initialization_options: init,
+            ..InitializeParams::default()
+        })
+    };
+    const SI_RANGE: &str = " ∈ [−∞, 0.0193548] [m**2]";
+    const SI_LENS: &str = "✗ VIOLATED (with v = 0.127 [m/s])";
+    for (init, hint, range, lens, card) in [
+        (
+            Some(serde_json::json!({"valueHintUnits": "asWritten"})),
+            " = 5 [in/s]",
+            " ∈ [−∞, 30] [in**2]",
+            "✗ VIOLATED (with v = 5 [in/s])",
+            "= `5 [in/s]` (SI: `0.127 [m/s]`)",
+        ),
+        (
+            Some(serde_json::json!({"valueHintUnits": "si"})),
+            " = 0.127 [m/s]",
+            SI_RANGE,
+            SI_LENS,
+            "= `0.127 [m/s]` (as written: `5 [in/s]`)",
+        ),
+        (
+            Some(serde_json::json!({"valueHintUnits": null})),
+            " = 0.127 [m/s]",
+            SI_RANGE,
+            SI_LENS,
+            "= `0.127 [m/s]` (as written: `5 [in/s]`)",
+        ),
+        (
+            None,
+            " = 0.127 [m/s]",
+            SI_RANGE,
+            SI_LENS,
+            "= `0.127 [m/s]` (as written: `5 [in/s]`)",
+        ),
+        // Unreadable: ignored, the evaluator's units stay.
+        (
+            Some(serde_json::json!({"valueHintUnits": "SI"})),
+            " = 0.127 [m/s]",
+            SI_RANGE,
+            SI_LENS,
+            "= `0.127 [m/s]` (as written: `5 [in/s]`)",
+        ),
+        (
+            Some(serde_json::json!({"valueHintUnits": true})),
+            " = 0.127 [m/s]",
+            SI_RANGE,
+            SI_LENS,
+            "= `0.127 [m/s]` (as written: `5 [in/s]`)",
+        ),
+    ] {
+        let mut client = start(init.clone());
+        let u = uri("units.sysml");
+        client.open(&u, text);
+        let labels = hints(&mut client, &u);
+        assert!(labels.iter().any(|l| l == hint), "{init:?}: {labels:?}");
+        assert!(labels.iter().any(|l| l == range), "{init:?}: {labels:?}");
+        let titles = lenses(&mut client, &u);
+        assert!(titles.iter().any(|t| t == lens), "{init:?}: {titles:?}");
+        // A sum keeps its left operand's written unit in both modes.
+        assert!(
+            labels.iter().any(|l| l == " = 11 [in]"),
+            "{init:?}: {labels:?}"
+        );
+        let shown = hover(&mut client, &u);
+        assert!(shown.contains(card), "{init:?}: {shown}");
+        client.shutdown();
+    }
+
+    // A server started with a default (the command line's
+    // `lsp --value-hint-units`) uses it; a client's option still wins, and
+    // an unreadable one leaves the default.
+    let started = |init: Option<serde_json::Value>| {
+        let (server_side, client_side) = Connection::memory();
+        let server = std::thread::spawn(move || {
+            sysmlv2_lsp::run_with_defaults(
+                server_side,
+                None,
+                sysmlv2_lsp::ServerDefaults::default()
+                    .with_value_hint_units(sysmlv2_parser::eval::UnitDisplay::AsWritten),
+            )
+        });
+        let mut c = Client {
+            conn: client_side,
+            server: Some(server),
+            next_id: 0,
+        };
+        let _: lsp_types::InitializeResult = c.request_ok::<Initialize>(InitializeParams {
+            initialization_options: init,
+            ..InitializeParams::default()
+        });
+        c.notify::<Initialized>(lsp_types::InitializedParams {});
+        c
+    };
+    for (init, hint, range) in [
+        (None, " = 5 [in/s]", " ∈ [\u{2212}∞, 30] [in**2]"),
+        (
+            Some(serde_json::json!({"valueHintUnits": "si"})),
+            " = 0.127 [m/s]",
+            SI_RANGE,
+        ),
+        (
+            Some(serde_json::json!({"valueHintUnits": "SI"})),
+            " = 5 [in/s]",
+            " ∈ [\u{2212}∞, 30] [in**2]",
+        ),
+        (
+            Some(serde_json::json!({"valueHintUnits": null})),
+            " = 5 [in/s]",
+            " ∈ [\u{2212}∞, 30] [in**2]",
+        ),
+    ] {
+        let mut client = started(init.clone());
+        let u = uri("units.sysml");
+        client.open(&u, text);
+        let labels = hints(&mut client, &u);
+        assert!(labels.iter().any(|l| l == hint), "{init:?}: {labels:?}");
+        assert!(labels.iter().any(|l| l == range), "{init:?}: {labels:?}");
+        client.shutdown();
+    }
+}
+
 #[test]
 fn inlay_hints_land_after_closing_parenthesis() {
     let mut client = Client::start();
@@ -755,6 +948,56 @@ fn redundant_value_hints_ignore_spacing_and_name_quotes() {
             .any(|(line, l)| *line == 4 && l.contains("= 5 [kg]")),
         "computed value still hinted: {labels:?}"
     );
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_write_combined_masses_in_kilograms() {
+    // The library's `kg` is the gram with the `kilo` prefix; a combined
+    // result still shows in kilograms, not as thousands of grams, and
+    // by name where SI names its unit.
+    let text = "package Q {\n    private import SI::*;\n    \
+                attribute f = 2 [kg] * 3 [m/s**2];\n    \
+                attribute p = 10 [N] / (2 [m**2]);\n    \
+                attribute e = 10 [N] * 2 [m];\n    \
+                attribute rho = 1000 [kg] / (1 [m**3]);\n}\n";
+    let mut client = Client::start_with_library();
+    let u = uri("coherent.sysml");
+    client.open(&u, text);
+    let hints: Option<Vec<lsp_types::InlayHint>> =
+        client.request_ok::<InlayHintRequest>(InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: u },
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 7,
+                    character: 0,
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        });
+    let labels: Vec<(u32, String)> = hints
+        .unwrap()
+        .iter()
+        .map(|h| match &h.label {
+            InlayHintLabel::String(s) => (h.position.line, s.clone()),
+            other => panic!("unexpected label shape: {other:?}"),
+        })
+        .collect();
+    for (line, label) in [
+        (2, " = 6 [N]"),
+        (3, " = 5 [Pa]"),
+        (4, " = 20 [J]"),
+        (5, " = 1000 [kg/m**3]"),
+    ] {
+        assert!(
+            labels.iter().any(|(l, s)| *l == line && s == label),
+            "line {line} hints {label:?}: {labels:?}"
+        );
+    }
     client.shutdown();
 }
 

@@ -210,7 +210,7 @@ fn ordinary_unknowns_successful_defaults_and_unvisited_branches_are_not_failures
             assert!(report.inherited_default_failures.is_empty(), "{name}");
             let checked = report.into_checked_result().unwrap();
             if matches!(name, "empty" | "fixed") {
-                assert!(matches!(checked, Value::Unbound(_)));
+                assert!(matches!(checked, Value::Unbound(..)));
             }
         }
         assert_eq!(model.loaded_library_unit_count(), loaded);
@@ -336,7 +336,7 @@ fn inherited_id_bound_defaults_report_the_authored_provider_not_the_reference_ta
                     assert_eq!(report.result, legacy, "mode={mode} {side}");
                     assert_eq!(report.inherited_default_failures.len(), usize::from(fails));
                     if fails {
-                        assert!(matches!(report.result, Ok(Value::Unbound(_))));
+                        assert!(matches!(report.result, Ok(Value::Unbound(..))));
                         let failure = &report.inherited_default_failures[0];
                         assert_eq!(failure.requested, requested);
                         assert_eq!(failure.origin, origin);

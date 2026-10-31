@@ -98,6 +98,78 @@ pub fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Each crate's integration tests build as one binary: `tests/integration.rs`
+/// declares every other `tests/*.rs` file as a module, except a file that
+/// needs a process of its own, which the crate's `Cargo.toml` names as a
+/// test target of its own. Cargo builds no file in neither place, so this
+/// panics naming each one: a new test file cannot silently never run.
+/// `root` is the source of `tests/integration.rs`.
+pub fn assert_suite_declares_every_test_file(manifest_dir: &str, root: &str) {
+    let manifest = fs::read_to_string(Path::new(manifest_dir).join("Cargo.toml"))
+        .expect("the crate's manifest");
+    let mut declared: Vec<String> = root
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("mod ")?.strip_suffix(';'))
+        .map(|name| format!("tests/{name}.rs"))
+        .collect();
+    declared.extend(manifest.lines().filter_map(|line| {
+        let path = line.trim().strip_prefix("path")?.trim_start();
+        Some(path.strip_prefix('=')?.trim().trim_matches('"').to_owned())
+    }));
+    let mut missing = Vec::new();
+    let tests = Path::new(manifest_dir).join("tests");
+    for entry in fs::read_dir(&tests).expect("the crate has a tests directory") {
+        let path = entry.expect("readable tests directory").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !declared.contains(&format!("tests/{name}")) {
+                missing.push(name.to_owned());
+            }
+        }
+    }
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "neither a `mod` in tests/integration.rs nor a test target in Cargo.toml: {}",
+        missing.join(", ")
+    );
+}
+
+/// `f` over every item, spread across the machine's cores, with the
+/// results in `items`' order: for fixture loops whose items are
+/// independent, so a long loop costs its share of the cores rather than
+/// one. Each item runs exactly once; a panic in `f` fails the caller
+/// with its own message once the other items are done.
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .clamp(1, items.len().max(1));
+    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else {
+                            return out;
+                        };
+                        out.push((i, f(item)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
 /// The gated corpus directories within the release checkout — exactly
 /// the sparse-checkout cone. Collection is pinned to these so a *full*
 /// submodule checkout (which carries extra model trees under `kerml/`)

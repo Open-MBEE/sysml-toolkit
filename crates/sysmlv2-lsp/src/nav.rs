@@ -512,6 +512,12 @@ pub struct Nav {
     /// set it via `initializationOptions.numberFormat` or the push
     /// server's setter.
     number_format: sysmlv2_parser::numfmt::NumberFormat,
+    /// Which units evaluated-value inlay hints and hover values show
+    /// quantities in: the evaluator's own (SI for products, quotients
+    /// and powers) by default, or the units each value was written in.
+    /// Hosts set it via `initializationOptions.valueHintUnits` or the
+    /// push server's setter.
+    value_hint_units: sysmlv2_parser::eval::UnitDisplay,
     /// The client declared `completionItem.snippetSupport` at
     /// `initialize`: a repair suffix riding a completion's main edit
     /// may carry a `$0` stop that parks the cursor before the
@@ -617,6 +623,7 @@ impl Nav {
             split_cache: None,
             hide_redundant_value_hints: true,
             number_format: sysmlv2_parser::numfmt::NumberFormat::exact(),
+            value_hint_units: sysmlv2_parser::eval::UnitDisplay::Si,
             snippet_completions: false,
             insert_replace_completions: false,
             signature_label_offsets: false,
@@ -714,6 +721,14 @@ impl Nav {
             // Range hints are rendered when the verify pass runs.
             self.verify = None;
         }
+    }
+
+    /// Set which units evaluated-value inlay hints and hover values
+    /// show quantities in (the evaluator's own by default). Like the
+    /// number format, answers change without any source changing, so
+    /// the host should ask clients to re-pull hints.
+    pub fn set_value_hint_units(&mut self, units: sysmlv2_parser::eval::UnitDisplay) {
+        self.value_hint_units = units;
     }
 
     /// Set whether accepting a unit completion inside an untyped
@@ -1968,6 +1983,7 @@ impl Nav {
         enc: Encoding,
     ) -> Option<(String, Range)> {
         let number_format = self.number_format;
+        let units = self.value_hint_units;
         let read = self.read_session(docs)?;
         let session = &mut *read.session;
         let unit = Self::unit_of_static(uri, session)?;
@@ -2031,14 +2047,26 @@ impl Nav {
             }
             Ok(
                 sysmlv2_parser::eval::Value::Element(_)
-                | sysmlv2_parser::eval::Value::Unbound(_)
-                | sysmlv2_parser::eval::Value::UnboundMember(_),
+                | sysmlv2_parser::eval::Value::Unbound(..)
+                | sysmlv2_parser::eval::Value::UnboundMember(..),
             )
             | Err(_) => text,
-            Ok(v) => format!(
-                "{text}  \n= `{}`",
-                resolved.render_value_as(&v, &number_format)
-            ),
+            // In the configured units; a quantity that reads differently
+            // in the other units shows that reading too.
+            Ok(v) => {
+                use sysmlv2_parser::eval::UnitDisplay;
+                let shown = resolved.render_value_in(&v, &number_format, units);
+                let (other, label) = match units {
+                    UnitDisplay::Si => (UnitDisplay::AsWritten, "as written"),
+                    UnitDisplay::AsWritten => (UnitDisplay::Si, "SI"),
+                };
+                let also = resolved.render_value_in(&v, &number_format, other);
+                if also == shown {
+                    format!("{text}  \n= `{shown}`")
+                } else {
+                    format!("{text}  \n= `{shown}` ({label}: `{also}`)")
+                }
+            }
         };
         // Documentation bodies annotating the element join the card
         // under a rule, block-comment `*` gutters stripped. A named doc
@@ -4222,6 +4250,7 @@ impl Nav {
         use sysmlv2_parser::ast::ExprKind;
         let hide_redundant = self.hide_redundant_value_hints;
         let number_format = self.number_format;
+        let units = self.value_hint_units;
         let Some(doc_text) = docs.get(uri).map(|d| d.text.clone()) else {
             return Vec::new();
         };
@@ -4283,8 +4312,8 @@ impl Nav {
             // name — except after a bare reference, which already spells
             // the same element, and for the unbound self-result.
             let rendered = match value {
-                sysmlv2_parser::eval::Value::Unbound(_)
-                | sysmlv2_parser::eval::Value::UnboundMember(_) => continue,
+                sysmlv2_parser::eval::Value::Unbound(..)
+                | sysmlv2_parser::eval::Value::UnboundMember(..) => continue,
                 sysmlv2_parser::eval::Value::Element(t) => {
                     if bare_ref || t == e {
                         continue;
@@ -4294,9 +4323,11 @@ impl Nav {
                         None => continue,
                     }
                 }
-                // In the configured number format: by default the exact
-                // fraction (`1/3`).
-                v => session.resolved().render_value_as(&v, &number_format),
+                // In the configured number format (by default the exact
+                // fraction, `1/3`) and units.
+                v => session
+                    .resolved()
+                    .render_value_in(&v, &number_format, units),
             };
             // A hint that restates the declared expression (`x = 3.63 [kg]`,
             // `10[kg]` or `10 ['m/s²']` ⇒ ` = 10 [m/s²]`) adds nothing.
@@ -4366,10 +4397,14 @@ impl Nav {
                 }
                 // Editor hints take the display range: a bound without a
                 // terminating decimal expansion in the configured number
-                // format (the exact fraction by default).
-                let label = match &r.unit {
-                    Some(u) => format!(" ∈ {} [{u}]", r.range_approx),
-                    None => format!(" ∈ {}", r.range_approx),
+                // format (the exact fraction by default), in the units
+                // the value hints use.
+                let label = match (units, &r.as_written, &r.unit) {
+                    (sysmlv2_parser::eval::UnitDisplay::AsWritten, Some(w), _) => {
+                        format!(" ∈ {} [{}]", w.range_approx, w.unit)
+                    }
+                    (_, _, Some(u)) => format!(" ∈ {} [{u}]", r.range_approx),
+                    (_, _, None) => format!(" ∈ {}", r.range_approx),
                 };
                 out.push(lsp_types::InlayHint {
                     position,
@@ -4398,6 +4433,7 @@ impl Nav {
     ) -> Vec<lsp_types::CodeLens> {
         use sysmlv2_parser::check::ConstraintVerdict;
         use sysmlv2_solve::PropagateOutcome;
+        let units = self.value_hint_units;
         let Some(doc_text) = docs.get(uri).map(|d| d.text.clone()) else {
             return Vec::new();
         };
@@ -4425,7 +4461,7 @@ impl Nav {
                     let vals: Vec<String> = c
                         .bindings
                         .iter()
-                        .filter_map(|b| b.value.as_ref().map(|v| format!("{} = {v}", b.feature)))
+                        .filter_map(|b| b.value_in(units).map(|v| format!("{} = {v}", b.feature)))
                         .collect();
                     if vals.is_empty() {
                         String::new()
@@ -4470,7 +4506,7 @@ impl Nav {
                         .iter()
                         .filter(|c| c.check.verdict == ConstraintVerdict::Violated)
                         .flat_map(|c| &c.check.bindings)
-                        .filter_map(|b| b.value.as_ref().map(|v| format!("{} = {v}", b.feature)))
+                        .filter_map(|b| b.value_in(units).map(|v| format!("{} = {v}", b.feature)))
                         .collect();
                     if vals.is_empty() {
                         "✗ VIOLATED".to_string()

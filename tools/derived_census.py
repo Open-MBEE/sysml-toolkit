@@ -351,6 +351,17 @@ COMPOSITION_ERRATA = {
     ("nestedInterface", "nestedUsage", "ReferenceUsage"): "InterfaceUsage",
 }
 
+# Published 20250201 rules whose base can never hold the selected kind. A
+# metadata usage is an annotating element, owned through an OwningMembership
+# that is no FeatureMembership, so `ownedUsage->selectByKind(MetadataUsage)`
+# and its nested twin are empty on every model (SYSML21-419). The approved
+# resolution (SYSML21-569) selects from the owned members instead. Keyed to
+# the exact rule tuple like the errata above.
+COMPOSITION_BASE_ERRATA = {
+    ("ownedMetadata", "ownedUsage", "MetadataUsage"): "ownedMember",
+    ("nestedMetadata", "nestedUsage", "MetadataUsage"): "ownedMember",
+}
+
 
 def composition_rows(records, ancestors_of):
     """The kind-filtered compositions: every derived property whose OCL
@@ -373,6 +384,7 @@ def composition_rows(records, ancestors_of):
             if m and lhs in (None, name):
                 base = BASE_ALIASES.get(m.group(2), m.group(2))
                 kind = COMPOSITION_ERRATA.get((name, base, m.group(3)), m.group(3))
+                base = COMPOSITION_BASE_ERRATA.get((name, base, m.group(3)), base)
                 candidate = (base, kind, single)
                 if name in rows and rows[name] != candidate:
                     raise ValueError(f"conflicting composition rules for {name}: {rows[name]} / {candidate}")
@@ -418,7 +430,10 @@ def write_compositions(records, ancestors_of):
         "//! documentation defines as the usage's `definition`s of the",
         "//! property's declared type. `single` marks an upper bound of 1 (the",
         "//! first match, else null). A composition is computable exactly when",
-        "//! its base is.",
+        "//! its base is. `ownedMetadata` and `nestedMetadata` select from the",
+        "//! owned members, per the approved resolution of SYSML21-419 (the",
+        "//! published rules read the owned usages, which never hold a",
+        "//! metadata usage).",
         "",
         "/// `(name, base, kind, single)`, sorted by name.",
         "pub(crate) static COMPOSITIONS: &[(&str, &str, &str, bool)] = &[",

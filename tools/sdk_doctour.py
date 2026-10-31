@@ -4,7 +4,8 @@
 Extracts every ```pycon block from SDK.md and executes them as a single
 doctest over one shared namespace, so each output shown in the document
 is checked against the real one. Requires the `sysmlv2` module (build
-with `maturin develop` in crates/sysmlv2-py).
+with `maturin develop` in crates/sysmlv2-py). CI runs it in the
+`python` job of .github/workflows/ci.yml.
 """
 
 import doctest

@@ -1,6 +1,6 @@
 //! Query-local proofs for supported inheritance and import providers.
 use super::Builder;
-use crate::metaclass::is_a;
+use crate::metaclass::{conforms, is_a};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -247,6 +247,7 @@ impl ProviderCompleteness {
         {
             return None;
         }
+        let semantic = b.semantically_annotated();
         let context = &b.scopes[scope];
         let inverse_recursive = context.owner.is_some_and(|owner| {
             self.recursive_import_domains
@@ -274,31 +275,31 @@ impl ProviderCompleteness {
         if *steps > crate::eval::MAX_STEPS {
             return None;
         }
-        // Chains and filters need a richer proof. No
-        // inference is preferable to treating skipped results as absence.
+        // Filters need a richer proof. No inference is preferable to
+        // treating skipped results as absence. A chain among the bases is
+        // proved below through the stored chain feature's links.
         if !context.filters.is_empty()
-            || !context.chain_bases.is_empty()
             || context.imports.iter().any(|i| !i.filters.is_empty())
             || context.member_imports.iter().any(|i| !i.filters.is_empty())
         {
             return None;
         }
+        let chain_bases = context.chain_bases.len();
         let owner = context.owner;
         if owner.is_some_and(|owner| {
             !b.dynamic_evidence_current(owner) || !b.result_redefinition_evidence_current(owner)
         }) {
             return None;
         }
-        // Semantic metadata may add bases that the current resolver omits when
-        // an annotation is incomplete. Their absence needs a separate proof.
-        if owner.is_some_and(|e| b.metadata_of.get(&e).is_some_and(|m| !m.is_empty())) {
+        // Semantic metadata adds bases the resolver alone sees (KerML 9.2);
+        // their absence needs a separate proof. Plain metadata adds none.
+        if owner.is_some_and(|e| semantic.contains(&e)) {
             return None;
         }
         let annotations = self.annotations.as_ref()?;
         if !annotations.is_current(b)
             || !annotations.ids_unique
             || annotations.annotations_incomplete
-            || owner.is_some_and(|e| annotations.metadata_annotation_targets.contains(&e))
         {
             // Annotation-dependent supertype absence is not implemented. A
             // separately witnessed positive path remains usable by callers.
@@ -320,6 +321,7 @@ impl ProviderCompleteness {
             .map(|e| b.elements[e].owned_relationships.clone())
             .unwrap_or_default();
         let mut dependencies = Vec::new();
+        let mut chains_proved = 0usize;
         let mut recursive_domain = literal_package
             || inverse_recursive
             || namespaces.iter().any(|&(_, _, recursive)| recursive);
@@ -338,8 +340,43 @@ impl ProviderCompleteness {
                 if !is_a!(b.elements[target], "Type") {
                     return None;
                 }
-                dependencies.push(Dependency::Scope(*b.elem_scope.get(&target)?));
+                match b.elem_scope.get(&target) {
+                    Some(&target_scope) => dependencies.push(Dependency::Scope(target_scope)),
+                    None if is_chain(b, target) => {
+                        // A chain the specialization names (`:> a.b`,
+                        // `references a.b`): the chain feature opens no
+                        // scope of its own, and this scope inherits from
+                        // its last link, whose scope is the dependency.
+                        // The links before it resolved as members of their
+                        // predecessors when the chain was recorded; the
+                        // stored chain feature's validated endpoints stand
+                        // for that resolution, as a written base's stored
+                        // target stands for its own.
+                        dependencies.push(Dependency::Scope(chain_last_link_scope(
+                            b,
+                            annotations,
+                            target,
+                            steps,
+                        )?));
+                        chains_proved += 1;
+                    }
+                    None => {
+                        // A conjugated type the lowering gives no scope of
+                        // its own (a port definition's `~P`): its members
+                        // are its original's, whose scope is the dependency.
+                        dependencies.push(Dependency::Scope(conjugation_original_scope(
+                            b,
+                            annotations,
+                            target,
+                            steps,
+                        )?));
+                    }
+                }
             }
+        }
+        if chains_proved < chain_bases {
+            // A written chain base without a validated stored chain feature.
+            return None;
         }
         if recursive_domain {
             self.recursive.touched = true;
@@ -400,6 +437,82 @@ impl ProviderCompleteness {
         dependencies.dedup();
         Some(dependencies)
     }
+}
+
+/// Whether `element` owns a feature chaining: the chain a specialization
+/// names.
+fn is_chain(b: &Builder, element: usize) -> bool {
+    b.elements.get(element).is_some_and(|e| {
+        e.owned_relationships.iter().any(|&r| {
+            b.elements
+                .get(r)
+                .is_some_and(|r| is_a!(r, "FeatureChaining"))
+        })
+    })
+}
+
+/// The scope of the original type of a conjugated type that opens no scope
+/// of its own: the one Conjugation the type owns, whose conjugated end is
+/// the type itself, names it. `None` for any other scope-less target.
+fn conjugation_original_scope(
+    b: &Builder,
+    raw: &super::structural_index::StoredStructure,
+    conjugated: usize,
+    steps: &mut usize,
+) -> Option<usize> {
+    let element = b.elements.get(conjugated)?;
+    *steps = steps.saturating_add(element.owned_relationships.len().saturating_add(1));
+    if *steps > crate::eval::MAX_STEPS || !is_a!(element, "Type") {
+        return None;
+    }
+    let mut original = None;
+    for &relationship in element.owned_relationships.iter() {
+        let relation = b.elements.get(relationship)?;
+        if !conforms(relation.ty, "Conjugation") {
+            continue;
+        }
+        if relation
+            .props
+            .get("conjugatedType")
+            .and_then(|value| value.as_reference())
+            != Some(element.id)
+            || original.is_some()
+        {
+            return None;
+        }
+        let id = relation.props.get("originalType")?.as_reference()?;
+        original = Some(raw.element_for_uuid(b, id)?);
+    }
+    let original = original?;
+    if !is_a!(b.elements[original], "Type") {
+        return None;
+    }
+    b.elem_scope.get(&original).copied()
+}
+
+/// The scope of a stored chain feature's last link, once every chaining
+/// endpoint is validated (`checked_feature_target`); `None` for a target
+/// that is not a validated chain or whose last link opens no scope.
+fn chain_last_link_scope(
+    b: &Builder,
+    raw: &super::structural_index::StoredStructure,
+    chain: usize,
+    steps: &mut usize,
+) -> Option<usize> {
+    let relationships = &b.elements.get(chain)?.owned_relationships;
+    *steps = steps.saturating_add(relationships.len().saturating_add(1));
+    if *steps > crate::eval::MAX_STEPS {
+        return None;
+    }
+    let last = super::type_relations::checked_feature_target(
+        b,
+        raw,
+        chain,
+        relationships,
+        b.elements.len(),
+        steps,
+    )??;
+    b.elem_scope.get(&last).copied()
 }
 
 /// Reuse completed resolver evidence without entering its unbudgeted cold
@@ -952,10 +1065,18 @@ mod annotation_completeness_tests {
 
     #[test]
     fn warm_scope_proof_observes_annotation_retarget_and_repair() {
+        // Plain metadata adds no base and keeps no scope out; a semantic
+        // metadata annotation (KerML 9.2) does, and a retargeted row counts
+        // as soon as the stored rows say so.
         let mut model = Model::new();
+        let lib = model.add_library_source(
+            "annotation-lifecycle-lib.kerml",
+            "standard library package Metaobjects { metaclass SemanticMetadata { feature baseType; } }",
+        );
+        assert!(lib.diagnostics.is_empty(), "{:?}", lib.diagnostics);
         let p = model.add_source(
             "annotation-lifecycle.kerml",
-            "metaclass M; classifier A; classifier B; @M about B;",
+            "metaclass M specializes Metaobjects::SemanticMetadata; classifier A; classifier B; @M about B;",
         );
         assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
         let mut r = ResolvedModel::build(&model);

@@ -8,7 +8,7 @@
 //!   "findings": [
 //!     {
 //!       "stage": "lint" | "parse" | "context" | "referential" | "semantic",
-//!       "rule": "<lint rule id>" | null,
+//!       "rule": "<lint rule id | normative rule id>" | null,
 //!       "severity": "error" | "warn" | "info" | "hint",
 //!       "message": "…",
 //!       "unit": <index> | null,   "unitName": "<name>" | null,
@@ -172,7 +172,9 @@ impl Report {
 
     /// Add a checker diagnostic from `stage` (`parse`, `context`,
     /// `referential`, `semantic`) located in the unit reported as
-    /// `index`. No alias translation: a parse-stage diagnostic belongs
+    /// `index`. Its `rule` is the diagnostic's [`Diagnostic::code`], the
+    /// normative rule a semantic finding reports, and null when it names
+    /// none. No alias translation: a parse-stage diagnostic belongs
     /// to a unit the engine never numbered, so the caller already
     /// speaks in reported indexes, and running those through the
     /// engine aliases would remap them wrongly wherever the two index
@@ -191,7 +193,7 @@ impl Report {
         self.tally(severity);
         let mut item = item(
             stage,
-            None,
+            d.code,
             severity,
             &d.message,
             Some((index, d.span)),
@@ -449,6 +451,25 @@ mod tests {
         assert_eq!(
             keys, lint_keys,
             "check and lint items must share one key set"
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_reports_the_rule_its_code_names() {
+        let mut units = Units::new();
+        units.add(0, "model.sysml", "part p { satisfy c; }");
+        let mut report = Report::new();
+        report.push_diagnostic(
+            "semantic",
+            0,
+            &Diagnostic::error(Span::new(9, 19), "must reference a RequirementUsage")
+                .with_code("validateSatisfyRequirementUsageReference"),
+            &units,
+        );
+        let v = report.into_value();
+        assert_eq!(
+            v["findings"][0]["rule"],
+            "validateSatisfyRequirementUsageReference"
         );
     }
 }

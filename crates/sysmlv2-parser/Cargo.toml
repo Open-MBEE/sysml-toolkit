@@ -16,14 +16,15 @@ include = [
     "src/**",
     "Cargo.toml",
 ]
+autotests = false
 
 [features]
 default = ["json"]
 json = ["dep:sysmlv2-model", "dep:serde_json"]
 
 [dependencies]
-sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.10.10" }
-sysmlv2-model = { path = "../sysmlv2-model", version = "0.10.10", optional = true }
+sysmlv2-syntax = { path = "../sysmlv2-syntax", version = "0.11.3" }
+sysmlv2-model = { path = "../sysmlv2-model", version = "0.11.3", optional = true }
 # for tests/examples that build serde_json values directly
 serde_json = { workspace = true, optional = true }
 
@@ -31,3 +32,15 @@ serde_json = { workspace = true, optional = true }
 jsonschema.workspace = true
 sysmlv2-testkit.workspace = true
 uuid.workspace = true
+
+# The integration tests build as one binary: tests/integration.rs
+# declares the files under tests/ as its modules.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# Turns the process-wide unit-spelling switch off, so it keeps a process
+# of its own: no test in the suite reads the switch while it is off.
+[[test]]
+name = "eval_unit_spelling_off"
+path = "tests/eval_unit_spelling_off.rs"

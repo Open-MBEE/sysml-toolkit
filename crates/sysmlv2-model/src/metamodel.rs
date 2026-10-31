@@ -1,7 +1,7 @@
 //! Normative declaration metadata for SDK generation. Declaration availability
 //! does not imply executable semantic support or whole-model conformance.
 
-pub use crate::operation_catalog::{OperationSpec, ParameterSpec};
+pub use crate::operation_catalog::{OperationSpec, ParameterSpec, SYNTHESIZED_RESULTS};
 pub use crate::semantic_catalog::PropertySpec;
 
 /// A property name on a concrete or abstract metaclass and its redefinition.
@@ -38,7 +38,9 @@ pub fn properties(metaclass: &str) -> impl Iterator<Item = PropertyDescriptor> {
 /// All declared operations in normative identity order. Overrides remain
 /// separate declarations with explicit redefinition links. This is an inventory,
 /// not an execution dispatcher; parameter metadata is preserved without guessing
-/// missing result declarations or directions in the source XMI.
+/// missing directions in the source XMI. The only additions are the result
+/// parameters the normative text declares and the XMI omits, listed in
+/// [`SYNTHESIZED_RESULTS`] (the Boolean results of both `isCompatibleWith`).
 pub fn operations() -> &'static [OperationSpec] {
     crate::operation_catalog::OPERATIONS
 }
@@ -128,12 +130,30 @@ mod tests {
         assert_eq!(name.parameters[0].name, "");
         assert_eq!(name.parameters[0].direction, None);
         assert_eq!(name.parameters[0].target, "String");
-        let compatible = ops
+        // The XMI declares no result for either `isCompatibleWith`; the
+        // text does (Boolean), and the generator adds exactly those two.
+        for metaclass in ["Type", "Feature"] {
+            let compatible = ops
+                .iter()
+                .find(|o| o.declaring_metaclass == metaclass && o.name == "isCompatibleWith")
+                .unwrap();
+            assert_eq!(compatible.parameters.len(), 2, "{metaclass}");
+            assert_eq!(compatible.parameters[0].name, "otherType");
+            let result = &compatible.parameters[1];
+            assert_eq!(
+                (result.name, result.target, result.direction),
+                ("", "Boolean", None)
+            );
+            assert_eq!((result.lower, result.upper), (1, Some(1)));
+            assert!(SYNTHESIZED_RESULTS.contains(&result.id));
+        }
+        assert_eq!(SYNTHESIZED_RESULTS.len(), 2);
+        let synthesized = ops
             .iter()
-            .find(|o| o.declaring_metaclass == "Type" && o.name == "isCompatibleWith")
-            .unwrap();
-        assert_eq!(compatible.parameters.len(), 1);
-        assert_eq!(compatible.parameters[0].name, "otherType");
+            .flat_map(|o| o.parameters.iter())
+            .filter(|p| SYNTHESIZED_RESULTS.contains(&p.id))
+            .count();
+        assert_eq!(synthesized, 2);
         assert!(operation("effectiveName").is_none());
     }
 }

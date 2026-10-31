@@ -290,6 +290,52 @@ fn terminal_name_span(spelling: &str) -> Span {
         .unwrap_or_else(|| Span::new(0, spelling.len() as u32))
 }
 
+/// Why `text` cannot be written into a body as whole members, judged by
+/// its braces alone: a `}` that closes more than the text opened ends
+/// the owner's body early, so what follows lands outside it (`} part
+/// def X {` parses in any body), and a `{` the text leaves open takes
+/// the owner's closing brace for its own. Braces inside names, strings
+/// and comments are parts of those tokens and do not count. `None` when
+/// the braces balance.
+fn unbalanced_braces(text: &str) -> Option<&'static str> {
+    let (tokens, _) = tokenize(text);
+    let mut depth = 0usize;
+    for t in &tokens {
+        match t.kind {
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace if depth == 0 => {
+                return Some("a `}` closes a body the text did not open");
+            }
+            TokenKind::RBrace => depth -= 1,
+            _ => {}
+        }
+    }
+    (depth > 0).then_some("a `{` is left without its `}`")
+}
+
+/// Whether `text` ends inside a `//` note, which runs to the end of its
+/// line: text that follows on the same line would become part of it.
+fn ends_in_line_note(text: &str) -> bool {
+    let (tokens, _) = tokenize(text);
+    tokens
+        .iter()
+        .rev()
+        .find(|t| t.kind != TokenKind::Eof)
+        .is_some_and(|t| t.kind == TokenKind::LineNote)
+}
+
+/// The members of a parsed `package __p { … }` probe; `None` unless the
+/// parse is that one package.
+fn probe_body(unit: &sysmlv2_syntax::ast::SourceUnit) -> Option<&[sysmlv2_syntax::ast::Member]> {
+    match unit.members.as_slice() {
+        [m] => match &m.kind {
+            sysmlv2_syntax::ast::MemberKind::Package(p) => Some(p.body.as_deref().unwrap_or(&[])),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The definition name [`EditBuilder::extract_definition`] synthesizes
 /// when none is given — exposed so surfaces (the LSP action title, the
 /// CLI's dry-run output) can spell the name the engine will use.
@@ -474,6 +520,17 @@ pub enum TransformError {
         element: String,
         broken: Vec<String>,
     },
+    /// An inserted or moved member would leave its owner with more than
+    /// one of a member it may own at most one of — a subject, an
+    /// objective, an `entry`, `do` or `exit` action, a rendering, a
+    /// return parameter (the commit was rolled back). `member` names
+    /// the kind (`"subject"`, `` "`entry` action" ``, …), `count` how
+    /// many the owner would own.
+    DuplicateMember {
+        owner: String,
+        member: String,
+        count: usize,
+    },
 }
 
 impl fmt::Display for TransformError {
@@ -575,6 +632,14 @@ impl fmt::Display for TransformError {
                 f,
                 "edit refused: `{element}`'s effective members would change structurally: {}",
                 broken.join("; ")
+            ),
+            TransformError::DuplicateMember {
+                owner,
+                member,
+                count,
+            } => write!(
+                f,
+                "edit refused: `{owner}` would own {count} {member}s; it may own at most one"
             ),
         }
     }
@@ -920,8 +985,10 @@ impl CheckStage {
 
 /// One finding from [`check_sources`]: the CLI `check` verdict shape with
 /// the unit name and a 1-based line/column position resolved from the
-/// diagnostic's span.
+/// diagnostic's span. Only this crate builds one, so later fields do
+/// not break readers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct CheckFinding {
     pub severity: Severity,
     pub message: String,
@@ -934,6 +1001,9 @@ pub struct CheckFinding {
     pub span: Span,
     /// The stage that produced the finding.
     pub stage: CheckStage,
+    /// The rule the finding reports ([`Diagnostic::code`]): the
+    /// normative rule of a semantic finding, `None` when it names none.
+    pub code: Option<&'static str>,
 }
 
 /// Text a lenient parse removed from a unit, or closers it appended —
@@ -1237,6 +1307,282 @@ fn indent_start(bytes: &[u8], pos: u32) -> u32 {
     start
 }
 
+/// The extents of `owner`'s members written in `unit` (inside `within`,
+/// the owner's own extent, when it has one), `skip` left out, in
+/// source order — the list a member slot addresses.
+fn lexical_members(
+    r: &ResolvedModel,
+    owner: ElementRef,
+    unit: usize,
+    within: Option<Span>,
+    skip: Option<ElementRef>,
+) -> Vec<Span> {
+    let mut sibs: Vec<Span> = r
+        .owned_members(owner)
+        .into_iter()
+        .filter(|m| Some(*m) != skip)
+        .filter_map(|m| r.member_extent(m))
+        .filter(|(u, sp)| {
+            *u == unit && within.is_none_or(|w| sp.start >= w.start && sp.end <= w.end)
+        })
+        .map(|(_, sp)| sp)
+        .collect();
+    sibs.sort_by_key(|sp| sp.start);
+    sibs.dedup();
+    sibs
+}
+
+/// A member its owner may own at most one of: the subject of a
+/// requirement or case, the objective of a case, each kind of state
+/// subaction, the rendering of a view, the return parameter of a
+/// calculation, function or expression.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SoleMember {
+    Subject,
+    Objective,
+    Entry,
+    Do,
+    Exit,
+    Rendering,
+    Return,
+}
+
+impl SoleMember {
+    /// The kind as a refusal names it.
+    fn describe(self) -> &'static str {
+        match self {
+            SoleMember::Subject => "subject",
+            SoleMember::Objective => "objective",
+            SoleMember::Entry => "`entry` action",
+            SoleMember::Do => "`do` action",
+            SoleMember::Exit => "`exit` action",
+            SoleMember::Rendering => "rendering",
+            SoleMember::Return => "return parameter",
+        }
+    }
+
+    /// The subaction keyword of a state subaction kind.
+    fn subaction(self) -> Option<&'static str> {
+        match self {
+            SoleMember::Entry => Some("entry"),
+            SoleMember::Do => Some("do"),
+            SoleMember::Exit => Some("exit"),
+            _ => None,
+        }
+    }
+
+    /// The membership metaclass that owns a member of this kind.
+    fn membership(self) -> &'static str {
+        match self {
+            SoleMember::Subject => "SubjectMembership",
+            SoleMember::Objective => "ObjectiveMembership",
+            SoleMember::Entry | SoleMember::Do | SoleMember::Exit => "StateSubactionMembership",
+            SoleMember::Rendering => "ViewRenderingMembership",
+            SoleMember::Return => "ReturnParameterMembership",
+        }
+    }
+
+    /// The kind a parsed member declares, if it is one of these.
+    fn of_member(m: &sysmlv2_syntax::ast::Member) -> Option<SoleMember> {
+        use sysmlv2_syntax::ast::{MemberKind, StateSubactionKind};
+        Some(match &m.kind {
+            MemberKind::Subject(_) => SoleMember::Subject,
+            MemberKind::Objective(_) => SoleMember::Objective,
+            MemberKind::StateSubaction { kind, .. } => match kind {
+                StateSubactionKind::Entry => SoleMember::Entry,
+                StateSubactionKind::Do => SoleMember::Do,
+                StateSubactionKind::Exit => SoleMember::Exit,
+            },
+            MemberKind::Render(_) => SoleMember::Rendering,
+            MemberKind::Return(_) => SoleMember::Return,
+            _ => return None,
+        })
+    }
+
+    /// The kind of member `e` is in its owner, if it is one of these.
+    fn of_element(r: &mut ResolvedModel, e: ElementRef) -> Option<SoleMember> {
+        let via = r.owning_membership_type(e)?;
+        let all = [
+            SoleMember::Subject,
+            SoleMember::Objective,
+            SoleMember::Rendering,
+            SoleMember::Return,
+        ];
+        if let Some(kind) = all.into_iter().find(|k| k.membership() == via) {
+            return Some(kind);
+        }
+        if via != "StateSubactionMembership" {
+            return None;
+        }
+        let owner = r.owner(e)?;
+        let (word, _) = r
+            .state_subactions(owner)
+            .into_iter()
+            .find(|(_, a)| *a == e)?;
+        [SoleMember::Entry, SoleMember::Do, SoleMember::Exit]
+            .into_iter()
+            .find(|k| k.subaction() == Some(word.as_str()))
+    }
+
+    /// How many members of this kind `owner` owns.
+    fn count(self, r: &mut ResolvedModel, owner: ElementRef) -> usize {
+        match self.subaction() {
+            Some(word) => r
+                .state_subactions(owner)
+                .iter()
+                .filter(|(k, _)| k == word)
+                .count(),
+            None => r.members_via(owner, self.membership()).len(),
+        }
+    }
+}
+
+/// What members arriving in an owner (inserted text, a moved member)
+/// ask of where they land and of the owner.
+struct Arrival {
+    /// The members among them their owner may own at most one of.
+    sole: Vec<SoleMember>,
+    /// One of them is an input parameter other than a subject: an `in`
+    /// or `inout` feature, an actor or a stakeholder.
+    input: bool,
+}
+
+impl Arrival {
+    /// The members of an inserted text, parsed.
+    fn of_text(members: &[sysmlv2_syntax::ast::Member]) -> Arrival {
+        use sysmlv2_syntax::ast::{FeatureDirection, MemberKind};
+        Arrival {
+            sole: members.iter().filter_map(SoleMember::of_member).collect(),
+            input: members.iter().any(|m| match &m.kind {
+                MemberKind::Actor(_) | MemberKind::Stakeholder(_) => true,
+                MemberKind::Usage(u) => matches!(
+                    u.prefix.direction,
+                    Some(FeatureDirection::In | FeatureDirection::InOut)
+                ),
+                _ => false,
+            }),
+        }
+    }
+
+    /// A member moving in.
+    fn of_element(r: &mut ResolvedModel, e: ElementRef) -> Arrival {
+        let sole: Vec<SoleMember> = SoleMember::of_element(r, e).into_iter().collect();
+        let input = matches!(
+            r.owning_membership_type(e),
+            Some("ActorMembership" | "StakeholderMembership")
+        ) || matches!(r.declared_direction(e), Some("in" | "inout"));
+        Arrival { sole, input }
+    }
+
+    fn subject(&self) -> bool {
+        self.sole.contains(&SoleMember::Subject)
+    }
+}
+
+/// The slots among `owner`'s lexical members `sibs` where `arrival` may
+/// land, as the inclusive range `(lo, hi)`. Never past a trailing
+/// result expression: calculation, case and function bodies end with
+/// it. A subject goes no later than the first parameter (a directed
+/// feature, or a member through a parameter membership), since it must
+/// be its owner's first input; any other input goes no earlier than
+/// just past the subject.
+fn slot_bounds(
+    r: &ResolvedModel,
+    owner: ElementRef,
+    sibs: &[Span],
+    arrival: &Arrival,
+) -> (usize, usize) {
+    let (mut lo, mut hi) = (0, sibs.len());
+    for m in r.owned_members(owner) {
+        let Some(k) = r
+            .member_extent(m)
+            .and_then(|(_, sp)| sibs.iter().position(|s| *s == sp))
+        else {
+            continue;
+        };
+        let via = r.owning_membership_type(m);
+        let parameter = r.declared_direction(m).is_some()
+            || matches!(
+                via,
+                Some(
+                    "ParameterMembership"
+                        | "SubjectMembership"
+                        | "ActorMembership"
+                        | "StakeholderMembership"
+                        | "ReturnParameterMembership"
+                )
+            );
+        if via == Some("ResultExpressionMembership") || (arrival.subject() && parameter) {
+            hi = hi.min(k);
+        }
+        if arrival.input && !arrival.subject() && via == Some("SubjectMembership") {
+            lo = lo.max(k + 1);
+        }
+    }
+    (lo.min(hi), hi)
+}
+
+/// Where a member inserted at slot `k` among `sibs` goes, and the text
+/// that puts `text` there indented `child`: on the line after its
+/// predecessor's declaration (past a comment that ends that line, so
+/// a comment leading the next member stays with it), or on the line
+/// before the first member for slot 0 — right after the opening brace,
+/// breaking the line, when the first member shares the brace's line.
+/// `None` where the caller's append covers it: no members, or a last
+/// member that shares its line with the closing brace.
+fn slot_insertion(
+    src: &str,
+    sibs: &[Span],
+    k: usize,
+    child: &str,
+    text: &str,
+) -> Option<(u32, String)> {
+    let bytes = src.as_bytes();
+    if k == 0 {
+        let at = indent_start(bytes, sibs.first()?.start);
+        if at > 0 && bytes[at as usize - 1] != b'\n' {
+            return Some((at, format!("\n{child}{text}")));
+        }
+        return Some((at, format!("{child}{text}\n")));
+    }
+    let prev = sibs.get(k.min(sibs.len()).checked_sub(1)?)?;
+    let mut at = prev.end as usize;
+    loop {
+        while at < bytes.len() && matches!(bytes[at], b' ' | b'\t') {
+            at += 1;
+        }
+        // A block comment closed on this line is stepped over.
+        if bytes[at..].starts_with(b"/*") {
+            match src[at + 2..].find("*/") {
+                Some(close) if !src[at..at + 2 + close].contains('\n') => {
+                    at += close + 4;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        break;
+    }
+    if bytes[at..].starts_with(b"//") {
+        at += src[at..].find('\n').unwrap_or(bytes.len() - at);
+    }
+    if bytes[at..].starts_with(b"\r\n") {
+        Some((at as u32 + 2, format!("{child}{text}\n")))
+    } else if bytes[at..].starts_with(b"\n") {
+        Some((at as u32 + 1, format!("{child}{text}\n")))
+    } else if at == bytes.len() {
+        Some((at as u32, format!("\n{child}{text}\n")))
+    } else if k >= sibs.len() {
+        // The last member shares its line with the closing brace: the
+        // append path breaks that line.
+        None
+    } else {
+        // The next member shares the predecessor's line: break the line
+        // right after the predecessor.
+        Some((prev.end, format!("\n{child}{text}")))
+    }
+}
+
 /// The text a removal takes with the member at `extent`: its own lines,
 /// indentation and line break included (either line ending), when the
 /// member stands alone on them. A member that shares its line keeps the
@@ -1265,6 +1611,47 @@ fn cut_whole_lines(src: &str, extent: Span) -> Span {
         // Nothing closes the line, so the indentation stays where it is.
         Span::new(extent.start, end)
     }
+}
+
+/// The `then` (with its multiplicity, `then [1]`) that opens the member
+/// at `extent` in `src` when it leads a declaration (`then perform action
+/// b;`): the implied succession from the member before, which shares the
+/// declaration's extent. `None` when the member leads with no `then`.
+fn leading_then_span(src: &str, extent: Span) -> Option<Span> {
+    let source = slice(src, extent);
+    let parsed = parse_source(source);
+    let member = parsed.unit.members.first().filter(|m| m.leading_then)?;
+    let (tokens, _) = tokenize(source);
+    let token = tokens.iter().find(|t| {
+        t.kind == TokenKind::Ident && &source[t.span.start as usize..t.span.end as usize] == "then"
+    })?;
+    let end = member
+        .leading_then_multiplicity
+        .as_ref()
+        .map_or(token.span.end, |m| m.span.end);
+    Some(Span::new(
+        extent.start + token.span.start,
+        extent.start + end,
+    ))
+}
+
+/// `spans` (disjoint, in source order) with each run that only
+/// whitespace separates in `src` joined into one span.
+fn join_whitespace_separated(src: &str, spans: &[Span]) -> Vec<Span> {
+    let mut joined: Vec<Span> = Vec::new();
+    for &span in spans {
+        match joined.last_mut() {
+            Some(last)
+                if slice(src, Span::new(last.end, span.start))
+                    .trim()
+                    .is_empty() =>
+            {
+                last.end = span.end;
+            }
+            _ => joined.push(span),
+        }
+    }
+    joined
 }
 
 /// Widen `span` to whole lines when its text stands alone on them: the
@@ -1644,6 +2031,7 @@ fn findings_for(
                 col: pos.col,
                 span: d.span,
                 stage,
+                code: d.code,
             }
         })
         .collect()
@@ -2036,7 +2424,7 @@ impl Session {
         indent: Indent,
     ) -> Result<Session, SessionError> {
         Self::from_interchange_json_impl(
-            unwrap_flexo(value),
+            unwrap_change_records(value.clone()),
             lib,
             unit_names,
             indent,
@@ -2054,7 +2442,7 @@ impl Session {
         indent: Indent,
         format: GraphFormat,
     ) -> Result<Session, SessionError> {
-        let value = unwrap_flexo(value);
+        let value = unwrap_change_records(value.clone());
         sysmlv2_model::migration::validate_conditional_graph_format(&value, format).map_err(
             |message| SessionError::Parse {
                 unit: "<interchange>".into(),
@@ -2073,6 +2461,10 @@ impl Session {
         indent: Indent,
         format: GraphFormat,
     ) -> Result<Session, SessionError> {
+        sysmlv2_model::lift::validate_ownership(&value).map_err(|message| SessionError::Parse {
+            unit: "<interchange>".into(),
+            diagnostics: vec![Diagnostic::error(Span::default(), message)],
+        })?;
         let mut warnings = Vec::new();
         // Library ids are named through the same map the CLI seeds for
         // its JSON → text conversion.
@@ -2105,22 +2497,37 @@ impl Session {
         // the same way, since the unit name prefixes every ownership
         // path (= every re-emitted id).
         let docs: Vec<(Option<String>, serde_json::Value)> =
-            sysmlv2_model::lift::split_documents(&value)
-                .unwrap_or_else(|| vec![(single_root_name(&value), value.clone())]);
+            sysmlv2_model::lift::split_documents(&value).unwrap_or_else(|| {
+                vec![(sysmlv2_model::lift::single_root_name(&value), value.clone())]
+            });
         let document_names = sysmlv2_model::lift::document_reference_name_map(&value);
         names.extend(document_names.clone());
         lift_names.extend(document_names);
         let mut sources = Vec::with_capacity(docs.len());
         for (i, (root_name, doc)) in docs.iter().enumerate() {
-            let unit_name = unit_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| doc_unit_name(root_name.as_deref(), i));
-            let lifted = sysmlv2_model::lift::from_compact_json_with_names(doc, &lift_names)
-                .map_err(|message| SessionError::Parse {
-                    unit: unit_name.clone(),
-                    diagnostics: vec![Diagnostic::error(Span::default(), message)],
-                })?;
+            let named = unit_names.get(i).cloned();
+            let dialect = named
+                .as_deref()
+                .and_then(sysmlv2_model::lift::dialect_from_name);
+            let lifted =
+                sysmlv2_model::lift::from_compact_json_with_dialect(doc, &lift_names, dialect)
+                    .map_err(|message| SessionError::Parse {
+                        unit: named.clone().unwrap_or_else(|| {
+                            sysmlv2_model::lift::document_file_name(
+                                root_name.as_deref(),
+                                i,
+                                Default::default(),
+                            )
+                        }),
+                        diagnostics: vec![Diagnostic::error(Span::default(), message)],
+                    })?;
+            let unit_name = named.unwrap_or_else(|| {
+                sysmlv2_model::lift::document_file_name(
+                    root_name.as_deref(),
+                    i,
+                    lifted.unit.dialect,
+                )
+            });
             warnings.extend(lifted.errors);
             // Lifted doc/comment bodies are dedented (interchange
             // normalization stripped their margins) — re-lay them.
@@ -2484,6 +2891,57 @@ impl Session {
         .map_err(SessionError::Cbor)
     }
 
+    /// The delta from a graph store's branch head to this session's
+    /// model, both in the store's spelling. `head` is the head's compact
+    /// element array as the store hands it back; the target is this
+    /// model graph-normalized (`sysmlv2_cbor::graph_normalize`), so only
+    /// real changes ship and the declared result digest is the one the
+    /// store reconstructs. A strict delta also carries the model's unit
+    /// structure, so the store keeps its file layout.
+    pub fn delta_cbor_from_store_head(
+        &self,
+        head: &serde_json::Value,
+        portable: bool,
+    ) -> Result<Vec<u8>, SessionError> {
+        self.check_graph_document(head)?;
+        let base = sysmlv2_cbor::graph_normalize(head)?;
+        let (target, units) = self.compact_json_with_units_overlaid();
+        let root_paths: Vec<(String, String)> = units
+            .into_iter()
+            .filter_map(|(i, path)| {
+                let id = target.get(i)?.get("@id")?.as_str()?.to_owned();
+                Some((id, path))
+            })
+            .collect();
+        let target = sysmlv2_cbor::graph_normalize(&target)?;
+        let units = if portable {
+            Vec::new()
+        } else {
+            let position: HashMap<&str, usize> = target
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(i, e)| Some((e.get("@id")?.as_str()?, i)))
+                .collect();
+            let mut units: Vec<(usize, String)> = root_paths
+                .into_iter()
+                .filter_map(|(id, path)| Some((*position.get(id.as_str())?, path)))
+                .collect();
+            units.sort_by_key(|(i, _)| *i);
+            units
+        };
+        sysmlv2_cbor::delta_compact_cbor(
+            &base,
+            &target,
+            &sysmlv2_cbor::DeltaOptions::new()
+                .with_graph_format(self.model.graph_format())
+                .with_portable(portable)
+                .with_units(units),
+        )
+        .map_err(SessionError::Cbor)
+    }
+
     /// [`Self::delta_cbor_from`] with **id elision** (strict identity
     /// only): created ids the applier can re-derive
     /// from the applied graph are not shipped — the session's standard
@@ -2803,7 +3261,7 @@ impl Session {
     /// has (after a rename, or a text session compared with an earlier
     /// export).
     pub fn id_map_from(&mut self, input: &serde_json::Value) -> Vec<(Uuid, Uuid)> {
-        let input = unwrap_flexo(input);
+        let input = unwrap_change_records(input.clone());
         let names = sysmlv2_model::lift::document_name_map(&input);
         let mut session_ids: HashMap<String, Uuid> = HashMap::new();
         let user: Vec<ElementRef> = self.resolved.user_elements().collect();
@@ -3153,15 +3611,24 @@ impl Session {
     /// Respell every reference with the **shortest** spelling that still
     /// resolves to the same element: bare name where unambiguous,
     /// a qualified suffix where needed, the original spelling as the
-    /// untouched fallback. *Plain* sites and **import targets** are
-    /// considered (chain steps and other special-rule sites are not);
-    /// candidates are pre-checked by resolving from the site's own
-    /// recorded scope — a heuristic for import targets, whose own rules
-    /// differ — and the whole result is verified by a reparse: every
-    /// respelled site must resolve to the identical qualified name,
-    /// every untouched site must be unaffected, or the offending
-    /// respells are dropped and the pass retried. Declarations never
-    /// move, so interchange ids are untouched by construction.
+    /// untouched fallback. *Plain* sites, **feature chains** and
+    /// **import targets** are considered; other special-rule sites are
+    /// not. A chain respells as one unit: the shortest head, then the
+    /// written member names. A run that starts mid-chain, or continues
+    /// into another `$::`-rooted link, keeps its spelling. A namespace
+    /// import (`Pkg::*`, `Pkg::**`) shortens like any other reference.
+    /// A member import draws its candidates from suffixes of the
+    /// *written* path, so an alias import still names the alias. It
+    /// keeps at least two segments (one when only one is written),
+    /// because it binds its last segment into the importing scope and
+    /// `import Member;` could only resolve through itself. Candidates
+    /// are pre-checked by resolving from the site's own recorded scope
+    /// — a heuristic for import targets, whose own rules differ — and
+    /// the whole result is verified by a reparse: every respelled site
+    /// must resolve to the identical qualified name, every untouched
+    /// site must be unaffected, or the offending respells are dropped
+    /// and the pass retried. Declarations never move, so interchange
+    /// ids are untouched by construction.
     ///
     /// # Panics
     ///
@@ -3655,6 +4122,7 @@ enum Op {
     InsertMember {
         owner: ElementRef,
         text: String,
+        index: Option<usize>,
     },
     InsertTopLevel {
         unit_name: String,
@@ -4014,7 +4482,9 @@ impl EditBuilder<'_> {
     /// feature (`:>> mass` → `:>> mass : T`). Declaration position,
     /// value, and body are untouched. Whether the new spelling resolves
     /// surfaces through the commit's findings (unresolved-count change),
-    /// like inserted member text.
+    /// like inserted member text. `ty` is one type name and nothing more
+    /// (`~P` for a conjugated port type); anything else — `T = 5`, `T,
+    /// U`, `T; part q` — is refused with [`TransformError::InvalidType`].
     pub fn set_feature_type(&mut self, e: ElementRef, ty: &str) -> &mut Self {
         self.ops.push(Op::SetFeatureType {
             e,
@@ -4024,11 +4494,46 @@ impl EditBuilder<'_> {
     }
 
     /// Insert `text` as the last member of `owner`'s body (a
-    /// `;`-terminated declaration grows a body).
+    /// `;`-terminated declaration grows a body), or as late as the
+    /// grammar and the parameter order allow: before the result
+    /// expression a calculation, constraint, case or function body ends
+    /// with, and a subject before the owner's first parameter (a subject
+    /// must be the first input). A unit's root namespace as `owner`
+    /// appends at that unit's top level. The commit refuses with
+    /// [`TransformError::DuplicateMember`] when `owner` would end up
+    /// with two subjects, objectives, `entry`, `do` or `exit` actions,
+    /// renderings or return parameters. Text whose braces do not balance
+    /// on their own — a `}` closing a body it did not open, which would
+    /// end `owner`'s body early and declare what follows outside it, or
+    /// a `{` left open — is refused with [`TransformError::InvalidMember`].
     pub fn insert_member(&mut self, owner: ElementRef, text: &str) -> &mut Self {
+        self.insert_member_at(owner, text, None)
+    }
+
+    /// [`Self::insert_member`] at `index` among `owner`'s current
+    /// lexical members: the new member is written on the line after the
+    /// declaration of the member before that slot (past a comment that
+    /// ends its line), or before the first member at slot 0; past the
+    /// end, after the last member. Without members, or where the last
+    /// member shares its line with the closing brace, it appends as
+    /// [`Self::insert_member`] does, and so does `None`. The slot is held
+    /// to where the member may go: before a trailing result expression,
+    /// a subject no later than the first parameter, any other input (an
+    /// `in` or `inout` feature, an actor, a stakeholder) no earlier than
+    /// just past the subject, and past the `then` run of the member
+    /// before it (`state a; then b;` with a slot after `a` lands after
+    /// `then b;`, which starts from `a` and would start from the new
+    /// member otherwise).
+    pub fn insert_member_at(
+        &mut self,
+        owner: ElementRef,
+        text: &str,
+        index: Option<usize>,
+    ) -> &mut Self {
         self.ops.push(Op::InsertMember {
             owner,
             text: text.to_string(),
+            index,
         });
         self
     }
@@ -4054,8 +4559,14 @@ impl EditBuilder<'_> {
     }
 
     /// Remove the member declaration that created `e` (and everything it
-    /// owns). Fails at commit if any reference outside the removed text
-    /// targets the element or its descendants.
+    /// owns). The `then` members written right after it go too (`state
+    /// a; then b;`, `action a; if ok then b; else c;`, `entry; then
+    /// idle;`): they name no source and start from the member they
+    /// follow, so left behind they would follow nothing or start from
+    /// another member. A `then` leading a declaration after it (`then
+    /// action b;`) goes and the declaration stays. Fails at commit if
+    /// any reference outside the removed text targets the element or its
+    /// descendants.
     pub fn remove(&mut self, e: ElementRef) -> &mut Self {
         self.ops.push(Op::Remove { e });
         self
@@ -4071,7 +4582,10 @@ impl EditBuilder<'_> {
     /// a rename); alias and short-name spellings stay as written and
     /// must still resolve post-commit — the standard verification. No
     /// pre-state outside-reference refusal: validity is judged on the
-    /// post-edit model.
+    /// post-edit model. Text that ends in a `//` note moves what followed
+    /// the member on its line to a line of its own, so it does not become
+    /// part of the note. Text whose braces do not balance on their own is
+    /// refused, as for [`Self::insert_member`].
     pub fn replace_member(&mut self, e: ElementRef, text: &str) -> &mut Self {
         self.ops.push(Op::ReplaceMember {
             e,
@@ -4095,7 +4609,15 @@ impl EditBuilder<'_> {
     /// still denote the moved element, references carried inside the
     /// moved text must still resolve to their old targets — or the
     /// commit rolls back. Multi-line members keep their internal
-    /// indentation as written.
+    /// indentation as written. The slot is held as
+    /// [`Self::insert_member_at`] holds it, and a move that would give
+    /// `new_owner` a second subject, objective, subaction of one kind,
+    /// rendering or return parameter is refused as an insert is. The
+    /// `then b;`, `if g then b;` and `else b;` members written after
+    /// `e` start from it, so they move with it as they go with it on
+    /// [`Self::remove`]: a reorder keeps `a`'s transitions `a`'s, and a
+    /// move into another owner carries them, where their targets must
+    /// still resolve or the commit rolls back.
     pub fn move_member(
         &mut self,
         e: ElementRef,
@@ -4269,6 +4791,14 @@ struct Planner<'s> {
     /// Operations explicitly replacing/deleting old reference text release its
     /// payload identity evidence. Relocations must carry it or refuse instead.
     released_identity_ranges: Vec<(usize, Span)>,
+    /// The `then` members (and leading `then`s) earlier removals in this
+    /// batch took along with the member they follow: a later `remove` of
+    /// one of them has nothing left to do.
+    then_runs_removed: Vec<(usize, Span)>,
+    /// The cuts of leading `then`s earlier removals in this batch took
+    /// (`action a; then action b;` loses `then ` with `a`): a later
+    /// removal of the declaration they lead cuts them with it.
+    leading_then_cuts: Vec<(usize, Span)>,
     moved_identity_sites: Vec<MovedIdentitySites>,
     /// Reference sites carried inside moved text (`move_member`), to be
     /// re-verified at their post-insert positions.
@@ -4294,6 +4824,19 @@ struct Planner<'s> {
     /// Findings recorded while planning (dropped colliding renames);
     /// they lead the committed report's findings.
     findings: Vec<String>,
+    /// Owners an insert or move brings members into that an owner may
+    /// own at most one of, checked against the post-commit model.
+    sole_checks: Vec<SoleCheck>,
+}
+
+/// An owner receiving members of [`SoleMember`] kinds: the owner, its
+/// unit and pre-commit extent start (where the post-commit owner is
+/// found again), and the kinds arriving.
+struct SoleCheck {
+    owner: ElementRef,
+    unit: usize,
+    start: u32,
+    sole: Vec<SoleMember>,
 }
 
 /// One `move_member`'s carried reference sites: the destination
@@ -4326,6 +4869,8 @@ impl<'s> Planner<'s> {
             correspondence: Vec::new(),
             consumed: Vec::new(),
             released_identity_ranges: Vec::new(),
+            then_runs_removed: Vec::new(),
+            leading_then_cuts: Vec::new(),
             moved_identity_sites: Vec::new(),
             moved_expects: Vec::new(),
             refuse_new_unresolved: false,
@@ -4333,6 +4878,7 @@ impl<'s> Planner<'s> {
             report_unused_imports: false,
             new_units: Vec::new(),
             findings: Vec::new(),
+            sole_checks: Vec::new(),
         }
     }
 
@@ -4394,7 +4940,7 @@ impl<'s> Planner<'s> {
             Op::SetRedefinedFeature { e, target } => self.plan_set_redefined(*e, target),
             Op::RemoveFeatureValue { e } => self.plan_remove_value(*e),
             Op::SetCommentBody { e, body } => self.plan_set_comment_body(*e, body),
-            Op::InsertMember { owner, text } => self.plan_insert(*owner, text),
+            Op::InsertMember { owner, text, index } => self.plan_insert(*owner, text, *index),
             Op::InsertTopLevel { unit_name, text } => self.plan_insert_top(unit_name, text),
             Op::AddUnit { name } => self.plan_add_unit(name),
             Op::Remove { e } => self.plan_remove(*e),
@@ -4804,14 +5350,41 @@ impl<'s> Planner<'s> {
     fn plan_set_type(&mut self, e: ElementRef, ty: &str) -> Result<(), TransformError> {
         let ty = ty.trim();
         // Validate the spelling as a typing target in a probe
-        // declaration (names, qualified names, quoted names all pass;
-        // stray tokens fail here instead of at reparse).
-        let probe = format!("package __p {{ attribute __x : {ty}; }}");
+        // declaration (names, qualified names, quoted names all pass):
+        // one usage whose one typing is the whole of the text, so stray
+        // tokens fail here instead of at reparse — and text that would
+        // reach past the clause (`T; } part def X {`, `T = 5`, `T, U`)
+        // fails at all.
+        let lead = "package __p { attribute __x : ";
+        let probe = format!("{lead}{ty}; }}");
         let parse = parse_source(&probe);
-        if !parse.diagnostics.is_empty() {
+        let whole = parse.diagnostics.is_empty()
+            && probe_body(&parse.unit)
+                .and_then(|body| match body {
+                    [one] => match &one.kind {
+                        sysmlv2_syntax::ast::MemberKind::Usage(u) => Some(u),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .is_some_and(|u| {
+                    matches!(
+                        u.declaration.specializations.as_slice(),
+                        [sysmlv2_syntax::ast::FeatureSpecialization::TypedBy(ts)]
+                            if matches!(ts.as_slice(), [t]
+                                if t.target.span().end as usize == lead.len() + ty.len()
+                                    && (t.is_conjugated
+                                        || t.target.span().start as usize == lead.len()))
+                    )
+                });
+        if !whole {
             return Err(TransformError::InvalidType {
                 text: ty.to_string(),
-                message: parse.diagnostics[0].message.clone(),
+                message: parse
+                    .diagnostics
+                    .first()
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| "not one type name".into()),
             });
         }
         let r = self.session.resolved();
@@ -4857,25 +5430,83 @@ impl<'s> Planner<'s> {
         Ok(())
     }
 
-    fn validate_member_text(text: &str) -> Result<(), TransformError> {
+    /// Refuse member text that does not parse; otherwise say what its
+    /// members ask of where they land.
+    fn validate_member_text(text: &str) -> Result<Arrival, TransformError> {
+        let refuse = |message: String| TransformError::InvalidMember {
+            text: text.to_string(),
+            message,
+        };
+        // Braces first: text that closes the probe's body still parses,
+        // as the probe and whatever follows it.
+        if let Some(why) = unbalanced_braces(text) {
+            return Err(refuse(why.to_string()));
+        }
         let probe = format!("package __p {{ {text} }}");
         let parse = parse_source(&probe);
         if !parse.diagnostics.is_empty() {
-            return Err(TransformError::InvalidMember {
-                text: text.to_string(),
-                message: parse.diagnostics[0].message.clone(),
-            });
+            return Err(refuse(parse.diagnostics[0].message.clone()));
         }
-        Ok(())
+        let members = probe_body(&parse.unit)
+            .ok_or_else(|| refuse("the text is not whole members of one body".into()))?;
+        Ok(Arrival::of_text(members))
     }
 
-    fn plan_insert(&mut self, owner: ElementRef, text: &str) -> Result<(), TransformError> {
-        Self::validate_member_text(text)?;
-        let (unit, extent) = self
-            .session
-            .resolved()
-            .member_extent(owner)
-            .ok_or(TransformError::NoExtent(owner))?;
+    fn plan_insert(
+        &mut self,
+        owner: ElementRef,
+        text: &str,
+        index: Option<usize>,
+    ) -> Result<(), TransformError> {
+        let arrival = Self::validate_member_text(text)?;
+        let r = self.session.resolved();
+        let Some((unit, extent)) = r.member_extent(owner) else {
+            // A unit's root namespace has no declaration of its own:
+            // inserting into it writes at that unit's top level.
+            if r.owner(owner).is_some() {
+                return Err(TransformError::NoExtent(owner));
+            }
+            let unit = r.unit_of(owner);
+            let sibs = lexical_members(r, owner, unit, None, None);
+            let src = self.user_src(unit, owner)?;
+            let text = reindent_member_text(text, "", indent_unit("", src));
+            let splice = match index.and_then(|k| slot_insertion(src, &sibs, k, "", &text)) {
+                Some((at, text)) => (at, text),
+                None if src.is_empty() || src.ends_with('\n') => {
+                    (src.len() as u32, format!("{text}\n"))
+                }
+                None => (src.len() as u32, format!("\n{text}\n")),
+            };
+            self.splices.push(Splice {
+                unit,
+                start: splice.0,
+                end: splice.0,
+                text: splice.1,
+                expects: Vec::new(),
+            });
+            return Ok(());
+        };
+        let sibs = lexical_members(r, owner, unit, Some(extent), None);
+        // The slot the grammar and the parameter order admit: an append
+        // into a body that ends with its result expression lands before
+        // it, a subject before the first parameter.
+        let (lo, hi) = slot_bounds(r, owner, &sibs, &arrival);
+        let slot = match index {
+            Some(k) => Some(k.clamp(lo, hi)),
+            None => (hi < sibs.len()).then_some(hi),
+        };
+        let slot = match slot {
+            Some(k) => Some(self.hold_past_then_run(owner, unit, &sibs, k)?),
+            None => None,
+        };
+        if !arrival.sole.is_empty() {
+            self.sole_checks.push(SoleCheck {
+                owner,
+                unit,
+                start: extent.start,
+                sole: arrival.sole,
+            });
+        }
         let src = self.user_src(unit, owner)?;
         let indent = line_indent(src, extent.start);
         let child = child_indent(&indent, src);
@@ -4884,6 +5515,17 @@ impl<'s> Planner<'s> {
         // indent style, so a nested insert reads as if written there.
         let text = reindent_member_text(text, &child, indent_unit(&indent, src));
         let text = text.as_str();
+        // At a slot among the owner's members: beside its neighbours.
+        if let Some((at, text)) = slot.and_then(|k| slot_insertion(src, &sibs, k, &child, text)) {
+            self.splices.push(Splice {
+                unit,
+                start: at,
+                end: at,
+                text,
+                expects: Vec::new(),
+            });
+            return Ok(());
+        }
         let last = extent.end - 1;
         match src.as_bytes()[last as usize] {
             b'}' => {
@@ -4974,34 +5616,42 @@ impl<'s> Planner<'s> {
     fn plan_remove(&mut self, e: ElementRef) -> Result<(), TransformError> {
         let r = self.session.resolved();
         let (unit, mut extent) = r.member_extent(e).ok_or(TransformError::NoExtent(e))?;
+        let mut only_then = false;
         if r.element_type(e) == "SuccessionAsUsage" {
             // A leading `then` and its following declaration share an outer
             // source extent. Removing the relationship must retain the action.
-            let source = slice(self.user_src(unit, e)?, extent);
-            let parsed = parse_source(source);
-            if let Some(member) = parsed.unit.members.first().filter(|m| m.leading_then) {
-                let (tokens, _) = sysmlv2_syntax::lexer::tokenize(source);
-                if let Some(token) = tokens.iter().find(|t| {
-                    t.kind == TokenKind::Ident
-                        && &source[t.span.start as usize..t.span.end as usize] == "then"
-                }) {
-                    let end = member
-                        .leading_then_multiplicity
-                        .as_ref()
-                        .map_or(token.span.end, |m| m.span.end);
-                    extent = Span::new(extent.start + token.span.start, extent.start + end);
-                }
+            if let Some(then) = leading_then_span(self.user_src(unit, e)?, extent) {
+                extent = then;
+                only_then = true;
             }
         }
+        if self.then_runs_removed.contains(&(unit, extent)) {
+            return Ok(()); // already leaving with the member it follows
+        }
+        // The members after `then action b;` follow `b`, which stays.
+        let (run, leading_then) = if only_then {
+            (Vec::new(), None)
+        } else {
+            self.then_run_spans(e, unit, extent)?
+        };
+        self.then_runs_removed
+            .extend(run.iter().chain(&leading_then).map(|&span| (unit, span)));
+        let mut removed = vec![extent];
+        removed.extend(&run);
         let r = self.session.resolved();
         let element = r
             .element_qualified_name(e)
             .unwrap_or_else(|| format!("{:?}", e));
         // References from outside the removed text into it strand — fail
         // now, naming them. "Into it" = the target's own extent (or
-        // declaration) lies within the removed range.
-        let inside =
-            |u: usize, sp: Span| u == unit && sp.start >= extent.start && sp.end <= extent.end;
+        // declaration) lies within a removed range.
+        let inside = |u: usize, sp: Span| {
+            u == unit
+                && removed
+                    .iter()
+                    .chain(&leading_then)
+                    .any(|range| sp.start >= range.start && sp.end <= range.end)
+        };
         let mut broken = Vec::new();
         for site in r.reference_sites().to_vec() {
             if inside(site.unit, site.name_span) {
@@ -5031,47 +5681,224 @@ impl<'s> Planner<'s> {
         }
         // Consume surrounding whitespace: the line's leading indentation
         // and the trailing newline, when nothing else shares the line.
-        let cut = cut_whole_lines(self.user_src(unit, e)?, extent);
-        let (start, end) = (cut.start, cut.end);
-        self.consumed.push((unit, cut));
-        self.released_identity_ranges.push((unit, cut));
-        self.splices.push(Splice {
-            unit,
-            start,
-            end,
-            text: String::new(),
-            expects: Vec::new(),
+        // Ranges only whitespace separates go as one, so `entry; then
+        // idle;` on a line of its own leaves no blank line behind. A
+        // leading `then` is a cut of its own: its declaration stays on
+        // its line, and a later removal of the declaration takes it.
+        let src = self.user_src(unit, e)?;
+        let mut cuts: Vec<Span> = join_whitespace_separated(src, &removed)
+            .into_iter()
+            .map(|range| cut_whole_lines(src, range))
+            .collect();
+        if let Some(then) = leading_then {
+            let cut = cut_whole_lines(src, then);
+            self.leading_then_cuts.push((unit, cut));
+            cuts.push(cut);
+        }
+        // This member's own leading `then`, taken by an earlier removal of
+        // the member it follows, goes inside these cuts now.
+        let taken = &self.leading_then_cuts;
+        self.splices.retain(|s| {
+            !(s.unit == unit
+                && s.text.is_empty()
+                && taken.contains(&(unit, Span::new(s.start, s.end)))
+                && cuts.iter().any(|c| c.start <= s.start && s.end <= c.end))
         });
+        for cut in cuts {
+            self.consumed.push((unit, cut));
+            self.released_identity_ranges.push((unit, cut));
+            self.splices.push(Splice {
+                unit,
+                start: cut.start,
+                end: cut.end,
+                text: String::new(),
+                expects: Vec::new(),
+            });
+        }
         Ok(())
+    }
+
+    /// What the member at `extent` (`e`'s) takes with it when it is
+    /// removed or moved: the `then b;`, `if g then b;`, `else b;` and
+    /// `accept s then b;` members written right after it. They name no source:
+    /// the grammar writes them as a suffix of the member before them
+    /// (`state a; then b;`, `decide d; if ok then b; else c;`, `entry;
+    /// then idle;`), and each starts from that member. Left behind, they
+    /// would follow nothing, or quietly start from whatever member came
+    /// to precede them. A member opens such a run when `check` lets one
+    /// follow it; a member of a run opens none, since the members after
+    /// it start from the member before them all. A `then` that leads a
+    /// declaration (`then action c;`) starts from `e` too: only that
+    /// `then` goes, answered on its own, and the members after the
+    /// declaration start from it. Comments, documentation and textual
+    /// representations between them stay. Spans in `unit`, the whole
+    /// members in source order; none for a KerML unit.
+    fn then_run_spans(
+        &mut self,
+        e: ElementRef,
+        unit: usize,
+        extent: Span,
+    ) -> Result<(Vec<Span>, Option<Span>), TransformError> {
+        use sysmlv2_syntax::ast::{Member, MemberKind};
+        use sysmlv2_syntax::check::{
+            keeps_target_succession_run, opens_target_succession_run, starts_from_its_position,
+        };
+        let in_run =
+            |m: &Member| matches!(&m.kind, MemberKind::Usage(u) if starts_from_its_position(u));
+        let src = self.user_src(unit, e)?;
+        let opens = !is_kerml_unit(&self.unit_name(unit))
+            && parse_source(slice(src, extent))
+                .unit
+                .members
+                .first()
+                .is_some_and(|m| opens_target_succession_run(m) && !in_run(m));
+        if !opens {
+            return Ok((Vec::new(), None));
+        }
+        let r = self.session.resolved();
+        let Some(owner) = r.owner(e) else {
+            return Ok((Vec::new(), None));
+        };
+        let members = r.owned_members(owner);
+        let Some(at) = members.iter().position(|&m| m == e) else {
+            return Ok((Vec::new(), None));
+        };
+        let following: Vec<Span> = members[at + 1..]
+            .iter()
+            .filter_map(|&m| r.member_extent(m))
+            .filter(|&(u, _)| u == unit)
+            .map(|(_, span)| span)
+            .collect();
+        let src = self.user_src(unit, e)?;
+        let mut run = Vec::new();
+        let mut leading_then = None;
+        let mut end = extent.end;
+        for span in following {
+            if span.end <= end {
+                continue; // a `then` declaration's succession shares its extent
+            }
+            if span.start < end {
+                break;
+            }
+            // Only notes, comments and documentation may lie between: an
+            // import, an alias or `first start;` owns no element here,
+            // and ends the run.
+            let gap = parse_source(slice(src, Span::new(end, span.start)));
+            if !gap.diagnostics.is_empty()
+                || !gap.unit.members.iter().all(keeps_target_succession_run)
+            {
+                break;
+            }
+            let parsed = parse_source(slice(src, span));
+            let Some(m) = parsed.unit.members.first() else {
+                break;
+            };
+            if m.leading_then {
+                leading_then = leading_then_span(src, span);
+                break;
+            }
+            if !(keeps_target_succession_run(m) || in_run(m)) {
+                break;
+            }
+            if in_run(m) {
+                run.push(span);
+            }
+            end = span.end;
+        }
+        // A member an earlier op in this batch already removes or
+        // rewrites is that op's to cut.
+        let consumed = |span: &Span| {
+            self.consumed
+                .iter()
+                .any(|&(u, c)| u == unit && span.start >= c.start && span.end <= c.end)
+        };
+        run.retain(|span| !consumed(span));
+        Ok((run, leading_then.filter(|span| !consumed(span))))
+    }
+
+    /// `slot` among `sibs` (the members of `owner` written in `unit`, in
+    /// source order), held past the `then` run the member before it
+    /// opens. The members of a run start from the member before them
+    /// all, so a member written between an opener and its run, or
+    /// between two members of a run, would take the rest of the run from
+    /// it: `state a; then b;` with `state x;` at slot 1 would start the
+    /// transition from `x`. The slot moves to the first member after the
+    /// run, past the declaration a `then` leads (`then action c;`, whose
+    /// `then` starts from the opener too). A slot elsewhere is unchanged.
+    fn hold_past_then_run(
+        &mut self,
+        owner: ElementRef,
+        unit: usize,
+        sibs: &[Span],
+        slot: usize,
+    ) -> Result<usize, TransformError> {
+        use sysmlv2_syntax::ast::MemberKind;
+        use sysmlv2_syntax::check::starts_from_its_position;
+        if slot == 0 || slot >= sibs.len() {
+            return Ok(slot);
+        }
+        // The nearest member before the slot that is no run member
+        // itself: the one whose run the slot may lie in.
+        let opener = {
+            let src = self.user_src(unit, owner)?;
+            let in_run =
+                |span: Span| {
+                    parse_source(slice(src, span)).unit.members.first().is_some_and(
+                    |m| matches!(&m.kind, MemberKind::Usage(u) if starts_from_its_position(u)),
+                )
+                };
+            (0..slot).rev().find(|&j| !in_run(sibs[j]))
+        };
+        let Some(j) = opener else {
+            return Ok(slot);
+        };
+        let e = {
+            let r = self.session.resolved();
+            r.owned_members(owner)
+                .into_iter()
+                .find(|&m| r.member_extent(m) == Some((unit, sibs[j])))
+        };
+        let Some(e) = e else {
+            return Ok(slot);
+        };
+        let (run, leading_then) = self.then_run_spans(e, unit, sibs[j])?;
+        let mut k = slot;
+        while k < sibs.len() && run.contains(&sibs[k]) {
+            k += 1;
+        }
+        if k < sibs.len()
+            && leading_then.is_some_and(|t| t.start >= sibs[k].start && t.end <= sibs[k].end)
+        {
+            k += 1;
+        }
+        Ok(k)
     }
 
     fn plan_replace(&mut self, e: ElementRef, text: &str) -> Result<(), TransformError> {
         let text = text.trim();
+        let refuse = |message: String| TransformError::InvalidMember {
+            text: text.to_string(),
+            message,
+        };
         // Parse the replacement up front: it must be exactly one member,
-        // and its declared name drives reference respelling.
+        // and its declared name drives reference respelling. Braces
+        // first, as for an insert: text that closes the probe's body
+        // parses as the probe and whatever follows it.
+        if let Some(why) = unbalanced_braces(text) {
+            return Err(refuse(why.to_string()));
+        }
         let probe = format!("package __p {{\n{text}\n}}");
         let parse = parse_source(&probe);
         if !parse.diagnostics.is_empty() {
-            return Err(TransformError::InvalidMember {
-                text: text.to_string(),
-                message: parse.diagnostics[0].message.clone(),
-            });
+            return Err(refuse(parse.diagnostics[0].message.clone()));
         }
-        let inner: &[sysmlv2_syntax::ast::Member] = match parse.unit.members.as_slice() {
-            [m] => match &m.kind {
-                sysmlv2_syntax::ast::MemberKind::Package(p) => p.body.as_deref().unwrap_or(&[]),
-                _ => unreachable!("probe wraps the text in a package"),
-            },
-            _ => unreachable!("probe has one root"),
-        };
+        let inner = probe_body(&parse.unit)
+            .ok_or_else(|| refuse("the text is not whole members of one body".into()))?;
         if inner.len() != 1 {
-            return Err(TransformError::InvalidMember {
-                text: text.to_string(),
-                message: format!(
-                    "a replacement must contain exactly one member, found {}",
-                    inner.len()
-                ),
-            });
+            return Err(refuse(format!(
+                "a replacement must contain exactly one member, found {}",
+                inner.len()
+            )));
         }
         let new_name: Option<String> = {
             use sysmlv2_syntax::ast::MemberKind as K;
@@ -5095,7 +5922,24 @@ impl<'s> Planner<'s> {
         // past the first line's indentation, which survives as-is).
         let src = self.user_src(unit, e)?;
         let base = line_indent(src, extent.start);
-        let text = reindent_member_text(text, &base, indent_unit(&base, src));
+        let mut text = reindent_member_text(text, &base, indent_unit(&base, src));
+        // A `//` note ending the replacement runs to the end of the line:
+        // what follows the member on its line would become part of the
+        // note, so that moves to a line of its own at the member's
+        // indentation, the blanks before it replaced.
+        let mut end = extent.end;
+        if ends_in_line_note(&text) {
+            let bytes = src.as_bytes();
+            let mut next = end as usize;
+            while next < bytes.len() && matches!(bytes[next], b' ' | b'\t') {
+                next += 1;
+            }
+            if next < bytes.len() && !matches!(bytes[next], b'\n' | b'\r') {
+                end = next as u32;
+                text.push('\n');
+                text.push_str(&base);
+            }
+        }
 
         // The whole extent is consumed: references inside it vanish with
         // the old text, and untouched-site verification skips them.
@@ -5105,7 +5949,7 @@ impl<'s> Planner<'s> {
         self.splices.push(Splice {
             unit,
             start: extent.start,
-            end: extent.end,
+            end,
             text,
             expects: Vec::new(),
         });
@@ -5224,6 +6068,14 @@ impl<'s> Planner<'s> {
         if dunit < unit_offset {
             return Err(TransformError::NotDeclared(new_owner));
         }
+        // The `then` members written after `e` start from it, so they
+        // move with it, as they go with it when it is removed: the block
+        // from `e` through the last of them, notes between included. A
+        // `then` leading the declaration after the run starts from `e`
+        // too; it is cut, and the declaration stays where it is.
+        let (run, leading_then) = self.then_run_spans(e, unit, extent)?;
+        let block = Span::new(extent.start, run.last().map_or(extent.end, |span| span.end));
+        let r = self.session.resolved();
         // Ownership-path change: register it like a rename, so outside
         // references verify against the moved qualified name.
         let old_qn = r.element_qualified_name(e);
@@ -5236,30 +6088,35 @@ impl<'s> Planner<'s> {
             }
         }
         // Destination's lexical members (self excluded), in source order
-        // — `index` addresses this list.
-        let mut sibs: Vec<Span> = r
-            .owned_members(new_owner)
+        // — `index` addresses this list, within the slots the grammar
+        // and the parameter order admit (see `plan_insert`).
+        let sibs: Vec<Span> = lexical_members(r, new_owner, dunit, Some(dextent), Some(e))
             .into_iter()
-            .filter(|m| *m != e)
-            .filter_map(|m| r.member_extent(m))
-            .filter(|(u, sp)| *u == dunit && sp.start >= dextent.start && sp.end <= dextent.end)
-            .map(|(_, sp)| sp)
+            // The run moves with `e`: its members are no slots of a
+            // reorder. A member written in `e`'s own text (the
+            // succession of a leading `then`, `then action b;`) still is
+            // one, as it was before the run moved: hosts count it.
+            .filter(|s| !(dunit == unit && run.contains(s)))
             .collect();
-        sibs.sort_by_key(|sp| sp.start);
-        sibs.dedup();
-        // References carried inside the moved text: recorded now (with
-        // their pre-commit targets), verified at their new positions.
+        let arrival = Arrival::of_element(r, e);
+        let (lo, hi) = slot_bounds(r, new_owner, &sibs, &arrival);
+        let slot = index.unwrap_or(usize::MAX).clamp(lo, hi);
+        let slot = self.hold_past_then_run(new_owner, dunit, &sibs, slot)?;
+        let r = self.session.resolved();
+        // References carried inside the moved text, the run's included:
+        // recorded now (with their pre-commit targets), verified at
+        // their new positions.
         let inner_sites: Vec<(u32, u32, Option<String>)> = {
             let all = r.reference_sites().to_vec();
             all.iter()
                 .filter(|s| {
                     s.unit == unit
-                        && s.name_span.start >= extent.start
-                        && s.name_span.end <= extent.end
+                        && s.name_span.start >= block.start
+                        && s.name_span.end <= block.end
                 })
                 .map(|s| {
                     (
-                        s.name_span.start - extent.start,
+                        s.name_span.start - block.start,
                         s.name_span.end - s.name_span.start,
                         r.element_qualified_name(s.target),
                     )
@@ -5271,9 +6128,9 @@ impl<'s> Planner<'s> {
             r.bound_id_reference_sites()
                 .into_iter()
                 .filter(|&(u, span, _)| {
-                    u == unit && span.start >= extent.start && span.end <= extent.end
+                    u == unit && span.start >= block.start && span.end <= block.end
                 })
-                .map(|(_, span, id)| (span, span.start - extent.start, id))
+                .map(|(_, span, id)| (span, span.start - block.start, id))
                 .collect()
         } else {
             Vec::new()
@@ -5282,27 +6139,39 @@ impl<'s> Planner<'s> {
         // Excise, with remove's whitespace discipline (no stranding
         // check — the text comes back; verification decides what broke).
         let src = self.user_src(unit, e)?;
-        let member_text = slice(src, extent).to_string();
-        let cut = cut_whole_lines(src, extent);
-        self.consumed.push((unit, cut));
-        self.splices.push(Splice {
-            unit,
-            start: cut.start,
-            end: cut.end,
-            text: String::new(),
-            expects: Vec::new(),
-        });
+        let member_text = slice(src, block).to_string();
+        let mut cuts = vec![cut_whole_lines(src, block)];
+        if let Some(then) = leading_then {
+            let cut = cut_whole_lines(src, then);
+            self.leading_then_cuts.push((unit, cut));
+            cuts.push(cut);
+        }
+        for cut in cuts {
+            self.consumed.push((unit, cut));
+            self.splices.push(Splice {
+                unit,
+                start: cut.start,
+                end: cut.end,
+                text: String::new(),
+                expects: Vec::new(),
+            });
+        }
 
         // Insert at the destination slot (plan_insert's composition for
         // the append shapes; before-a-sibling lands at its line start).
         let dsrc = self.user_src(dunit, new_owner)?;
         let indent = line_indent(dsrc, dextent.start);
         let child = child_indent(&indent, dsrc);
-        let slot = index.unwrap_or(usize::MAX);
         let (ins_start, ins_end, ins_text) = if slot < sibs.len() {
             let sib = sibs[slot];
             let at = indent_start(dsrc.as_bytes(), sib.start);
-            (at, at, format!("{child}{member_text}\n"))
+            if at > 0 && dsrc.as_bytes()[at as usize - 1] != b'\n' {
+                // The sibling shares its line with what precedes it (a
+                // one-line body): break the line before the sibling.
+                (at, at, format!("\n{child}{member_text}"))
+            } else {
+                (at, at, format!("{child}{member_text}\n"))
+            }
         } else {
             let last = dextent.end - 1;
             match dsrc.as_bytes()[last as usize] {
@@ -5357,6 +6226,14 @@ impl<'s> Planner<'s> {
                     .into_iter()
                     .map(|(off, len, qn)| (off + prefix, len, qn))
                     .collect(),
+            });
+        }
+        if !arrival.sole.is_empty() {
+            self.sole_checks.push(SoleCheck {
+                owner: new_owner,
+                unit: dunit,
+                start: dextent.start,
+                sole: arrival.sole,
             });
         }
         self.splices.push(Splice {
@@ -6224,6 +7101,46 @@ impl<'s> Planner<'s> {
             }
             Some((pos as i64 + delta) as u32)
         };
+        // An owner an insert or move brings a one-of member into (a
+        // subject, an objective, a subaction kind, a rendering, a return
+        // parameter) must not end up with two. Counted on the
+        // post-commit model, so a batch that also removes, replaces or
+        // moves out the member already there passes, and an owner that
+        // already had several is refused only if the batch adds more.
+        if !self.sole_checks.is_empty() {
+            // Post-commit elements by extent start, the outermost one
+            // where several start together.
+            let mut by_start: HashMap<(usize, u32), (ElementRef, u32)> = HashMap::new();
+            for e in new_resolved.user_elements() {
+                if let Some((unit, sp)) = new_resolved.member_extent(e) {
+                    let slot = by_start.entry((unit, sp.start)).or_insert((e, sp.end));
+                    if sp.end > slot.1 {
+                        *slot = (e, sp.end);
+                    }
+                }
+            }
+            for check in &self.sole_checks {
+                let Some(&(post_owner, _)) = shift(check.unit, check.start, false)
+                    .and_then(|start| by_start.get(&(check.unit, start)))
+                else {
+                    continue;
+                };
+                for &kind in &check.sole {
+                    let post = kind.count(&mut new_resolved, post_owner);
+                    if post > 1 && post > kind.count(&mut self.session.resolved, check.owner) {
+                        return Err(TransformError::DuplicateMember {
+                            owner: self
+                                .session
+                                .resolved
+                                .element_qualified_name(check.owner)
+                                .unwrap_or_else(|| "<anonymous>".to_string()),
+                            member: kind.describe().to_string(),
+                            count: post,
+                        });
+                    }
+                }
+            }
+        }
         // Resolve lifted identity references before semantic checks. Failed
         // commits and dry runs must not retire ids or change session warnings.
         let mut next_ids = self.session.explicit_ids.clone();
@@ -6790,10 +7707,27 @@ impl<'s> Planner<'s> {
     }
 }
 
+/// Read a payload the way Flexo MMS returns it: unwrap its
+/// `{payload, identity}` change records, read the server's empty-string
+/// property values as null, and derive the ownership back-references it
+/// leaves out ([`sysmlv2_model::lift::complete_owning_references`]).
+/// The CLI's `--flexo` and the bindings' `flexo` option run this before
+/// opening a session; a Rust host passes the result to any
+/// `Session::from_interchange_json*` constructor. Those unwrap change
+/// records and read empty strings as null on their own, but never derive
+/// ownership a payload does not state, and refuse one that omits it.
+pub fn unwrap_flexo(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, sysmlv2_model::lift::LiftError> {
+    let mut value = unwrap_change_records(value);
+    sysmlv2_model::lift::complete_owning_references(&mut value)?;
+    Ok(value)
+}
+
 /// Unwrap Flexo MMS `{payload, identity}` change records when the whole
 /// list is wrapped, normalizing the server's empty-string property
 /// values back to null; anything else passes through.
-fn unwrap_flexo(value: &serde_json::Value) -> serde_json::Value {
+fn unwrap_change_records(value: serde_json::Value) -> serde_json::Value {
     fn empties_to_null(v: &mut serde_json::Value) {
         match v {
             serde_json::Value::Object(map) => {
@@ -6810,65 +7744,19 @@ fn unwrap_flexo(value: &serde_json::Value) -> serde_json::Value {
         }
     }
     let serde_json::Value::Array(items) = value else {
-        return value.clone();
+        return value;
     };
     let wrapped = !items.is_empty()
         && items
             .iter()
             .all(|r| r.get("payload").is_some() && r.get("identity").is_some());
     let mut elements: Vec<serde_json::Value> = if wrapped {
-        items
-            .iter()
-            .map(|r| r.get("payload").cloned().unwrap_or(serde_json::Value::Null))
-            .collect()
+        items.into_iter().map(|mut r| r["payload"].take()).collect()
     } else {
-        items.clone()
+        items
     };
     elements.iter_mut().for_each(empties_to_null);
     serde_json::Value::Array(elements)
-}
-
-/// The recorded name of a single-document payload's root namespace
-/// (`qualifiedName`/`declaredName` — the Flexo convention), matching
-/// `split_documents`' naming for multi-document lists.
-fn single_root_name(value: &serde_json::Value) -> Option<String> {
-    let elements = value.as_array()?;
-    elements
-        .iter()
-        .find(|e| {
-            e.get("@type").and_then(|v| v.as_str()) == Some("Namespace")
-                && e.get("owningRelationship")
-                    .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
-        })
-        .and_then(|root| {
-            root.get("qualifiedName")
-                .or_else(|| root.get("declaredName"))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
-}
-
-/// Unit name for one lifted document: the root namespace's recorded name
-/// when it is a plain model file name (the Flexo convention), else a
-/// numbered fallback.
-fn doc_unit_name(root_name: Option<&str>, index: usize) -> String {
-    if let Some(name) = root_name {
-        let base = Path::new(name)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let safe = !base.is_empty()
-            && base
-                .chars()
-                .all(|c| c != ':' && c != '*' && c != '?' && c != '"');
-        let model_file = Path::new(&base)
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("sysml") || e.eq_ignore_ascii_case("kerml"));
-        if safe && model_file {
-            return base;
-        }
-    }
-    format!("document-{}.sysml", index + 1)
 }
 
 /// `text` without its trailing whitespace and notes (`// …`, `/* … */`).

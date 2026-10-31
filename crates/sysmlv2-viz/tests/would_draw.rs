@@ -302,3 +302,47 @@ fn the_count_is_the_document_s_total_on_the_28_unit_model() {
     }));
     assert_counts(&mut r, Some(scope), &opts, "one package");
 }
+
+/// Members a body introduces in a role of their own (subjects, actors,
+/// objectives, results, state actions, ends, …) and a port's directed
+/// features are rows of their owners: the count, like the document,
+/// neither draws nor hides them.
+#[test]
+fn role_members_count_as_the_rows_they_are() {
+    let mut r = with_library(&[(
+        "body_members.sysml",
+        include_str!("fixtures/body_members.sysml"),
+    )]);
+    for (label, base) in [
+        ("defaults", VizOptions::default()),
+        (
+            "library, inherited",
+            VizOptions::default()
+                .with_show_lib(true)
+                .with_show_inherited(true),
+        ),
+    ] {
+        assert_summaries(&mut r, None, &base, label);
+    }
+    // Closed at the package, the summary hides what the full picture
+    // draws but its notes: no role member is among them.
+    let full = sysmlv2_viz::graph(&mut r, None, &VizOptions::default()).unwrap();
+    let cards = full["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] != "note")
+        .count();
+    let opts = VizOptions::default().with_summary(Some(SummaryOptions {
+        open: Vec::new(),
+        note_budget: 200,
+        leaf_budget: 500,
+        unbounded: Vec::new(),
+    }));
+    let closed = sysmlv2_viz::graph(&mut r, None, &opts).unwrap();
+    assert_eq!(sysmlv2_viz::summary_would_draw(&closed), cards);
+    assert_eq!(
+        sysmlv2_viz::summary_would_draw_within(&mut r, None, &opts, usize::MAX).unwrap(),
+        Some(cards)
+    );
+}

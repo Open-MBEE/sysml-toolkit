@@ -38,10 +38,11 @@ pub use decode::{
     from_compact_cbor_elided, from_compact_cbor_units, from_full_cbor, graph_format,
 };
 pub use delta::{
-    ApplyReport, Claim, DeltaOptions, FLAG_DELTA, FLAG_DELTA_PORTABLE, apply_delta_cbor,
-    apply_delta_cbor_lenient, apply_delta_cbor_report, apply_delta_cbor_report_with,
-    apply_delta_cbor_with, delta_canonical, delta_compact_cbor, delta_compact_cbor_elided,
-    empty_base_digest, rebase_ids, state_digest, state_digest_streamed,
+    ApplyReport, Claim, DeltaOptions, FLAG_DELTA, FLAG_DELTA_PORTABLE, StoreDelta,
+    apply_delta_cbor, apply_delta_cbor_lenient, apply_delta_cbor_report,
+    apply_delta_cbor_report_with, apply_delta_cbor_with, delta_canonical, delta_compact_cbor,
+    delta_compact_cbor_elided, empty_base_digest, rebase_ids, state_digest, state_digest_streamed,
+    store_delta_cbor,
 };
 pub use describe::describe;
 pub use encode::{

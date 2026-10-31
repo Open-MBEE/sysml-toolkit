@@ -319,7 +319,9 @@ impl EditBatch {
         Ok(())
     }
 
-    /// Insert `text` as the last member of `owner`'s body.
+    /// Insert `text` as the last member of `owner`'s body: before the
+    /// result expression a calculation, constraint or case body ends
+    /// with, and a subject before the first parameter.
     fn insert_member(&mut self, owner: &Element, text: &str) -> PyResult<()> {
         self.guard(owner.gen)?;
         self.ops.push(Op::InsertMember(owner.e, text.to_string()));
@@ -412,6 +414,16 @@ impl Session {
         Ok(())
     }
 
+    /// `v` with its quantities in the module's units (`set_value_units`).
+    fn in_value_units(&mut self, v: EvalValue) -> EvalValue {
+        match value_units_mode() {
+            sysmlv2_model::eval::UnitDisplay::AsWritten => {
+                self.inner.resolved().quantities_as_written(&v)
+            }
+            sysmlv2_model::eval::UnitDisplay::Si => v,
+        }
+    }
+
     fn value_to_py(&self, py: Python<'_>, v: &EvalValue) -> PyResult<Py<PyAny>> {
         match v {
             EvalValue::Boolean(b) => b.into_py_any(py),
@@ -431,7 +443,7 @@ impl Session {
             }
             EvalValue::Real(f) => f.into_py_any(py),
             EvalValue::String(s) => s.into_py_any(py),
-            EvalValue::Element(e) | EvalValue::Unbound(e) | EvalValue::UnboundMember(e) => {
+            EvalValue::Element(e) | EvalValue::Unbound(e, _) | EvalValue::UnboundMember(e, _) => {
                 Ok(Py::new(py, self.mint(*e))?.into_any())
             }
             // An indeterminate result (an operation over an unbound
@@ -489,12 +501,19 @@ impl Session {
     /// form; Flexo `{payload, identity}` wrapping accepted). Pass `lib`
     /// (a standard-library directory) to name library element ids
     /// during the lift and keep the library loaded for resolution — a
-    /// library-typed payload generally needs it.
+    /// library-typed payload generally needs it. `flexo=True` reads the
+    /// payload the way Flexo MMS returns it, deriving the
+    /// `owningRelationship` and `owningRelatedElement` it omits from the
+    /// owners' `ownedRelationship` and `ownedRelatedElement`; without it
+    /// such a payload is refused.
     #[staticmethod]
-    #[pyo3(signature = (json, lib = None))]
-    fn from_interchange_json(json: &str, lib: Option<&str>) -> PyResult<Session> {
-        let value: serde_json::Value =
+    #[pyo3(signature = (json, lib = None, flexo = false))]
+    fn from_interchange_json(json: &str, lib: Option<&str>, flexo: bool) -> PyResult<Session> {
+        let mut value: serde_json::Value =
             serde_json::from_str(json).map_err(|e| refused(e.to_string()))?;
+        if flexo {
+            value = sysmlv2_transform::unwrap_flexo(value).map_err(|e| refused(e.to_string()))?;
+        }
         Ok(Session {
             inner: TSession::from_interchange_json_with_library(
                 &value,
@@ -551,6 +570,7 @@ impl Session {
         };
         let root = self.inner.resolved().root_scope();
         let value = self.inner.resolved().query(root, &ast).map_err(failed)?;
+        let value = self.in_value_units(value);
         self.value_to_py(py, &value)
     }
 
@@ -558,6 +578,7 @@ impl Session {
     fn evaluate(&mut self, py: Python<'_>, e: &Element) -> PyResult<Py<PyAny>> {
         self.guard(e.gen)?;
         let value = self.inner.resolved().evaluate(e.e).map_err(failed)?;
+        let value = self.in_value_units(value);
         self.value_to_py(py, &value)
     }
 
@@ -611,7 +632,8 @@ impl Session {
                 DerivedValue::Null => Ok(py.None()),
                 DerivedValue::Bool(b) => b.into_py_any(py),
                 DerivedValue::Str(s) => s.into_py_any(py),
-                DerivedValue::Strings(ss) => ss.into_py_any(py),
+                DerivedValue::Strings(ss) | DerivedValue::Literals(ss) => ss.into_py_any(py),
+                DerivedValue::Literal(s) => s.into_py_any(py),
                 DerivedValue::Element(x) => Ok(Py::new(py, self.mint(x))?.into_any()),
                 DerivedValue::Elements(xs) => {
                     let items: Vec<Element> = xs.into_iter().map(|x| self.mint(x)).collect();
@@ -841,6 +863,39 @@ impl Session {
         PyBytes::new(py, &self.inner.to_compact_cbor())
     }
 
+    /// Decode any snapshot-form s2c payload (compact, id-elided, or
+    /// full) to its element array as JSON text, exactly as encoded (no
+    /// session lift), naming elided targets through the session's
+    /// library. Delta payloads are refused.
+    fn decode_cbor(&self, data: &[u8]) -> PyResult<String> {
+        self.inner
+            .decode_cbor(data)
+            .map(|v| v.to_string())
+            .map_err(failed)
+    }
+
+    /// The s2c delta (`bytes`) from a graph store's branch head to the
+    /// session's model, both in the store's spelling, so only real
+    /// changes ship. `head_json` is the head's compact element array as
+    /// the store hands it back (`decode_cbor` of its s2c snapshot). A
+    /// strict delta (the default) carries the model's file layout;
+    /// `portable` selects id-keyed identities.
+    #[pyo3(signature = (head_json, portable = false))]
+    fn delta_cbor_from_head<'py>(
+        &self,
+        py: Python<'py>,
+        head_json: &str,
+        portable: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let head: serde_json::Value =
+            serde_json::from_str(head_json).map_err(|e| refused(e.to_string()))?;
+        let bytes = self
+            .inner
+            .delta_cbor_from_store_head(&head, portable)
+            .map_err(failed)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Full-form CBOR (`bytes`) — the binary re-encoding of
     /// `to_full_json`. Emit view only; transport the compact form.
     #[pyo3(signature = (recover_refs = true))]
@@ -1018,11 +1073,13 @@ impl Session {
     /// `std_color=True` colors nodes by metaclass family;
     /// `link_template` embeds `[[hyperlinks]]` (placeholders `{file}`,
     /// `{line}`, `{col}`, `{qname}`, `{id}`) carried into rendered
-    /// SVG. Feed the text to any PlantUML build.
+    /// SVG; `value_units="si"|"asWritten"` picks the units `= value`
+    /// quantities show in (by default the module's `set_value_units`
+    /// choice). Feed the text to any PlantUML build.
     #[pyo3(signature = (element = None, view = "tree", horizontal = false, show_values = true,
                         show_notes = true, show_metadata = true, show_inherited = false,
                         show_lib = false, show_imported = false, line_style = None,
-                        std_color = false, link_template = None))]
+                        std_color = false, link_template = None, value_units = None))]
     // `&mut self`: rendering resolves lazily through the session's
     // model; the name is the Python API, not a Rust conversion.
     #[allow(clippy::too_many_arguments, clippy::wrong_self_convention)]
@@ -1040,7 +1097,12 @@ impl Session {
         line_style: Option<&str>,
         std_color: bool,
         link_template: Option<String>,
+        value_units: Option<&str>,
     ) -> PyResult<String> {
+        let value_units = match value_units {
+            None => value_units_mode(),
+            Some(spec) => sysmlv2_model::eval::UnitDisplay::parse(spec).map_err(refused)?,
+        };
         let view = match view {
             "tree" => sysmlv2_viz::View::Tree,
             "interconnection" | "ic" => sysmlv2_viz::View::Interconnection,
@@ -1081,6 +1143,7 @@ impl Session {
                 sysmlv2_viz::Direction::TopToBottom
             })
             .with_show_values(show_values)
+            .with_value_units(value_units)
             .with_view(view)
             .with_show_notes(show_notes)
             .with_show_metadata(show_metadata)
@@ -1120,6 +1183,11 @@ struct Finding {
     line: u32,
     #[pyo3(get)]
     col: u32,
+    /// The normative rule a semantic finding reports, such as
+    /// `"validateSatisfyRequirementUsageReference"`; `None` when the
+    /// finding names none.
+    #[pyo3(get)]
+    rule: Option<String>,
 }
 
 #[pymethods]
@@ -1169,6 +1237,7 @@ fn check(
             unit: f.unit,
             line: f.line,
             col: f.col,
+            rule: f.code.map(str::to_string),
         })
         .collect())
 }
@@ -1272,6 +1341,17 @@ impl LspServer {
         self.inner.take_outbound().map_err(failed)
     }
 
+    /// Set which units evaluated-value inlay hints, range hints,
+    /// violated-verdict code lenses and hover values show quantities in:
+    /// `si` (the default) or `asWritten`. Raises `ValueError` on any
+    /// other mode. Returns the refresh requests to relay, like
+    /// `set_workspace`.
+    fn set_value_hint_units(&mut self, mode: &str) -> PyResult<Vec<String>> {
+        let units = sysmlv2_model::eval::UnitDisplay::parse(mode).map_err(PyValueError::new_err)?;
+        self.inner.set_value_hint_units(units);
+        self.inner.take_outbound().map_err(failed)
+    }
+
     /// Set whether accepting a unit completion inside an untyped
     /// attribute's quantity bracket also declares the type the unit
     /// determines (default on). Takes effect on the next completion
@@ -1279,6 +1359,71 @@ impl LspServer {
     fn set_infer_unit_types(&mut self, on: bool) {
         self.inner.set_infer_unit_types(on);
     }
+}
+
+/// Whether the module shows quantities in the units they were written in
+/// (`set_value_units`); process-wide.
+static VALUE_UNITS_AS_WRITTEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn value_units_mode() -> sysmlv2_model::eval::UnitDisplay {
+    if VALUE_UNITS_AS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed) {
+        sysmlv2_model::eval::UnitDisplay::AsWritten
+    } else {
+        sysmlv2_model::eval::UnitDisplay::Si
+    }
+}
+
+/// Choose the units evaluated quantities come back in across the module:
+/// `"si"`, the default, keeps the evaluator's units (a bracket's unit,
+/// kept through sums and scaling, and SI units for a product, quotient or
+/// power: `10 ['in'] / (2 [s])` is `(0.127, "m/s")`); `"asWritten"` uses
+/// the units each value was written in, where they cover its dimensions
+/// (`(5, "in/s")`). It applies to what `Session.query` and
+/// `Session.evaluate` return and is the default of `to_plantuml`'s
+/// `value_units`. Evaluation is unchanged. Process-wide; a language
+/// server keeps its own `set_value_hint_units`. Raises `ValueError` on
+/// any other mode.
+#[pyfunction]
+fn set_value_units(mode: &str) -> PyResult<()> {
+    let as_written =
+        match sysmlv2_model::eval::UnitDisplay::parse(mode).map_err(PyValueError::new_err)? {
+            sysmlv2_model::eval::UnitDisplay::Si => false,
+            sysmlv2_model::eval::UnitDisplay::AsWritten => true,
+        };
+    VALUE_UNITS_AS_WRITTEN.store(as_written, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// The module's `set_value_units` choice: `"si"` or `"asWritten"`.
+#[pyfunction]
+fn value_units() -> &'static str {
+    value_units_mode().as_str()
+}
+
+/// The strict s2c delta that turns one graph store's state into
+/// another's: what a push or pull between two stores sends. `base` is
+/// the receiving branch's head and `target` the sending side's state,
+/// each an s2c snapshot as a store serves it. The target's ids are
+/// rebased onto the base by ownership path, its file layout rides along,
+/// and the delta is applied to the base before it is returned. Returns
+/// `(payload, result_digest, fallback)`: the delta `bytes`; the state
+/// digest the receiving store reports for its new head (record it as the
+/// expected head); and `None` when the rebase was used, else why not (it
+/// collided or its delta did not apply, so the delta keeps the target's
+/// own ids).
+#[pyfunction]
+fn store_delta_cbor<'py>(
+    py: Python<'py>,
+    base: &[u8],
+    target: &[u8],
+) -> PyResult<(Bound<'py, PyBytes>, String, Option<String>)> {
+    let delta = sysmlv2_cbor::store_delta_cbor(base, target).map_err(failed)?;
+    Ok((
+        PyBytes::new(py, &delta.bytes),
+        delta.result_digest.to_string(),
+        delta.fallback,
+    ))
 }
 
 /// Enable or disable expanding quoted power-product unit spellings
@@ -1317,5 +1462,8 @@ fn sysmlv2(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FailedError", failed_class(m.py())?)?;
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(set_unit_spelling_expansion, m)?)?;
+    m.add_function(wrap_pyfunction!(store_delta_cbor, m)?)?;
+    m.add_function(wrap_pyfunction!(set_value_units, m)?)?;
+    m.add_function(wrap_pyfunction!(value_units, m)?)?;
     Ok(())
 }

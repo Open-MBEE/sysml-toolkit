@@ -8,8 +8,10 @@
 
 use std::fs;
 use sysmlv2_parser::ast::{Dialect, MemberKind, UsageDetail, UsageKind};
-use sysmlv2_parser::json::to_compact_json;
-use sysmlv2_parser::lift::from_compact_json;
+use sysmlv2_parser::check::validate;
+use sysmlv2_parser::json::{library_name_map, model_to_compact_json, to_compact_json};
+use sysmlv2_parser::lift::{from_compact_json, from_compact_json_with_names};
+use sysmlv2_parser::model::Model;
 use sysmlv2_parser::parser::{Parse, parse_kerml_source, parse_source};
 use sysmlv2_parser::print::print_source;
 
@@ -58,6 +60,18 @@ fn corpus_json_roundtrip() {
             ));
             continue;
         }
+        // The corpus passes the body-context check (tests/check.rs), so a
+        // finding on the regenerated text is the lift's or the printer's: a
+        // spelling the grammar allows in some other body, which the JSON
+        // comparison below cannot see (`transition then t;` for an action
+        // body's `else t;` re-emits the same elements).
+        if let Some(d) = validate(&reparsed.unit).first() {
+            failures.push(format!(
+                "{display}: lifted text does not check: {}",
+                d.message
+            ));
+            continue;
+        }
         if to_compact_json(&reparsed.unit) != json1 {
             failures.push(format!("{display}: JSON changed across the round-trip"));
         }
@@ -65,6 +79,71 @@ fn corpus_json_roundtrip() {
     assert!(
         failures.is_empty(),
         "{} corpus files failed the JSON round-trip:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Flexo MMS gate: for every corpus file, the compact JSON with its
+/// ownership back-references (`owningRelationship`,
+/// `owningRelatedElement`) removed is refused by the lift, and
+/// `complete_owning_references` gives back exactly the ones removed —
+/// the original JSON, less the null ones it has no reason to write.
+#[test]
+fn corpus_omitted_back_references_are_refused_then_derived_exactly() {
+    use serde_json::Value;
+    use sysmlv2_parser::lift::{LiftError, complete_owning_references};
+    const BACK: [&str; 2] = ["owningRelationship", "owningRelatedElement"];
+
+    let files = sysmlv2_testkit::corpus_files();
+    assert!(files.len() > 340, "expected the full corpus checkout");
+    let mut failures = Vec::new();
+    for path in files {
+        let src = fs::read_to_string(&path).unwrap();
+        let dialect = if path.extension().and_then(|e| e.to_str()) == Some("kerml") {
+            Dialect::Kerml
+        } else {
+            Dialect::Sysml
+        };
+        let display = path.display();
+        let original = to_compact_json(&parse(&src, dialect).unit);
+
+        let mut expected = original.clone();
+        let mut stripped = original.clone();
+        for element in expected.as_array_mut().unwrap() {
+            let element = element.as_object_mut().unwrap();
+            element.retain(|key, value| !(BACK.contains(&key.as_str()) && value.is_null()));
+        }
+        let mut removed = 0;
+        for element in stripped.as_array_mut().unwrap() {
+            let element = element.as_object_mut().unwrap();
+            for key in BACK {
+                removed += usize::from(element.remove(key).is_some_and(|v: Value| !v.is_null()));
+            }
+        }
+        if removed > 0
+            && !matches!(
+                from_compact_json(&stripped),
+                Err(LiftError::OmittedOwnership { .. })
+            )
+        {
+            failures.push(format!("{display}: the stripped payload was not refused"));
+        }
+        let written = complete_owning_references(&mut stripped).unwrap();
+        if written != removed || stripped != expected {
+            failures.push(format!(
+                "{display}: {written} back-references derived for {removed} removed{}",
+                if stripped == expected {
+                    ""
+                } else {
+                    ", and the JSON differs"
+                }
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} corpus files:\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -151,8 +230,9 @@ fn corpus_full_json_lift_matches_compact() {
 }
 
 /// One-source round-trip: emit → lift → print → parse → emit must
-/// reproduce the first JSON exactly.
-fn assert_roundtrips(src: &str) {
+/// reproduce the first JSON exactly, and the printed text must pass the
+/// body-context check. Answers the printed text.
+fn assert_roundtrips(src: &str) -> String {
     let original = parse(src, Dialect::Sysml);
     assert!(original.diagnostics.is_empty(), "source parses: {src}");
     let json1 = to_compact_json(&original.unit);
@@ -164,10 +244,117 @@ fn assert_roundtrips(src: &str) {
         reparsed.diagnostics.is_empty(),
         "regenerated text must re-parse:\n{printed}"
     );
+    if let Some(d) = validate(&reparsed.unit).first() {
+        panic!("regenerated text must check: {}\n{printed}", d.message);
+    }
     let json2 = to_compact_json(&reparsed.unit);
     assert_eq!(
         json1, json2,
         "round-trip diverged for:\n{src}\n→\n{printed}"
+    );
+    printed
+}
+
+/// The default target succession (`else t;`) regenerates as `else`. The
+/// interchange form spells it as a transition owning its empty parameter
+/// and its succession, the shape a state body spells `transition then
+/// t;`, and only the owner's body tells the two apart: an action,
+/// calculation or case body refuses the second spelling, a state body the
+/// first. The JSON comparison alone cannot see the difference, since both
+/// spellings re-emit the same elements.
+#[test]
+fn default_target_succession_roundtrips_as_else() {
+    for src in [
+        "action def Router { action fast; action slow; decide branch; if true then fast; else slow; }",
+        "part def P { action a { action fast; action slow; decide; if true then fast; else slow; } }",
+        "calc def C { action fast; action slow; if true then fast; else slow; }",
+        "use case def U { action fast; action slow; if true then fast; else slow; }",
+        "action def A { action fast; action slow; if true then fast; else slow { action inner; } }",
+    ] {
+        let printed = assert_roundtrips(src);
+        assert_eq!(printed.matches("else ").count(), 1, "{printed}");
+        assert!(!printed.contains("transition then"), "{printed}");
+    }
+    // A state body has no `else`: its sourceless transition is the bare
+    // `then` the grammar spells a state body's target transition with
+    // (the `transition` keyword needs a source there), its guarded target
+    // transition stays `if g then`, and a sourced one keeps its `first`.
+    let printed = assert_roundtrips(
+        "state def SM { state s1; state s2; transition then s1; if true then s2; transition first s1 then s2; }",
+    );
+    assert!(!printed.contains("else "), "{printed}");
+    assert!(!printed.contains("transition then"), "{printed}");
+    assert_eq!(printed.matches("then $::SM::s1;").count(), 1, "{printed}");
+    assert_eq!(
+        printed.matches("if true then $::SM::s2;").count(),
+        1,
+        "{printed}"
+    );
+    assert_eq!(
+        printed
+            .matches("transition first $::SM::s1 then $::SM::s2;")
+            .count(),
+        1,
+        "{printed}"
+    );
+}
+
+/// A reference usage in an interface body regenerates with its `ref`
+/// keyword. The interchange form spells `ref x : T` and `x : T` as one
+/// element; the keyword-less form prints wherever the grammar has it,
+/// and an interface body is the one body that has none besides its ends.
+#[test]
+fn interface_reference_usage_roundtrips_with_its_keyword() {
+    let printed = assert_roundtrips(
+        "package P { port def PD; part def D { port p : PD; } interface def I { end a : PD; end b : PD; ref d : D; connect a to d.p; } part def Q { x : D; ref y : D; } }",
+    );
+    // The interface body's `ref d` keeps its keyword, its ends stay
+    // keyword-less, and the part body's `x` and `y` print as the lift
+    // prints every other reference usage.
+    assert!(printed.contains("ref d"), "{printed}");
+    assert!(printed.contains("end a"), "{printed}");
+    assert!(!printed.contains("ref a"), "{printed}");
+    assert_eq!(printed.matches("ref ").count(), 1, "{printed}");
+}
+
+/// A reference to an unnamed subject, objective or return parameter, or
+/// to a member nested under one, lifts under the positional name the
+/// emitter finds it by (`subj`, `obj`, `result`) and resolves back to it.
+#[test]
+fn implied_role_names_roundtrip() {
+    assert_roundtrips(
+        "package P {
+            part def V { attribute mass; }
+            requirement def R { subject : V; require constraint { subj.mass <= 10 } }
+            verification def VD { subject : V; objective { verify requirement r; } }
+            calc def C { in x; return : V; }
+            part p { ref y = VD::obj::r; ref z = C::result; }
+        }",
+    );
+}
+
+/// A reference to a flow, succession or binding end, or to a flow end's
+/// flow feature, lifts under the positional name the emitter finds it by
+/// (`source`, `earlierOccurrence`, `sameThing`) and resolves back to it.
+#[test]
+fn implied_end_names_roundtrip() {
+    assert_roundtrips(
+        "package P {
+            part def A { port p; attribute m; }
+            part def S {
+                part a : A;
+                part b : A;
+                flow f from a.p to b.p;
+                action x;
+                action y;
+                succession s first x then y;
+                binding bd bind a.m = b.m;
+                ref fp :> f::source::p;
+                ref ft :> f.target.p;
+                ref sx :> s::earlierOccurrence;
+                ref bs :> bd::sameThing;
+            }
+        }",
     );
 }
 
@@ -1285,4 +1472,101 @@ fn specialized_reference_names_take_precedence_over_redefinitions() {
             }
         }
     }
+}
+
+/// A reference to an unnamed end of a typed connector-family usage, or of
+/// a definition specializing one with ends, lifts under the name of the
+/// type's end at its position — the name the emitter finds it by — and
+/// resolves back to it, binary or n-ary.
+#[test]
+fn typed_connector_end_names_roundtrip() {
+    assert_roundtrips(
+        "package P {
+            part def A { attribute m; }
+            part a : A;
+            part b : A;
+            allocation def L2P { end logical : A; end physical : A; }
+            allocation a1 : L2P allocate a to b;
+            connection def C3 { end e1; end e2; end e3; }
+            connection bus : C3 connect (a, b, a.m);
+            connection def Seat { end bead : A; end rim : A; }
+            connection def Seat2 :> Seat { end : A; end : A; }
+            connection def AB { end x; end y; }
+            binding ab1 : AB bind a.m = b.m;
+            part p {
+                ref r1 :> a1.logical.m;
+                ref r2 :> bus.e3;
+                ref r3 :> P::bus::e1;
+                ref r4 :> Seat2::rim;
+                ref r5 :> ab1.y;
+            }
+        }",
+    );
+}
+
+/// The seam model (`implied_name_seams::SEAM`): references to the members
+/// the three kinds of implied name find — a role's `subj`, `obj` or
+/// `result`, a connector type's end names, the library binary ends — lift
+/// under the names the emitter finds them by and resolve back, so the JSON
+/// round-trips. The lifted text spells a typed binary end by its positional
+/// name (`ln.source` for the end `ln.left` reaches): both find the end.
+#[test]
+fn implied_names_lift_as_the_emitter_finds_them() {
+    let src = crate::implied_name_seams::SEAM;
+    assert_roundtrips(src);
+    let lifted =
+        from_compact_json(&to_compact_json(&parse(src, Dialect::Sysml).unit)).expect("lift");
+    assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+    let printed = print_source(&lifted.unit);
+    for spelling in [
+        "r1 :> $::P::s::ln.source.mass;",
+        "r2 :> $::P::s::ln.target.w;",
+        "r3 :> $::P::s::ln.source;",
+        "r4 :> $::P::s::sc.earlierOccurrence;",
+        "r5 :> $::P::s::bd.sameThing;",
+        "y = $::P::VD::obj::r;",
+        "z = $::P::C::result;",
+        "sj = $::P::R::subj;",
+    ] {
+        assert!(printed.contains(spelling), "{spelling} in:\n{printed}");
+    }
+}
+
+/// A connection definition that specializes a library type first and a
+/// user type with named ends second (`implied_name_seams::MULTI_GENERAL`):
+/// the lift spells a reference to the definition's unnamed ends by the
+/// user type's end names, passing over the library general it cannot
+/// read, and the text re-parses to the same JSON with the library loaded.
+#[test]
+fn typed_end_names_lift_past_a_library_general() {
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let src = crate::implied_name_seams::MULTI_GENERAL;
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source("seams.sysml", src);
+    assert!(!model.has_errors(), "{:?}", model.units()[0].diagnostics);
+    let json1 = model_to_compact_json(&model);
+    let lifted = from_compact_json_with_names(&json1, &library_name_map(&model)).expect("lift");
+    assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+    let printed = print_source(&lifted.unit);
+    for spelling in [
+        "r1 :> $::P::X::ue1;",
+        "r2 :> $::P::X::ue2;",
+        "r3 :> $::P::x.target.m;",
+    ] {
+        assert!(printed.contains(spelling), "{spelling} in:\n{printed}");
+    }
+    let mut again = Model::new();
+    again.load_library_dir(&lib).unwrap();
+    again.add_source("seams.sysml", &printed);
+    assert!(!again.has_errors(), "{:?}", again.units()[0].diagnostics);
+    assert_eq!(
+        json1,
+        model_to_compact_json(&again),
+        "round-trip diverged for:\n{src}\n→\n{printed}"
+    );
 }

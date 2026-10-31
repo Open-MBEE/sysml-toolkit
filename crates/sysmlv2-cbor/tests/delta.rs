@@ -715,6 +715,58 @@ fn units_ride_the_delta_and_apply_returns_them() {
     );
 }
 
+/// A file added ahead of the existing ones (listed first, or sorting
+/// first in an id-sorted store listing) still lands: a delta cannot move
+/// roots, so its result — digest, unit indices, and the index a store
+/// transitions to — is the order applying it reproduces, the created
+/// root after the surviving one.
+#[test]
+fn a_unit_created_ahead_of_the_others_applies() {
+    let (base, _) = compact_with_units(&[("b.sysml", UNIT_B)]);
+    let (target, target_units) = compact_with_units(&[("c.sysml", UNIT_C), ("b.sysml", UNIT_B)]);
+    let target = rebase_ids(&base, &target).unwrap();
+    let bytes = delta_compact_cbor(
+        &base,
+        &target,
+        &DeltaOptions::new().with_units(target_units.clone()),
+    )
+    .unwrap();
+    let (got, report) = sysmlv2_cbor::apply_delta_cbor_report(&bytes, &base).unwrap();
+    let arr = got.as_array().unwrap();
+    let root_of = |path: &str| {
+        let (i, _) = target_units.iter().find(|(_, p)| p == path).unwrap();
+        target.as_array().unwrap()[*i]["@id"].clone()
+    };
+    let units: Vec<(Value, &str)> = report
+        .units
+        .iter()
+        .map(|(i, p)| (arr[*i]["@id"].clone(), p.as_str()))
+        .collect();
+    assert_eq!(
+        units,
+        [
+            (root_of("b.sysml"), "b.sysml"),
+            (root_of("c.sysml"), "c.sysml")
+        ]
+    );
+    assert_eq!(
+        state_digest(&got).unwrap(),
+        state_digest(&delta_canonical(&got).unwrap()).unwrap()
+    );
+
+    let base_index = sysmlv2_cbor::index::BaseIndex::from_compact(&base).unwrap();
+    let transitioned = sysmlv2_cbor::index::resolve_strict_delta(&bytes, &base_index)
+        .unwrap()
+        .transition(&base_index)
+        .unwrap();
+    assert_eq!(
+        transitioned.to_bytes(),
+        sysmlv2_cbor::index::BaseIndex::from_compact(&got)
+            .unwrap()
+            .to_bytes()
+    );
+}
+
 /// A rename-only change is a legal delta: empty change list, new
 /// units, base digest == result digest.
 #[test]

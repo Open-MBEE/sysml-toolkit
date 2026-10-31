@@ -29,8 +29,8 @@ use std::fmt::Write as _;
 use sysmlv2_model::json::{ElementRef, ResolvedModel};
 
 use crate::{
-    VizOptions, behavior, escape, frame, inline_label, link_suffix, stereo_text, stereotype,
-    style_header, usage_label,
+    VizOptions, behavior, escape, frame, inline_label, link_suffix, node_usage_label, stereo_text,
+    stereotype, style_header, usage_label,
 };
 
 /// Connector-family metaclasses rendered as edges, not nodes.
@@ -160,7 +160,8 @@ struct Emitter<'a> {
     /// Ports inherited from a usage's definition, aliased per
     /// (usage, definition port) — the same port renders on every usage
     /// of the definition.
-    typed_port_alias: HashMap<(ElementRef, ElementRef), String>,
+    /// (usage alias, definition port) → the alias of that port's chip on that usage (see [`project_end`]).
+    typed_port_alias: HashMap<(String, ElementRef), String>,
     body: String,
     edges: String,
     connectors: Vec<ElementRef>,
@@ -311,7 +312,7 @@ impl Emitter<'_> {
         let ty = self.r.element_type(e);
         let stereo = stereotype(ty);
         let label = if is_usage {
-            usage_label(self.r, e)
+            node_usage_label(self.r, e)
         } else {
             self.r.element_name(e).unwrap_or("").to_string()
         };
@@ -386,7 +387,7 @@ impl Emitter<'_> {
         let label = if ty.ends_with("Definition") {
             self.r.element_name(e).unwrap_or("").to_string()
         } else {
-            usage_label(self.r, e)
+            node_usage_label(self.r, e)
         };
         let label = if label.trim().is_empty() {
             format!("({stereo})")
@@ -441,11 +442,12 @@ impl Emitter<'_> {
         let alias = match on {
             None => self.alias_for(p),
             Some(owner) => {
-                if let Some(a) = self.typed_port_alias.get(&(owner, p)) {
+                let owner_alias = self.alias_for(owner);
+                if let Some(a) = self.typed_port_alias.get(&(owner_alias.clone(), p)) {
                     a.clone()
                 } else {
                     let a = self.next_alias();
-                    self.typed_port_alias.insert((owner, p), a.clone());
+                    self.typed_port_alias.insert((owner_alias, p), a.clone());
                     a
                 }
             }
@@ -631,7 +633,7 @@ impl Emitter<'_> {
                 }
             }
             if let Some((_, word)) = REF_EDGES.iter().find(|(t, _)| *t == ty) {
-                for chain in self.r.referenced_features(e) {
+                for chain in crate::resolved_references(self.r, e) {
                     if let Some(target_alias) =
                         chain.last().and_then(|t| self.alias.get(t).cloned())
                     {
@@ -681,22 +683,31 @@ pub(crate) fn project_end(
     r: &mut ResolvedModel,
     chain: &[ElementRef],
     drawn: &HashMap<ElementRef, String>,
-    typed_ports: &HashMap<(ElementRef, ElementRef), String>,
+    typed_ports: &HashMap<(String, ElementRef), String>,
 ) -> Option<(String, usize)> {
     let mut best = None;
     let mut context = None;
+    // the node the chain stands on, where a port copied onto it (a
+    // usage's port through its definition, a port's nested port) is
+    // keyed by that node rather than by the element it copies
+    let mut context_node: Option<String> = None;
     for (i, &link) in chain.iter().enumerate() {
-        if let Some(ctx) = context {
-            if let Some(id) = typed_ports.get(&(ctx, link)) {
-                // Per-usage port chips have no rendered descendants.
-                return Some((id.clone(), i + 1));
+        if let Some(node) = &context_node {
+            if let Some(id) = typed_ports.get(&(node.clone(), link)) {
+                best = Some((id.clone(), i + 1));
+                context_node = Some(id.clone());
+                context = Some(link);
+                continue;
             }
+        }
+        if let Some(ctx) = context {
             if r.owner(link) != Some(ctx) {
                 break;
             }
         }
         if let Some(id) = drawn.get(&link) {
             best = Some((id.clone(), i + 1));
+            context_node = Some(id.clone());
         }
         context = Some(link);
     }

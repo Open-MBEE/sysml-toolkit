@@ -48,19 +48,13 @@ use crate::metaclass::is_a;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use sysmlv2_syntax::ast::Dialect;
+use sysmlv2_syntax::ast::{Dialect, UsageKind};
 use uuid::Uuid;
 
-/// One kind's implied specializations: the library bases (qualified
+/// One element's implied specializations: the library roles (qualified
 /// names), the relationship metaclass, its source and target keys, and
 /// the explicit metaclasses that cover them.
-type ImpliedBases = (
-    &'static [&'static str],
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static [&'static str],
-);
+type ImpliedBases<'a> = (Vec<&'static str>, &'a str, &'a str, &'a str, &'a [&'a str]);
 
 type SpecializationGraph = crate::id_graph::IdMap<Uuid, Vec<Uuid>>;
 type StaticPlannerBases = (IdMap<usize, Vec<usize>>, IdSet<usize>);
@@ -611,7 +605,7 @@ pub(super) fn literal_implied_base(ty: &str) -> Option<&'static str> {
 /// accumulated independently below; a missing narrower role must not erase
 /// an available broader requirement.
 /// Dynamic callee/result requirements remain separate.
-fn expression_implied_base(ty: &str) -> Option<&'static str> {
+pub(super) fn expression_implied_base(ty: &str) -> Option<&'static str> {
     literal_implied_base(ty).or_else(|| {
         if ty == "ConstructorExpression" {
             Some("Performances::constructorEvaluations")
@@ -624,7 +618,7 @@ fn expression_implied_base(ty: &str) -> Option<&'static str> {
 /// Inherited obligations apply to leaf expressions as well as their abstract
 /// bases. The exact-leaf result-provider policy remains separate: broader
 /// LiteralExpression ancestry cannot certify a missing leaf role or value.
-fn additional_expression_base(ty: &str) -> Option<&'static str> {
+pub(super) fn additional_expression_base(ty: &str) -> Option<&'static str> {
     if conforms(ty, "BooleanExpression") {
         Some("Performances::booleanEvaluations")
     } else if conforms(ty, "LiteralExpression") {
@@ -634,7 +628,7 @@ fn additional_expression_base(ty: &str) -> Option<&'static str> {
     }
 }
 
-fn invariant_implied_base(negated: bool) -> &'static str {
+pub(super) fn invariant_implied_base(negated: bool) -> &'static str {
     if negated {
         "Performances::falseEvaluations"
     } else {
@@ -644,7 +638,7 @@ fn invariant_implied_base(negated: bool) -> &'static str {
 
 /// isNegated is a required Boolean with default false. Only absence uses
 /// that default; an explicitly malformed value cannot select either branch.
-fn invariant_negation(element: &Elem) -> Option<bool> {
+pub(super) fn invariant_negation(element: &Elem) -> Option<bool> {
     match element.props.get("isNegated") {
         None => Some(false),
         Some(value) => value.as_bool(),
@@ -653,7 +647,7 @@ fn invariant_negation(element: &Elem) -> Option<bool> {
 
 /// SysML assert/satisfy obligations accumulate independently of inherited
 /// Invariant requirements. A missing narrower role never removes another one.
-fn assertion_implied_base(negated: bool) -> &'static str {
+pub(super) fn assertion_implied_base(negated: bool) -> &'static str {
     if negated {
         "Constraints::negatedConstraintChecks"
     } else {
@@ -661,7 +655,7 @@ fn assertion_implied_base(negated: bool) -> &'static str {
     }
 }
 
-fn satisfaction_implied_base(negated: bool) -> &'static str {
+pub(super) fn satisfaction_implied_base(negated: bool) -> &'static str {
     if negated {
         "Requirements::notSatisfiedRequirementChecks"
     } else {
@@ -676,6 +670,10 @@ const CHAIN_FUNCTION: &str = "ControlFunctions::.";
 /// checkFeatureSpecialization is unconditional for every Feature descendant,
 /// including variable, end and portion features. Other families remain separate.
 const FEATURE_BASE: &str = "Base::things";
+/// checkMultiplicitySpecialization (KerML 8.3.3.1.9): every Multiplicity
+/// subsets the root feature of all multiplicities, `Base::naturals`, which
+/// subsets `dataValues` and so `things`.
+const MULTIPLICITY_BASE: &str = "Base::naturals";
 const STEP_BASE: &str = "Performances::performances";
 const TYPED_FEATURE_BASES: [(&str, &str); 3] = [
     ("Structure", "Objects::objects"),
@@ -711,7 +709,9 @@ fn expression_role_kind(name: &str) -> &'static str {
         "Items::Item::subparts" => "PartUsage",
         "Objects::Object::subobjects"
         | "Occurrences::Occurrence::suboccurrences"
+        | "Occurrences::Occurrence::portions"
         | FEATURE_BASE
+        | MULTIPLICITY_BASE
         | "Objects::objects"
         | "Occurrences::occurrences"
         | "Base::dataValues" => "Feature",
@@ -1320,6 +1320,40 @@ impl Builder {
         owners
     }
 
+    /// The work [`Self::implied_names`] is about to do: the shared part's
+    /// names, spelled once, when it is not built yet, and a copy with the
+    /// build's own names when it has some; a built shared part alone costs
+    /// a step.
+    fn charge_implied_names(&self, steps: &mut Option<&mut usize>) -> Option<()> {
+        let frozen = self.lib_qnames.base_len();
+        let shared_built =
+            self.lib_qnames.base_untouched() && self.prefix_implied_names.get().is_some();
+        if shared_built && self.lib_qnames.len() == frozen && self.external_implied_names.is_empty()
+        {
+            return planning_charge(steps, 1);
+        }
+        planning_charge(
+            steps,
+            self.lib_qnames
+                .len()
+                .saturating_add(self.external_implied_names.capacity()),
+        )?;
+        for (_, segments) in self
+            .lib_qnames
+            .iter()
+            .skip(if shared_built { frozen } else { 0 })
+        {
+            planning_charge(steps, segments.len())?;
+            for segment in segments {
+                planning_charge(steps, segment.len())?;
+            }
+        }
+        for name in self.external_implied_names.keys() {
+            planning_charge(steps, name.len())?;
+        }
+        Some(())
+    }
+
     /// The names implied relationships are planned by: the library's
     /// qualified names by name, then a build's own library units' and its
     /// external names (the later entry of a name winning). The frozen rows'
@@ -1380,6 +1414,9 @@ impl Builder {
         owners: &[Option<usize>],
         mut steps: Option<&mut usize>,
     ) -> Option<Vec<(usize, PlannedEdge)>> {
+        // The owner roles read a transition's written source through the
+        // element-id index.
+        self.ensure_ids();
         let mut candidates = Vec::new();
         planning_charge(&mut steps, super::type_relations::COMPOSITE_ROLES.len())?;
         let typing_structure = if self.graph_format == crate::model::GraphFormat::CanonicalV3
@@ -1412,7 +1449,8 @@ impl Builder {
                                 .props
                                 .get("isComposite")
                                 .and_then(|v| v.as_bool())
-                                == Some(true))
+                                == Some(true)
+                            || is_portion(&self.elements[i]))
                     {
                         let typed = self.owned_typing_requirements(
                             i,
@@ -2296,6 +2334,9 @@ impl Builder {
                 [p, t, n] if p == "Items" && t == "Item" && n == "subparts" => {
                     Some("Items::Item::subparts")
                 }
+                [p, t, n] if p == "Occurrences" && t == "Occurrence" && n == "portions" => {
+                    Some("Occurrences::Occurrence::portions")
+                }
                 _ => None,
             };
             let name = if let Some(name) = composite {
@@ -2303,6 +2344,7 @@ impl Builder {
             } else if let [package, member] = segments.as_slice() {
                 match (package.as_str(), member.as_str()) {
                     ("Base", "things") => Some(FEATURE_BASE),
+                    ("Base", "naturals") => Some(MULTIPLICITY_BASE),
                     ("Performances", "performances") => Some(STEP_BASE),
                     (package, member) if binary_role_name(package, member).is_some() => {
                         binary_role_name(package, member)
@@ -2389,6 +2431,7 @@ impl Builder {
             .chain([
                 CHAIN_FUNCTION,
                 FEATURE_BASE,
+                MULTIPLICITY_BASE,
                 STEP_BASE,
                 additional_expression_base("BooleanExpression").unwrap(),
                 additional_expression_base("LiteralExpression").unwrap(),
@@ -2414,8 +2457,10 @@ impl Builder {
             let element = self.element_index_of_uuid(id);
             // Operator, Feature and Step roles need a unique loaded kind witness;
             // external names alone cannot certify their required heritage.
-            if (matches!(name, CHAIN_FUNCTION | FEATURE_BASE | STEP_BASE)
-                || BINARY_ROLES.iter().any(|(role, _)| *role == name)
+            if (matches!(
+                name,
+                CHAIN_FUNCTION | FEATURE_BASE | MULTIPLICITY_BASE | STEP_BASE
+            ) || BINARY_ROLES.iter().any(|(role, _)| *role == name)
                 || TYPED_FEATURE_BASES.iter().any(|(_, role)| *role == name)
                 || super::type_relations::COMPOSITE_ROLES.contains(&name))
                 && element.is_none()
@@ -2500,21 +2545,7 @@ impl Builder {
                 return self.positional_direct_bases_from_plan(&plan, steps);
             }
         }
-        planning_charge(
-            &mut steps,
-            self.lib_qnames
-                .len()
-                .saturating_add(self.external_implied_names.capacity()),
-        )?;
-        for (_, segments) in &self.lib_qnames {
-            planning_charge(&mut steps, segments.len())?;
-            for segment in segments {
-                planning_charge(&mut steps, segment.len())?;
-            }
-        }
-        for name in self.external_implied_names.keys() {
-            planning_charge(&mut steps, name.len())?;
-        }
+        self.charge_implied_names(&mut steps)?;
         let names = self.implied_names();
         let plan = self.supported_implied_specializations_with_budget(
             &names,
@@ -2678,6 +2709,7 @@ impl Builder {
             .get("isComposite")
             .and_then(|v| v.as_bool())
             == Some(true)
+            || is_portion(&self.elements[feature])
         {
             let mut local = 0;
             let steps = budget.as_deref_mut().unwrap_or(&mut local);
@@ -2693,22 +2725,8 @@ impl Builder {
                     {
                         if super::membership_evidence::member(self, raw, owner, membership, steps)
                             == Some(feature)
-                            && matches!(
+                            && super::type_relations::composite_owner_context(
                                 self.elements[owner].ty,
-                                "Type"
-                                    | "Classifier"
-                                    | "Class"
-                                    | "Structure"
-                                    | "DataType"
-                                    | "Definition"
-                                    | "AttributeDefinition"
-                                    | "OccurrenceDefinition"
-                                    | "ItemDefinition"
-                                    | "PartDefinition"
-                                    | "Feature"
-                                    | "OccurrenceUsage"
-                                    | "ItemUsage"
-                                    | "PartUsage"
                             )
                         {
                             let owner_types = if is_a!(self.elements[owner], "Feature") {
@@ -2731,9 +2749,20 @@ impl Builder {
                                 self.elements[owner].ty,
                                 required[0],
                                 required[1],
+                                self.elements[feature]
+                                    .props
+                                    .get("isComposite")
+                                    .and_then(|v| v.as_bool())
+                                    == Some(true),
+                                is_portion(&self.elements[feature]),
                                 owner_types,
                             ) {
+                                // The library's own `portions` is the root of
+                                // its role: no feature specializes itself.
                                 if let Some(&target) = targets.get(role) {
+                                    if target == self.elements[feature].id {
+                                        continue;
+                                    }
                                     requirements.push((
                                         "Subsetting",
                                         "subsettingFeature",
@@ -2898,12 +2927,28 @@ impl Builder {
                     out.push(("Subclassification", "subclassifier", "superclassifier", id));
                 }
             }
-        } else if let Some(kind) =
-            usage_kind_of(ty, Dialect::Sysml).filter(|_| !matches!(ty, "Flow" | "SuccessionFlow"))
+            // An individual definition is a Life
+            // (`checkOccurrenceDefinitionIndividualSpecialization`).
+            if is_individual(&self.elements[i]) {
+                if let Some(&id) = names.get(INDIVIDUAL_BASE) {
+                    out.push(("Subclassification", "subclassifier", "superclassifier", id));
+                }
+            }
+        } else if usage_kind_of(ty, Dialect::Sysml)
+            .filter(|_| !matches!(ty, "Flow" | "SuccessionFlow"))
+            .is_some()
         {
-            for name in implicit_usage_bases(kind) {
-                if let Some(&id) = names.get(*name) {
+            let owner = self.elements[i]
+                .owning_relationship
+                .and_then(|m| rel_owner.get(m).copied().flatten().map(|o| (m, o)));
+            for name in usage_roles(self, i, owner) {
+                if let Some(&id) = names.get(name) {
                     out.push(("Subsetting", "subsettingFeature", "subsettedFeature", id));
+                }
+            }
+            for name in usage_redefinition_roles(self, i, owner) {
+                if let Some(&id) = names.get(name) {
+                    out.push(("Redefinition", "redefiningFeature", "redefinedFeature", id));
                 }
             }
         }
@@ -2962,6 +3007,13 @@ impl Builder {
         }
         if let Some(name) = additional_expression_base(ty) {
             if let Some(&id) = expression_targets.get(name) {
+                out.push(("Subsetting", "subsettingFeature", "subsettedFeature", id));
+            }
+        }
+        // A transition's guard expression is its transition action's guard
+        // (SysML `checkTransitionUsageTransitionFeatureSpecialization`).
+        if conforms(ty, "Expression") && is_transition_guard(self, i) {
+            if let Some(&id) = names.get(TRANSITION_GUARD) {
                 out.push(("Subsetting", "subsettingFeature", "subsettedFeature", id));
             }
         }
@@ -3032,8 +3084,21 @@ impl Builder {
         }
         // Append the inherited generic obligation independently of narrower
         // roles, then let the shared minimizer preserve only necessary edges.
+        // A Multiplicity's generic obligation is `Base::naturals` itself
+        // (checkMultiplicitySpecialization): the root of all multiplicities
+        // subsets `dataValues` and so `things`, and planning it in place of
+        // `things` keeps one obligation per multiplicity, where a second
+        // one over every range of the library exhausted the cold planning
+        // budget. A library without `naturals` still gets `things`.
         if conforms(ty, "Feature") {
-            if let Some(&id) = expression_targets.get(FEATURE_BASE) {
+            let base = if conforms(ty, "Multiplicity")
+                && expression_targets.contains_key(MULTIPLICITY_BASE)
+            {
+                MULTIPLICITY_BASE
+            } else {
+                FEATURE_BASE
+            };
+            if let Some(&id) = expression_targets.get(base) {
                 out.push(("Subsetting", "subsettingFeature", "subsettedFeature", id));
             }
         }
@@ -3578,6 +3643,7 @@ impl ResolvedModel {
         self.by_id_built_for = usize::MAX;
         self.quantity_index = None;
         self.name_memo.clear();
+        self.short_name_memo.clear();
         self.redefiner_index = None;
         self.import_truncated.clear();
     }
@@ -5069,6 +5135,7 @@ impl Builder {
         self.stored_structure = None;
     }
     fn materialize_semantic_graph(&mut self) {
+        self.ensure_ids();
         if self.implied.is_some() {
             self.materialize_owned_results(None);
             return;
@@ -5129,6 +5196,23 @@ impl Builder {
                     targets.push(target_id);
                 }
             }
+        }
+        // A target transition's implicit source as a row of its own: an
+        // implied Membership whose member is the source every reader
+        // derives (`implicit_transition_source`), after the transition's
+        // written relationships and the specializations planned for it.
+        // No specialization: no base, nothing to minimize, no legacy slot.
+        for (transition, source) in implicit_transition_source_rows(self, own_from, from, &owners) {
+            planned.push((
+                transition,
+                (
+                    "Membership",
+                    "membershipOwningNamespace",
+                    "memberElement",
+                    self.elements[source].id,
+                ),
+                None,
+            ));
         }
         // Retain this producer's exact recipes for the immediately following
         // tail transaction. Its positional table was computed from this same
@@ -5813,6 +5897,7 @@ impl Builder {
         mut steps: Option<&mut usize>,
         workspace: &mut super::positional::PositionalWorkspace,
     ) -> Option<Arc<super::semantic_batch::StaticPrefix>> {
+        self.ensure_ids();
         let required = self.supported_implied_specializations_with_budget(
             names,
             library_configuration,
@@ -5956,23 +6041,30 @@ impl Builder {
         // (anti-redundancy, approximated as any explicit same-kind
         // specialization — the emitter's rule).
         let bases: Option<ImpliedBases> = if let Some(kind) = def_kind_of(t) {
+            let mut bases = implicit_def_bases(kind).to_vec();
+            if is_individual(&self.elements[i]) {
+                bases.push(INDIVIDUAL_BASE);
+            }
             Some((
-                implicit_def_bases(kind),
+                bases,
                 "Subclassification",
                 "subclassifier",
                 "superclassifier",
                 &["Subclassification", "Specialization"],
             ))
+        } else if usage_kind_of(t, Dialect::Sysml).is_some() {
+            let owner = self.elements[i]
+                .owning_relationship
+                .and_then(|m| rel_owner.get(m).copied().flatten().map(|o| (m, o)));
+            Some((
+                usage_roles(self, i, owner),
+                "Subsetting",
+                "subsettingFeature",
+                "subsettedFeature",
+                &["Subsetting", "Redefinition", "ReferenceSubsetting"] as &[&str],
+            ))
         } else {
-            usage_kind_of(t, Dialect::Sysml).map(|kind| {
-                (
-                    implicit_usage_bases(kind),
-                    "Subsetting",
-                    "subsettingFeature",
-                    "subsettedFeature",
-                    &["Subsetting", "Redefinition", "ReferenceSubsetting"] as &[&str],
-                )
-            })
+            None
         };
         if let Some((bases, rel_ty, src, tgt, covering)) = bases {
             planning_charge(&mut steps, bases.len())?;
@@ -5981,8 +6073,23 @@ impl Builder {
                 .any(|&r| covering.contains(&self.elements[r].ty));
             if !covered {
                 for base in bases {
-                    if let Some(&id) = lib_by_name.get(*base) {
+                    if let Some(&id) = lib_by_name.get(base) {
                         plan.push((rel_ty, src, tgt, id));
+                    }
+                }
+                if usage_kind_of(t, Dialect::Sysml).is_some() {
+                    let owner = self.elements[i]
+                        .owning_relationship
+                        .and_then(|m| rel_owner.get(m).copied().flatten().map(|o| (m, o)));
+                    for base in usage_redefinition_roles(self, i, owner) {
+                        if let Some(&id) = lib_by_name.get(base) {
+                            plan.push((
+                                "Redefinition",
+                                "redefiningFeature",
+                                "redefinedFeature",
+                                id,
+                            ));
+                        }
                     }
                 }
             }
@@ -7928,6 +8035,783 @@ mod prefix_overlay_tests {
             )
             .is_none(),
             "an owner past the rows"
+        );
+    }
+}
+
+/// What a transition's source is, as far as the caller knows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum TransitionSource {
+    /// No source written and no action before the transition in its
+    /// owner's body to stand as its implicit source.
+    None,
+    /// The written source resolved to a state.
+    State,
+    /// The written source resolved to a feature that is no state.
+    Other,
+    /// A source is written but not resolved (the lowering decides the
+    /// heritage before resolution): the owner's kind stands in, a state's
+    /// transitions leaving states and an action's leaving actions.
+    Unresolved,
+}
+
+/// The owning feature membership a usage's owner roles turn on.
+pub(super) struct OwnerFacts<'a> {
+    /// The owning membership's metaclass.
+    pub membership_kind: &'static str,
+    /// Its `kind` (`entry`, `do`, `exit`; `trigger`, `effect`, `guard`).
+    pub membership_role: Option<&'a str>,
+    /// The owner's metaclass.
+    pub owner_kind: &'static str,
+    /// Whether the owner is a parallel state.
+    pub parallel: bool,
+}
+
+/// What a usage's roles turn on besides its kind: read off the syntax tree
+/// by the lowering, off the rows by the planner and the checked audit.
+pub(super) struct RoleFacts<'a> {
+    pub ty: &'static str,
+    pub composite: bool,
+    /// An if action with an else branch.
+    pub if_else: bool,
+    /// An occurrence usage's `portionKind` (`snapshot` or `timeslice`).
+    pub portion_kind: Option<&'a str>,
+    pub owner: Option<OwnerFacts<'a>>,
+    pub source: TransitionSource,
+}
+
+/// The role a transition's guard expression takes: the specification spells
+/// it `Actions::TransitionAction::guard`, which the library declares on the
+/// kernel's `TransitionPerformance` and the transition action inherits.
+pub(super) const TRANSITION_GUARD: &str = "TransitionPerformances::TransitionPerformance::guard";
+
+/// Whether `e` is a transition's guard expression: owned by a
+/// `TransitionFeatureMembership` of kind `guard`.
+pub(super) fn is_transition_guard(b: &Builder, e: usize) -> bool {
+    b.elements[e].owning_relationship.is_some_and(|membership| {
+        let relation = &b.elements[membership];
+        relation.ty == "TransitionFeatureMembership"
+            && relation.props.get("kind").and_then(|v| v.as_str()) == Some("guard")
+    })
+}
+
+/// The library class an individual definition specializes
+/// (`checkOccurrenceDefinitionIndividualSpecialization`).
+pub(super) const INDIVIDUAL_BASE: &str = "Occurrences::Life";
+
+/// Whether a feature is declared a portion (`isPortion`), composite by
+/// the KerML rule and a portion of its featuring type.
+pub(super) fn is_portion(element: &Elem) -> bool {
+    element.props.get("isPortion").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Whether a definition is declared `individual`.
+pub(super) fn is_individual(element: &Elem) -> bool {
+    element.props.get("isIndividual").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// The owner roles [`roles_of`] gives, beside the kind roles of
+/// [`implicit_usage_bases`].
+#[cfg(test)]
+pub(super) const OWNER_ROLES: &[&str] = &[
+    "Actions::ifThenElseActions",
+    "Occurrences::Occurrence::timeEnclosedOccurrences",
+    "Actions::TransitionAction::accepter",
+    "Actions::TransitionAction::effect",
+    "Actions::Action::subactions",
+    "Actions::Action::whileLoops",
+    "Actions::Action::forLoops",
+    "Actions::Action::ifSubactions",
+    "Actions::Action::assignments",
+    "Actions::Action::sendSubactions",
+    "Actions::Action::terminateSubactions",
+    "Actions::Action::acceptSubactions",
+    "Actions::Action::decisionTransitions",
+    "Parts::Part::ownedActions",
+    "Parts::Part::performedActions",
+    "Parts::Part::ownedStates",
+    "Parts::Part::exhibitedStates",
+    "Parts::Part::ownedPorts",
+    "States::StateAction::substates",
+    "States::StateAction::exclusiveStates",
+    "States::StateAction::stateTransitions",
+    "Ports::Port::subports",
+    "Requirements::RequirementCheck::subrequirements",
+    "Requirements::RequirementCheck::concerns",
+    "Requirements::RequirementCheck::assumptions",
+    "Requirements::RequirementCheck::constraints",
+    "Requirements::RequirementCheck::actors",
+    "Requirements::RequirementCheck::stakeholders",
+    "VerificationCases::VerificationCase::obj::requirementVerifications",
+    "Items::Item::checkedConstraints",
+    "Calculations::Calculation::subcalculations",
+    "Cases::Case::subcases",
+    "Cases::Case::actors",
+    "AnalysisCases::AnalysisCase::subAnalysisCases",
+    "VerificationCases::VerificationCase::subVerificationCases",
+    "UseCases::UseCase::subUseCases",
+    "UseCases::UseCase::includedUseCases",
+    "Views::View::subviews",
+    "Views::View::viewRendering",
+    "Views::View::viewpointSatisfactions",
+    "Views::Rendering::subrenderings",
+    "States::StateAction::entryAction",
+    "States::StateAction::doAction",
+    "States::StateAction::exitAction",
+];
+
+/// The library roles a SysML usage takes by its kind (Table 32) and by its
+/// place in its owner (SysML 8.3.16–8.3.18): the kind roles of
+/// [`implicit_usage_bases`], with an if-else taking `ifThenElseActions` and
+/// a transition's trigger taking `Actions::TransitionAction::accepter` in
+/// place of `acceptActions`; then, under an owning feature membership of
+/// `owner`, a composite action's `Actions::Action::subactions` (not a
+/// state's entry or exit action) with its kind's `whileLoops`, `forLoops`,
+/// `ifSubactions`, `assignments`, `sendSubactions`, `terminateSubactions`
+/// or `acceptSubactions`, a transition effect's `TransitionAction::effect`,
+/// a part's `ownedActions`, `performedActions`, `ownedStates`,
+/// `exhibitedStates` and `ownedPorts`, a state's `substates` or
+/// `exclusiveStates` by the owner's parallelism, a sourced transition's
+/// `stateTransitions` (a state's, leaving a state) or `decisionTransitions`
+/// (an action's, leaving no state), and a port's `subports`. The lowering
+/// gives every usage's heritage these roles, the planner plans them and the
+/// checked audit requires them, from this one list; a transition's source
+/// is unresolved when the lowering decides, so a state's sourced transitions
+/// are its state transitions and an action's its decision transitions
+/// there (the spec's rules read the source's kind, which the planner and
+/// the audit do).
+pub(super) fn roles_of(kind: UsageKind, facts: &RoleFacts) -> Vec<&'static str> {
+    let ty = facts.ty;
+    let mut roles: Vec<&'static str> = implicit_usage_bases(kind).to_vec();
+    if ty == "IfActionUsage" && facts.if_else {
+        roles.retain(|role| *role != "Actions::ifThenActions");
+        roles.push("Actions::ifThenElseActions");
+    }
+    // A snapshot or time slice (SysML `checkOccurrenceUsageSnapshotSpecialization`,
+    // `checkOccurrenceUsageTimeSliceSpecialization`).
+    match facts.portion_kind {
+        Some("snapshot") => roles.push("Occurrences::Occurrence::snapshots"),
+        Some("timeslice") => roles.push("Occurrences::Occurrence::timeSlices"),
+        _ => {}
+    }
+    let Some(owner) = &facts.owner else {
+        return roles;
+    };
+    if !conforms(owner.membership_kind, "FeatureMembership") {
+        return roles;
+    }
+    let composite = facts.composite;
+    let membership_role = owner.membership_role;
+    let state_subaction = owner.membership_kind == "StateSubactionMembership";
+    let trigger = conforms(ty, "AcceptActionUsage")
+        && owner.membership_kind == "TransitionFeatureMembership"
+        && membership_role == Some("trigger");
+    let effect = conforms(ty, "ActionUsage")
+        && owner.membership_kind == "TransitionFeatureMembership"
+        && membership_role == Some("effect");
+    let owner_kind = owner.owner_kind;
+    let in_action = conforms(owner_kind, "ActionDefinition") || conforms(owner_kind, "ActionUsage");
+    let in_state = conforms(owner_kind, "StateDefinition") || conforms(owner_kind, "StateUsage");
+    let in_part = conforms(owner_kind, "PartDefinition") || conforms(owner_kind, "PartUsage");
+    let in_port = conforms(owner_kind, "PortDefinition") || conforms(owner_kind, "PortUsage");
+    let in_item = conforms(owner_kind, "ItemDefinition") || conforms(owner_kind, "ItemUsage");
+    let in_requirement =
+        conforms(owner_kind, "RequirementDefinition") || conforms(owner_kind, "RequirementUsage");
+    let in_calculation =
+        conforms(owner_kind, "CalculationDefinition") || conforms(owner_kind, "CalculationUsage");
+    let in_case = conforms(owner_kind, "CaseDefinition") || conforms(owner_kind, "CaseUsage");
+    let in_analysis =
+        conforms(owner_kind, "AnalysisCaseDefinition") || conforms(owner_kind, "AnalysisCaseUsage");
+    let in_verification = conforms(owner_kind, "VerificationCaseDefinition")
+        || conforms(owner_kind, "VerificationCaseUsage");
+    let in_use_case =
+        conforms(owner_kind, "UseCaseDefinition") || conforms(owner_kind, "UseCaseUsage");
+    let in_view = conforms(owner_kind, "ViewDefinition") || conforms(owner_kind, "ViewUsage");
+    let in_rendering =
+        conforms(owner_kind, "RenderingDefinition") || conforms(owner_kind, "RenderingUsage");
+    // An event occurrence in an occurrence (SysML
+    // `checkEventOccurrenceUsageSpecialization`).
+    if ty == "EventOccurrenceUsage"
+        && (conforms(owner_kind, "OccurrenceDefinition") || conforms(owner_kind, "OccurrenceUsage"))
+    {
+        roles.push("Occurrences::Occurrence::timeEnclosedOccurrences");
+    }
+    if trigger {
+        roles.retain(|role| *role != "Actions::acceptActions");
+        roles.push("Actions::TransitionAction::accepter");
+    }
+    if effect {
+        roles.push("Actions::TransitionAction::effect");
+    }
+    if conforms(ty, "ActionUsage") {
+        let subaction =
+            composite && in_action && (!state_subaction || membership_role == Some("do"));
+        if subaction {
+            roles.push("Actions::Action::subactions");
+            match ty {
+                "WhileLoopActionUsage" => roles.push("Actions::Action::whileLoops"),
+                "ForLoopActionUsage" => roles.push("Actions::Action::forLoops"),
+                "IfActionUsage" => roles.push("Actions::Action::ifSubactions"),
+                "AssignmentActionUsage" => roles.push("Actions::Action::assignments"),
+                "SendActionUsage" => roles.push("Actions::Action::sendSubactions"),
+                "TerminateActionUsage" => roles.push("Actions::Action::terminateSubactions"),
+                "AcceptActionUsage" if !trigger => roles.push("Actions::Action::acceptSubactions"),
+                _ => {}
+            }
+        }
+        if composite && in_part {
+            roles.push("Parts::Part::ownedActions");
+        }
+        if conforms(ty, "PerformActionUsage") && in_part {
+            roles.push("Parts::Part::performedActions");
+        }
+    }
+    if conforms(ty, "StateUsage") {
+        if composite && in_state && !state_subaction {
+            roles.push(if owner.parallel {
+                "States::StateAction::substates"
+            } else {
+                "States::StateAction::exclusiveStates"
+            });
+        }
+        if composite && in_part {
+            roles.push("Parts::Part::ownedStates");
+        }
+        if conforms(ty, "ExhibitStateUsage") && in_part {
+            roles.push("Parts::Part::exhibitedStates");
+        }
+    }
+    if ty == "TransitionUsage" && composite {
+        let state = match facts.source {
+            TransitionSource::None => None,
+            TransitionSource::State => Some(true),
+            TransitionSource::Other => Some(false),
+            TransitionSource::Unresolved => Some(in_state),
+        };
+        match state {
+            Some(true) if in_state => roles.push("States::StateAction::stateTransitions"),
+            Some(false) if in_action => roles.push("Actions::Action::decisionTransitions"),
+            _ => {}
+        }
+    }
+    if conforms(ty, "PortUsage") {
+        if in_part {
+            roles.push("Parts::Part::ownedPorts");
+        }
+        if composite && in_port {
+            roles.push("Ports::Port::subports");
+        }
+    }
+    // Requirements, constraints and concerns (SysML 8.3.19).
+    if conforms(ty, "RequirementUsage") {
+        if composite && in_requirement {
+            roles.push("Requirements::RequirementCheck::subrequirements");
+        }
+        if owner.membership_kind == "RequirementVerificationMembership" {
+            roles.push("VerificationCases::VerificationCase::obj::requirementVerifications");
+        }
+    }
+    if conforms(ty, "ConcernUsage") && owner.membership_kind == "FramedConcernMembership" {
+        roles.push("Requirements::RequirementCheck::concerns");
+    }
+    if conforms(ty, "ConstraintUsage") {
+        if in_item {
+            roles.push("Items::Item::checkedConstraints");
+        }
+        if owner.membership_kind == "RequirementConstraintMembership" {
+            roles.push(if membership_role == Some("assumption") {
+                "Requirements::RequirementCheck::assumptions"
+            } else {
+                "Requirements::RequirementCheck::constraints"
+            });
+        }
+    }
+    // Calculations and cases (SysML 8.3.20–8.3.24).
+    if conforms(ty, "CalculationUsage") && in_calculation {
+        roles.push("Calculations::Calculation::subcalculations");
+    }
+    if conforms(ty, "CaseUsage") && composite && in_case {
+        roles.push("Cases::Case::subcases");
+    }
+    if conforms(ty, "AnalysisCaseUsage") && composite && in_analysis {
+        roles.push("AnalysisCases::AnalysisCase::subAnalysisCases");
+    }
+    if conforms(ty, "VerificationCaseUsage") && composite && in_verification {
+        roles.push("VerificationCases::VerificationCase::subVerificationCases");
+    }
+    if conforms(ty, "UseCaseUsage") {
+        if composite && in_use_case {
+            roles.push("UseCases::UseCase::subUseCases");
+        }
+        if conforms(ty, "IncludeUseCaseUsage") && in_use_case {
+            roles.push("UseCases::UseCase::includedUseCases");
+        }
+    }
+    if conforms(ty, "PartUsage") {
+        if owner.membership_kind == "ActorMembership" {
+            roles.push(if in_requirement {
+                "Requirements::RequirementCheck::actors"
+            } else {
+                "Cases::Case::actors"
+            });
+        }
+        if owner.membership_kind == "StakeholderMembership" {
+            roles.push("Requirements::RequirementCheck::stakeholders");
+        }
+    }
+    // Views (SysML 8.3.25).
+    if conforms(ty, "ViewUsage") && in_view {
+        roles.push("Views::View::subviews");
+    }
+    if conforms(ty, "RenderingUsage") && in_rendering {
+        roles.push("Views::Rendering::subrenderings");
+    }
+    if conforms(ty, "ViewpointUsage") && composite && in_view {
+        roles.push("Views::View::viewpointSatisfactions");
+    }
+    roles
+}
+
+/// The library features a usage redefines by its place in its owner (the
+/// specification's `redefinesFromLibrary` owner rules): a state's entry,
+/// do and exit actions redefine `States::StateAction::entryAction`,
+/// `doAction` and `exitAction`
+/// (`ActionUsage.checkActionUsageStateActionRedefinition`), and a view's
+/// rendering (`render rendering r;`, under a `ViewRenderingMembership`)
+/// `Views::View::viewRendering`. The lowering, the planner and the checked
+/// audit read this list as they read [`roles_of`]; an unnamed such action
+/// is named by what it redefines (`naming::membership_implied_name_of`).
+pub(super) fn redefinition_roles_of(facts: &RoleFacts) -> Vec<&'static str> {
+    let mut roles = Vec::new();
+    let Some(owner) = &facts.owner else {
+        return roles;
+    };
+    if conforms(facts.ty, "ActionUsage") && owner.membership_kind == "StateSubactionMembership" {
+        match owner.membership_role {
+            Some("entry") => roles.push("States::StateAction::entryAction"),
+            Some("do") => roles.push("States::StateAction::doAction"),
+            Some("exit") => roles.push("States::StateAction::exitAction"),
+            _ => {}
+        }
+    }
+    if conforms(facts.ty, "RenderingUsage") && owner.membership_kind == "ViewRenderingMembership" {
+        roles.push("Views::View::viewRendering");
+    }
+    roles
+}
+
+/// The facts [`roles_of`] and [`redefinition_roles_of`] read off the rows
+/// for `feature`, under its owning membership and the owner carrying it
+/// (`owner`), none of the owner's for a usage owned otherwise; `None` for
+/// an element that is no SysML usage, or a flow, whose roles are planned
+/// elsewhere.
+fn role_facts(
+    b: &Builder,
+    feature: usize,
+    owner: Option<(usize, usize)>,
+) -> Option<(UsageKind, RoleFacts<'_>)> {
+    let ty = b.elements[feature].ty;
+    let kind =
+        usage_kind_of(ty, Dialect::Sysml).filter(|_| !matches!(ty, "Flow" | "SuccessionFlow"))?;
+    let flag = |b: &Builder, e: usize, key: &str| {
+        b.elements[e].props.get(key).and_then(|v| v.as_bool()) == Some(true)
+    };
+    let source = if ty == "TransitionUsage" {
+        transition_source(b, feature, owner.map(|(_, carrier)| carrier))
+    } else {
+        TransitionSource::None
+    };
+    let parameters = b.elements[feature]
+        .owned_relationships
+        .iter()
+        .filter(|&&r| b.elements[r].ty == "ParameterMembership")
+        .count();
+    let owner = owner.map(|(membership, owner)| OwnerFacts {
+        membership_kind: b.elements[membership].ty,
+        membership_role: b.elements[membership]
+            .props
+            .get("kind")
+            .and_then(|v| v.as_str()),
+        owner_kind: b.elements[owner].ty,
+        parallel: flag(b, owner, "isParallel"),
+    });
+    Some((
+        kind,
+        RoleFacts {
+            ty,
+            composite: flag(b, feature, "isComposite"),
+            if_else: ty == "IfActionUsage" && parameters >= 3,
+            portion_kind: b.elements[feature]
+                .props
+                .get("portionKind")
+                .and_then(|v| v.as_str()),
+            owner,
+            source,
+        },
+    ))
+}
+
+/// [`roles_of`] read off the rows ([`role_facts`]): the library features
+/// `feature` subsets by its kind and its place in its owner.
+pub(super) fn usage_roles(
+    b: &Builder,
+    feature: usize,
+    owner: Option<(usize, usize)>,
+) -> Vec<&'static str> {
+    match role_facts(b, feature, owner) {
+        Some((kind, facts)) => roles_of(kind, &facts),
+        None => Vec::new(),
+    }
+}
+
+/// [`redefinition_roles_of`] read off the rows ([`role_facts`]): the
+/// library features `feature` redefines by its place in its owner.
+pub(super) fn usage_redefinition_roles(
+    b: &Builder,
+    feature: usize,
+    owner: Option<(usize, usize)>,
+) -> Vec<&'static str> {
+    match role_facts(b, feature, owner) {
+        Some((_, facts)) => redefinition_roles_of(&facts),
+        None => Vec::new(),
+    }
+}
+
+/// A transition's source, by kind: the one written (`first s`), the member
+/// of its first owned membership (the spec's `TransitionUsage::source`), a
+/// chain's last link, when that member is an action; else the implicit
+/// source of a target transition ([`implicit_transition_source`] among its
+/// `carrier`'s members). Resolved through the element-id index when built
+/// ([`Builder::ensure_ids`]); unresolved otherwise, or while a reference is
+/// pending.
+fn transition_source(b: &Builder, transition: usize, carrier: Option<usize>) -> TransitionSource {
+    let written = written_transition_source(b, transition);
+    if written != TransitionSource::None {
+        return written;
+    }
+    match carrier.map(|carrier| implicit_transition_anchor(b, transition, carrier)) {
+        Some(Anchor::Element(source)) if is_a!(b.elements[source], "StateUsage") => {
+            TransitionSource::State
+        }
+        Some(Anchor::Element(_)) => TransitionSource::Other,
+        Some(Anchor::Unresolved) => TransitionSource::Unresolved,
+        Some(Anchor::None) | None => TransitionSource::None,
+    }
+}
+
+/// What a target transition's implicit source is at a point of its owner's
+/// body (SysML 8.2.2.21): the last action before it that can stand as a
+/// predecessor ([`is_previous_candidate`]: no parameter, no transition, no
+/// connector but a flow or message), or the written source of the last
+/// transition before it, whichever comes later (`if g then a; else b;`
+/// after `first x` both leave `x`, after `decide d` both leave `d`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Anchor {
+    /// No action and no sourced transition before it.
+    None,
+    /// The source.
+    Element(usize),
+    /// The last transition before it writes a source that is not resolved.
+    Unresolved,
+}
+
+/// The implicit source of `transition`, a target transition (`then t;`,
+/// `if g then t;`, `accept … then t;`, `else t;`), among `carrier`'s owned
+/// members before it: see [`Anchor`].
+pub(super) fn implicit_transition_anchor(b: &Builder, transition: usize, carrier: usize) -> Anchor {
+    let mut anchor = Anchor::None;
+    for &rel in b.elements[carrier].owned_relationships.iter() {
+        if !is_a!(b.elements[rel], "FeatureMembership") {
+            continue;
+        }
+        let Some(&member) = b.elements[rel].children.first() else {
+            continue;
+        };
+        if member == transition {
+            return anchor;
+        }
+        if b.elements[member].ty == "TransitionUsage" {
+            match written_transition_source_element(b, member) {
+                Ok(Some(source)) => anchor = Anchor::Element(source),
+                Ok(None) => {}
+                Err(()) => anchor = Anchor::Unresolved,
+            }
+        } else if is_a!(b.elements[member], "ActionUsage")
+            && is_previous_candidate(b, carrier, rel, member)
+        {
+            anchor = Anchor::Element(member);
+        }
+    }
+    Anchor::None
+}
+
+/// Whether `member`, the element `membership` owns in `owner`'s body,
+/// stands as the lexical predecessor of what follows it there — the source
+/// of a `then` succession, the implicit source of a target transition — as
+/// the Pilot Implementation's `UsageUtil.getPreviousFeature` reads one: no
+/// parameter (a directed feature of a behavior or step, or a parameter
+/// membership's member), no transition, and no connector unless a message.
+/// So `decide d; if g then b; then c;` leaves `c`'s source at `d`, past the
+/// guarded transition. The Pilot tells a message from a flow by its ends (a
+/// message's events are parameter members, a flow's ends end features);
+/// this lowering gives both end features and the lift prints both as flows,
+/// so every flow usage stands as a predecessor here, a `flow` with ends
+/// included (the Pilot skips that one), which keeps `then message` chains
+/// leaving the message before them.
+pub(super) fn is_previous_candidate(
+    b: &Builder,
+    owner: usize,
+    membership: usize,
+    member: usize,
+) -> bool {
+    let row = &b.elements[member];
+    let parameter = is_a!(b.elements[membership], "ParameterMembership")
+        || ((is_a!(b.elements[owner], "Behavior") || is_a!(b.elements[owner], "Step"))
+            && row
+                .props
+                .get("direction")
+                .is_some_and(|direction| direction.as_str().is_some()));
+    !parameter
+        && row.ty != "TransitionUsage"
+        && (!is_a!(row, "Connector") || is_a!(row, "FlowUsage"))
+}
+
+/// The target transitions among the authored rows `from..to` with an
+/// implicit source ([`implicit_transition_source`] among the members of
+/// the owner `owners` gives their owning membership), each with it: the
+/// implied Membership rows the materializer appends after the transition's
+/// written relationships, so the source is a member of the transition as
+/// the specification's `TransitionUsage::source` reads it.
+pub(super) fn implicit_transition_source_rows(
+    b: &Builder,
+    from: usize,
+    to: usize,
+    owners: &[Option<usize>],
+) -> Vec<(usize, usize)> {
+    let mut rows = Vec::new();
+    for transition in from..to {
+        if b.elements[transition].ty != "TransitionUsage"
+            || !b.is_authored(transition)
+            || written_transition_source(b, transition) != TransitionSource::None
+        {
+            continue;
+        }
+        let Some(membership) = b.elements[transition].owning_relationship else {
+            continue;
+        };
+        let Some(Some(carrier)) = owners.get(membership).copied() else {
+            continue;
+        };
+        if let Some(source) = implicit_transition_source(b, transition, carrier) {
+            rows.push((transition, source));
+        }
+    }
+    rows
+}
+
+/// [`implicit_transition_anchor`]'s source when it is one.
+pub(super) fn implicit_transition_source(
+    b: &Builder,
+    transition: usize,
+    carrier: usize,
+) -> Option<usize> {
+    match implicit_transition_anchor(b, transition, carrier) {
+        Anchor::Element(source) => Some(source),
+        Anchor::None | Anchor::Unresolved => None,
+    }
+}
+
+/// The source a transition writes (`first s`), by kind, from
+/// [`written_transition_source_element`].
+pub(super) fn written_transition_source(b: &Builder, transition: usize) -> TransitionSource {
+    match written_transition_source_element(b, transition) {
+        Ok(Some(source)) if is_a!(b.elements[source], "StateUsage") => TransitionSource::State,
+        Ok(Some(_)) => TransitionSource::Other,
+        Ok(None) => TransitionSource::None,
+        Err(()) => TransitionSource::Unresolved,
+    }
+}
+
+/// The source a transition writes (`first s`): the member of its first
+/// owned membership, a chain's last link, when that member is an action
+/// (`Ok(None)` otherwise: the link source's empty parameter is first where
+/// no source is written); `Err` while the reference is pending or the
+/// element-id index is not built ([`Builder::ensure_ids`]).
+fn written_transition_source_element(b: &Builder, transition: usize) -> Result<Option<usize>, ()> {
+    let Some(&membership) = b.elements[transition]
+        .owned_relationships
+        .iter()
+        .find(|&&r| is_a!(b.elements[r], "Membership"))
+    else {
+        return Ok(None);
+    };
+    let ids = b.built_ids();
+    // `Some(None)`: a reference the index would resolve, without the index.
+    let resolve = |relation: &Elem, key: &str| {
+        let id = relation.props.get(key).and_then(|v| v.as_reference())?;
+        Some(ids.and_then(|ids| ids.get(&id).copied()))
+    };
+    let relation = &b.elements[membership];
+    let mut source = match resolve(relation, "memberElement") {
+        Some(Some(member)) => member,
+        Some(None) => return Err(()),
+        None => match relation.children.first() {
+            Some(&child) => child,
+            None => return Err(()),
+        },
+    };
+    for &chaining in b.elements[source].owned_relationships.iter() {
+        if b.elements[chaining].ty != "FeatureChaining" {
+            continue;
+        }
+        match resolve(&b.elements[chaining], "chainingFeature") {
+            Some(Some(link)) => source = link,
+            _ => return Err(()),
+        }
+    }
+    Ok(is_a!(b.elements[source], "ActionUsage").then_some(source))
+}
+
+#[cfg(test)]
+mod owner_role_heritage_tests {
+    use super::*;
+    use crate::json::{ResolvedModel, relationship_owners};
+    use crate::model::Model;
+    use std::path::Path;
+    use sysmlv2_syntax::ast::QualifiedName;
+
+    /// Every owner role, with transition sources the lowering reads (a
+    /// member declared before the transition, a target transition's last
+    /// action before it) and ones it cannot (`v`'s, declared after it: its
+    /// owner's kind stands in, as the planner then finds).
+    const SOURCE: &str = "package Ro {
+        attribute def Sig;
+        port def P { in attribute a : ScalarValues::Real; }
+        part def Veh {
+            port p : P;
+            port q : P { port sub : P; }
+            action go;
+            perform action run;
+            state st;
+            exhibit state ex;
+        }
+        action def A {
+            action a1;
+            action a2;
+            attribute x;
+            assign x := 1;
+            accept sig : Sig;
+            if true { action t1; } else { action e1; }
+            if false { action t2; }
+            while true { action w1; }
+            for i in 1..2 { action f1; }
+            decide d;
+            if true then a1;
+            else a2;
+            transition first a1 if true then a2;
+        }
+        state def S parallel { state p1; state p2; }
+        state def T {
+            entry; then s1;
+            state s1 { entry action e1; do action d1; do assign y := 2; attribute y; }
+            state s2;
+            transition t first s1 accept sig : Sig do action eff then s2;
+            transition u first s2 then s1;
+            transition v first s3 then s1;
+            state s3;
+            if true then s1;
+            else s2;
+        }
+        state def W { entry action e0; state s; transition w first e0 then s; }
+        action top;
+        item def I { part p; item j; constraint c; }
+        concern def Cn;
+        requirement def RD {
+            subject s; actor act; stakeholder sh;
+            assume constraint asm; require constraint req;
+            requirement sub; frame concern fc : Cn;
+        }
+        requirement r : RD;
+        case def CD { actor act; case sub; }
+        analysis def AD { analysis sub; }
+        verification def VD { objective { verify r; } verification sub; }
+        use case def UD { use case sub; include use case inc : UD; }
+        calc def CalcD { calc sub; }
+        rendering def RenD { rendering sub; }
+        view def ViewD { view sub; render rendering rend : RenD; viewpoint vp; }
+        part def Occ { snapshot part snap : Occ; timeslice part slice : Occ; event occurrence ev; }
+    }";
+
+    /// The lowering gives a usage's heritage the roles the planner plans
+    /// for it, from the one list ([`roles_of`]): every planned role is
+    /// among its scope's implied bases, and every owner role there is
+    /// planned.
+    #[test]
+    fn the_heritage_carries_the_planned_owner_roles() {
+        let library = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec-refs/SysML-v2-Release/sysml.library");
+        assert!(
+            library.exists(),
+            "corpus not found at {}: initialize the submodule (see spec-refs/README.md)",
+            library.display()
+        );
+        let mut model = Model::new();
+        model.load_library_dir(&library).unwrap();
+        let unit = model.add_source("roles.sysml", SOURCE);
+        assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+        let mut r = ResolvedModel::build(&model);
+        r.b.ensure_ids();
+        let owners = relationship_owners(&r.b);
+        let spell = |qn: &QualifiedName| {
+            qn.segments
+                .iter()
+                .map(|s| s.value.as_str())
+                .collect::<Vec<_>>()
+                .join("::")
+        };
+        let mut checked = 0;
+        let mut with_owner_roles = 0;
+        let elements: Vec<usize> = r.user_elements().map(|e| e.0).collect();
+        for e in elements {
+            let ty = r.b.elements[e].ty;
+            if usage_kind_of(ty, Dialect::Sysml).is_none()
+                || matches!(ty, "Flow" | "SuccessionFlow")
+            {
+                continue;
+            }
+            let Some(&scope) = r.b.elem_scope.get(&e) else {
+                continue;
+            };
+            let owner = r.b.elements[e]
+                .owning_relationship
+                .and_then(|m| owners[m].map(|o| (m, o)));
+            let mut planned = usage_roles(&r.b, e, owner);
+            planned.extend(usage_redefinition_roles(&r.b, e, owner));
+            let lowered: Vec<String> = r.b.scopes[scope].implied_bases.iter().map(spell).collect();
+            let name = r
+                .element_qualified_name(ElementRef(e))
+                .unwrap_or_else(|| format!("<{ty}>"));
+            for role in &planned {
+                assert!(
+                    lowered.iter().any(|n| n == role),
+                    "{name}: planned {role}, heritage {lowered:?}"
+                );
+            }
+            for base in lowered.iter().filter(|n| OWNER_ROLES.contains(&n.as_str())) {
+                assert!(
+                    planned.contains(&base.as_str()),
+                    "{name}: heritage {base}, planned {planned:?}"
+                );
+            }
+            checked += 1;
+            if planned.iter().any(|role| OWNER_ROLES.contains(role)) {
+                with_owner_roles += 1;
+            }
+        }
+        assert!(checked >= 30, "{checked} usages");
+        assert!(
+            with_owner_roles >= 36,
+            "{with_owner_roles} with owner roles"
         );
     }
 }

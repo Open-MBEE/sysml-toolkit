@@ -106,14 +106,12 @@ fn typed_occurrence_ends_and_positional_redefinitions_preserve_replay_evidence()
             let typed = resolved
                 .resolve_qualified("TypedReference::typedEnd")
                 .unwrap();
+            // The typed end's specialization exclusions are decided on both
+            // formats: the roles its typing adds are planned on the canonical
+            // format only, and the audit requires them only there.
+            assert_eq!(resolved.usage_variability_report(typed).value, Ok(true));
             if format == GraphFormat::CanonicalV3 {
-                assert_eq!(resolved.usage_variability_report(typed).value, Ok(true));
                 assert_eq!(resolved.property(typed, "isConstant"), Ok(true.into()));
-            } else {
-                assert_eq!(
-                    resolved.usage_variability_report(typed).value,
-                    Err(UsageVariabilityIssue::IncompleteSpecialization)
-                );
             }
             assert_eq!(
                 ids,

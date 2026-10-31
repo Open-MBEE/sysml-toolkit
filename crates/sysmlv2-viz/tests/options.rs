@@ -2,6 +2,7 @@
 //! of the option enums (parse, display, serde), and the typed error the
 //! structured graph returns for a view it has no emitter for.
 
+use sysmlv2_model::eval::UnitDisplay;
 use sysmlv2_model::json::ResolvedModel;
 use sysmlv2_model::model::Model;
 use sysmlv2_viz::{Direction, GraphError, LineStyle, View, VizOptions, graph};
@@ -13,12 +14,14 @@ fn setters_change_one_option_each() {
     assert_eq!(d.view, View::Tree);
     assert_eq!(d.line_style, LineStyle::Default);
     assert!(d.show_values && d.show_notes && d.show_metadata);
+    assert_eq!(d.value_units, UnitDisplay::Si);
     assert!(!d.show_inherited && !d.show_lib && !d.show_imported && !d.std_color);
     assert!(d.link_template.is_none() && d.roots.is_none());
 
     let opts = VizOptions::default()
         .with_direction(Direction::LeftToRight)
         .with_show_values(false)
+        .with_value_units(UnitDisplay::AsWritten)
         .with_view(View::Mixed)
         .with_show_notes(false)
         .with_show_metadata(false)
@@ -31,6 +34,7 @@ fn setters_change_one_option_each() {
         .with_roots(Some(Vec::new()));
     assert_eq!(opts.direction, Direction::LeftToRight);
     assert!(!opts.show_values);
+    assert_eq!(opts.value_units, UnitDisplay::AsWritten);
     assert_eq!(opts.view, View::Mixed);
     assert!(!opts.show_notes);
     assert!(!opts.show_metadata);

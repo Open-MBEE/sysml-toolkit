@@ -405,7 +405,10 @@ fn package_formula_dependencies_keep_the_receiver_without_capturing_package_name
 }
 
 #[test]
-fn annotated_provider_completeness_remains_conservative() {
+fn plainly_annotated_provider_completeness_answers() {
+    // Plain metadata adds no base and keeps no provider out; semantic
+    // metadata (a definition conforming to `Metaobjects::SemanticMetadata`)
+    // does, pinned in `checked_metadata_receivers`.
     for mut r in models(
         "package A { metadata def Marker;
             part def Base { attribute n = 4; part slots[n]; }
@@ -413,10 +416,8 @@ fn annotated_provider_completeness_remains_conservative() {
         "#A::Marker part def Annotated :> A::Base { part :>> slots; }
         part def Child :> Annotated { part :>> slots; }",
     ) {
-        for name in ["Annotated::slots", "Child::slots"] {
-            let e = r.resolve_qualified(name).unwrap();
-            assert_eq!(r.effective_cardinality(e), None, "{name}");
-        }
+        exact(&mut r, "Annotated::slots", 4);
+        exact(&mut r, "Child::slots", 4);
         exact(&mut r, "A::Base::slots", 4);
     }
 }

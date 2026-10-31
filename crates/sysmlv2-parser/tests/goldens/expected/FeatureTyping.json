@@ -252,21 +252,21 @@
     }
   },
   {
-    "@id": "adcf011f-beff-50f8-acf4-30d3e5684ddc",
+    "@id": "e78417cb-888d-5847-b2bc-f05550dfc770",
     "@type": "FeatureTyping",
-    "elementId": "adcf011f-beff-50f8-acf4-30d3e5684ddc",
+    "elementId": "e78417cb-888d-5847-b2bc-f05550dfc770",
     "isImplied": false,
     "isImpliedIncluded": false,
     "ownedRelationship": [],
     "owningRelatedElement": {
-      "@id": "2fdd8a1a-ce4c-5233-a30b-47e81334d8d2"
+      "@id": "8fa1534d-9700-572c-a58c-4b0e298de1fc"
     },
     "owningRelationship": null,
     "type": {
       "@id": "8b08d4bb-a8c2-5e8f-8c93-e6e5b15fc79d"
     },
     "typedFeature": {
-      "@id": "2fdd8a1a-ce4c-5233-a30b-47e81334d8d2"
+      "@id": "8fa1534d-9700-572c-a58c-4b0e298de1fc"
     }
   },
   {

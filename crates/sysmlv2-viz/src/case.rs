@@ -96,9 +96,10 @@ impl Emitter<'_> {
         let ty = self.r.element_type(e);
         // An `include use case` that references another case is pure
         // edge; an inline one (`include use case z { … }`) is a case of
-        // its own.
+        // its own, and so is one whose reference did not resolve in full,
+        // read as written (`include 'add fuel';`).
         if ty == "IncludeUseCaseUsage" {
-            let refs = self.r.referenced_features(e);
+            let refs = crate::resolved_references(self.r, e);
             if let Some(target) = refs.first().and_then(|chain| chain.last().copied()) {
                 if let Some(owner_alias) = self.r.owner(e).and_then(|o| self.alias.get(&o).cloned())
                 {
@@ -143,11 +144,14 @@ impl Emitter<'_> {
         }
         let ty = self.r.element_type(e);
         let stereo = stereotype(ty);
-        let label = if ty.ends_with("Definition") {
+        let mut label = if ty.ends_with("Definition") {
             self.r.element_name(e).unwrap_or("").to_string()
         } else {
             usage_label(self.r, e)
         };
+        if label.trim().is_empty() {
+            label = crate::referenced_name(self.r, e).unwrap_or_default();
+        }
         let label = if label.trim().is_empty() {
             format!("({stereo})")
         } else {

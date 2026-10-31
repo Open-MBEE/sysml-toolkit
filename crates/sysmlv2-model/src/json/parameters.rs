@@ -1,5 +1,5 @@
 //! Declaration identities used to admit runtime parameter bindings.
-use super::{Builder, ElementRef, ResolvedModel, ScopeRef};
+use super::{Builder, ElementRef, LookupAccess, LookupResult, ResolvedModel, ScopeRef};
 use crate::metaclass::conforms;
 use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
@@ -109,6 +109,7 @@ enum Role {
     End,
     Result,
     Subject,
+    Objective,
 }
 
 /// The slots of each type and role read so far by one positional walk —
@@ -132,6 +133,12 @@ fn function_or_expression(ty: &str) -> bool {
     conforms(ty, "Function") || conforms(ty, "Expression")
 }
 
+/// The SysML family whose objective redefines its general's objective,
+/// even an inherited one: cases.
+fn case_kind(ty: &str) -> bool {
+    conforms(ty, "CaseDefinition") || conforms(ty, "CaseUsage")
+}
+
 /// The SysML families whose subject redefines its general's subject, even an
 /// inherited one: requirements and cases.
 fn subject_family(ty: &str) -> Option<u8> {
@@ -149,6 +156,12 @@ impl Builder {
         self.elements[feature]
             .owning_relationship
             .is_some_and(|r| is_a!(self.elements[r], "SubjectMembership"))
+    }
+
+    fn is_objective(&self, feature: usize) -> bool {
+        self.elements[feature]
+            .owning_relationship
+            .is_some_and(|r| is_a!(self.elements[r], "ObjectiveMembership"))
     }
 
     fn is_private_member(&self, feature: usize) -> bool {
@@ -266,8 +279,9 @@ impl Builder {
         let own = self.ordered_parameters(walk, ty);
         let mut generals = self.direct_generals(ty);
         // A parameter also specializes the ones it redefines by position: an
-        // argument written `in f = g;` is called with `f`'s parameters.
-        if self.is_parameter(ty) {
+        // argument written `in f = g;` is called with `f`'s parameters. So
+        // does a case's objective, which redefines its generals' objectives.
+        if self.is_parameter(ty) || self.is_objective(ty) {
             for target in self.direct_redefinitions(walk, ty) {
                 if !generals.contains(&target) {
                     generals.push(target);
@@ -410,6 +424,77 @@ impl Builder {
         self.positional_targets(feature, owner, &mut SlotMemo::default())
     }
 
+    /// An inherited end that lookup found by name in the body `s` of a type,
+    /// answered by the type's own end at the same position among the ends
+    /// of a general the type's declaration spells (a typing or
+    /// specialization; see [`Self::effective_slots`]) when that end declares
+    /// no name and redefines nothing explicitly: such an end redefines the
+    /// general's end by position and takes its name as its effective name
+    /// (KerML 8.2.3.5), and the redefined end is not inherited. In
+    /// `allocation a : L2P allocate l to p;`, `logical` names `a`'s first
+    /// end when `L2P` declares `end logical; end physical;`. An end paired
+    /// only with an implied library base's end keeps the library's (a
+    /// connection definition's unnamed ends and `source`), as do any other
+    /// hit and a hit through an alias. So does an end of a user type paired
+    /// with a library general's end: an interchange document holds the
+    /// user's model and only names the library's elements, so its lift
+    /// could not name this end by the library end's name.
+    pub(super) fn owned_end_redefining(
+        &mut self,
+        s: usize,
+        hit: LookupResult,
+        access: LookupAccess,
+    ) -> LookupResult {
+        let LookupResult::Found(found, _, None) = hit else {
+            return hit;
+        };
+        if self.declared_only || !self.positional_is_end(found) {
+            return hit;
+        }
+        let Some(owner) = self.scopes[s]
+            .owner
+            .filter(|owner| self.elem_scope.get(owner) == Some(&s))
+        else {
+            return hit;
+        };
+        let (bases, explicit) = self.base_scopes_split(s);
+        let library_owner = self.is_library_elem(owner);
+        let generals: Vec<usize> = bases[..explicit]
+            .iter()
+            .filter_map(|&base| self.scopes[base].owner)
+            .filter(|&general| {
+                general != owner && (library_owner || !self.is_library_elem(general))
+            })
+            .collect();
+        if generals.is_empty() {
+            return hit;
+        }
+        let mut memo = SlotMemo::default();
+        for (index, end) in self.owned_ends(owner).into_iter().enumerate() {
+            if end == found
+                || Some(end) == self.exclude
+                || self.effective_name(end).is_some()
+                || !access.admits(self.owning_visibility(end))
+                || self.elements[end]
+                    .owned_relationships
+                    .iter()
+                    .any(|&r| self.elements[r].ty == "Redefinition")
+            {
+                continue;
+            }
+            for &general in &generals {
+                if self
+                    .effective_slots(general, Role::End, &mut memo)
+                    .get(index)
+                    == Some(&found)
+                {
+                    return LookupResult::Found(end, self.elem_scope.get(&end).copied(), None);
+                }
+            }
+        }
+        hit
+    }
+
     /// [`Self::positional_redefinition_targets`] within one walk.
     pub(crate) fn positional_targets(
         &mut self,
@@ -445,6 +530,23 @@ impl Builder {
                     continue;
                 }
                 if let [target] = self.nearest_members(general, Role::Result, memo)[..] {
+                    push(&mut targets, target);
+                }
+            }
+            return targets;
+        }
+        // A case's objective redefines the objective of each case the
+        // owner's declaration specializes, even an inherited one (SysML
+        // `checkRequirementUsageObjectiveRedefinition`), as a subject does.
+        if self.is_objective(feature) {
+            if !case_kind(owner_ty) {
+                return targets;
+            }
+            for general in self.direct_generals(owner) {
+                if !case_kind(self.elements[general].ty) {
+                    continue;
+                }
+                if let [target] = self.nearest_members(general, Role::Objective, memo)[..] {
                     push(&mut targets, target);
                 }
             }
@@ -558,7 +660,9 @@ impl Builder {
         let own = match role {
             Role::Parameter => self.owned_parameters(ty),
             Role::End => self.owned_ends(ty),
-            Role::Result | Role::Subject => unreachable!("singular roles are read nearest"),
+            Role::Result | Role::Subject | Role::Objective => {
+                unreachable!("singular roles are read nearest")
+            }
         };
         if memo.active.len() > MAX_SIGNATURE_DEPTH || !memo.active.insert((ty, role)) {
             return own;
@@ -650,6 +754,7 @@ impl Builder {
         let select: fn(&Self, usize) -> bool = match role {
             Role::Result => Self::positional_is_result,
             Role::Subject => Self::is_subject,
+            Role::Objective => Self::is_objective,
             Role::Parameter | Role::End => unreachable!("positional roles are read as slots"),
         };
         let own: Vec<usize> = self

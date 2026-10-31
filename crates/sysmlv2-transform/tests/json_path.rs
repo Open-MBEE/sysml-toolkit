@@ -215,6 +215,74 @@ fn flexo_change_records_unwrap() {
 }
 
 #[test]
+fn omitted_ownership_back_references_are_derived_only_on_request() {
+    // Flexo MMS returns change records without `owningRelationship` and
+    // `owningRelatedElement`. A session refuses that payload by itself;
+    // `unwrap_flexo` derives them, and the session it opens is the one the
+    // complete payload opens, ids and all.
+    let input = demo_json("m.sysml");
+    let records = |elements: &Value, strip: bool| {
+        Value::Array(
+            elements
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    let mut payload = e.clone();
+                    if strip {
+                        let payload = payload.as_object_mut().unwrap();
+                        payload.remove("owningRelationship");
+                        payload.remove("owningRelatedElement");
+                    }
+                    json!({ "payload": payload, "identity": { "@id": e["@id"] } })
+                })
+                .collect(),
+        )
+    };
+    let stripped = records(&input, true);
+    let refused = Session::from_interchange_json(&stripped)
+        .err()
+        .expect("refused without the back-references")
+        .to_string();
+    assert!(
+        refused.contains("omits the inverse ownership ends"),
+        "{refused}"
+    );
+
+    let derived =
+        Session::from_interchange_json(&sysmlv2_transform::unwrap_flexo(stripped).unwrap())
+            .unwrap();
+    let complete = Session::from_interchange_json(&records(&input, false)).unwrap();
+    assert!(derived.warnings().is_empty(), "{:?}", derived.warnings());
+    let units = |s: &Session| {
+        s.units()
+            .map(|(_, name, text)| (name.to_string(), text.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(units(&derived), units(&complete));
+    assert_eq!(derived.to_compact_json(), complete.to_compact_json());
+    assert_eq!(ids(&derived.to_compact_json()), ids(&input));
+}
+
+#[test]
+fn an_unnamed_kerml_document_opens_as_a_kerml_unit() {
+    // Without a file name on its root, a document's unit is numbered; it
+    // takes the extension of the dialect it lifted as, or KerML text would
+    // be parsed as SysML and refused.
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "m.kerml".to_string(),
+        "package P {\n    class A;\n    class B specializes A;\n    feature f : A;\n}\n",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let input = model_to_compact_json(&model);
+    let mut s = Session::from_interchange_json(&input).expect("opens");
+    assert_eq!(s.units().next().unwrap().1, "document-1.kerml");
+    assert!(s.resolved().resolve_qualified("P::B").is_some());
+    assert_eq!(ids(&s.to_compact_json()), ids(&input));
+}
+
+#[test]
 fn full_form_input_is_accepted() {
     let input = demo_json("m.sysml");
     let s = Session::from_interchange_json(&input).expect("lifts");
@@ -446,4 +514,40 @@ fn multiline_doc_bodies_reflow_and_invert() {
     let s2 = Session::from_interchange_json(&v2).expect("lifts");
     let t2 = s2.units().next().unwrap().2.to_string();
     assert!(t2.contains("/*a\nb*/"), "{t2}");
+}
+
+#[test]
+fn an_explicit_kerml_filename_preserves_a_feature_slice() {
+    let document = json!([{"@id":"00000000-0000-0000-0000-000000000001",
+        "@type":"Feature", "declaredName":"f",
+        "owningRelationship":{"@id":"00000000-0000-0000-0000-000000000002"}}]);
+    for name in ["slice.kerml", "slice.KerML"] {
+        let session =
+            Session::from_interchange_json_named(&document, None, &[name.into()]).unwrap();
+        assert_eq!(session.units().next().unwrap().2, "feature f;\n");
+        assert!(session.warnings().is_empty(), "{:?}", session.warnings());
+    }
+    assert!(
+        Session::from_interchange_json_named(&document, None, &["slice.sysml".into()]).is_err()
+    );
+    assert!(Session::from_interchange_json(&document).is_err());
+}
+
+#[test]
+fn ownership_conflicts_are_refused_before_document_splitting() {
+    let document = json!([
+        {"@id":"root1","@type":"Namespace","ownedRelationship":[{"@id":"m1"}]},
+        {"@id":"root2","@type":"Namespace","ownedRelationship":[{"@id":"m2"}]},
+        {"@id":"m1","@type":"OwningMembership","owningRelatedElement":{"@id":"root1"},"ownedRelatedElement":[{"@id":"p"}]},
+        {"@id":"m2","@type":"OwningMembership","owningRelatedElement":{"@id":"root2"},"ownedRelatedElement":[{"@id":"p"}]},
+        {"@id":"p","@type":"PartUsage","declaredName":"p","owningRelationship":{"@id":"m1"}}
+    ]);
+    assert!(sysmlv2_model::lift::split_documents(&document).is_some());
+    let error = Session::from_interchange_json(&document)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("ownership conflict"), "{error}");
+    assert!(sysmlv2_transform::unwrap_flexo(document.clone()).is_err());
+    assert!(sysmlv2_model::loader::load_document(&document, &Default::default()).is_err());
 }

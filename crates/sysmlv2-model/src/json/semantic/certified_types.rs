@@ -36,6 +36,10 @@ pub fn conditional_property_capability(declaration: &str) -> Option<ConditionalP
         "Systems-DefinitionAndUsage-Definition-directedUsage" => {
             "Systems-DefinitionAndUsage-Definition-directedUsage"
         }
+        "Systems-DefinitionAndUsage-Usage-usage" => "Systems-DefinitionAndUsage-Usage-usage",
+        "Systems-DefinitionAndUsage-Usage-directedUsage" => {
+            "Systems-DefinitionAndUsage-Usage-directedUsage"
+        }
         "Core-Types-Type-input" => "Core-Types-Type-input",
         "Core-Types-Type-feature" => "Core-Types-Type-feature",
         "Core-Types-Type-featureMembership" => "Core-Types-Type-featureMembership",
@@ -463,6 +467,8 @@ impl CheckedRow {
                 effective.id,
                 "Systems-DefinitionAndUsage-Definition-usage"
                     | "Systems-DefinitionAndUsage-Definition-directedUsage"
+                    | "Systems-DefinitionAndUsage-Usage-usage"
+                    | "Systems-DefinitionAndUsage-Usage-directedUsage"
             ))
             && effective.id != "Core-Types-Type-input"
             && !crate::json::type_features::supported_root(r.element_type(e))
@@ -607,6 +613,8 @@ impl CheckedRow {
             effective.id,
             "Systems-DefinitionAndUsage-Definition-usage"
                 | "Systems-DefinitionAndUsage-Definition-directedUsage"
+                | "Systems-DefinitionAndUsage-Usage-usage"
+                | "Systems-DefinitionAndUsage-Usage-directedUsage"
         ) {
             let base = if effective.name == "usage" {
                 "Core-Types-Type-feature"

@@ -1788,3 +1788,58 @@ fn declared_multiplicity_spans_a_prepared_library_and_its_model() {
     assert_eq!(r.declared_multiplicity(own), Some((1.0, 2.0)));
     assert_eq!(r.declared_multiplicity(shared), Some((3.0, 4.0)));
 }
+
+/// `membership_member_name` is the specification's `memberName`: the
+/// member's effective name after a declared alias name. A binary
+/// connection's end memberships answer `source` and `target`; the
+/// membership of an unnamed `satisfy r by a` answers nothing, although
+/// lookup still accepts `r` as its syntactic locator.
+#[test]
+fn membership_member_name_is_the_specification_member_name() {
+    let mut model = sysmlv2_parser::model::Model::new();
+    model.add_source(
+        "names.sysml",
+        "package Names {
+            part def P;
+            part a : P;
+            part b : P;
+            connection c connect a to b;
+            requirement def R;
+            requirement r : R;
+            satisfy r by a;
+            alias other for r;
+        }",
+    );
+    assert!(!model.has_errors());
+    let mut r = sysmlv2_parser::json::ResolvedModel::build(&model);
+    let c = r.resolve_qualified("Names::c").unwrap();
+    let mut end_names = Vec::new();
+    for m in r.owned_relationships(c) {
+        if r.element_type(m) == "EndFeatureMembership" {
+            end_names.push(r.membership_member_name(m));
+        }
+    }
+    end_names.sort();
+    assert_eq!(
+        end_names,
+        [Some("source".to_string()), Some("target".to_string())]
+    );
+    let package = r.resolve_qualified("Names").unwrap();
+    let (mut satisfy, mut alias) = (None, None);
+    for m in r.owned_relationships(package) {
+        let Some(member) = r.membership_member(m) else {
+            continue;
+        };
+        if r.element_type(member) == "SatisfyRequirementUsage" {
+            satisfy = Some(m);
+        } else if r.element_type(m) == "Membership" {
+            alias = Some(m);
+        }
+    }
+    assert_eq!(r.membership_member_name(satisfy.unwrap()), None);
+    assert!(r.resolve_qualified("Names::r").is_some());
+    assert_eq!(
+        r.membership_member_name(alias.unwrap()).as_deref(),
+        Some("other")
+    );
+}

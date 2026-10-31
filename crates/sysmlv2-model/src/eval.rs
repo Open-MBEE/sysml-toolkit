@@ -24,7 +24,8 @@
 //! declarations make `min` ≡ `{s}`×60 and `km` ≡ `{m}`×1000), so
 //! same-dimension arithmetic and comparison *convert* across scales,
 //! `*`/`/`/`**` combine exponents and cancel (folding scales into the
-//! number), and different *dimensions* never mix.
+//! number, written in SI-coherent units: `kg`, not `g`), and different
+//! *dimensions* never mix.
 //!
 //! Constructors (`new T(…)`) build [`Value::Instance`] data values:
 //! positional arguments bind the type's public features in order (its
@@ -49,6 +50,20 @@
 //! fallback). Misses are definite against reflection metaclasses and
 //! user-defined types; other library targets stay undecided.
 //!
+//! Every feature evaluates with an effective value: its own, else the
+//! default an effective redefinition supplies, else the default its
+//! general declares — inherited defaults included (SysML 8.4.4.11). When
+//! an inherited default's expression fails to evaluate, the plain entry
+//! points (`evaluate`, `evaluate_in`, `evaluate_qualified`, `query`) fall
+//! back to the unbound value rather than failing, which value hints,
+//! verdicts, the multiplicity checks and the solver rely on;
+//! `evaluate_report` / `evaluate_in_report` record each failure that
+//! fallback hid and [`EvaluationReport::into_checked_result`] refuses the
+//! value when one was, the entry point for a host that must not see a
+//! degraded value. The evaluator reads the parsed expression kept per
+//! feature value, never the Expression element tree; the two agree
+//! because both come from one parse.
+//!
 //! Documented v1 gaps (all reported as [`EvalError::Unsupported`]):
 //! extents (`all T`).
 
@@ -59,6 +74,7 @@ use crate::json::{
     Builder, CallableBody, CallableResult, ChainRedefinitions, ElementRef, ResolvedModel,
     RuntimeFrame, RuntimeFrameProof, ScopeRef, Tri,
 };
+use crate::layered::IdMap;
 use crate::metaclass::is_a;
 
 /// Owner-context library collections per member metaclass — the
@@ -78,7 +94,7 @@ fn implied_collection_extras(metaclass: &str) -> &'static [&'static str] {
 }
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use sysmlv2_syntax::Span;
 use sysmlv2_syntax::ast::*;
 use uuid::Uuid;
@@ -109,13 +125,15 @@ pub enum Value {
     /// exact). Defaults read through a parameter or reference that still
     /// stands for an argument are indeterminate. Minted only for features
     /// outside library evaluation frames — library calc bodies keep the
-    /// closed one-element convention their semantics rely on.
-    Unbound(ElementRef),
+    /// closed one-element convention their semantics rely on. The [`Via`]
+    /// is the instance the feature is a feature of: a member read off it
+    /// reads that instance's redefinitions.
+    Unbound(ElementRef, Via),
     /// An unvalued member reached through an unknown receiver. Like
     /// [`Value::Unbound`], but retains the receiver's uncertainty through
     /// aliases, conditionals, sequences and calculation arguments. A
     /// later chain step must not read the member type's defaults.
-    UnboundMember(ElementRef),
+    UnboundMember(ElementRef, Via),
     /// The result of an operation over an unknown operand: arithmetic,
     /// comparison, or logic over an unbound feature is not a type error —
     /// the formula is parametric and its value simply is not determined.
@@ -142,6 +160,74 @@ pub enum Value {
     Sequence(Vec<Value>),
 }
 
+/// The instances a placeholder's feature is read for (see [`Value::Unbound`]):
+/// the namespaces that stand, innermost first, for the namespaces around the
+/// feature's declaration, from the one it is a feature of outward. A feature
+/// a part inherits from its definition is the part's: `drone.spare` is
+/// `Quad::spare` read for `drone`, so `drone.spare.mass` reads the
+/// redefinitions in `drone`. Links that are the declared namespaces
+/// themselves add nothing and are left off, so a feature read where it is
+/// declared has none. `Via::default()` reads as declared, with no instances
+/// established: a placeholder from outside an evaluation, which no chain
+/// takes for several instances.
+#[derive(Clone, Debug, Default)]
+pub struct Via {
+    links: Option<Arc<[usize]>>,
+    /// Whether the evaluation established these instances (see
+    /// `Evaluator::faithful`). Equality ignores it.
+    known: bool,
+}
+
+impl PartialEq for Via {
+    fn eq(&self, other: &Via) -> bool {
+        self.links == other.links
+    }
+}
+
+impl Eq for Via {}
+
+impl std::hash::Hash for Via {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.links.hash(state);
+    }
+}
+
+impl Via {
+    fn new(links: &[usize], known: bool) -> Via {
+        Via {
+            links: (!links.is_empty()).then(|| links.into()),
+            known,
+        }
+    }
+
+    /// As declared, established.
+    fn declared() -> Via {
+        Via::new(&[], true)
+    }
+
+    /// The same instances, not established.
+    fn unestablished(&self) -> Via {
+        Via {
+            links: self.links.clone(),
+            known: false,
+        }
+    }
+
+    /// Whether the feature is read where it is declared.
+    pub fn is_declared(&self) -> bool {
+        self.links.is_none()
+    }
+
+    /// The instances, innermost first.
+    pub fn instances(&self) -> impl Iterator<Item = ElementRef> + '_ {
+        self.links().iter().map(|&e| ElementRef(e))
+    }
+
+    fn links(&self) -> &[usize] {
+        self.links.as_deref().unwrap_or_default()
+    }
+}
+
 /// One base factor of a normalized unit: a resolved unit element raised
 /// to a reduced rational exponent (`den > 0`, `num != 0`, gcd 1). The
 /// name is the element's simple name, kept for display only — identity
@@ -166,16 +252,21 @@ pub(crate) struct Dim {
 /// boundaries; anything else is an opaque base. Two units are the same
 /// unit iff dims and scale agree; same dims with different scales
 /// convert, different dims are a type error.
+///
+/// A unit also remembers the units its value was written in (see
+/// [`ResolvedModel::value_as_written`]); that record is display
+/// provenance and takes no part in identity.
 #[derive(Clone, Debug)]
 pub struct Unit {
     pub(crate) dims: Vec<Dim>,
     pub(crate) scale: Rational,
     pub(crate) display: String,
+    pub(crate) basis: UnitBasis,
 }
 
 impl Unit {
-    /// A reference-magnitude unit (scale 1) with the canonical display:
-    /// what arithmetic produces after folding scales into the number.
+    /// A reference-magnitude unit (scale 1) with the canonical display.
+    #[cfg(test)]
     pub(crate) fn from_dims(dims: Vec<Dim>) -> Unit {
         let merged = normalize_dims(dims);
         let display = render_dims(&merged);
@@ -183,6 +274,95 @@ impl Unit {
             dims: merged,
             scale: Rational::one(),
             display,
+            basis: UnitBasis::default(),
+        }
+    }
+
+    /// This unit with `basis` as its record of written units.
+    fn with_basis(mut self, basis: UnitBasis) -> Unit {
+        self.basis = basis;
+        self
+    }
+
+    /// The unit to show this unit's magnitudes in when values read in the
+    /// units they were written in, or `None` when that is this unit
+    /// itself (a bracket's unit, kept through additive and scalar
+    /// operations) or when the written units do not reach it.
+    ///
+    /// Products, quotients and powers fold into SI-coherent units
+    /// (`10 ['in'] / (2 [s])` is `0.127 [m/s]`); this re-expresses them
+    /// from the written units, first match wins:
+    ///
+    /// 1. a written unit, or an integer power of one, with exactly these
+    ///    dimensions (`[mi]` for `60 [mi/h] * (30 [min])`, `[in**2]` for
+    ///    an area of inches, `[1/h]`);
+    /// 2. a written *named* compound unit times written single-dimension
+    ///    units for the rest (`[N*m]`, `[lbf/in**2]`);
+    /// 3. a written single-dimension unit for every dimension that has
+    ///    one, and for the others the unit an SI-coherent result writes
+    ///    them in (`[in/s]`, `[ft*lb/s**2]`, `[in*kg/s**3]`).
+    ///
+    /// Each dimension takes the first unit written for it, so one result
+    /// never mixes two units of one dimension (`60 [km/h] / (10 [s])`
+    /// reads `21600 [km/h**2]`). Conversions are the evaluator's own
+    /// exact factors, so a re-expressed magnitude is as exact as the
+    /// original.
+    pub(crate) fn as_written(&self, b: &Builder) -> Option<Unit> {
+        let atoms = self.basis.atoms();
+        if atoms.is_empty() || self.dims.is_empty() {
+            return None;
+        }
+        let target = written_power(&self.dims, atoms)
+            .or_else(|| written_compound(&self.dims, atoms, b))
+            .or_else(|| written_factors(&self.dims, atoms, b))?;
+        // A unit that already reads as written stays as it is (with its
+        // own spelling).
+        if target.scale == self.scale && same_dims(&target, self) {
+            return None;
+        }
+        Some(target.with_basis(self.basis.clone()))
+    }
+
+    /// The SI-coherent unit over `dims`, with the canonical display: what
+    /// arithmetic produces after folding scales into the number. It is
+    /// the reference unit, except that a base element SI writes through
+    /// another unit (the gram, as the kilogram; see [`si_coherent_unit`])
+    /// takes that unit's symbol, and the unit's factor raised to the
+    /// element's exponent goes into the scale. A factor without an exact
+    /// power (the kilogram's to `1/2`) leaves the element as it is, so the
+    /// scale stays exact. A unit SI names (`N`, `Pa`, `J`, `W`; see
+    /// [`SI_NAMED_UNITS`]) is written by that name.
+    pub(crate) fn coherent(dims: Vec<Dim>, b: &Builder) -> Unit {
+        let dims = normalize_dims(dims);
+        let mut scale = Rational::one();
+        let mut symbols = Vec::new();
+        for (i, d) in dims.iter().enumerate() {
+            let Some((symbol, factor)) = si_coherent_unit(b, d.elem) else {
+                continue;
+            };
+            let power = Rational::new(i128::from(d.num), i128::from(d.den))
+                .and_then(|e| factor.pow_rational(&e));
+            if let Some(power) = power {
+                scale = scale.mul(&power);
+                symbols.push((i, symbol));
+            }
+        }
+        let display = if let Some(name) = si_named_unit(b, &dims) {
+            name.to_string()
+        } else if symbols.is_empty() {
+            render_dims(&dims)
+        } else {
+            let mut spelled = dims.clone();
+            for (i, symbol) in symbols {
+                spelled[i].name = symbol.to_string();
+            }
+            render_dims(&spelled)
+        };
+        Unit {
+            dims,
+            scale,
+            display,
+            basis: UnitBasis::default(),
         }
     }
 
@@ -217,8 +397,8 @@ impl Unit {
     }
 
     /// Display spelling: the source spelling for bracket-constructed
-    /// units (`km/h`), the canonical reference rendering for
-    /// arithmetic results (`kg*m/s**2`, `1/h`, `m**(1/2)`).
+    /// units (`km/h`), the canonical SI-coherent rendering for
+    /// arithmetic results (`N`, `kg/m**3`, `1/h`, `m**(1/2)`).
     pub fn display(&self) -> &str {
         &self.display
     }
@@ -227,17 +407,279 @@ impl Unit {
 /// Dimensional equality — same exponent map, ignoring scale. Same dims
 /// with different scales are *convertible*, not equal.
 fn same_dims(a: &Unit, b: &Unit) -> bool {
-    a.dims.len() == b.dims.len()
-        && a.dims
-            .iter()
-            .zip(&b.dims)
-            .all(|(x, y)| x.elem == y.elem && x.num == y.num && x.den == y.den)
+    dims_equal(&a.dims, &b.dims)
 }
 
 impl PartialEq for Unit {
     fn eq(&self, other: &Unit) -> bool {
         same_dims(self, other) && self.scale == other.scale
     }
+}
+
+/// How rendered quantities choose their unit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum UnitDisplay {
+    /// The evaluator's own unit: a bracket's spelling, kept through
+    /// additive and scalar operations, and SI-coherent units for
+    /// products, quotients and powers (`0.127 [m/s]`, `6 [N]`).
+    #[default]
+    Si,
+    /// The units the value was written in, where they reach its
+    /// dimensions (`5 [in/s]`); otherwise as [`Self::Si`]. See
+    /// [`ResolvedModel::value_as_written`].
+    AsWritten,
+}
+
+impl UnitDisplay {
+    /// Read a setting value: `si` or `asWritten`.
+    pub fn parse(spec: &str) -> Result<UnitDisplay, String> {
+        match spec {
+            "si" => Ok(UnitDisplay::Si),
+            "asWritten" => Ok(UnitDisplay::AsWritten),
+            other => Err(format!(
+                "unknown unit display `{other}` (expected `si` or `asWritten`)"
+            )),
+        }
+    }
+
+    /// The setting value [`Self::parse`] reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnitDisplay::Si => "si",
+            UnitDisplay::AsWritten => "asWritten",
+        }
+    }
+}
+
+/// The most written units one value remembers; later ones are dropped.
+const MAX_WRITTEN_UNITS: usize = 8;
+
+/// One unit as a quantity bracket wrote it: a named unit (`in`, `N`) or
+/// a compound bracket as a whole (`km/h`), with its normalized dimensions
+/// and scale.
+#[derive(Clone, Debug)]
+pub(crate) struct WrittenUnit {
+    dims: Vec<Dim>,
+    scale: Rational,
+    display: String,
+    /// A single unit reference rather than a compound spelling.
+    named: bool,
+}
+
+impl WrittenUnit {
+    /// A named unit with exactly one dimension to the first power — the
+    /// unit a dimension can be written in on its own (`in`, `h`, `lb`).
+    fn single_dimension(&self) -> Option<&Dim> {
+        match self.dims.as_slice() {
+            [d] if self.named && d.num == 1 && d.den == 1 => Some(d),
+            _ => None,
+        }
+    }
+
+    fn same_unit(&self, other: &WrittenUnit) -> bool {
+        self.scale == other.scale && dims_equal(&self.dims, &other.dims)
+    }
+}
+
+/// The units a quantity's value was written in: the bracket units that
+/// reached it (a compound bracket also contributes the named units it is
+/// spelled from), in order of first appearance, without repeats, at most
+/// [`MAX_WRITTEN_UNITS`]. Shared, so carrying it through arithmetic
+/// costs a reference count.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UnitBasis(Option<std::sync::Arc<[WrittenUnit]>>);
+
+impl UnitBasis {
+    fn of(written: Vec<WrittenUnit>) -> UnitBasis {
+        let mut atoms: Vec<WrittenUnit> = Vec::with_capacity(written.len());
+        for w in written {
+            if atoms.len() < MAX_WRITTEN_UNITS && !atoms.iter().any(|a| a.same_unit(&w)) {
+                atoms.push(w);
+            }
+        }
+        if atoms.is_empty() {
+            UnitBasis(None)
+        } else {
+            UnitBasis(Some(atoms.into()))
+        }
+    }
+
+    fn atoms(&self) -> &[WrittenUnit] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+
+    /// `a`'s written units, then `b`'s that `a` lacks.
+    fn merge(a: &UnitBasis, b: &UnitBasis) -> UnitBasis {
+        match (&a.0, &b.0) {
+            (_, None) => a.clone(),
+            (None, _) => b.clone(),
+            (Some(x), Some(y)) if std::sync::Arc::ptr_eq(x, y) || x.len() >= MAX_WRITTEN_UNITS => {
+                a.clone()
+            }
+            (Some(x), Some(y)) => UnitBasis::of(x.iter().chain(y.iter()).cloned().collect()),
+        }
+    }
+}
+
+fn dims_equal(a: &[Dim], b: &[Dim]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.elem == y.elem && x.num == y.num && x.den == y.den)
+}
+
+/// Whether a unit spelling needs parentheses before an operator binds to
+/// it as a whole.
+fn compound_spelling(s: &str) -> bool {
+    s.contains(['*', '/', '⋅', '·', ' '])
+}
+
+/// The first written unit whose integer power (`k ≠ 0`) has exactly
+/// `dims`.
+fn written_power(dims: &[Dim], atoms: &[WrittenUnit]) -> Option<Unit> {
+    atoms.iter().find_map(|a| {
+        let (first, of) = (dims.first()?, a.dims.first()?);
+        if a.dims.len() != dims.len() || first.elem != of.elem {
+            return None;
+        }
+        // k = (first.num/first.den) / (of.num/of.den), an integer.
+        let (n, d) = (first.num * of.den, first.den * of.num);
+        if d == 0 || n % d != 0 {
+            return None;
+        }
+        let k = n / d;
+        if k == 0 || !dims_equal(dims, &dims_pow(&a.dims, (k, 1))) {
+            return None;
+        }
+        let spelled = if compound_spelling(&a.display) {
+            format!("({})", a.display)
+        } else {
+            a.display.clone()
+        };
+        let display = match k {
+            1 => a.display.clone(),
+            -1 => format!("1/{spelled}"),
+            k if k < 0 => format!("1/{spelled}**{}", -k),
+            k => format!("{spelled}**{k}"),
+        };
+        Some(Unit {
+            dims: dims.to_vec(),
+            scale: a.scale.pow_or_approx(k),
+            display,
+            basis: UnitBasis::default(),
+        })
+    })
+}
+
+/// For each dimension, the first written unit that measures it alone.
+fn single_dimension_units(atoms: &[WrittenUnit]) -> Vec<(usize, &WrittenUnit)> {
+    let mut out: Vec<(usize, &WrittenUnit)> = Vec::new();
+    for a in atoms {
+        if let Some(d) = a.single_dimension() {
+            if !out.iter().any(|(elem, _)| *elem == d.elem) {
+                out.push((d.elem, a));
+            }
+        }
+    }
+    out
+}
+
+/// `dims` spelled with the single-dimension units in `singles` where one
+/// measures the dimension, and otherwise as an SI-coherent result writes
+/// it (the gram as the kilogram; see [`Unit::coherent`]): the spelled
+/// factors, the combined scale, and whether any written unit took part. A
+/// written unit spells only an integer power.
+fn spell_dims(
+    dims: &[Dim],
+    singles: &[(usize, &WrittenUnit)],
+    b: &Builder,
+) -> (Vec<Dim>, Rational, bool) {
+    let mut scale = Rational::one();
+    let mut used = false;
+    let spelled = dims
+        .iter()
+        .map(|d| match singles.iter().find(|(elem, _)| *elem == d.elem) {
+            Some((_, w)) if d.den == 1 => {
+                used = true;
+                scale = scale.mul(&w.scale.pow_or_approx(d.num));
+                Dim {
+                    name: w.display.clone(),
+                    ..d.clone()
+                }
+            }
+            _ => {
+                let coherent = si_coherent_unit(b, d.elem).and_then(|(symbol, factor)| {
+                    let power = Rational::new(i128::from(d.num), i128::from(d.den))
+                        .and_then(|e| factor.pow_rational(&e))?;
+                    Some((symbol, power))
+                });
+                match coherent {
+                    Some((symbol, power)) => {
+                        scale = scale.mul(&power);
+                        Dim {
+                            name: symbol.to_string(),
+                            ..d.clone()
+                        }
+                    }
+                    None => d.clone(),
+                }
+            }
+        })
+        .collect();
+    (spelled, scale, used)
+}
+
+/// A written named compound unit (`N`, `lbf`, `L`) times written
+/// single-dimension units for whatever it leaves over (`N*m`,
+/// `lbf/in**2`, `L/h`). Every leftover dimension must have a written
+/// unit.
+fn written_compound(dims: &[Dim], atoms: &[WrittenUnit], b: &Builder) -> Option<Unit> {
+    let singles = single_dimension_units(atoms);
+    atoms
+        .iter()
+        .filter(|a| a.named && a.single_dimension().is_none())
+        .find_map(|a| {
+            let rest = normalize_dims(dims_combine(dims, &a.dims, -1));
+            if rest.is_empty()
+                || !rest
+                    .iter()
+                    .all(|d| d.den == 1 && singles.iter().any(|(elem, _)| *elem == d.elem))
+            {
+                return None;
+            }
+            let (spelled, scale, _) = spell_dims(&rest, &singles, b);
+            let head = if compound_spelling(&a.display) {
+                format!("({})", a.display)
+            } else {
+                a.display.clone()
+            };
+            // The compound first, then the leftover factors.
+            let rest = render_dims(&spelled);
+            let display = match rest.strip_prefix("1/") {
+                Some(denominator) => format!("{head}/{denominator}"),
+                None => format!("{head}*{rest}"),
+            };
+            Some(Unit {
+                dims: dims.to_vec(),
+                scale: a.scale.mul(&scale),
+                display,
+                basis: UnitBasis::default(),
+            })
+        })
+}
+
+/// Every dimension a written single-dimension unit measures, in that
+/// unit; the SI-coherent unit for the rest (`in/s`, `ft*lb/s**2`,
+/// `in*kg/s**3`). `None` when no written unit measures any of them.
+fn written_factors(dims: &[Dim], atoms: &[WrittenUnit], b: &Builder) -> Option<Unit> {
+    let singles = single_dimension_units(atoms);
+    let (spelled, scale, used) = spell_dims(dims, &singles, b);
+    used.then(|| Unit {
+        dims: dims.to_vec(),
+        scale,
+        display: render_dims(&spelled),
+        basis: UnitBasis::default(),
+    })
 }
 
 /// Process-wide switch for expanding *spelled* power-product unit names:
@@ -506,7 +948,107 @@ fn render_dims(dims: &[Dim]) -> String {
     }
 }
 
+/// The short name of a unit that the standard library's `SI` package
+/// declares (`g`, `m`, `s`), or `None` for any other element, a user unit
+/// spelled the same included.
+fn si_short_name(b: &Builder, elem: usize) -> Option<&str> {
+    if !b.is_library_elem(elem) {
+        return None;
+    }
+    let name = |e: usize, key: &str| b.elements[e].props.get(key).and_then(|v| v.as_str());
+    let package = b.owner_elem(elem)?;
+    if name(package, "declaredName")? != "SI" {
+        return None;
+    }
+    name(elem, "declaredShortName")
+}
+
+/// How SI writes a base unit element in a coherent result: the symbol of
+/// SI's base unit for it and that unit's factor to the element, or `None`
+/// when the element is that base unit itself. The library declares `kg` as
+/// the gram with the `kilo` prefix, so mass expands to the gram, while the
+/// kilogram is SI's base unit of mass: a result over `g` is written in
+/// `kg`, 1000 g.
+pub(crate) fn si_coherent_unit(b: &Builder, elem: usize) -> Option<(&'static str, Rational)> {
+    match si_short_name(b, elem)? {
+        "g" => Some(("kg", Rational::from_integer(1000))),
+        _ => None,
+    }
+}
+
+/// SI's named units that a coherent result is written as, by their
+/// exponents of the kilogram, the metre and the second. A torque (`N*m`)
+/// has the joule's and is written `J` too.
+const SI_NAMED_UNITS: [(&str, [i32; 3]); 4] = [
+    ("N", [1, 1, -2]),
+    ("Pa", [1, -1, -2]),
+    ("J", [1, 2, -2]),
+    ("W", [1, 2, -3]),
+];
+
+/// The SI named unit that `dims` make (`N` for `kg*m/s**2`), when every
+/// element is SI's gram, metre or second (see [`SI_NAMED_UNITS`]).
+fn si_named_unit(b: &Builder, dims: &[Dim]) -> Option<&'static str> {
+    let mut exponents = [0; 3];
+    for d in dims {
+        let slot = match si_short_name(b, d.elem)? {
+            "g" => 0,
+            "m" => 1,
+            "s" => 2,
+            _ => return None,
+        };
+        if d.den != 1 {
+            return None;
+        }
+        exponents[slot] = d.num;
+    }
+    SI_NAMED_UNITS
+        .iter()
+        .find(|(_, e)| *e == exponents)
+        .map(|(name, _)| *name)
+}
+
 impl Value {
+    /// Heap storage a clone allocates, excluding this value's inline
+    /// storage. Written-unit provenance is shared by Arc and is not copied.
+    /// Call only after a bounded traversal (`charge_chain_value`).
+    fn clone_heap_bytes(&self) -> usize {
+        match self {
+            Value::String(s) => s.len(),
+            Value::Rational(r) => r.clone_heap_bytes(),
+            Value::Quantity(n, u) => {
+                let dims = u.dims.iter().fold(
+                    u.dims.len().saturating_mul(std::mem::size_of::<Dim>()),
+                    |bytes, d| bytes.saturating_add(d.name.len()),
+                );
+                std::mem::size_of::<Value>()
+                    .saturating_add(n.clone_heap_bytes())
+                    .saturating_add(dims)
+                    .saturating_add(u.display.len())
+                    .saturating_add(u.scale.clone_heap_bytes())
+            }
+            Value::Instance {
+                ty_name, fields, ..
+            } => fields.iter().fold(
+                ty_name.len().saturating_add(
+                    fields
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(String, Value)>()),
+                ),
+                |bytes, (name, value)| {
+                    bytes
+                        .saturating_add(name.len())
+                        .saturating_add(value.clone_heap_bytes())
+                },
+            ),
+            Value::Sequence(items) => items.iter().fold(
+                items.len().saturating_mul(std::mem::size_of::<Value>()),
+                |bytes, value| bytes.saturating_add(value.clone_heap_bytes()),
+            ),
+            _ => 0,
+        }
+    }
+
     fn null() -> Value {
         Value::Sequence(Vec::new())
     }
@@ -535,6 +1077,19 @@ impl Value {
             Value::Real(f) => Some(Num::Approx(*f)),
             _ => None,
         }
+    }
+
+    /// This quantity re-expressed in the units its value was written in
+    /// ([`Unit::as_written`]): an equal value, converted by the
+    /// evaluator's exact factors. `None` for anything else and for a
+    /// quantity already in those units.
+    pub(crate) fn as_written(&self, b: &Builder) -> Option<Value> {
+        let Value::Quantity(n, u) = self else {
+            return None;
+        };
+        let target = u.as_written(b)?;
+        let n = scale_magnitude((**n).clone(), &scale_ratio(&u.scale, &target.scale)).ok()?;
+        Some(Value::Quantity(Box::new(n), target))
     }
 
     /// The canonical value of a number: an exact integer in `i128` range
@@ -768,7 +1323,7 @@ impl fmt::Display for Value {
             Value::Real(r) => write!(f, "{r}"),
             Value::String(s) => write!(f, "{s:?}"),
             Value::Element(_) => write!(f, "<element>"),
-            Value::Unbound(_) | Value::UnboundMember(_) => write!(f, "<unbound feature>"),
+            Value::Unbound(..) | Value::UnboundMember(..) => write!(f, "<unbound feature>"),
             Value::Indeterminate => write!(f, "<indeterminate>"),
             Value::Quantity(n, u) => write!(f, "{n} [{}]", u.display),
             Value::Instance {
@@ -871,6 +1426,13 @@ pub(crate) fn evaluate_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Resul
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
     .expr(scope, e)
 }
@@ -907,8 +1469,62 @@ pub(crate) fn evaluate_expr_with(
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
     .expr(scope, e)
+}
+
+/// [`evaluate_expr_with`], with the receivers whose count left a chain step
+/// unknown: placeholders of unknown or open multiplicity, in the order
+/// evaluation met them. An indeterminate result may owe to one of them.
+pub(crate) fn evaluate_expr_explained(
+    b: &mut Builder,
+    scope: usize,
+    e: &Expr,
+    overrides: HashMap<usize, Value>,
+) -> (Result_, Vec<ElementRef>) {
+    let mut evaluator = Evaluator {
+        b,
+        env: Vec::new(),
+        lexical_scope: None,
+        value_scopes: Default::default(),
+        frame_proofs: Default::default(),
+        report: None,
+        inherited_failure_epoch: 0,
+        call_frames: Vec::new(),
+        in_progress: HashSet::new(),
+        cardinality_in_progress: HashSet::new(),
+        cardinality_context: None,
+        cardinality_providers: Default::default(),
+        unit_trace: Default::default(),
+        overrides,
+        unbound_receiver: None,
+        lib_frames: 0,
+        call_depth: 0,
+        steps: 0,
+        allocated: 0,
+        query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
+    };
+    let result = evaluator.expr(scope, e);
+    let receivers = evaluator
+        .open_receivers
+        .into_iter()
+        .map(ElementRef)
+        .collect();
+    (result, receivers)
 }
 
 /// The measurement [`Unit`] denoted by a bracket's unit expression
@@ -938,6 +1554,13 @@ pub(crate) fn unit_of_expr_in(b: &mut Builder, scope: usize, e: &Expr) -> Result
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
     .unit_of(scope, e)
 }
@@ -971,6 +1594,13 @@ pub(crate) fn evaluate_query_in(b: &mut Builder, scope: usize, e: &Expr) -> Resu
         steps: 0,
         allocated: 0,
         query: true,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
     .expr(scope, e)
 }
@@ -1012,6 +1642,13 @@ fn evaluate_query_with_env(
         steps: 0,
         allocated: 0,
         query: true,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
     .expr(scope, e)
 }
@@ -1042,6 +1679,13 @@ pub(crate) fn effective_cardinality(
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
     .unbound_cardinality(e.0)
 }
@@ -1050,17 +1694,21 @@ pub(crate) fn effective_cardinality(
 /// [`Evaluator::cardinality_in`] that answers the open default, with no
 /// bound, subsetting or positional target to consult first.
 pub(crate) fn implicit_open_multiplicity(model: &mut ResolvedModel, e: ElementRef) -> bool {
-    let b = &mut model.b;
-    if !b.structural_usage(e.0)
-        || b.default_cardinality(e.0) != (0, None)
-        || b.local_multiplicity(e.0) != Some(None)
-        || b.declared_multiplicity_of(e.0).is_some()
+    implicit_open_in(&mut model.b, e.0)
+}
+
+/// [`implicit_open_multiplicity`] on the builder.
+fn implicit_open_in(b: &mut Builder, e: usize) -> bool {
+    if !b.structural_usage(e)
+        || b.default_cardinality(e) != (0, None)
+        || b.local_multiplicity(e) != Some(None)
+        || b.declared_multiplicity_of(e).is_some()
     {
         return false;
     }
     let mut steps = 0;
-    matches!(b.cardinality_subset_targets(e.0, &mut steps), Some(targets) if targets.is_empty())
-        && matches!(b.cardinality_positional_targets(e.0, &mut steps), Some(targets) if targets.is_empty())
+    matches!(b.cardinality_subset_targets(e, &mut steps), Some(targets) if targets.is_empty())
+        && matches!(b.cardinality_positional_targets(e, &mut steps), Some(targets) if targets.is_empty())
 }
 
 /// Current graph expressions admitted by the shared checked providers.
@@ -1123,6 +1771,13 @@ fn checked_multiplicity_evaluator(b: &mut Builder, steps: usize) -> Evaluator<'_
         steps,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
 }
 
@@ -1171,6 +1826,13 @@ pub(crate) fn evaluate_multiplicity_bound(
         steps: *steps,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     };
     let value = match context {
         MultiplicityBoundContext::Lexical => evaluator.expr(scope, expr).ok(),
@@ -1206,6 +1868,13 @@ pub(crate) fn evaluate_feature(model: &mut ResolvedModel, e: ElementRef) -> Resu
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     }
     .feature_value(e.0)
 }
@@ -1235,6 +1904,13 @@ fn evaluate_report_with(
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     };
     let result = evaluate(&mut evaluator);
     evaluator
@@ -1285,15 +1961,24 @@ pub(crate) fn evaluate_chain_of(
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     };
     let v = ev.feature_value(root.0)?;
+    // A host names the root by its element, with no instance around it, so
+    // only a placeholder declared outright has its instances established.
+    let v = {
+        let b = &*ev.b;
+        unestablished(v, &|e| declared_outright(b, e))
+    };
     let index = ev.b.chain_redefinitions();
     if index.is_empty() {
-        let mut v = v;
-        for m in members {
-            v = ev.chain_into(v, m)?;
-        }
-        return Ok(v);
+        return ev.chain_members(v, members);
     }
     ev.walk_chain(&index, Vec::new(), vec![Some(root.0)], v, members)
 }
@@ -1356,25 +2041,39 @@ pub(crate) fn evaluate_value_chain(
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     };
-    let mut value = target;
-    for member in members {
-        value = ev.chain_into(value, member)?;
-    }
-    Ok(value)
+    // A value from outside carries no record of how it was reached, so a
+    // placeholder in it does not fan out.
+    let target = unestablished(target, &|_| false);
+    ev.chain_members(target, members)
 }
 
-/// Evaluate `member` as a chain step off `receiver` — the semantics of
-/// `receiver.member`, so the receiver establishes the featuring context
-/// and its redefinitions shadow inherited values. Returns `None` when
-/// the chain shape does not apply (the receiver evaluates to a scalar,
-/// or cannot reach the member as a chain step) so callers can fall back
-/// to plain own-scope evaluation.
+/// Evaluate `member` as a chain step off the receiver, the last element of
+/// `path` (the elements a qualified name's prefix segments resolve to, in
+/// order), so the receiver establishes the featuring context and its
+/// redefinitions shadow inherited values. The receiver is read for the
+/// segments before it, innermost first (its instance chain, see [`Via`]). A
+/// receiver with no value stands for one instance of it, whatever its
+/// multiplicity but `[0]`, when it is read as each of its instances reads it
+/// (see `Evaluator::faithful`): then this is the member's value for each
+/// instance, where the chain `receiver.member` would read every value of a
+/// receiver of several or unknown count. Returns `None` when the
+/// chain shape does not apply (the receiver evaluates to a scalar, or
+/// cannot reach the member as a chain step) so callers can fall back to
+/// plain own-scope evaluation.
 pub(crate) fn evaluate_member_of(
     model: &mut ResolvedModel,
-    receiver: ElementRef,
+    path: &[ElementRef],
     member: &QualifiedName,
 ) -> Option<Result_> {
+    let &receiver = path.last()?;
     let mut ev = Evaluator {
         b: &mut model.b,
         env: Vec::new(),
@@ -1396,19 +2095,52 @@ pub(crate) fn evaluate_member_of(
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     };
-    let target = match ev.feature_value(receiver.0) {
+    // Each segment is read for the ones before it: the receiver is a feature
+    // of the segment before it, read for the segments before that one.
+    let target = match path.len().checked_sub(2) {
+        Some(at) => {
+            let owner = path[at].0;
+            let chain: Vec<usize> = path[..at].iter().rev().map(|p| p.0).collect();
+            let via = ev.normalized(owner, &chain, true);
+            let scope = ev.b.elem_scope.get(&owner).copied();
+            let context = Context::new(owner, via);
+            ev.in_context(Some(context), |ev| ev.feature_value_in(receiver.0, scope))
+        }
+        None => ev.feature_value(receiver.0),
+    };
+    let target = match target {
         Ok(
             v @ (Value::Element(_)
-            | Value::Unbound(_)
-            | Value::UnboundMember(_)
+            | Value::Unbound(..)
+            | Value::UnboundMember(..)
             | Value::Indeterminate
             | Value::Sequence(_)
             | Value::Instance { .. }),
         ) => v,
         _ => return None,
     };
-    match ev.chain_into(target, member) {
+    let out = match &target {
+        Value::Unbound(..) | Value::UnboundMember(..) => match ev.value_cardinality(&target) {
+            // A receiver for one value or none reads as a chain step does.
+            Some((0, Some(0)) | (1, Some(1))) => ev.chain_members(target, &[member]),
+            // The qualified name names the member's declaration through
+            // the receiver's, and its value is the one every instance of
+            // the receiver has, when the receiver is read as each of its
+            // instances reads it.
+            _ if ev.may_fan_out(&target) => ev.member_value(target, member),
+            _ => ev.chain_members(target, &[member]),
+        },
+        _ => ev.chain_members(target, &[member]),
+    };
+    match out {
         Err(EvalError::Unresolved(_)) => None,
         out => Some(out),
     }
@@ -1439,6 +2171,19 @@ pub const MAX_ALLOCATION: usize = 256 << 20;
 /// recursive calculation that needs more frames than this is a runaway,
 /// not a deep model.
 pub const MAX_CALL_DEPTH: usize = 64;
+/// The most receivers one evaluation records as leaving a chain step
+/// unknown (see `Evaluator::open_receivers`).
+const MAX_OPEN_RECEIVERS: usize = 8;
+/// The most values a chain through unknown instances repeats (see
+/// `Evaluator::chain_members`); a longer result is indeterminate.
+const MAX_REPEATED: usize = 10_000;
+/// The most scopes a walk out from one scope visits (see
+/// `Evaluator::member_namespace`).
+const MAX_SCOPE_WALK: usize = 1024;
+/// The most levels of features specializing one another that
+/// `Evaluator::specialized_within` follows; deeper counts as saying
+/// something.
+const MAX_SPECIALIZER_DEPTH: usize = 8;
 
 #[derive(Clone, Copy)]
 struct CardinalityContext {
@@ -1463,32 +2208,163 @@ struct EnvironmentBinding {
     value: Value,
 }
 
-/// The root reference of a chain of names (`a.b.c`), its members pushed
-/// onto `members` in order; `None` for any other shape.
-fn name_path<'e>(e: &'e Expr, members: &mut Vec<&'e QualifiedName>) -> Option<&'e Expr> {
+/// The expression a chain of names (`x.b.c`) starts from, its members
+/// pushed onto `members` in order: the first expression that is not a
+/// chain step to a name (`x`, or `f(y)` in `f(y).b.c`).
+fn chain_root<'e>(e: &'e Expr, members: &mut Vec<&'e QualifiedName>) -> &'e Expr {
     match &e.kind {
-        ExprKind::Ref(_) => Some(e),
         ExprKind::ChainStep {
             target,
             member: TargetRef::Name(member),
         } => {
-            let root = name_path(target, members)?;
+            let root = chain_root(target, members);
             members.push(member);
-            Some(root)
+            root
         }
-        _ => None,
+        _ => e,
     }
 }
 
-/// Record the element `value` stands for as an instance whose chain
-/// redefinitions start at step `next` of a chain walk.
-fn instance_context(value: &Value, next: usize, contexts: &mut Vec<(usize, usize)>) {
-    if let Value::Element(ElementRef(e))
-    | Value::Unbound(ElementRef(e))
-    | Value::UnboundMember(ElementRef(e)) = value
-    {
-        contexts.push((*e, next));
+/// `value` with no placeholder in it taken as established (see [`Via`]),
+/// except the ones `keep` admits.
+fn unestablished(value: Value, keep: &dyn Fn(usize) -> bool) -> Value {
+    match value {
+        Value::Unbound(e, via) if !keep(e.0) => Value::Unbound(e, via.unestablished()),
+        Value::UnboundMember(e, via) => Value::UnboundMember(e, via.unestablished()),
+        Value::Sequence(items) => Value::Sequence(
+            items
+                .into_iter()
+                .map(|item| unestablished(item, keep))
+                .collect(),
+        ),
+        Value::Instance {
+            ty,
+            ty_name,
+            fields,
+        } => Value::Instance {
+            ty,
+            ty_name,
+            fields: fields
+                .into_iter()
+                .map(|(name, v)| (name, unestablished(v, keep)))
+                .collect(),
+        },
+        v => v,
     }
+}
+
+/// What one chain step maps over (see `Evaluator::chain_receivers`).
+enum Receivers {
+    /// A receiver of unknown or open count: the step is indeterminate.
+    Unknown,
+    /// One receiver.
+    One(Value),
+    /// A placeholder for this exact number (at least two) of instances.
+    Instances(Value, usize),
+    /// Flattened receivers, each one value.
+    Items(Vec<Value>),
+}
+
+/// The outcome of one chain step (see `Evaluator::chain_member`).
+enum ChainStep {
+    /// The step's value.
+    Next(Value),
+    /// A placeholder for this many instances to fan out from.
+    FanOut(Value, usize),
+    /// The chain's value, whatever its remaining steps.
+    Done(Value),
+}
+
+/// Whether `e` is a usage declared in usages alone up to a package: one
+/// declared instance (or a member of one), not a definition's member that
+/// every instance of the definition has.
+fn declared_outright(b: &Builder, e: usize) -> bool {
+    is_a!(b.elements[e], "Usage")
+        && declared_owners(b, e)
+            .iter()
+            .take_while(|&&o| is_a!(b.elements[o], "Type"))
+            .all(|&o| is_a!(b.elements[o], "Usage"))
+}
+
+/// The namespaces around `e`'s declaration, innermost first.
+fn declared_owners(b: &Builder, e: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut current = b.owner_elem(e);
+    while let Some(owner) = current {
+        if out.len() >= MAX_CALL_DEPTH {
+            break;
+        }
+        out.push(owner);
+        current = b.owner_elem(owner);
+    }
+    out
+}
+
+/// A chain's values: one value is the value itself, any other number a
+/// sequence (KerML values are flat sequences).
+fn one_or_sequence(mut values: Vec<Value>) -> Value {
+    match values.len() {
+        1 => values.pop().expect("one value"),
+        _ => Value::Sequence(values),
+    }
+}
+
+/// Record the element `value` stands for, with its instances, as an
+/// instance whose chain redefinitions start at step `next` of a chain walk.
+fn instance_context(value: &Value, next: usize, contexts: &mut Vec<(usize, Via, usize)>) {
+    match value {
+        Value::Element(ElementRef(e)) => contexts.push((*e, Via::declared(), next)),
+        Value::Unbound(ElementRef(e), via) | Value::UnboundMember(ElementRef(e), via) => {
+            contexts.push((*e, via.clone(), next))
+        }
+        _ => {}
+    }
+}
+
+/// Where an expression is read: in `namespace` (the receiver whose members
+/// it belongs to), which is read for the instances `via`. Names in the
+/// expression resolve where they are written; a feature they find in a
+/// namespace around `namespace` that an instance stands for is read as that
+/// instance's version, in it (see `Evaluator::retarget`).
+#[derive(Clone, Debug)]
+struct Context {
+    namespace: usize,
+    via: Via,
+    /// The context's levels (`Evaluator::aligned`), filled on first use and
+    /// shared by the context's clones.
+    aligned: std::rc::Rc<std::cell::OnceCell<Arc<Aligned>>>,
+}
+
+impl Context {
+    fn new(namespace: usize, via: Via) -> Context {
+        Context {
+            namespace,
+            via,
+            aligned: Default::default(),
+        }
+    }
+}
+
+/// What a binding gives a feature (see `Evaluator::bound_value`).
+enum Bound {
+    /// No binding names the feature where it is read.
+    None,
+    /// The other end's value.
+    Settled(Value),
+    /// Bindings name the feature, but none settles a value: an unvalued
+    /// other end, or one that comes back round to the feature.
+    Unsettled,
+}
+
+/// Where a feature reached by a lookup is read for an instance of the
+/// context (see `Evaluator::retarget`).
+enum Retarget {
+    /// The instance's version of the feature, in the instance.
+    To(usize, Context),
+    /// The instance inherits two redefinitions of the feature that agree on
+    /// nothing (one path redefines it by name, another under another name
+    /// with a value of its own): no reading is the instance's.
+    Disagreeing,
 }
 
 /// The features a unit expansion asked the value of while it was being
@@ -1551,6 +2427,63 @@ struct Evaluator<'m> {
     /// classification and the reflection intrinsics. Never set for model
     /// feature values — corpus evaluation semantics must not drift.
     query: bool,
+    /// The receivers whose count left a chain step unknown (placeholders
+    /// of unknown or open multiplicity), first first and each once, at
+    /// most [`MAX_OPEN_RECEIVERS`]: what explains an indeterminate verdict.
+    open_receivers: Vec<usize>,
+    /// How many reads could not be taken for the instances they were read
+    /// for (see `Evaluator::faithful`). A fan-out repeats a value only when
+    /// its evaluation made no such read.
+    lossy_reads: usize,
+    /// The namespace the expression in evaluation is read in, with the
+    /// instances that stand for the namespaces around it (see [`Context`]);
+    /// `None` reads every name where it is declared.
+    context: Option<Context>,
+    /// What the fan-out's checks found, by element and instances.
+    guard_memo: GuardMemo,
+    /// How many fan-outs are evaluating their one instance. Reads are
+    /// checked for faithfulness only inside one, where [`Self::lossy_reads`]
+    /// decides whether the result stands for every instance.
+    fanning: usize,
+    /// How many bindings are being followed to their other end (a budget,
+    /// [`MAX_CALL_DEPTH`]: a chain of bindings that long is a runaway).
+    binding_depth: usize,
+    /// The features, each with the instances it is read for, whose bindings
+    /// the outermost binding read in progress has already followed without
+    /// settling them: a second visit adds nothing, so a densely bound
+    /// component is walked once, not once per path through it. Cleared when
+    /// that read ends.
+    binding_unsettled: HashSet<BindingVisit>,
+}
+
+/// A feature whose bindings are followed, with the namespace and the
+/// instances it is read for ([`Evaluator::binding_unsettled`]).
+type BindingVisit = (usize, usize, Vec<usize>, bool);
+
+/// Answers of the guard's and the context's walks (`Evaluator::faithful`,
+/// `Evaluator::reads_as_declared`, `Evaluator::specializes_cleanly`,
+/// `Evaluator::general_closure`, `Evaluator::aligned`, …), which depend on
+/// the model alone.
+#[derive(Default)]
+struct GuardMemo {
+    faithful: IdMap<usize, IdMap<Vec<usize>, bool>>,
+    reads: IdMap<(usize, usize), bool>,
+    cleanly: IdMap<(usize, usize), bool>,
+    generals: IdMap<usize, Arc<HashSet<usize>>>,
+    /// The namespaces around each element's declaration.
+    owners: IdMap<usize, Arc<[usize]>>,
+    /// Each feature with the features it redefines, transitively.
+    redefined: IdMap<usize, Arc<[usize]>>,
+    /// `Evaluator::member_namespace` by (feature, scope).
+    namespaces: IdMap<(usize, usize), Option<usize>>,
+}
+
+/// The levels of a context (see `Evaluator::aligned`): its instance chain,
+/// and for each of the first instances the type declared in the same place.
+#[derive(Debug)]
+struct Aligned {
+    instances: Vec<usize>,
+    levels: Vec<usize>,
 }
 
 impl Evaluator<'_> {
@@ -1576,7 +2509,7 @@ impl Evaluator<'_> {
     /// anything inside a library evaluation frame keep the closed
     /// [`Value::Element`] convention. Non-feature elements (packages,
     /// definitions referenced as values) are closed element values.
-    fn placeholder(&mut self, e: usize) -> Value {
+    fn placeholder(&mut self, e: usize, via: Via) -> Value {
         let ty = self.b.elements[e].ty;
         let feature_like = ty.ends_with("Usage")
             || matches!(
@@ -1601,13 +2534,559 @@ impl Evaluator<'_> {
         let unknown_member = self.receiver_member(e).is_some();
         if feature_like && !variant && (self.lib_frames == 0 || unknown_member) {
             if unknown_member {
-                Value::UnboundMember(ElementRef(e))
+                Value::UnboundMember(ElementRef(e), via)
             } else {
-                Value::Unbound(ElementRef(e))
+                Value::Unbound(ElementRef(e), via)
             }
         } else {
             Value::Element(ElementRef(e))
         }
+    }
+
+    /// `links`, the instances read for the namespaces around `anchor`
+    /// innermost first, less the trailing links that are the declared
+    /// namespaces themselves (see [`Via`]); `known` when the evaluation
+    /// established them.
+    fn normalized(&self, anchor: usize, links: &[usize], known: bool) -> Via {
+        let mut keep = links.len();
+        while keep > 0 {
+            let inner = match keep {
+                1 => anchor,
+                n => links[n - 2],
+            };
+            if self.b.owner_elem(inner) != Some(links[keep - 1]) {
+                break;
+            }
+            keep -= 1;
+        }
+        Via::new(&links[..keep], known)
+    }
+
+    /// The namespaces around the context's namespace that instances stand
+    /// for, outward: the context's instance chain ([`Self::expanded`]) and,
+    /// for each of its first instances, the type its declaration is nested
+    /// in at the same place. The levels line up while each instance is the
+    /// declared type or specializes it.
+    fn aligned(&mut self, context: &Context) -> Arc<Aligned> {
+        if let Some(aligned) = context.aligned.get() {
+            return Arc::clone(aligned);
+        }
+        let instances = self.expanded(context.namespace, &context.via);
+        let mut levels = Vec::new();
+        let mut declared = self.b.owner_elem(context.namespace);
+        for &instance in &instances {
+            let Some(d) = declared.filter(|&d| is_a!(self.b.elements[d], "Type")) else {
+                break;
+            };
+            if instance != d && !self.b.indexed_conforms(instance, d) {
+                break;
+            }
+            levels.push(d);
+            declared = self.b.owner_elem(d);
+        }
+        let aligned = Arc::new(Aligned { instances, levels });
+        let _ = context.aligned.set(Arc::clone(&aligned));
+        aligned
+    }
+
+    /// The instance chain `e` is read for: the instances of `via`, then the
+    /// namespaces declared around the last of them (around `e` when there are
+    /// none), innermost first.
+    fn expanded(&mut self, e: usize, via: &Via) -> Vec<usize> {
+        let mut chain = via.links().to_vec();
+        let last = chain.last().copied().unwrap_or(e);
+        chain.extend(self.declared_owners(last).iter());
+        chain
+    }
+
+    /// The instances that stand for namespace `n` and the namespaces around
+    /// it, innermost first, where the evaluation is read, and whether the
+    /// evaluation established them: the context's own for its namespace or
+    /// one nested in it, the ones the context lines up with a namespace
+    /// around it ([`Self::aligned`]), and `n` itself as declared otherwise —
+    /// not established when the context stands for instances and none
+    /// stands for `n`.
+    fn chain_for(&mut self, n: usize) -> (Vec<usize>, bool) {
+        let Some(context) = self.context.clone() else {
+            return (vec![n], true);
+        };
+        if context.via.is_declared() {
+            return (vec![n], context.via.known);
+        }
+        self.chain_for_uncached(n, &context)
+    }
+
+    fn chain_for_uncached(&mut self, n: usize, context: &Context) -> (Vec<usize>, bool) {
+        let mut chain = Vec::new();
+        let mut current = Some(n);
+        while let Some(c) = current.filter(|_| chain.len() < MAX_CALL_DEPTH) {
+            chain.push(c);
+            if c == context.namespace {
+                chain.extend_from_slice(context.via.links());
+                return (chain, context.via.known);
+            }
+            current = self.b.owner_elem(c);
+        }
+        let aligned = self.aligned(context);
+        if let Some(at) = aligned.levels.iter().position(|&declared| declared == n) {
+            return (aligned.instances[at..].to_vec(), context.via.known);
+        }
+        (vec![n], false)
+    }
+
+    /// The namespace on the way out from `scope` through which a lookup
+    /// reaches `e` as a member: the first that is `e`'s owner or specializes
+    /// it. `None` when no type owns `e`.
+    fn member_namespace(&mut self, e: usize, scope: usize) -> Option<usize> {
+        if let Some(&answer) = self.guard_memo.namespaces.get(&(e, scope)) {
+            return answer;
+        }
+        let answer = self.member_namespace_uncached(e, scope);
+        self.guard_memo.namespaces.insert((e, scope), answer);
+        answer
+    }
+
+    fn member_namespace_uncached(&mut self, e: usize, scope: usize) -> Option<usize> {
+        let owner = self.b.owner_elem(e)?;
+        if !is_a!(self.b.elements[owner], "Type") {
+            return None;
+        }
+        let mut current = Some(scope);
+        for _ in 0..MAX_SCOPE_WALK {
+            let s = current?;
+            if let Some(n) = self.b.scope_owner(s) {
+                if n == owner || self.b.indexed_conforms(n, owner) {
+                    return Some(n);
+                }
+            }
+            current = self.b.scope_parent(s);
+        }
+        None
+    }
+
+    /// The instances a placeholder for `e` is read for, when a lookup from
+    /// `scope` (or where `e` is declared) reaches it: those of the namespace
+    /// it is a member of there. A feature no type owns is read the same
+    /// wherever it is reached; one whose namespace the lookup does not pass
+    /// has no instances established.
+    fn via_of(&mut self, e: usize, scope: Option<usize>) -> Via {
+        if !self
+            .b
+            .owner_elem(e)
+            .is_some_and(|o| is_a!(self.b.elements[o], "Type"))
+        {
+            return Via::declared();
+        }
+        let Some(n) = scope
+            .or_else(|| self.b.owner_scope_of(e))
+            .and_then(|s| self.member_namespace(e, s))
+        else {
+            return Via::default();
+        };
+        // A member the context's namespace declares, when that namespace is
+        // read as declared, is read as declared too.
+        if let Some(context) = &self.context {
+            if context.namespace == n
+                && context.via.is_declared()
+                && self.b.owner_elem(e) == Some(n)
+            {
+                return context.via.clone();
+            }
+        }
+        let (chain, known) = self.chain_for(n);
+        self.normalized(e, &chain, known)
+    }
+
+    /// The context an expression evaluated in `scope` is read in, given the
+    /// evaluation's: the namespace `scope` belongs to, with the instances
+    /// that stand for those around it. `None` when nothing stands for them
+    /// and the reading is established. An instance standing for the
+    /// namespace itself is no place to read it (that instance's version of
+    /// a feature is read in it instead, see [`Self::retarget`]): the
+    /// expression reads as declared, a read not taken for its instances.
+    fn context_at(&mut self, scope: usize) -> Option<Context> {
+        let context = self.context.clone()?;
+        if context.via.is_declared() && context.via.known {
+            return None;
+        }
+        let n = self.b.nearest_scope_owner(scope)?;
+        if n == context.namespace {
+            return Some(context);
+        }
+        let (chain, known) = self.chain_for(n);
+        let (&first, rest) = chain.split_first()?;
+        if first != n {
+            self.lossy_reads += 1;
+            return Some(Context::new(n, Via::default()));
+        }
+        let via = self.normalized(n, rest, known);
+        (!via.is_declared() || !via.known).then_some(Context::new(n, via))
+    }
+
+    /// Where `e`, reached by a lookup from `scope`, is read when the
+    /// namespace it is a member of there is one an instance of the context
+    /// stands for: that instance's version of `e` ([`Self::version_in`]), in
+    /// that instance. `Quad::each`, read from `Quad::spare` for `drone`, is
+    /// `drone`'s `attribute :>> each = 0.6;`.
+    fn retarget(&mut self, e: usize, scope: usize) -> Option<Retarget> {
+        let context = self.context.clone().filter(|c| !c.via.is_declared())?;
+        let n = self.member_namespace(e, scope)?;
+        let aligned = self.aligned(&context);
+        let at = aligned
+            .levels
+            .iter()
+            .zip(&aligned.instances)
+            .position(|(&declared, &instance)| declared == n && instance != declared)?;
+        let (instance, rest) = (aligned.instances[at], aligned.instances[at + 1..].to_vec());
+        // An instance whose version of `e` its name does not find reads `e`
+        // itself, a read not taken for the instance.
+        let version = match self.version_in(instance, e) {
+            Some(version) => version,
+            None => {
+                self.lossy_reads += 1;
+                e
+            }
+        };
+        if self.disagreeing(instance, e, version) {
+            return Some(Retarget::Disagreeing);
+        }
+        let via = self.normalized(instance, &rest, context.via.known);
+        Some(Retarget::To(version, Context::new(instance, via)))
+    }
+
+    /// Whether `instance` inherits, on another path than `version`'s, a
+    /// redefinition of `e` that neither specializes `version` nor is
+    /// specialized by it (`mix : H1, R1` where `H1` redefines `each` by name
+    /// and `R1` as `w :>> each = 0.9`): the paths disagree, and no one
+    /// reading is the instance's. When no version was settled on (`version`
+    /// is `e` itself: the lookup was ambiguous, or found `e` past a renamed
+    /// redefinition), any redefinition the instance inherits disagrees with
+    /// the declaration.
+    fn disagreeing(&mut self, instance: usize, e: usize, version: usize) -> bool {
+        let index = self.b.feature_specializers();
+        let Some(specializers) = index.get(&e) else {
+            return false;
+        };
+        let generals = self.general_closure(instance);
+        for (f, links) in specializers {
+            if !links.is_empty() || *f == version {
+                continue;
+            }
+            let redefines = self
+                .b
+                .explicit_specialization_elems(*f)
+                .iter()
+                .any(|(kind, target)| *kind == "Redefinition" && *target == e);
+            if !redefines {
+                continue;
+            }
+            let Some(owner) = self.b.owner_elem(*f) else {
+                continue;
+            };
+            if generals.contains(&owner)
+                && (version == e
+                    || (!self.b.indexed_conforms(version, *f)
+                        && !self.b.indexed_conforms(*f, version)))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `instance`'s feature of `e`'s name, when it is `e` or redefines it:
+    /// explicitly, or by name in a type that specializes `e`'s owner (the
+    /// resolver's same-name shadowing). Unrelated declarations of the name,
+    /// imported or local, do not count.
+    fn version_in(&mut self, instance: usize, e: usize) -> Option<usize> {
+        let value = self.b.id_name(e)?;
+        let name = Name {
+            value,
+            span: Span::default(),
+        };
+        let sub = self.b.elem_scope.get(&instance).copied();
+        let hit = self.b.resolve_rest(instance, sub, &[name], 0)?;
+        let hit_owner = self.b.owner_elem(hit)?;
+        if !self.b.indexed_conforms(instance, hit_owner) {
+            return None;
+        }
+        if self.b.indexed_conforms(hit, e) {
+            return Some(hit);
+        }
+        // SysML also permits redefinition by name in a specializing type,
+        // without an explicit `:>>` edge. Unrelated locals with the same name
+        // do not satisfy this owner relationship, and neither does a feature
+        // that subsets or redefines another one (`:>> Other::each`).
+        if self.b.elements[hit].ty.ends_with("Usage")
+            && self
+                .b
+                .explicit_specialization_elems(hit)
+                .iter()
+                .all(|(kind, _)| matches!(*kind, "FeatureTyping" | "Subclassification"))
+        {
+            let base_owner = self.b.owner_elem(e)?;
+            if hit_owner != base_owner
+                && self.b.indexed_conforms(hit_owner, base_owner)
+                && !self.b.indexed_conforms(base_owner, hit_owner)
+            {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    /// A valued chain redefinition in a type around `instance` (an instance
+    /// of its `via`, or a namespace its declaration is nested in) that covers
+    /// the path from that type's member down to `feature`, read for
+    /// `instance`: the redefining feature and the context to read it in.
+    /// `attribute :>> b.kb = 9;` in `a6` is `kb` for `a6.b`, wherever `kb` is
+    /// read for it; a definition's own `attribute :>> a.b.kb = 4;` is `kb`
+    /// for its `a.b`.
+    fn outer_chain_redefinition(
+        &mut self,
+        instance: usize,
+        feature: usize,
+        via: &Via,
+    ) -> Option<(usize, Context)> {
+        let index = self.b.chain_redefinitions();
+        if index.is_empty() {
+            return None;
+        }
+        // The types around the instance, innermost first, up to a package.
+        let outers: Vec<usize> = self
+            .expanded(instance, via)
+            .into_iter()
+            .take_while(|&n| is_a!(self.b.elements[n], "Type"))
+            .collect();
+        if outers.is_empty() {
+            return None;
+        }
+        // The path outermost first, and each outer type with the step its
+        // chains start at, nearest first.
+        let mut steps: Vec<Option<usize>> = outers.iter().rev().map(|&l| Some(l)).collect();
+        steps.extend([Some(instance), Some(feature)]);
+        let contexts = outers
+            .iter()
+            .enumerate()
+            .map(|(at, &outer)| {
+                let via = self.normalized(outer, &outers[at + 1..], via.known);
+                (outer, via, outers.len() - at)
+            })
+            .collect::<Vec<_>>();
+        // A redefinition through a feature the path's step only specializes
+        // (`b1 :> bs` for a step through `bs`) is some of its values', not
+        // the path's.
+        let (redefining, outer, via) = self.chain_redefinition(&index, &contexts, &steps, true)?;
+        Some((redefining, Context::new(outer, via)))
+    }
+
+    /// The value a binding connector gives `e`, read from `ctx` (or where it
+    /// is declared): a binding owned by a type around the namespace `e` is
+    /// read in, or by a general of one, whose one end names the path from
+    /// that type down to `e` (strictly, each step the link or specializing
+    /// it) has `e`'s value at its other end, read for that type. `bind each
+    /// = six;` in `bound : Quad` makes `each` read `six` wherever it is read
+    /// for `bound`; `bind b.kb = z;` makes `kb` read `z` for `b`. Every
+    /// binding naming `e` is tried, in whatever order they are written; the
+    /// first whose other end settles gives the value ([`Bound::Settled`]).
+    /// Ends that settle nothing, and a binding that comes back round to a
+    /// feature whose bindings are being followed, leave `e`
+    /// [`Bound::Unsettled`]: the caller lets a default apply at the top of a
+    /// read, and otherwise reads a placeholder whose instances are not
+    /// established, so no chain takes it for several instances ([`Via`]). A
+    /// value of `e`'s own that is no default is kept (the caller does not
+    /// ask).
+    fn bound_value(&mut self, e: usize, ctx: Option<usize>) -> Result<Bound, EvalError> {
+        let index = self.b.binding_ends();
+        // Bindings name the features they bind, or features those redefine:
+        // a feature none of them names is bound by nothing.
+        if index.by_owner.is_empty()
+            || !self
+                .redefined_closure(e)
+                .iter()
+                .any(|f| index.named.contains(f))
+        {
+            return Ok(Bound::None);
+        }
+        let Some(n) = ctx
+            .or_else(|| self.b.owner_scope_of(e))
+            .and_then(|s| self.member_namespace(e, s))
+        else {
+            return Ok(Bound::None);
+        };
+        let (chain, known) = self.chain_for(n);
+        if chain.first() != Some(&n) {
+            return Ok(Bound::None);
+        }
+        let via = self.normalized(n, &chain[1..], known);
+        let outers: Vec<usize> = self
+            .expanded(n, &via)
+            .into_iter()
+            .take_while(|&t| is_a!(self.b.elements[t], "Type"))
+            .collect();
+        // The path outermost first, and each type on it with the step its
+        // bindings' ends start at, nearest first.
+        let mut steps: Vec<usize> = outers.iter().rev().copied().collect();
+        steps.extend([n, e]);
+        let mut contexts: Vec<(usize, Via, usize)> = vec![(n, via.clone(), steps.len() - 1)];
+        contexts.extend(outers.iter().enumerate().map(|(at, &outer)| {
+            let via = self.normalized(outer, &outers[at + 1..], known);
+            (outer, via, outers.len() - at)
+        }));
+        let key = (e, usize::MAX - 1);
+        let visit: BindingVisit = (e, n, via.instances().map(|i| i.0).collect(), via.known);
+        if self.binding_unsettled.contains(&visit) || !self.in_progress.insert(key) {
+            // Come back round to a feature whose bindings are being followed,
+            // or were followed in this read without settling it.
+            return Ok(Bound::Unsettled);
+        }
+        if self.binding_depth >= MAX_CALL_DEPTH {
+            self.in_progress.remove(&key);
+            return Err(EvalError::Budget(format!(
+                "evaluation followed more than {MAX_CALL_DEPTH} bindings in a row"
+            )));
+        }
+        self.binding_depth += 1;
+        let out = self.bound_value_in(&index, &steps, &contexts);
+        self.binding_depth -= 1;
+        self.in_progress.remove(&key);
+        if self.binding_depth == 0 {
+            self.binding_unsettled.clear();
+        } else if matches!(out, Ok(Bound::Unsettled)) {
+            self.binding_unsettled.insert(visit);
+        }
+        out
+    }
+
+    /// [`Self::bound_value`] over the bindings of `contexts`' types and their
+    /// explicit generals, nearest first.
+    fn bound_value_in(
+        &mut self,
+        index: &crate::json::BindingEnds,
+        steps: &[usize],
+        contexts: &[(usize, Via, usize)],
+    ) -> Result<Bound, EvalError> {
+        // Every binding naming the feature is an equality; the first whose
+        // other end settles gives the value, whatever the order they are
+        // written in. One that settles nothing (`bind x = y;` with `y`
+        // unvalued) leaves the rest their say.
+        let mut unsettled = false;
+        // An end with a value nobody knows (`bind x = y;` with `y`
+        // redefined two ways) still fixes the feature: no default applies.
+        let mut unknown = false;
+        for (t, via_t, start) in contexts {
+            let covered = &steps[*start..];
+            let mut queue = std::collections::VecDeque::from([*t]);
+            let mut seen = HashSet::from([*t]);
+            while let Some(owner) = queue.pop_front() {
+                let bindings: Vec<(Vec<usize>, Vec<usize>)> = index
+                    .by_owner
+                    .get(&owner)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, a, b)| (a.clone(), b.clone()))
+                    .collect();
+                for (a, b) in bindings {
+                    self.steps += 1;
+                    if self.steps > MAX_STEPS {
+                        return Err(EvalError::Budget(format!(
+                            "evaluation took more than {MAX_STEPS} steps"
+                        )));
+                    }
+                    let other = if self.end_covers(&a, covered) {
+                        b
+                    } else if self.end_covers(&b, covered) {
+                        a
+                    } else {
+                        continue;
+                    };
+                    let context = Context::new(*t, via_t.clone());
+                    // An end whose value comes back round to this feature
+                    // (`in y = x; bind x = b.y;`) is an equality nothing
+                    // settles, not a cyclic value.
+                    let value = match self.in_context(Some(context), |ev| ev.end_value(*t, &other))
+                    {
+                        Err(EvalError::Cycle(_)) => None,
+                        value => value?,
+                    };
+                    match value {
+                        Some(Value::Indeterminate) => unknown = true,
+                        Some(Value::Unbound(..) | Value::UnboundMember(..)) | None => {
+                            unsettled = true
+                        }
+                        Some(value) => return Ok(Bound::Settled(value)),
+                    }
+                }
+                if seen.len() < MAX_CALL_DEPTH {
+                    for general in self.b.explicit_supertype_elems(owner) {
+                        if seen.insert(general) {
+                            queue.push_back(general);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(if unknown {
+            Bound::Settled(Value::Indeterminate)
+        } else if unsettled {
+            Bound::Unsettled
+        } else {
+            Bound::None
+        })
+    }
+
+    /// Whether a binding end's `links` name the path `covered`: as many
+    /// links as steps, each step the link or specializing it.
+    fn end_covers(&mut self, links: &[usize], covered: &[usize]) -> bool {
+        links.len() == covered.len()
+            && links
+                .iter()
+                .zip(covered)
+                .all(|(&link, &step)| self.b.indexed_conforms(step, link))
+    }
+
+    /// The value of a binding end, `links` read from the type `t` that the
+    /// binding is read for: the first link as `t`'s feature, each later one
+    /// as a member of the value so far. `None` when a link has no name to
+    /// read it by.
+    fn end_value(&mut self, t: usize, links: &[usize]) -> Result<Option<Value>, EvalError> {
+        let Some((&first, rest)) = links.split_first() else {
+            return Ok(None);
+        };
+        let scope = self.b.elem_scope.get(&t).copied();
+        // The link as the type `t` has it: its redefinition by name, when the
+        // binding is inherited (`bind x = y;` in a general, `:>> y = 7;` in
+        // `t`).
+        let version = self.version_in(t, first).unwrap_or(first);
+        // A link `t` redefines otherwise as well (under another name, or
+        // two ways on different paths) has no reading that is `t`'s.
+        if self.disagreeing(t, first, version) {
+            return Ok(Some(Value::Indeterminate));
+        }
+        let mut value = self.feature_value_in(version, scope)?;
+        for &link in rest {
+            let Some(name) = self.b.id_name(link) else {
+                return Ok(None);
+            };
+            let qn = QualifiedName {
+                is_global: false,
+                segments: vec![Name {
+                    value: name,
+                    span: Span::default(),
+                }],
+                span: Span::default(),
+            };
+            value = self.member_value(value, &qn)?;
+        }
+        Ok(Some(value))
+    }
+
+    /// Run `f` with the evaluation read in `context`.
+    fn in_context<T>(&mut self, context: Option<Context>, f: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = std::mem::replace(&mut self.context, context);
+        let out = f(self);
+        self.context = previous;
+        out
     }
 
     /// Intersect visibility atomically: proof failure leaves every frame intact.
@@ -1663,6 +3142,67 @@ impl Evaluator<'_> {
         if let Some(v) = self.overrides.get(&e) {
             return Ok(v.clone());
         }
+        // A feature of a namespace that an instance stands for is the
+        // instance's version, read in the instance.
+        match ctx.and_then(|scope| self.retarget(e, scope)) {
+            Some(Retarget::To(version, context)) => {
+                if let Some((redefining, outer)) =
+                    self.outer_chain_redefinition(context.namespace, version, &context.via)
+                {
+                    let scope = self.b.elem_scope.get(&outer.namespace).copied();
+                    return self
+                        .in_context(Some(outer), |ev| ev.feature_value_in(redefining, scope));
+                }
+                let scope = self.b.elem_scope.get(&context.namespace).copied();
+                return self.in_context(Some(context), |ev| ev.feature_value_in(version, scope));
+            }
+            Some(Retarget::Disagreeing) => return Ok(Value::Indeterminate),
+            None => {}
+        }
+        // A type around the namespace the feature is read in may redefine it
+        // as a chain through that namespace (`attribute :>> b.kb = 9;`
+        // around `b`, for `kb` read in `b`).
+        if let Some(scope) = ctx
+            .filter(|_| self.unbound_receiver.is_none() && !self.b.chain_redefinitions().is_empty())
+        {
+            if let Some(n) = self.member_namespace(e, scope) {
+                let (chain, known) = self.chain_for(n);
+                if chain.first() == Some(&n) {
+                    let via = self.normalized(n, &chain[1..], known);
+                    if let Some((redefining, outer)) = self.outer_chain_redefinition(n, e, &via) {
+                        let scope = self.b.elem_scope.get(&outer.namespace).copied();
+                        return self
+                            .in_context(Some(outer), |ev| ev.feature_value_in(redefining, scope));
+                    }
+                }
+            }
+        }
+        // A binding in a type around the namespace the feature is read in
+        // (`bind each = six;`) gives it the other end's value, unless it has
+        // a value of its own that is no default. Library calculation bodies
+        // keep their closed convention and follow none.
+        let own_value = self.b.values.contains_key(&e) && !self.b.default_values.contains(&e);
+        if !own_value && self.lib_frames == 0 {
+            // A bound's feature is read for the bound's receiver.
+            let site = ctx.or_else(|| self.cardinality_context.and_then(|c| c.scope));
+            match self.bound_value(e, site)? {
+                Bound::Settled(value) => return Ok(value),
+                // While another binding is being followed, a default of the
+                // feature settles nothing (it would stand in for the value
+                // that binding is looking for); read at the top, the default
+                // applies, and a feature with none is unknown, not one of
+                // several known instances.
+                Bound::Unsettled => {
+                    let default =
+                        self.b.default_values.contains(&e) || self.inherited_default(e).is_some();
+                    if self.binding_depth > 0 || !default {
+                        let via = self.via_of(e, ctx);
+                        return Ok(self.placeholder(e, via.unestablished()));
+                    }
+                }
+                Bound::None => {}
+            }
+        }
         let (scope, expr, inherited, origin) = match self.b.values.get(&e).cloned() {
             Some((s, x)) => (s, x, false, e),
             // A redefining feature with no value of its own inherits a
@@ -1679,7 +3219,10 @@ impl Evaluator<'_> {
                 _ => {
                     return Ok(match self.singleton_subset_value(e, ctx) {
                         Some(value) => value,
-                        None => self.placeholder(e),
+                        None => {
+                            let via = self.via_of(e, ctx);
+                            self.placeholder(e, via)
+                        }
                     });
                 }
             },
@@ -1747,7 +3290,8 @@ impl Evaluator<'_> {
         if !self.in_progress.insert((e, scope)) {
             if inherited && self.report.is_none() {
                 self.inherited_failure_epoch = self.inherited_failure_epoch.saturating_add(1);
-                return Ok(self.placeholder(e));
+                let via = self.via_of(e, Some(scope));
+                return Ok(self.placeholder(e, via));
             }
             let name = self.b.elements[e]
                 .props
@@ -1758,7 +3302,8 @@ impl Evaluator<'_> {
             let error = EvalError::Cycle(name);
             if inherited {
                 self.record_inherited_failure(dependency, expr.span, error);
-                return Ok(self.placeholder(e));
+                let via = self.via_of(e, Some(scope));
+                return Ok(self.placeholder(e, via));
             }
             return Err(error);
         }
@@ -1776,7 +3321,8 @@ impl Evaluator<'_> {
         let saved_origin = self.b.set_identity_origin(origin);
         let lexical = self.lexical_scope;
         self.lexical_scope = Some(declaration);
-        let out = self.expr(scope, expr);
+        let context = self.context_at(scope);
+        let out = self.in_context(context, |ev| ev.expr(scope, expr));
         self.lexical_scope = lexical;
         self.b.identity_origin_unit = saved_origin;
         self.restore_frames(hidden);
@@ -1789,7 +3335,8 @@ impl Evaluator<'_> {
         match out {
             Err(error) if inherited => {
                 self.record_inherited_failure(dependency, expr.span, error);
-                Ok(self.placeholder(e))
+                let via = self.via_of(e, Some(scope));
+                Ok(self.placeholder(e, via))
             }
             result => result,
         }
@@ -2102,7 +3649,9 @@ impl Evaluator<'_> {
                 if operands.len() == 1 {
                     return match operator {
                         BinaryOp::Add => Some(first),
-                        BinaryOp::Sub => arith(BinaryOp::Sub, Value::Integer(0), first).ok(),
+                        BinaryOp::Sub => {
+                            arith(BinaryOp::Sub, Value::Integer(0), first, self.b).ok()
+                        }
                         _ => None,
                     };
                 }
@@ -2111,7 +3660,7 @@ impl Evaluator<'_> {
                 }
                 let second =
                     self.certified_multiplicity_value(operands[1], context, operators, depth + 1)?;
-                arith(*operator, first, second).ok()
+                arith(*operator, first, second, self.b).ok()
             }
             _ => None,
         }
@@ -2174,8 +3723,28 @@ impl Evaluator<'_> {
         original: usize,
         context: Option<usize>,
     ) -> Option<Value> {
-        let (target, rebased) = self.cardinality_reference_target(original, context)?;
-        self.cardinality_feature_value(target, context, rebased)
+        if let Some((target, rebased)) = self.cardinality_reference_target(original, context) {
+            return self.cardinality_feature_value(target, context, rebased);
+        }
+        // A feature of a type around the receiver (`:>> n = k;` with `k` in
+        // the enclosing definition) is the version of the instance standing
+        // for that type, when the receiver is read for one, read in that
+        // instance's scope so what its value names is selected there.
+        let receiver = context.and_then(|s| self.b.scope_owner(s))?;
+        let owner = self.b.owner_elem(original)?;
+        if !is_a!(self.b.elements[owner], "Type") || self.b.conforms_upward(receiver, owner) {
+            return None;
+        }
+        let scope = *self.b.elem_scope.get(&receiver)?;
+        match self.retarget(original, scope)? {
+            Retarget::To(version, instance) => {
+                let scope = self.b.elem_scope.get(&instance.namespace).copied();
+                self.in_context(Some(instance), |ev| {
+                    ev.cardinality_feature_value(version, scope, true)
+                })
+            }
+            Retarget::Disagreeing => None,
+        }
     }
 
     fn cardinality_reference_target(
@@ -2356,16 +3925,32 @@ impl Evaluator<'_> {
     }
 
     fn value_cardinality(&mut self, value: &Value) -> Option<Cardinality> {
-        let (Value::Unbound(ElementRef(e)) | Value::UnboundMember(ElementRef(e))) = value else {
+        let (Value::Unbound(ElementRef(e), via) | Value::UnboundMember(ElementRef(e), via)) = value
+        else {
             return None;
         };
         let previous = self.unbound_receiver;
-        if matches!(value, Value::UnboundMember(_)) {
+        if matches!(value, Value::UnboundMember(..)) {
             // A symbolic bound must not become concrete by reading a default
             // on the type of an unknown receiver.
             self.unbound_receiver = self.b.owner_elem(*e);
         }
-        let result = self.unbound_cardinality(*e);
+        // The count is the instance's: bounds select their features in the
+        // instance the placeholder is read for, and a feature of a type
+        // around it in the instance standing for that type.
+        let (context, reading) = match via.links().split_first() {
+            Some((&instance, rest)) => (
+                self.b.elem_scope.get(&instance).copied(),
+                Some(Context::new(
+                    instance,
+                    self.normalized(instance, rest, via.known),
+                )),
+            ),
+            None => (self.b.owner_scope_of(*e), None),
+        };
+        let reading = std::mem::replace(&mut self.context, reading);
+        let result = self.cardinality_in(*e, context, &mut HashMap::new());
+        self.context = reading;
         self.unbound_receiver = previous;
         result
     }
@@ -2385,13 +3970,19 @@ impl Evaluator<'_> {
             Value::String(s) => s.len(),
             _ => return Ok(value),
         };
+        self.charge_allocation(bytes)?;
+        Ok(value)
+    }
+
+    /// Reserve allocation budget before copying a value's payload.
+    fn charge_allocation(&mut self, bytes: usize) -> Result<(), EvalError> {
         self.allocated = self.allocated.saturating_add(bytes);
         if self.allocated > MAX_ALLOCATION {
             return Err(EvalError::Budget(format!(
                 "evaluation materialized more than {MAX_ALLOCATION} bytes of sequences and strings"
             )));
         }
-        Ok(value)
+        Ok(())
     }
 
     fn expr(&mut self, scope: usize, e: &Expr) -> Result_ {
@@ -2428,7 +4019,7 @@ impl Evaluator<'_> {
                 let v = self.expr(scope, operand)?;
                 if matches!(
                     v,
-                    Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+                    Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate
                 ) && !matches!(op, UnaryOp::Tilde)
                 {
                     return Ok(Value::Indeterminate);
@@ -2457,7 +4048,7 @@ impl Evaluator<'_> {
                 let tval = self.expr(scope, target)?;
                 let i = match self.expr(scope, index)? {
                     Value::Integer(i) => i,
-                    Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
+                    Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate => {
                         return Ok(Value::Indeterminate);
                     }
                     _ => return Err(EvalError::Type("index must be an integer".into())),
@@ -2472,7 +4063,7 @@ impl Evaluator<'_> {
                 // sequence.
                 match &tval {
                     Value::Indeterminate => return Ok(Value::Indeterminate),
-                    Value::Unbound(_) | Value::UnboundMember(_) => {
+                    Value::Unbound(..) | Value::UnboundMember(..) => {
                         let bounds = self.value_cardinality(&tval);
                         let admitted =
                             i >= 1 && bounds.is_none_or(|(_, hi)| hi.is_none_or(|hi| i <= hi));
@@ -2507,7 +4098,7 @@ impl Evaluator<'_> {
                 let num = self.expr(scope, target)?;
                 if matches!(
                     num,
-                    Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+                    Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate
                 ) {
                     return Ok(Value::Indeterminate);
                 }
@@ -2561,8 +4152,8 @@ impl Evaluator<'_> {
                                 | Value::Rational(_)
                                 | Value::Real(_)
                                 | Value::Quantity(..) => {}
-                                Value::Unbound(_)
-                                | Value::UnboundMember(_)
+                                Value::Unbound(..)
+                                | Value::UnboundMember(..)
                                 | Value::Indeterminate => {
                                     return Ok(Value::Indeterminate);
                                 }
@@ -2649,7 +4240,11 @@ impl Evaluator<'_> {
     /// reads `that` as the type's own instance.
     fn featuring_instance(&mut self, elem: usize) -> Value {
         if let Some(receiver) = self.unbound_receiver {
-            return Value::UnboundMember(ElementRef(receiver));
+            let via = match &self.context {
+                Some(context) if context.namespace == receiver => context.via.clone(),
+                _ => Via::default(),
+            };
+            return Value::UnboundMember(ElementRef(receiver), via);
         }
         let ty = self.b.elements[elem].ty;
         let feature_like = ty.ends_with("Usage")
@@ -2669,7 +4264,11 @@ impl Evaluator<'_> {
         } else {
             elem
         };
-        self.placeholder(anchor)
+        // The instance that stands for the anchor, read for those around it.
+        let (chain, known) = self.chain_for(anchor);
+        let (&instance, rest) = chain.split_first().unwrap_or((&anchor, &[]));
+        let via = self.normalized(instance, rest, known);
+        self.placeholder(instance, via)
     }
 
     /// Runtime arguments are attached to declarations, not written spellings.
@@ -2810,10 +4409,38 @@ impl Evaluator<'_> {
         let value = if qn.segments.len() == 1 && !qn.is_global {
             self.feature_value_in(elem, Some(member_scope))
         } else {
-            self.feature_value(elem)
+            self.read_declared(elem);
+            self.in_context(None, |ev| ev.feature_value(elem))
         };
         self.unbound_receiver = previous;
         value
+    }
+
+    /// Note a read of `e` where it is declared (a qualified name): when an
+    /// instance of the evaluation's context stands for a namespace around
+    /// `e`'s declaration, that reading is not the instance's, so the read is
+    /// not taken for the instances (see [`Self::lossy_reads`]).
+    fn read_declared(&mut self, e: usize) {
+        if self.fanning == 0 {
+            return;
+        }
+        let Some(context) = self.context.clone().filter(|c| !c.via.is_declared()) else {
+            return;
+        };
+        let aligned = self.aligned(&context);
+        let substituted: Vec<usize> = aligned
+            .levels
+            .iter()
+            .zip(&aligned.instances)
+            .filter(|(declared, instance)| declared != instance)
+            .map(|(&declared, _)| declared)
+            .collect();
+        if declared_owners(self.b, e)
+            .iter()
+            .any(|owner| substituted.contains(owner))
+        {
+            self.lossy_reads += 1;
+        }
     }
 
     /// The receiver's version of a lexical member, including a member
@@ -2821,35 +4448,7 @@ impl Evaluator<'_> {
     /// do not become unknown just because their caller has no instance.
     fn receiver_member(&mut self, elem: usize) -> Option<usize> {
         let receiver = self.unbound_receiver?;
-        let value = self.b.id_name(elem)?;
-        let name = Name {
-            value,
-            span: Span::default(),
-        };
-        let sub = self.b.elem_scope.get(&receiver).copied();
-        let hit = self.b.resolve_rest(receiver, sub, &[name], 0)?;
-        let hit_owner = self.b.owner_elem(hit)?;
-        if !self.b.indexed_conforms(receiver, hit_owner) {
-            return None;
-        }
-        if self.b.indexed_conforms(hit, elem) {
-            return Some(hit);
-        }
-        // SysML also permits redefinition by name in a specializing
-        // type, without an explicit :>> edge (the resolver's same-name
-        // shadowing rule). Unrelated locals with the same name do not
-        // satisfy this owner relationship.
-        if self.b.elements[hit].ty.ends_with("Usage") {
-            let owner = self.b.owner_elem(hit)?;
-            let base_owner = self.b.owner_elem(elem)?;
-            if owner != base_owner
-                && self.b.indexed_conforms(owner, base_owner)
-                && !self.b.indexed_conforms(base_owner, owner)
-            {
-                return Some(hit);
-            }
-        }
-        None
+        self.version_in(receiver, elem)
     }
 
     /// A method-local expression may still read the receiver's fields.
@@ -2954,22 +4553,24 @@ impl Evaluator<'_> {
         let TargetRef::Name(member) = member else {
             return Err(EvalError::Unsupported("chained chain member".into()));
         };
+        // The chain's names are taken in one walk, so a step over several
+        // unknown instances can take the rest of the chain from one of them
+        // (see [`Self::chain_members`]).
+        let mut members = Vec::new();
+        let root = chain_root(target, &mut members);
+        members.push(member);
         // A featuring instance may redefine a chain of names as a whole
         // (`attribute :>> chassis.mass = 2.5 [kg];`): walk such a chain a
         // step at a time so the redefinition stands in for the steps it
         // covers.
-        if self.cardinality_context.is_none() {
-            let mut members = Vec::new();
-            if let Some(root) = name_path(target, &mut members) {
-                let index = self.b.chain_redefinitions();
-                if !index.is_empty() {
-                    members.push(member);
-                    return self.chain_path(&index, scope, root, &members);
-                }
+        if self.cardinality_context.is_none() && matches!(root.kind, ExprKind::Ref(_)) {
+            let index = self.b.chain_redefinitions();
+            if !index.is_empty() {
+                return self.chain_path(&index, scope, root, &members);
             }
         }
-        let target = self.expr(scope, target)?;
-        self.chain_into(target, member)
+        let value = self.expr(scope, root)?;
+        self.chain_members(value, &members)
     }
 
     /// [`Self::chain_step`] over a chain of names, `root` then `members`.
@@ -2988,7 +4589,11 @@ impl Evaluator<'_> {
             root_elem = self.b.resolve(scope, qn, 0);
             if let (Some(elem), [name], false) = (root_elem, qn.segments.as_slice(), qn.is_global) {
                 if let Some(owner) = self.featuring_owner(scope, elem, name) {
-                    contexts.push((owner, 0));
+                    // The instance that stands for that owner, if any.
+                    let (chain, known) = self.chain_for(owner);
+                    let (&instance, rest) = chain.split_first().unwrap_or((&owner, &[]));
+                    let via = self.normalized(instance, rest, known);
+                    contexts.push((instance, via, 0));
                 }
             }
         }
@@ -2997,27 +4602,64 @@ impl Evaluator<'_> {
     }
 
     /// Take the chain steps `members` from `value`, the value of the element
-    /// `steps[0]`. Each of `contexts` — an instance, and the index of the
-    /// step its chains start at — and every element a step reaches may
-    /// redefine the steps from there to the current one as a whole; the
-    /// first such redefinition stands in for the current step.
+    /// `steps[0]`. Each of `contexts` — an instance, the instances it is read
+    /// for, and the index of the step its chains start at — and every element
+    /// a step reaches may redefine the steps from there to the current one as
+    /// a whole; the first such redefinition stands in for the current step. A
+    /// value that stands for several unknown instances fans out as
+    /// [`Self::chain_members`] describes.
     fn walk_chain(
         &mut self,
         index: &ChainRedefinitions,
-        mut contexts: Vec<(usize, usize)>,
+        mut contexts: Vec<(usize, Via, usize)>,
         mut steps: Vec<Option<usize>>,
         mut value: Value,
         members: &[&QualifiedName],
     ) -> Result_ {
         instance_context(&value, steps.len(), &mut contexts);
-        for member in members {
+        for (at, member) in members.iter().enumerate() {
+            let count = if self.may_fan_out(&value) {
+                self.instance_count(&value).filter(|&count| count > 1)
+            } else {
+                None
+            };
             steps.push(self.member_hit(&value, member));
-            value = match self.chain_redefinition(index, &contexts, &steps) {
-                Some((feature, instance)) => {
-                    let context = self.b.elem_scope.get(&instance).copied();
-                    self.feature_value_in(feature, context)?
+            // A redefinition's value is read in its instance.
+            let redefined = match self.chain_redefinition(index, &contexts, &steps, false) {
+                Some((feature, instance, via)) => {
+                    if !self.faithful(instance, &via) {
+                        self.lossy_reads += 1;
+                    }
+                    let scope = self.b.elem_scope.get(&instance).copied();
+                    let context = Context::new(instance, via);
+                    Some(self.in_context(Some(context), |ev| ev.feature_value_in(feature, scope))?)
                 }
-                None => self.chain_into(value, member)?,
+                None => None,
+            };
+            // A chain redefinition through the placeholder names it
+            // ([`Self::named_by`]), so a faithful one has none.
+            if let (Some(count), None) = (count, &redefined) {
+                if count > MAX_REPEATED {
+                    return Ok(Value::Indeterminate);
+                }
+                let lossy_reads = self.lossy_reads;
+                self.fanning += 1;
+                let one = match self.member_value(value, member) {
+                    Ok(one) => self.walk_chain(index, contexts, steps, one, &members[at + 1..]),
+                    Err(error) => Err(error),
+                };
+                self.fanning -= 1;
+                return self.repeat_for(one, count, lossy_reads);
+            }
+            value = match redefined {
+                Some(redefined) => redefined,
+                None => match self.chain_member(value, member)? {
+                    ChainStep::Next(value) => value,
+                    ChainStep::FanOut(one, count) => {
+                        return self.fanned_out(one, count, &members[at..]);
+                    }
+                    ChainStep::Done(value) => return Ok(value),
+                },
             };
             instance_context(&value, steps.len(), &mut contexts);
         }
@@ -3025,11 +4667,11 @@ impl Evaluator<'_> {
     }
 
     /// The element a chain step from `value` reaches through `member`,
-    /// resolved as [`Self::chain_into`] resolves it.
+    /// resolved as [`Self::member_value`] resolves it.
     fn member_hit(&mut self, value: &Value, member: &QualifiedName) -> Option<usize> {
         let (Value::Element(ElementRef(e))
-        | Value::Unbound(ElementRef(e))
-        | Value::UnboundMember(ElementRef(e))) = value
+        | Value::Unbound(ElementRef(e), _)
+        | Value::UnboundMember(ElementRef(e), _)) = value
         else {
             return None;
         };
@@ -3062,14 +4704,17 @@ impl Evaluator<'_> {
     /// start through the last step, with the instance it covers them for.
     /// Contexts are tried in order; an instance's own redefinitions come
     /// before those of its explicit heritage, nearest first. A step matches
-    /// a link it is, specializes, or is specialized by.
+    /// a link it is or specializes, or, unless `strict`, one it is
+    /// specialized by.
     fn chain_redefinition(
         &mut self,
         index: &ChainRedefinitions,
-        contexts: &[(usize, usize)],
+        contexts: &[(usize, Via, usize)],
         steps: &[Option<usize>],
-    ) -> Option<(usize, usize)> {
-        for &(instance, start) in contexts {
+        strict: bool,
+    ) -> Option<(usize, usize, Via)> {
+        for (instance, via, start) in contexts {
+            let (instance, start) = (*instance, *start);
             let Some(covered) = steps
                 .get(start..)
                 .filter(|covered| covered.len() >= 2)
@@ -3084,10 +4729,10 @@ impl Evaluator<'_> {
                     if links.len() == covered.len()
                         && links.iter().zip(&covered).all(|(&link, &step)| {
                             self.b.indexed_conforms(step, link)
-                                || self.b.indexed_conforms(link, step)
+                                || (!strict && self.b.indexed_conforms(link, step))
                         })
                     {
-                        return Some((*feature, instance));
+                        return Some((*feature, instance, via.clone()));
                     }
                 }
                 if seen.len() < MAX_CALL_DEPTH {
@@ -3108,7 +4753,8 @@ impl Evaluator<'_> {
     /// elements (reflection results) still denote individual declarations.
     fn collection_value(&mut self, value: Value) -> Value {
         match value {
-            v @ (Value::Unbound(_) | Value::UnboundMember(_)) => match self.value_cardinality(&v) {
+            v @ (Value::Unbound(..) | Value::UnboundMember(..)) => match self.value_cardinality(&v)
+            {
                 Some((0, Some(0))) => Value::null(),
                 Some((1, Some(1))) => v,
                 _ => Value::Indeterminate,
@@ -3128,52 +4774,924 @@ impl Evaluator<'_> {
         }
     }
 
-    /// One chain step over an evaluated target. Per KFL `'.'`, a
-    /// multi-valued source maps the member access over its items and the
-    /// result feature is *unique* (its `source`/`target` are declared
-    /// nonunique, the `chain` result carries KerML's default) — equal
-    /// values collapse to one, and a singleton is the value itself
-    /// (KerML values are flat sequences). This is why rollups over
-    /// possibly-equal values need `collect`, and why
-    /// `engines.specificImpulseVacuum` over five identical engines is
-    /// one number, not five.
+    /// The chain steps `members`, in order, over an evaluated target. Per
+    /// KFL `'.'`, a multi-valued source maps each member access over its
+    /// items, and the result keeps every value: `source` and `target` are
+    /// declared nonunique, so the masses of three parts weighing 10, 10
+    /// and 12 are three values and `sum` adds all of them. A singleton is
+    /// the value itself (KerML values are flat sequences).
+    ///
+    /// A receiver that stands for an exact number n ≥ 2 of unknown
+    /// instances (`part wheels : Wheel[4];` with no value) fans out: the
+    /// rest of the chain is taken once, from one of them, and its result
+    /// repeats n times when it is data ([`Self::is_data`]). Data has no
+    /// identity, so copies of it are the values of distinct instances; any
+    /// other result stays indeterminate, since n copies of one placeholder
+    /// would answer identity questions about n distinct instances.
+    ///
+    /// The one instance is read for the instances its placeholder carries
+    /// (see [`Via`]), so a fan-out needs every one of the n instances to read
+    /// what it reads: the placeholder must be read *faithfully*
+    /// ([`Self::faithful`]), its declaration and every declaration around it
+    /// read as the instance in the same place does, with nothing that names
+    /// some of its values; and the one instance's evaluation may make no read
+    /// that is not taken for its instances ([`Self::lossy_reads`]). A
+    /// receiver that fails any of this, or is of unknown or open count,
+    /// leaves the chain indeterminate.
+    ///
     /// Uncertainty follows the evaluated receiver, including a receiver
     /// returned by an alias, conditional or calculation.
-    fn chain_into(&mut self, target: Value, member: &QualifiedName) -> Result_ {
-        charge_chain_value(&target, &mut self.steps, 0)?;
+    fn chain_members(&mut self, mut value: Value, members: &[&QualifiedName]) -> Result_ {
+        for (at, member) in members.iter().enumerate() {
+            match self.chain_member(value, member)? {
+                ChainStep::Next(next) => value = next,
+                ChainStep::FanOut(one, count) => {
+                    return self.fanned_out(one, count, &members[at..]);
+                }
+                ChainStep::Done(done) => return Ok(done),
+            }
+        }
+        Ok(value)
+    }
+
+    /// One step of [`Self::chain_members`].
+    fn chain_member(
+        &mut self,
+        value: Value,
+        member: &QualifiedName,
+    ) -> Result<ChainStep, EvalError> {
+        charge_chain_value(&value, &mut self.steps, 0)?;
         if member.segments.is_empty() {
             return Err(EvalError::Unsupported("empty chain member name".into()));
         }
-        let target = self.collection_value(target);
-        // An unknown target has nothing to resolve a member against, and
-        // the step is as parametric as the target was: strictly
-        // propagating (see [`Value::Indeterminate`]) rather than a type
-        // error, so `subject.part.attribute` stays one undecided verdict.
-        if matches!(target, Value::Indeterminate) {
-            return Ok(Value::Indeterminate);
-        }
-        if let Value::Sequence(items) = target {
-            let mut out: Vec<Value> = Vec::new();
-            for item in items {
-                for v in self.chain_into(item, member)?.items() {
-                    let mut duplicate = false;
-                    for x in &out {
-                        charge_chain_value(x, &mut self.steps, 0)?;
-                        charge_chain_value(&v, &mut self.steps, 0)?;
-                        if value_eq(x, &v) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                    if !duplicate {
-                        out.push(v);
-                    }
+        Ok(match self.chain_receivers(value) {
+            // An unknown target has nothing to resolve a member against, and
+            // the step is as parametric as the target was: strictly
+            // propagating (see [`Value::Indeterminate`]) rather than a type
+            // error, so `subject.part.attribute` stays one undecided verdict.
+            Receivers::Unknown => ChainStep::Done(Value::Indeterminate),
+            Receivers::One(target) => ChainStep::Next(self.member_value(target, member)?),
+            Receivers::Instances(one, count) => {
+                if self.may_fan_out(&one) {
+                    ChainStep::FanOut(one, count)
+                } else {
+                    ChainStep::Done(Value::Indeterminate)
                 }
             }
-            return Ok(match out.len() {
-                1 => out.pop().unwrap(),
-                _ => Value::Sequence(out),
+            Receivers::Items(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    out.extend(self.member_value(item, member)?.items());
+                }
+                ChainStep::Next(one_or_sequence(out))
+            }
+        })
+    }
+
+    /// The chain steps `members` from `count` unknown instances that the
+    /// faithfully read placeholder `one` stands for (see
+    /// [`Self::chain_members`]).
+    fn fanned_out(&mut self, one: Value, count: usize, members: &[&QualifiedName]) -> Result_ {
+        let Some((member, rest)) = members.split_first() else {
+            return Ok(Value::Indeterminate);
+        };
+        if count > MAX_REPEATED {
+            return Ok(Value::Indeterminate);
+        }
+        let lossy_reads = self.lossy_reads;
+        self.fanning += 1;
+        let value = match self.member_value(one, member) {
+            Ok(value) => self.chain_members(value, rest),
+            Err(error) => Err(error),
+        };
+        self.fanning -= 1;
+        self.repeat_for(value, count, lossy_reads)
+    }
+
+    /// The values of `count` instances, given one instance's `value` (an
+    /// evaluation that started when [`Self::lossy_reads`] was at
+    /// `lossy_reads`). It never answers worse than not fanning out: a lossy
+    /// read, a result that is not data, too many values, or a failure
+    /// short of an exhausted budget leave it indeterminate.
+    fn repeat_for(&mut self, value: Result_, count: usize, lossy_reads: usize) -> Result_ {
+        match value {
+            Ok(value) if self.lossy_reads == lossy_reads => self.repeated(value, count),
+            Ok(_) => Ok(Value::Indeterminate),
+            Err(error @ EvalError::Budget(_)) => Err(error),
+            Err(_) => Ok(Value::Indeterminate),
+        }
+    }
+
+    /// The values `count` instances have when each has `value`: its items
+    /// repeated `count` times when it is data and they number at most
+    /// [`MAX_REPEATED`], indeterminate otherwise.
+    fn repeated(&mut self, value: Value, count: usize) -> Result_ {
+        charge_chain_value(&value, &mut self.steps, 0)?;
+        if !self.is_data(&value) {
+            return Ok(Value::Indeterminate);
+        }
+        let items = value.items();
+        let Some(total) = items
+            .len()
+            .checked_mul(count)
+            .filter(|&total| total <= MAX_REPEATED)
+        else {
+            return Ok(Value::Indeterminate);
+        };
+        let bytes = items.iter().fold(0usize, |bytes, item| {
+            bytes
+                .saturating_add(std::mem::size_of::<Value>())
+                .saturating_add(item.clone_heap_bytes())
+        });
+        self.charge_allocation(bytes.saturating_mul(count))?;
+        let mut out = Vec::with_capacity(total);
+        for _ in 0..count {
+            out.extend(items.iter().cloned());
+        }
+        Ok(Value::Sequence(out))
+    }
+
+    /// Whether `value` is data: booleans, numbers, strings, quantities,
+    /// enumeration literals and constructed attribute values, through
+    /// sequences. Data has no identity of its own (equal data values are
+    /// the same value), so copies of one value can stand for the values of
+    /// distinct instances. Elements and unknowns are never data here.
+    fn is_data(&self, value: &Value) -> bool {
+        match value {
+            Value::Boolean(_)
+            | Value::Integer(_)
+            | Value::Rational(_)
+            | Value::Real(_)
+            | Value::String(_) => true,
+            Value::Quantity(magnitude, _) => self.is_data(magnitude),
+            Value::Sequence(items) => items.iter().all(|item| self.is_data(item)),
+            Value::Instance { ty, fields, .. } => {
+                crate::metaclass::conforms(self.b.elements[ty.0].ty, "DataType")
+                    && fields.iter().all(|(_, field)| self.is_data(field))
+            }
+            Value::Element(ElementRef(e)) => {
+                is_a!(self.b.elements[*e], "AttributeUsage")
+                    && self.b.elements[*e]
+                        .owning_relationship
+                        .is_some_and(|r| self.b.elements[r].ty == "VariantMembership")
+            }
+            Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate => false,
+        }
+    }
+
+    /// See [`declared_outright`].
+    fn declared_outright(&self, e: usize) -> bool {
+        declared_outright(self.b, e)
+    }
+
+    /// The namespaces around `e`'s declaration, innermost first.
+    fn declared_owners(&mut self, e: usize) -> Arc<[usize]> {
+        if let Some(owners) = self.guard_memo.owners.get(&e) {
+            return Arc::clone(owners);
+        }
+        let owners: Arc<[usize]> = declared_owners(self.b, e).into();
+        self.guard_memo.owners.insert(e, Arc::clone(&owners));
+        owners
+    }
+
+    /// Whether `e`, read for `via`, is read as each of its instances reads
+    /// it: the evaluation established its instances, it is declared for its
+    /// instance chain ([`Self::declared_for`] over [`Self::expanded`]), and so
+    /// is each of those instances for the ones around it. Then reading `e`'s
+    /// members in its context, where a feature of a namespace an instance
+    /// stands for is read as the instance's version by name, reads them for
+    /// every instance alike.
+    fn faithful(&mut self, e: usize, via: &Via) -> bool {
+        if !via.known {
+            return false;
+        }
+        if let Some(&answer) = self
+            .guard_memo
+            .faithful
+            .get(&e)
+            .and_then(|by_links| by_links.get(via.links()))
+        {
+            return answer;
+        }
+        let instances = self.expanded(e, via);
+        let mut answer = self.declared_for(e, &instances) && self.subsets_as_declared(e, via);
+        if let Some((&instance, rest)) = via.links().split_first().filter(|_| answer) {
+            let via = self.normalized(instance, rest, true);
+            answer = self.faithful(instance, &via);
+        }
+        self.guard_memo
+            .faithful
+            .entry(e)
+            .or_default()
+            .insert(via.links().to_vec(), answer);
+        answer
+    }
+
+    /// Whether every feature `e` subsets reads, for `via`, as declared: none
+    /// is a feature of a namespace an instance there stands for that the
+    /// instance redefines. `frontLeft :> wheels` read for `v7`, which
+    /// redefines `wheels`, has its values among `v7`'s wheels, which its own
+    /// declaration does not read.
+    fn subsets_as_declared(&mut self, e: usize, via: &Via) -> bool {
+        if via.is_declared() {
+            return true;
+        }
+        let targets: Vec<usize> = self
+            .b
+            .explicit_specialization_elems(e)
+            .into_iter()
+            .filter(|(kind, _)| *kind == "Subsetting")
+            .map(|(_, target)| target)
+            .collect();
+        if targets.is_empty() {
+            return true;
+        }
+        let context = Context::new(e, via.clone());
+        let aligned = self.aligned(&context);
+        let substituted: Vec<(usize, usize)> = aligned
+            .levels
+            .iter()
+            .zip(&aligned.instances)
+            .filter(|(declared, instance)| declared != instance)
+            .map(|(&declared, &instance)| (declared, instance))
+            .collect();
+        for target in targets {
+            let Some(owner) = self.b.owner_elem(target) else {
+                continue;
+            };
+            for &(declared, instance) in &substituted {
+                if (declared == owner || self.b.indexed_conforms(declared, owner))
+                    && self.version_in(instance, target) != Some(target)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the instance chain `instances` (the instance `x` is a member
+    /// of first, then the one that instance is a member of, and so on) reads
+    /// what `x`'s declaration says. At every namespace around the declaration
+    /// that is a type, the instance in the same place must be that type, or
+    /// specialize it changing nothing evaluation does not follow on any path
+    /// ([`Self::specializes_cleanly`]). No feature of the instances or of
+    /// `x` may be a reference, whose referent may override what the
+    /// declaration says, or bind, and no feature that bears on these
+    /// instances may subset or redefine them ([`Self::named_by`]).
+    fn declared_for(&mut self, x: usize, instances: &[usize]) -> bool {
+        if self.b.is_reference_feature(x) || self.binds(x) || self.named_by(x, instances, None) {
+            return false;
+        }
+        let mut owner = self.b.owner_elem(x);
+        for (at, &instance) in instances.iter().enumerate() {
+            let Some(o) = owner else { return true };
+            if !is_a!(self.b.elements[o], "Type") {
+                return true;
+            }
+            if instance != o && !self.specializes_cleanly(instance, o) {
+                return false;
+            }
+            if self.b.is_reference_feature(instance)
+                || self.binds(instance)
+                || self.named_by(instance, &instances[at + 1..], None)
+            {
+                return false;
+            }
+            owner = self.b.owner_elem(o);
+        }
+        // The chain ran out while declarations around `x` remain types.
+        owner.is_none_or(|o| !is_a!(self.b.elements[o], "Type"))
+    }
+
+    /// Whether `instance` specializes `general` and every namespace on every
+    /// path between them, `instance` included, changes nothing that
+    /// evaluation does not follow ([`Self::follows`]): then what `general`
+    /// declares reads, for `instance`, as the instance's versions by name. A
+    /// walk past [`MAX_CALL_DEPTH`] namespaces does not count.
+    fn specializes_cleanly(&mut self, instance: usize, general: usize) -> bool {
+        if let Some(&answer) = self.guard_memo.cleanly.get(&(instance, general)) {
+            return answer;
+        }
+        let answer = self.specializes_cleanly_uncached(instance, general);
+        self.guard_memo.cleanly.insert((instance, general), answer);
+        answer
+    }
+
+    fn specializes_cleanly_uncached(&mut self, instance: usize, general: usize) -> bool {
+        // The namespaces on the paths, then what each changes.
+        let mut frontier = vec![instance];
+        let mut seen = HashSet::from([instance]);
+        let mut paths = HashSet::new();
+        let mut reaches = false;
+        while let Some(namespace) = frontier.pop() {
+            if namespace == general {
+                reaches = true;
+                continue;
+            }
+            if !self.b.conforms_upward(namespace, general) {
+                continue;
+            }
+            paths.insert(namespace);
+            for next in self.b.explicit_supertype_elems(namespace) {
+                if seen.insert(next) {
+                    if seen.len() > MAX_CALL_DEPTH {
+                        return false;
+                    }
+                    frontier.push(next);
+                }
+            }
+        }
+        let mut namespaces: Vec<usize> = paths.iter().copied().collect();
+        namespaces.sort_unstable();
+        reaches
+            && namespaces
+                .into_iter()
+                .all(|namespace| self.follows(namespace, &paths))
+    }
+
+    /// Whether evaluation follows what `namespace` changes in a general's
+    /// declarations: its features redefine one only by its name
+    /// (`attribute :>> each = 0.6;`), which a lookup in an instance finds in
+    /// place of the general's, or subset ones saying nothing of them
+    /// ([`Self::says`]) where no namespace of `paths` (those on the
+    /// paths to the general) gives them a say: `attribute :>> each2 = 0.8;`
+    /// below `attribute each2 :> each;` gives single-valued `each` that value.
+    /// A feature that subsets one and says something, redefines one under
+    /// another name (`attribute weight :>> each = 0.6;`, which the lookup of
+    /// `each` does not find) or several at once, a chain redefinition
+    /// (`attribute :>> a.b = …;`), a binding connector it does not follow
+    /// ([`Self::binds`]) and a parameter (which can redefine one by position)
+    /// change something evaluation does not follow.
+    fn follows(&mut self, namespace: usize, paths: &HashSet<usize>) -> bool {
+        if self
+            .b
+            .chain_redefinitions()
+            .get(&namespace)
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return false;
+        }
+        if self.binds(namespace) {
+            return false;
+        }
+        for m in self.b.owned_member_elems(namespace, true) {
+            if self.b.is_parameter(m) {
+                return false;
+            }
+            let specializations: Vec<(&str, usize)> = self
+                .b
+                .explicit_specialization_elems(m)
+                .into_iter()
+                .filter(|(kind, _)| !matches!(*kind, "FeatureTyping" | "Subclassification"))
+                .collect();
+            match specializations.as_slice() {
+                [] => {}
+                [("Redefinition", target)] if self.by_name(m, *target) => {}
+                all if all.iter().all(|(kind, _)| *kind == "Subsetting")
+                    && !self.says(m, None)
+                    && !self.specialized_within(m, paths, MAX_SPECIALIZER_DEPTH) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether `m` redefines `target` under `target`'s own name: it declares
+    /// no name of its own, or that one.
+    fn by_name(&self, m: usize, target: usize) -> bool {
+        match self.b.elements[m]
+            .props
+            .get("declaredName")
+            .and_then(|v| v.as_str())
+        {
+            None => true,
+            Some(name) => self.b.id_name(target).as_deref() == Some(name),
+        }
+    }
+
+    /// Whether `hit`, a member a lookup found in `receiver`, has there the
+    /// value its declaration gives it: no namespace between `receiver` and
+    /// `hit`'s owner, on any path of specializations (`receiver` included),
+    /// has a feature that subsets it or redefines it under another name and
+    /// says something of its values ([`Self::says`]), or ends a
+    /// binding to it, nor to a feature it redefines. A redefinition by its
+    /// name would have been the one found.
+    fn reads_as_declared(&mut self, receiver: usize, hit: usize) -> bool {
+        if let Some(&answer) = self.guard_memo.reads.get(&(receiver, hit)) {
+            return answer;
+        }
+        let answer = self.reads_as_declared_uncached(receiver, hit);
+        self.guard_memo.reads.insert((receiver, hit), answer);
+        answer
+    }
+
+    fn reads_as_declared_uncached(&mut self, receiver: usize, hit: usize) -> bool {
+        let Some(owner) = self.b.owner_elem(hit) else {
+            return true;
+        };
+        if receiver == owner {
+            return true;
+        }
+        // The namespaces on the paths from the receiver to the owner.
+        let mut between = HashSet::new();
+        let mut frontier = vec![receiver];
+        let mut seen = HashSet::from([receiver]);
+        while let Some(namespace) = frontier.pop() {
+            if namespace == owner || !self.b.conforms_upward(namespace, owner) {
+                continue;
+            }
+            between.insert(namespace);
+            for next in self.b.explicit_supertype_elems(namespace) {
+                if seen.insert(next) {
+                    if seen.len() > MAX_CALL_DEPTH {
+                        return false;
+                    }
+                    frontier.push(next);
+                }
+            }
+        }
+        let features = self.redefined_closure(hit);
+        // A value of its own that is no default is the hit's value, which a
+        // feature among its values cannot change.
+        let bound = self.b.values.contains_key(&hit) && !self.b.default_values.contains(&hit);
+        let index = self.b.feature_specializers();
+        for &g in features.iter() {
+            for (f, _) in index.get(&g).into_iter().flatten() {
+                if self.b.indexed_conforms(hit, *f) {
+                    continue;
+                }
+                let holder = self.b.owner_elem(*f);
+                let subsets_only =
+                    self.b
+                        .explicit_specialization_elems(*f)
+                        .iter()
+                        .all(|(kind, _)| {
+                            matches!(*kind, "Subsetting" | "FeatureTyping" | "Subclassification")
+                        });
+                let held = match holder {
+                    // A connector's end: the connector is the namespace's.
+                    Some(h) if is_a!(self.b.elements[h], "Connector") => self.b.owner_elem(h),
+                    // A feature that says nothing of the values it names
+                    // (`attribute rimMass :> mass;`) changes none of them,
+                    // unless a namespace between gives it a say
+                    // (`attribute :>> rimMass = 12;`).
+                    _ if !self.says(*f, None)
+                        && !self.specialized_within(*f, &between, MAX_SPECIALIZER_DEPTH) =>
+                    {
+                        None
+                    }
+                    _ if bound && subsets_only => None,
+                    holder => holder,
+                };
+                if held.is_some_and(|h| between.contains(&h)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a feature that bears on the receiver `e`'s instance chain (the
+    /// evaluation's context) names some of `e`'s values and says something
+    /// about the member `hit` read off them ([`Self::named_by`]).
+    fn named_about(&mut self, e: usize, hit: usize) -> bool {
+        if !self.b.feature_specializers().contains_key(&e) {
+            return false;
+        }
+        let via = self
+            .context
+            .as_ref()
+            .map(|c| c.via.clone())
+            .unwrap_or_default();
+        let instances = self.expanded(e, &via);
+        let features = self.redefined_closure(hit);
+        self.named_by(e, &instances, Some(&features))
+    }
+
+    /// Whether a feature declared in one of `namespaces`, or anywhere inside
+    /// one, subsets or redefines `f` and says something, or does so through
+    /// a feature that subsets or redefines it there in turn, to `depth`
+    /// levels.
+    fn specialized_within(&mut self, f: usize, namespaces: &HashSet<usize>, depth: usize) -> bool {
+        if depth == 0 {
+            return true;
+        }
+        let index = self.b.feature_specializers();
+        for (g, links) in index.get(&f).into_iter().flatten() {
+            if !links.is_empty() {
+                continue;
+            }
+            let mut around = self.b.owner_elem(*g);
+            let mut inside = false;
+            while let Some(a) = around.filter(|&a| is_a!(self.b.elements[a], "Type")) {
+                if namespaces.contains(&a) {
+                    inside = true;
+                    break;
+                }
+                around = self.b.owner_elem(a);
+            }
+            if !inside {
+                continue;
+            }
+            if self.says(*g, None) || self.specialized_within(*g, namespaces, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `hit` and the features it redefines, transitively.
+    fn redefined_closure(&mut self, hit: usize) -> Arc<[usize]> {
+        if let Some(features) = self.guard_memo.redefined.get(&hit) {
+            return Arc::clone(features);
+        }
+        let mut features = vec![hit];
+        let mut at = 0;
+        while let Some(&f) = features.get(at) {
+            at += 1;
+            for target in self.b.redefinition_target_elems(f) {
+                if !features.contains(&target) && features.len() < MAX_CALL_DEPTH {
+                    features.push(target);
+                }
+            }
+        }
+        let features: Arc<[usize]> = features.into();
+        self.guard_memo.redefined.insert(hit, Arc::clone(&features));
+        features
+    }
+
+    /// Whether `e` owns a binding connector that evaluation does not follow
+    /// ([`Self::bound_value`] follows one with both ends resolved).
+    fn binds(&mut self, e: usize) -> bool {
+        let followed = self.b.binding_ends();
+        self.b.owned_member_elems(e, true).into_iter().any(|m| {
+            is_a!(self.b.elements[m], "BindingConnector")
+                && !followed
+                    .by_owner
+                    .get(&e)
+                    .is_some_and(|bindings| bindings.iter().any(|(c, _, _)| *c == m))
+        })
+    }
+
+    /// Whether `namespace` changes nothing that a general's declarations
+    /// read: none of its features subsets or redefines a feature, alone or
+    /// as a chain (`attribute :>> a.b = …;`), binds two of them, or is a
+    /// parameter, which can redefine one by position. The resolver's
+    /// implicit same-name redefinitions count too, including short names.
+    fn adds_nothing(&mut self, namespace: usize) -> bool {
+        if self
+            .b
+            .chain_redefinitions()
+            .get(&namespace)
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return false;
+        }
+        for m in self.b.owned_member_elems(namespace, true) {
+            if self.b.is_parameter(m)
+                || is_a!(self.b.elements[m], "BindingConnector")
+                || self
+                    .b
+                    .explicit_specialization_elems(m)
+                    .iter()
+                    .any(|(kind, _)| !matches!(*kind, "FeatureTyping" | "Subclassification"))
+            {
+                return false;
+            }
+        }
+        if let Some(&scope) = self.b.elem_scope.get(&namespace) {
+            let inherited = self.b.inherited_bindings(scope, false);
+            if inherited.truncated
+                || inherited.incomplete
+                || !inherited.implicit_redefinitions.is_empty()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a feature that bears on `instances` subsets or redefines `e`
+    /// (or names it in a chain) and says something ([`Self::says`]) `about`
+    /// the member read, or about anything when `about` is `None`: any such
+    /// feature, when `e` is one declared instance's feature
+    /// ([`Self::declared_outright`]); otherwise one owned by a package, by
+    /// `e` or one of the instances, by a general one of them inherits from,
+    /// or by a specialization of an instance that is a usage declared where
+    /// the chain reached it (`part q2 :> q { … }`, whose values are among
+    /// `q`'s); for a member read, also one declared anywhere inside those
+    /// (`part inner { part m1 :> motors[1] { attribute :>> mass = 1.0; } }`).
+    /// A chain bears on them when it runs through one of them. Such a
+    /// feature says something about some of `e`'s values there (`part m1 :>
+    /// q.motors { … }`), which `e`'s declaration does not. A specialization
+    /// of a definition, or of a feature an instance merely inherits, is
+    /// another instance's, and does not change what that declaration says
+    /// here.
+    fn named_by(&mut self, e: usize, instances: &[usize], about: Option<&[usize]>) -> bool {
+        let index = self.b.feature_specializers();
+        let Some(specializers) = index.get(&e) else {
+            return false;
+        };
+        let outright = self.declared_outright(e);
+        let mut generals: Option<Vec<Arc<HashSet<usize>>>> = None;
+        for (f, links) in specializers {
+            if !self.says(*f, about) {
+                continue;
+            }
+            if outright {
+                return true;
+            }
+            let generals = generals.get_or_insert_with(|| {
+                instances.iter().map(|&i| self.general_closure(i)).collect()
             });
+            if !links.is_empty() {
+                if links.iter().any(|link| instances.contains(link))
+                    || links
+                        .first()
+                        .is_some_and(|first| generals.iter().any(|closure| closure.contains(first)))
+                {
+                    return true;
+                }
+                continue;
+            }
+            let Some(owner) = self.b.owner_elem(*f) else {
+                return true;
+            };
+            if !is_a!(self.b.elements[owner], "Type") {
+                return true;
+            }
+            let bears = |a: usize| {
+                a == e
+                    || instances.contains(&a)
+                    || generals.iter().any(|closure| closure.contains(&a))
+            };
+            if bears(owner) {
+                return true;
+            }
+            if about.is_some() {
+                let mut around = self.b.owner_elem(owner);
+                while let Some(a) = around.filter(|&a| is_a!(self.b.elements[a], "Type")) {
+                    if bears(a) {
+                        return true;
+                    }
+                    around = self.b.owner_elem(a);
+                }
+            }
+            // Only a usage specializes a usage instance.
+            if !is_a!(self.b.elements[owner], "Usage") {
+                continue;
+            }
+            for (at, &instance) in instances.iter().enumerate() {
+                let declared_there = instances
+                    .get(at + 1)
+                    .is_none_or(|&next| self.b.owner_elem(instance) == Some(next));
+                if declared_there
+                    && self.declared_outright(instance)
+                    && self.b.conforms_upward(owner, instance)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the specializing feature `f` can give the values it names
+    /// something their declaration does not: a value of its own, a type of
+    /// its own (with its own defaults), a second feature it subsets or
+    /// redefines (whose declarations its values then have too), a chain
+    /// redefinition, or members that redefine, subset or bind — any such
+    /// member when `about` is `None` ([`Self::adds_nothing`]), else one that
+    /// redefines or subsets one of the features `about` (a member read and
+    /// what it redefines) or a feature redefining one. A connector's or an
+    /// allocation's end names what it connects and says nothing about it.
+    fn says(&mut self, f: usize, about: Option<&[usize]>) -> bool {
+        let specializations = self.b.elements[f]
+            .owned_relationships
+            .iter()
+            .filter(|&&r| {
+                matches!(
+                    self.b.elements[r].ty,
+                    "Subsetting" | "Redefinition" | "ReferenceSubsetting"
+                )
+            })
+            .count();
+        if specializations > 1
+            || self.b.values.contains_key(&f)
+            || self
+                .b
+                .explicit_specialization_elems(f)
+                .iter()
+                .any(|(kind, _)| *kind == "FeatureTyping")
+        {
+            return true;
+        }
+        let Some(about) = about else {
+            return !self.adds_nothing(f);
+        };
+        if self
+            .b
+            .chain_redefinitions()
+            .get(&f)
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return true;
+        }
+        for m in self.b.owned_member_elems(f, true) {
+            if self.b.is_parameter(m) || is_a!(self.b.elements[m], "BindingConnector") {
+                return true;
+            }
+            let targets: Vec<usize> = self
+                .b
+                .explicit_specialization_elems(m)
+                .into_iter()
+                .filter(|(kind, _)| !matches!(*kind, "FeatureTyping" | "Subclassification"))
+                .map(|(_, target)| target)
+                .collect();
+            for target in targets {
+                if about
+                    .iter()
+                    .any(|&g| target == g || self.b.indexed_conforms(target, g))
+                {
+                    return true;
+                }
+            }
+        }
+        // A usage `f` owns under the name, or short name, of one of `about`
+        // (`attribute mass = 1;` or `attribute <mass> weight = 1;` inside
+        // `part m1 :> motors[1]`) redefines it by name alone, the way
+        // `version_in` follows one, and says as much of it as a spelled
+        // `:>>`. The resolver's recorded pairs are keyed on conformance
+        // between owners, which a subsetting of a usage does not enter, so
+        // the names are compared here. Inheritance evidence cut short or
+        // incomplete may hide such a member, so it counts too.
+        if let Some(&scope) = self.b.elem_scope.get(&f) {
+            let inherited = self.b.inherited_bindings(scope, false);
+            if inherited.truncated || inherited.incomplete {
+                return true;
+            }
+        }
+        fn spelled(b: &Builder, e: usize) -> Vec<&str> {
+            ["declaredName", "declaredShortName"]
+                .into_iter()
+                .filter_map(|key| b.elements[e].props.get(key).and_then(|v| v.as_str()))
+                .collect()
+        }
+        let names: Vec<&str> = about.iter().flat_map(|&g| spelled(self.b, g)).collect();
+        if names.is_empty() {
+            return false;
+        }
+        self.b.owned_member_elems(f, true).into_iter().any(|m| {
+            self.b.elements[m].ty.ends_with("Usage")
+                && spelled(self.b, m).iter().any(|n| names.contains(n))
+        })
+    }
+
+    /// `e` and the namespaces its explicit generals reach.
+    fn general_closure(&mut self, e: usize) -> Arc<HashSet<usize>> {
+        if let Some(closure) = self.guard_memo.generals.get(&e) {
+            return Arc::clone(closure);
+        }
+        let mut seen = HashSet::from([e]);
+        let mut frontier = vec![e];
+        while let Some(namespace) = frontier.pop() {
+            for general in self.b.explicit_supertype_elems(namespace) {
+                if seen.len() < MAX_SEQUENCE && seen.insert(general) {
+                    frontier.push(general);
+                }
+            }
+        }
+        let closure = Arc::new(seen);
+        self.guard_memo.generals.insert(e, Arc::clone(&closure));
+        closure
+    }
+
+    /// Whether the placeholder `one` for several instances may fan out: it
+    /// is read faithfully ([`Self::faithful`]). An unvalued member of an
+    /// unknown receiver never is.
+    fn may_fan_out(&mut self, one: &Value) -> bool {
+        match one {
+            Value::Unbound(ElementRef(e), via) => self.faithful(*e, via),
+            _ => false,
+        }
+    }
+
+    /// Whether `m`, a feature of `receiver`, is one of `hit`'s values: it
+    /// specializes `hit`, explicitly or through its usage kind's implied
+    /// subsettings (SysML 8.4.2 Table 32).
+    fn names_values_of(&mut self, receiver: usize, m: usize, hit: usize) -> bool {
+        if m == hit {
+            return false;
+        }
+        if self.b.conforms_upward(m, hit) {
+            return true;
+        }
+        let scope = self.b.elem_scope.get(&receiver).copied().unwrap_or(0);
+        let metaclass = self.b.elements[m].ty;
+        let mut names: Vec<&'static str> =
+            match crate::lift::usage_kind_of(metaclass, Dialect::Sysml) {
+                Some(kind) => crate::json::implicit_usage_bases(kind).to_vec(),
+                None => Vec::new(),
+            };
+        names.extend(implied_collection_extras(metaclass));
+        names.iter().any(|n| {
+            self.b
+                .resolve(scope, &crate::json::lib_qn(n), 0)
+                .is_some_and(|c| c == hit || self.b.conforms_upward(c, hit))
+        })
+    }
+
+    /// What a chain step maps over (see [`Self::chain_members`]): nested
+    /// sequences flattened, a placeholder for exactly one value standing
+    /// for it, one for none dropped, one for an exact count n ≥ 2 kept with
+    /// that count when it is the whole receiver. A placeholder of unknown or
+    /// open count, one for several values inside a sequence, or an unknown
+    /// item leaves the receivers unknown.
+    fn chain_receivers(&mut self, value: Value) -> Receivers {
+        match value {
+            Value::Indeterminate => Receivers::Unknown,
+            v @ (Value::Unbound(..) | Value::UnboundMember(..)) => match self.instance_count(&v) {
+                Some(0) => Receivers::Items(Vec::new()),
+                Some(1) => Receivers::One(v),
+                Some(count) => Receivers::Instances(v, count),
+                None => {
+                    self.note_open_receiver(&v);
+                    Receivers::Unknown
+                }
+            },
+            Value::Sequence(items) => {
+                let mut out = Vec::new();
+                if self.flatten_receivers(items, &mut out) {
+                    Receivers::Items(out)
+                } else {
+                    Receivers::Unknown
+                }
+            }
+            v => Receivers::One(v),
+        }
+    }
+
+    fn flatten_receivers(&mut self, items: Vec<Value>, out: &mut Vec<Value>) -> bool {
+        for item in items {
+            match item {
+                Value::Indeterminate => return false,
+                v @ (Value::Unbound(..) | Value::UnboundMember(..)) => {
+                    match self.instance_count(&v) {
+                        Some(0) => {}
+                        Some(1) => out.push(v),
+                        Some(_) => return false,
+                        None => {
+                            self.note_open_receiver(&v);
+                            return false;
+                        }
+                    }
+                }
+                Value::Sequence(inner) => {
+                    if !self.flatten_receivers(inner, out) {
+                        return false;
+                    }
+                }
+                v => out.push(v),
+            }
+        }
+        true
+    }
+
+    /// Record the element of a placeholder whose count left a chain step
+    /// unknown because it declares no multiplicity and so is a collection
+    /// of any size (see `open_receivers`). Library features are not
+    /// recorded: a chain the library takes (a unit prefix's factor, say)
+    /// is not the model's to change.
+    fn note_open_receiver(&mut self, value: &Value) {
+        if let Value::Unbound(ElementRef(e), _) | Value::UnboundMember(ElementRef(e), _) = value {
+            let e = *e;
+            if self.open_receivers.len() < MAX_OPEN_RECEIVERS
+                && !self.open_receivers.contains(&e)
+                && !self.b.is_library_elem(e)
+                && implicit_open_in(self.b, e)
+            {
+                self.open_receivers.push(e);
+            }
+        }
+    }
+
+    /// The exact number of values a placeholder stands for, when its
+    /// bounds agree and the count is at most [`MAX_SEQUENCE`].
+    fn instance_count(&mut self, value: &Value) -> Option<usize> {
+        match self.value_cardinality(value)? {
+            (lower, Some(upper)) if lower == upper => usize::try_from(lower)
+                .ok()
+                .filter(|&count| count <= MAX_SEQUENCE),
+            _ => None,
+        }
+    }
+
+    /// The member `member` of one receiver: a constructed instance's field,
+    /// or the member's value in the receiver's context.
+    fn member_value(&mut self, target: Value, member: &QualifiedName) -> Result_ {
+        if member.segments.is_empty() {
+            return Err(EvalError::Unsupported("empty chain member name".into()));
         }
         if let Value::Instance {
             ty_name, fields, ..
@@ -3189,18 +5707,49 @@ impl Evaluator<'_> {
                 });
         }
         let unbound = match &target {
-            Value::UnboundMember(_) => true,
-            Value::Unbound(e) => self.b.is_reference_feature(e.0),
+            Value::UnboundMember(..) => true,
+            Value::Unbound(e, _) => self.b.is_reference_feature(e.0),
             _ => false,
         };
-        let (Value::Element(ElementRef(elem))
-        | Value::Unbound(ElementRef(elem))
-        | Value::UnboundMember(ElementRef(elem))) = target
-        else {
-            return Err(EvalError::Type(
-                "chain target must be a model element".into(),
-            ));
+        // Outside a fan-out no result stands for several instances, so the
+        // read need not be checked for faithfulness.
+        let guard = self.fanning > 0;
+        let (elem, via, faithful) = match target {
+            Value::Element(ElementRef(elem)) => {
+                let via = Via::declared();
+                let faithful = guard && self.faithful(elem, &via);
+                (elem, via, faithful)
+            }
+            Value::Unbound(ElementRef(elem), via) => {
+                let faithful = guard && self.faithful(elem, &via);
+                (elem, via, faithful)
+            }
+            Value::UnboundMember(ElementRef(elem), via) => (elem, via, false),
+            _ => {
+                return Err(EvalError::Type(
+                    "chain target must be a model element".into(),
+                ));
+            }
         };
+        // The receiver's members read for the instances it is read for.
+        let context = Context::new(elem, via);
+        self.in_context(Some(context), |ev| {
+            ev.receiver_value(elem, unbound, faithful, member)
+        })
+    }
+
+    /// [`Self::member_value`] of `member` off the model element `elem`, read
+    /// in its context. The read is taken for the receiver's instances when
+    /// the receiver is read faithfully and the member has there the value
+    /// its declaration gives it ([`Self::reads_as_declared`]); otherwise it
+    /// counts in [`Self::lossy_reads`].
+    fn receiver_value(
+        &mut self,
+        elem: usize,
+        unbound: bool,
+        faithful: bool,
+        member: &QualifiedName,
+    ) -> Result_ {
         let sub = self.b.elem_scope.get(&elem).copied();
         let Some(hit) = self.b.resolve_rest(elem, sub, &member.segments, 0) else {
             // `x.that` — the featuring instance of `x` (see `reference`
@@ -3211,6 +5760,11 @@ impl Evaluator<'_> {
             }
             return Err(EvalError::Unresolved(member.to_display_string()));
         };
+        if self.fanning > 0
+            && !(faithful && self.reads_as_declared(elem, hit) && !self.named_about(elem, hit))
+        {
+            self.lossy_reads += 1;
+        }
         // A member with no bound value may be a *collection the receiver
         // populates*: features of the receiver that specialize it —
         // explicitly, or through their usage kind's implied subsettings
@@ -3218,11 +5772,40 @@ impl Evaluator<'_> {
         // materialize as relationships. `p.performedActions` collects
         // p's perform usages, each standing for its referenced action.
         if !unbound && !self.b.values.contains_key(&hit) {
-            if let Some(items) = self.collection_items(elem, hit)? {
+            if let Some((items, redefining)) = self.collection_items(elem, hit)? {
+                // A redefinition is the member itself; features subsetting it
+                // populate it only when they can supply every value it needs:
+                // `part m1 :> motors[1];` is one of four motors, not the four,
+                // which stay unknown (their count still answers from the
+                // declared bounds).
+                if !redefining && !self.covers(hit, sub, &items) {
+                    let via = self.via_of(hit, sub);
+                    return Ok(self.placeholder(hit, via));
+                }
                 return Ok(match items.len() {
                     1 => items.into_iter().next().unwrap(),
                     _ => Value::Sequence(items),
                 });
+            }
+        }
+        // A member the receiver inherits while a type it specializes
+        // redefines it under another name (`attribute weight :>> each;`) has
+        // no reading that is the receiver's (a redefining member of the
+        // receiver's own with no value to shadow was collected above).
+        if self.b.owner_elem(hit) != Some(elem) && self.disagreeing(elem, hit, hit) {
+            return Ok(Value::Indeterminate);
+        }
+        // An instance around the receiver may redefine the member as a
+        // chain through it.
+        if !unbound {
+            let via = self
+                .context
+                .as_ref()
+                .map(|c| c.via.clone())
+                .unwrap_or_default();
+            if let Some((redefining, outer)) = self.outer_chain_redefinition(elem, hit, &via) {
+                let scope = self.b.elem_scope.get(&outer.namespace).copied();
+                return self.in_context(Some(outer), |ev| ev.feature_value_in(redefining, scope));
             }
         }
         // Evaluate fixed formulas in the unknown receiver's context too:
@@ -3235,8 +5818,36 @@ impl Evaluator<'_> {
         value
     }
 
+    /// Whether `items`, the values of features that specialize `hit`, are
+    /// all of `hit`'s values in the receiver whose scope is `scope`: each is
+    /// one value (a settled value, or a placeholder for exactly one), and
+    /// their number is at least `hit`'s lower bound and, when `hit` has a
+    /// finite upper bound, exactly that. A subsetting part with no
+    /// multiplicity of its own (`part left :> wheels;`) stands for as many
+    /// values as the member and populates nothing; one `[1]` part among four
+    /// is one of four.
+    fn covers(&mut self, hit: usize, scope: Option<usize>, items: &[Value]) -> bool {
+        for item in items {
+            match item {
+                Value::Unbound(..) | Value::UnboundMember(..) => {
+                    if self.value_cardinality(item) != Some((1, Some(1))) {
+                        return false;
+                    }
+                }
+                Value::Indeterminate | Value::Sequence(_) => return false,
+                _ => {}
+            }
+        }
+        let count = i128::try_from(items.len()).unwrap_or(i128::MAX);
+        match self.cardinality_in(hit, scope, &mut HashMap::new()) {
+            Some((lower, upper)) => count >= lower && upper.is_none_or(|upper| upper == count),
+            None => true,
+        }
+    }
+
     /// The values of the receiver's owned features that specialize
-    /// `hit`, in declaration order — `None` when none does (an ordinary
+    /// `hit`, in declaration order, and whether every one redefines it (so
+    /// stands for it whole) — `None` when none does (an ordinary
     /// member access, not a collection). Implied subsettings resolve by
     /// library name, so a model loaded without the standard library
     /// degrades to the explicit-edge answer. A reference usage stands
@@ -3247,37 +5858,155 @@ impl Evaluator<'_> {
         &mut self,
         receiver: usize,
         hit: usize,
-    ) -> Result<Option<Vec<Value>>, EvalError> {
-        let scope = self.b.elem_scope.get(&receiver).copied().unwrap_or(0);
+    ) -> Result<Option<(Vec<Value>, bool)>, EvalError> {
         let mut items = Vec::new();
         let mut any = false;
-        for m in self.b.owned_member_elems(receiver, true) {
-            if m == hit {
-                continue;
+        let mut redefining = true;
+        let mut members: Vec<usize> = Vec::new();
+        // The receiver's own features first, then those of its generals,
+        // nearest first.
+        let mut namespaces = vec![receiver];
+        let mut seen = HashSet::from([receiver]);
+        // The resolver's same-name redefinitions in the receiver: a general's
+        // member and the member hiding it (`part a :> items[1] { … }` in the
+        // receiver hides `Kit::a`).
+        let shadowed: HashMap<usize, usize> = match self.b.elem_scope.get(&receiver).copied() {
+            Some(scope) => self
+                .b
+                .inherited_bindings(scope, false)
+                .implicit_redefinitions
+                .iter()
+                .copied()
+                .collect(),
+            None => HashMap::new(),
+        };
+        let mut at = 0;
+        while let Some(&namespace) = namespaces.get(at) {
+            at += 1;
+            if namespaces.len() < MAX_CALL_DEPTH {
+                for general in self.b.explicit_supertype_elems(namespace) {
+                    if seen.insert(general) {
+                        namespaces.push(general);
+                    }
+                }
             }
-            let mut is_member = self.b.conforms_upward(m, hit);
-            if !is_member {
-                let metaclass = self.b.elements[m].ty;
-                let mut names: Vec<&'static str> =
-                    match crate::lift::usage_kind_of(metaclass, Dialect::Sysml) {
-                        Some(kind) => crate::json::implicit_usage_bases(kind).to_vec(),
-                        None => Vec::new(),
-                    };
-                names.extend(implied_collection_extras(metaclass));
-                is_member = names.iter().any(|n| {
-                    self.b
-                        .resolve(scope, &crate::json::lib_qn(n), 0)
-                        .is_some_and(|c| c == hit || self.b.conforms_upward(c, hit))
-                });
+            for m in self.b.owned_member_elems(namespace, true) {
+                if !self.names_values_of(receiver, m, hit) {
+                    continue;
+                }
+                // A general's member the receiver has a version of its own
+                // (a same-named member, `part a[1] { … }` for `Kit::a`) is
+                // read as that version.
+                let mut m = m;
+                if namespace != receiver {
+                    let mut hops = 0;
+                    while let Some(&hiding) = shadowed.get(&m) {
+                        hops += 1;
+                        if hiding == m || hops > MAX_SPECIALIZER_DEPTH {
+                            break;
+                        }
+                        m = hiding;
+                    }
+                    if let Some(version) = self.version_in(receiver, m) {
+                        m = version;
+                    }
+                }
+                if !members.contains(&m) {
+                    members.push(m);
+                }
             }
-            if !is_member {
-                continue;
-            }
-            any = true;
-            let target = self.reference_target(m).unwrap_or(m);
-            items.extend(self.feature_value_in(target, None)?.items());
         }
-        Ok(if any { Some(items) } else { None })
+        // A member another collected member redefines (`part renamed :>>
+        // a;`) names values the other already stands for.
+        let members: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&m| {
+                !members
+                    .iter()
+                    .any(|&c| c != m && self.redefined_closure(c).contains(&m))
+            })
+            .collect();
+        // Members that are one value each and subset a collected member that
+        // is one value (`part also :> a[1];` and `part again :> a[1];`
+        // beside `a[1]`) all name that one value: they count once, read as
+        // the most specific when they form a chain, as the shared one when
+        // the rest only name it, and as unknown when siblings say different
+        // things of it.
+        let single: Vec<bool> = members
+            .iter()
+            .map(|&m| self.unbound_cardinality(m) == Some((1, Some(1))))
+            .collect();
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (at, &m) in members.iter().enumerate() {
+            let mut shared = m;
+            if single[at] {
+                // Climb until no collected singleton is above.
+                let mut climbed = true;
+                while climbed {
+                    climbed = false;
+                    for (other, &c) in members.iter().enumerate() {
+                        if c != shared
+                            && single[other]
+                            && self.b.conforms_upward(shared, c)
+                            && !self.b.conforms_upward(c, shared)
+                        {
+                            shared = c;
+                            climbed = true;
+                        }
+                    }
+                }
+            }
+            match groups.iter_mut().find(|(top, _)| *top == shared) {
+                Some((_, group)) => group.push(m),
+                None => groups.push((shared, vec![m])),
+            }
+        }
+        let mut kept: Vec<Option<usize>> = Vec::new();
+        for (shared, group) in groups {
+            if group.len() == 1 {
+                kept.push(Some(group[0]));
+                continue;
+            }
+            // The member below every other, when they form a chain.
+            let lowest = group.iter().copied().find(|&m| {
+                group
+                    .iter()
+                    .all(|&c| c == m || self.b.conforms_upward(m, c))
+            });
+            if let Some(lowest) = lowest {
+                kept.push(Some(lowest));
+                continue;
+            }
+            let silent = group
+                .iter()
+                .all(|&m| m == shared || (!self.says(m, Some(&[shared])) && !self.says(m, None)));
+            kept.push(silent.then_some(shared));
+        }
+        for m in kept {
+            let Some(m) = m else {
+                any = true;
+                redefining = false;
+                items.push(Value::Indeterminate);
+                continue;
+            };
+            any = true;
+            redefining &= self
+                .b
+                .redefinition_target_elems(m)
+                .iter()
+                .any(|&t| t == hit || self.b.conforms_upward(t, hit));
+            let target = self.reference_target(m);
+            let value = match target {
+                Some(target) => self.feature_value_in(target, None)?,
+                None => {
+                    let scope = self.b.elem_scope.get(&receiver).copied();
+                    self.feature_value_in(m, scope)?
+                }
+            };
+            items.extend(value.items());
+        }
+        Ok(if any { Some((items, redefining)) } else { None })
     }
 
     /// The resolved target of `m`'s own `ReferenceSubsetting`, if any —
@@ -3309,12 +6038,30 @@ impl Evaluator<'_> {
     /// or `km` carry their factor to the reference as `scale`); `* / **`
     /// combine exponents and scales. The display keeps the source
     /// spelling (`km/h`).
+    ///
+    /// The unit also records how it was written (see
+    /// [`Unit::as_written`]): a compound bracket as a whole, then each
+    /// named unit it is spelled from (`km/h`, then `km` and `h`).
     fn unit_of(&mut self, scope: usize, e: &Expr) -> Result<Unit, EvalError> {
-        let (dims, scale, display) = self.unit_dims(scope, e)?;
+        let mut written = Vec::new();
+        let (dims, scale, display) = self.unit_dims(scope, e, &mut written)?;
+        let dims = normalize_dims(dims);
+        if !matches!(e.kind, ExprKind::Ref(_)) {
+            written.insert(
+                0,
+                WrittenUnit {
+                    dims: dims.clone(),
+                    scale: scale.clone(),
+                    display: display.clone(),
+                    named: false,
+                },
+            );
+        }
         Ok(Unit {
-            dims: normalize_dims(dims),
+            dims,
             scale,
             display,
+            basis: UnitBasis::of(written),
         })
     }
 
@@ -3322,6 +6069,7 @@ impl Evaluator<'_> {
         &mut self,
         scope: usize,
         e: &Expr,
+        written: &mut Vec<WrittenUnit>,
     ) -> Result<(Vec<Dim>, Rational, String), EvalError> {
         match &e.kind {
             ExprKind::Ref(qn) => {
@@ -3335,13 +6083,21 @@ impl Evaluator<'_> {
                     .map(|s| s.value.clone())
                     .unwrap_or_default();
                 let (dims, scale) = self.expanded_unit(scope, elem, name.clone(), 0);
+                if written.len() < MAX_WRITTEN_UNITS {
+                    written.push(WrittenUnit {
+                        dims: normalize_dims(dims.clone()),
+                        scale: scale.clone(),
+                        display: name.clone(),
+                        named: true,
+                    });
+                }
                 Ok((dims, scale, name))
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let (ld, ls, ldisp) = self.unit_dims(scope, lhs)?;
+                let (ld, ls, ldisp) = self.unit_dims(scope, lhs, written)?;
                 match op {
                     BinaryOp::Mul => {
-                        let (rd, rs, rdisp) = self.unit_dims(scope, rhs)?;
+                        let (rd, rs, rdisp) = self.unit_dims(scope, rhs, written)?;
                         Ok((
                             dims_combine(&ld, &rd, 1),
                             ls.mul(&rs),
@@ -3349,7 +6105,7 @@ impl Evaluator<'_> {
                         ))
                     }
                     BinaryOp::Div => {
-                        let (rd, rs, rdisp) = self.unit_dims(scope, rhs)?;
+                        let (rd, rs, rdisp) = self.unit_dims(scope, rhs, written)?;
                         Ok((
                             dims_combine(&ld, &rd, -1),
                             scale_ratio(&ls, &rs),
@@ -3626,10 +6382,18 @@ impl Evaluator<'_> {
 
     /// The `unitConversion` declaration of a unit element, if it carries
     /// one that this evaluator can use: both members must be *bound* —
-    /// `referenceUnit` to a unit element and `conversionFactor` to a
-    /// finite positive number (the abstract inherited members on every
+    /// `referenceUnit` to a unit (a base or converted unit, a derived
+    /// unit like `N`, or a product like `m^3`) and `conversionFactor` to
+    /// a finite positive number (the abstract inherited members on every
     /// `MeasurementUnit` are valueless and fall out here).
     fn conversion_dims(&mut self, elem: usize, depth: u32) -> Option<(Vec<Dim>, Rational)> {
+        /// What a conversion's `referenceUnit` is bound to.
+        enum Reference {
+            /// The unit element it evaluates to.
+            Unit(usize),
+            /// A unit expression, in the scope it is written in.
+            Expression(usize, Expr),
+        }
         let seg = |s: &str| {
             vec![Name {
                 value: s.to_string(),
@@ -3647,18 +6411,34 @@ impl Evaluator<'_> {
             match b.feature_value_in(hit, scope) {
                 Ok(
                     Value::Element(ElementRef(e))
-                    | Value::Unbound(ElementRef(e))
-                    | Value::UnboundMember(ElementRef(e)),
+                    | Value::Unbound(ElementRef(e), _)
+                    | Value::UnboundMember(ElementRef(e), _),
                 ) if e == hit => None,
                 Ok(v) => Some(v),
                 Err(_) => None,
             }
         };
-        let ref_unit = match member(self, conv, conv_scope, "referenceUnit")? {
-            Value::Element(ElementRef(e))
-            | Value::Unbound(ElementRef(e))
-            | Value::UnboundMember(ElementRef(e)) => e,
-            _ => return None,
+        // A derived reference unit (`N`, whose value is `kg*m/s^2`) or a
+        // product (`m^3`) evaluates to a product of units, which no value
+        // represents. Its binding is a unit expression all the same, read
+        // below as a derived unit's definition is, unless this evaluation
+        // overrides the member.
+        let reference = match member(self, conv, conv_scope, "referenceUnit") {
+            Some(
+                Value::Element(ElementRef(e))
+                | Value::Unbound(ElementRef(e), _)
+                | Value::UnboundMember(ElementRef(e), _),
+            ) => Reference::Unit(e),
+            _ => {
+                let hit = self
+                    .b
+                    .resolve_rest(conv, conv_scope, &seg("referenceUnit"), 0)?;
+                if self.overrides.contains_key(&hit) {
+                    return None;
+                }
+                let (scope, expr) = self.b.values.get(&hit).cloned()?;
+                Reference::Expression(scope, expr)
+            }
         };
         // `ConversionByConvention` binds `conversionFactor` directly;
         // `ConversionByPrefix` derives it as `prefix.conversionFactor`
@@ -3670,8 +6450,8 @@ impl Evaluator<'_> {
             None => {
                 let prefix = match member(self, conv, conv_scope, "prefix")? {
                     Value::Element(ElementRef(e))
-                    | Value::Unbound(ElementRef(e))
-                    | Value::UnboundMember(ElementRef(e)) => e,
+                    | Value::Unbound(ElementRef(e), _)
+                    | Value::UnboundMember(ElementRef(e), _) => e,
                     _ => return None,
                 };
                 let p_scope = self.b.elem_scope.get(&prefix).copied();
@@ -3684,18 +6464,35 @@ impl Evaluator<'_> {
         if !factor.is_positive() {
             return None;
         }
-        let ref_name = self.b.elements[ref_unit]
-            .props
-            .get("declaredShortName")
-            .or_else(|| self.b.elements[ref_unit].props.get("declaredName"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unit")
-            .to_string();
-        // The reference unit resolves its own spelled components from
-        // its declaring scope; the conversion's scope is only the
-        // fallback.
-        let ref_scope = conv_scope.unwrap_or(0);
-        let (dims, ref_scale) = self.expanded_unit(ref_scope, ref_unit, ref_name, depth + 1);
+        let (dims, ref_scale) = match reference {
+            Reference::Unit(ref_unit) => {
+                // An absent name is a null property: read each name as a
+                // string before falling back, so a unit with only a
+                // declared name keeps it.
+                let props = &self.b.elements[ref_unit].props;
+                let ref_name = props
+                    .get("declaredShortName")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| props.get("declaredName").and_then(|v| v.as_str()))
+                    .unwrap_or("unit")
+                    .to_string();
+                // The reference unit resolves its own spelled components
+                // from its declaring scope; the conversion's scope is only
+                // the fallback.
+                let ref_scope = conv_scope.unwrap_or(0);
+                self.expanded_unit(ref_scope, ref_unit, ref_name, depth + 1)
+            }
+            Reference::Expression(scope, expr) => {
+                let (dims, scale) = self.power_product_dims(scope, &expr, depth)?;
+                // A reference that cancels (`m/m`) leaves the unit opaque,
+                // as a definition that cancels does.
+                let dims = normalize_dims(dims);
+                if dims.is_empty() {
+                    return None;
+                }
+                (dims, scale)
+            }
+        };
         Some((dims, factor.mul(&ref_scale)))
     }
 
@@ -3817,8 +6614,8 @@ impl Evaluator<'_> {
             ClassificationOp::AtType => {
                 for v in &items {
                     let (Value::Element(ElementRef(e))
-                    | Value::Unbound(ElementRef(e))
-                    | Value::UnboundMember(ElementRef(e))) = v
+                    | Value::Unbound(ElementRef(e), _)
+                    | Value::UnboundMember(ElementRef(e), _)) = v
                     else {
                         return Err(EvalError::Type(
                             "the metadata test `@` applies to model elements".into(),
@@ -3849,8 +6646,8 @@ impl Evaluator<'_> {
                     match v {
                         Value::Instance { .. } => metas.push(v),
                         Value::Element(ElementRef(e))
-                        | Value::Unbound(ElementRef(e))
-                        | Value::UnboundMember(ElementRef(e)) => {
+                        | Value::Unbound(ElementRef(e), _)
+                        | Value::UnboundMember(ElementRef(e), _) => {
                             if matches!(self.b.elements[e].ty, "MetadataUsage" | "MetadataFeature")
                             {
                                 // An annotation already *is* a metaobject.
@@ -3892,8 +6689,8 @@ impl Evaluator<'_> {
     fn metadata_access(&mut self, scope: usize, target: &QualifiedName) -> Result_ {
         if let Some(value) = self.environment_value(scope, target)? {
             let (Value::Element(ElementRef(e))
-            | Value::Unbound(ElementRef(e))
-            | Value::UnboundMember(ElementRef(e))) = value
+            | Value::Unbound(ElementRef(e), _)
+            | Value::UnboundMember(ElementRef(e), _)) = value
             else {
                 return Err(EvalError::Type(
                     "`.metadata` applies to model elements".into(),
@@ -3983,8 +6780,8 @@ impl Evaluator<'_> {
         let classifier = match v {
             Value::Instance { ty, .. } => ty.0,
             Value::Element(ElementRef(e))
-            | Value::Unbound(ElementRef(e))
-            | Value::UnboundMember(ElementRef(e)) => *e,
+            | Value::Unbound(ElementRef(e), _)
+            | Value::UnboundMember(ElementRef(e), _) => *e,
             _ => {
                 return Err(EvalError::Type(
                     "metadata classification applies to metaobjects".into(),
@@ -4057,8 +6854,8 @@ impl Evaluator<'_> {
             Value::Boolean(_) => scalar(&["Boolean", "ScalarValue"]),
             Value::String(_) => scalar(&["String", "ScalarValue"]),
             Value::Element(ElementRef(e))
-            | Value::Unbound(ElementRef(e))
-            | Value::UnboundMember(ElementRef(e)) => {
+            | Value::Unbound(ElementRef(e), _)
+            | Value::UnboundMember(ElementRef(e), _) => {
                 if !direct && self.conforms_upward(*e, target) {
                     return Ok(Some(true));
                 }
@@ -4153,10 +6950,13 @@ impl Evaluator<'_> {
                 let display = qn.to_display_string();
                 if let Some(value) = self.environment_value(scope, qn)? {
                     return match value {
-                        Value::Element(ElementRef(elem))
-                        | Value::Unbound(ElementRef(elem))
-                        | Value::UnboundMember(ElementRef(elem)) => {
-                            self.user_calc_elem(&display, elem, args)
+                        Value::Element(ElementRef(elem)) => {
+                            self.user_calc_elem(&display, elem, args, None)
+                        }
+                        Value::Unbound(ElementRef(elem), via)
+                        | Value::UnboundMember(ElementRef(elem), via) => {
+                            let context = Context::new(elem, via);
+                            self.user_calc_elem(&display, elem, args, Some(context))
                         }
                         Value::Indeterminate => Ok(Value::Indeterminate),
                         other => Err(EvalError::Type(format!(
@@ -4167,6 +6967,26 @@ impl Evaluator<'_> {
                 let Some(elem) = self.b.resolve(scope, qn, 0) else {
                     return Err(EvalError::Unsupported(format!("function `{display}`")));
                 };
+                // A calculation a simple name finds as a namespace's feature
+                // runs for the instance that namespace is read for, as a
+                // feature value would be read; a qualified name names the
+                // declaration.
+                if qn.segments.len() == 1 && !qn.is_global {
+                    let (elem, context) = match self.retarget(elem, scope) {
+                        Some(Retarget::To(version, instance)) => {
+                            let mut chain = vec![instance.namespace];
+                            chain.extend_from_slice(instance.via.links());
+                            (
+                                version,
+                                self.normalized(version, &chain, instance.via.known),
+                            )
+                        }
+                        Some(Retarget::Disagreeing) => return Ok(Value::Indeterminate),
+                        None => (elem, self.via_of(elem, Some(scope))),
+                    };
+                    let context = Context::new(elem, context);
+                    return self.user_calc_elem(&display, elem, args, Some(context));
+                }
                 (display, elem)
             }
             TargetRef::Chain(links) => {
@@ -4183,10 +7003,59 @@ impl Evaluator<'_> {
                 let Some(elem) = self.b.resolve_chain_member(scope, Some(links), &empty) else {
                     return Err(EvalError::Unsupported(format!("function `{display}`")));
                 };
-                (display, elem)
+                let context = self.callee_receiver(scope, links, elem)?;
+                if context.is_none() {
+                    self.read_declared(elem);
+                }
+                return self.user_calc_elem(&display, elem, args, context);
             }
         };
-        self.user_calc_elem(&display, elem, args)
+        self.read_declared(elem);
+        self.user_calc_elem(&display, elem, args, None)
+    }
+
+    /// The context a chained callee (`drone.twice()`) runs in: the one
+    /// instance its prefix evaluates to, when the calculation is that
+    /// instance's feature. Anything else runs as declared. The prefix is
+    /// evaluated only to find the instance, so it counts as no read of the
+    /// evaluation's value; an exhausted budget still propagates.
+    fn callee_receiver(
+        &mut self,
+        scope: usize,
+        links: &[QualifiedName],
+        elem: usize,
+    ) -> Result<Option<Context>, EvalError> {
+        let Some((root, rest)) = links
+            .split_last()
+            .and_then(|(_, prefix)| prefix.split_first())
+        else {
+            return Ok(None);
+        };
+        let lossy_reads = self.lossy_reads;
+        let members: Vec<&QualifiedName> = rest.iter().collect();
+        let receiver = match self.reference(scope, root) {
+            Ok(value) => self.chain_members(value, &members),
+            Err(error) => Err(error),
+        };
+        self.lossy_reads = lossy_reads;
+        let (instance, via) = match receiver {
+            Ok(Value::Unbound(ElementRef(e), via) | Value::UnboundMember(ElementRef(e), via)) => {
+                (e, via)
+            }
+            Ok(Value::Element(ElementRef(e))) => (e, Via::declared()),
+            Err(error @ EvalError::Budget(_)) => return Err(error),
+            _ => return Ok(None),
+        };
+        let Some(owner) = self.b.owner_elem(elem) else {
+            return Ok(None);
+        };
+        if instance != owner && !self.b.indexed_conforms(instance, owner) {
+            return Ok(None);
+        }
+        let mut chain = vec![instance];
+        chain.extend_from_slice(via.links());
+        let via = self.normalized(elem, &chain, via.known);
+        Ok(Some(Context::new(elem, via)))
     }
 
     /// Invoke an already-resolved calculation element. Kept separate from
@@ -4197,15 +7066,32 @@ impl Evaluator<'_> {
         display: &str,
         elem: usize,
         args: Vec<(Option<String>, Value)>,
+        context: Option<Context>,
     ) -> Result_ {
         let previous = self.unbound_receiver;
-        let elem = match self.receiver_member(elem) {
-            Some(hit) => hit,
+        let (elem, context) = match self.receiver_member(elem) {
+            Some(hit) => {
+                // The unknown receiver's own calculation, read for it.
+                let receiver = self
+                    .unbound_receiver
+                    .and_then(|r| self.b.elem_scope.get(&r).copied());
+                let via = self.via_of(hit, receiver);
+                let context = Context::new(hit, via);
+                (hit, Some(context))
+            }
             None => {
                 self.unbound_receiver = None;
-                elem
+                (elem, context)
             }
         };
+        // The body reads for the instances the calculation is read for; a
+        // calculation not read as each of them reads it reads for none.
+        if let Some(context) = context.as_ref().filter(|_| self.fanning > 0) {
+            if !self.faithful(context.namespace, &context.via) {
+                self.lossy_reads += 1;
+            }
+        }
+        let previous_context = std::mem::replace(&mut self.context, context);
         let value = (|| {
             let scope =
                 self.b.elem_scope.get(&elem).copied().ok_or_else(|| {
@@ -4219,6 +7105,7 @@ impl Evaluator<'_> {
             self.restore_frames(hidden);
             value
         })();
+        self.context = previous_context;
         self.unbound_receiver = previous;
         value
     }
@@ -4448,8 +7335,8 @@ impl Evaluator<'_> {
                     .unwrap_or(false)
         };
         match (a, b) {
-            (Value::Unbound(_) | Value::UnboundMember(_), _)
-            | (_, Value::Unbound(_) | Value::UnboundMember(_)) => {
+            (Value::Unbound(..) | Value::UnboundMember(..), _)
+            | (_, Value::Unbound(..) | Value::UnboundMember(..)) => {
                 Err(EvalError::Type("comparison with an unbound feature".into()))
             }
             (Value::Element(x), Value::Element(y)) => {
@@ -4494,7 +7381,7 @@ impl Evaluator<'_> {
     fn tri_boolean(&mut self, scope: usize, e: &Expr) -> Result<Option<bool>, EvalError> {
         match self.expr(scope, e)? {
             Value::Boolean(b) => Ok(Some(b)),
-            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => Ok(None),
+            Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate => Ok(None),
             other => Err(EvalError::Type(format!("expected a boolean, got {other}"))),
         }
     }
@@ -4563,10 +7450,10 @@ impl Evaluator<'_> {
         // type-error below (an enum literal is not a number).
         if matches!(
             l,
-            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+            Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate
         ) || matches!(
             r,
-            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+            Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate
         ) {
             return Ok(Value::Indeterminate);
         }
@@ -4609,7 +7496,7 @@ impl Evaluator<'_> {
                 }
                 _ => Err(EvalError::Type("`..` needs integer bounds".into())),
             },
-            Add | Sub | Mul | Div | Rem | Pow | Caret => arith(op, l, r),
+            Add | Sub | Mul | Div | Rem | Pow | Caret => arith(op, l, r, self.b),
             _ => unreachable!("short-circuit ops handled above"),
         }?;
         self.charged(value)
@@ -4697,7 +7584,7 @@ impl Evaluator<'_> {
                 _ => None,
             };
             if let Some(op) = op {
-                return arith(op, l.clone(), r.clone());
+                return arith(op, l.clone(), r.clone(), self.b);
             }
         }
         if let Some(name) = intrinsic {
@@ -4761,9 +7648,9 @@ impl Evaluator<'_> {
                                     out.push(item.clone());
                                 }
                             }
-                            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
-                                unknown = true
-                            }
+                            Value::Unbound(..)
+                            | Value::UnboundMember(..)
+                            | Value::Indeterminate => unknown = true,
                             _ => {
                                 return Err(EvalError::Type(format!(
                                     "{name} body must yield a boolean"
@@ -4771,9 +7658,9 @@ impl Evaluator<'_> {
                             }
                         },
                         "forAll" => match v {
-                            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
-                                unknown = true
-                            }
+                            Value::Unbound(..)
+                            | Value::UnboundMember(..)
+                            | Value::Indeterminate => unknown = true,
                             v if v != Value::Boolean(true) => {
                                 return Ok(Value::Boolean(false));
                             }
@@ -4781,9 +7668,9 @@ impl Evaluator<'_> {
                         },
                         "exists" => match v {
                             Value::Boolean(true) => return Ok(Value::Boolean(true)),
-                            Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
-                                unknown = true
-                            }
+                            Value::Unbound(..)
+                            | Value::UnboundMember(..)
+                            | Value::Indeterminate => unknown = true,
                             _ => {}
                         },
                         _ => unreachable!(),
@@ -4804,7 +7691,7 @@ impl Evaluator<'_> {
                         Value::Boolean(false) => {}
                         // An unknown predicate makes *which* item is
                         // selected unknown.
-                        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
+                        Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate => {
                             return Ok(Value::Indeterminate);
                         }
                         _ => {
@@ -5044,8 +7931,8 @@ impl Evaluator<'_> {
                 if let Some(value) = value {
                     return match value {
                         Value::Element(ElementRef(e))
-                        | Value::Unbound(ElementRef(e))
-                        | Value::UnboundMember(ElementRef(e)) => self.library_intrinsic(e),
+                        | Value::Unbound(ElementRef(e), _)
+                        | Value::UnboundMember(ElementRef(e), _) => self.library_intrinsic(e),
                         _ => None,
                     };
                 }
@@ -5117,16 +8004,16 @@ impl Evaluator<'_> {
                 "ownedMember",
                 [
                     Value::Element(ElementRef(e))
-                    | Value::Unbound(ElementRef(e))
-                    | Value::UnboundMember(ElementRef(e)),
+                    | Value::Unbound(ElementRef(e), _)
+                    | Value::UnboundMember(ElementRef(e), _),
                 ],
             ) if self.query => Ok(Value::Sequence(self.owned_members(*e, false))),
             (
                 "ownedFeature",
                 [
                     Value::Element(ElementRef(e))
-                    | Value::Unbound(ElementRef(e))
-                    | Value::UnboundMember(ElementRef(e)),
+                    | Value::Unbound(ElementRef(e), _)
+                    | Value::UnboundMember(ElementRef(e), _),
                 ],
             ) if self.query => Ok(Value::Sequence(self.owned_members(*e, true))),
             // Element reflection (query mode): names, metaclass and
@@ -5135,8 +8022,8 @@ impl Evaluator<'_> {
                 "declaredName" | "shortName" | "qualifiedName" | "metaclass" | "docs",
                 [
                     Value::Element(ElementRef(e))
-                    | Value::Unbound(ElementRef(e))
-                    | Value::UnboundMember(ElementRef(e)),
+                    | Value::Unbound(ElementRef(e), _)
+                    | Value::UnboundMember(ElementRef(e), _),
                 ],
             ) if self.query => Ok(self.reflect_element(name, *e)),
             (
@@ -5146,8 +8033,8 @@ impl Evaluator<'_> {
                 let mut out = Vec::new();
                 for item in items {
                     if let Value::Element(ElementRef(e))
-                    | Value::Unbound(ElementRef(e))
-                    | Value::UnboundMember(ElementRef(e)) = item
+                    | Value::Unbound(ElementRef(e), _)
+                    | Value::UnboundMember(ElementRef(e), _) = item
                     {
                         out.extend(self.reflect_element(name, *e).items());
                     }
@@ -5157,12 +8044,12 @@ impl Evaluator<'_> {
             // Fold through `arith` so quantities work: same-dimension
             // items sum (the plain-zero identity coerces), products
             // compose dimensions.
-            ("sum", [s]) => items(s)
-                .into_iter()
-                .try_fold(Value::Integer(0), |acc, v| arith(BinaryOp::Add, acc, v)),
-            ("product", [s]) => items(s)
-                .into_iter()
-                .try_fold(Value::Integer(1), |acc, v| arith(BinaryOp::Mul, acc, v)),
+            ("sum", [s]) => items(s).into_iter().try_fold(Value::Integer(0), |acc, v| {
+                arith(BinaryOp::Add, acc, v, self.b)
+            }),
+            ("product", [s]) => items(s).into_iter().try_fold(Value::Integer(1), |acc, v| {
+                arith(BinaryOp::Mul, acc, v, self.b)
+            }),
             // A bare unbound feature is a placeholder for an *unknown*
             // sequence: its cardinality comes from the declared
             // multiplicity, never from the placeholder itself. An exact
@@ -5170,7 +8057,7 @@ impl Evaluator<'_> {
             // emptiness; anything else is honestly undecided. Sequences
             // containing placeholders are normalized above; library
             // frames never mint Unbound in the first place.
-            ("size", [v @ (Value::Unbound(_) | Value::UnboundMember(_))]) => {
+            ("size", [v @ (Value::Unbound(..) | Value::UnboundMember(..))]) => {
                 match self.value_cardinality(v) {
                     Some((lo, Some(hi))) if lo == hi => Ok(Value::Integer(lo)),
                     // Indeterminate, not an error — the cardinality is
@@ -5181,14 +8068,14 @@ impl Evaluator<'_> {
                     _ => Ok(Value::Indeterminate),
                 }
             }
-            ("isEmpty", [v @ (Value::Unbound(_) | Value::UnboundMember(_))]) => {
+            ("isEmpty", [v @ (Value::Unbound(..) | Value::UnboundMember(..))]) => {
                 match self.value_cardinality(v) {
                     Some((_, Some(0))) => Ok(Value::Boolean(true)),
                     Some((lo, _)) if lo >= 1 => Ok(Value::Boolean(false)),
                     _ => Ok(Value::Indeterminate),
                 }
             }
-            ("notEmpty", [v @ (Value::Unbound(_) | Value::UnboundMember(_))]) => {
+            ("notEmpty", [v @ (Value::Unbound(..) | Value::UnboundMember(..))]) => {
                 match self.value_cardinality(v) {
                     Some((_, Some(0))) => Ok(Value::Boolean(false)),
                     Some((lo, _)) if lo >= 1 => Ok(Value::Boolean(true)),
@@ -5268,6 +8155,7 @@ impl Evaluator<'_> {
                 BinaryOp::Pow,
                 v.clone(),
                 Value::Rational(Rational::new(1, 2).expect("non-zero denominator")),
+                self.b,
             ),
             ("sqrt", [v]) => match v.num() {
                 Some(n) if n.is_negative() => {
@@ -5289,7 +8177,7 @@ impl Evaluator<'_> {
             // RationalFunctions::rat/numer/denom — exact division and the
             // reduced fraction's parts (a double counts through its exact
             // dyadic value).
-            ("rat", [a, b]) => arith(BinaryOp::Div, a.clone(), b.clone()),
+            ("rat", [a, b]) => arith(BinaryOp::Div, a.clone(), b.clone(), self.b),
             ("numer", [v]) => rational_part(v, true),
             ("denom", [v]) => rational_part(v, false),
             // ComplexFunctions::re/im on real values.
@@ -5555,7 +8443,7 @@ fn scale_magnitude(v: Value, factor: &Rational) -> Result<Value, EvalError> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Sequence),
-        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => {
+        Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate => {
             Ok(Value::Indeterminate)
         }
         other => Err(EvalError::Type(format!(
@@ -5586,7 +8474,7 @@ fn rational_part(v: &Value, numer: bool) -> Result<Value, EvalError> {
 /// an unbound or indeterminate value.
 fn value_is_unknown(v: &Value) -> bool {
     match v {
-        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate => true,
+        Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate => true,
         Value::Quantity(n, _) => value_is_unknown(n),
         Value::Instance { fields, .. } => fields.iter().any(|(_, v)| value_is_unknown(v)),
         Value::Sequence(items) => items.iter().any(value_is_unknown),
@@ -5668,7 +8556,9 @@ fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, EvalError> {
     }
 }
 
-fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
+/// `l op r`. `model` says how a combined quantity's unit is written (see
+/// [`Unit::coherent`]).
+fn arith(op: BinaryOp, l: Value, r: Value, model: &Builder) -> Result<Value, EvalError> {
     use BinaryOp::*;
     // KerML scalars *are* one-element sequences — an operand that
     // arrives as a singleton (a `collect` result, say) is the value.
@@ -5681,10 +8571,10 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
     // like `sum`/`product` reach arithmetic through here directly).
     if matches!(
         l,
-        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+        Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate
     ) || matches!(
         r,
-        Value::Unbound(_) | Value::UnboundMember(_) | Value::Indeterminate
+        Value::Unbound(..) | Value::UnboundMember(..) | Value::Indeterminate
     ) {
         return Ok(Value::Indeterminate);
     }
@@ -5700,11 +8590,14 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
     // Quantities: same-dimension additive ops (converting across scales
     // — minutes and seconds interoperate), scalar scaling, exponent-map
     // combination for `*`, `/`, and `**`. Combined results fold their
-    // scales into the number and take the reference spelling, so the
-    // printed magnitude is always true to the printed unit; dimensions
-    // that cancel completely leave a plain number.
-    let quantity_or_plain = |n: Value, dims: Vec<Dim>, scale: Rational| {
-        let unit = Unit::from_dims(dims);
+    // scales into the number and take the SI-coherent spelling (`kg`
+    // rather than `g`), so the printed magnitude is always true to the
+    // printed unit; dimensions that cancel completely leave a plain
+    // number. The result keeps the operands' written units (see
+    // `Unit::as_written`).
+    let quantity_or_plain = |n: Value, dims: Vec<Dim>, scale: Rational, basis: UnitBasis| {
+        let unit = Unit::coherent(dims, model).with_basis(basis);
+        let scale = scale_ratio(&scale, &unit.scale);
         let n = if scale.is_one() {
             n
         } else {
@@ -5721,9 +8614,10 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
     };
     match (op, &l, &r) {
         (Add | Sub, Value::Quantity(a, u), Value::Quantity(b, v)) => {
+            let unit = || u.clone().with_basis(UnitBasis::merge(&u.basis, &v.basis));
             return if u == v {
-                let n = arith(op, (**a).clone(), (**b).clone())?;
-                Ok(Value::Quantity(Box::new(n), u.clone()))
+                let n = arith(op, (**a).clone(), (**b).clone(), model)?;
+                Ok(Value::Quantity(Box::new(n), unit()))
             } else if same_dims(u, v) {
                 // Convert the right operand into the left's unit.
                 let (Some(a), Some(b)) = (a.num(), b.num()) else {
@@ -5735,7 +8629,7 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
                 } else {
                     a.sub(&b)
                 };
-                Ok(Value::Quantity(Box::new(bounded(n)?), u.clone()))
+                Ok(Value::Quantity(Box::new(bounded(n)?), unit()))
             } else {
                 Err(EvalError::Type(format!(
                     "cannot combine quantities in `{}` and `{}`",
@@ -5744,27 +8638,33 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
             };
         }
         (Mul, Value::Quantity(a, u), Value::Quantity(b, v)) => {
-            let n = arith(Mul, (**a).clone(), (**b).clone())?;
-            return quantity_or_plain(n, dims_combine(&u.dims, &v.dims, 1), u.scale.mul(&v.scale));
+            let n = arith(Mul, (**a).clone(), (**b).clone(), model)?;
+            return quantity_or_plain(
+                n,
+                dims_combine(&u.dims, &v.dims, 1),
+                u.scale.mul(&v.scale),
+                UnitBasis::merge(&u.basis, &v.basis),
+            );
         }
         (Div, Value::Quantity(a, u), Value::Quantity(b, v)) => {
-            let n = arith(Div, (**a).clone(), (**b).clone())?;
+            let n = arith(Div, (**a).clone(), (**b).clone(), model)?;
             return quantity_or_plain(
                 n,
                 dims_combine(&u.dims, &v.dims, -1),
                 scale_ratio(&u.scale, &v.scale),
+                UnitBasis::merge(&u.basis, &v.basis),
             );
         }
         (Mul, Value::Quantity(a, u), s) | (Mul, s, Value::Quantity(a, u))
             if matches!(s, Value::Integer(_) | Value::Rational(_) | Value::Real(_)) =>
         {
-            let n = arith(Mul, (**a).clone(), s.clone())?;
+            let n = arith(Mul, (**a).clone(), s.clone(), model)?;
             return Ok(Value::Quantity(Box::new(n), u.clone()));
         }
         (Div, Value::Quantity(a, u), s)
             if matches!(s, Value::Integer(_) | Value::Rational(_) | Value::Real(_)) =>
         {
-            let n = arith(Div, (**a).clone(), s.clone())?;
+            let n = arith(Div, (**a).clone(), s.clone(), model)?;
             return Ok(Value::Quantity(Box::new(n), u.clone()));
         }
         // A scalar over a quantity is a reciprocal-unit quantity
@@ -5772,11 +8672,12 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
         (Div, s, Value::Quantity(a, u))
             if matches!(s, Value::Integer(_) | Value::Rational(_) | Value::Real(_)) =>
         {
-            let n = arith(Div, s.clone(), (**a).clone())?;
+            let n = arith(Div, s.clone(), (**a).clone(), model)?;
             return quantity_or_plain(
                 n,
                 dims_pow(&u.dims, (-1, 1)),
                 scale_ratio(&Rational::one(), &u.scale),
+                u.basis.clone(),
             );
         }
         // A quantity raised to a numeric power scales its exponents
@@ -5789,9 +8690,9 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
                     "a unit exponent beyond simple fractions".into(),
                 ));
             };
-            let n = arith(op, (**a).clone(), s.clone())?;
+            let n = arith(op, (**a).clone(), s.clone(), model)?;
             let scale = u.scale.pow_ratio_or_approx(exp);
-            return quantity_or_plain(n, dims_pow(&u.dims, exp), scale);
+            return quantity_or_plain(n, dims_pow(&u.dims, exp), scale, u.basis.clone());
         }
         // A plain *zero* is the additive identity of every dimension
         // (`mass + sum(subcomponents.totalMass)` over no subcomponents is
@@ -5800,7 +8701,7 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
         (Add | Sub, Value::Quantity(..), z) if is_zero(z) => return Ok(l),
         (Add, z, Value::Quantity(..)) if is_zero(z) => return Ok(r),
         (Sub, z, Value::Quantity(a, u)) if is_zero(z) => {
-            let n = arith(Sub, Value::Integer(0), (**a).clone())?;
+            let n = arith(Sub, Value::Integer(0), (**a).clone(), model)?;
             return Ok(Value::Quantity(Box::new(n), u.clone()));
         }
         (_, Value::Quantity(..), _) | (_, _, Value::Quantity(..)) => {
@@ -5898,6 +8799,13 @@ pub(crate) fn prepare_unit(b: &mut Builder, elem: usize) {
         steps: 0,
         allocated: 0,
         query: false,
+        open_receivers: Vec::new(),
+        lossy_reads: 0,
+        context: None,
+        guard_memo: Default::default(),
+        fanning: 0,
+        binding_depth: 0,
+        binding_unsettled: HashSet::new(),
     };
     for name in names {
         evaluator.expanded_unit(scope, elem, name, 0);
@@ -5989,6 +8897,13 @@ mod memo_tests {
             steps: 0,
             allocated: 0,
             query: false,
+            open_receivers: Vec::new(),
+            lossy_reads: 0,
+            context: None,
+            guard_memo: Default::default(),
+            fanning: 0,
+            binding_depth: 0,
+            binding_unsettled: HashSet::new(),
         };
         ev.b.used_imports.clear();
         // A recursion cutoff must never poison a later complete reduction.
@@ -6054,6 +8969,13 @@ mod memo_tests {
             steps: 0,
             allocated: 0,
             query: false,
+            open_receivers: Vec::new(),
+            lossy_reads: 0,
+            context: None,
+            guard_memo: Default::default(),
+            fanning: 0,
+            binding_depth: 0,
+            binding_unsettled: HashSet::new(),
         }
     }
 
@@ -6314,6 +9236,13 @@ mod parameter_environment_tests {
             steps: MAX_STEPS - 1,
             allocated: 0,
             query: false,
+            open_receivers: Vec::new(),
+            lossy_reads: 0,
+            context: None,
+            guard_memo: Default::default(),
+            fanning: 0,
+            binding_depth: 0,
+            binding_unsettled: HashSet::new(),
         };
         // The first frame is eligible for masking, but the second proof fails.
         assert!(ev.mask_frames(scope.0, scope.0).is_err());
@@ -6337,7 +9266,10 @@ mod parameter_environment_tests {
             assert_eq!(ev.lexical_scope, Some(scope.0));
             assert_eq!(ev.b.identity_origin_unit, Some(0));
             assert_eq!(ev.unbound_receiver, Some(base.0));
-            assert!(ev.user_calc_elem("Other", other.0, Vec::new()).is_err());
+            assert!(
+                ev.user_calc_elem("Other", other.0, Vec::new(), None)
+                    .is_err()
+            );
             assert_eq!(ev.call_frames.len(), 1);
             assert!(ev.call_frames[0].visible);
             assert_eq!(ev.call_depth, 0);

@@ -193,9 +193,9 @@ fn prepared_library_supports_interchange_and_attachment() {
     let json = original.to_compact_json();
     let bytes = original.to_compact_cbor();
     let mut old_json =
-        Session::from_interchange_json(&json, Some(lib.clone()), None, None).unwrap();
+        Session::from_interchange_json(&json, Some(lib.clone()), None, None, None).unwrap();
     let mut new_json =
-        Session::from_interchange_json_with_prepared_library(&json, &prepared, None).unwrap();
+        Session::from_interchange_json_with_prepared_library(&json, &prepared, None, None).unwrap();
     assert_eq!(old_json.to_compact_json(), new_json.to_compact_json());
     assert_eq!(old_json.check(), new_json.check());
     let old_cbor = Session::from_compact_cbor(&bytes, Some(lib), None, None).unwrap();

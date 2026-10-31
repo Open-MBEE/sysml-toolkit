@@ -4,7 +4,7 @@
 //!
 //! A fixed-seed xorshift PRNG makes every run reproducible; failures print
 //! the seed and mutation index. Deeper runs: `FUZZ_ITERS=10000 cargo test
-//! --release --test fuzz`. (True coverage-guided fuzzing via cargo-fuzz /
+//! --release -p sysmlv2-parser --test integration fuzz::`. (True coverage-guided fuzzing via cargo-fuzz /
 //! libFuzzer needs a nightly toolchain and is tracked in the plan as an
 //! optional follow-up; this gate is the always-on floor.)
 

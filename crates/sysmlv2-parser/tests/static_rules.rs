@@ -504,8 +504,9 @@ fn structural_rules_have_legal_counterparts() {
         serde_json::from_str(include_str!("fixtures/opensysml/static-contracts.json")).unwrap();
     let contracts = contracts["contracts"].as_array().unwrap();
     assert_eq!(contracts.len(), cases.len());
-    let mut failures = Vec::new();
-    for (file, from, to) in cases {
+    // Each case builds its own models, so the cases run on every core.
+    let failures: Vec<String> = sysmlv2_testkit::par_map(&cases, |&(file, from, to)| {
+        let mut failures = Vec::new();
         let contract = contracts
             .iter()
             .find(|c| c["fixture"] == file)
@@ -574,7 +575,9 @@ fn structural_rules_have_legal_counterparts() {
                 failures.push(format!("{file}: legal neighbor rejected: {diagnostics:?}"));
             }
         }
-    }
+        failures
+    })
+    .concat();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -720,8 +723,10 @@ fn additional_negative_contracts_have_legal_counterparts() {
     ResolvedModel::build(&base);
     let cache = base.take_recorded_library_cache().unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opensysml");
-    let mut failures = Vec::new();
-    for c in contracts["contracts"].as_array().unwrap() {
+    let contracts = contracts["contracts"].as_array().unwrap();
+    // Each case builds its own models, so the cases run on every core.
+    let failures: Vec<String> = sysmlv2_testkit::par_map(contracts, |c| {
+        let mut failures = Vec::new();
         let name = c["fixture"].as_str().unwrap();
         let source = fs::read_to_string(root.join(name)).unwrap();
         let tag = format!("[{}]", c["rule"].as_str().unwrap());
@@ -764,7 +769,9 @@ fn additional_negative_contracts_have_legal_counterparts() {
                 }
             }
         }
-    }
+        failures
+    })
+    .concat();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

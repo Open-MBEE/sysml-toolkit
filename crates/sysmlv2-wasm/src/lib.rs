@@ -107,6 +107,17 @@ struct MetadataValues {
     values: Vec<(String, EvalValue)>,
 }
 
+/// Parse an interchange JSON payload, read the way Flexo MMS returns it
+/// when `flexo` is set ([`sysmlv2_transform::unwrap_flexo`]).
+fn interchange_value(json: &str, flexo: Option<bool>) -> Result<serde_json::Value, String> {
+    let value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(if flexo == Some(true) {
+        sysmlv2_transform::unwrap_flexo(value).map_err(|e| e.to_string())?
+    } else {
+        value
+    })
+}
+
 fn parse_sources(json: &str) -> Result<Vec<(String, String)>, String> {
     let sources: Vec<SourceIn> =
         serde_json::from_str(json).map_err(|e| format!("sources must be [{{name, text}}]: {e}"))?;
@@ -188,10 +199,12 @@ pub struct Element {
 
 /// Diagram options as JSON, mirroring the Python `to_plantuml`
 /// signature: `{element?, roots?, view?, horizontal?, showValues?,
-/// showNotes?, showMetadata?, showInherited?, showLib?, showImported?,
-/// lineStyle?, stdColor?, linkTemplate?}` — all optional, defaults
-/// match Python. `roots` restricts an all-roots diagram to the named
-/// top-level elements (ignored when `element` scopes to one subtree).
+/// valueUnits?, showNotes?, showMetadata?, showInherited?, showLib?,
+/// showImported?, lineStyle?, stdColor?, linkTemplate?}` — all
+/// optional, defaults match Python. `roots` restricts an all-roots
+/// diagram to the named top-level elements (ignored when `element`
+/// scopes to one subtree). `valueUnits` is `"si"` (the default) or
+/// `"asWritten"`: the units a `= value` quantity shows in.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PlantumlOpts {
@@ -209,6 +222,7 @@ struct PlantumlOpts {
     horizontal: bool,
     #[serde(default = "yes")]
     show_values: bool,
+    value_units: Option<String>,
     #[serde(default = "yes")]
     show_notes: bool,
     #[serde(default = "yes")]
@@ -422,6 +436,22 @@ fn parse_line_style(name: Option<&str>) -> Result<sysmlv2_viz::LineStyle, String
     }
 }
 
+thread_local! {
+    /// The units this module shows evaluated quantities in unless a
+    /// request names its own: [`set_value_units`].
+    static VALUE_UNITS: std::cell::Cell<sysmlv2_model::eval::UnitDisplay> =
+        const { std::cell::Cell::new(sysmlv2_model::eval::UnitDisplay::Si) };
+}
+
+/// A `valueUnits` option: `"si"` or `"asWritten"`; absent, the module's
+/// [`setValueUnits`](set_value_units) choice.
+fn parse_value_units(spec: Option<&str>) -> Result<sysmlv2_model::eval::UnitDisplay, String> {
+    spec.map_or(
+        Ok(VALUE_UNITS.get()),
+        sysmlv2_model::eval::UnitDisplay::parse,
+    )
+}
+
 /// The memoized line index of a unit, built on first use; a unit whose
 /// source the session does not hold (a library unit) indexes as empty.
 fn unit_line_index<'a>(
@@ -474,10 +504,12 @@ fn unit_location<'a>(
 }
 
 /// A verdict's feature bindings as the verify report spells them: `{feature,
-/// value?, unitName?, line?, col?}`. A declaration in a library unit has
-/// no position (library sources are not held).
+/// value?, unitName?, line?, col?}`, values in the units `units` chooses. A
+/// declaration in a library unit has no position (library sources are not
+/// held).
 fn bindings_json(
     bindings: &[sysmlv2_model::check::ConstraintBinding],
+    units: sysmlv2_model::eval::UnitDisplay,
     session: &TSession,
     names: &HashMap<usize, String>,
     indexes: &mut HashMap<usize, LineIndex>,
@@ -494,7 +526,7 @@ fn bindings_json(
                 });
             json!({
                 "feature": b.feature,
-                "value": b.value,
+                "value": b.value_in(units),
                 "unitName": pos.and_then(|(u, _)| names.get(&u)),
                 "line": pos.map(|(_, lc)| lc.line),
                 "col": pos.map(|(_, lc)| lc.col),
@@ -505,10 +537,14 @@ fn bindings_json(
 
 /// The CLI's "why" suffix on a violated verdict line: the evaluated values
 /// of its bound references (`VIOLATED (with reserveKg = 0.10)`).
-fn with_values(detail: String, bindings: &[sysmlv2_model::check::ConstraintBinding]) -> String {
+fn with_values(
+    detail: String,
+    bindings: &[sysmlv2_model::check::ConstraintBinding],
+    units: sysmlv2_model::eval::UnitDisplay,
+) -> String {
     let vals: Vec<String> = bindings
         .iter()
-        .filter_map(|b| b.value.as_ref().map(|v| format!("{} = {v}", b.feature)))
+        .filter_map(|b| b.value_in(units).map(|v| format!("{} = {v}", b.feature)))
         .collect();
     if vals.is_empty() {
         detail
@@ -528,15 +564,28 @@ fn with_values(detail: String, bindings: &[sysmlv2_model::check::ConstraintBindi
 /// "setCommentBody", target, body}` (a comment's or documentation's
 /// `/* … */` body becomes `body`, the text as a reader sees it; the
 /// keyword, name, `about` list and locale stay as written) · `{op:
-/// "insertMember", owner, text}` · `{op: "insertTopLevel", unit, text}`
-/// · `{op: "remove", target}` · `{op: "replaceMember", target, text}`
+/// "insertMember", owner, text, index?}` (`index` = slot among the
+/// owner's current members: the new member goes on the line after the
+/// one before that slot; omitted = append; a unit's root namespace as
+/// `owner` writes at that unit's top level; the slot is held before a
+/// body's trailing result expression, a subject before the first
+/// parameter, other inputs after the subject, and past the `then`
+/// members that start from the member before the slot; a second subject,
+/// objective, `entry`/`do`/`exit` action, rendering or return
+/// parameter in one owner is refused) · `{op: "insertTopLevel",
+/// unit, text}`
+/// · `{op: "remove", target}` (the `then` members written right after
+/// the target go with it, since they start from it: `state a; then
+/// b;`, `entry; then idle;`) · `{op: "replaceMember", target, text}`
 /// (identity-preserving update: swaps the declaration for exactly one
 /// parsed member, respells outside references on a declared-name
 /// change, and judges validity on the post-edit model — no pre-state
 /// outside-reference refusal) · `{op: "moveMember", target, newOwner?,
 /// index?}` (omitted `newOwner` = reorder within the current owner;
 /// `index` = slot among the destination's current members, self
-/// excluded, omitted = append) · `{op: "addUnit", unit}` (create a
+/// excluded, omitted = append; held and refused as for `insertMember`;
+/// the `then` members written after the target move with it, as they
+/// go with it on `remove`) · `{op: "addUnit", unit}` (create a
 /// new, empty unit; refuses a name the session already holds — ops
 /// plan against the pre-commit state, so inserting into the born unit
 /// belongs in a following batch). Element references
@@ -563,7 +612,12 @@ enum EditOpIn {
     #[serde(rename = "setCommentBody")]
     SetCommentBody { target: String, body: String },
     #[serde(rename = "insertMember")]
-    InsertMember { owner: String, text: String },
+    InsertMember {
+        owner: String,
+        text: String,
+        #[serde(default)]
+        index: Option<u32>,
+    },
     #[serde(rename = "insertTopLevel")]
     InsertTopLevel { unit: String, text: String },
     #[serde(rename = "addUnit")]
@@ -591,7 +645,7 @@ enum ResolvedOp {
     SetRedefinedFeature(ElementRef, String),
     RemoveFeatureValue(ElementRef),
     SetCommentBody(ElementRef, String),
-    InsertMember(ElementRef, String),
+    InsertMember(ElementRef, String, Option<usize>),
     InsertTopLevel(String, String),
     AddUnit(String),
     Remove(ElementRef),
@@ -677,6 +731,8 @@ impl Session {
                 .map_err(|e| format!("bad options: {e}"))?;
         let view = parse_view(&opts.view)?;
         let line_style = parse_line_style(opts.line_style.as_deref())?;
+        let value_units = parse_value_units(opts.value_units.as_deref())
+            .map_err(|e| format!("bad options: valueUnits: {e}"))?;
         let mut root = opts
             .element
             .as_deref()
@@ -701,6 +757,7 @@ impl Session {
                 sysmlv2_viz::Direction::TopToBottom
             })
             .with_show_values(opts.show_values)
+            .with_value_units(value_units)
             .with_view(view)
             .with_show_notes(opts.show_notes)
             .with_show_metadata(opts.show_metadata)
@@ -860,6 +917,17 @@ impl Session {
         r.declaration_site(e).or_else(|| r.member_extent(e))
     }
 
+    /// A quantity as `{value, unit}` in the evaluator's units.
+    fn quantity_json(&mut self, v: &EvalValue) -> serde_json::Value {
+        let EvalValue::Quantity(n, unit) = v else {
+            return self.value_to_json(v);
+        };
+        json!({
+            "value": self.value_to_json(n),
+            "unit": unit.display(),
+        })
+    }
+
     fn value_to_json(&mut self, v: &EvalValue) -> serde_json::Value {
         match v {
             EvalValue::Boolean(b) => json!(b),
@@ -875,14 +943,25 @@ impl Session {
             EvalValue::Real(f) => json!(f),
             EvalValue::String(s) => json!(s),
             EvalValue::Indeterminate => json!({ "@indeterminate": true }),
-            EvalValue::Element(e) | EvalValue::Unbound(e) | EvalValue::UnboundMember(e) => json!({
-                "@element": self.inner.resolved().element_id(*e).to_string(),
-                "qualifiedName": self.inner.resolved().element_qualified_name(*e),
-            }),
-            EvalValue::Quantity(n, unit) => json!({
-                "value": self.value_to_json(n),
-                "unit": unit.display(),
-            }),
+            EvalValue::Element(e) | EvalValue::Unbound(e, _) | EvalValue::UnboundMember(e, _) => {
+                json!({
+                    "@element": self.inner.resolved().element_id(*e).to_string(),
+                    "qualifiedName": self.inner.resolved().element_qualified_name(*e),
+                })
+            }
+            // In the module's units (see `setValueUnits`).
+            EvalValue::Quantity(..)
+                if VALUE_UNITS.get() == sysmlv2_model::eval::UnitDisplay::AsWritten =>
+            {
+                match self.inner.resolved().value_as_written(v) {
+                    Some(EvalValue::Quantity(n, unit)) => json!({
+                        "value": self.value_to_json(&n),
+                        "unit": unit.display(),
+                    }),
+                    _ => self.quantity_json(v),
+                }
+            }
+            EvalValue::Quantity(..) => self.quantity_json(v),
             EvalValue::Instance {
                 ty_name, fields, ..
             } => {
@@ -1020,15 +1099,17 @@ impl Session {
         })
     }
 
-    /// Open interchange JSON against a shared prepared library.
+    /// Open interchange JSON against a shared prepared library; `flexo`
+    /// as in [`Self::from_interchange_json`].
     #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = fromInterchangeJsonWithPreparedLibrary)]
     pub fn from_interchange_json_with_prepared_library(
         json: &str,
         library: &PreparedLibrary,
         indent: Option<String>,
+        flexo: Option<bool>,
     ) -> Result<Session, String> {
-        let value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let value = interchange_value(json, flexo)?;
         Ok(Session {
             inner: TSession::from_interchange_json_indented(
                 &value,
@@ -1203,6 +1284,10 @@ impl Session {
     /// The optional `indent` names the indentation style for the
     /// lifted unit text: `"tabs"`, or a space count like `"4"`
     /// (default four spaces; presentation only, never identity).
+    /// `flexo: true` reads the payload the way Flexo MMS returns it,
+    /// deriving the `owningRelationship` and `owningRelatedElement` it
+    /// omits from the owners' `ownedRelationship` and
+    /// `ownedRelatedElement`; without it such a payload is refused.
     // The export boundary converts an optional string only when owned.
     #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = fromInterchangeJson)]
@@ -1211,8 +1296,9 @@ impl Session {
         lib_sources_json: Option<String>,
         lib_snapshot: Option<Vec<u8>>,
         indent: Option<String>,
+        flexo: Option<bool>,
     ) -> Result<Session, String> {
-        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let value = interchange_value(json, flexo)?;
         let lib = lib_sources_json
             .as_deref()
             .map(|s| parse_library(s, lib_snapshot))
@@ -1472,7 +1558,8 @@ impl Session {
             DerivedValue::Null => serde_json::Value::Null,
             DerivedValue::Bool(b) => serde_json::Value::Bool(*b),
             DerivedValue::Str(s) => serde_json::Value::String(s.clone()),
-            DerivedValue::Strings(ss) => serde_json::json!(ss),
+            DerivedValue::Strings(ss) | DerivedValue::Literals(ss) => serde_json::json!(ss),
+            DerivedValue::Literal(s) => serde_json::Value::String(s.clone()),
             DerivedValue::Element(x) => id(*x),
             DerivedValue::Elements(xs) => {
                 serde_json::Value::Array(xs.iter().map(|&x| id(x)).collect())
@@ -1817,9 +1904,14 @@ impl Session {
         Ok(self.inner.minimal_spelling(context.e, target.e))
     }
 
-    /// Rewrite every plain reference site to the shortest suffix that
-    /// still resolves to the same element (reparse-verified; ids are
-    /// untouched by construction). Returns `{respelled, sites}`.
+    /// Respell every reference with the shortest spelling that still
+    /// resolves to the same element: plain sites, feature chains (as one
+    /// unit: the shortest head, then the written member names) and
+    /// import targets (a member import keeps its written last segment
+    /// and at least two segments, or one when only one is written).
+    /// Reparse-verified; ids are untouched by construction. Returns
+    /// `{respelled, reverted}`, `reverted` counting the respells the
+    /// reparse dropped (their sites keep the original spelling).
     /// Element handles from before the call are invalidated — the
     /// sources were rewritten and the model rebuilt.
     #[wasm_bindgen(js_name = minimizeQualifications)]
@@ -2420,9 +2512,11 @@ impl Session {
                 EditOpIn::SetCommentBody { target, body } => {
                     ResolvedOp::SetCommentBody(resolve(&mut self.inner, &target)?, body)
                 }
-                EditOpIn::InsertMember { owner, text } => {
-                    ResolvedOp::InsertMember(resolve(&mut self.inner, &owner)?, text)
-                }
+                EditOpIn::InsertMember { owner, text, index } => ResolvedOp::InsertMember(
+                    resolve(&mut self.inner, &owner)?,
+                    text,
+                    index.map(|i| i as usize),
+                ),
                 EditOpIn::InsertTopLevel { unit, text } => ResolvedOp::InsertTopLevel(unit, text),
                 EditOpIn::AddUnit { unit } => ResolvedOp::AddUnit(unit),
                 EditOpIn::Remove { target } => {
@@ -2461,7 +2555,9 @@ impl Session {
                 ResolvedOp::SetRedefinedFeature(e, t) => batch.set_redefined_feature(*e, t),
                 ResolvedOp::RemoveFeatureValue(e) => batch.remove_feature_value(*e),
                 ResolvedOp::SetCommentBody(e, body) => batch.set_comment_body(*e, body),
-                ResolvedOp::InsertMember(e, text) => batch.insert_member(*e, text),
+                ResolvedOp::InsertMember(e, text, index) => {
+                    batch.insert_member_at(*e, text, *index)
+                }
                 ResolvedOp::InsertTopLevel(unit, text) => batch.insert_top_level(unit, text),
                 ResolvedOp::AddUnit(unit) => batch.add_unit(unit),
                 ResolvedOp::Remove(e) => batch.remove(*e),
@@ -2663,10 +2759,17 @@ impl Session {
     /// Verify constraints the way `sysmlv2 verify --ranges` does:
     /// evaluate every non-library constraint, then narrow free
     /// feature domains by joint interval propagation per unit — no
-    /// external solver. Options JSON: `{maxIters?, numberFormat?}`
-    /// (fixpoint pass cap per unit, default 100; the
+    /// external solver. Options JSON: `{maxIters?, numberFormat?,
+    /// valueUnits?}` (fixpoint pass cap per unit, default 100; the
     /// [`setNumberFormat`](LspServer::set_number_format) spec `rangeApprox`
-    /// writes non-terminating endpoints in, default `"exact"`). Returns a JSON report: `{constraints:
+    /// writes non-terminating endpoints in, default `"exact"`; `"si"` or
+    /// `"asWritten"`, by default the module's
+    /// [`setValueUnits`](set_value_units) choice: `"asWritten"` gives each
+    /// range in the units its bounds were written in where those differ
+    /// from the evaluator's — `unit`, `range` and `rangeApprox` then read
+    /// `in**2`, `[1, 6]` for bounds folded to `m**2` — and each binding's
+    /// `value`, in `bindings` and in a `detail`'s `(with …)`, in the units
+    /// it was written in). Returns a JSON report: `{constraints:
     /// [{unit, unitName, name, elementType, asserted, line, col,
     /// endLine, endCol, status, method, detail, bindings, features}]
     /// (`method` = which stage decided: evaluation|propagation, null
@@ -2699,9 +2802,12 @@ impl Session {
         struct VerifyOpts {
             max_iters: Option<usize>,
             number_format: Option<String>,
+            value_units: Option<String>,
         }
         let opts: VerifyOpts = serde_json::from_str(opts_json.as_deref().unwrap_or("{}"))
             .map_err(|e| format!("bad verify options: {e}"))?;
+        let value_units = parse_value_units(opts.value_units.as_deref())
+            .map_err(|e| format!("bad verify options: valueUnits: {e}"))?;
         let number_format = match opts.number_format.as_deref() {
             Some(spec) => sysmlv2_model::numfmt::NumberFormat::parse(spec)
                 .map_err(|e| format!("bad verify options: numberFormat: {e}"))?,
@@ -2756,9 +2862,9 @@ impl Session {
                 // The CLI's "why" suffix: evaluated values of the bound
                 // references under a violated verdict.
                 if status == "violated" {
-                    detail = with_values(detail, &c.bindings);
+                    detail = with_values(detail, &c.bindings, value_units);
                 }
-                let bindings = bindings_json(&c.bindings, inner, &names, &mut indexes);
+                let bindings = bindings_json(&c.bindings, value_units, inner, &names, &mut indexes);
                 let li = unit_line_index(&mut indexes, inner, c.unit);
                 let start = li.line_col(c.span.start);
                 let end = li.line_col(c.span.end);
@@ -2783,14 +2889,21 @@ impl Session {
         let ranges: Vec<serde_json::Value> = report
             .ranges
             .iter()
-            .map(|r| {
-                json!({
+            .map(|r| match (value_units, &r.as_written) {
+                (sysmlv2_model::eval::UnitDisplay::AsWritten, Some(w)) => json!({
+                    "feature": r.feature,
+                    "unit": w.unit,
+                    "range": w.range,
+                    "rangeApprox": w.range_approx,
+                    "narrowed": r.narrowed,
+                }),
+                _ => json!({
                     "feature": r.feature,
                     "unit": r.unit,
                     "range": r.range,
                     "rangeApprox": r.range_approx,
                     "narrowed": r.narrowed,
-                })
+                }),
             })
             .collect();
         let mut satisfactions: Vec<serde_json::Value> = Vec::new();
@@ -2811,7 +2924,7 @@ impl Session {
             for c in &claim.constraints {
                 let (status, mut detail) = verify_status(&c.check.verdict, None);
                 if status == "violated" {
-                    detail = with_values(detail, &c.check.bindings);
+                    detail = with_values(detail, &c.check.bindings, value_units);
                 }
                 let li = unit_line_index(&mut indexes, inner, c.check.unit);
                 let (start, end) = (
@@ -2830,7 +2943,7 @@ impl Session {
                     "endCol": end.col,
                     "status": status,
                     "detail": detail,
-                    "bindings": bindings_json(&c.check.bindings, inner, &names, &mut indexes),
+                    "bindings": bindings_json(&c.check.bindings, value_units, inner, &names, &mut indexes),
                 }));
             }
             let li = unit_line_index(&mut indexes, inner, claim.unit);
@@ -3217,12 +3330,14 @@ pub fn lenient_sources(sources_json: &str) -> Result<String, String> {
 /// per-unit parse and body-context validation always; referential and
 /// semantic checks against the standard library when `lib_sources_json`
 /// (same shape) is given. Returns findings as a JSON string:
-/// `[{severity, stage, message, unit, line, col, endLine, endCol}]`
+/// `[{severity, stage, message, unit, line, col, endLine, endCol, rule?}]`
 /// (1-based positions; the end pair spans the full diagnostic, so
 /// markers cover the whole offending construct rather than just its
 /// start). `stage` is `parse`, `context`, `referential` or `semantic`;
-/// only `parse` findings keep a unit out of a session. A broken parse
-/// is a finding, not an error.
+/// only `parse` findings keep a unit out of a session. `rule` names the
+/// normative rule a semantic finding reports
+/// (`validateSatisfyRequirementUsageReference`) and is absent when the
+/// finding names none. A broken parse is a finding, not an error.
 // The export boundary converts an optional string only when owned.
 #[allow(clippy::needless_pass_by_value)]
 #[wasm_bindgen]
@@ -3284,6 +3399,9 @@ fn check_findings_json(
             if let Some(end) = end {
                 obj["endLine"] = json!(end.line);
                 obj["endCol"] = json!(end.col);
+            }
+            if let Some(rule) = f.code {
+                obj["rule"] = json!(rule);
             }
             obj
         })
@@ -3365,6 +3483,35 @@ fn parse_dialect(dialect: Option<&str>) -> Result<Option<sysmlv2_syntax::ast::Di
 #[wasm_bindgen]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Choose the units evaluated quantities show in across this module.
+/// `"si"`, the default, keeps the evaluator's units: a bracket's unit,
+/// kept through sums and scaling, and SI units for a product, quotient
+/// or power (`10 ['in'] / (2 [s])` is `0.127 [m/s]`). `"asWritten"`
+/// shows each quantity in the units it was written in, where those
+/// cover its dimensions (`5 [in/s]`), by the rules
+/// [`LspServer.setValueHintUnits`](LspServer::set_value_hint_units)
+/// uses. It applies to the values [`Session::query`],
+/// [`Session::evaluate`] and [`Session::view_info`] return, and it is
+/// the default of the `valueUnits` option of [`Session::to_graph`],
+/// [`Session::to_plantuml`] and [`Session::verify`]. Evaluation is
+/// unchanged; only the unit a quantity is written in, and its number,
+/// differ. Module-wide, so hosts set it once at startup or on a settings
+/// change; a language server keeps its own setting. Throws on any other
+/// mode.
+#[wasm_bindgen(js_name = setValueUnits)]
+pub fn set_value_units(mode: &str) -> Result<(), String> {
+    VALUE_UNITS.set(sysmlv2_model::eval::UnitDisplay::parse(mode)?);
+    Ok(())
+}
+
+/// The module's [`setValueUnits`](set_value_units) choice: `"si"` or
+/// `"asWritten"`.
+#[must_use]
+#[wasm_bindgen(js_name = valueUnits)]
+pub fn value_units() -> String {
+    VALUE_UNITS.get().as_str().to_string()
 }
 
 /// Enable or disable expanding quoted power-product unit spellings
@@ -3691,6 +3838,22 @@ impl LspServer {
     pub fn set_number_format(&mut self, spec: &str) -> Result<Vec<String>, String> {
         let format = sysmlv2_model::numfmt::NumberFormat::parse(spec)?;
         self.inner.set_number_format(format);
+        self.inner.take_outbound().map_err(|e| e.to_string())
+    }
+
+    /// Set which units evaluated-value inlay hints and hover values show
+    /// quantities in: `si` (the evaluator's own — a bracket's unit, kept
+    /// through additive and scalar operations, and SI for products,
+    /// quotients and powers; the default) or `asWritten` (each value
+    /// re-expressed in the units it was written in where they reach its
+    /// dimensions: `10 ['in'] / (2 [s])` shows `5 [in/s]`, not
+    /// `0.127 [m/s]`). Hover shows the other reading alongside when it
+    /// differs. Throws on any other mode. Returns the refresh requests to
+    /// relay, like `setWorkspace`.
+    #[wasm_bindgen(js_name = setValueHintUnits)]
+    pub fn set_value_hint_units(&mut self, mode: &str) -> Result<Vec<String>, String> {
+        let units = sysmlv2_model::eval::UnitDisplay::parse(mode)?;
+        self.inner.set_value_hint_units(units);
         self.inner.take_outbound().map_err(|e| e.to_string())
     }
 

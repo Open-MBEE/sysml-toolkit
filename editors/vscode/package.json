@@ -73,6 +73,16 @@
           "type": "string",
           "default": "exact",
           "markdownDescription": "How value hints, hover values and range hints write a rational without a terminating decimal expansion: `exact` (`1/15`), `approx` (`≈0.06666666666666667`), `overline` (`0.06̅`), `parens` (`0.0(6)`) or `unicode` (`¹/₁₅`), then optional settings after commas, e.g. `overline,period=3` or `unicode,mixed=false` (see `sysmlv2 lsp --help`). Applies when the server starts; a spec the server cannot read shows a warning and keeps `exact`."
+        },
+        "sysmlv2.valueHintUnits": {
+          "type": "string",
+          "enum": ["si", "asWritten"],
+          "enumDescriptions": [
+            "The evaluator's units: a bracket's unit, kept through sums and scaling, and SI units for products, quotients and powers (`10 ['in'] / (2 [s])` shows `0.127 [m/s]`).",
+            "The units each value was written in, where they cover its dimensions (`10 ['in'] / (2 [s])` shows `5 [in/s]`)."
+          ],
+          "default": "si",
+          "markdownDescription": "Which units value hints, range hints, violated-verdict code lenses and hover values show quantities in. Hover shows the other reading too when it differs. Applies when the server starts."
         }
       }
     }

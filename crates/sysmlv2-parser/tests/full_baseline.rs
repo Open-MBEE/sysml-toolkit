@@ -8,7 +8,8 @@
 //! difference prints the changed pairs, so a promotion is adjudicated
 //! name by name rather than discovered as a byte diff of a 50k-element
 //! payload. Refresh the baseline deliberately with
-//! `SYSMLV2_UPDATE_BASELINE=1 cargo test --test full_baseline`; the
+//! `SYSMLV2_UPDATE_BASELINE=1 cargo test -p sysmlv2-parser --test integration
+//! full_baseline::`; the
 //! resulting fixture diff is the change's allowlist and belongs in the
 //! same commit.
 //!

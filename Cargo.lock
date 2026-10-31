@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-cbor"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "miniz_oxide",
  "serde_json",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-cli"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "clap",
  "miniz_oxide",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-lint"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "regex-lite",
  "serde_json",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-lsp"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "crossbeam-channel",
  "lsp-server",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-model"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "memmap2",
  "num-bigint",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-parser"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "jsonschema",
  "serde_json",
@@ -1050,10 +1050,11 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-py"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "pyo3",
  "serde_json",
+ "sysmlv2-cbor",
  "sysmlv2-lsp",
  "sysmlv2-model",
  "sysmlv2-syntax",
@@ -1063,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-solve"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "sysmlv2-model",
  "sysmlv2-syntax",
@@ -1072,18 +1073,18 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-syntax"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "sysmlv2-testkit"
-version = "0.10.10"
+version = "0.11.3"
 
 [[package]]
 name = "sysmlv2-transform"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "serde_json",
  "sysmlv2-cbor",
@@ -1096,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-viz"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1107,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "sysmlv2-wasm"
-version = "0.10.10"
+version = "0.11.3"
 dependencies = [
  "js-sys",
  "miniz_oxide",
@@ -1119,6 +1120,7 @@ dependencies = [
  "sysmlv2-model",
  "sysmlv2-solve",
  "sysmlv2-syntax",
+ "sysmlv2-testkit",
  "sysmlv2-transform",
  "sysmlv2-viz",
  "wasm-bindgen",

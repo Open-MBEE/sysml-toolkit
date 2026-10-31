@@ -92,7 +92,9 @@ impl ResolvedModel {
                 return Some(t);
             }
         }
-        None
+        // A target transition's source is the last action before it in
+        // its owner's body (SysML 8.2.2.21).
+        self.implicit_transition_source(e).map(Reference::Element)
     }
 
     /// `TransitionUsage::target = succession.targetFeature->first().featureTarget`

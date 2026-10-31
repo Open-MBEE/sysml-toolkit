@@ -630,6 +630,7 @@ fn load_document_impl(
     names: &HashMap<String, Vec<String>>,
     format: crate::model::GraphFormat,
 ) -> Result<(Model, ResolvedModel, ExplicitIds, Vec<String>), String> {
+    crate::lift::validate_ownership(document)?;
     let mut names = names.clone();
     names.extend(crate::lift::document_reference_name_map(document));
     let docs =

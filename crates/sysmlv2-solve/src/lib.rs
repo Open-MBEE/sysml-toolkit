@@ -48,7 +48,7 @@ use sysmlv2_model::numfmt::NumberFormat;
 use term::RenderCtx;
 use z3::{QueryResult, SExpr};
 
-/// How to reach Z3.
+/// How to reach Z3, and how to write the witnesses it finds.
 #[derive(Clone, Debug)]
 pub struct SolverConfig {
     /// Path to the `z3` binary; `None` = `z3` on `PATH`.
@@ -56,6 +56,14 @@ pub struct SolverConfig {
     /// Soft solver timeout per query, milliseconds (a hard process kill
     /// sits one second above it).
     pub timeout_ms: u64,
+    /// Which unit a quantity witness is written in:
+    /// [`UnitDisplay::Si`](sysmlv2_model::eval::UnitDisplay::Si), the
+    /// default, keeps the unit the constraint compared the feature
+    /// against; [`UnitDisplay::AsWritten`](sysmlv2_model::eval::UnitDisplay::AsWritten)
+    /// uses the unit its bound was written in where that is another one
+    /// (as [`FeatureRange::as_written`] does for a range), converted by
+    /// the exact factor. Display only: the verdict is the same.
+    pub value_units: sysmlv2_model::eval::UnitDisplay,
 }
 
 impl Default for SolverConfig {
@@ -63,6 +71,7 @@ impl Default for SolverConfig {
         SolverConfig {
             z3_path: None,
             timeout_ms: 4000,
+            value_units: sysmlv2_model::eval::UnitDisplay::Si,
         }
     }
 }
@@ -89,9 +98,10 @@ pub enum WitnessValue {
     Real(sysmlv2_model::rational::Rational),
     /// An enumeration literal, by declared name.
     Enum(String),
-    /// A value in an inferred measurement unit (e.g. `30 [d]`) — units are
-    /// never converted; the unit is the one the constraint compared the
-    /// feature against.
+    /// A value in an inferred measurement unit (e.g. `30 [d]`): the unit
+    /// the constraint compared the feature against, or with
+    /// [`SolverConfig::value_units`] asking for it, the unit its bound
+    /// was written in.
     WithUnit(Box<WitnessValue>, String),
     /// A solver value this crate does not decode; raw SMT text.
     Other(String),
@@ -345,6 +355,27 @@ pub struct FeatureRange {
     pub range_approx: String,
     /// Whether propagation tightened the domain past its declared type.
     pub narrowed: bool,
+    /// The range in the units its bounds were written in, when that is
+    /// another unit than [`Self::unit`]: a bound that folds through a
+    /// product, quotient or power is in SI-coherent units
+    /// (`footprint <= 2 ['in'] * (3 ['in'])` narrows `footprint` to
+    /// `[−∞, 0.00387096] [m**2]`), and this re-expresses it from the units
+    /// it was written in (`[−∞, 6] [in**2]`; see
+    /// [`ResolvedModel::value_as_written`]). The same set of values, by
+    /// exact factors; `None` for a range already in those units.
+    pub as_written: Option<WrittenRange>,
+}
+
+/// A [`FeatureRange`] re-expressed in the units its bounds were written
+/// in ([`FeatureRange::as_written`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WrittenRange {
+    /// The written unit (display spelling).
+    pub unit: String,
+    /// [`FeatureRange::range`] in [`Self::unit`].
+    pub range: String,
+    /// [`FeatureRange::range_approx`] in [`Self::unit`].
+    pub range_approx: String,
 }
 
 /// What propagation concluded about one undecided constraint. All verdicts
@@ -567,6 +598,14 @@ fn propagate_core(
                 range: ival::fmt_dom(&doms[vi], &jt.enums, &NumberFormat::exact()),
                 range_approx: ival::fmt_dom(&doms[vi], &jt.enums, &cfg.number_format),
                 narrowed: doms[vi] != baseline[vi],
+                as_written: v.written.as_ref().and_then(|(factor, unit)| {
+                    let dom = ival::scale_dom(&doms[vi], factor)?;
+                    Some(WrittenRange {
+                        unit: unit.clone(),
+                        range: ival::fmt_dom(&dom, &jt.enums, &NumberFormat::exact()),
+                        range_approx: ival::fmt_dom(&dom, &jt.enums, &cfg.number_format),
+                    })
+                }),
             });
         }
 
@@ -961,14 +1000,39 @@ fn solve_one(
         .filter(|(v, _)| !v.aux)
         .map(|(v, val)| {
             let decoded = decode_value(val, &tr.enums);
-            let decoded = match &v.unit {
-                Some(u) => WitnessValue::WithUnit(Box::new(decoded), u.clone()),
-                None => decoded,
+            let written = v
+                .written
+                .as_ref()
+                .filter(|_| cfg.value_units == sysmlv2_model::eval::UnitDisplay::AsWritten)
+                .and_then(|(factor, unit)| Some((scale_witness(&decoded, factor)?, unit)));
+            let decoded = match (written, &v.unit) {
+                (Some((scaled, unit)), _) => WitnessValue::WithUnit(Box::new(scaled), unit.clone()),
+                (None, Some(u)) => WitnessValue::WithUnit(Box::new(decoded), u.clone()),
+                (None, None) => decoded,
             };
             (v.display.clone(), decoded)
         })
         .collect();
     SolveOutcome::Satisfiable(pairs)
+}
+
+/// A numeric witness multiplied by `factor` (the value in another unit),
+/// exact: an integer stays one when the product is whole. `None` for any
+/// other witness.
+fn scale_witness(
+    w: &WitnessValue,
+    factor: &sysmlv2_model::rational::Rational,
+) -> Option<WitnessValue> {
+    use sysmlv2_model::rational::Rational;
+    let scaled = match w {
+        WitnessValue::Int(i) => Rational::from_integer(*i).mul(factor),
+        WitnessValue::Real(r) => r.mul(factor),
+        _ => return None,
+    };
+    Some(match (w, scaled.to_i128()) {
+        (WitnessValue::Int(_), Some(i)) => WitnessValue::Int(i),
+        _ => WitnessValue::Real(scaled),
+    })
 }
 
 /// Decode one `(get-value …)` value expression.
@@ -1169,6 +1233,7 @@ mod bound_injection {
             sym: sym.into(),
             sort,
             unit: None,
+            written: None,
             aux: false,
         }
     }

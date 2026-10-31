@@ -206,11 +206,13 @@ fn foreign_import_endpoint_inverse_and_visibility_mutations_are_observed() {
         r.b.checked_type_membership_operation(actual, &[], &[], true, &mut 0)
             .unwrap();
     assert!(restored.inherited.iter().any(|m| m.member == marker));
+    // Plain metadata on the foreign owner keeps nothing out (only semantic
+    // metadata adds a base the planner does not write).
     let metadata = r.b.metadata_of.clone();
     r.b.metadata_of.insert(foreign, vec![selected]);
     assert!(
         r.b.checked_type_membership_operation(child, &[], &[], true, &mut 0)
-            .is_err()
+            .is_ok()
     );
     r.b.metadata_of = metadata;
     assert!(

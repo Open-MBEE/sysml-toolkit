@@ -188,10 +188,20 @@ fn checked_usage_typing_replays_and_preserves_policy_and_incomplete_refusals() {
                 }
             }
         }
-        for path in ["Container::compositeCamera", "outer::nested", "broken"] {
+        for path in ["Container::compositeCamera", "broken"] {
             let e = r.resolve_qualified(path).unwrap();
             assert!(r.property(e, "type").is_err(), "{path}");
             assert!(r.property(e, "partDefinition").is_err(), "{path}");
+        }
+        // A referential part nested in a part usage: the structural usage
+        // is an audited owner context, so its member's typing certifies.
+        let nested = r.resolve_qualified("outer::nested").unwrap();
+        for property in ["type", "partDefinition"] {
+            assert_eq!(
+                r.property(nested, property),
+                Ok(serde_json::json!([{"@id": ids.1.to_string()}])),
+                "mode {mode} {property}"
+            );
         }
     }
     // A direct authored typing cannot replace the canonical family witness.
@@ -379,6 +389,12 @@ fn nested_composite_typing_uses_complete_owner_types_across_replay() {
                     ("outer::inner::sensor", "Module"),
                     ("items::inner", "ItemType"),
                     ("events::inner", "Event"),
+                    // The owner's value binds its value and leaves its
+                    // composition facts, and so its member's typing, intact.
+                    ("valued::inner", "Module"),
+                    // A variation owner's flag leaves them intact too (the
+                    // member it should not own is the verifier's finding).
+                    ("varying::inner", "Module"),
                 ] {
                     let e = r.resolve_qualified(path).unwrap();
                     let target = r.resolve_qualified(target).unwrap();
@@ -396,10 +412,8 @@ fn nested_composite_typing_uses_complete_owner_types_across_replay() {
                         Ok(serde_json::json!([{"@id":r.element_id(target).to_string()}]))
                     );
                 }
-                for path in ["broken::inner", "valued::inner", "varying::inner"] {
-                    let e = r.resolve_qualified(path).unwrap();
-                    assert!(r.property(e, "type").is_err(), "{format:?} {mode} {path}");
-                }
+                let e = r.resolve_qualified("broken::inner").unwrap();
+                assert!(r.property(e, "type").is_err(), "{format:?} {mode}");
             }
         }
     }

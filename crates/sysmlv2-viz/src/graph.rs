@@ -11,6 +11,7 @@
 //!   "view": "tree",
 //!   "nodes": [{
 //!     "id", "qname"?, "label", "stereo", "metaclass",
+//!     "impliedName"?: true,                  // qname's last name not declared
 //!     "kind": "package" | "node" | "enum",
 //!     "nodeKind"?: "def" | "usage" | "ref",  // notation shape triad
 //!     "redefining"?: true,                   // nameless `:>> x`: label borrowed
@@ -23,10 +24,18 @@
 //!     "file"?, "line"?, "col"?,          // declaration site
 //!     "lib"?: true,                       // library element (show_lib)
 //!     "direction"?, "conjugated"?: true,  // ports
-//!     "rows": [{ "id", "qname"?, "label", "inherited"?: true,
+//!     "rows": [{ "id", "qname"?, "label", "section", "inherited"?: true,
+//!                "impliedName"?: true,  // as on nodes
 //!                "redefining"?: true, "chain"?: [...], // as on nodes
 //!                "typeDerived"?: true,  // label type not written
 //!                "prefixes"?: [...], "detail"?: "ordered subsets x",
+//!                "role"?: "subject" | "actor" | "stakeholder" |
+//!                         "objective" | "return" | "result" |
+//!                         "assume" | "require" | "frame" | "verify" |
+//!                         "include" | "entry" | "do" | "exit" | "end",
+//!                "expr"?: "vehicle.mass <= limit", // assume/require/result
+//!                "direction"?: "in" | "out" | "inout", // a port's feature
+//!                "rows"?: [...],         // rows nested under this one
 //!                "file"?, "line"?, "col"? }]
 //!   }],
 //!   "edges": [{ "kind": "composition" | "membership" | "typing" |
@@ -46,13 +55,33 @@
 //! }
 //! ```
 //!
+//! A member introduced into its owner in a role of its own — a subject,
+//! actor, stakeholder, objective, return parameter, result expression,
+//! assumed or required constraint, framed concern, verified requirement,
+//! included use case, state `entry`/`do`/`exit` action, or a non-port
+//! `end` — is a row of its owner's card carrying its `role`, in the
+//! role's section (`subject`, `actors`, `stakeholders`, `objective`,
+//! `return`, `result`, `assume constraints`, `require constraints`,
+//! `frames`, `verifies`, `includes`, `state actions`, `ends`), its label
+//! led by no direction. A port's directed feature is a row of the port's
+//! card in `directed features`, with its `direction`. The state view
+//! draws a state's `entry`/`do`/`exit` actions as these same rows; an
+//! empty one (`entry;`) is a row too, its label empty.
+//!
+//! A node or row's `qname` is its qualified name as the specification
+//! derives it: an element that declares no name goes by the one it is
+//! given — a subject's `subj`, an objective's `obj`, what a `do refuel;`
+//! references, what a `:>> mass` redefines — and says `impliedName`. A
+//! rename changes only a declared name, so a host that edits such an
+//! element goes by its `id` and leaves its naming to the source.
+//!
 //! Summary emission ([`VizOptions::summary`], tree view): a container
 //! (a package, or an owner card with drawn members) outside the open
 //! set is one node whose subtree is hidden, carrying
 //! `"summary": { "open": false, "members", "containers", "leaves",
 //! "notes", "hidden", "truncated", "edgesIn", "edgesOut" }` — `notes`
 //! counts the notes on hidden elements below it and `hidden` the hidden
-//! drawable elements below it (the cards the full picture would add); an open container carries the
+//! drawable nodes below it (including port copies the full picture would add); an open container carries the
 //! same object with `"open": true` and `truncated` = direct members
 //! beyond the leaf budget (hidden and counted like a closed one's).
 //! Every reference edge with an endpoint that stands in for a hidden
@@ -69,7 +98,10 @@ use sysmlv2_model::json::{ElementRef, ResolvedModel};
 
 use crate::behavior::{ACTIONS, CONTROL_NODES, FLOWS, STATES, node_label, transition_edge_label};
 use crate::interconnect::{BLOCK_USAGES, CONNECTORS, KERML_BLOCKS};
-use crate::{Kind, SummaryOptions, View, VizOptions, classify, roots_of, stereotype, usage_label};
+use crate::{
+    Kind, ROW_DEPTH_CAP, Role, SummaryOptions, View, VizOptions, classify, member_role,
+    nested_row_members, node_usage_label, roots_of, row_parts, stereotype, usage_label,
+};
 
 /// Why [`graph`] drew nothing.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -218,6 +250,7 @@ pub fn graph(
         View::State | View::Action => {
             let mut g = BehaviorGraphEmitter {
                 r,
+                opts,
                 view: opts.view,
                 nodes: Vec::new(),
                 edges: Vec::new(),
@@ -401,7 +434,7 @@ impl SummaryState {
 /// and skipped kinds; on a non-package, compartment lines are rows, not
 /// members.
 fn drawable_children(
-    r: &ResolvedModel,
+    r: &mut ResolvedModel,
     show_metadata: bool,
     e: ElementRef,
     is_package: bool,
@@ -444,6 +477,11 @@ impl GraphEmitter<'_> {
             .unwrap_or(0);
         counts.notes += notes;
         counts.hidden += 1;
+        if is_usage {
+            counts.hidden = counts
+                .hidden
+                .saturating_add(count_port_copies(self.r, e, 0, usize::MAX).unwrap_or(usize::MAX));
+        }
         if let Some(s) = self.summary.as_mut() {
             // Overlapping roots reach an element twice; its references
             // bundle once.
@@ -622,101 +660,19 @@ impl GraphEmitter<'_> {
         self.r.element_id(e).to_string()
     }
 
-    /// Identity + declaration-site fields shared by nodes and rows.
     fn identity(&mut self, e: ElementRef) -> serde_json::Map<String, Json> {
-        let mut m = serde_json::Map::new();
-        m.insert("id".into(), json!(self.id_of(e)));
-        if let Some(qn) = self.r.element_qualified_name(e) {
-            m.insert("qname".into(), json!(qn));
-        }
-        if let Some((file, line, col)) = self.r.declaration_position(e) {
-            let file = file.to_string();
-            m.insert("file".into(), json!(file));
-            m.insert("line".into(), json!(line));
-            m.insert("col".into(), json!(col));
-        }
-        m
+        identity(self.r, e)
     }
 
     fn value_suffix(&mut self, e: ElementRef) -> Option<String> {
         if !self.opts.show_values {
             return None;
         }
-        crate::value_suffix(self.r, e)
+        crate::value_suffix(self.r, e, self.opts.value_units)
     }
 
     fn row(&mut self, m: ElementRef, inherited: bool) -> Option<Json> {
-        let mut label = usage_label(self.r, m);
-        if let Some(value) = self.value_suffix(m) {
-            label.push(' ');
-            label.push_str(&value);
-        }
-        if label.trim().is_empty() {
-            return None;
-        }
-        let mut section = section_of(self.r.element_type(m));
-        // Directed features render their direction in the label, and
-        // directed reference rows (action parameters) group under one
-        // "parameters" compartment instead of the generic references.
-        if let Some(dir) = self.r.declared_direction(m) {
-            let dir = dir.to_string();
-            if section == "references" {
-                section = "parameters".to_string();
-            }
-            label.insert(0, ' ');
-            label.insert_str(0, &dir);
-        }
-        let mut obj = self.identity(m);
-        obj.insert("label".into(), json!(label));
-        obj.insert("section".into(), json!(section));
-        if inherited {
-            obj.insert("inherited".into(), json!(true));
-        }
-        // A nameless redefinition borrows its label's name: say so, with the
-        // chain's links when it redefines a chain (`["chassis", "mass"]`), and
-        // whether the label's type was derived rather than written — a host
-        // draws the borrowed name and the derived type as such.
-        if crate::is_nameless_redefinition(self.r, m) {
-            obj.insert("redefining".into(), json!(true));
-            if let Some(links) = crate::redefined_chain(self.r, m) {
-                obj.insert("chain".into(), json!(links));
-            }
-        }
-        if crate::label_types(self.r, m).1 {
-            obj.insert("typeDerived".into(), json!(true));
-        }
-        let prefixes = self.r.prefix_keywords(m);
-        if !prefixes.is_empty() {
-            obj.insert("prefixes".into(), json!(prefixes));
-        }
-        // The notation's row tail: `ordered nonunique` properties and
-        // written `subsets`/`redefines` clauses. An anonymous
-        // redefining row already borrows the redefined name into its
-        // label — no clause for those.
-        let mut detail: Vec<String> = Vec::new();
-        if self.r.is_ordered(m) {
-            detail.push("ordered".into());
-        }
-        if !self.r.is_unique(m) {
-            detail.push("nonunique".into());
-        }
-        if self.r.element_name(m).is_some() {
-            for (kind, t) in self.r.explicit_specializations(m) {
-                let word = match kind {
-                    "Subsetting" => "subsets",
-                    "Redefinition" => "redefines",
-                    _ => continue,
-                };
-                let Some(n) = self.r.element_name(t).map(str::to_string) else {
-                    continue;
-                };
-                detail.push(format!("{word} {n}"));
-            }
-        }
-        if !detail.is_empty() {
-            obj.insert("detail".into(), json!(detail.join(" ")));
-        }
-        Some(Json::Object(obj))
+        row_at(self.r, self.opts, m, inherited, 0)
     }
 
     /// Rows + node children of `e` (the graph twin of the PlantUML
@@ -725,6 +681,7 @@ impl GraphEmitter<'_> {
         let mut rows = Vec::new();
         let mut children = Vec::new();
         let mut own_names: Vec<String> = Vec::new();
+        let mut own_roles: Vec<Role> = Vec::new();
         let metas = self.r.metadata_of(e);
         for m in self.r.owned_members(e) {
             if metas.contains(&m) {
@@ -735,6 +692,7 @@ impl GraphEmitter<'_> {
                     if let Some(n) = crate::display_name(self.r, m) {
                         own_names.push(n);
                     }
+                    own_roles.extend(member_role(self.r, m).filter(|role| role.singular()));
                     rows.extend(self.row(m, false));
                 }
                 Kind::Skip => {}
@@ -753,9 +711,11 @@ impl GraphEmitter<'_> {
                     if !matches!(classify(self.r, self.opts.show_metadata, m), Kind::Line) {
                         continue;
                     }
-                    // by the names the lines read, borrowed ones included
-                    let shadowed =
-                        crate::display_name(self.r, m).is_some_and(|n| own_names.contains(&n));
+                    // by the names the lines read, borrowed ones included,
+                    // and by the role an owner has one of
+                    let shadowed = crate::display_name(self.r, m)
+                        .is_some_and(|n| own_names.contains(&n))
+                        || member_role(self.r, m).is_some_and(|role| own_roles.contains(&role));
                     if !shadowed {
                         rows.extend(self.row(m, true));
                     }
@@ -812,7 +772,7 @@ impl GraphEmitter<'_> {
             stereotype(&ty)
         };
         let label = if is_usage {
-            usage_label(self.r, e)
+            node_usage_label(self.r, e)
         } else {
             self.r.element_name(e).unwrap_or("").to_string()
         };
@@ -861,6 +821,9 @@ impl GraphEmitter<'_> {
         obj.insert("stereo".into(), json!(stereo));
         obj.insert("metaclass".into(), json!(ty));
         notation_fields(self.r, &mut obj, e, is_usage);
+        if ty == "PortUsage" {
+            port_fields(self.r, &mut obj, e);
+        }
         if let Some(names) = self.aliases.get(&e) {
             obj.insert("aliases".into(), json!(names));
         }
@@ -871,6 +834,14 @@ impl GraphEmitter<'_> {
         self.nodes.push(Json::Object(obj));
         self.drawn.insert(e, id.clone());
         self.rendered.push((e, is_usage));
+
+        // A usage's ports through its definition (a port's nested ones
+        // included) draw on its card as port nodes of their own: the
+        // client folds them into the card as ghost rows, where a
+        // connector end names them.
+        if is_usage {
+            self.port_copies(e, &id, 0);
+        }
 
         // Summary mode: an owner card is a container — closed, its
         // members hide under it with counts; open, they draw as sibling
@@ -888,6 +859,36 @@ impl GraphEmitter<'_> {
         for child in children {
             self.render(child, parent);
             self.ownership_edge(&id, child);
+        }
+    }
+
+    /// The ports `on` has through its definition, as port nodes under
+    /// `parent` (a usage's card, a port's own row), each `inherited`
+    /// with a synthetic id under its parent's but the definition port's
+    /// identity, and each with its own nested ports in turn: the ones
+    /// it owns and the ones through its definition, to a bounded depth.
+    fn port_copies(&mut self, on: ElementRef, parent: &str, depth: usize) {
+        for p in port_copy_children(self.r, on, depth) {
+            let id = format!("{parent}~{}", self.id_of(p));
+            let label = usage_label(self.r, p);
+            let label = if label.trim().is_empty() {
+                "(port)".to_string()
+            } else {
+                label
+            };
+            let mut obj = self.identity(p);
+            obj.insert("id".into(), json!(id));
+            obj.insert("label".into(), json!(label));
+            obj.insert("kind".into(), json!("port"));
+            obj.insert("stereo".into(), json!("port"));
+            obj.insert("metaclass".into(), json!("PortUsage"));
+            notation_fields(self.r, &mut obj, p, true);
+            port_fields(self.r, &mut obj, p);
+            obj.insert("inherited".into(), json!(true));
+            obj.insert("rows".into(), json!([]));
+            obj.insert("parent".into(), json!(parent));
+            self.nodes.push(Json::Object(obj));
+            self.port_copies(p, &id, depth + 1);
         }
     }
 
@@ -1026,7 +1027,7 @@ impl GraphEmitter<'_> {
                 .find(|(t, _)| *t == ty)
                 .map(|(_, k)| *k)
             {
-                for chain in self.r.referenced_features(e) {
+                for chain in crate::resolved_references(self.r, e) {
                     let Some((tid, remapped)) =
                         chain.iter().rev().find_map(|l| self.visible_id(*l))
                     else {
@@ -1126,6 +1127,9 @@ struct DrawCount<'a> {
     hidden: HashMap<u128, usize>,
     /// Elements drawn as nodes.
     drawn: HashSet<ElementRef>,
+    /// Port copies counted so far: each is a node of its own in the
+    /// document, under a synthetic id, so each takes a key of its own.
+    copies: u128,
     /// `show_lib` only: the elements hidden under containers, and the
     /// drawn and hidden elements with their usage-likeness — a library
     /// node draws for a target neither drawn nor hidden.
@@ -1150,6 +1154,7 @@ impl DrawCount<'_> {
             nodes: HashMap::new(),
             hidden: HashMap::new(),
             drawn: HashSet::new(),
+            copies: 0,
             hidden_elements: HashSet::new(),
             referrers: Vec::new(),
         }
@@ -1197,6 +1202,11 @@ impl DrawCount<'_> {
                 .push((e, matches!(kind, Kind::UsageNode | Kind::Line)));
         }
         self.node(id, parent)?;
+        // A usage node carries its port copies (see
+        // [`GraphEmitter::port_copies`]), one node each.
+        if matches!(kind, Kind::UsageNode | Kind::Line) {
+            self.port_copies(e, 0)?;
+        }
         let children = drawable_children(self.r, self.opts.show_metadata, e, is_package);
         // An element without drawable members is a leaf, not a container.
         if children.is_empty() {
@@ -1228,6 +1238,17 @@ impl DrawCount<'_> {
         ControlFlow::Continue(())
     }
 
+    /// [`GraphEmitter::port_copies`]: the port copies a usage node
+    /// carries, each one more node, to the same depth.
+    fn port_copies(&mut self, on: ElementRef, depth: usize) -> ControlFlow<()> {
+        for p in port_copy_children(self.r, on, depth) {
+            self.copies += 1;
+            self.node(u128::MAX - self.copies, None)?;
+            self.port_copies(p, depth + 1)?;
+        }
+        ControlFlow::Continue(())
+    }
+
     /// [`GraphEmitter::hide_subtree`]: `e` and its drawable subtree hide
     /// under a container. Continues with how many elements hid.
     fn hide(&mut self, e: ElementRef) -> ControlFlow<(), usize> {
@@ -1239,6 +1260,15 @@ impl DrawCount<'_> {
         }
         let is_package = matches!(kind, Kind::Package);
         let mut hidden = 1;
+        if matches!(kind, Kind::UsageNode | Kind::Line) {
+            let Some(copies) =
+                count_port_copies(self.r, e, 0, self.limit.saturating_sub(self.walked))
+            else {
+                return ControlFlow::Break(());
+            };
+            self.walked += copies;
+            hidden += copies;
+        }
         for c in drawable_children(self.r, self.opts.show_metadata, e, is_package) {
             hidden += self.hide(c)?;
         }
@@ -1338,7 +1368,8 @@ struct IcGraphEmitter<'a> {
     nodes: Vec<Json>,
     edges: Vec<Json>,
     drawn: HashMap<ElementRef, String>,
-    typed_port: HashMap<(ElementRef, ElementRef), String>,
+    /// (node id, definition port) → the id of that port's copy on that node (see [`crate::interconnect::project_end`]).
+    typed_port: HashMap<(String, ElementRef), String>,
     connectors: Vec<ElementRef>,
     /// Memo of [`Self::has_content`] per element.
     content: HashMap<ElementRef, bool>,
@@ -1358,18 +1389,7 @@ impl IcGraphEmitter<'_> {
     }
 
     fn identity(&mut self, e: ElementRef) -> serde_json::Map<String, Json> {
-        let mut m = serde_json::Map::new();
-        m.insert("id".into(), json!(self.id_of(e)));
-        if let Some(qn) = self.r.element_qualified_name(e) {
-            m.insert("qname".into(), json!(qn));
-        }
-        if let Some((file, line, col)) = self.r.declaration_position(e) {
-            let file = file.to_string();
-            m.insert("file".into(), json!(file));
-            m.insert("line".into(), json!(line));
-            m.insert("col".into(), json!(col));
-        }
-        m
+        identity(self.r, e)
     }
 
     fn classify(&mut self, e: ElementRef) -> IcKind {
@@ -1422,7 +1442,7 @@ impl IcGraphEmitter<'_> {
         match self.classify(e) {
             IcKind::Package => self.render_package(e, parent),
             IcKind::Block { usage } => self.render_block(e, parent, usage),
-            IcKind::Port => self.render_port(e, parent, None),
+            IcKind::Port => self.render_port(e, parent, false, 0),
             IcKind::Connector => self.connectors.push(e),
             IcKind::Skip => {}
         }
@@ -1461,7 +1481,7 @@ impl IcGraphEmitter<'_> {
         let ty = self.r.element_type(e).to_string();
         let stereo = stereotype(&ty);
         let label = if is_usage {
-            usage_label(self.r, e)
+            node_usage_label(self.r, e)
         } else {
             self.r.element_name(e).unwrap_or("").to_string()
         };
@@ -1493,7 +1513,7 @@ impl IcGraphEmitter<'_> {
             }
             match self.classify(m) {
                 IcKind::Connector => self.connectors.push(m),
-                IcKind::Port => self.render_port(m, Some(&id), None),
+                IcKind::Port => self.render_port(m, Some(&id), false, 0),
                 IcKind::Skip => {}
                 _ => self.render(m, Some(&id)),
             }
@@ -1507,30 +1527,25 @@ impl IcGraphEmitter<'_> {
         // concrete port declared by a library definition the usage is
         // typed by still arrives.
         if is_usage {
-            let inherited: Vec<ElementRef> = self
-                .r
-                .inherited_features(e, false)
-                .into_iter()
-                .filter(|&m| self.r.element_type(m) == "PortUsage")
-                .filter(|&m| !(self.r.is_library_element(m) && self.r.is_abstract(m)))
-                .collect();
-            for p in inherited {
-                self.render_port(p, Some(&id), Some(e));
+            for p in inherited_ports(self.r, e) {
+                self.render_port(p, Some(&id), true, 0);
             }
         }
     }
 
-    /// One port node. `on` = the usage a definition port renders on —
-    /// such a node gets a synthetic per-usage id but the definition
-    /// port's identity fields (rename/reveal act on the definition).
-    fn render_port(&mut self, p: ElementRef, parent: Option<&str>, on: Option<ElementRef>) {
-        let node_id = match on {
-            None => self.id_of(p),
-            Some(usage) => {
-                let id = format!("{}~{}", self.id_of(usage), self.id_of(p));
-                self.typed_port.insert((usage, p), id.clone());
+    /// One port node, and the ports nested in it. `copy` = the port
+    /// is drawn on `parent` through that node's definition (a usage's
+    /// port, a port's nested port): such a node gets a synthetic id
+    /// under its parent's but the definition port's identity fields
+    /// (rename/reveal act on the definition), and is `inherited`.
+    fn render_port(&mut self, p: ElementRef, parent: Option<&str>, copy: bool, depth: usize) {
+        let node_id = match (copy, parent) {
+            (true, Some(pa)) => {
+                let id = format!("{pa}~{}", self.id_of(p));
+                self.typed_port.insert((pa.to_string(), p), id.clone());
                 id
             }
+            _ => self.id_of(p),
         };
         let label = usage_label(self.r, p);
         let label = if label.trim().is_empty() {
@@ -1545,25 +1560,30 @@ impl IcGraphEmitter<'_> {
         obj.insert("stereo".into(), json!("port"));
         obj.insert("metaclass".into(), json!("PortUsage"));
         notation_fields(self.r, &mut obj, p, true);
-        if let Some(dir) = self.r.declared_direction(p) {
-            let dir = dir.to_string();
-            obj.insert("direction".into(), json!(dir));
-        }
-        let conjugated = self
-            .r
-            .typings(p)
-            .iter()
-            .any(|&t| self.r.element_type(t) == "ConjugatedPortDefinition");
-        if conjugated {
-            obj.insert("conjugated".into(), json!(true));
+        port_fields(self.r, &mut obj, p);
+        if copy {
+            obj.insert("inherited".into(), json!(true));
         }
         obj.insert("rows".into(), json!([]));
         if let Some(pa) = parent {
             obj.insert("parent".into(), json!(pa));
         }
         self.nodes.push(Json::Object(obj));
-        if on.is_none() {
-            self.drawn.insert(p, node_id);
+        if !copy {
+            self.drawn.insert(p, node_id.clone());
+        }
+        // The ports nested in this one: its own (nodes of their own
+        // under an own port, copies under a copy) and the ones it has
+        // through its definition (copies), to a bounded depth — a port
+        // definition may nest its own type.
+        if depth >= PORT_NESTING_DEPTH {
+            return;
+        }
+        for m in owned_ports(self.r, p) {
+            self.render_port(m, Some(&node_id), copy, depth + 1);
+        }
+        for m in inherited_ports(self.r, p) {
+            self.render_port(m, Some(&node_id), true, depth + 1);
         }
     }
 
@@ -1692,6 +1712,7 @@ impl IcGraphEmitter<'_> {
 /// renamable and deletable like any member).
 struct BehaviorGraphEmitter<'a> {
     r: &'a mut ResolvedModel,
+    opts: &'a VizOptions,
     view: View,
     nodes: Vec<Json>,
     edges: Vec<Json>,
@@ -1709,18 +1730,7 @@ impl BehaviorGraphEmitter<'_> {
     }
 
     fn identity(&mut self, e: ElementRef) -> serde_json::Map<String, Json> {
-        let mut m = serde_json::Map::new();
-        m.insert("id".into(), json!(self.id_of(e)));
-        if let Some(qn) = self.r.element_qualified_name(e) {
-            m.insert("qname".into(), json!(qn));
-        }
-        if let Some((file, line, col)) = self.r.declaration_position(e) {
-            let file = file.to_string();
-            m.insert("file".into(), json!(file));
-            m.insert("line".into(), json!(line));
-            m.insert("col".into(), json!(col));
-        }
-        m
+        identity(self.r, e)
     }
 
     fn is_node(&self, ty: &str) -> bool {
@@ -1735,7 +1745,16 @@ impl BehaviorGraphEmitter<'_> {
             View::State => {
                 ty == "TransitionUsage" || ty == "SuccessionAsUsage" || ty == "Succession"
             }
-            _ => ty == "SuccessionAsUsage" || ty == "Succession" || FLOWS.contains(&ty),
+            // A transition is an action-view edge too: a decision's
+            // guarded branches (`if g then b;`, `else c;`) and a guarded
+            // succession with a written source (`first a if g then b;`),
+            // as the PlantUML action view draws them.
+            _ => {
+                ty == "TransitionUsage"
+                    || ty == "SuccessionAsUsage"
+                    || ty == "Succession"
+                    || FLOWS.contains(&ty)
+            }
         }
     }
 
@@ -1774,18 +1793,15 @@ impl BehaviorGraphEmitter<'_> {
             label
         };
 
-        // Subaction description lines (state view) become rows carrying
-        // the subaction's identity.
+        // A state's `entry` / `do` / `exit` actions (state view) are rows
+        // of its card, drawn as the tree view draws them: the subaction's
+        // identity, its `role`, the "state actions" section, and the label
+        // the tree's rows give (`warm`, an anonymous block's steps, an
+        // unnamed send's kind; an empty `entry;` with no label).
         let mut rows: Vec<Json> = Vec::new();
         if self.view == View::State {
-            for (kind, action) in self.r.state_subactions(e) {
-                let l = node_label(self.r, action, false);
-                if l.trim().is_empty() {
-                    continue;
-                }
-                let mut obj = self.identity(action);
-                obj.insert("label".into(), json!(format!("{kind} / {l}")));
-                rows.push(Json::Object(obj));
+            for (_, action) in self.r.state_subactions(e) {
+                rows.extend(row_at(self.r, self.opts, action, false, 0));
             }
         }
 
@@ -2010,6 +2026,148 @@ const REFERENTIAL_BY_NATURE: &[&str] = &[
     "PerformActionUsage",
 ];
 
+/// Identity + declaration-site fields shared by nodes and rows: a
+/// qualified name ending in a name the element is given rather than
+/// declares says `impliedName`.
+fn identity(r: &mut ResolvedModel, e: ElementRef) -> serde_json::Map<String, Json> {
+    let mut m = serde_json::Map::new();
+    m.insert("id".into(), json!(r.element_id(e).to_string()));
+    if let Some(qn) = r.element_qualified_name(e) {
+        m.insert("qname".into(), json!(qn));
+        if r.element_name(e).is_none() && r.element_declared_short_name(e).is_none() {
+            m.insert("impliedName".into(), json!(true));
+        }
+    }
+    if let Some((file, line, col)) = r.declaration_position(e) {
+        let file = file.to_string();
+        m.insert("file".into(), json!(file));
+        m.insert("line".into(), json!(line));
+        m.insert("col".into(), json!(col));
+    }
+    m
+}
+
+/// A compartment row at `depth` steps under its card's compartment:
+/// the line's own members that would be lines themselves (an
+/// attribute's nested attributes, an objective's `require` members)
+/// come along as its `rows`, to [`ROW_DEPTH_CAP`] levels, so a host
+/// can draw them under it. A role member's row says its `role` and
+/// takes the role's section, its label led by no direction (the role
+/// implies it), and an `assume` / `require` / result row carries its
+/// `expr`; an anonymous one draws when it has an expression or rows, an
+/// empty member of a role its owner has one of (`entry;`, an untyped
+/// `subject;`) as its keyword alone ([`crate::RowParts::draws`]).
+/// A port's directed feature files under "directed features" with its
+/// `direction` beside an unprefixed label.
+fn row_at(
+    r: &mut ResolvedModel,
+    opts: &VizOptions,
+    m: ElementRef,
+    inherited: bool,
+    depth: usize,
+) -> Option<Json> {
+    let parts = row_parts(r, opts, m, true);
+    let mut label = parts.label.clone();
+    if label.trim().is_empty() && parts.role.is_none() {
+        return None;
+    }
+    let mut nested = Vec::new();
+    if depth < ROW_DEPTH_CAP {
+        for c in nested_row_members(r, opts.show_metadata, m, parts.role) {
+            nested.extend(row_at(r, opts, c, inherited, depth + 1));
+        }
+    }
+    if !parts.draws(!nested.is_empty()) {
+        return None;
+    }
+    let section = if let Some(role) = parts.role {
+        role.section().to_string()
+    } else if parts.direction.is_some() {
+        "directed features".to_string()
+    } else {
+        let mut section = section_of(r.element_type(m));
+        // Directed features render their direction in the label, and
+        // directed reference rows (action parameters) group under one
+        // "parameters" compartment instead of the generic references.
+        if let Some(dir) = r.declared_direction(m) {
+            let dir = dir.to_string();
+            if section == "references" {
+                section = "parameters".to_string();
+            }
+            // A nameless row's label already leads with the space
+            // before its value (` = measurement`).
+            if !label.starts_with(' ') {
+                label.insert(0, ' ');
+            }
+            label.insert_str(0, &dir);
+        }
+        section
+    };
+    let mut obj = identity(r, m);
+    obj.insert("label".into(), json!(label));
+    obj.insert("section".into(), json!(section));
+    if let Some(role) = parts.role {
+        obj.insert("role".into(), json!(role.as_str()));
+    }
+    if let Some(direction) = parts.direction {
+        obj.insert("direction".into(), json!(direction));
+    }
+    if let Some(expr) = parts.expr {
+        obj.insert("expr".into(), json!(expr));
+    }
+    if inherited {
+        obj.insert("inherited".into(), json!(true));
+    }
+    // A nameless redefinition borrows its label's name: say so, with the
+    // chain's links when it redefines a chain (`["chassis", "mass"]`), and
+    // whether the label's type was derived rather than written — a host
+    // draws the borrowed name and the derived type as such.
+    if crate::is_nameless_redefinition(r, m) {
+        obj.insert("redefining".into(), json!(true));
+        if let Some(links) = crate::redefined_chain(r, m) {
+            obj.insert("chain".into(), json!(links));
+        }
+    }
+    if crate::label_types(r, m).1 {
+        obj.insert("typeDerived".into(), json!(true));
+    }
+    let prefixes = r.prefix_keywords(m);
+    if !prefixes.is_empty() {
+        obj.insert("prefixes".into(), json!(prefixes));
+    }
+    // The notation's row tail: `ordered nonunique` properties and
+    // written `subsets`/`redefines` clauses. An anonymous
+    // redefining row already borrows the redefined name into its
+    // label — no clause for those.
+    let mut detail: Vec<String> = Vec::new();
+    if r.is_ordered(m) {
+        detail.push("ordered".into());
+    }
+    if !r.is_unique(m) {
+        detail.push("nonunique".into());
+    }
+    if r.element_name(m).is_some() {
+        for (kind, t) in r.explicit_specializations(m) {
+            let word = match kind {
+                "Subsetting" => "subsets",
+                "Redefinition" => "redefines",
+                _ => continue,
+            };
+            let Some(n) = r.element_name(t).map(str::to_string) else {
+                continue;
+            };
+            detail.push(format!("{word} {n}"));
+        }
+    }
+    if !detail.is_empty() {
+        obj.insert("detail".into(), json!(detail.join(" ")));
+    }
+    if !nested.is_empty() {
+        obj.insert("rows".into(), Json::Array(nested));
+    }
+    Some(Json::Object(obj))
+}
+
 /// The notation's shape triad for one node: definition (sharp rect),
 /// usage (rounded), reference (dashed rounded).
 fn node_kind_of(r: &mut ResolvedModel, e: ElementRef, is_usage: bool) -> &'static str {
@@ -2052,6 +2210,118 @@ fn node_kind_of(r: &mut ResolvedModel, e: ElementRef, is_usage: bool) -> &'stati
 /// Insert the notation fields shared by every element node: the
 /// def/usage/ref shape triad, header prefix keywords, and the
 /// portion kind («timeslice»/«snapshot» headers).
+/// How deep a port's nested ports draw under it: a port definition may
+/// nest a port of its own type, so the copies stop here.
+const PORT_NESTING_DEPTH: usize = 3;
+
+/// The next level of a structure-tree port copy, shared by emission and
+/// both counts. A usage's own ports draw separately; beneath a copy,
+/// owned and inherited ports both need copies of their own.
+fn port_copy_children(r: &mut ResolvedModel, on: ElementRef, depth: usize) -> Vec<ElementRef> {
+    if depth >= PORT_NESTING_DEPTH {
+        return Vec::new();
+    }
+    let mut ports = if depth == 0 {
+        Vec::new()
+    } else {
+        owned_ports(r, on)
+    };
+    ports.extend(inherited_ports(r, on));
+    ports
+}
+
+/// Hidden port copies, stopping as soon as they exceed the remaining
+/// budget. The emitted summary requests the full count with `usize::MAX`.
+fn count_port_copies(
+    r: &mut ResolvedModel,
+    on: ElementRef,
+    depth: usize,
+    limit: usize,
+) -> Option<usize> {
+    let mut count = 0usize;
+    for p in port_copy_children(r, on, depth) {
+        count = count.checked_add(1)?;
+        if count > limit {
+            return None;
+        }
+        count += count_port_copies(r, p, depth + 1, limit - count)?;
+    }
+    Some(count)
+}
+
+/// A port node's own fields: its declared direction, and whether it is
+/// typed by a conjugated port definition (`~T`, the filled square).
+fn port_fields(r: &mut ResolvedModel, obj: &mut serde_json::Map<String, Json>, p: ElementRef) {
+    if let Some(dir) = r.declared_direction(p) {
+        let dir = dir.to_string();
+        obj.insert("direction".into(), json!(dir));
+    }
+    let conjugated = r
+        .typings(p)
+        .iter()
+        .any(|&t| r.element_type(t) == "ConjugatedPortDefinition");
+    if conjugated {
+        obj.insert("conjugated".into(), json!(true));
+    }
+}
+
+/// The ports `e` owns itself, in declaration order (its metadata left
+/// out).
+fn owned_ports(r: &mut ResolvedModel, e: ElementRef) -> Vec<ElementRef> {
+    let metas = r.metadata_of(e);
+    r.owned_members(e)
+        .into_iter()
+        .filter(|m| !metas.contains(m))
+        .filter(|&m| r.element_type(m) == "PortUsage")
+        .collect()
+}
+
+/// The standard library's definitions whose concrete ports are
+/// infrastructure every port or interface has rather than structure a
+/// model declares: `Ports::Port::subports`, and the `participant`,
+/// `source` and `target` ends of `Interfaces::Interface` and
+/// `Interfaces::BinaryInterface`. A domain library's ports, on abstract
+/// definitions of any kind included, are structure like a model's own.
+const STANDARD_LIBRARY_PORT_OWNERS: [&str; 3] = [
+    "Ports::Port",
+    "Interfaces::Interface",
+    "Interfaces::BinaryInterface",
+];
+
+/// Ports `e` has through its *written* heritage (typings and
+/// specializations, transitively), shadowing applied — the resolver's
+/// own walk ([`ResolvedModel::inherited_features`]). Three kinds stay
+/// out: implied bases (every part inherits the standard library's
+/// generic `ownedPorts` through its implied base), the library's
+/// *abstract* port usages when a written `:> Parts::Part` reaches
+/// them, and the standard library's own port infrastructure
+/// ([`STANDARD_LIBRARY_PORT_OWNERS`]): `Ports::Port::subports`, which
+/// every port has and which nests its own type, and the connector ends
+/// of `Interfaces::Interface` and `Interfaces::BinaryInterface`, which a
+/// written `:> Interfaces::BinaryInterface` reaches — none is structure
+/// the model declares. Concrete ports on domain-library definitions,
+/// including abstract ones of every kind, still arrive through written
+/// heritage.
+fn inherited_ports(r: &mut ResolvedModel, e: ElementRef) -> Vec<ElementRef> {
+    let mut out = Vec::new();
+    for m in r.inherited_features(e, false) {
+        if r.element_type(m) != "PortUsage" {
+            continue;
+        }
+        if r.is_library_element(m) {
+            let infrastructure = r.owner(m).is_some_and(|o| {
+                r.element_qualified_name(o)
+                    .is_some_and(|name| STANDARD_LIBRARY_PORT_OWNERS.contains(&name.as_str()))
+            });
+            if r.is_abstract(m) || infrastructure {
+                continue;
+            }
+        }
+        out.push(m);
+    }
+    out
+}
+
 fn notation_fields(
     r: &mut ResolvedModel,
     obj: &mut serde_json::Map<String, Json>,

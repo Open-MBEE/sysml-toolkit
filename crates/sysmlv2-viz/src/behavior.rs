@@ -25,7 +25,7 @@ use std::fmt::Write as _;
 use sysmlv2_model::json::{BodyFlowMember, ElementRef, ResolvedModel};
 use sysmlv2_syntax::ast::Dialect;
 
-use crate::{View, VizOptions, chain_label, escape, frame, inline_label, stereotype, usage_label};
+use crate::{View, VizOptions, escape, frame, inline_label, stereotype, usage_label};
 
 /// State-view node metaclasses.
 pub(crate) const STATES: &[&str] = &["StateDefinition", "StateUsage", "ExhibitStateUsage"];
@@ -286,25 +286,17 @@ impl Emitter<'_> {
         }
     }
 
-    /// `alias : entry / label` description lines, after the node. An
-    /// anonymous subaction block (`do action { step1; step2; }`) lists
-    /// its steps instead of disappearing.
+    /// `alias : entry / label` description lines, after the node, each
+    /// labelled as the graph's state-action row is: an anonymous
+    /// subaction block (`do action { step1; step2; }`) lists its steps
+    /// and one that only says what it does reads as its kind (`exit send
+    /// …` → `exit / send action`), instead of disappearing; an empty one
+    /// (`entry;`) draws no line.
     fn emit_subaction_lines(&mut self, e: ElementRef, alias: &str, depth: usize) {
         for (kind, action) in self.r.state_subactions(e) {
             let mut label = self.node_label(action, false);
             if label.trim().is_empty() {
-                let mut steps: Vec<String> = Vec::new();
-                for m in self.r.owned_members(action) {
-                    let ty = self.r.element_type(m);
-                    if !(ACTIONS.contains(&ty) || ty == "ReferenceUsage") {
-                        continue;
-                    }
-                    let l = node_label(self.r, m, false);
-                    if !l.trim().is_empty() {
-                        steps.push(l);
-                    }
-                }
-                label = steps.join("; ");
+                label = crate::state_action_label(self.r, action).unwrap_or_default();
             }
             if label.trim().is_empty() {
                 continue;
@@ -426,8 +418,28 @@ impl Emitter<'_> {
     }
 }
 
-/// The node label: usage shape, falling back to the referenced
-/// feature chain (`perform greet`, `exhibit s`).
+/// What an anonymous subaction block does: its steps, the action-family
+/// members and references it owns by their labels (`do action { sweep :
+/// Chore; polish; }` → `sweep : Chore; polish`). Empty when it has none.
+pub(crate) fn subaction_steps(r: &mut ResolvedModel, action: ElementRef) -> String {
+    let mut steps: Vec<String> = Vec::new();
+    for m in r.owned_members(action) {
+        let ty = r.element_type(m);
+        if !(ACTIONS.contains(&ty) || ty == "ReferenceUsage") {
+            continue;
+        }
+        let l = node_label(r, m, false);
+        if !l.trim().is_empty() {
+            steps.push(l);
+        }
+    }
+    steps.join("; ")
+}
+
+/// The node label: usage shape, falling back to what it references —
+/// the feature chain (`perform greet`, `exhibit s`), or as written when
+/// that did not resolve in full (`do 'provide power'` → `provide power`,
+/// `perform tank.drain` → `tank.drain`).
 pub(crate) fn node_label(r: &mut ResolvedModel, e: ElementRef, is_def: bool) -> String {
     let label = if is_def {
         r.element_name(e).unwrap_or("").to_string()
@@ -437,13 +449,7 @@ pub(crate) fn node_label(r: &mut ResolvedModel, e: ElementRef, is_def: bool) -> 
     if !label.trim().is_empty() {
         return label;
     }
-    for chain in r.referenced_features(e) {
-        let l = chain_label(r, &chain);
-        if !l.is_empty() {
-            return l;
-        }
-    }
-    String::new()
+    crate::referenced_name(r, e).unwrap_or_default()
 }
 
 /// The accepted payload's type (or name): `accept Overheat` →

@@ -123,9 +123,10 @@ fn to_json(r: &ResolvedModel, v: &DerivedValue) -> Value {
         DerivedValue::References(rs) => {
             Value::Array(rs.iter().map(|r| reference(r, &id)).collect())
         }
-        DerivedValue::Strings(ss) => {
+        DerivedValue::Strings(ss) | DerivedValue::Literals(ss) => {
             Value::Array(ss.iter().map(|s| Value::String(s.clone())).collect())
         }
+        DerivedValue::Literal(s) => Value::String(s.clone()),
         // `DerivedValue` is non-exhaustive: a new variant must fail the
         // gate loudly rather than compare as something else.
         other => panic!("unhandled derived value {other:?}"),

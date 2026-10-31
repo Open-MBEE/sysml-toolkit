@@ -143,6 +143,87 @@ fn full_form_validates_against_published_schema() {
     let _ = schema_validator;
 }
 
+/// A target transition's implied source Membership is a schema-valid row
+/// of the full form, with and without the library: `memberElement` the
+/// source, `membershipOwningNamespace` the transition, `visibility`
+/// public, `isImplied` true, and no self-referencing `source` on the
+/// transition.
+#[test]
+fn target_transition_source_membership_is_schema_valid() {
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            sysmlv2_testkit::workspace_root().join("spec-refs/SysML.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for with_library in [false, true] {
+        let mut model = Model::new();
+        if with_library {
+            let lib = sysmlv2_testkit::library_dir();
+            if !lib.exists() {
+                eprintln!("skipping: corpus not present");
+                continue;
+            }
+            model.load_library_dir(&lib).unwrap();
+        }
+        model.add_source(
+            "branches.sysml",
+            "package Branches {
+                action def Basic {
+                    attribute x = 1;
+                    action a; action b; action c;
+                    first a then d;
+                    decide d;
+                        if x > 0 then b;
+                        else c;
+                }
+                state def SM {
+                    state s1; state s2;
+                    accept T then s2;
+                    if true then s1;
+                }
+                item def T;
+            }",
+        );
+        let full = model_to_full_json(&model);
+        let elements = full.as_array().unwrap();
+        let transitions: Vec<&Value> = elements
+            .iter()
+            .filter(|e| e["@type"] == "TransitionUsage")
+            .collect();
+        assert_eq!(transitions.len(), 4, "library {with_library}");
+        let memberships: Vec<&Value> = elements
+            .iter()
+            .filter(|e| e["@type"] == "Membership" && e["isImplied"] == true)
+            .collect();
+        assert_eq!(memberships.len(), 4, "library {with_library}");
+        for transition in &transitions {
+            assert_ne!(transition["source"]["@id"], transition["@id"]);
+            let membership = memberships
+                .iter()
+                .find(|m| m["membershipOwningNamespace"]["@id"] == transition["@id"])
+                .expect("the transition's implied source membership");
+            assert_eq!(membership["memberElement"], transition["source"]);
+            assert_eq!(membership["visibility"], "public");
+            assert!(
+                transition["ownedRelationship"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"@id": membership["@id"]})),
+                "listed under the transition"
+            );
+        }
+        let failures = validate_elements(&schema, elements);
+        assert!(
+            failures.is_empty(),
+            "library {with_library}: {} schema violations:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+
 #[test]
 fn full_form_without_library_completes_properties() {
     let parse = parse_source("package P { part def V; part v : V; enum def E { a; } }");

@@ -16,7 +16,7 @@ pub(super) fn references(members: Vec<Membership>) -> DerivedValue {
             .collect(),
     )
 }
-pub(super) fn exclusions(value: &DerivedValue) -> Vec<usize> {
+pub(in crate::json) fn exclusions(value: &DerivedValue) -> Vec<usize> {
     match value {
         DerivedValue::Elements(values) => values.iter().map(|e| e.0).collect(),
         DerivedValue::References(values) => values
@@ -33,7 +33,10 @@ pub(super) fn exclusions(value: &DerivedValue) -> Vec<usize> {
 // within the same namespace. Every public selector starts at its owner at zero.
 fn depth_limit(depth: usize, effective: &'static str) -> Result<(), OperationError> {
     if depth > crate::json::MAX_RESOLUTION_DEPTH {
-        Err(OperationError::Incomplete { effective })
+        Err(OperationError::Incomplete {
+            effective,
+            blocker: None,
+        })
     } else {
         Ok(())
     }
@@ -130,14 +133,14 @@ pub(in crate::json) fn type_imports(
     }
     Ok(result)
 }
-fn owned(
+pub(super) fn owned(
     b: &crate::json::Builder,
     raw: &StoredStructure,
     owner: usize,
     steps: &mut usize,
     effective: &'static str,
 ) -> Result<Vec<Membership>, OperationError> {
-    let incomplete = || OperationError::Incomplete { effective };
+    let incomplete = || blocked(effective, owner);
     if !raw
         .import_domains(b, steps)
         .ok_or_else(incomplete)?
@@ -169,7 +172,9 @@ fn import_builder(
 ) -> Result<Vec<Membership>, OperationError> {
     depth_limit(depth, effective)?;
     charge(steps, excluded.len().saturating_add(12), effective)?;
-    let incomplete = || OperationError::Incomplete { effective };
+    // An Import whose target does not resolve, or whose endpoints are
+    // malformed, is the element that blocks every name through it.
+    let incomplete = || blocked(effective, relationship);
     let target =
         crate::json::import_memberships::checked_import_target(b, raw, owner, relationship, steps)
             .ok_or_else(incomplete)?;
@@ -216,7 +221,7 @@ fn imported_builder(
     policy: Traversal,
 ) -> Result<Vec<Membership>, OperationError> {
     depth_limit(depth, effective)?;
-    let incomplete = || OperationError::Incomplete { effective };
+    let incomplete = || blocked(effective, owner);
     let relationships = semantic_ownership::owned_relationships(b, owner).ok_or_else(incomplete)?;
     charge(
         steps,
@@ -267,7 +272,7 @@ fn memberships_of_visibility_builder(
         // Visibility-specific unions and Package's filtered imported collection
         // have distinct normative bodies. Do not silently choose a filter
         // evaluation policy for this contextual visible-import path.
-        return Err(OperationError::Incomplete { effective });
+        return Err(blocked(effective, owner));
     }
     result.retain(|m| requested.is_none_or(|v| v == m.visibility));
     result.extend(imported_builder(
@@ -296,7 +301,7 @@ fn visible_builder(
             "Namespace" | "Package" | "LibraryPackage"
         )
     {
-        return Err(OperationError::Incomplete { effective });
+        return Err(blocked(effective, owner));
     }
     let mut result = memberships_of_visibility_builder(
         b,
@@ -346,12 +351,12 @@ fn visible_builder(
         inherited_excluded.push(owner);
         let inherited = b
             .checked_type_memberships_for_visibility(owner, &inherited_excluded, recursive, steps)
-            .map_err(|_| OperationError::Incomplete { effective })?
+            .map_err(|_| blocked(effective, owner))?
             .inherited;
         charge(steps, inherited.len(), effective)?;
         for m in inherited {
-            let visibility = visibility_builder(b, m.relationship)
-                .ok_or(OperationError::Incomplete { effective })?;
+            let visibility =
+                visibility_builder(b, m.relationship).ok_or(blocked(effective, m.relationship))?;
             if all || visibility == "public" {
                 result.push(Membership {
                     relationship: m.relationship,
@@ -431,7 +436,7 @@ pub(super) fn sequence(
     if is_a!(r.b.elements[owner], "Type") {
         let inherited =
             r.b.checked_type_memberships_for_visibility(owner, excluded, false, steps)
-                .map_err(|_| OperationError::Incomplete { effective })?
+                .map_err(|_| blocked(effective, owner))?
                 .inherited;
         charge(steps, inherited.len(), effective)?;
         for m in inherited {
@@ -439,7 +444,7 @@ pub(super) fn sequence(
                 relationship: m.relationship,
                 member: m.member,
                 visibility: visibility(r, m.relationship)
-                    .ok_or(OperationError::Incomplete { effective })?,
+                    .ok_or(blocked(effective, m.relationship))?,
             });
         }
         all = unique(all);
@@ -456,7 +461,7 @@ fn filter_memberships(
     steps: &mut usize,
     effective: &'static str,
 ) -> Result<(), OperationError> {
-    let incomplete = || OperationError::Incomplete { effective };
+    let incomplete = || blocked(effective, owner);
     // ElementFilterMembership defines no filtering for a general Namespace;
     // this composition is specifically Package::importedMemberships.
     if !is_a!(r.b.elements[owner], "Package") {
@@ -544,7 +549,7 @@ pub(super) fn invoke_import(
 ) -> Result<DerivedValue, OperationError> {
     let (_, _, result) =
         super::with_stable_evidence(r, receiver, steps, effective, |r, raw, steps| {
-            let incomplete = || OperationError::Incomplete { effective };
+            let incomplete = || blocked(effective, receiver.0);
             let owner =
                 semantic_ownership::checked_relationship_carrier(&r.b, raw, receiver.0, steps)
                     .flatten()

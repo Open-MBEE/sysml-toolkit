@@ -7,7 +7,10 @@
 //! documentation defines as the usage's `definition`s of the
 //! property's declared type. `single` marks an upper bound of 1 (the
 //! first match, else null). A composition is computable exactly when
-//! its base is.
+//! its base is. `ownedMetadata` and `nestedMetadata` select from the
+//! owned members, per the approved resolution of SYSML21-419 (the
+//! published rules read the owned usages, which never hold a
+//! metadata usage).
 
 /// `(name, base, kind, single)`, sorted by name.
 pub(crate) static COMPOSITIONS: &[(&str, &str, &str, bool)] = &[
@@ -85,7 +88,7 @@ pub(crate) static COMPOSITIONS: &[(&str, &str, &str, bool)] = &[
     ("nestedFlow", "nestedUsage", "FlowUsage", false),
     ("nestedInterface", "nestedUsage", "InterfaceUsage", false),
     ("nestedItem", "nestedUsage", "ItemUsage", false),
-    ("nestedMetadata", "nestedUsage", "MetadataUsage", false),
+    ("nestedMetadata", "ownedMember", "MetadataUsage", false),
     ("nestedOccurrence", "nestedUsage", "OccurrenceUsage", false),
     ("nestedPart", "nestedUsage", "PartUsage", false),
     ("nestedPort", "nestedUsage", "PortUsage", false),
@@ -155,7 +158,7 @@ pub(crate) static COMPOSITIONS: &[(&str, &str, &str, bool)] = &[
     ),
     ("ownedItem", "ownedUsage", "ItemUsage", false),
     ("ownedMembership", "ownedRelationship", "Membership", false),
-    ("ownedMetadata", "ownedUsage", "MetadataUsage", false),
+    ("ownedMetadata", "ownedMember", "MetadataUsage", false),
     ("ownedOccurrence", "ownedUsage", "OccurrenceUsage", false),
     ("ownedPart", "ownedUsage", "PartUsage", false),
     ("ownedPort", "ownedUsage", "PortUsage", false),

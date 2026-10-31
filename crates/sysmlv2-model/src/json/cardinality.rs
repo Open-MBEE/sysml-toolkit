@@ -88,7 +88,8 @@ impl ResolvedModel {
     /// the compatibility evaluator, missing semantic providers cannot establish
     /// an unconstrained default. Unsupported expressions remain qualified.
     pub fn cardinality_report(&mut self, receiver: ElementRef) -> CardinalityReport {
-        self.cardinality_report_with_budget(receiver, 0)
+        let context = self.b.owner_scope_of(receiver.0);
+        self.cardinality_report_with_budget(receiver, 0, context)
     }
     /// Add cardinalities of a flat or nested sequence without pretending that
     /// one symbolic collection placeholder denotes one member. Closed reflection
@@ -113,11 +114,17 @@ impl ResolvedModel {
                 return Err(CardinalityIssue::WorkLimit);
             }
             match value {
-                Value::Indeterminate | Value::UnboundMember(_) => {
+                Value::Indeterminate | Value::UnboundMember(..) => {
                     Err(CardinalityIssue::IncompleteProvider)
                 }
-                Value::Unbound(element) => {
-                    let report = r.cardinality_report_with_budget(*element, *steps);
+                Value::Unbound(element, via) => {
+                    // The bounds are the instance's that the placeholder is
+                    // read for (`:>> n = 6;` in it selects its `n`).
+                    let context = match via.instances().next() {
+                        Some(instance) => r.b.elem_scope.get(&instance.0).copied(),
+                        None => r.b.owner_scope_of(element.0),
+                    };
+                    let report = r.cardinality_report_with_budget(*element, *steps, context);
                     *steps = report.steps;
                     let bounds = report.bounds?;
                     if stamp.as_ref().is_some_and(|previous| !previous.current(r)) {
@@ -184,6 +191,7 @@ impl ResolvedModel {
         &mut self,
         receiver: ElementRef,
         initial: usize,
+        context: Option<usize>,
     ) -> CardinalityReport {
         let mut steps = initial;
         let mut multiplicities = Vec::new();
@@ -213,7 +221,6 @@ impl ResolvedModel {
             {
                 return Err(CardinalityIssue::IncompleteProvider);
             }
-            let context = self.b.owner_scope_of(receiver.0);
             let mut reader = Reader {
                 raw,
                 relations: TypeRelations::default(),
@@ -563,11 +570,15 @@ impl Reader<'_> {
             if is_a!(b.elements[target], "Multiplicity") {
                 self.validate_domain(b, target, depth + 1)?;
             } else if kind == "Subsetting"
-                && self.relations.library_role(b, "Base::things", self.steps) == Some(target)
+                && ["Base::things", "Base::naturals"]
+                    .iter()
+                    .any(|role| self.relations.library_role(b, role, self.steps) == Some(target))
             {
-                // Every Feature subsets the universal library feature. This
-                // checked identity adds no integer-domain constraint; unrelated
-                // non-Multiplicity targets are not silently discarded.
+                // Every Feature subsets the universal library feature, and
+                // every Multiplicity the root of all multiplicities. These
+                // checked identities add no integer-domain constraint;
+                // unrelated non-Multiplicity targets are not silently
+                // discarded.
                 self.universal_relationships.insert(relationship);
             } else {
                 return Err(CardinalityIssue::InvalidRelationship);
@@ -1228,7 +1239,8 @@ mod tests {
         );
         assert_eq!(bounds(&mut r, "a").unwrap().size(), Some(3));
         let b = r.resolve_qualified("b").unwrap();
-        let failed = r.cardinality_report_with_budget(b, crate::eval::MAX_STEPS);
+        let context = r.b.owner_scope_of(b.0);
+        let failed = r.cardinality_report_with_budget(b, crate::eval::MAX_STEPS, context);
         assert_eq!(failed.bounds, Err(CardinalityIssue::WorkLimit));
         assert!(failed.multiplicities.is_empty());
         assert_eq!(r.cardinality_report(b).bounds.unwrap().size(), Some(2));
@@ -1277,8 +1289,9 @@ mod tests {
                 }
             }
             let slots = r.resolve_qualified("Child::slots").unwrap();
+            let context = r.b.owner_scope_of(slots.0);
             assert_eq!(
-                r.cardinality_report_with_budget(slots, crate::eval::MAX_STEPS)
+                r.cardinality_report_with_budget(slots, crate::eval::MAX_STEPS, context)
                     .bounds,
                 Err(CardinalityIssue::WorkLimit)
             );
@@ -1447,23 +1460,38 @@ mod tests {
     }
 
     #[test]
-    fn checked_contextual_references_keep_metadata_domains_qualified() {
-        for on_expression in [false, true] {
-            let mut r = fixture(CONTEXTUAL_BOUNDS, GraphFormat::CanonicalV3);
-            let slots = r.resolve_qualified("Child::slots").unwrap();
-            assert_eq!(r.cardinality_report(slots).bounds.unwrap().size(), Some(6));
-            let target = if on_expression {
-                let domain = r.resolve_qualified("Parent::dynamic").unwrap().0;
-                r.b.owned_member_elems(domain, false)
-                    .into_iter()
-                    .find(|&e| r.b.elements[e].ty == "FeatureReferenceExpression")
-                    .unwrap()
-            } else {
-                r.resolve_qualified("Child::n").unwrap().0
-            };
-            r.b.metadata_of.insert(target, vec![target]);
-            assert!(r.cardinality_report(slots).bounds.is_err());
-        }
+    fn checked_contextual_references_keep_semantic_metadata_domains_qualified() {
+        // Plain metadata adds no base and keeps no domain qualified; a
+        // semantic metadata annotation (KerML 9.2) adds a base the planner
+        // does not write, so its target's domain stays qualified.
+        let mut r = fixture(CONTEXTUAL_BOUNDS, GraphFormat::CanonicalV3);
+        let slots = r.resolve_qualified("Child::slots").unwrap();
+        assert_eq!(r.cardinality_report(slots).bounds.unwrap().size(), Some(6));
+        let n = r.resolve_qualified("Child::n").unwrap().0;
+        r.b.metadata_of.insert(n, vec![n]);
+        assert_eq!(r.cardinality_report(slots).bounds.unwrap().size(), Some(6));
+        let mut m = Model::with_graph_format(GraphFormat::CanonicalV3);
+        assert!(
+            m.add_library_source("bounds-library.kerml", LIB)
+                .diagnostics
+                .is_empty()
+        );
+        assert!(
+            m.add_library_source(
+                "bounds-metaobjects.kerml",
+                "standard library package Metaobjects { metaclass SemanticMetadata { feature baseType; } }"
+            )
+            .diagnostics
+            .is_empty()
+        );
+        let source = format!(
+            "{CONTEXTUAL_BOUNDS} metaclass Mark specializes Metaobjects::SemanticMetadata; @Mark about Child::n;"
+        );
+        let unit = m.add_source("bounds.kerml", &source);
+        assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+        let mut r = ResolvedModel::build(&m);
+        let slots = r.resolve_qualified("Child::slots").unwrap();
+        assert!(r.cardinality_report(slots).bounds.is_err());
     }
 
     #[test]

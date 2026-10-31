@@ -170,6 +170,22 @@ type (226, 231)
 
 Malformed expressions raise `sysmlv2.RefusedError` with the parser's diagnostics.
 
+A quantity comes back as a `(number, unit)` tuple. A product, quotient or power of quantities is in SI units; `sysmlv2.set_value_units("asWritten")` makes `query` and `evaluate` answer in the units each value was written in instead, where those cover its dimensions (`"si"` restores the default, and `sysmlv2.value_units()` reads the choice back). The value is the same either way; only its unit and number differ. The choice is process-wide, like `set_unit_spelling_expansion`:
+
+```pycon
+>>> q = sysmlv2.Session.from_sources([("q.sysml", """package Q {
+...     attribute m; attribute s;
+...     attribute 'in' { attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; } }
+...     attribute speed = 10 ['in'] / (2 [s]);
+... }""")])
+>>> q.query("Q::speed")
+(Fraction(127, 1000), 'm/s')
+>>> sysmlv2.set_value_units("asWritten")
+>>> q.query("Q::speed")
+(5, 'in/s')
+>>> sysmlv2.set_value_units("si")
+```
+
 ## 5. Batch edits with verified commits
 
 Edits are staged on a batch, then committed atomically. The engine splices the source text span-by-span — everything outside the edit, comments included, is preserved byte-for-byte — and the commit reparses, re-resolves, and verifies **semantic identity**: every untouched reference site must still denote the same element, else the whole batch rolls back.
@@ -359,16 +375,18 @@ The lift prints every reference as an always-correct `$::`-rooted path. `minimiz
 >>> "part v : $::Rig::Vehicle;" in j.source(0)
 True
 >>> j.minimize_qualifications()
-(4, 0)
+(5, 0)
 >>> "part v : Vehicle;" in j.source(0)
 True
 >>> "part front : Defs::SpareWheel;" in j.source(0)
+True
+>>> "private import Defs::Wheel;" in j.source(0)
 True
 >>> json.loads(j.to_compact_json())[0]["@id"] == elements[0]["@id"]
 True
 ```
 
-`front` keeps exactly one qualifier — only `Wheel` is imported into `Rig`, so a bare `SpareWheel` would not resolve; import targets keep their printed form (their resolution rules differ).
+The five respellings are `SpareWheel :> Wheel`, the import, `front`, `spare` and `v`. `front` and `spare` keep exactly one qualifier — only `Wheel` is imported into `Rig`, so a bare `SpareWheel` would not resolve. A member import is respelled under its own floor of two segments: it binds its last segment into the importing scope, so `import Wheel;` could only resolve through itself. Its candidates are suffixes of the written path, so an alias import still names the alias. On authored text the result is usually the spelling the author wrote — here `Defs::Wheel`. A namespace import (`Pkg::*`, `Pkg::**`) shortens like any other reference.
 
 ---
 
@@ -395,7 +413,7 @@ Id-elided payloads (`Session::to_compact_cbor_elided` in Rust, CLI `--elide-ids`
 
 ## 8. Checking models
 
-`sysmlv2.check(sources, lib=None)` exposes the checking stages as a library call: per-unit parse and body-context validation always, plus referential and semantic checks against the standard library when `lib` is given (loaded through the same native prepared-library cache as sessions). Unlike CLI `check`, this API currently runs model-level checks only when `lib` is supplied and does not include unused-private-import analysis. It returns `Finding`s — severity, stage (`parse`, `context`, `referential` or `semantic`; only `parse` findings keep a unit out of a session), message, unit name, and a 1-based line/column — and never raises for model problems, so a broken parse is data, not an exception:
+`sysmlv2.check(sources, lib=None)` exposes the checking stages as a library call: per-unit parse and body-context validation always, plus referential and semantic checks against the standard library when `lib` is given (loaded through the same native prepared-library cache as sessions). Unlike CLI `check`, this API currently runs model-level checks only when `lib` is supplied and does not include unused-private-import analysis. It returns `Finding`s — severity, stage (`parse`, `context`, `referential` or `semantic`; only `parse` findings keep a unit out of a session), message, unit name, a 1-based line/column, and `rule` (the normative rule a semantic finding reports, `None` when it names none) — and never raises for model problems, so a broken parse is data, not an exception:
 
 ```pycon
 >>> bad = sysmlv2.check([("bad.sysml", "package Bad {\n  part p : ;\n}")])
@@ -416,7 +434,7 @@ With `lib="<sysml.library dir>"`, unresolved references come back as warnings wi
 
 ## 9. PlantUML diagrams
 
-`to_plantuml(element=None, view="tree", horizontal=False, show_values=True, show_notes=True, show_metadata=True, show_inherited=False, show_lib=False, show_imported=False, line_style=None, std_color=False, link_template=None)` emits one view of the model as PlantUML text (feed it to any PlantUML build for SVG/PNG; the CLI verb `sysmlv2 viz` is the same emitter). The default `tree` view is the structure diagram — packages, definitions, usages with attribute compartments, plus composition / typing / specialization edges:
+`to_plantuml(element=None, view="tree", horizontal=False, show_values=True, show_notes=True, show_metadata=True, show_inherited=False, show_lib=False, show_imported=False, line_style=None, std_color=False, link_template=None, value_units=None)` emits one view of the model as PlantUML text (feed it to any PlantUML build for SVG/PNG; the CLI verb `sysmlv2 viz` is the same emitter). The default `tree` view is the structure diagram — packages, definitions, usages with attribute compartments, plus composition / typing / specialization edges:
 
 ```pycon
 >>> v = sysmlv2.Session.from_sources(
@@ -498,13 +516,13 @@ o1 .. n1
 
 Every view takes the same keyword options: comment/doc bodies attach as notes (`show_notes=False` omits), prefix metadata joins the stereotype list (`show_metadata=False` hides metadata), `show_inherited=True` adds `^`-marked inherited compartment lines, `show_lib=True` gives referenced library types marked nodes, `show_imported=True` draws `«import»` edges, `line_style="polyline"|"ortho"` picks edge routing, `std_color=True` colors nodes by metaclass family, and `link_template="vscode://file/{file}:{line}"` embeds `[[hyperlinks]]` (placeholders `{file}`/`{line}`/`{col}`/`{qname}`/`{id}`) that PlantUML carries into rendered SVG — diagram nodes click through to source.
 
-`element="V::A"` roots the diagram at one element (unknown names raise `sysmlv2.RefusedError`, as do an unknown `view` or `line_style`); sessions lifted from interchange JSON diagram the same way — fetch a Flexo element list, `from_interchange_json`, `to_plantuml`.
+`value_units="asWritten"` shows the `= value` quantities in the units they were written in (`"si"` the evaluator's; by default the module's `set_value_units` choice). `element="V::A"` roots the diagram at one element (unknown names raise `sysmlv2.RefusedError`, as do an unknown `view`, `line_style` or `value_units`); sessions lifted from interchange JSON diagram the same way — fetch a Flexo element list, `from_interchange_json`, `to_plantuml`.
 
 ---
 
 ## Running this tour
 
-The code blocks above are doctests over one shared namespace:
+The code blocks above are doctests over one shared namespace, and CI runs them on every pull request into `main` or `develop`:
 
 ```console
 $ python tools/sdk_doctour.py        # extracts SDK.md's pycon blocks and runs them

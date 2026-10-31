@@ -3,12 +3,29 @@
 # Gitflow: feature branches PR into develop;
 # releases PR develop into main; tags cut from main.
 #
-# The test job (full corpus gates + clippy) runs on PRs targeting main
-# or develop — plain pushes don't trigger it (main lands only via a
+# The test job (full corpus gates) and the lint job (formatting,
+# generated catalogs, clippy, docs) run on PRs targeting main or
+# develop — plain pushes don't trigger them (main lands only via a
 # tested PR, so a redundant main-push run would just duplicate the tag
-# run on the same commit). Pushing a tag like `v0.1.0` runs the test job
-# plus the cross-target build matrix, packages the binaries (plus
-# SHA256SUMS), and attaches them to a GitHub release.
+# run on the same commit). Pushing a tag like `v0.1.0` runs both plus
+# the cross-target build matrix, packages the binaries, writes
+# SHA256SUMS over them and the npm package tarball, and attaches all
+# of it to a GitHub release.
+#
+# The lint job runs beside the test job, not after it, so a lint
+# failure shows within minutes. The test job is the long one: it
+# compiles the whole workspace in release and runs every test. Each
+# crate's integration tests build as ONE binary (tests/integration.rs
+# declares every file there as a module), so the job links one test
+# binary per crate instead of one per file, and each crate's tests
+# share one pool of test threads. It runs on ubuntu-latest unless the
+# TEST_RUNNER repository variable names another runner label, such as a
+# larger runner: the build and the test pools use every core it has.
+#
+# Third-party dependency builds are cached per job (the workspace's own
+# crates always rebuild). Only pull request runs save the cache: one
+# saved under a tag is never read again. A new commit pushed to a PR
+# cancels that PR's run still in progress.
 #
 # Only the complete (default-features) binary ships. A slim variant
 # (--no-default-features — the core textual <-> JSON pipeline:
@@ -17,8 +34,20 @@
 # the release carries a SIZES.md comparing the two, so the cost of the
 # optional verbs (and the future lsp feature) stays visible at every
 # release without doubling the artifact list. Flip slim archives on
-# only if a variant's delta ever grows past caring about. The test job
+# only if a variant's delta ever grows past caring about. The lint job
 # clippy-checks the slim variant so it cannot rot between releases.
+#
+# The test job also runs CLI.md as a test (tools/cli_doctour.py): every
+# console block runs in order in one shell session against the release
+# CLI, and each command's output must match the one shown.
+#
+# The python job gates the Python face: it builds the binding's
+# extension module, runs its smoke test over the whole public surface
+# (with the standard library fetched, so the library-element checks run
+# rather than skip) and its implied-conformance test, and runs SDK.md's
+# tour as a doctest (tools/sdk_doctour.py), so every output the tour
+# shows is the one the binding prints. The binding is not a release
+# artifact, so tags do not wait on it.
 #
 # The wasm job gates the browser face: clippy for the wasi CLI and for
 # wasm32-unknown-unknown, then the real pipeline — wasm-pack build, the
@@ -61,13 +90,20 @@ on:
 permissions:
   contents: write
 
+# One group per PR, so a newer commit's run replaces the older one. Tag
+# and manual runs each get a group of their own: none is ever cancelled
+# or queued behind another.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
     name: test (full corpus gates)
-    # The full corpus plus lint/docs outgrew 45 minutes on a cold runner.
+    # The full corpus outgrew 45 minutes on a cold standard runner.
     timeout-minutes: 90
     # Release PRs (release/* -> main, opened and admin-merged by
     # tools/release.sh in one step) run these gates like any other PR.
@@ -75,7 +111,7 @@ jobs:
     # same command that merged, so a skipped release PR makes the tag run
     # the first time CI ever sees the tree — and a failure there lands
     # after main has already moved, with the version spent.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - name: Fetch the SysML-v2-Release corpus (sparse, blob-filtered)
@@ -89,8 +125,45 @@ jobs:
           git checkout "$sha"
       - name: Fetch the Apollo 11 validation corpus
         run: git submodule update --init spec-refs/apollo-11-sysml-v2
-      - name: Install z3
-        run: sudo apt-get update && sudo apt-get install -y z3
+      - name: Install z3, jq and xxd
+        # z3 for the solver gates; jq and xxd for the CLI.md tour.
+        run: sudo apt-get update && sudo apt-get install -y z3 jq xxd
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'pull_request' }}
+      - name: Run the full test suite
+        run: cargo test --release
+      - name: Ambient library (strict candidate check; resolves without naming its file)
+        # The binary the test step built (the CLI's tests run it). A
+        # `cargo run -p sysmlv2-cli` here would resolve features for that
+        # one package, not the workspace, and rebuild every crate.
+        # SYSMLV2_AMBIENT=off keeps the built-in copy out of the candidate
+        # check so the two cannot collide.
+        run: |
+          SYSMLV2_AMBIENT=off target/release/sysmlv2 check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/TransformMeta.sysml
+          SYSMLV2_AMBIENT=off target/release/sysmlv2 check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/StringPatterns.sysml
+          printf 'package V {\n    #TransformMeta::Generated part def G;\n    attribute def E :> ScalarValues::String {\n        @StringPatterns::Pattern { regex = "[a-z]+"; }\n    }\n}\n' > /tmp/ambient.sysml
+          target/release/sysmlv2 check --strict --lib spec-refs/SysML-v2-Release/sysml.library /tmp/ambient.sysml
+      - name: CLI.md tour (every console block, run in order)
+        # Against target/release/sysmlv2, the binary the test step built;
+        # a `cargo build -p sysmlv2-cli` here would rebuild every crate, as
+        # for the ambient check above.
+        run: python3 tools/cli_doctour.py
+
+  lint:
+    name: lint (formatting, catalogs, clippy, docs)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain (rust-toolchain.toml)
         shell: bash
         run: |
@@ -104,8 +177,10 @@ jobs:
           python3 tools/semantic_catalog.py --check
           python3 tools/operation_catalog.py --check
           python3 tools/gen_metaclass_hierarchy.py --check
-      - name: Run the full test suite
-        run: cargo test --release
+          python3 tools/gen_cbor_tables.py --check
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'pull_request' }}
       - name: Clippy
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Clippy (slim CLI — no default features)
@@ -114,14 +189,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps
-      - name: Ambient library (strict candidate check; resolves without naming its file)
-        # SYSMLV2_AMBIENT=off keeps the built-in copy out of the candidate
-        # check so the two cannot collide.
-        run: |
-          SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/TransformMeta.sysml
-          SYSMLV2_AMBIENT=off cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library local-packages/StringPatterns.sysml
-          printf 'package V {\n    #TransformMeta::Generated part def G;\n    attribute def E :> ScalarValues::String {\n        @StringPatterns::Pattern { regex = "[a-z]+"; }\n    }\n}\n' > /tmp/ambient.sysml
-          cargo run --release -p sysmlv2-cli -- check --strict --lib spec-refs/SysML-v2-Release/sysml.library /tmp/ambient.sysml
 
   msrv:
     name: msrv (declared rust-version still builds)
@@ -135,9 +202,61 @@ jobs:
           echo "rust-version: $msrv"
           rustup toolchain install "$msrv" --profile minimal
           echo "MSRV=$msrv" >> "$GITHUB_ENV"
+          # Every later step's rustc is the minimum one too, so the cache
+          # below is keyed on it rather than on the pinned toolchain.
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'pull_request' }}
       - name: Check every target on the minimum toolchain
         # The `+toolchain` override wins over rust-toolchain.toml.
         run: cargo +"$MSRV" check --all-targets --locked
+
+  python:
+    name: python (binding tests + SDK.md tour)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      # The smoke test's library-element checks read the standard library
+      # and skip without it; the tour needs none.
+      - name: Fetch the standard library (sparse, blob-filtered)
+        run: |
+          sha=$(git ls-tree HEAD spec-refs/SysML-v2-Release | awk '{print $3}')
+          echo "corpus pin: $sha"
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/Systems-Modeling/SysML-v2-Release \
+            spec-refs/SysML-v2-Release
+          cd spec-refs/SysML-v2-Release
+          git sparse-checkout set sysml.library
+          git fetch --filter=blob:none origin "$sha"
+          git checkout "$sha"
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'pull_request' }}
+      # The binding is a single abi3 extension module, so the cdylib built
+      # with the feature pyproject.toml gives maturin, under the name
+      # Python imports, is the whole install: no wheel, no virtualenv.
+      - name: Build the Python module
+        run: |
+          python3 --version
+          cargo rustc --release -p sysmlv2-py --features pyo3/extension-module --lib --crate-type cdylib
+          mkdir -p "$RUNNER_TEMP/py"
+          cp target/release/libsysmlv2.so "$RUNNER_TEMP/py/sysmlv2.abi3.so"
+      - name: Binding smoke test (the whole public surface)
+        run: PYTHONPATH="$RUNNER_TEMP/py" python3 crates/sysmlv2-py/tests/smoke.py
+      - name: Implied conformance test (reachability, stale-handle guards)
+        run: PYTHONPATH="$RUNNER_TEMP/py" python3 crates/sysmlv2-py/tests/implied_conformance.py
+      - name: SDK.md tour (every pycon block, as one doctest)
+        run: PYTHONPATH="$RUNNER_TEMP/py" python3 tools/sdk_doctour.py
 
   wasm:
     name: wasm (wasm32 gate + npm package + node smoke)
@@ -166,6 +285,9 @@ jobs:
           toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown --target wasm32-wasip1
           rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'pull_request' }}
       - name: Clippy (wasm32)
         run: cargo clippy --release -p sysmlv2-wasm --target wasm32-unknown-unknown -- -D warnings
       # The CLI's wasi branches compile for no other target, so the
@@ -207,14 +329,14 @@ jobs:
       # A failing smoke is only diagnosable from the bytes it ran, and
       # those are built here and never uploaded on a red run. Keep them
       # when something fails; a green run publishes the tarball below and
-      # this costs nothing. It is a separate artifact deliberately — the
-      # release job merges every artifact into one directory and attaches
-      # the lot, so this must not ride along with the tarball.
+      # this costs nothing. It is a separate artifact deliberately, named
+      # outside the `sysmlv2-*` set the release job downloads, so it can
+      # never ride along with the tarball into a release.
       - name: Keep the wasm artifacts a failure needs
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: sysmlv2-wasm-failed
+          name: wasm-failed-debug
           path: |
             crates/sysmlv2-wasm/npm/pkg/cli/sysmlv2-cli.wasm
             crates/sysmlv2-wasm/npm/pkg/sysmlv2_bg.wasm
@@ -263,7 +385,7 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/')
-    needs: test
+    needs: [test, lint]
     strategy:
       fail-fast: false
       matrix:
@@ -354,8 +476,13 @@ jobs:
     needs: [build, wasm]
     runs-on: ubuntu-latest
     steps:
+      # Only the release assets: the native archives (`sysmlv2-<target>`)
+      # and the npm package tarball (`sysmlv2-wasm-npm`). Everything in
+      # dist/ is attached below, so the run's other artifacts, such as
+      # the bytes the wasm job keeps when it fails, stay out by name.
       - uses: actions/download-artifact@v8
         with:
+          pattern: sysmlv2-*
           path: dist
           merge-multiple: true
       - name: Binary size comparison (SIZES.md)
@@ -372,7 +499,11 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum sysmlv2-* > SHA256SUMS
+          # The native archives and the npm package tarball, the package's
+          # only distribution when the registry publish is skipped. Named
+          # by extension, so no other file in dist/ is listed, and a
+          # missing archive or tarball fails the step.
+          sha256sum sysmlv2-*.tar.gz sysmlv2-*.zip sysml-wasm-*.tgz > SHA256SUMS
           cat SHA256SUMS
       - name: Create release
         env:

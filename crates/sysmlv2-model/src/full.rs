@@ -307,6 +307,13 @@ pub const UNRESOLVED_REP_LANGUAGE: &str = "x-sysmlv2-unresolved-reference";
 /// compact→full re-derivation cell of the conversion matrix: unlike
 /// lifting to text and rebuilding, element identities survive, so a
 /// stored payload can be upgraded without breaking external references.
+///
+/// This enrichment API does not validate or repair stored ownership. Missing
+/// or inconsistent inverse ends can survive in the result. Call
+/// [`crate::lift::validate_ownership`] first when validation is required, or
+/// opt into [`crate::lift::complete_owning_references`] before conversion
+/// to repair omitted inverse ends. Reference recovery is independent of
+/// ownership repair.
 pub fn from_compact_value(
     compact: Value,
     lib_by_name: &HashMap<String, String>,
@@ -324,6 +331,9 @@ pub fn from_compact_value(
     .expect("the boolean compatibility policies cannot reject")
 }
 
+/// Enrich the original compact graph with an explicit reference policy.
+/// Ownership is neither validated nor repaired, as in [`from_compact_value`];
+/// even [`UnresolvedReferencePolicy::Reject`] only rejects unresolved references.
 pub fn from_compact_value_with_policy(
     compact: Value,
     lib_by_name: &HashMap<String, String>,
@@ -385,7 +395,10 @@ fn derived_to_json(resolved: &crate::json::ResolvedModel, v: &crate::json::Deriv
         V::References(rs) => {
             Value::Array(rs.iter().map(|r| reference_to_json(resolved, r)).collect())
         }
-        V::Strings(ss) => Value::Array(ss.iter().map(|s| Value::String(s.clone())).collect()),
+        V::Strings(ss) | V::Literals(ss) => {
+            Value::Array(ss.iter().map(|s| Value::String(s.clone())).collect())
+        }
+        V::Literal(s) => Value::String(s.clone()),
     }
 }
 
@@ -2370,8 +2383,13 @@ fn effective_name_of(
             _ => {}
         }
     }
-    if let Some(n) = implied_member_name(i, elements, index) {
-        return Some(n);
+    // A SysML reference rule names ahead of the membership's role: a
+    // state's `do refuel;` is `refuel`, its performed action, not the
+    // `doAction` it redefines.
+    if named_reference.is_none() {
+        if let Some(n) = implied_member_name(i, elements, index) {
+            return Some(n);
+        }
     }
     // Actor/stakeholder parameters implicitly *subset* the library
     // `actors`/`stakeholders` collections — subsetting carries no name, so
@@ -2395,11 +2413,15 @@ fn effective_name_of(
 }
 
 /// Positional names of implicitly-redefining members (the pilot's computed
-/// redefinitions are its `namingFeature`s): the two bare ends of a binary
-/// connector-family usage redefine the library binary ends (`source` /
-/// `target`; successions `earlierOccurrence` / `laterOccurrence`), a flow's
-/// payload feature redefines `payload`, and a transition trigger the
-/// `accepter` action. This toolkit does not materialize those implied
+/// redefinitions are its `namingFeature`s), for a record the derivation
+/// layer's projection does not cover: a flow's payload feature redefines
+/// `payload`, a transition trigger the `accepter` action, a subject,
+/// objective, return parameter or view rendering its library role feature
+/// (`crate::json::naming::membership_implied_name`), a positional
+/// argument the callee's parameter, and the two ends of a binary
+/// connector-family element the library binary ends
+/// (`crate::json::binary_end_names`, by the owner's metaclass) — the same
+/// tables the layer reads. This toolkit does not materialize those implied
 /// Redefinition elements yet, but the names are what the pilot serializes
 /// as `memberName`/`name`.
 fn implied_member_name(
@@ -2417,22 +2439,15 @@ fn implied_member_name(
     if t == "AcceptActionUsage" && rel_ty == "TransitionFeatureMembership" {
         return Some("accepter".to_string());
     }
-    // Return parameters implicitly redefine the function's result.
-    if rel_ty == "ReturnParameterMembership" {
-        return Some("result".to_string());
-    }
-    // Subject parameters implicitly redefine the library Case/Requirement
-    // `subj` parameter (SysML 7.19), including a satisfy's `by` subject.
-    if rel_ty == "SubjectMembership" {
-        return Some("subj".to_string());
-    }
-    // Objective requirements redefine the library Case `obj` parameter;
-    // view renderings the `viewRendering` feature.
-    if rel_ty == "ObjectiveMembership" {
-        return Some("obj".to_string());
-    }
-    if rel_ty == "ViewRenderingMembership" {
-        return Some("viewRendering".to_string());
+    // A return parameter redefines the function's `result`, a subject the
+    // library Case/Requirement `subj` (SysML 7.19, a satisfy's `by`
+    // subject included), an objective the Case `obj`, a view rendering
+    // `viewRendering`.
+    if let Some(n) = crate::json::naming::membership_implied_name_of(
+        rel_ty,
+        elements[rel].get("kind").and_then(Value::as_str),
+    ) {
+        return Some(n.to_string());
     }
     // Positional invocation/constructor arguments implicitly redefine the
     // callee's `in` parameters in order, which names them (named arguments
@@ -2446,23 +2461,7 @@ fn implied_member_name(
     // Owner and its end-membership positions.
     let owner_id = elements[rel].get("owningRelatedElement").and_then(ref_of)?;
     let owner = *index.get(&owner_id)?;
-    let owner_ty = ty(&elements[owner]);
-    let names: [&str; 2] = match owner_ty {
-        "SuccessionAsUsage" | "Succession" | "TransitionUsage" => {
-            ["earlierOccurrence", "laterOccurrence"]
-        }
-        // Binding ends redefine the library `Links::SelfLink` ends.
-        "BindingConnectorAsUsage" | "BindingConnector" => ["thisThing", "sameThing"],
-        "ConnectionUsage"
-        | "AllocationUsage"
-        | "InterfaceUsage"
-        | "Connector"
-        | "FlowUsage"
-        | "SuccessionFlowUsage"
-        | "Flow"
-        | "SuccessionFlow" => ["source", "target"],
-        _ => return None,
-    };
+    let names = crate::json::binary_end_names_of(ty(&elements[owner]))?;
     let ends: Vec<&str> = elements[owner]
         .get("ownedRelationship")
         .and_then(|v| v.as_array())?
@@ -2820,6 +2819,93 @@ fn add_implied_relationships(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_enrichment_requires_explicit_ownership_repair() {
+        let mut model = Model::new();
+        assert!(
+            model
+                .add_source("model.sysml", "package P { part p; }")
+                .diagnostics
+                .is_empty()
+        );
+        let complete = model_to_compact_json(&model);
+        let mut omitted = complete.clone();
+        let mut removed = Vec::new();
+        for row in omitted.as_array_mut().unwrap() {
+            let id = row["@id"].as_str().unwrap().to_owned();
+            for key in ["owningRelationship", "owningRelatedElement"] {
+                if row
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key)
+                    .is_some_and(|value| !value.is_null())
+                {
+                    removed.push((id.clone(), key));
+                }
+            }
+        }
+        assert!(!removed.is_empty());
+        assert!(matches!(
+            crate::lift::validate_ownership(&omitted),
+            Err(crate::lift::LiftError::OmittedOwnership { .. })
+        ));
+        let mut repaired = omitted.clone();
+        assert_eq!(
+            crate::lift::complete_owning_references(&mut repaired).unwrap(),
+            removed.len()
+        );
+        crate::lift::validate_ownership(&repaired).unwrap();
+
+        for policy in [
+            UnresolvedReferencePolicy::Preserve,
+            UnresolvedReferencePolicy::LegacyDanglingId,
+            UnresolvedReferencePolicy::Reject,
+        ] {
+            let names = HashMap::new();
+            let direct = from_compact_value_with_policy(omitted.clone(), &names, policy).unwrap();
+            assert_eq!(
+                direct
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| &row["@id"])
+                    .collect::<Vec<_>>(),
+                complete
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| &row["@id"])
+                    .collect::<Vec<_>>()
+            );
+            for (id, key) in &removed {
+                let row = direct
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["@id"] == *id)
+                    .unwrap();
+                assert!(row[*key].is_null(), "{id}.{key} must remain missing");
+            }
+            let expected =
+                from_compact_value_with_policy(complete.clone(), &names, policy).unwrap();
+            assert_eq!(
+                from_compact_value_with_policy(repaired.clone(), &names, policy).unwrap(),
+                expected
+            );
+            if policy != UnresolvedReferencePolicy::Reject {
+                let recover_refs = policy == UnresolvedReferencePolicy::Preserve;
+                assert_eq!(
+                    from_compact_value(omitted.clone(), &names, recover_refs),
+                    direct
+                );
+                assert_eq!(
+                    from_compact_value(repaired.clone(), &names, recover_refs),
+                    expected
+                );
+            }
+        }
+    }
 
     /// The generated property catalog is looked up by binary search, in
     /// the metaclass table and in every property list. Regenerating the

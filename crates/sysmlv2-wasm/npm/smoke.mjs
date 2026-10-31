@@ -67,6 +67,16 @@ assert.throws(() => session.references("Flashlight::Nope"), /element not found/)
 const back = Session.fromInterchangeJson(session.toFullJson(true));
 assert.ok(back.resolve("Flashlight::flashlight::body"), "round-trip resolve");
 
+// Flexo MMS returns change records without the ownership back-references:
+// refused as they are, read with the trailing `flexo` flag.
+const records = JSON.stringify(JSON.parse(session.toCompactJson()).map(e => {
+  const { owningRelationship, owningRelatedElement, ...payload } = e;
+  return { payload, identity: { "@id": e["@id"] } };
+}));
+assert.throws(() => Session.fromInterchangeJson(records), /omits the inverse ownership ends/);
+const fromFlexo = Session.fromInterchangeJson(records, undefined, undefined, undefined, true);
+assert.equal(fromFlexo.units(), Session.fromInterchangeJson(session.toCompactJson()).units());
+
 // Anonymous graph nodes have IDs, but deliberately have no qualified name.
 const anonymous = Session.fromSources(JSON.stringify([{ name: "anonymous.sysml", text:
   "package P { action a; action b; succession first a then b; constraint { true } }" }]));

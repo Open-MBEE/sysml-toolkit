@@ -203,6 +203,47 @@ pub(crate) fn usage_body_takes_result(dialect: Dialect, k: UsageKind) -> bool {
     usage_body_ctx(dialect, k).takes_result()
 }
 
+/// The spellings a body settles for the members the interchange form
+/// does not tell apart. The lift asks, so that the text it regenerates
+/// takes the form this check accepts in that body; the JSON form carries
+/// no flag for either, since both spellings of each are one element.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BodySpellings {
+    /// A transition with no source, trigger, guard or effect is the
+    /// default target succession, `else t;` (SysML
+    /// `DefaultTargetSuccession`): the action, calculation and case
+    /// bodies, whose transitions are the guarded and default target
+    /// successions only. Elsewhere it is `transition then t;`, which a
+    /// state body takes and those bodies refuse.
+    pub default_target: bool,
+    /// A reference usage that is no end carries the `ref` keyword: an
+    /// interface body, whose `InterfaceNonOccurrenceUsageElement` has no
+    /// `DefaultReferenceUsage`. Elsewhere the keyword-less form prints.
+    pub reference_keyword: bool,
+}
+
+/// The spellings a `k` definition's body in `dialect` settles (see
+/// [`BodySpellings`]).
+pub fn definition_body_spellings(dialect: Dialect, k: DefKind) -> BodySpellings {
+    body_spellings(def_body_ctx(dialect, k))
+}
+
+/// The spellings a `k` usage's body in `dialect` settles (see
+/// [`BodySpellings`]).
+pub fn usage_body_spellings(dialect: Dialect, k: UsageKind) -> BodySpellings {
+    body_spellings(usage_body_ctx(dialect, k))
+}
+
+/// The two rules this check applies (`Cat::Transition`, `Cat::NonOccurrence`
+/// in an interface body), as the lift needs them.
+fn body_spellings(ctx: Ctx) -> BodySpellings {
+    BodySpellings {
+        default_target: matches!(ctx, Ctx::Action | Ctx::Calculation | Ctx::Case),
+        reference_keyword: matches!(ctx, Ctx::Interface),
+    }
+}
+
 /// Grammar category of a SysML usage member (`NonOccurrenceUsageElement`,
 /// `StructureUsageElement`, `BehaviorUsageElement`, `ActionNode`, …).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -225,10 +266,8 @@ fn usage_cat(u: &Usage) -> Cat {
     match u.kind {
         Metadata => Cat::Annotation,
         Ref | Default | Attribute | Enum | Extended | Binding => Cat::NonOccurrence,
-        Succession => match &u.detail {
-            UsageDetail::Succession { source: None, .. } => Cat::TargetSuccession,
-            _ => Cat::NonOccurrence,
-        },
+        Succession if starts_from_its_position(u) => Cat::TargetSuccession,
+        Succession => Cat::NonOccurrence,
         Transition => Cat::Transition,
         Occurrence | Item | Part | View | Rendering | Port | Connection | Interface
         | Allocation | Flow | Message | SuccessionFlow | Event => Cat::Structure,
@@ -239,6 +278,75 @@ fn usage_cat(u: &Usage) -> Cat {
         | Join | Fork => Cat::ActionNode,
         Feature | Step | Expr | BoolExpr | Invariant | Connector => Cat::KFeature,
     }
+}
+
+/// Whether `u` is written with no source of its own and so starts from
+/// the member it follows: a target succession (`then b;`, `then [1]
+/// b;`) or a target transition (`if g then b;`, `else b;`, `accept s
+/// then b;`, `transition accept s then b;`). The grammar writes these
+/// as a suffix of the member before them, which opens their run (see
+/// [`opens_target_succession_run`]); every member of a run starts from
+/// that member, not from the one right before it.
+#[must_use]
+pub fn starts_from_its_position(u: &Usage) -> bool {
+    match &u.detail {
+        UsageDetail::Succession { source, .. } => {
+            u.kind == UsageKind::Succession
+                && source
+                    .as_deref()
+                    .is_none_or(|end| end.name.is_none() && end.target.is_unspelled())
+        }
+        UsageDetail::Transition { source, .. } => {
+            u.kind == UsageKind::Transition && source.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Whether a target succession written right after `m` starts from it:
+/// an initial node (`first start;`), a state action (`entry;`), or a
+/// structure, behavior, action-node or transition usage. Those are the
+/// members a run of [`starts_from_its_position`] members may follow.
+#[must_use]
+pub fn opens_target_succession_run(m: &Member) -> bool {
+    matches!(
+        m.kind,
+        MemberKind::InitialNode(_) | MemberKind::StateSubaction { .. }
+    ) || matches!(
+        &m.kind,
+        MemberKind::Usage(u)
+            if matches!(
+                usage_cat(u),
+                Cat::Structure | Cat::Behavior | Cat::ActionNode | Cat::Transition
+            )
+    )
+}
+
+/// Whether a bare `then t;` written right after `m` in a state body is a
+/// target transition rather than a target succession (SysML.xtext
+/// `StateBodyItem`: `BehaviorUsageMember ( TargetTransitionUsageMember )*`):
+/// `m` is a behavior usage (a state, an action, a calculation, a
+/// constraint, a requirement, a case, a perform, an exhibit, …) or a
+/// transition. After an entry action the `then` is a succession
+/// (`EntryTransitionMember`), and after a structure usage or anything
+/// else it is one too.
+#[must_use]
+pub fn opens_target_transition_run(m: &Member) -> bool {
+    matches!(
+        &m.kind,
+        MemberKind::Usage(u) if matches!(usage_cat(u), Cat::Behavior | Cat::Transition)
+    )
+}
+
+/// Whether `m` leaves a run of target successions as it found it: a
+/// comment, documentation or textual representation between a member
+/// and its `then` members does not part them.
+#[must_use]
+pub fn keeps_target_succession_run(m: &Member) -> bool {
+    matches!(
+        m.kind,
+        MemberKind::Comment(_) | MemberKind::Doc(_) | MemberKind::TextualRep(_)
+    )
 }
 
 fn def_kind_keyword(k: DefKind) -> &'static str {
@@ -599,24 +707,10 @@ impl Validator {
             }
             self.check_member(ctx, owner_is_variation, m);
             self.walk_member_children(ctx, m);
-            target_succession_run = if is_target_succession
-                || matches!(
-                    m.kind,
-                    MemberKind::Comment(_) | MemberKind::Doc(_) | MemberKind::TextualRep(_)
-                ) {
+            target_succession_run = if is_target_succession || keeps_target_succession_run(m) {
                 target_succession_run
             } else {
-                matches!(
-                    m.kind,
-                    MemberKind::InitialNode(_) | MemberKind::StateSubaction { .. }
-                ) || matches!(
-                    &m.kind,
-                    MemberKind::Usage(u)
-                        if matches!(
-                            usage_cat(u),
-                            Cat::Structure | Cat::Behavior | Cat::ActionNode | Cat::Transition
-                        )
-                )
+                opens_target_succession_run(m)
             };
         }
     }

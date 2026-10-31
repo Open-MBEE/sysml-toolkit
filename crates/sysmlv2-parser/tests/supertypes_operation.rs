@@ -122,9 +122,13 @@ fn explicit_direct_supertypes_preserve_order_conjugation_and_chain_identity() {
                     Err(OperationError::Incomplete { .. })
                 ));
             }
+            // `supertypes(false)` lists the complete direct bases; this
+            // library has no kernel roots to certify them against, so it is
+            // refused as incomplete (the answering case runs on the standard
+            // library in `conformance_operations`).
             assert!(matches!(
                 r.invoke_operation(c, SUPERTYPES, &[DerivedValue::Bool(false)]),
-                Err(OperationError::UnsupportedConfiguration { .. })
+                Err(OperationError::Incomplete { .. })
             ));
             assert!(matches!(
                 r.invoke_operation(c, SUPERTYPES, &[DerivedValue::Str("true".into())]),

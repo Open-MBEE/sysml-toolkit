@@ -85,6 +85,16 @@ pub enum DerivedValue {
     References(Vec<Reference>),
     /// A multi-valued string property — the requirement/concern `text`.
     Strings(Vec<String>),
+    /// A literal value: an unlimited natural a multiplicity operation
+    /// answers, in the spelling of the literal expression that would carry
+    /// it (`3`, or `*` for the unbounded one).
+    Literal(String),
+    /// The literal values a model-level evaluation yields, in order, each in
+    /// the spelling of the literal expression that would carry it (`3`,
+    /// `2.5`, `true`, `"text"`, `*`; a quantity as `3 [kg]`). An evaluation
+    /// whose values are elements answers [`Self::References`] instead; the
+    /// toolkit materializes no result elements.
+    Literals(Vec<String>),
 }
 
 impl DerivedValue {
@@ -1104,23 +1114,7 @@ impl ResolvedModel {
     /// (Compare [`Self::is_library_element`], which answers whether the
     /// element came from a library *unit*.)
     fn d_is_library_element(&mut self, e: ElementRef) -> bool {
-        self.ensure_rel_owner();
-        let mut at = Some(e.0);
-        let mut steps = 0usize;
-        while let Some(i) = at {
-            if self.b.elements[i].ty == "LibraryPackage" {
-                return true;
-            }
-            steps += 1;
-            if steps > 2 * self.b.elements.len() {
-                return false; // malformed ownership cycle
-            }
-            // Up one step, through relationship nodes: a relationship's
-            // carrier (`owningRelatedElement`), else its own owning
-            // relationship, as `Relationship::libraryNamespace()` walks.
-            at = self.rel_owner[i].or(self.b.elements[i].owning_relationship);
-        }
-        false
+        self.library_namespace(e).is_some()
     }
 
     /// `Element::owner = owningRelationship.owningRelatedElement`. A

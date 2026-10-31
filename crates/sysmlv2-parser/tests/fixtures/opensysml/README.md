@@ -20,7 +20,7 @@ intended rule; the contract manifests and the paired checker tests do that.
 Regenerate only after adjudicating every changed result:
 
 ```sh
-UPDATE_OPENSYSML_BASELINE=1 cargo test -p sysmlv2-parser --test opensysml
+UPDATE_OPENSYSML_BASELINE=1 cargo test -p sysmlv2-parser --test integration opensysml::
 ```
 
 The `opensysmlcheck` example prints the full-library run as JSON. It shares

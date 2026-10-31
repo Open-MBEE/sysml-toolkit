@@ -68,6 +68,10 @@ pub struct PushServer {
     /// `hide_redundant_hints`; `initialize` may override it via
     /// `initializationOptions.numberFormat`.
     number_format: sysmlv2_parser::numfmt::NumberFormat,
+    /// Which units value hints and hover values show quantities in.
+    /// Held like `hide_redundant_hints`; `initialize` may override it
+    /// via `initializationOptions.valueHintUnits`.
+    value_hint_units: sysmlv2_parser::eval::UnitDisplay,
     /// Accepting a unit completion inside an untyped attribute's
     /// quantity bracket also declares the type the unit determines.
     /// Held like `hide_redundant_hints`; `initialize` may override it
@@ -136,6 +140,7 @@ impl PushServer {
             documents_moved: false,
             hide_redundant_hints: true,
             number_format: sysmlv2_parser::numfmt::NumberFormat::exact(),
+            value_hint_units: sysmlv2_parser::eval::UnitDisplay::Si,
             infer_unit_types: true,
         }
     }
@@ -166,6 +171,22 @@ impl PushServer {
         self.number_format = format;
         if let Some(server) = &mut self.server {
             server.nav.set_number_format(format);
+            self.send_refreshes();
+        }
+    }
+
+    /// Set which units value hints and hover values show quantities in:
+    /// the evaluator's own (SI for products, quotients and powers; the
+    /// default) or the units each value was written in. On a running
+    /// server supporting clients are asked to re-pull — drain with
+    /// [`Self::take_outbound`].
+    pub fn set_value_hint_units(&mut self, units: sysmlv2_parser::eval::UnitDisplay) {
+        if self.value_hint_units == units {
+            return;
+        }
+        self.value_hint_units = units;
+        if let Some(server) = &mut self.server {
+            server.nav.set_value_hint_units(units);
             self.send_refreshes();
         }
     }
@@ -384,6 +405,16 @@ impl PushServer {
             None => {}
         }
         nav.set_number_format(self.number_format);
+        match crate::value_hint_units(&init) {
+            Some(Ok(units)) => self.value_hint_units = units,
+            Some(Err(err)) => {
+                let _ = connection
+                    .sender
+                    .send(crate::value_hint_units_refused(&err));
+            }
+            None => {}
+        }
+        nav.set_value_hint_units(self.value_hint_units);
         if let Some(on) = crate::infer_unit_types(&init) {
             self.infer_unit_types = on;
         }
@@ -9137,6 +9168,100 @@ mod tests {
             "the cached range hint is re-rendered: {hints:?}"
         );
         assert!(hover.contains("= `0.(3)`"), "{hover}");
+    }
+
+    /// A unit-display change on a running server re-spells the next
+    /// pull's value hint and hover; setting the mode in force asks for
+    /// no refresh, a change does, and a pre-`initialize` setting is held
+    /// for the server build.
+    #[test]
+    fn value_hint_units_change_respells_and_requests_refresh() {
+        use sysmlv2_parser::eval::UnitDisplay;
+        let methods = |s: &mut PushServer| -> Vec<String> {
+            s.take_outbound()
+                .expect("serializable outbound")
+                .iter()
+                .map(|m| {
+                    let v: serde_json::Value = serde_json::from_str(m).expect("valid json");
+                    v["method"].as_str().unwrap_or_default().to_string()
+                })
+                .collect()
+        };
+        let mut s = PushServer::new();
+        s.set_value_hint_units(UnitDisplay::AsWritten);
+        assert_eq!(methods(&mut s), Vec::<String>::new());
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {"workspace": {
+                    "inlayHint": {"refreshSupport": true}}}}}),
+        );
+        assert_eq!(
+            s.value_hint_units,
+            UnitDisplay::AsWritten,
+            "held across initialize"
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/u.sysml", "languageId": "sysml", "version": 1,
+                    "text": "package U {\n    attribute s; attribute m;\n    attribute 'in' { attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; } }\n    attribute v = 10 ['in'] / (2 [s]);\n}\n"}}}),
+        );
+        let _ = methods(&mut s);
+        let mut id = 1;
+        let mut pull = |s: &mut PushServer| -> (Vec<String>, String) {
+            id += 2;
+            let hints = responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/inlayHint",
+                    "params": {"textDocument": {"uri": "file:///w/u.sysml"},
+                               "range": {"start": {"line": 0, "character": 0},
+                                         "end": {"line": 9, "character": 0}}}}),
+            )[0]["result"]
+                .as_array()
+                .expect("hints")
+                .iter()
+                .map(|h| h["label"].as_str().unwrap_or_default().to_string())
+                .collect();
+            let hover = responses(
+                s,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id + 1, "method": "textDocument/hover",
+                    "params": {"textDocument": {"uri": "file:///w/u.sysml"},
+                               "position": {"line": 3, "character": 14}}}),
+            )[0]["result"]["contents"]["value"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            (hints, hover)
+        };
+        let (hints, hover) = pull(&mut s);
+        assert_eq!(hints, vec![" = 5 [in/s]".to_string()]);
+        assert!(
+            hover.contains("= `5 [in/s]` (SI: `0.127 [m/s]`)"),
+            "{hover}"
+        );
+        s.set_value_hint_units(UnitDisplay::AsWritten);
+        assert_eq!(
+            methods(&mut s),
+            Vec::<String>::new(),
+            "unchanged: no refresh"
+        );
+        s.set_value_hint_units(UnitDisplay::Si);
+        let asked = methods(&mut s);
+        assert!(
+            asked.contains(&"workspace/inlayHint/refresh".to_string()),
+            "expected a refresh request, got {asked:?}"
+        );
+        let (hints, hover) = pull(&mut s);
+        assert_eq!(hints, vec![" = 0.127 [m/s]".to_string()]);
+        assert!(
+            hover.contains("= `0.127 [m/s]` (as written: `5 [in/s]`)"),
+            "{hover}"
+        );
     }
 
     /// A number-format change on a running server asks clients to

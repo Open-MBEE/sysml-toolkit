@@ -1417,6 +1417,698 @@ fn removing_inline_succession_preserves_its_action_and_references() {
     }
 }
 
+/// Remove `owner`'s entry action and answer the text after the commit,
+/// failing when a `check` of it reports anything.
+fn remove_entry(src: &str, owner: &str) -> String {
+    let mut s = session(src);
+    let owner = s.resolved().resolve_qualified(owner).unwrap();
+    let entry = s
+        .resolved()
+        .owned_members(owner)
+        .into_iter()
+        .find(|&m| s.resolved().owning_membership_kind(m) == Some("entry"))
+        .unwrap();
+    let mut edit = s.edit();
+    edit.remove(entry);
+    edit.commit().expect("the entry and its transitions go");
+    let out = text(&s);
+    let findings = sysmlv2_transform::check_sources_syntax(&[("t.sysml".into(), out.clone())]);
+    assert!(findings.is_empty(), "{out}\n{findings:?}");
+    out
+}
+
+#[test]
+fn removing_an_entry_action_removes_its_transitions() {
+    // Anonymous, named, and guarded entry transitions all start from the
+    // entry action by position; none of them may outlive it.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        entry;\n        then idle;\n        state idle;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        state idle;\n    }\n}\n"
+    );
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        entry action warm;\n        then idle;\n        state idle;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        state idle;\n    }\n}\n"
+    );
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        attribute ready;\n        entry;\n        if ready then idle;\n        private then other;\n        state idle;\n        state other;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        attribute ready;\n        state idle;\n        state other;\n    }\n}\n"
+    );
+    // On one line, the entry and its transitions leave no blank line.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        entry; then idle;\n        state idle;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        state idle;\n    }\n}\n"
+    );
+    // Mid-line, the spaces around the removed text stay, as for any
+    // member removed from a one-line body.
+    assert_eq!(
+        remove_entry(
+            "package E { state def S { entry; then idle; state idle; } }",
+            "E::S"
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" "),
+        "package E { state def S { state idle; } }"
+    );
+    // Behind a state, a `then` left over would pass `check` as a
+    // transition from that state, quietly changing the model.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        state a;\n        entry;\n        then idle;\n        state idle;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        state a;\n        state idle;\n    }\n}\n"
+    );
+    // On a state usage too.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state s {\n        entry action warm { action step; }\n        then idle;\n        state idle;\n    }\n}\n",
+            "E::s"
+        ),
+        "package E {\n    state s {\n        state idle;\n    }\n}\n"
+    );
+}
+
+#[test]
+fn removing_an_entry_action_keeps_what_does_not_start_from_it() {
+    // A comment, documentation or note between the entry and its
+    // transitions stays; the transitions after it still go.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        entry;\n        // why idle\n        /* first */\n        doc /* entered */\n        then idle;\n        state idle;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        // why idle\n        /* first */\n        doc /* entered */\n        state idle;\n    }\n}\n"
+    );
+    // A `then` leading a declaration: the declaration stays, and so do
+    // the members after it, which start from it.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        entry;\n        then state idle;\n        then done;\n        state done;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        state idle;\n        then done;\n        state done;\n    }\n}\n"
+    );
+    // A transition that names its source ends the run.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        entry;\n        then idle;\n        transition first idle then done;\n        state idle;\n        state done;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        transition first idle then done;\n        state idle;\n        state done;\n    }\n}\n"
+    );
+    // A `do` no `then` follows takes nothing; the members around it stay.
+    let src = "package E {\n    state def S {\n        entry;\n        then idle;\n        do;\n        exit;\n        state idle;\n    }\n}\n";
+    let mut s = session(src);
+    let owner = s.resolved().resolve_qualified("E::S").unwrap();
+    let action = s
+        .resolved()
+        .owned_members(owner)
+        .into_iter()
+        .find(|&m| s.resolved().owning_membership_kind(m) == Some("do"))
+        .unwrap();
+    let mut edit = s.edit();
+    edit.remove(action);
+    edit.commit().expect("commit");
+    assert_eq!(
+        text(&s),
+        "package E {\n    state def S {\n        entry;\n        then idle;\n        exit;\n        state idle;\n    }\n}\n"
+    );
+}
+
+#[test]
+fn removing_an_entry_action_and_its_transitions_in_one_batch() {
+    // A selection holding the entry and its transitions (a diagram's
+    // entry row and its edges) removes them in one batch, in either
+    // order.
+    let src = "package E {\n    state def S {\n        attribute ready;\n        entry;\n        then idle;\n        if ready then idle;\n        then state other;\n        state idle;\n    }\n}\n";
+    let expected = "package E {\n    state def S {\n        attribute ready;\n        state other;\n        state idle;\n    }\n}\n";
+    for entry_first in [true, false] {
+        let mut s = session(src);
+        let owner = s.resolved().resolve_qualified("E::S").unwrap();
+        let members = s.resolved().owned_members(owner);
+        let entry = members
+            .iter()
+            .copied()
+            .find(|&m| s.resolved().owning_membership_kind(m) == Some("entry"))
+            .unwrap();
+        let transitions: Vec<_> = members
+            .iter()
+            .copied()
+            .filter(|&m| {
+                matches!(
+                    s.resolved().element_type(m),
+                    "SuccessionAsUsage" | "TransitionUsage"
+                )
+            })
+            .collect();
+        assert_eq!(transitions.len(), 3);
+        let mut edit = s.edit();
+        if entry_first {
+            edit.remove(entry);
+        }
+        for &t in &transitions {
+            edit.remove(t);
+        }
+        if !entry_first {
+            edit.remove(entry);
+        }
+        edit.commit()
+            .unwrap_or_else(|e| panic!("entry first: {entry_first}: {e:?}"));
+        assert_eq!(text(&s), expected, "entry first: {entry_first}");
+    }
+}
+
+#[test]
+fn an_entry_transition_reading_into_the_entry_does_not_hold_it_back() {
+    // The guard reads a feature of the entry action; both go together,
+    // so the reference strands nothing.
+    assert_eq!(
+        remove_entry(
+            "package E {\n    state def S {\n        entry action warm { attribute ok; }\n        if warm.ok then idle;\n        state idle;\n    }\n}\n",
+            "E::S"
+        ),
+        "package E {\n    state def S {\n        state idle;\n    }\n}\n"
+    );
+    // A reference from outside the removed text still refuses.
+    let src = "package E {\n    state def S {\n        entry action warm { attribute ok; }\n        then idle;\n        state idle;\n        attribute seen = warm.ok;\n    }\n}\n";
+    let mut s = session(src);
+    let owner = s.resolved().resolve_qualified("E::S").unwrap();
+    let entry = s
+        .resolved()
+        .owned_members(owner)
+        .into_iter()
+        .find(|&m| s.resolved().owning_membership_kind(m) == Some("entry"))
+        .unwrap();
+    let mut edit = s.edit();
+    edit.remove(entry);
+    assert!(
+        matches!(
+            edit.commit(),
+            Err(TransformError::RemovalBreaksReferences { .. })
+        ),
+        "{}",
+        text(&s)
+    );
+    assert_eq!(text(&s), src);
+}
+
+/// Remove `qualified` and answer the text after the commit, failing
+/// when a `check` of it reports anything.
+fn remove_checked(src: &str, qualified: &str) -> String {
+    let mut s = session(src);
+    let e = s.resolved().resolve_qualified(qualified).unwrap();
+    let mut edit = s.edit();
+    edit.remove(e);
+    edit.commit()
+        .unwrap_or_else(|err| panic!("remove {qualified}: {err:?}"));
+    let out = text(&s);
+    let findings = sysmlv2_transform::check_sources_syntax(&[("t.sysml".into(), out.clone())]);
+    assert!(findings.is_empty(), "{out}\n{findings:?}");
+    out
+}
+
+/// The members of `owner` in `s` that are written `then …;`, `if … then
+/// …;` or `else …;`, in declaration order.
+fn successions_of(s: &mut Session, owner: &str) -> Vec<sysmlv2_transform::ElementRef> {
+    let owner = s.resolved().resolve_qualified(owner).unwrap();
+    let members = s.resolved().owned_members(owner);
+    members
+        .into_iter()
+        .filter(|&m| {
+            matches!(
+                s.resolved().element_type(m),
+                "SuccessionAsUsage" | "TransitionUsage"
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn removing_a_member_removes_the_then_members_that_follow_it() {
+    // First in its body, a `then` left over follows nothing.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    state def S {\n        state a;\n        then b;\n        state b;\n    }\n}\n",
+            "E::S::a"
+        ),
+        "package E {\n    state def S {\n        state b;\n    }\n}\n"
+    );
+    // Behind another member, it would pass `check` as a transition from
+    // that member, quietly changing the model. Every member of the run
+    // starts from `a`, so the whole run goes.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    state def S {\n        state z;\n        state a;\n        then b;\n        then c;\n        state b;\n        state c;\n    }\n}\n",
+            "E::S::a"
+        ),
+        "package E {\n    state def S {\n        state z;\n        state b;\n        state c;\n    }\n}\n"
+    );
+    assert_eq!(
+        remove_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        then b;\n        action b;\n    }\n}\n",
+            "E::A::a"
+        ),
+        "package E {\n    action def A {\n        action z;\n        action b;\n    }\n}\n"
+    );
+    // A multiplicity on the `then` still names no source.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        then [1] b;\n        action b;\n    }\n}\n",
+            "E::A::a"
+        ),
+        "package E {\n    action def A {\n        action z;\n        action b;\n    }\n}\n"
+    );
+    // A decision's guarded and default successions start from it.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    action def A {\n        attribute ok;\n        action z;\n        decide d;\n        if ok then b;\n        else c;\n        action b;\n        action c;\n    }\n}\n",
+            "E::A::d"
+        ),
+        "package E {\n    action def A {\n        attribute ok;\n        action z;\n        action b;\n        action c;\n    }\n}\n"
+    );
+    // So do a state's target transitions, keyword or not.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    state def S {\n        attribute ok;\n        state z;\n        state a;\n        if ok then b;\n        accept go then b;\n        transition accept stop then b;\n        state b;\n    }\n}\n",
+            "E::S::a"
+        ),
+        "package E {\n    state def S {\n        attribute ok;\n        state z;\n        state b;\n    }\n}\n"
+    );
+    // A note, comment or documentation between stays.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        // why b\n        /* next */\n        then b;\n        action b;\n    }\n}\n",
+            "E::A::a"
+        ),
+        "package E {\n    action def A {\n        action z;\n        // why b\n        /* next */\n        action b;\n    }\n}\n"
+    );
+    // On one line, the spaces around the removed text stay, as for any
+    // member removed from a one-line body.
+    assert_eq!(
+        remove_checked(
+            "package E { state def S { state z; state a; then b; state b; } }",
+            "E::S::a"
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" "),
+        "package E { state def S { state z; state b; } }"
+    );
+}
+
+#[test]
+fn removing_a_member_keeps_what_does_not_follow_it() {
+    // `a`'s own leading `then` goes with it, and so does its run; the
+    // `then` leading the next declaration goes, and the declaration and
+    // the members after it, which follow it, stay.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    action def A {\n        action z;\n        then action a;\n        then b;\n        then action c;\n        then d;\n        action b;\n        action d;\n    }\n}\n",
+            "E::A::a"
+        ),
+        "package E {\n    action def A {\n        action z;\n        action c;\n        then d;\n        action b;\n        action d;\n    }\n}\n"
+    );
+    // A run after `first start;` is the initial node's.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    action def A {\n        action a;\n        first start;\n        then b;\n        action b;\n    }\n}\n",
+            "E::A::a"
+        ),
+        "package E {\n    action def A {\n        first start;\n        then b;\n        action b;\n    }\n}\n"
+    );
+    // A succession that names its source ends the run.
+    assert_eq!(
+        remove_checked(
+            "package E {\n    action def A {\n        action a;\n        then b;\n        first b then c;\n        action b;\n        action c;\n    }\n}\n",
+            "E::A::a"
+        ),
+        "package E {\n    action def A {\n        first b then c;\n        action b;\n        action c;\n    }\n}\n"
+    );
+    // A member of a run opens none: the members after it start from the
+    // member before them all, which stays.
+    let src = "package E {\n    state def S {\n        attribute ok;\n        state a;\n        if ok then b;\n        then c;\n        state b;\n        state c;\n    }\n}\n";
+    for (index, expected) in [
+        (
+            0,
+            "package E {\n    state def S {\n        attribute ok;\n        state a;\n        then c;\n        state b;\n        state c;\n    }\n}\n",
+        ),
+        (
+            1,
+            "package E {\n    state def S {\n        attribute ok;\n        state a;\n        if ok then b;\n        state b;\n        state c;\n    }\n}\n",
+        ),
+    ] {
+        let mut s = session(src);
+        let succession = successions_of(&mut s, "E::S")[index];
+        let mut edit = s.edit();
+        edit.remove(succession);
+        edit.commit().expect("commit");
+        assert_eq!(text(&s), expected);
+    }
+    // Nor does the succession a leading `then` writes: removing it
+    // leaves the declaration and its run.
+    let mut s = session(
+        "package E {\n    action def A {\n        action a;\n        then action b;\n        then c;\n        action c;\n    }\n}\n",
+    );
+    let succession = successions_of(&mut s, "E::A")[0];
+    let mut edit = s.edit();
+    edit.remove(succession);
+    edit.commit().expect("commit");
+    assert_eq!(
+        text(&s),
+        "package E {\n    action def A {\n        action a;\n        action b;\n        then c;\n        action c;\n    }\n}\n"
+    );
+    // A `then` that follows another member still holds back what it
+    // targets.
+    let src = "package E {\n    action def A {\n        action a;\n        then b;\n        action b;\n        then a;\n    }\n}\n";
+    let mut s = session(src);
+    let a = s.resolved().resolve_qualified("E::A::a").unwrap();
+    let mut edit = s.edit();
+    edit.remove(a);
+    assert!(matches!(
+        edit.commit(),
+        Err(TransformError::RemovalBreaksReferences { .. })
+    ));
+    assert_eq!(text(&s), src);
+}
+
+/// `what` moved into `to` at `index`, committed and checked.
+fn move_checked(src: &str, what: &str, to: &str, index: Option<usize>) -> String {
+    let mut s = session(src);
+    let e = s.resolved().resolve_qualified(what).unwrap();
+    let to = s.resolved().resolve_qualified(to).unwrap();
+    let mut edit = s.edit();
+    edit.move_member(e, to, index);
+    edit.commit()
+        .unwrap_or_else(|err| panic!("move {what} into {to:?}: {err:?}"));
+    let out = text(&s);
+    let findings = sysmlv2_transform::check_sources_syntax(&[("t.sysml".into(), out.clone())]);
+    assert!(findings.is_empty(), "{out}\n{findings:?}");
+    out
+}
+
+#[test]
+fn moving_a_member_moves_the_then_members_that_follow_it() {
+    // Behind another member, a run left behind would quietly start
+    // from that member. Reordered to the front, `a` keeps its run.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        then b;\n        then c;\n        action b;\n        action c;\n    }\n}\n",
+            "E::A::a",
+            "E::A",
+            Some(0)
+        ),
+        "package E {\n    action def A {\n        action a;\n        then b;\n        then c;\n        action z;\n        action b;\n        action c;\n    }\n}\n"
+    );
+    // First in its body, a `then` left over would follow nothing.
+    // Reordered behind `z`, the run follows `a` there.
+    assert_eq!(
+        move_checked(
+            "package E {\n    state def S {\n        state a;\n        then b;\n        state z;\n        state b;\n    }\n}\n",
+            "E::S::a",
+            "E::S",
+            Some(1)
+        ),
+        "package E {\n    state def S {\n        state z;\n        state a;\n        then b;\n        state b;\n    }\n}\n"
+    );
+    // A decision's guarded and default successions start from it.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        attribute ok;\n        action z;\n        decide d;\n        if ok then b;\n        else c;\n        action b;\n        action c;\n    }\n}\n",
+            "E::A::d",
+            "E::A",
+            None
+        ),
+        "package E {\n    action def A {\n        attribute ok;\n        action z;\n        action b;\n        action c;\n        decide d;\n        if ok then b;\n        else c;\n    }\n}\n"
+    );
+    // A note between moves with the run; the `then` leading the next
+    // declaration starts from `a` and goes, and the declaration stays.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        // why b\n        then b;\n        then action c;\n        action b;\n    }\n}\n",
+            "E::A::a",
+            "E::A",
+            Some(0)
+        ),
+        "package E {\n    action def A {\n        action a;\n        // why b\n        then b;\n        action z;\n        action c;\n        action b;\n    }\n}\n"
+    );
+    // A member of a run moves alone: the members after it start from
+    // the member before them all.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        action a;\n        then b;\n        then c;\n        action b;\n        action c;\n    }\n}\n",
+            "E::A::b",
+            "E::A",
+            Some(0)
+        ),
+        "package E {\n    action def A {\n        action b;\n        action a;\n        then b;\n        then c;\n        action c;\n    }\n}\n"
+    );
+    // On one line, as for a one-line body's other members.
+    assert_eq!(
+        move_checked(
+            "package E { state def S { state z; state a; then b; state b; } }",
+            "E::S::a",
+            "E::S",
+            Some(0)
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" "),
+        "package E { state def S { state a; then b; state z; state b; } }"
+    );
+}
+
+#[test]
+fn a_leading_then_keeps_its_slot_in_a_reorder() {
+    // `then action b;` writes a succession and `b` in one text. Moving
+    // `b`, that succession is still a slot of the reorder, as it was
+    // before runs moved with their member, so a host's slot one past
+    // `c` lands before `d`, not after it.
+    let src = "package E {\n    action def A {\n        action a;\n        then action b;\n        action c;\n        action d;\n    }\n}\n";
+    let mut s = session(src);
+    let b = s.resolved().resolve_qualified("E::A::b").unwrap();
+    let owner = s.resolved().resolve_qualified("E::A").unwrap();
+    let mut edit = s.edit();
+    edit.move_member(b, owner, Some(3));
+    edit.commit().expect("commit");
+    assert_eq!(
+        text(&s),
+        "package E {\n    action def A {\n        action a;\n        action c;\n        then action b;\n        action d;\n    }\n}\n"
+    );
+    // A run of `then` members after the moved member is no slot: the
+    // same reorder of `a` past `z` counts `z` and `b`, not `then b;`.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        action a;\n        then b;\n        action z;\n        action b;\n    }\n}\n",
+            "E::A::a",
+            "E::A",
+            Some(1)
+        ),
+        "package E {\n    action def A {\n        action z;\n        action a;\n        then b;\n        action b;\n    }\n}\n"
+    );
+}
+
+#[test]
+fn moving_a_member_into_another_owner_takes_its_run_along() {
+    // The run's targets must still resolve from the new owner: where
+    // `b` is a member of `B`, `a` keeps its transition there.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        then b;\n    }\n    action def B {\n        action q;\n        action b;\n    }\n}\n",
+            "E::A::a",
+            "E::B",
+            None
+        ),
+        "package E {\n    action def A {\n        action z;\n    }\n    action def B {\n        action q;\n        action b;\n        action a;\n        then b;\n    }\n}\n"
+    );
+    // A `then` that names its target in full resolves from anywhere.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        then E::A::b;\n        action b;\n    }\n    action def B {\n        action q;\n    }\n}\n",
+            "E::A::a",
+            "E::B",
+            None
+        ),
+        "package E {\n    action def A {\n        action z;\n        action b;\n    }\n    action def B {\n        action q;\n        action a;\n        then E::A::b;\n    }\n}\n"
+    );
+
+    // Moved alone, the run's `b` no longer resolves from `B`: the
+    // commit rolls back rather than leaving `then b;` behind in `A`,
+    // first in its body with nothing to follow.
+    let src = "package E {\n    action def A {\n        action a;\n        then b;\n        action b;\n    }\n    action def B {\n        action q;\n    }\n}\n";
+    let mut s = session(src);
+    let a = s.resolved().resolve_qualified("E::A::a").unwrap();
+    let dst = s.resolved().resolve_qualified("E::B").unwrap();
+    let mut edit = s.edit();
+    edit.move_member(a, dst, None);
+    assert!(edit.commit().is_err());
+    assert_eq!(text(&s), src);
+}
+
+/// `text` inserted into `owner` at `index`, committed and checked.
+fn insert_checked(src: &str, owner: &str, member: &str, index: usize) -> String {
+    let mut s = session(src);
+    let owner = s.resolved().resolve_qualified(owner).unwrap();
+    let mut edit = s.edit();
+    edit.insert_member_at(owner, member, Some(index));
+    edit.commit()
+        .unwrap_or_else(|err| panic!("insert at {index}: {err:?}"));
+    let out = text(&s);
+    let findings = sysmlv2_transform::check_sources_syntax(&[("t.sysml".into(), out.clone())]);
+    assert!(findings.is_empty(), "{out}\n{findings:?}");
+    out
+}
+
+#[test]
+fn a_slot_inside_a_then_run_is_held_past_it() {
+    // Right after the opener (a host's Duplicate writes the copy at
+    // `index + 1`): the copy would take `a`'s transition. It lands
+    // after the run.
+    assert_eq!(
+        insert_checked(
+            "package E {\n    state def S {\n        state a;\n        then b;\n        state b;\n    }\n}\n",
+            "E::S",
+            "state aCopy;",
+            1
+        ),
+        "package E {\n    state def S {\n        state a;\n        then b;\n        state aCopy;\n        state b;\n    }\n}\n"
+    );
+    // Between two members of a run.
+    assert_eq!(
+        insert_checked(
+            "package E {\n    action def A {\n        action a;\n        then b;\n        then c;\n        action b;\n        action c;\n    }\n}\n",
+            "E::A",
+            "action x;",
+            2
+        ),
+        "package E {\n    action def A {\n        action a;\n        then b;\n        then c;\n        action x;\n        action b;\n        action c;\n    }\n}\n"
+    );
+    // Before the declaration a `then` leads: its `then` starts from the
+    // opener, so the slot is past the declaration.
+    assert_eq!(
+        insert_checked(
+            "package E {\n    action def A {\n        action a;\n        then b;\n        then action c;\n        action d;\n        action b;\n    }\n}\n",
+            "E::A",
+            "action x;",
+            2
+        ),
+        "package E {\n    action def A {\n        action a;\n        then b;\n        then action c;\n        action x;\n        action d;\n        action b;\n    }\n}\n"
+    );
+    // A decision's guarded and default successions.
+    assert_eq!(
+        insert_checked(
+            "package E {\n    action def A {\n        attribute ok;\n        decide d;\n        if ok then b;\n        else c;\n        action b;\n        action c;\n    }\n}\n",
+            "E::A",
+            "action x;",
+            2
+        ),
+        "package E {\n    action def A {\n        attribute ok;\n        decide d;\n        if ok then b;\n        else c;\n        action x;\n        action b;\n        action c;\n    }\n}\n"
+    );
+    // A slot elsewhere is where it was asked: before the opener, and
+    // after the run.
+    assert_eq!(
+        insert_checked(
+            "package E {\n    state def S {\n        state z;\n        state a;\n        then b;\n        state b;\n    }\n}\n",
+            "E::S",
+            "state x;",
+            1
+        ),
+        "package E {\n    state def S {\n        state z;\n        state x;\n        state a;\n        then b;\n        state b;\n    }\n}\n"
+    );
+    assert_eq!(
+        insert_checked(
+            "package E {\n    state def S {\n        state a;\n        then b;\n        state b;\n    }\n}\n",
+            "E::S",
+            "state x;",
+            2
+        ),
+        "package E {\n    state def S {\n        state a;\n        then b;\n        state x;\n        state b;\n    }\n}\n"
+    );
+    // A move to such a slot is held the same way.
+    assert_eq!(
+        move_checked(
+            "package E {\n    action def A {\n        action z;\n        action a;\n        then b;\n        action b;\n    }\n}\n",
+            "E::A::z",
+            "E::A",
+            Some(1)
+        ),
+        "package E {\n    action def A {\n        action a;\n        then b;\n        action z;\n        action b;\n    }\n}\n"
+    );
+}
+
+#[test]
+fn moving_the_target_of_a_then_away_is_refused() {
+    // `then b;` stays in `A` and would no longer resolve: the commit
+    // rolls back rather than leaving it stranded.
+    let src = "package E {\n    action def A {\n        action z;\n        action a;\n        then b;\n        action b;\n    }\n    action def B {\n        action q;\n    }\n}\n";
+    let mut s = session(src);
+    let b = s.resolved().resolve_qualified("E::A::b").unwrap();
+    let dst = s.resolved().resolve_qualified("E::B").unwrap();
+    let mut edit = s.edit();
+    edit.move_member(b, dst, None);
+    match edit.commit() {
+        Err(TransformError::SemanticIdentity { broken }) => {
+            assert!(broken.iter().any(|m| m.contains("`b`")), "{broken:?}");
+        }
+        other => panic!("expected SemanticIdentity, got {other:?}"),
+    }
+    assert_eq!(text(&s), src);
+}
+
+#[test]
+fn removing_two_members_of_a_flow_in_one_batch() {
+    // Removing `a` takes the `then` of `then action c;`; removing `c` in
+    // the same batch takes the whole declaration, in either order.
+    let src = "package E {\n    action def A {\n        action a;\n        then action c;\n        then d;\n        action d;\n    }\n}\n";
+    let expected = "package E {\n    action def A {\n        action d;\n    }\n}\n";
+    for a_first in [true, false] {
+        let mut s = session(src);
+        let a = s.resolved().resolve_qualified("E::A::a").unwrap();
+        let c = s.resolved().resolve_qualified("E::A::c").unwrap();
+        let mut edit = s.edit();
+        if a_first {
+            edit.remove(a).remove(c);
+        } else {
+            edit.remove(c).remove(a);
+        }
+        edit.commit()
+            .unwrap_or_else(|e| panic!("a first: {a_first}: {e:?}"));
+        assert_eq!(text(&s), expected, "a first: {a_first}");
+    }
+    // The leading `then`'s own succession, removed beside `a`, has
+    // nothing left to do.
+    for a_first in [true, false] {
+        let mut s = session(src);
+        let a = s.resolved().resolve_qualified("E::A::a").unwrap();
+        let succession = successions_of(&mut s, "E::A")[0];
+        let mut edit = s.edit();
+        if a_first {
+            edit.remove(a).remove(succession);
+        } else {
+            edit.remove(succession).remove(a);
+        }
+        edit.commit()
+            .unwrap_or_else(|e| panic!("a first: {a_first}: {e:?}"));
+        assert_eq!(
+            text(&s),
+            "package E {\n    action def A {\n        action c;\n        then d;\n        action d;\n    }\n}\n",
+            "a first: {a_first}"
+        );
+    }
+}
+
 #[test]
 fn check_sources_names_the_private_member_behind_an_unresolved_reference() {
     let lib = sysmlv2_testkit::library_dir();

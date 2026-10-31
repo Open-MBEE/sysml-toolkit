@@ -616,7 +616,7 @@ fn chain_member_through_overriding_usage() {
     // the chain access collects the subsetter as a member populating `c`.
     let e = r.resolve_qualified("T::bodySubset").unwrap();
     assert!(
-        matches!(r.evaluate(e), Ok(Value::Unbound(_))),
+        matches!(r.evaluate(e), Ok(Value::Unbound(..))),
         "bodySubset stays unbound"
     );
 }
@@ -1492,25 +1492,30 @@ fn quantity_zero_identity() {
     );
 }
 
-/// Chain steps over a multi-valued source map the member access and the
-/// result is unique per KFL `'.'` (its `source`/`target` are declared
-/// nonunique; the `chain` result feature carries KerML's default) —
-/// five engines with one specific impulse read as one value, while
-/// distinct values stay a sequence.
+/// Chain steps over a multi-valued source map the member access and keep
+/// every value, per KFL `'.'` (its `source` and `target` are declared
+/// nonunique): three parts with one value read as three values, so a
+/// rollup over equal values counts each of them.
 #[test]
-fn chain_over_sequence_maps_and_dedups() {
+fn chain_over_sequence_maps_and_keeps_duplicates() {
     let decls = "part def E { attribute v = 304; }
                  part def P { attribute m; }
                  part e1 : E[1]; part e2 : E[1]; part e3 : E[1];
                  part a : P[1] { attribute :>> m = 1; }
                  part b : P[1] { attribute :>> m = 2; }
-                 part s[1] { part es = (e1, e2, e3); part ps = (a, b); }";
-    assert_eq!(eval_with(decls, "s.es.v"), Ok(int(304)));
+                 part c : P[1] { attribute :>> m = 1; }
+                 part s[1] { part es = (e1, e2, e3); part ps = (a, b, c); }";
+    assert_eq!(
+        eval_with(decls, "s.es.v"),
+        Ok(Value::Sequence(vec![int(304), int(304), int(304)]))
+    );
+    assert_eq!(eval_with(decls, "sum(s.es.v)"), Ok(int(912)));
     assert_eq!(
         eval_with(decls, "s.ps.m"),
-        Ok(Value::Sequence(vec![int(1), int(2)]))
+        Ok(Value::Sequence(vec![int(1), int(2), int(1)]))
     );
-    assert_eq!(eval_with(decls, "sum(s.ps.m)"), Ok(int(3)));
+    assert_eq!(eval_with(decls, "sum(s.ps.m)"), Ok(int(4)));
+    assert_eq!(eval_with(decls, "size((a, a).m)"), Ok(int(2)));
 }
 
 /// Featuring contexts persist through nested simple-name references:
@@ -1685,6 +1690,249 @@ fn unit_conversion_via_measurement_references() {
     ));
 }
 
+/// An absent name is a null property: a reference unit with only a
+/// declared name still spells the results it reaches, and an enum
+/// literal with only a short name renders by it.
+#[test]
+fn names_fall_back_past_absent_properties() {
+    let units = "attribute s; attribute m;
+                 attribute 'in' {
+                     attribute unitConversion {
+                         attribute referenceUnit = m;
+                         attribute conversionFactor = 0.0254;
+                     }
+                 }";
+    assert_eq!(
+        eval_with(units, "10 ['in'] / (2 [s])").unwrap().to_string(),
+        "0.127 [m/s]"
+    );
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        "package T { enum def Level { enum <lo>; enum <hi> high; }
+             attribute a = Level::lo; attribute b = Level::hi; }",
+    );
+    let mut r = ResolvedModel::build(&model);
+    for (name, shown) in [("T::a", "lo"), ("T::b", "high")] {
+        let e = r.resolve_qualified(name).unwrap();
+        let v = r.evaluate(e).unwrap();
+        assert_eq!(r.render_value(&v), shown, "{name}");
+    }
+}
+
+/// Library-shaped units in two systems for the as-written tests: SI
+/// bases with `kg` prefixed from `g` and `N` defined from them, inches,
+/// feet, miles and pounds converting to SI, and hours and minutes.
+const WRITTEN_UNITS: &str = "attribute s; attribute m; attribute g;
+     attribute kilo { attribute conversionFactor = 1000; }
+     attribute kg {
+         attribute unitConversion { attribute prefix = kilo; attribute referenceUnit = g; }
+     }
+     attribute km {
+         attribute unitConversion { attribute prefix = kilo; attribute referenceUnit = m; }
+     }
+     attribute N = kg*m/s^2;
+     attribute 'in' {
+         attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; }
+     }
+     attribute ft {
+         attribute unitConversion { attribute referenceUnit = 'in'; attribute conversionFactor = 12; }
+     }
+     attribute mi {
+         attribute unitConversion { attribute referenceUnit = ft; attribute conversionFactor = 5280; }
+     }
+     attribute lb {
+         attribute unitConversion { attribute referenceUnit = kg; attribute conversionFactor = 0.45359237; }
+     }
+     attribute lbf {
+         attribute unitConversion { attribute referenceUnit = N; attribute conversionFactor = 4.4482216152605; }
+     }
+     attribute h {
+         attribute unitConversion { attribute referenceUnit = s; attribute conversionFactor = 3600; }
+     }
+     attribute min {
+         attribute unitConversion { attribute referenceUnit = s; attribute conversionFactor = 60; }
+     }";
+
+/// `expr` (as `attribute result = <expr>;` beside the units), evaluated,
+/// and its value re-expressed in the units it was written in.
+fn eval_written(expr: &str) -> (Value, Option<Value>) {
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        &format!("package T {{ {WRITTEN_UNITS} attribute result = {expr}; }}"),
+    );
+    let mut r = ResolvedModel::build(&model);
+    let e = r.resolve_qualified("T::result").expect("result resolves");
+    let v = r.evaluate(e).unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+    let as_written = r.value_as_written(&v);
+    (v, as_written)
+}
+
+/// `expr`'s value as the evaluator renders it, then re-expressed in the
+/// units it was written in (the same string when it already is).
+fn written(expr: &str) -> (String, String) {
+    let (v, as_written) = eval_written(expr);
+    let shown = as_written.map_or_else(|| v.to_string(), |w| w.to_string());
+    (v.to_string(), shown)
+}
+
+/// `quantities_as_written` reaches the quantities inside a sequence and an
+/// instance's fields, and leaves every other value as it is.
+#[test]
+fn nested_quantities_re_express_in_their_written_units() {
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        &format!(
+            "package T {{ {WRITTEN_UNITS}
+                attribute d = 10 ['in'];
+                attribute pair = (d / (2 [s]), d * d, 3, \"x\");
+                attribute def Box {{ attribute speed; attribute label; }}
+                attribute box = new Box(d / (2 [s]), \"b\");
+            }}"
+        ),
+    );
+    let mut r = ResolvedModel::build(&model);
+    let eval = |r: &mut ResolvedModel, name: &str| {
+        let e = r.resolve_qualified(name).expect("resolves");
+        r.evaluate(e).unwrap_or_else(|e| panic!("{name}: {e:?}"))
+    };
+    let pair = eval(&mut r, "T::pair");
+    assert_eq!(pair.to_string(), "(0.127 [m/s], 0.064516 [m**2], 3, \"x\")");
+    assert_eq!(
+        r.quantities_as_written(&pair).to_string(),
+        "(5 [in/s], 100 [in**2], 3, \"x\")"
+    );
+    let boxed = eval(&mut r, "T::box");
+    assert_eq!(
+        r.quantities_as_written(&boxed).to_string(),
+        boxed.to_string().replace("0.127 [m/s]", "5 [in/s]")
+    );
+    assert!(boxed.to_string().contains("0.127 [m/s]"), "{boxed}");
+    // Already as written, and not a quantity at all: unchanged.
+    let d = eval(&mut r, "T::d");
+    assert_eq!(r.quantities_as_written(&d), d);
+    assert_eq!(
+        r.quantities_as_written(&Value::Integer(3)),
+        Value::Integer(3)
+    );
+}
+
+/// Products, quotients and powers fold into the reference units; the
+/// written units they came from re-express them: a written unit (or a
+/// power of one) with the result's dimensions first, then a named
+/// compound unit with written units for the rest, then a written unit
+/// per dimension.
+#[test]
+fn quantities_re_express_in_their_written_units() {
+    // One written unit per dimension.
+    assert_eq!(
+        written("10 ['in'] / (2 [s])"),
+        ("0.127 [m/s]".into(), "5 [in/s]".into())
+    );
+    assert_eq!(written("60 [mi] / (1 [h])").1, "60 [mi/h]");
+    assert_eq!(
+        written("2 [lb] * (32 [ft]) / (1 [s])**2").1,
+        "64 [ft*lb/s**2]"
+    );
+    assert_eq!(written("2 [kg] * (3 [m/s^2])").1, "6 [kg*m/s**2]");
+    // A written unit with the result's dimensions, or a power of one.
+    assert_eq!(written("60 [mi] / (1 [h]) * (30 [min])").1, "30 [mi]");
+    assert_eq!(written("10 ['in'] * (10 ['in'])").1, "100 [in**2]");
+    assert_eq!(
+        written("2 ['in'] * (3 ['in']) * (4 ['in'])").1,
+        "24 [in**3]"
+    );
+    assert_eq!(written("2 / (4 [h])").1, "0.5 [1/h]");
+    assert_eq!(written("(3 [km/h]) ** 2").1, "9 [(km/h)**2]");
+    // A named compound unit with written units for what it leaves.
+    assert_eq!(written("10 [N] * (2 [m])").1, "20 [N*m]");
+    assert_eq!(written("10 [N] / (2 [m^2])").1, "5 [N/m**2]");
+    assert_eq!(
+        written("10 [lbf] / (2 ['in'] * (1 ['in']))").1,
+        "5 [lbf/in**2]"
+    );
+    assert_eq!(written("10 [N] / (5 [lb])").1, "2 [N/lb]");
+    // Each dimension takes the first unit written for it.
+    assert_eq!(written("60 [km/h] / (10 [s])").1, "21600 [km/h**2]");
+    assert_eq!(written("1 [ft] * (12 ['in'])").1, "1 [ft**2]");
+}
+
+/// Units the evaluator already keeps as written stay as they are:
+/// brackets, additive and scalar operations (which convert into the left
+/// operand's unit), explicit conversions, and reference units nothing
+/// else was written for. Dimensionless results are plain numbers.
+#[test]
+fn written_units_already_shown_stay() {
+    for expr in [
+        "10 ['in']",
+        "10 ['in'] + 1 [ft]",
+        "1 [ft] + 12 ['in']",
+        "10 ['in'] / 2",
+        "-(10 ['in'])",
+        "(10 ['in'] / (2 [s])) [m/s]",
+        "(10 ['in'] / (2 [s])) [km/h]",
+        "2 [m] * (3 [m])",
+        "3 [km/h] * 2",
+        // `N/kg` is exactly the reference `m/s**2`: an equal unit keeps
+        // the evaluator's spelling.
+        "10 [N] / (5 [kg])",
+    ] {
+        let (v, as_written) = eval_written(expr);
+        assert_eq!(as_written, None, "{expr} is already as written: {v}");
+    }
+    assert_eq!(eval_with(WRITTEN_UNITS, "12 ['in'] / (1 [ft])"), Ok(int(1)));
+    // A sum whose left operand was folded takes a written unit of its
+    // dimensions from either side.
+    assert_eq!(
+        written("10 ['in'] * (10 ['in']) + 1 [ft^2]").1,
+        "244 [in**2]"
+    );
+}
+
+/// The renderer picks the unit display per call, recursing through
+/// sequences, and leaves everything else to the number format.
+#[test]
+fn render_value_in_chooses_the_unit_display() {
+    use sysmlv2_parser::eval::UnitDisplay;
+    use sysmlv2_parser::numfmt::NumberFormat;
+    let mut model = Model::new();
+    model.add_source(
+        "t.sysml",
+        &format!(
+            "package T {{ {WRITTEN_UNITS}
+                 attribute d = 10 ['in'];
+                 attribute t = 3 [s];
+                 attribute pair = (d / t, d * d);
+             }}"
+        ),
+    );
+    let mut r = ResolvedModel::build(&model);
+    let e = r.resolve_qualified("T::pair").unwrap();
+    let v = r.evaluate(e).unwrap();
+    let exact = NumberFormat::exact();
+    assert_eq!(
+        r.render_value_in(&v, &exact, UnitDisplay::Si),
+        r.render_value_as(&v, &exact)
+    );
+    assert_eq!(
+        r.render_value_in(&v, &exact, UnitDisplay::Si),
+        "(127/1500 [m/s], 0.064516 [m**2])"
+    );
+    assert_eq!(
+        r.render_value_in(&v, &exact, UnitDisplay::AsWritten),
+        "(10/3 [in/s], 100 [in**2])"
+    );
+    assert_eq!(
+        r.render_value_in(&v, &NumberFormat::approx(), UnitDisplay::AsWritten),
+        "(≈3.3333333333333335 [in/s], 100 [in**2])"
+    );
+    assert_eq!(UnitDisplay::parse("asWritten"), Ok(UnitDisplay::AsWritten));
+    assert_eq!(UnitDisplay::parse("si"), Ok(UnitDisplay::Si));
+    assert!(UnitDisplay::parse("SI").is_err());
+}
+
 /// A bracket over an already-dimensioned value: same dimensions convert
 /// across scales; different dimensions take the magnitude as written —
 /// the explicit annotation wins. The normative precedence binds a
@@ -1828,7 +2076,7 @@ fn redefinition_inherits_default_value_expressions() {
     // narrowed structure.
     assert_eq!(eval_with(decls, "Trimmed::weight"), Ok(int(7)));
     // A non-default inherited binding stays unbound (a placeholder).
-    assert!(matches!(eval_with(decls, "Q::x"), Ok(Value::Unbound(_))));
+    assert!(matches!(eval_with(decls, "Q::x"), Ok(Value::Unbound(..))));
 }
 
 /// Lib-gated: `performedActions` roll-ups. A `perform x;` member
@@ -1932,7 +2180,7 @@ fn unbound_cardinality_comes_from_declared_multiplicity() {
     );
     assert!(matches!(
         eval_with(decls, "rack.lone#(1)"),
-        Ok(Value::Unbound(_))
+        Ok(Value::Unbound(..))
     ));
     assert!(matches!(
         eval_with(decls, "rack.slots#(5)"),
@@ -2388,6 +2636,202 @@ fn exact_unit_conversion() {
     );
 }
 
+/// Lib-gated: combined results are written in SI-coherent units. The
+/// library's `kg` is the gram with the `kilo` prefix, so mass expands to
+/// `g`; a product or quotient over it is written in `kg` with the
+/// magnitude divided by 1000 per power of mass, exactly, and is the same
+/// unit as the bracket that spells it; SI's named units (`N`, `Pa`, `J`,
+/// `W`) are written by name. A user unit named `g` is not SI's.
+#[test]
+fn combined_results_are_written_in_kilograms() {
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source(
+        "coherent.sysml",
+        "package C {
+            private import SI::*;
+            attribute f = 2 [kg] * 3 [m/s**2];
+            attribute p = 10 [N] / (2 [m**2]);
+            attribute e = 10 [N] * 2 [m];
+            attribute rho = 1000 [kg] / (1 [m**3]);
+            attribute w = e / (4 [s]);
+            attribute pressure = p == 5 [Pa];
+            attribute force = f == 6 [N];
+            attribute more = f + 1 [N];
+            attribute grams = 0.5 [g] * 3 [m];
+            attribute squared = 4 [g] * 2 [g];
+            attribute per = 1 / (4 [kg]);
+            attribute root = sqrt(4 [g]);
+            attribute same = 6 [kg*m/s**2];
+            package U {
+                attribute g;
+                attribute twice = 2 [g] * 3 [g];
+            }
+            package V {
+                attribute kg; attribute m; attribute s;
+                attribute f = 2 [kg] * 3 [m/s**2];
+            }
+            package W {
+                private import USCustomaryUnits::*;
+                attribute torque = 10 [N] * (2 [ft]);
+                attribute weight = 2 [lb] * 32.174 [ft] / (1 [s]) ** 2;
+                attribute accel = 10 [N] / (5 [kg]);
+                attribute stress = 10 [N] / (2 ['in'] * (1 ['in']));
+                attribute flux = 10 [N] * (2 ['m⋅s⁻¹']) / (3 ['in']);
+            }
+        }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let mut value = |q: &str| {
+        let e = r.resolve_qualified(q).expect("resolves");
+        r.evaluate(e)
+    };
+    let shown = |v: Result<Value, EvalError>| v.map(|v| v.to_string());
+    // SI's named units are written by their names.
+    assert_eq!(shown(value("C::f")), Ok("6 [N]".into()));
+    assert_eq!(shown(value("C::p")), Ok("5 [Pa]".into()));
+    assert_eq!(shown(value("C::e")), Ok("20 [J]".into()));
+    assert_eq!(shown(value("C::w")), Ok("5 [W]".into()));
+    assert_eq!(shown(value("C::rho")), Ok("1000 [kg/m**3]".into()));
+    assert_eq!(value("C::pressure"), Ok(Value::Boolean(true)));
+    assert_eq!(value("C::force"), Ok(Value::Boolean(true)));
+    // The result is the bracket's unit, not one that converts to it, so
+    // adding a bracket value keeps the number as it is.
+    assert_eq!(value("C::f"), value("C::same"));
+    assert_eq!(shown(value("C::more")), Ok("7 [N]".into()));
+    // Grams convert exactly, every power of mass by its own factor.
+    let Ok(Value::Quantity(n, u)) = value("C::grams") else {
+        panic!("a quantity");
+    };
+    assert_eq!((*n, u.display()), (rat(3, 2000), "kg*m"));
+    assert_eq!(shown(value("C::squared")), Ok("0.000008 [kg**2]".into()));
+    assert_eq!(shown(value("C::per")), Ok("0.25 [1/kg]".into()));
+    // No exact power of the factor: the root of a mass stays in grams.
+    assert_eq!(shown(value("C::root")), Ok("2 [g**(1/2)]".into()));
+    assert_eq!(shown(value("C::U::twice")), Ok("6 [g**2]".into()));
+    assert_eq!(shown(value("C::V::f")), Ok("6 [kg*m/s**2]".into()));
+    // Read in the units they were written in, values written in SI units
+    // read as SI writes them, and other units re-express them.
+    assert_eq!(shown(value("C::W::accel")), Ok("2 [m/s**2]".into()));
+    let mut written = |q: &str| {
+        let e = r.resolve_qualified(q).expect("resolves");
+        let v = r.evaluate(e).unwrap();
+        r.value_as_written(&v).map(|w| w.to_string())
+    };
+    assert_eq!(written("C::e"), None);
+    assert_eq!(written("C::p"), None);
+    assert_eq!(written("C::W::accel"), None);
+    assert_eq!(written("C::W::torque"), Some("20 [N*ft]".into()));
+    assert_eq!(written("C::W::stress"), Some("5 [N/in**2]".into()));
+    assert_eq!(written("C::W::weight"), Some("64.348 [ft*lb/s**2]".into()));
+    // A dimension nobody wrote a unit for reads as SI writes it: the
+    // mass the newton brings is in kilograms.
+    assert_eq!(
+        written("C::W::flux"),
+        Some("500000000/48387 [in*kg/s**3]".into())
+    );
+}
+
+/// A conversion's reference unit can be a derived unit (`N = kg*m/s^2`)
+/// or a product of units (`m^3`). Either evaluates to a product of units,
+/// which no value represents, so the binding is read as a unit
+/// expression: the converted unit takes the reference's dimensions. A
+/// reference that cancels leaves the unit a named unit, not a number.
+#[test]
+fn conversions_to_derived_and_product_reference_units() {
+    let units = "attribute s; attribute m; attribute g;
+                 attribute kilo { attribute conversionFactor = 1000; }
+                 attribute kg {
+                     attribute unitConversion { attribute prefix = kilo; attribute referenceUnit = g; }
+                 }
+                 attribute N = kg*m/s^2;
+                 attribute lbf {
+                     attribute unitConversion { attribute referenceUnit = N; attribute conversionFactor = 4.4482216152605; }
+                 }
+                 attribute L {
+                     attribute unitConversion { attribute referenceUnit = m^3; attribute conversionFactor = 0.001; }
+                 }
+                 attribute ratio {
+                     attribute unitConversion { attribute referenceUnit = m/m; attribute conversionFactor = 2; }
+                 }";
+    assert_eq!(
+        eval_with(units, "1 [lbf] == 4.4482216152605 [N]"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        eval_with(units, "1 [N] + 1 [lbf]").map(|v| v.to_string()),
+        Ok("5.4482216152605 [N]".into())
+    );
+    assert_eq!(
+        eval_with(units, "1000 [L] == 1 [m^3]"),
+        Ok(Value::Boolean(true))
+    );
+    assert!(matches!(
+        eval_with(units, "1 [ratio] + 1"),
+        Err(EvalError::Type(_))
+    ));
+}
+
+/// Lib-gated: the standard library's conversions to derived reference
+/// units (`lbf`, `kip` and `ozf` to `N`, `Btu_IT` to `J`, `hp` to `W`)
+/// and to products of units (`gal` to `m^3`, `L` to `m³`) convert, so
+/// they compare, add and combine with SI's units.
+#[test]
+fn standard_library_conversions_to_derived_reference_units() {
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut model = Model::new();
+    model.load_library_dir(&lib).unwrap();
+    model.add_source(
+        "derived.sysml",
+        "package D {
+            private import SI::*;
+            private import USCustomaryUnits::*;
+            attribute force = 1 [lbf] == 4.448222 [N];
+            attribute sum = 1 [N] + 1 [lbf];
+            attribute kips = 1 [kip] == 1000 [lbf];
+            attribute ounces = 1 [ozf] == 0.2780139 [N];
+            attribute energy = 1 [Btu_IT] == 1055.056 [J];
+            attribute power = 1 [hp] == 745.6999 [W];
+            attribute volume = 1 [gal] == 3.785412 [L];
+            attribute cubic = 1000 [L] == 1 [m^3];
+            attribute moment = 1 ['ft⋅lbf'] == 1 [ft] * 1 [lbf];
+            attribute rate = 1 [ft] * 1 [lbf] / (1 [s]);
+        }",
+    );
+    assert!(!model.has_errors());
+    let mut r = ResolvedModel::build(&model);
+    let mut value = |q: &str| {
+        let e = r.resolve_qualified(q).expect("resolves");
+        r.evaluate(e)
+    };
+    for name in [
+        "force", "kips", "ounces", "energy", "power", "volume", "cubic", "moment",
+    ] {
+        assert_eq!(
+            value(&format!("D::{name}")),
+            Ok(Value::Boolean(true)),
+            "{name}"
+        );
+    }
+    let rate = value("D::rate").unwrap();
+    assert_eq!(value("D::sum").unwrap().to_string(), "5.448222 [N]");
+    assert_eq!(rate.to_string(), "1.3558180656 [W]");
+    assert_eq!(
+        r.value_as_written(&rate).map(|w| w.to_string()),
+        Some("1 [lbf*ft/s]".into())
+    );
+}
+
 /// The evaluation budget: a range, a string or a step count that would
 /// run or allocate without bound fails cleanly instead of hanging the
 /// evaluator or exhausting memory.
@@ -2472,6 +2916,36 @@ fn evaluation_budget_bounds_cumulative_allocation_and_number_size() {
         matches!(&sum, Err(EvalError::Budget(m)) if m.contains("bits")),
         "{sum:?}"
     );
+}
+
+#[test]
+fn fan_out_charges_cloned_payloads_before_repeating_them() {
+    let payload = "x".repeat(1 << 20);
+    let decls = format!(
+        "attribute def Packet {{ attribute text; }}
+         part def Record {{
+             attribute text = \"{payload}\";
+             attribute packet = new Packet(text);
+         }}
+         part many : Record[257];
+         part few : Record[2];
+         part def Numeric {{ attribute number = 2 ** 500000; }}
+         part numbers : Numeric[5000];"
+    );
+    // Each string is small enough on its own. Cloning it directly or
+    // inside a data instance must account for its heap storage, as must
+    // cloning a large exact number. The count cap alone admits all three.
+    for expr in ["many.text", "many.packet", "numbers.number"] {
+        let result = eval_with(&decls, expr);
+        assert!(
+            matches!(&result, Err(EvalError::Budget(m)) if m.contains("bytes")),
+            "{expr} must exhaust the allocation budget"
+        );
+    }
+    for expr in ["few.text", "few.packet"] {
+        let result = eval_with(&decls, expr).unwrap();
+        assert!(matches!(result, Value::Sequence(items) if items.len() == 2));
+    }
 }
 
 /// The allocation budget covers every operator that materializes a value,
@@ -2656,10 +3130,38 @@ fn unbound_collections_never_materialize_as_single_instances() {
         part concrete = (m1, m2, m3, m4);
         calc def Identity { in x; return result = x; }
     ";
+    // A chain from an exact count of unknown instances takes the member
+    // from one of them, once per instance: every motor has the declared
+    // mass. Nothing materializes the motors themselves.
+    for collection in ["motors", "rack.motors"] {
+        assert_eq!(
+            eval_with(decls, &format!("{collection}.mass")),
+            Ok(Value::Sequence(vec![rat(11, 20); 4])),
+            "{collection}"
+        );
+        assert_eq!(
+            eval_with(decls, &format!("sum({collection}.mass)")),
+            Ok(rat(11, 5)),
+            "{collection}"
+        );
+    }
+    // A calculation hands back the placeholder with no record of how it was
+    // reached; a member declared outright in usages names its instances.
+    for expr in [
+        "sum(Identity(motors).mass)",
+        "sum(Identity(rack.motors).mass)",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(rat(11, 5)), "{expr}");
+    }
+    for expr in [
+        "optional.mass",
+        "sum(optional.mass)",
+        "sum(Identity(optional).mass)",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
     for collection in ["motors", "rack.motors", "optional"] {
         for expr in [
-            format!("{collection}.mass"),
-            format!("sum({collection}.mass)"),
             format!("{collection}->collect {{ in m; m.mass }}"),
             format!("{collection}->reduce {{ in a; in b; a }}"),
             format!("{collection}->forAll {{ in m; m.mass == 0.55 }}"),
@@ -2667,7 +3169,6 @@ fn unbound_collections_never_materialize_as_single_instances() {
             format!("size(({collection},))"),
             format!("size({collection} as Motor)"),
             format!("size(m1->collect {{ in m; {collection} }})"),
-            format!("sum(Identity({collection}).mass)"),
             format!("size(tail({collection}))"),
             format!("size(reverse({collection}))"),
             format!("size(union({collection}, m1))"),
@@ -2685,7 +3186,7 @@ fn unbound_collections_never_materialize_as_single_instances() {
         ("size(concrete)", int(4)),
         ("size((m1, m2))", int(2)),
         ("sum(concrete->collect { in m; m.mass })", rat(11, 5)),
-        ("sum(concrete.mass)", rat(11, 20)), // existing unique dot-chain semantics
+        ("sum(concrete.mass)", rat(11, 5)),
         ("sum(empty.mass)", int(0)),
         ("product(empty.mass)", int(1)),
         ("size((empty, m1))", int(1)),
@@ -2720,7 +3221,7 @@ fn indexing_chained_collections_requires_known_flattened_positions() {
     // remains unknown. Direct unknown collections retain their upper bounds.
     assert!(matches!(
         eval_with(declarations, "(a, b).scalar#(1)"),
-        Ok(Value::Unbound(_))
+        Ok(Value::Unbound(..))
     ));
     assert_eq!(eval_with(declarations, "(a, b).scalar#(2)"), Ok(int(99)));
     assert_eq!(
@@ -2734,7 +3235,7 @@ fn indexing_chained_collections_requires_known_flattened_positions() {
 }
 
 #[test]
-fn qualified_collection_receivers_preserve_indeterminate_values() {
+fn qualified_collection_receivers_fan_out_or_stay_indeterminate() {
     use sysmlv2_parser::ast::{Name, QualifiedName};
     let mut model = Model::new();
     let unit = model.add_source(
@@ -2755,12 +3256,1175 @@ fn qualified_collection_receivers_preserve_indeterminate_values() {
         }],
         span: Default::default(),
     };
-    for name in ["P::motors", "P::wrapped"] {
-        let root = r.resolve_qualified(name).unwrap();
-        assert_eq!(r.evaluate_chain(root, &[&member]), Ok(Value::Indeterminate));
+    // The chain reads every motor; the qualified name, one motor.
+    let root = r.resolve_qualified("P::motors").unwrap();
+    assert_eq!(
+        r.evaluate_chain(root, &[&member]),
+        Ok(Value::Sequence(vec![rat(11, 20); 4]))
+    );
+    assert_eq!(r.evaluate_qualified("P::motors::mass"), Ok(rat(11, 20)));
+    // A tuple of four unknown motors has no positions to put them at.
+    let root = r.resolve_qualified("P::wrapped").unwrap();
+    assert_eq!(r.evaluate_chain(root, &[&member]), Ok(Value::Indeterminate));
+    assert_eq!(
+        r.evaluate_qualified("P::wrapped::mass"),
+        Ok(Value::Indeterminate)
+    );
+}
+
+/// A qualified name's prefix with no value stands for one instance of it,
+/// whatever its multiplicity, at every depth: a part a package owns is a
+/// collection of any size, yet `P::car::mass` is the mass of each car.
+/// The chain `car.mass` reads every car, so it stays indeterminate.
+#[test]
+fn qualified_names_evaluate_for_one_instance_of_their_prefix() {
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "t.sysml",
+        "package P {
+            part def Wheel { attribute mass = 20; }
+            part def Car {
+                attribute base = 1000;
+                part wheels : Wheel[4];
+                attribute mass = base + sum(wheels.mass);
+            }
+            part car : Car { attribute :>> base = 1200; part :>> wheels { attribute :>> mass = 25; } }
+            part fleet : Car[2..*];
+            part tuned : Car[1] { attribute :>> wheels.mass = 30; }
+            part none : Car[0];
+            attribute chained = car.mass;
+        }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let mut r = ResolvedModel::build(&model);
+    for (name, expected) in [
+        ("P::car::base", int(1200)),
+        ("P::car::mass", int(1300)),
+        ("P::car::wheels::mass", int(25)),
+        ("P::fleet::mass", int(1080)),
+        ("P::fleet::wheels::mass", int(20)),
+        ("P::Car::wheels::mass", int(20)),
+        // A feature of no instance has no value to read.
+        ("P::none::mass", Value::Sequence(Vec::new())),
+    ] {
+        assert_eq!(r.evaluate_qualified(name), Ok(expected), "{name}");
+    }
+    // `tuned` redefines the wheels' mass as a chain, which their declaration
+    // in `Car` does not see: no wheel is taken for its instances.
+    assert_eq!(
+        r.evaluate_qualified("P::tuned::wheels::mass"),
+        Ok(Value::Indeterminate)
+    );
+    assert_eq!(r.evaluate_qualified("P::chained"), Ok(Value::Indeterminate));
+}
+
+/// A constraint or feature declared in an instance reads for that instance
+/// even with no chain to it, and so does a calculation the definition
+/// declares when the instance runs it: a rollup in it fans out over the
+/// instance's motors.
+#[test]
+fn evaluation_started_in_an_instance_reads_for_it() {
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "t.sysml",
+        "package P {
+            part def Motor { attribute mass; }
+            part def Quad {
+                attribute each default 0.5;
+                part motors : Motor[4] { attribute :>> mass = each; }
+                calc tot { return r = sum(motors.mass); }
+                attribute total = tot();
+            }
+            part drone : Quad[1] {
+                attribute :>> each = 0.6;
+                attribute direct = total;
+                attribute called = tot();
+            }
+        }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let mut r = ResolvedModel::build(&model);
+    for name in ["P::drone::direct", "P::drone::called"] {
+        let e = r.resolve_qualified(name).unwrap();
+        assert_eq!(r.evaluate(e), Ok(rat(12, 5)), "{name}");
+        assert_eq!(r.evaluate_qualified(name), Ok(rat(12, 5)), "{name}");
+    }
+    // Read for the definition itself, its declarations are what it reads.
+    let total = r.resolve_qualified("P::Quad::total").unwrap();
+    assert_eq!(r.evaluate(total), Ok(int(2)));
+}
+
+/// A chain step over a feature that stands for an exact number of unknown
+/// instances takes the rest of the chain from one of them and repeats a
+/// data result once per instance, through nested counts. A result with an
+/// identity (an element, an unknown) stays indeterminate, as does a
+/// receiver of open count.
+#[test]
+fn chains_over_an_exact_count_of_unknown_instances_fan_out() {
+    let decls = "
+        part def Tire { attribute pressure = 30; }
+        part def Wheel { part tire : Tire; attribute rim = 17; port valve; }
+        part def Spoke { attribute length = 2; }
+        part def Hub { part spokes : Spoke[3]; }
+        part def Gauge { attribute reading; attribute fallback default 7; }
+        enum def Mode { on; off; }
+        part def Switch { attribute mode : Mode = Mode::on; }
+        part def Pair { attribute xs = (1, 2); }
+        part def Car {
+            part wheels : Wheel[4];
+            attribute totalPressure = sum(wheels.tire.pressure);
+        }
+        part def Rig { ref part one : Gauge[1]; ref part two : Gauge[2]; }
+        part wheels : Wheel[4];
+        part hubs : Hub[2];
+        part gauges : Gauge[3];
+        part rig : Rig[1];
+        part some : Wheel[2..4];
+        part switches : Switch[2];
+        part pairs : Pair[600000];
+        part car : Car[1] { part :>> wheels { part :>> tire { attribute :>> pressure = 32; } } }
+    ";
+    for (expr, expected) in [
+        ("wheels.rim", Value::Sequence(vec![int(17); 4])),
+        ("sum(wheels.tire.pressure)", int(120)),
+        ("size(hubs.spokes.length)", int(6)),
+        ("sum(hubs.spokes.length)", int(12)),
+        ("size(switches.mode)", int(2)),
+        ("gauges.fallback", Value::Sequence(vec![int(7); 3])),
+        ("car.totalPressure", int(128)),
+        ("sum(car.wheels.tire.pressure)", int(128)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    for expr in [
+        "wheels.tire",
+        "size(wheels.tire)",
+        "wheels.valve",
+        "gauges.reading",
+        // A reference's default is no value of what it refers to, one
+        // instance or several.
+        "rig.one.fallback",
+        "rig.two.fallback",
+        "some.rim",
+        "sum(some.rim)",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+    // Too many repeated values: indeterminate, as without the fan-out.
+    assert_eq!(eval_with(decls, "pairs.xs"), Ok(Value::Indeterminate));
+}
+
+/// The one instance a fan-out evaluates is read for the instance the chain
+/// went through, so a redefinition there by name (`each`, and `n`, which
+/// counts the motors) is what every motor reads. A feature that names some
+/// of the motors' values (`m1 :> motors`) leaves the chain indeterminate, as
+/// does an evaluation of the one instance that recurses into itself.
+#[test]
+fn a_fan_out_reads_only_where_the_instances_read() {
+    let decls = "
+        part def Motor { attribute mass default 0.5; }
+        part def Quad {
+            attribute each default 0.5;
+            attribute n default 4;
+            part motors : Motor[4] { attribute :>> mass = each; }
+            part counted : Motor[n];
+            attribute total = sum(motors.mass);
+            attribute countedTotal = sum(counted.mass);
+        }
+        part plain : Quad[1];
+        part heavier : Quad[1] { attribute :>> each = 0.6; }
+        part hexa : Quad[1] { attribute :>> n = 6; }
+        part named : Quad[1] { part m1 :> motors[1] { attribute :>> mass = 1.0; } }
+        part redefinedNamed : Quad[1] {
+            part :>> motors;
+            part m1 :> motors[1] { attribute :>> mass = 1.0; }
+        }
+        part own : Quad[1] { attribute :>> each = 0.6; part :>> motors; }
+        part def Node {
+            attribute weight = 1;
+            part subs : Node[2];
+            attribute total = weight + sum(subs.total);
+        }
+        part tree : Node[1];
+    ";
+    for (expr, expected) in [
+        ("plain.total", int(2)),
+        ("own.total", rat(12, 5)),
+        ("heavier.total", rat(12, 5)),
+        ("plain.countedTotal", int(2)),
+        ("hexa.countedTotal", int(3)),
+        ("size(hexa.counted)", int(6)),
+        ("size(tree.subs.weight)", int(2)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    for expr in ["named.total", "redefinedNamed.total", "tree.total"] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+}
+
+/// A redefinition by name alone, under the feature's name or a short name,
+/// is the instance's version as a spelled `:>>` is: a fan-out reads it,
+/// through an intermediate definition, over another such redefinition, and
+/// with a type of its own. Two of them on different paths disagree, so the
+/// read is refused.
+#[test]
+fn a_fan_out_follows_implicit_redefinitions() {
+    for overriding in [
+        "attribute each = 0.6;",
+        "attribute <each> heavier = 0.6;",
+        "attribute each : ScalarValues::Real = 0.6;",
+    ] {
+        let decls = format!(
+            "part def Motor {{ attribute mass; }}
+             part def Quad {{
+                 attribute each default 0.5;
+                 part motors : Motor[4] {{ attribute :>> mass = each; }}
+                 attribute total = sum(motors.mass);
+             }}
+             part def Heavy :> Quad {{ {overriding} }}
+             part def Indirect :> Heavy;
+             part def Again :> Heavy {{ attribute each = 0.7; }}
+             part def Other :> Quad {{ attribute each = 0.7; }}
+             part def Both :> Heavy, Other;
+             part h : Indirect[1];
+             part a : Again[1];
+             part b : Both[1];
+             part plain : Quad[1] {{ attribute unrelated = 9; }}"
+        );
+        assert_eq!(eval_with(&decls, "h.each"), Ok(rat(3, 5)));
+        for expr in ["h.total", "sum(h.motors.mass)"] {
+            assert_eq!(
+                eval_with(&decls, expr),
+                Ok(rat(12, 5)),
+                "{overriding}: {expr}"
+            );
+        }
+        assert_eq!(eval_with(&decls, "a.total"), Ok(rat(14, 5)), "{overriding}");
         assert_eq!(
-            r.evaluate_qualified(&format!("{name}::mass")),
-            Ok(Value::Indeterminate)
+            eval_with(&decls, "b.total"),
+            Ok(Value::Indeterminate),
+            "{overriding}"
+        );
+        assert_eq!(eval_with(&decls, "plain.total"), Ok(int(2)));
+    }
+}
+
+/// A feature naming some of the instances says something of a member when
+/// one of its own members redefines that member by name alone, as it does
+/// with a spelled `:>>`: the fan-out is refused. One redefining an unrelated
+/// member by name refuses too (develop's rule for a specializer with any
+/// implicit redefinition), and a subsetting that says nothing still counts.
+#[test]
+fn a_specializer_redefining_by_name_alone_refuses_a_fan_out() {
+    const DECLS: &str = "part def Motor { attribute mass; attribute pressure default 30; }
+         part def Quad {
+             attribute each default 0.5;
+             part motors : Motor[4] { attribute :>> mass = each; }
+             attribute total = sum(motors.mass);
+         }
+         part def Named :> Quad { part m1 :> motors[1] { attribute mass = 1; } }
+         part def Short :> Quad { part m1 :> motors[1] { attribute <mass> weight = 1; } }
+         part def Unrelated :> Quad { part m1 :> motors[1] { attribute pressure = 32; } }
+         part def Deep :> Quad { part box { part m1 :> motors[1] { attribute mass = 1; } } }
+         part def Counted :> Quad { part m1 :> motors[1]; }
+         part n : Named[1];
+         part s : Short[1];
+         part u : Unrelated[1];
+         part d : Deep[1];
+         part c : Counted[1];
+         part i : Quad[1] { part m1 :> motors[1] { attribute mass = 1; } }
+         part k : Quad[1] { part box { part m1 :> motors[1] { attribute <mass> weight = 1; } } }";
+    for expr in [
+        "n.total",
+        "sum(n.motors.mass)",
+        "s.total",
+        "u.total",
+        "d.total",
+        "i.total",
+        "sum(i.motors.mass)",
+        "k.total",
+    ] {
+        assert_eq!(eval_with(DECLS, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+    assert_eq!(eval_with(DECLS, "c.total"), Ok(int(2)));
+    assert_eq!(eval_with(DECLS, "n.m1.mass"), Ok(int(1)));
+}
+
+#[test]
+fn a_fan_out_checks_library_specializers_in_every_load_mode() {
+    use sysmlv2_parser::prepared::PreparedLibrary;
+    for specializer in [
+        "part heavy :> motors[1] { attribute :>> mass = 1; }",
+        "ref part heavy ::> motors[1] { attribute :>> mass = 1; }",
+        "part counted :> motors[1];",
+    ] {
+        let source = format!(
+            "package L {{
+                part def Motor {{ attribute mass default 0.5; }}
+                part def Quad {{
+                    part motors : Motor[4];
+                    {specializer}
+                    attribute total = sum(motors.mass);
+                }}
+            }}"
+        );
+        for mode in ["source", "library", "prepared", "restored"] {
+            let mut model = Model::new();
+            let unit = if mode == "source" {
+                model.add_source("library.sysml", &source)
+            } else {
+                model.add_library_source("library.sysml", &source)
+            };
+            assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+            if matches!(mode, "prepared" | "restored") {
+                let mut prepared = model.prepare_library().unwrap();
+                if mode == "restored" {
+                    let bytes = prepared.to_bytes(42).unwrap();
+                    prepared =
+                        std::sync::Arc::new(PreparedLibrary::from_bytes(&bytes, 42).unwrap());
+                }
+                model = Model::new();
+                prepared.install(&mut model).unwrap();
+            }
+            let unit = model.add_source(
+                "user.sysml",
+                "package T { part q : L::Quad[1]; attribute total = q.total; }",
+            );
+            assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+            let mut r = ResolvedModel::build(&model);
+            let total = r.resolve_qualified("T::total").unwrap();
+            let expected = if specializer.contains("counted") {
+                int(2)
+            } else {
+                Value::Indeterminate
+            };
+            assert_eq!(r.evaluate(total), Ok(expected), "{mode}: {specializer}");
+        }
+    }
+}
+
+/// The instance chain a fan-out reads through is checked whole: every
+/// declaration around the one instance must read as the instance in the
+/// same place does, on every specialization path (a redefinition by name is
+/// read as the instance's), and no feature elsewhere may name some of these
+/// instances' values. A reference, a binding the evaluation does not follow
+/// and a feature naming some of the instances leave the chain
+/// indeterminate. A definition's own reading is its declaration, whatever
+/// its specializations redefine.
+#[test]
+fn a_fan_out_checks_the_whole_instance_chain() {
+    let decls = "
+        part def Rotor { attribute mass; }
+        part def Motor { part rotor : Rotor[1]; attribute mass default 0.5; }
+        part def Quad {
+            attribute each default 0.5;
+            part motors : Motor[4] { part :>> rotor { attribute :>> mass = each; } }
+            attribute total = sum(motors.rotor.mass);
+        }
+        part def Heavy :> Quad { attribute :>> each = 0.6; }
+        part def Plain :> Quad;
+        part def Mix :> Heavy, Plain;
+        part diamond : Quad, Heavy [1];
+        part mixed : Mix[1];
+        part nested : Quad[1] { attribute :>> each = 0.6; part :>> motors; }
+        part plain : Plain[1];
+        part ownRotors : Quad[1] {
+            attribute :>> each = 0.6;
+            part :>> motors { part :>> rotor { attribute :>> mass = each; } }
+        }
+        part def Rack { attribute k default 3; part sub : Motor[2] { attribute :>> mass = k; } }
+        part def Holder { ref part rack : Rack[1]; attribute w = sum(rack.sub.mass); }
+        part holder : Holder[1];
+        part def Pod { part motors : Motor[4]; attribute total = sum(motors.mass); }
+        part q : Pod[1];
+        part m1 :> q.motors [1] { attribute :>> mass = 1.0; }
+        part spare : Pod[1];
+        part spare2 :> spare { part :>> motors { attribute :>> mass = 1.0; } }
+        part loose : Pod[1];
+        part def Calculated {
+            attribute each default 0.5;
+            part motors : Motor[4] { attribute :>> mass = each; }
+            calc tot { return r = sum(motors.mass); }
+            attribute total = tot();
+        }
+        part calculated : Calculated[1] { attribute :>> each = 0.6; }
+        part own : Pod[1] { part :>> motors; }
+        part other[1] { ref part favourite ::> own.motors[1] { attribute :>> mass = 1.0; } }
+        attribute six = 0.6;
+        part bound : Calculated[1] { bind each = six; }
+        part own2 : Pod[1] { part :>> motors; }
+        part other2[1] { ref part favourite ::> T::own2::motors[1] { attribute :>> mass = 1.0; } }
+        part wired : Pod[1] { part :>> motors; }
+        part def Thing;
+        part thing : Thing[1];
+        allocation wiring allocate thing to wired.motors;
+        part heavyOnes : Motor[0..*] { attribute :>> mass = 1.0; }
+        part shared : Pod[1];
+        part heavyShared :> shared.motors, heavyOnes [1];
+        part counted : Pod[1];
+        part countedOne :> counted.motors [1];
+    ";
+    for (expr, expected) in [
+        ("plain.total", int(2)),
+        ("ownRotors.total", rat(12, 5)),
+        ("loose.total", int(2)),
+        // An allocation's end names the motors and says nothing about them,
+        // and so does a feature that only counts one of them.
+        ("wired.total", int(2)),
+        ("counted.total", int(2)),
+        ("Quad::total", int(2)),
+        // Every path to `Quad` redefines `each` by name, or nothing.
+        ("diamond.total", rat(12, 5)),
+        ("mixed.total", rat(12, 5)),
+        ("nested.total", rat(12, 5)),
+        ("sum(nested.motors.rotor.mass)", rat(12, 5)),
+        // A calculation the definition declares runs for the instance.
+        ("calculated.total", rat(12, 5)),
+        // A binding with both ends resolved is followed.
+        ("bound.total", rat(12, 5)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    for expr in [
+        "holder.w",
+        "q.total",
+        "spare.total",
+        // A reference anywhere naming one of the instance's own motors.
+        "own.total",
+        "own2.total",
+        // A motor that is also one of the heavy ones.
+        "shared.total",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+}
+
+/// A feature with no value that an instance inherits, or that a chain reaches
+/// through an instance, is that instance's: its members read the instance's
+/// redefinitions, at every depth, through an alias, a calculation and a
+/// qualified path. A definition's own reading, and a qualified name, read the
+/// declaration.
+#[test]
+fn placeholders_read_for_the_instance_they_were_reached_through() {
+    let decls = "
+        part def Motor { attribute mass; }
+        part def Quad {
+            attribute each default 0.5;
+            part spare : Motor[1] { attribute :>> mass = each; }
+            attribute s = spare;
+            attribute spareMass = spare.mass;
+            calc twice { return r = spare.mass * 2; }
+            attribute doubled = twice();
+        }
+        part drone : Quad[1] {
+            attribute :>> each = 0.6;
+            attribute inner = spare.mass;
+            attribute called = twice();
+        }
+        part def Heavy :> Quad { attribute :>> each = 0.7; attribute own = spare.mass; }
+        part heavy : Heavy[1];
+        part def Sys {
+            part drone : Quad[1] { attribute :>> each = 0.65; }
+            attribute inner = drone.spare.mass;
+        }
+        part def Sys2 :> Sys { part :>> drone { attribute :>> each = 0.66; } }
+        part sys : Sys[1];
+        part sys2 : Sys2[1];
+    ";
+    for (expr, expected) in [
+        ("drone.spare.mass", rat(3, 5)),
+        ("drone.spareMass", rat(3, 5)),
+        ("drone.s.mass", rat(3, 5)),
+        ("drone.inner", rat(3, 5)),
+        ("drone.doubled", rat(6, 5)),
+        ("drone.twice()", rat(6, 5)),
+        ("drone.called", rat(6, 5)),
+        ("heavy.own", rat(7, 10)),
+        ("heavy.spare.mass", rat(7, 10)),
+        ("sys.drone.spare.mass", rat(13, 20)),
+        ("sys.inner", rat(13, 20)),
+        ("sys2.drone.spare.mass", rat(33, 50)),
+        ("sys2.inner", rat(33, 50)),
+        ("sys2.drone.doubled", rat(33, 25)),
+        ("Quad::spareMass", rat(1, 2)),
+        ("Quad::doubled", int(1)),
+        ("Quad::spare.mass", rat(1, 2)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+}
+
+/// An instance reads a name its declaration resolves where the declaration
+/// resolves it: a package-level feature beside the declaring definition
+/// stays that one, whatever the instance's own package declares. A
+/// qualified name's prefix supplies the instances, and `that` is the
+/// instance standing for the featuring type.
+#[test]
+fn an_instance_reads_names_where_its_declaration_resolves_them() {
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "t.sysml",
+        "package A {
+            attribute g = 9.8;
+            part def Motor { attribute mass; }
+            part def Quad {
+                attribute each default 0.5;
+                part spare : Motor[1] {
+                    attribute :>> mass = each;
+                    attribute grav = g;
+                    attribute owner = that;
+                }
+            }
+        }
+        package B {
+            private import A::*;
+            attribute g = 1;
+            attribute each = 99;
+            part drone : Quad[1] { attribute :>> each = 0.6; }
+            attribute grav = drone.spare.grav;
+            attribute owner = drone.spare.owner;
+        }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let mut r = ResolvedModel::build(&model);
+    for (name, expected) in [
+        ("B::drone::spare::mass", rat(3, 5)),
+        ("B::drone::spare::grav", rat(49, 5)),
+        ("A::Quad::spare::mass", rat(1, 2)),
+    ] {
+        assert_eq!(r.evaluate_qualified(name), Ok(expected), "{name}");
+    }
+    let grav = r.resolve_qualified("B::grav").unwrap();
+    assert_eq!(r.evaluate(grav), Ok(rat(49, 5)));
+    let drone = r.resolve_qualified("B::drone").unwrap();
+    let owner = r.resolve_qualified("B::owner").unwrap();
+    assert!(
+        matches!(r.evaluate(owner), Ok(Value::Unbound(e, _)) if e == drone),
+        "{:?}",
+        r.evaluate(owner)
+    );
+}
+
+/// A fan-out reads what a lookup by name finds, so what that misses keeps
+/// the chain indeterminate rather than repeating a declaration's value: a
+/// redefinition under another name, in the instance, in the part the chain
+/// reads through or in its type; a subsetting feature; a qualified name
+/// that reads a declaration the instance stands for. Nested instances read
+/// for each other, and a count reads the instance's bounds.
+#[test]
+fn a_fan_out_refuses_what_a_lookup_by_name_misses() {
+    let decls = "
+        part def Motor { attribute mass default 0.5; }
+        part def Quad {
+            attribute each default 0.5;
+            attribute n default 4;
+            part motors : Motor[4] { attribute :>> mass = each; }
+            part plainMotors : Motor[4];
+            part counted : Motor[n];
+            attribute total = sum(motors.mass);
+            attribute plainTotal = sum(plainMotors.mass);
+            calc own { return r = each; }
+            part called : Motor[4] { attribute :>> mass = Quad::own(); }
+            part spare : Motor[1] { attribute :>> mass = each; }
+            part qualified : Motor[4] { attribute :>> mass = Quad::spare::mass; }
+        }
+        part drone : Quad[1] { attribute :>> each = 0.6; }
+        part renamed : Quad[1] { attribute weight :>> each = 0.6; }
+        part subset : Quad[1] { attribute e2 :> each = 0.6; }
+        part renamedInside : Quad[1] { part :>> plainMotors { attribute weight :>> mass = 1.0; } }
+        part def Heavy :> Motor { attribute weight :>> mass = 1.0; }
+        part typed : Quad[1] { part :>> plainMotors : Heavy; }
+        part def Sys {
+            attribute k default 5;
+            part drone : Quad[1] { attribute :>> each = 0.65; attribute :>> n = k; }
+        }
+        part def Sys2 :> Sys { part :>> drone { attribute :>> each = 0.7; } }
+        part sys : Sys[1];
+        part sys2 : Sys2[1];
+        part def Other { attribute each default 9; }
+        part both : Quad, Other [1] { attribute :>> Other::each = 7; }
+        part nestedNamed : Quad[1] {
+            attribute :>> each = 0.6;
+            part inner[1] { part m1 :> motors[1] { attribute :>> mass = 1.0; } }
+        }
+        part def Vehicle {
+            part wheels : Motor[4];
+            part frontLeft :> wheels;
+            attribute front = sum(frontLeft.mass);
+        }
+        part v7 : Vehicle[1] { part :>> wheels { attribute :>> mass = 1.1; } }
+        part def Sub :> Quad { attribute each2 :> each; }
+        part pinned : Sub[1] { attribute :>> each2 = 0.8; }
+        part pinnedInside : Quad[1] { attribute e2 :> each; part inner[1] { attribute :>> e2 = 0.8; } }
+        part def Car {
+            part wheels : Motor[4];
+            part frontAxle[1] { part leftWheel :> wheels { attribute :>> mass = 1.2; } }
+        }
+        part car : Car[1];
+        part counted4 : Quad[1] { attribute :>> each = 0.6; part m1 :> motors[1]; }
+    ";
+    for (expr, expected) in [
+        // `both` redefines `Other::each`, not `Quad::each`.
+        ("both.spare.mass", rat(1, 2)),
+        ("sys.drone.total", rat(13, 5)),
+        ("sum(sys.drone.motors.mass)", rat(13, 5)),
+        ("sys2.drone.total", rat(14, 5)),
+        ("sys2.drone.plainTotal", int(2)),
+        // A feature that only counts one of the motors changes no value.
+        ("counted4.total", rat(12, 5)),
+        // The count reads `k` in the enclosing instance.
+        ("size(sys.drone.counted)", int(5)),
+        ("sum(sys.drone.counted.mass)", rat(5, 2)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    for expr in [
+        "renamed.total",
+        "subset.total",
+        "renamedInside.plainTotal",
+        "sum(renamedInside.plainMotors.mass)",
+        "typed.plainTotal",
+        "sum(drone.called.mass)",
+        "sum(drone.qualified.mass)",
+        "both.total",
+        // A motor declared inside the instance, with a mass of its own.
+        "nestedNamed.total",
+        // The front wheels are among `v7`'s wheels, which their own
+        // declaration does not read.
+        "v7.front",
+        "sum(v7.frontLeft.mass)",
+        // `each2 :> each`, given a value below, gives single-valued `each`
+        // that value.
+        "pinned.total",
+        "pinnedInside.total",
+        // A wheel declared inside the car, with a mass of its own.
+        "sum(car.wheels.mass)",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+}
+
+/// Reads for an instance take what an instance around it says: a chain
+/// redefinition (`attribute :>> b.kb = 9;`) wherever the feature is read for
+/// that path, a calculation's parameter bound to the instance's feature, and
+/// a count from the instance's bounds. A feature that subsets one and says
+/// nothing of its values changes none of them.
+#[test]
+fn instances_read_what_the_instances_around_them_say() {
+    let decls = "
+        part def C { attribute kc default 1; attribute v = kc * 10; }
+        part def B { attribute kb default 2; attribute twice = kb * 2; part c : C[1] { attribute :>> kc = kb; } }
+        part def A { attribute k default 3; part b : B[1] { attribute :>> kb = k; } }
+        part chained : A[1] { attribute :>> b.kb = 9; }
+        part redefinedToo : A[1] { attribute :>> b.kb = 9; part :>> b; }
+        part threeLinks : A[1] { attribute :>> b.c.kc = 11; }
+        part def Own { part a : A[1]; attribute :>> a.b.kb = 4; attribute sv = a.b.c.v; }
+        part def Pair { part bs : B[2]; part b1 :> bs[1]; part b2 :> bs[1]; attribute t = sum(bs.c.v); }
+        part pair : Pair[1] { attribute :>> b1.kb = 9; }
+        part nested : A[1] { part :>> b { attribute :>> kb = k + 100; } attribute :>> k = 7; }
+        calc def Twice { in x; return r = 2 * x; }
+        part def Plate { attribute w = 3; attribute area = w * 4; calc dbl : Twice { in x = area; } attribute a2 = dbl(); }
+        part plate : Plate[1] { attribute :>> w = 5; }
+        part def Wheel { attribute mass = 10; }
+        part def SubW :> Wheel { attribute rimMass :> mass; }
+        part def Car { part wheels : Wheel[4]; attribute total = sum(wheels.mass); }
+        part car : Car[1] { part :>> wheels : SubW[4]; }
+        part def Rack { attribute n = 4; part items : Wheel[n]; attribute cnt = size(items); }
+        part rack : Rack[1] { attribute :>> n = 6; }
+        part def Tyre { attribute mass = 10; attribute pressure = 30; }
+        part def Fleet {
+            part wheels : Tyre[4];
+            part axle[1] { part leftWheel :> wheels { attribute :>> pressure = 32; } }
+        }
+        part fleet : Fleet[1];
+    ";
+    for (expr, expected) in [
+        ("chained.b.kb", int(9)),
+        ("chained.b.c.v", int(90)),
+        // Read beside the chain's end, in the same instance, three links
+        // down, and in a definition's own reading.
+        ("chained.b.twice", int(18)),
+        ("redefinedToo.b.c.v", int(90)),
+        ("threeLinks.b.c.v", int(110)),
+        ("Own::sv", int(40)),
+        ("nested.b.c.v", int(1070)),
+        ("plate.a2", int(40)),
+        ("car.total", int(40)),
+        ("sum(car.wheels.mass)", int(40)),
+        ("rack.cnt", int(6)),
+        // A wheel declared inside the fleet changes its pressure, not its
+        // mass.
+        ("sum(fleet.wheels.mass)", int(40)),
+        ("pair.b1.c.v", int(90)),
+        ("pair.b2.c.v", int(20)),
+        // `b1` and `b2`, declared in `Pair`, are the pair's two `bs`.
+        ("sum(pair.bs.c.v)", int(110)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    // The pressure it changes, and a rollup in the pair's definition over
+    // `bs` when a chain in the pair pins one of them, stay unknown.
+    for expr in ["sum(fleet.wheels.pressure)", "pair.t"] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+}
+
+/// A binding connector gives a feature with no value of its own the other
+/// end's value, read for the instance the binding is read for: in the
+/// instance, in its definition, through a chain end, from either side, from
+/// an enclosing instance, and inside a fan-out. A default yields to a
+/// settled value and holds against an unsettled one; a value of the feature's
+/// own that is no default is kept; two unvalued ends stay unknown.
+#[test]
+fn bindings_give_a_feature_the_other_ends_value() {
+    let decls = "
+        part def Motor { attribute mass default 0.5; }
+        part def Quad {
+            attribute each default 0.5;
+            part spare : Motor[1] { attribute :>> mass = each; }
+            part motors : Motor[4] { attribute :>> mass = each; }
+            attribute total = sum(motors.mass);
+            calc tot { return r = sum(motors.mass); }
+            attribute viaCalc = tot();
+        }
+        attribute six = 0.6;
+        part bound : Quad[1] { bind each = six; }
+        part def BoundDef :> Quad { bind each = six; }
+        part bd : BoundDef[1];
+        part reversed : Quad[1] { bind six = each; }
+        part local : Quad[1] { attribute z = 0.7; bind each = z; }
+        part def C { attribute kc default 1; attribute v = kc * 10; }
+        part def B { attribute kb default 2; part c : C[1] { attribute :>> kc = kb; } }
+        part def A { attribute k default 3; part b : B[1] { attribute :>> kb = k; } }
+        part a8 : A[1] { attribute z = 12; bind k = z; }
+        part def Two { attribute x; attribute y; bind x = y; }
+        part two : Two[1];
+        part def Twin { attribute x; attribute y = 5; bind x = y; }
+        part twin : Twin[1];
+        part valued : Quad[1] { attribute :>> each = 0.9; bind each = six; }
+        part unsettled : Quad[1] { attribute w; bind each = w; }
+        part def Sys { attribute s = 0.8; part q : Quad[1] { bind each = s; } attribute inner = q.total; }
+        part sys : Sys[1];
+        part sys2 : Sys[1] { attribute :>> s = 0.3; }
+        part outerChain : Sys[1] { attribute z = 0.2; bind q.each = z; }
+        action def Act { in x; }
+        action act : Act[1] { action b[1] { in y = x; } bind x = b.y; }
+        part def Base { attribute x default 1; attribute y = 5; bind x = y; }
+        part inherits : Base[1] { attribute :>> y = 7; }
+        part o1[1] { attribute x default 1; attribute y; attribute z = 5; bind x = y; bind x = z; }
+        part o2[1] { attribute x default 1; attribute y; attribute z = 5; bind x = z; bind x = y; }
+        part def Rack { attribute n default 4; part items : Motor[n]; }
+        part rack : Rack[1] { attribute six = 6; bind n = six; }
+    ";
+    for (expr, expected) in [
+        ("bound.spare.mass", rat(3, 5)),
+        ("bound.total", rat(12, 5)),
+        ("bound.viaCalc", rat(12, 5)),
+        ("bound.each", rat(3, 5)),
+        ("bd.spare.mass", rat(3, 5)),
+        ("bd.total", rat(12, 5)),
+        ("reversed.spare.mass", rat(3, 5)),
+        ("local.total", rat(14, 5)),
+        ("a8.k", int(12)),
+        ("a8.b.c.v", int(120)),
+        ("twin.x", int(5)),
+        ("valued.spare.mass", rat(9, 10)),
+        ("unsettled.spare.mass", rat(1, 2)),
+        ("unsettled.total", int(2)),
+        ("sys.q.total", rat(16, 5)),
+        ("sys.inner", rat(16, 5)),
+        ("sys2.q.spare.mass", rat(3, 10)),
+        ("outerChain.q.total", rat(16, 5)),
+        // An inherited binding reads the instance's version of its end.
+        ("inherits.x", int(7)),
+        // Whatever the order, the binding whose end settles gives the value;
+        // a default does not settle a binding being followed.
+        ("o1.x", int(5)),
+        ("o1.y", int(5)),
+        ("o2.x", int(5)),
+        ("o2.y", int(5)),
+        // A bound reads its feature through the binding too.
+        ("rack.n", int(6)),
+        ("size(rack.items)", int(6)),
+        ("sum(rack.items.mass)", int(3)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    // Two unvalued ends, and an equality that comes back round to the
+    // feature read (`y = x`, `x = b.y`), settle nothing.
+    for expr in ["two.x", "act.b.y"] {
+        assert!(
+            matches!(eval_with(decls, expr), Ok(Value::Unbound(..))),
+            "{expr}: {:?}",
+            eval_with(decls, expr)
         );
     }
+}
+
+/// A multiplicity bound reading a feature of an enclosing instance reads it
+/// there, with that instance's redefinitions and through its formulas; two
+/// redefinitions of one feature inherited on paths that agree on nothing, an
+/// ambiguous lookup past such redefinitions, or a redefinition under another
+/// name in a type the instance specializes leave the feature's reads
+/// indeterminate, where agreeing paths and a single one read the redefinition.
+#[test]
+fn enclosing_bounds_are_read_there_and_disagreeing_redefinitions_refuse() {
+    let decls = "
+        part def Motor { attribute mass default 0.5; }
+        part def Rack { attribute n = 4; part items : Motor[n]; attribute total = sum(items.mass); }
+        part def Sys { attribute k = 5; part rack : Rack[1] { attribute :>> n = k; } }
+        part sys : Sys[1];
+        part sys2 : Sys[1] { attribute :>> k = 7; }
+        part def Deep { attribute m = 3; attribute k = m * 2; part rack : Rack[1] { attribute :>> n = k; } }
+        part deep : Deep[1] { attribute :>> m = 4; }
+        part def Quad { attribute each default 0.5; part spare : Motor[1] { attribute :>> mass = each; } attribute spareMass = spare.mass; }
+        part def H1 :> Quad { attribute :>> each = 0.6; }
+        part def H2 :> Quad { attribute :>> each = 0.7; }
+        part def R1 :> Quad { attribute w :>> each = 0.9; }
+        part def H1b :> H1 { attribute :>> each = 0.65; }
+        part both : H1, H2 [1];
+        part mix : H1, R1 [1];
+        part mix3 : R1 [1] { attribute :>> each = 0.4; }
+        part agree : H1, H1b [1];
+        part h1 : H1[1];
+        part renamed : Quad[1] { attribute weight :>> each = 0.6; }
+    ";
+    for (expr, expected) in [
+        ("size(sys.rack.items)", int(5)),
+        ("sum(sys.rack.items.mass)", rat(5, 2)),
+        ("sys.rack.total", rat(5, 2)),
+        ("size(sys2.rack.items)", int(7)),
+        ("sys2.rack.total", rat(7, 2)),
+        ("size(deep.rack.items)", int(8)),
+        ("agree.spare.mass", rat(13, 20)),
+        ("h1.spare.mass", rat(3, 5)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    for expr in [
+        "both.spare.mass",
+        "both.spareMass",
+        "mix.spare.mass",
+        "mix3.spare.mass",
+        "renamed.spare.mass",
+        "renamed.each",
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(Value::Indeterminate), "{expr}");
+    }
+}
+
+/// A chain of bindings longer than the call depth is a runaway, refused with
+/// a budget error rather than followed without bound.
+#[test]
+fn a_runaway_chain_of_bindings_exhausts_the_budget() {
+    let mut decls = String::from("part p[1] {");
+    for i in 0..120 {
+        decls.push_str(&format!(" attribute x{i};"));
+    }
+    decls.push_str(" attribute x120 = 7;");
+    for i in (0..120).rev() {
+        decls.push_str(&format!(" bind x{i} = x{};", i + 1));
+    }
+    decls.push('}');
+    assert!(matches!(
+        eval_with(&decls, "p.x0"),
+        Err(EvalError::Budget(_))
+    ));
+    // A chain within the budget is followed to its end.
+    let mut decls = String::from("part p[1] {");
+    for i in 0..20 {
+        decls.push_str(&format!(" attribute x{i};"));
+    }
+    decls.push_str(" attribute x20 = 7;");
+    for i in (0..20).rev() {
+        decls.push_str(&format!(" bind x{i} = x{};", i + 1));
+    }
+    decls.push('}');
+    assert_eq!(eval_with(&decls, "p.x0"), Ok(int(7)));
+}
+
+/// A component in which every feature is bound to every other is walked
+/// once per read, not once per path through it: forty features finish
+/// at once, unsettled with none valued and settled when one is. Cycles
+/// with a value reach it from every feature, and a feature read twice in
+/// one expression is settled both times.
+#[test]
+fn a_densely_bound_component_is_walked_once() {
+    for valued in [false, true] {
+        let mut decls = String::from("part p[1] {");
+        for i in 0..40 {
+            decls.push_str(&format!(" attribute x{i};"));
+        }
+        if valued {
+            decls.push_str(" attribute x40 = 7;");
+        } else {
+            decls.push_str(" attribute x40;");
+        }
+        for i in 0..=40 {
+            for j in i + 1..=40 {
+                decls.push_str(&format!(" bind x{i} = x{j};"));
+            }
+        }
+        decls.push('}');
+        let value = eval_with(&decls, "p.x0");
+        if valued {
+            assert_eq!(value, Ok(int(7)));
+        } else {
+            assert!(matches!(value, Ok(Value::Unbound(..))), "{value:?}");
+        }
+    }
+    const DECLS: &str = "part def Ring {
+             attribute a; attribute b; attribute c; attribute d = 4;
+             bind a = b; bind b = c; bind c = a; bind c = d;
+         }
+         part ring : Ring[1];
+         part def Twice { attribute u; attribute v = 3; bind u = v; attribute w = u + u; }
+         part tw : Twice[1];";
+    assert_eq!(eval_with(DECLS, "ring.a"), Ok(int(4)));
+    assert_eq!(eval_with(DECLS, "ring.b"), Ok(int(4)));
+    assert_eq!(eval_with(DECLS, "tw.w"), Ok(int(6)));
+}
+
+/// A binding whose other end has a value nobody knows still fixes the
+/// feature, so its default does not apply: `y` redefined under another name
+/// in the instance has no reading that is the instance's. A binding to an
+/// unvalued feature leaves the default its say, and one reaching a value
+/// through another binding takes it.
+#[test]
+fn a_binding_to_an_unknown_value_keeps_the_default_out() {
+    const DECLS: &str =
+        "part def Base { attribute x default 1; attribute y default 5; bind x = y; }
+         part p : Base[1] { attribute renamed :>> y = 7; }
+         part def Pair { attribute x default 1; attribute y; attribute z; bind x = y; bind y = z; }
+         part q : Pair[1];
+         part r : Pair[1] { attribute :>> z = 9; }";
+    assert_eq!(eval_with(DECLS, "p.x"), Ok(Value::Indeterminate));
+    assert_eq!(eval_with(DECLS, "p.y"), Ok(Value::Indeterminate));
+    assert_eq!(eval_with(DECLS, "p.renamed"), Ok(int(7)));
+    assert_eq!(eval_with(DECLS, "q.x"), Ok(int(1)));
+    assert_eq!(eval_with(DECLS, "r.x"), Ok(int(9)));
+}
+
+/// Bindings a library declares are followed when a model reads through
+/// them, and a model's binding to a feature a library declares is followed
+/// too.
+#[test]
+fn library_bindings_are_followed() {
+    let mut model = Model::new();
+    let unit = model.add_library_source(
+        "domain.sysml",
+        "package D { part def Base { attribute x default 1; attribute y = 5; bind x = y; } part def Plain { attribute x default 1; } }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let unit = model.add_source(
+        "user.sysml",
+        "package U {
+            part p : D::Base[1];
+            part q : D::Plain[1] { attribute y = 5; bind x = y; }
+            attribute px = p.x;
+            attribute qx = q.x;
+        }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let mut r = ResolvedModel::build(&model);
+    for name in ["U::px", "U::qx"] {
+        let e = r.resolve_qualified(name).unwrap();
+        assert_eq!(r.evaluate(e), Ok(int(5)), "{name}");
+    }
+}
+
+/// The cardinality report of a placeholder reads its bounds in the instance
+/// the placeholder is read for, as `size` does: never the declaration's
+/// bounds the instance overrides. Its certified projection covers
+/// declaration receivers, so for an instance it may answer incomplete
+/// rather than certify.
+#[test]
+fn the_cardinality_report_never_certifies_bounds_an_instance_overrides() {
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "t.sysml",
+        "package P {
+            part def Motor;
+            part def Rack { attribute n default 4; part items : Motor[n]; }
+            part p : Rack[1] { attribute :>> n = 6; }
+            attribute items = p.items;
+            attribute count = size(p.items);
+        }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let mut r = ResolvedModel::build(&model);
+    let count = r.resolve_qualified("P::count").unwrap();
+    assert_eq!(r.evaluate(count), Ok(int(6)));
+    let items = r.resolve_qualified("P::items").unwrap();
+    let value = r.evaluate(items).unwrap();
+    assert!(matches!(value, Value::Unbound(..)), "{value:?}");
+    match r.collection_cardinality_report(&value).bounds {
+        Ok(bounds) => assert_eq!(bounds.size(), Some(6)),
+        Err(issue) => assert!(
+            matches!(
+                issue,
+                sysmlv2_parser::json::CardinalityIssue::IncompleteProvider
+                    | sysmlv2_parser::json::CardinalityIssue::UnsupportedBound
+            ),
+            "{issue:?}"
+        ),
+    }
+}
+
+/// Features that are one value each and subset a feature that is one
+/// value all name that one value. Siblings that only name it count it once;
+/// a chain reads its most specific member; siblings saying something of it
+/// leave the population unknown; subsets of two different values count two.
+#[test]
+fn subsets_of_one_value_count_it_once() {
+    const DECLS: &str = "part def Motor { attribute mass default 10; }
+         part def Kit { part items : Motor[0..*]; part a :> items[1]; }
+         part def Kit2 { part items : Motor[0..*]; part a :> items[1]; part b :> items[1]; }
+         part sib : Kit[1] { part also :> a[1]; part again :> a[1]; }
+         part sib3 : Kit[1] { part also :> a[1]; part again :> a[1]; part third :> a[1]; }
+         part sibsay : Kit[1] { part also :> a[1] { attribute :>> mass = 20; } part again :> a[1]; }
+         part chain : Kit[1] { part also :> a[1]; part deeper :> also[1] { attribute :>> mass = 4; } }
+         part two : Kit2[1] { part also :> a[1]; part again :> b[1]; }";
+    assert_eq!(eval_with(DECLS, "size(sib.items)"), Ok(int(1)));
+    assert_eq!(eval_with(DECLS, "sum(sib.items.mass)"), Ok(int(10)));
+    assert_eq!(eval_with(DECLS, "size(sib3.items)"), Ok(int(1)));
+    assert_eq!(
+        eval_with(DECLS, "sum(sibsay.items.mass)"),
+        Ok(Value::Indeterminate)
+    );
+    assert_eq!(eval_with(DECLS, "size(chain.items)"), Ok(int(1)));
+    assert_eq!(eval_with(DECLS, "sum(chain.items.mass)"), Ok(int(4)));
+    assert_eq!(eval_with(DECLS, "size(two.items)"), Ok(int(2)));
+    assert_eq!(eval_with(DECLS, "sum(two.items.mass)"), Ok(int(20)));
+}
+
+/// A general's member that the receiver hides with a same-named member of
+/// its own, in the receiver or in a definition between, is gathered as the
+/// receiver's member, never as well as it.
+#[test]
+fn a_population_reads_the_receivers_same_name_version() {
+    const DECLS: &str = "part def Motor { attribute mass default 2; }
+         part def Kit { part items : Motor[0..*]; part a :> items[1]; }
+         part shadow : Kit[1] { part a[1] { attribute mass = 3; } }
+         part def Kit3 :> Kit { part a[1] { attribute mass = 4; } }
+         part mid : Kit3[1];
+         part subsetting : Kit[1] { part a :> items[1] { attribute mass = 5; } }";
+    assert_eq!(eval_with(DECLS, "shadow.a.mass"), Ok(int(3)));
+    assert_eq!(eval_with(DECLS, "sum(shadow.items.mass)"), Ok(int(3)));
+    assert_eq!(eval_with(DECLS, "size(shadow.items)"), Ok(int(1)));
+    assert_eq!(eval_with(DECLS, "sum(mid.items.mass)"), Ok(int(4)));
+    assert_eq!(eval_with(DECLS, "sum(subsetting.items.mass)"), Ok(int(5)));
+    assert_eq!(eval_with(DECLS, "size(subsetting.items)"), Ok(int(1)));
+}
+
+/// Features that specialize a member populate it only when they can supply
+/// every value it needs: one `[1]` part among four motors leaves the four
+/// unknown, their count still the declared one, and their values readable
+/// when the part adds nothing.
+#[test]
+fn a_partly_populated_collection_stays_unknown() {
+    let decls = "
+        part def Motor { attribute mass default 0.5; }
+        part def Quad {
+            attribute each default 0.5;
+            part motors : Motor[4] { attribute :>> mass = each; }
+        }
+        part drone : Quad[1] { attribute :>> each = 0.6; part m1 :> motors[1]; }
+        part heavy : Quad[1] { part m1 :> motors[1] { attribute :>> mass = 1.0; } }
+        part kit[1] { part items : Motor[0..*]; part a :> items[1]; part b :> items[1]; }
+        part def Kit { part items : Motor[0..*]; part a :> items[1] { attribute :>> mass = 1; } part b :> items[1] { attribute :>> mass = 2; } }
+        part fromDef : Kit[1];
+        part redefined : Kit[1] { part :>> a { attribute :>> mass = 10; } }
+        part def Axle { part wheels : Motor[2]; attribute wm = sum(wheels.mass); }
+        part def FrontAxle :> Axle { part left :> wheels; part right :> wheels; }
+        part axle : FrontAxle[1];
+        part six : Quad[1] { part sx :>> motors[6]; }
+        part def Kit2 { part items : Motor[0..*]; part a :> items[1] { attribute :>> mass = 2; } }
+        part renamed : Kit2[1] { part r :>> a { attribute :>> mass = 10; } }
+        part chained : Kit2[1] { part also :> a[1]; }
+    ";
+    for (expr, expected) in [
+        ("size(drone.motors)", int(4)),
+        ("isEmpty(drone.motors)", Value::Boolean(false)),
+        ("drone.motors.mass", Value::Sequence(vec![rat(3, 5); 4])),
+        ("size(heavy.motors)", int(4)),
+        ("size(kit.items)", int(2)),
+        // Subsetting parts a general declares populate the member too.
+        ("size(fromDef.items)", int(2)),
+        ("sum(fromDef.items.mass)", int(3)),
+        ("sum(redefined.items.mass)", int(12)),
+        // A subsetting part with no multiplicity of its own populates
+        // nothing; a redefinition is the member itself.
+        ("sum(axle.wheels.mass)", int(1)),
+        ("axle.wm", int(1)),
+        ("sum(six.motors.mass)", int(3)),
+        // A redefinition of a populating part, under another name, stands
+        // for it; a part subsetting a `[1]` part as `[1]` is that part.
+        ("size(renamed.items)", int(1)),
+        ("sum(renamed.items.mass)", int(10)),
+        ("size(chained.items)", int(1)),
+        ("sum(chained.items.mass)", int(2)),
+    ] {
+        assert_eq!(eval_with(decls, expr), Ok(expected), "{expr}");
+    }
+    assert_eq!(
+        eval_with(decls, "heavy.motors.mass"),
+        Ok(Value::Indeterminate)
+    );
+}
+
+/// A host's chain off a root it names reads for no instance around the
+/// root, so a definition's feature does not fan out from there, while a
+/// part declared outright does. A placeholder from outside the evaluation
+/// never fans out. A declaration nested in a type the instance chain does
+/// not stand for keeps the chain indeterminate.
+#[test]
+fn a_fan_out_from_outside_needs_instances_the_evaluation_established() {
+    use sysmlv2_parser::ast::{Name, QualifiedName};
+    let mut model = Model::new();
+    let unit = model.add_source(
+        "t.sysml",
+        "package P {
+            private import ScalarFunctions::*;
+            part def Motor { attribute mass = 0.5; }
+            part def Quad { part motors : Motor[4]; }
+            part drone : Quad[1];
+            part def Outer {
+                attribute k default 3;
+                part def Inner { part ms : Motor[2] { attribute :>> mass = k; } attribute t = sum(ms.mass); }
+            }
+            part inner : Outer::Inner[1];
+        }",
+    );
+    assert!(unit.diagnostics.is_empty());
+    let mut r = ResolvedModel::build(&model);
+    let member = QualifiedName {
+        is_global: false,
+        segments: vec![Name {
+            value: "mass".into(),
+            span: Default::default(),
+        }],
+        span: Default::default(),
+    };
+    let definition = r.resolve_qualified("P::Quad::motors").unwrap();
+    assert_eq!(
+        r.evaluate_chain(definition, &[&member]),
+        Ok(Value::Indeterminate)
+    );
+    let motors = r.resolve_qualified("P::drone::motors").unwrap();
+    let held = r.evaluate(motors).unwrap();
+    assert!(matches!(held, Value::Unbound(..)), "{held:?}");
+    assert_eq!(
+        r.evaluate_value_chain(held, &[&member]),
+        Ok(Value::Indeterminate)
+    );
+    // `Inner`'s own reading is its declaration's; `inner`'s is not read for
+    // an instance of `Outer`, which no instance around it stands for.
+    let t = r.resolve_qualified("P::Outer::Inner::t").unwrap();
+    assert_eq!(r.evaluate(t), Ok(int(6)));
+    assert_eq!(
+        r.evaluate_qualified("P::inner::t"),
+        Ok(Value::Indeterminate)
+    );
 }

@@ -58,8 +58,8 @@ pub(super) fn endpoints_from(
         {
             continue;
         }
-        // Transition-owned successions use the transition's explicit source.
-        // Implicit transition-source Membership establishment is a distinct rule.
+        // Transition-owned successions use the transition's source, written
+        // or, for a target transition, implicit.
         let explicit_transition = b.elements[owner].ty == "TransitionUsage";
         if let Entry::Vacant(entry) = bodies.entry(owner) {
             let mut members = Vec::new();
@@ -119,10 +119,31 @@ pub(super) fn endpoints_from(
                             .then_some(member)
                         })
                     })
-                    .flatten();
+                    .flatten()
+                    // A target transition's source is the last action
+                    // before it in its owner's body (SysML 8.2.2.21).
+                    .or_else(|| {
+                        if !explicit_transition || chained_source {
+                            return None;
+                        }
+                        let membership = b.elements[owner].owning_relationship?;
+                        let Some(Some(carrier)) = raw.carrier(b, membership) else {
+                            return None;
+                        };
+                        super::implied::implicit_transition_source(b, owner, carrier)
+                    });
                 let occurrence = |rel: usize, member: usize| {
                     is_a!(b.elements[rel], "FeatureMembership")
                         && is_a!(b.elements[member], "OccurrenceUsage")
+                };
+                // A `then` leaves the last occurrence before it that can
+                // stand as a predecessor: no parameter, no transition, no
+                // connector but a flow or message (`decide d; if g then b;
+                // then c;` leaves `c` from `d`, not from the guarded
+                // transition). It reaches the next occurrence whatever it is.
+                let predecessor = |rel: usize, member: usize| {
+                    occurrence(rel, member)
+                        && super::implied::is_previous_candidate(b, owner, rel, member)
                 };
                 let mut previous = None;
                 for &(rel, member) in &members {
@@ -137,7 +158,7 @@ pub(super) fn endpoints_from(
                             None,
                         ),
                     );
-                    if occurrence(rel, member) {
+                    if predecessor(rel, member) {
                         previous = Some(member);
                     }
                 }
@@ -240,6 +261,122 @@ mod tests {
         assert!(endpoints(&mut r.b, &mut exhausted).is_none());
         assert_eq!(endpoints(&mut r.b, &mut 0).unwrap(), edges);
     }
+    /// A target transition's succession leaves the transition's implicit
+    /// source, the last action before the transition in its owner's body.
+    #[test]
+    fn target_transition_successions_take_the_implicit_source() {
+        let mut model = Model::new();
+        assert!(
+            model
+                .add_source(
+                    "targets.sysml",
+                    "state def T { state a; state b; if true then b; else a; }"
+                )
+                .diagnostics
+                .is_empty()
+        );
+        let mut r = ResolvedModel::build(&model);
+        let b_state = r.resolve_qualified("T::b").unwrap().0;
+        let transitions = r.elements_of_metaclass("TransitionUsage");
+        assert_eq!(transitions.len(), 2);
+        let edges = endpoints(&mut r.b, &mut 0).unwrap();
+        for transition in transitions {
+            let succession = r.b.elements[transition.0]
+                .owned_relationships
+                .iter()
+                .filter_map(|&rel| r.b.elements[rel].children.first().copied())
+                .find(|&e| r.b.elements[e].ty == "SuccessionAsUsage")
+                .expect("the transition succession");
+            let source_end = r.b.elements[succession]
+                .owned_relationships
+                .iter()
+                .filter(|&&rel| r.b.elements[rel].ty == "EndFeatureMembership")
+                .filter_map(|&rel| r.b.elements[rel].children.first().copied())
+                .next()
+                .expect("the source end");
+            assert!(edges.contains(&(source_end, b_state)), "{edges:?}");
+        }
+    }
+
+    /// A `then` after a guarded branch of a decision leaves the decision
+    /// node: the transition before it stands as no predecessor.
+    #[test]
+    fn a_then_after_a_guarded_branch_leaves_the_decision_node() {
+        let mut model = Model::new();
+        assert!(
+            model
+                .add_source(
+                    "related.sysml",
+                    "action def Basic { action b; action c; action e; decide d; if true then b; then c; else e; }"
+                )
+                .diagnostics
+                .is_empty()
+        );
+        let mut r = ResolvedModel::build(&model);
+        let basic = r.resolve_qualified("Basic").unwrap().0;
+        let d = r.resolve_qualified("Basic::d").unwrap().0;
+        let plain = r.b.elements[basic]
+            .owned_relationships
+            .iter()
+            .filter_map(|&rel| r.b.elements[rel].children.first().copied())
+            .find(|&e| r.b.elements[e].ty == "SuccessionAsUsage")
+            .expect("the plain succession");
+        let source_end = r.b.elements[plain]
+            .owned_relationships
+            .iter()
+            .filter(|&&rel| r.b.elements[rel].ty == "EndFeatureMembership")
+            .filter_map(|&rel| r.b.elements[rel].children.first().copied())
+            .next()
+            .expect("the source end");
+        let edges = endpoints(&mut r.b, &mut 0).unwrap();
+        assert!(edges.contains(&(source_end, d)), "{edges:?}");
+    }
+    /// Parameters and connectors other than flows and messages stand as no
+    /// predecessor of a `then`: after an `in` parameter it leaves the
+    /// action before the parameter, after a connection the action before
+    /// the connection.
+    #[test]
+    fn parameters_and_connectors_are_no_predecessors() {
+        let mut model = Model::new();
+        assert!(
+            model
+                .add_source(
+                    "skipped.sysml",
+                    "action def Skipped {
+                        action a; in item p; then b;
+                        action b; action c;
+                        connect b to c; then e; action e;
+                    }"
+                )
+                .diagnostics
+                .is_empty()
+        );
+        let mut r = ResolvedModel::build(&model);
+        let skipped = r.resolve_qualified("Skipped").unwrap().0;
+        let a = r.resolve_qualified("Skipped::a").unwrap().0;
+        let c = r.resolve_qualified("Skipped::c").unwrap().0;
+        let plain: Vec<usize> = r.b.elements[skipped]
+            .owned_relationships
+            .iter()
+            .filter_map(|&rel| r.b.elements[rel].children.first().copied())
+            .filter(|&e| r.b.elements[e].ty == "SuccessionAsUsage")
+            .collect();
+        assert_eq!(plain.len(), 2);
+        let source_end = |r: &ResolvedModel, succession: usize| {
+            r.b.elements[succession]
+                .owned_relationships
+                .iter()
+                .filter(|&&rel| r.b.elements[rel].ty == "EndFeatureMembership")
+                .filter_map(|&rel| r.b.elements[rel].children.first().copied())
+                .next()
+                .expect("the source end")
+        };
+        let (then_b, then_e) = (source_end(&r, plain[0]), source_end(&r, plain[1]));
+        let edges = endpoints(&mut r.b, &mut 0).unwrap();
+        assert!(edges.contains(&(then_b, a)), "{edges:?}");
+        assert!(edges.contains(&(then_e, c)), "{edges:?}");
+    }
+
     #[test]
     fn standalone_specialization_of_empty_source_prevents_inference() {
         let mut r = build(1);

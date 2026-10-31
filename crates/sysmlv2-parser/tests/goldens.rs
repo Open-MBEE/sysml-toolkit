@@ -13,7 +13,7 @@
 //! To regenerate deliberately after a reviewed emitter change:
 //!
 //! ```console
-//! UPDATE_GOLDENS=1 cargo test -p sysmlv2-parser --test goldens
+//! UPDATE_GOLDENS=1 cargo test -p sysmlv2-parser --test integration goldens::
 //! ```
 
 #![cfg(feature = "json")]
@@ -126,7 +126,7 @@ fn golden_snapshots_per_metaclass() {
     assert!(
         report.is_empty(),
         "golden snapshots drifted — review the diffs, then regenerate with \
-         `UPDATE_GOLDENS=1 cargo test -p sysmlv2-parser --test goldens`:\n{report}"
+         `UPDATE_GOLDENS=1 cargo test -p sysmlv2-parser --test integration goldens::`:\n{report}"
     );
 }
 

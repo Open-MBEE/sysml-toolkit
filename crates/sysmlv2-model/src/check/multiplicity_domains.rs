@@ -436,13 +436,13 @@ impl Reader<'_> {
         // Unknown values must not be mistaken for known values of an invalid kind.
         if matches!(
             upper,
-            eval::Value::Indeterminate | eval::Value::Unbound(_) | eval::Value::UnboundMember(_)
+            eval::Value::Indeterminate | eval::Value::Unbound(..) | eval::Value::UnboundMember(..)
         ) || matches!(
             lower,
             Some(
                 eval::Value::Indeterminate
-                    | eval::Value::Unbound(_)
-                    | eval::Value::UnboundMember(_)
+                    | eval::Value::Unbound(..)
+                    | eval::Value::UnboundMember(..)
             )
         ) {
             return None;

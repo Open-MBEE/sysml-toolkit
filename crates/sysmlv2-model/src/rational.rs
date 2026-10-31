@@ -466,6 +466,26 @@ impl Rational {
         }
     }
 
+    /// Heap storage copied by `Clone`, excluding the inline representation.
+    /// Round limbs to 64 bits, also a conservative bound on 32-bit targets.
+    pub(crate) fn clone_heap_bytes(&self) -> usize {
+        match &self.0 {
+            Repr::Small(_) => 0,
+            Repr::Big(b) => {
+                let limbs = b
+                    .numer()
+                    .bits()
+                    .div_ceil(64)
+                    .saturating_add(b.denom().bits().div_ceil(64));
+                std::mem::size_of::<BigRational>().saturating_add(
+                    usize::try_from(limbs)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(8),
+                )
+            }
+        }
+    }
+
     /// `self ** e` for an integer exponent; `None` for `0 ** negative`
     /// and for results too large to materialize.
     #[must_use]

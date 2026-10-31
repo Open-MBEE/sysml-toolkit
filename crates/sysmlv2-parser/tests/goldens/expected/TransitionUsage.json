@@ -21,6 +21,9 @@
       },
       {
         "@id": "af89b209-ac56-5bae-8225-1bfdcd5bc3e0"
+      },
+      {
+        "@id": "572a9202-3ac0-5b1e-a7a1-8ddbfc5c0690"
       }
     ],
     "owningRelationship": {
@@ -46,10 +49,41 @@
     "ownedRelationship": [
       {
         "@id": "bebc7490-3575-5791-9bd4-38368922f812"
+      },
+      {
+        "@id": "d1f0c627-a13f-597c-9fba-ff014967b88e"
       }
     ],
     "owningRelationship": {
       "@id": "746361f6-225c-5866-9403-2a8bb342580e"
+    }
+  },
+  {
+    "@id": "03ec9c3f-ac40-54cb-a78c-9d5ee8146263",
+    "@type": "TransitionUsage",
+    "declaredName": null,
+    "declaredShortName": null,
+    "direction": null,
+    "elementId": "03ec9c3f-ac40-54cb-a78c-9d5ee8146263",
+    "isAbstract": false,
+    "isComposite": true,
+    "isConstant": false,
+    "isDerived": false,
+    "isEnd": false,
+    "isImpliedIncluded": false,
+    "isOrdered": false,
+    "isUnique": true,
+    "isVariation": false,
+    "ownedRelationship": [
+      {
+        "@id": "b9183aa8-6941-5ee2-abd0-f286838b06e1"
+      },
+      {
+        "@id": "464c64c6-3f74-5827-8a16-0352036ed908"
+      }
+    ],
+    "owningRelationship": {
+      "@id": "1e3c2cc9-7074-5fa1-883b-e661fda24a7b"
     }
   },
   {
@@ -73,10 +107,10 @@
         "@id": "9b45386e-6eb2-51a3-b46f-2dd5c74c9674"
       },
       {
-        "@id": "612ba7ee-84bd-52b6-ba14-136d2fc6bc62"
+        "@id": "ee335cc4-2005-5299-9b8e-95f33617808c"
       },
       {
-        "@id": "24e6b8da-7771-56ad-a590-2a9c79f4966b"
+        "@id": "612ba7ee-84bd-52b6-ba14-136d2fc6bc62"
       },
       {
         "@id": "74591cc9-e9ec-5cb8-baaa-e893c25aa087"
@@ -86,6 +120,9 @@
       },
       {
         "@id": "83dc5e45-bd09-59c9-95a3-7717fb19ab11"
+      },
+      {
+        "@id": "75df8def-b035-5408-9db2-3ecb8d1424fa"
       }
     ],
     "owningRelationship": {
@@ -114,6 +151,9 @@
       },
       {
         "@id": "c2f7e9ec-d585-5c86-b7ae-4a19cecf99cf"
+      },
+      {
+        "@id": "ebc76536-09a8-59c0-902c-aad53f78cef2"
       }
     ],
     "owningRelationship": {

@@ -63,62 +63,6 @@ fn relationships(
     Ok(rows)
 }
 
-/// A structural owner's ordinary member has no end, parameter, subject, result
-/// or state-subaction positional role. Its subclass's internal features need
-/// their own certificates, but do not change this member's redefinition list.
-fn ordinary_usage_member(
-    b: &Builder,
-    raw: &StoredStructure,
-    feature: usize,
-    steps: &mut usize,
-) -> bool {
-    let row = &b.elements[feature];
-    if !matches!(
-        row.ty,
-        "PortUsage"
-            | "ActionUsage"
-            | "StateUsage"
-            | "ConstraintUsage"
-            | "ConnectionUsage"
-            | "InterfaceUsage"
-            | "AllocationUsage"
-            | "FlowUsage"
-            | "SuccessionAsUsage"
-    ) || row.props.get("direction").is_some_and(|v| !v.is_null())
-        || row
-            .props
-            .get("isEnd")
-            .is_some_and(|v| v.as_bool() != Some(false))
-    {
-        return false;
-    }
-    let Some(membership) = row.owning_relationship else {
-        return false;
-    };
-    if b.elements[membership].ty != "FeatureMembership" {
-        return false;
-    }
-    // The main proof checks reciprocal ownership and complete ancestry below.
-    // No assumption is made about features in an action/state/usage body.
-    let Some(Some(owner)) =
-        semantic_ownership::checked_relationship_carrier(b, raw, membership, steps)
-    else {
-        return false;
-    };
-    matches!(
-        b.elements[owner].ty,
-        "Type"
-            | "Classifier"
-            | "Class"
-            | "Structure"
-            | "DataType"
-            | "Definition"
-            | "AttributeDefinition"
-            | "OccurrenceDefinition"
-            | "ItemDefinition"
-            | "PartDefinition"
-    )
-}
 struct Facts<'a>(&'a Builder);
 impl MembershipFacts for Facts<'_> {
     fn is_feature(&self, e: usize) -> bool {
@@ -286,7 +230,42 @@ impl super::Builder {
             &mut TypeRelations::default(),
         )
     }
+    /// One walk, retried once when a nested certificate (an end's or a
+    /// parameter's owner, asked for its positional targets) refreshed the
+    /// shared evidence under it: the second walk reads the refreshed state.
     fn checked_type_memberships_filtered(
+        &mut self,
+        receiver: usize,
+        exclude_implied: bool,
+        excluded_namespaces: &[usize],
+        excluded_types: Option<&[usize]>,
+        steps: &mut usize,
+        relations: &mut TypeRelations,
+    ) -> Result<super::type_features::MembershipSequence, TypeInputIssue> {
+        let first = self.checked_type_memberships_filtered_once(
+            receiver,
+            exclude_implied,
+            excluded_namespaces,
+            excluded_types,
+            steps,
+            relations,
+        );
+        match first {
+            Err(TypeInputIssue::StaleEvidence) if *steps <= crate::eval::MAX_STEPS => {
+                *relations = TypeRelations::default();
+                self.checked_type_memberships_filtered_once(
+                    receiver,
+                    exclude_implied,
+                    excluded_namespaces,
+                    excluded_types,
+                    steps,
+                    relations,
+                )
+            }
+            other => other,
+        }
+    }
+    fn checked_type_memberships_filtered_once(
         &mut self,
         receiver: usize,
         exclude_implied: bool,
@@ -326,6 +305,9 @@ impl super::Builder {
         if inverse.sources_incomplete {
             return Err(TypeInputIssue::IncompleteProvider);
         }
+        // Plain metadata adds no base; semantic metadata adds one the
+        // planner does not write (KerML 9.2), so its targets stay out.
+        let semantic = self.semantically_annotated();
         let stamp = Stamp::capture_builder(self);
         let b = &mut *self;
         let mut nodes = IdMap::default();
@@ -335,6 +317,18 @@ impl super::Builder {
         let mut root_import = false;
         let mut visible_import_owners = IdSet::default();
         let mut imported_features = IdSet::default();
+        // Features a node names through a membership that does not own them
+        // (an alias, an expression's referent): members, not features, of
+        // the node.
+        let mut referenced = IdSet::default();
+        // Whether a node's own features turn around seen from the receiver:
+        // a conjugated type flips what it inherits from its original (KerML
+        // `Type::directionOf`), so the flip passes from a node to its bases
+        // and toggles at each conjugated node. A node reached both ways
+        // (`None`) has no one answer; only a directed feature of its own
+        // needs one.
+        let mut flips: IdMap<usize, Option<bool>> = IdMap::default();
+        flips.insert(receiver, Some(false));
         let mut todo = vec![receiver];
         while let Some(owner) = todo.pop() {
             charge(steps, 1)?;
@@ -348,33 +342,43 @@ impl super::Builder {
             if !super::type_features::supported_root(element.ty) || !b.is_authored(owner) {
                 return Err(TypeInputIssue::UnsupportedConfiguration);
             }
-            if element.ty == "Feature"
-                && (element
-                    .props
-                    .get("isEnd")
-                    .is_some_and(|v| v.as_bool() != Some(false))
-                    || element.props.get("direction").is_some_and(|v| !v.is_null()))
-            {
-                return Err(TypeInputIssue::UnsupportedConfiguration);
-            }
+            // An end or directed feature is a receiver or ancestor like any
+            // other: its positional redefinition targets enter its complete
+            // direct bases through its owner's membership certificate
+            // (`TypeRelations::feature_requirements`).
             if !domains.owner_complete(owner)
                 || !imports.owner_complete(owner)
-                || raw.metadata_annotation_targets.contains(&owner)
-                || b.metadata_of.get(&owner).is_some_and(|m| !m.is_empty())
+                || semantic.contains(&owner)
             {
                 return Err(TypeInputIssue::IncompleteProvider);
             }
-            if relations
+            // A conjugated node (a port definition's `~P`) inherits its
+            // original's memberships, turned around: its complete direct
+            // bases are the original alone.
+            let conjugated = relations
                 .owned_conjugation(b, owner, steps)
                 .ok_or(TypeInputIssue::IncompleteProvider)?
-                .is_some()
-            {
-                return Err(TypeInputIssue::UnsupportedConfiguration);
-            }
+                .is_some();
             let direct = relations
                 .complete_direct_bases(b, owner, steps)
                 .ok_or(TypeInputIssue::IncompleteProvider)?;
             charge(steps, direct.len().saturating_mul(2))?;
+            let flip = match flips.get(&owner) {
+                Some(Some(flip)) => Some(*flip ^ conjugated),
+                Some(None) => None,
+                None => Some(conjugated),
+            };
+            for &base in &direct {
+                match flips.get(&base) {
+                    Some(Some(known)) if Some(*known) != flip => {
+                        flips.insert(base, None);
+                    }
+                    Some(_) => {}
+                    None => {
+                        flips.insert(base, flip);
+                    }
+                }
+            }
             todo.extend(direct.iter().copied());
             bases.insert(owner, direct.clone());
             let mut node = Node {
@@ -432,6 +436,9 @@ impl super::Builder {
                 }
                 if is_a!(b.elements[member], "Feature") {
                     features.push(member);
+                    if !is_a!(row, "OwningMembership") {
+                        referenced.insert(member);
+                    }
                 }
                 if visibility != "private" {
                     node.owned_memberships.push(membership);
@@ -479,21 +486,22 @@ impl super::Builder {
                 .elements
                 .get(feature)
                 .ok_or(TypeInputIssue::InvalidElement)?;
+            // A value expression is an owned member of the feature it values
+            // (through the FeatureValue, an owning membership that is not a
+            // feature membership), never one of its features; it takes part
+            // in the membership lists and in nothing else here.
+            let valued = row
+                .owning_relationship
+                .is_some_and(|m| b.elements[m].ty == "FeatureValue");
+            // A feature member of any kind under any membership of a type:
+            // its redefinition list is the owned, inverse, retained and
+            // positional redefinitions gathered below, the same for every
+            // kind; an end's or parameter's positional targets are planned
+            // with its owner's node. An expression member's dynamic and
+            // result evidence must be current like any feature's.
             if !is_a!(row, "Feature")
-                || (is_a!(row, "Usage")
-                    && !ordinary_usage_member(b, &raw, feature, steps)
-                    && !matches!(
-                        row.ty,
-                        "ReferenceUsage"
-                            | "AttributeUsage"
-                            | "OccurrenceUsage"
-                            | "ItemUsage"
-                            | "PartUsage"
-                    ))
-                || is_a!(row, "InvocationExpression")
                 || raw.bad_bases.contains(&feature)
-                || raw.metadata_annotation_targets.contains(&feature)
-                || b.metadata_of.get(&feature).is_some_and(|m| !m.is_empty())
+                || semantic.contains(&feature)
                 || !b.dynamic_evidence_current(feature)
                 || !b.result_redefinition_evidence_current(feature)
             {
@@ -545,10 +553,33 @@ impl super::Builder {
                                     .get(key)
                                     .is_some_and(|v| v.as_bool() != Some(false))
                             })
-                        || raw.metadata_annotation_targets.contains(&owner)
-                        || b.metadata_of.get(&owner).is_some_and(|m| !m.is_empty())
+                        || semantic.contains(&owner)
                     {
                         return Err(TypeInputIssue::UnsupportedConfiguration);
+                    }
+                    owner
+                }
+                None if valued => {
+                    let membership = b.elements[feature]
+                        .owning_relationship
+                        .ok_or(TypeInputIssue::IncompleteProvider)?;
+                    let owner = semantic_ownership::checked_relationship_carrier(
+                        b, &raw, membership, steps,
+                    )
+                    .flatten()
+                    .ok_or(TypeInputIssue::InvalidRelationship)?;
+                    if membership_evidence::member(b, &raw, owner, membership, steps)
+                        != Some(feature)
+                        || b.elements[feature]
+                            .props
+                            .get("direction")
+                            .is_some_and(|v| !v.is_null())
+                        || b.elements[feature]
+                            .props
+                            .get("isEnd")
+                            .is_some_and(|v| v.as_bool() != Some(false))
+                    {
+                        return Err(TypeInputIssue::InvalidRelationship);
                     }
                     owner
                 }
@@ -582,6 +613,43 @@ impl super::Builder {
                     }
                     owner
                 }
+                None if b.elements[feature].owning_relationship.is_some_and(|m| {
+                    matches!(b.elements[m].ty, "OwningMembership" | "VariantMembership")
+                }) =>
+                {
+                    // A Feature a type owns outside a feature membership: an
+                    // end's cross feature (the `end [m] part x` prefix
+                    // declaration), a range's bound expressions, the chain a
+                    // reference or expression names. It takes part in the
+                    // membership lists as a member of its owner and in the
+                    // feature lists not at all; its subsettings are retained
+                    // edges like any other feature's.
+                    let membership = b.elements[feature]
+                        .owning_relationship
+                        .expect("matched an owning membership");
+                    let owner = semantic_ownership::checked_relationship_carrier(
+                        b, &raw, membership, steps,
+                    )
+                    .flatten()
+                    .ok_or(TypeInputIssue::InvalidRelationship)?;
+                    if !is_a!(b.elements[owner], "Type") {
+                        return Err(TypeInputIssue::IncompleteProvider);
+                    }
+                    if membership_evidence::member(b, &raw, owner, membership, steps)
+                        != Some(feature)
+                        || b.elements[feature]
+                            .props
+                            .get("direction")
+                            .is_some_and(|v| !v.is_null())
+                        || b.elements[feature]
+                            .props
+                            .get("isEnd")
+                            .is_some_and(|v| v.as_bool() != Some(false))
+                    {
+                        return Err(TypeInputIssue::InvalidRelationship);
+                    }
+                    owner
+                }
                 None => return Err(TypeInputIssue::IncompleteProvider),
             };
             if !visible_import_owners.is_empty() {
@@ -589,7 +657,19 @@ impl super::Builder {
                 feature_owners.insert(feature, owner);
             }
             if !nodes.contains_key(&owner) && !imported_features.contains(&feature) {
-                return Err(TypeInputIssue::IncompleteProvider);
+                // A feature owned elsewhere that a node only names (an
+                // alias, a reference expression's referent) keeps its own
+                // redefinitions; one with a positional role would need its
+                // owner's plan, which this walk does not establish.
+                let positional = referenced.contains(&feature)
+                    && (b.is_parameter(feature)
+                        || b.elements[feature]
+                            .props
+                            .get("isEnd")
+                            .is_some_and(|v| v.as_bool() != Some(false)));
+                if !referenced.contains(&feature) || positional {
+                    return Err(TypeInputIssue::IncompleteProvider);
+                }
             }
             if !domains.owner_complete(owner)
                 || b.elements[feature]
@@ -834,6 +914,16 @@ impl super::Builder {
             },
             root_import,
             required_positional,
+            conjugated_owners: flips
+                .iter()
+                .filter(|(_, &flipped)| flipped == Some(true))
+                .map(|(&owner, _)| owner)
+                .collect(),
+            ambiguous_owners: flips
+                .iter()
+                .filter(|(_, &flipped)| flipped.is_none())
+                .map(|(&owner, _)| owner)
+                .collect(),
         })
     }
 }

@@ -311,6 +311,95 @@ fn ports_declared_by_a_domain_library_definition_still_render() {
 }
 
 #[test]
+fn abstract_domain_library_owners_keep_concrete_ports() {
+    let mut m = Model::new();
+    let lib = m.add_library_source(
+        "domain.sysml",
+        "package Domain {
+            port def Signal;
+            abstract port def Socket { port pin : Signal; }
+            abstract part def Device { port io : Socket; }
+        }",
+    );
+    assert!(lib.diagnostics.is_empty(), "{:?}", lib.diagnostics);
+    let user = m.add_source(
+        "user.sysml",
+        "part def Concrete :> Domain::Device;
+         part a : Concrete; part b : Concrete;
+         connect a.io.pin to b.io.pin;",
+    );
+    assert!(user.diagnostics.is_empty(), "{:?}", user.diagnostics);
+    let mut r = ResolvedModel::build(&m);
+    for view in [View::Tree, View::Interconnection] {
+        let g = graph(&mut r, None, &VizOptions::default().with_view(view)).unwrap();
+        let nodes = g["nodes"].as_array().unwrap();
+        let mut pins = Vec::new();
+        for name in ["a", "b"] {
+            let usage = nodes.iter().find(|n| n["qname"] == name).unwrap();
+            let io = nodes
+                .iter()
+                .find(|n| n["parent"] == usage["id"] && n["qname"] == "Domain::Device::io")
+                .expect("concrete port on abstract part definition");
+            let pin = nodes
+                .iter()
+                .find(|n| n["parent"] == io["id"] && n["qname"] == "Domain::Socket::pin")
+                .expect("concrete port on abstract port definition");
+            pins.push(pin["id"].clone());
+        }
+        if view == View::Interconnection {
+            let edges = g["edges"].as_array().unwrap();
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0]["source"], pins[0]);
+            assert_eq!(edges[0]["target"], pins[1]);
+        }
+    }
+}
+
+#[test]
+fn abstract_domain_library_connection_definitions_keep_concrete_ports() {
+    for kind in ["interface", "connection", "flow", "allocation"] {
+        let mut m = Model::new();
+        let lib = m.add_library_source(
+            "domain.sysml",
+            &format!(
+                "package Domain {{
+                    port def P;
+                    abstract {kind} def Base {{ port monitor : P; }}
+                }}"
+            ),
+        );
+        assert!(lib.diagnostics.is_empty(), "{kind}: {:?}", lib.diagnostics);
+        let user = m.add_source(
+            "user.sysml",
+            &format!(
+                "package Q {{
+                    {kind} def Derived :> Domain::Base;
+                    {kind} x : Derived;
+                }}"
+            ),
+        );
+        assert!(
+            user.diagnostics.is_empty(),
+            "{kind}: {:?}",
+            user.diagnostics
+        );
+        let mut r = ResolvedModel::build(&m);
+        let g = graph(&mut r, None, &VizOptions::default().with_view(View::Tree)).unwrap();
+        let nodes = g["nodes"].as_array().unwrap();
+        let usage = nodes
+            .iter()
+            .find(|n| n["qname"] == "Q::x")
+            .unwrap_or_else(|| panic!("{kind}: usage drawn\n{g}"));
+        let on_usage: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n["parent"] == usage["id"])
+            .filter_map(|n| n["qname"].as_str())
+            .collect();
+        assert_eq!(on_usage, ["Domain::Base::monitor"], "{kind}\n{g}");
+    }
+}
+
+#[test]
 fn written_specialization_of_a_library_part_keeps_abstract_library_ports_out() {
     let lib = sysmlv2_testkit::library_dir();
     if !lib.exists() {
@@ -341,4 +430,166 @@ fn written_specialization_of_a_library_part_keeps_abstract_library_ports_out() {
         .filter_map(|n| n["qname"].as_str())
         .collect();
     assert_eq!(on_usage, ["Q::Vehicle::p"], "{g}");
+}
+
+#[test]
+fn written_specialization_of_a_library_interface_keeps_its_ends_off_the_usage() {
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut m = Model::new();
+    m.load_library_dir(&lib).expect("library loads");
+    // `Interfaces::BinaryInterface` declares `participant`, `source` and
+    // `target` as ports: connector ends, not structure. A written
+    // `:> Interfaces::BinaryInterface` reaches them through explicit
+    // heritage, and they must not copy onto the interface usage.
+    let unit = m.add_source(
+        "interfaces.sysml",
+        "package Q {
+            port def P;
+            part def Device { port p : P; }
+            interface def Link :> Interfaces::BinaryInterface;
+            part a : Device; part b : Device;
+            interface l : Link connect a.p to b.p;
+         }",
+    );
+    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    let mut r = ResolvedModel::build(&m);
+    for view in [View::Tree, View::Interconnection] {
+        let g = graph(&mut r, None, &VizOptions::default().with_view(view)).unwrap();
+        let nodes = g["nodes"].as_array().unwrap();
+        let library_ports: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n["kind"] == "port")
+            .filter_map(|n| n["qname"].as_str())
+            .filter(|q| q.starts_with("Interfaces::"))
+            .collect();
+        assert!(library_ports.is_empty(), "{library_ports:?}\n{g}");
+        if view == View::Tree {
+            let usage = nodes.iter().find(|n| n["qname"] == "Q::l").unwrap();
+            let on_usage: Vec<&str> = nodes
+                .iter()
+                .filter(|n| n["parent"] == usage["id"])
+                .filter_map(|n| n["qname"].as_str())
+                .collect();
+            assert!(on_usage.is_empty(), "{on_usage:?}\n{g}");
+        }
+    }
+}
+
+#[test]
+fn nested_ports_copy_onto_usages_and_chains_reach_them() {
+    let mut r = resolved(
+        "port def Spigot; port def Bank { port hot : Spigot; port cold : Spigot; }
+        port def Ctl;
+        part def Tank { port bank : Bank; }
+        part def Engine { in port control : Ctl; }
+        part tank : Tank; part engine : Engine;
+        connect tank.bank.hot to engine.control;",
+    );
+    let opts = VizOptions::default().with_view(View::Interconnection);
+    let g = graph(&mut r, None, &opts).unwrap();
+    let nodes = g["nodes"].as_array().unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    let by_id = |id: &serde_json::Value| nodes.iter().find(|n| &n["id"] == id).unwrap();
+    // the definition's own port, and the nested ports it has through its type, as nodes under it
+    let bank_def = nodes
+        .iter()
+        .find(|n| n["qname"] == "Tank::bank" && n["inherited"].is_null())
+        .unwrap();
+    let under_def: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["parent"] == bank_def["id"])
+        .map(|n| n["qname"].as_str().unwrap())
+        .collect();
+    assert_eq!(under_def, ["Bank::hot", "Bank::cold"], "{g}");
+    // the usage's copy of the port, with its nested copies under the copy's id
+    let tank = nodes.iter().find(|n| n["qname"] == "tank").unwrap();
+    let bank_on_tank = nodes
+        .iter()
+        .find(|n| n["parent"] == tank["id"] && n["qname"] == "Tank::bank")
+        .unwrap();
+    assert_eq!(bank_on_tank["inherited"], true, "{g}");
+    let hot_on_tank = nodes
+        .iter()
+        .find(|n| n["parent"] == bank_on_tank["id"] && n["qname"] == "Bank::hot")
+        .unwrap();
+    assert_eq!(hot_on_tank["inherited"], true);
+    assert!(
+        hot_on_tank["id"]
+            .as_str()
+            .unwrap()
+            .starts_with(bank_on_tank["id"].as_str().unwrap())
+    );
+    // the connector ends on the nested copy, not on the port it copies
+    assert_eq!(edges.len(), 1, "{g}");
+    assert_eq!(edges[0]["source"], hot_on_tank["id"], "{g}");
+    assert!(edges[0]["sourcePath"].is_null(), "{g}");
+    let control = by_id(&edges[0]["target"]);
+    assert_eq!(control["qname"], "Engine::control");
+    assert_eq!(control["direction"], "in");
+}
+
+#[test]
+fn structure_tree_usages_carry_their_definition_ports_as_inherited_nodes() {
+    let mut r = resolved(
+        "port def P; port def Bank { port hot : P; }
+        part def Engine { in port control : ~P; port bank : Bank; }
+        part engine : Engine;",
+    );
+    let opts = VizOptions::default().with_view(View::Tree);
+    let g = graph(&mut r, None, &opts).unwrap();
+    let nodes = g["nodes"].as_array().unwrap();
+    // the definition's port usage node carries its direction and conjugation
+    let control = nodes
+        .iter()
+        .find(|n| n["qname"] == "Engine::control" && n["inherited"].is_null())
+        .unwrap();
+    assert_eq!(control["kind"], "node");
+    assert_eq!(control["direction"], "in", "{g}");
+    assert_eq!(control["conjugated"], true, "{g}");
+    // the usage carries copies of both ports, the nested one under its port's copy
+    let engine = nodes.iter().find(|n| n["qname"] == "engine").unwrap();
+    let copies: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["parent"] == engine["id"] && n["kind"] == "port")
+        .map(|n| n["qname"].as_str().unwrap())
+        .collect();
+    assert_eq!(copies, ["Engine::control", "Engine::bank"], "{g}");
+    let bank_copy = nodes
+        .iter()
+        .find(|n| n["parent"] == engine["id"] && n["qname"] == "Engine::bank")
+        .unwrap();
+    assert_eq!(bank_copy["inherited"], true);
+    let hot_copy = nodes
+        .iter()
+        .find(|n| n["parent"] == bank_copy["id"])
+        .unwrap();
+    assert_eq!(hot_copy["qname"], "Bank::hot");
+    assert_eq!(hot_copy["inherited"], true);
+    // the definition's own port node draws its nested port through its type as a copy under it
+    let bank_def = nodes
+        .iter()
+        .find(|n| n["qname"] == "Engine::bank" && n["inherited"].is_null())
+        .unwrap();
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["parent"] == bank_def["id"] && n["qname"] == "Bank::hot"),
+        "{g}"
+    );
+}
+
+#[test]
+fn self_typed_port_nesting_stops_at_the_depth_bound() {
+    let mut r =
+        resolved("port def Loop { port again : Loop; } part def D { port p : Loop; } part d : D;");
+    let opts = VizOptions::default().with_view(View::Interconnection);
+    let g = graph(&mut r, None, &opts).unwrap();
+    let nodes = g["nodes"].as_array().unwrap();
+    assert!(nodes.len() < 40, "{}", nodes.len());
+    let tree = graph(&mut r, None, &VizOptions::default().with_view(View::Tree)).unwrap();
+    assert!(tree["nodes"].as_array().unwrap().len() < 40);
 }

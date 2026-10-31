@@ -1051,6 +1051,51 @@ impl Builder {
     /// planning reached too must therefore come out as it did there, complete
     /// or not, with the same redefinitions; otherwise (`Some(None)`) the
     /// caller plans every row.
+    /// The positional roots a row contributes: a type that owns an end, a
+    /// parameter or a case objective through a feature membership, and each
+    /// objective it owns. An objective redefines the objective of each case
+    /// its owner specializes, and a specializing objective pairs its own
+    /// subject and parameters against it, planned or seeded, so both are
+    /// roots. Root discovery needs existence, not an ordered collection.
+    fn positional_roots_of(&self, e: usize, steps: &mut Option<&mut usize>) -> Option<Vec<usize>> {
+        let mut roots = Vec::new();
+        if !is_a!(self.elements[e], "Type") {
+            return Some(roots);
+        }
+        let mut found = false;
+        for &rel in &self.elements[e].owned_relationships {
+            charge(steps, 1)?;
+            if !is_a!(self.elements[rel], "FeatureMembership") {
+                continue;
+            }
+            if is_a!(self.elements[rel], "ObjectiveMembership") {
+                found = true;
+                roots.extend(
+                    self.elements[rel]
+                        .children
+                        .iter()
+                        .copied()
+                        .filter(|&f| is_a!(self.elements[f], "Type")),
+                );
+                continue;
+            }
+            if found {
+                continue;
+            }
+            for &f in &self.elements[rel].children {
+                charge(steps, 1)?;
+                if self.positional_is_end(f) || self.is_parameter(f) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if found {
+            roots.insert(0, e);
+        }
+        Some(roots)
+    }
+
     pub(super) fn plan_positional_on_library(
         &mut self,
         library: &std::sync::Arc<super::LibraryPlans>,
@@ -1063,29 +1108,7 @@ impl Builder {
         charge(&mut steps, end - floor)?;
         let mut roots = Vec::new();
         for e in floor..end {
-            if !is_a!(self.elements[e], "Type") {
-                continue;
-            }
-            let mut found = false;
-            for &rel in &self.elements[e].owned_relationships {
-                charge(&mut steps, 1)?;
-                if !is_a!(self.elements[rel], "FeatureMembership") {
-                    continue;
-                }
-                for &f in &self.elements[rel].children {
-                    charge(&mut steps, 1)?;
-                    if self.positional_is_end(f) || self.is_parameter(f) {
-                        found = true;
-                        break;
-                    }
-                }
-                if found {
-                    break;
-                }
-            }
-            if found {
-                roots.push(e);
-            }
+            roots.extend(self.positional_roots_of(e, &mut steps)?);
         }
         let mut workspace = PositionalWorkspace::one_shot();
         workspace.reached = Some(Vec::new());
@@ -1195,10 +1218,18 @@ impl Builder {
                 return None;
             }
             let memberships = self.positional_owned_memberships(owner, &mut budget)?;
-            if memberships.len() != node.owned_memberships.len()
+            // The checked node lists the materialized implied memberships
+            // too (a target transition's source); the positional planner
+            // reads the authored rows, so the two agree on those.
+            let authored: Vec<&PositionalMembership> = node
+                .owned_memberships
+                .iter()
+                .filter(|m| self.is_authored(m.relationship))
+                .collect();
+            if memberships.len() != authored.len()
                 || memberships
                     .iter()
-                    .zip(&node.owned_memberships)
+                    .zip(&authored)
                     .any(|(a, b)| a.relationship != b.relationship || a.member != b.member)
             {
                 return None;
@@ -1336,31 +1367,7 @@ impl Builder {
         } else {
             for e in self.authored_rows() {
                 charge(&mut steps, 1)?;
-                if !is_a!(self.elements[e], "Type") {
-                    continue;
-                }
-                // Root discovery needs existence, not an ordered collection.
-                // Defer sorting/allocation until the reachable Node is built.
-                let mut found = false;
-                for &rel in &self.elements[e].owned_relationships {
-                    charge(&mut steps, 1)?;
-                    if !is_a!(self.elements[rel], "FeatureMembership") {
-                        continue;
-                    }
-                    for &f in &self.elements[rel].children {
-                        charge(&mut steps, 1)?;
-                        if self.positional_is_end(f) || self.is_parameter(f) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if found {
-                        break;
-                    }
-                }
-                if found {
-                    roots.push(e);
-                }
+                roots.extend(self.positional_roots_of(e, &mut steps)?);
             }
         }
         if !workspace.one_shot && selected_roots.is_none() && workspace.roots.is_none() {
@@ -1404,6 +1411,40 @@ impl Builder {
                 &mut import_proof,
                 &mut prerequisites,
             );
+            // A case's objective is planned after its owner, which pairs it
+            // with the objectives of the owner's generals, and after those
+            // objectives, so that its own subject and parameters pair
+            // against them as against its bases.
+            if owned_as_objective(self, e) {
+                if let Some(owner) = self.owner_elem(e) {
+                    let mut required = vec![owner];
+                    let mut seen = IdSet::default();
+                    let mut stack: Vec<usize> = direct_bases
+                        .get(&owner)
+                        .map(<[usize]>::to_vec)
+                        .unwrap_or_default();
+                    while let Some(ancestor) = stack.pop() {
+                        charge(&mut steps, 1)?;
+                        if required.len() > 256 || !seen.insert(ancestor) {
+                            continue;
+                        }
+                        let members = self.owned_member_elems(ancestor, true);
+                        charge(&mut steps, members.len())?;
+                        required.extend(
+                            members
+                                .into_iter()
+                                .filter(|&m| m != e && owned_as_objective(self, m)),
+                        );
+                        stack.extend(
+                            direct_bases
+                                .get(&ancestor)
+                                .map(<[usize]>::to_vec)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    prerequisites.entry(e).or_default().extend(required);
+                }
+            }
             if let Some(required) = prerequisites.get(&e) {
                 charge(&mut steps, required.len())?;
                 todo.extend(required.iter().copied());
@@ -1629,6 +1670,28 @@ impl Builder {
                     plan.incomplete.insert(e);
                 }
             }
+            // The objectives of its owner's generals an objective was paired
+            // with when the owner was planned (SysML
+            // `checkRequirementUsageObjectiveRedefinition`): bases for its own
+            // subject and parameters.
+            let objective_bases: Vec<usize> = plan
+                .targets
+                .get(&e)
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .copied()
+                        .filter(|&t| owned_as_objective(self, t))
+                        .collect()
+                })
+                .unwrap_or_default();
+            charge(&mut steps, objective_bases.len())?;
+            if objective_bases.iter().any(|b| {
+                plan.incomplete.contains(b)
+                    || !(effective.contains_key(b) || planned.effective.contains(*b))
+            }) {
+                plan.incomplete.insert(e);
+            }
             if plan.incomplete.contains(&e) {
                 continue;
             }
@@ -1668,13 +1731,16 @@ impl Builder {
                     .owning_relationship
                     .is_some_and(|r| is_a!(self.elements[r], "SubjectMembership"))
             };
+            let is_objective = |feature: usize| owned_as_objective(self, feature);
+            let case_kind =
+                |kind: &str| conforms(kind, "CaseDefinition") || conforms(kind, "CaseUsage");
             let subjects: Vec<_> = parameters
                 .iter()
                 .copied()
                 .filter(|&f| is_subject(f))
                 .collect();
             if subject_family(self.elements[e].ty).is_some() {
-                for base in &node.bases {
+                for base in node.bases.iter().chain(objective_bases.iter()) {
                     charge(&mut steps, 1)?;
                     charge_sort(&mut steps, effective_of(&effective, planned, base).len())?;
                 }
@@ -1682,6 +1748,7 @@ impl Builder {
             let subject_bases: Vec<_> = if let Some(family) = subject_family(self.elements[e].ty) {
                 node.bases
                     .iter()
+                    .chain(objective_bases.iter())
                     .filter(|&&base| subject_family(self.elements[base].ty) == Some(family))
                     .map(|&base| {
                         let mut subjects: Vec<_> = effective_of(&effective, planned, &base)
@@ -1722,7 +1789,61 @@ impl Builder {
                     }
                 }
             }
-            for &base in &node.bases {
+            // A case's objective redefines the specialized case's objective,
+            // inherited or not (SysML
+            // `checkRequirementUsageObjectiveRedefinition`), as its subject
+            // does; an ambiguous objective view is left unplanned.
+            if case_kind(self.elements[e].ty) {
+                charge(&mut steps, node.owned.len())?;
+                let objectives: Vec<_> = node
+                    .owned
+                    .iter()
+                    .copied()
+                    .filter(|&f| is_objective(f))
+                    .collect();
+                if objectives.len() > 1 {
+                    plan.incomplete.insert(e);
+                    continue;
+                }
+                let mut ambiguous = false;
+                let mut objective_targets = Vec::new();
+                for &base in &node.bases {
+                    if !case_kind(self.elements[base].ty) {
+                        continue;
+                    }
+                    charge(&mut steps, 1)?;
+                    let view = effective_of(&effective, planned, &base);
+                    charge_sort(&mut steps, view.len())?;
+                    let mut found: Vec<_> =
+                        view.iter().copied().filter(|&f| is_objective(f)).collect();
+                    found.sort_unstable();
+                    found.dedup();
+                    match found[..] {
+                        [] => {}
+                        [target] => objective_targets.push(target),
+                        _ => ambiguous = true,
+                    }
+                }
+                if ambiguous {
+                    plan.incomplete.insert(e);
+                    continue;
+                }
+                if let Some(&source) = objectives.first() {
+                    for target in objective_targets {
+                        charge(&mut steps, 1)?;
+                        add_edge(
+                            source,
+                            target,
+                            &mut redefinitions,
+                            &planned.redefinitions,
+                            &mut plan.targets,
+                            &mut traversal,
+                            &mut steps,
+                        )?;
+                    }
+                }
+            }
+            for &base in node.bases.iter().chain(objective_bases.iter()) {
                 charge(&mut steps, 1)?;
                 let base_roles = roles
                     .get(&base)
@@ -1998,12 +2119,14 @@ impl Builder {
         if !raw.ids_unique || raw.annotations_incomplete || self.metadata_associations_incomplete {
             return None;
         }
+        // Semantic metadata adds a base the planner does not write (KerML
+        // 9.2); plain metadata adds none.
+        let semantic = self.semantically_annotated();
         // The checked Type caller establishes these domains before asking for
         // selectors; the publication planner must establish them independently.
         if !raw.import_domains(self, steps)?.owner_complete(owner)
             || !raw.membership_domains(self, steps)?.owner_complete(owner)
-            || raw.metadata_annotation_targets.contains(&owner)
-            || self.metadata_of.get(&owner).is_some_and(|v| !v.is_empty())
+            || semantic.contains(&owner)
         {
             return None;
         }
@@ -2053,6 +2176,9 @@ impl Builder {
         if !raw.ids_unique || raw.annotations_incomplete || self.metadata_associations_incomplete {
             return None;
         }
+        // Semantic metadata adds a base the planner does not write (KerML
+        // 9.2); plain metadata adds none.
+        let semantic = self.semantically_annotated();
         let mut budget = Some(steps);
         charge(&mut budget, imports.0.len().saturating_add(imports.1.len()))?;
         let mut todo: Vec<_> = imports
@@ -2099,11 +2225,7 @@ impl Builder {
                     !v.is_null() && !matches!(v.as_str(), Some("in" | "out" | "inout"))
                 })
                 || raw.bad_bases.contains(&feature)
-                || raw.metadata_annotation_targets.contains(&feature)
-                || self
-                    .metadata_of
-                    .get(&feature)
-                    .is_some_and(|v| !v.is_empty())
+                || semantic.contains(&feature)
             {
                 return None;
             }
@@ -2132,8 +2254,7 @@ impl Builder {
                 self, raw, membership, steps,
             )??;
             if !domains.owner_complete(owner)
-                || raw.metadata_annotation_targets.contains(&owner)
-                || self.metadata_of.get(&owner).is_some_and(|v| !v.is_empty())
+                || semantic.contains(&owner)
                 || super::membership_evidence::member(self, raw, owner, membership, steps)
                     != Some(feature)
             {
@@ -2328,6 +2449,9 @@ impl Builder {
         steps: &mut usize,
         proof: &mut ImportProof,
     ) -> Option<()> {
+        // Semantic metadata adds a base the planner does not write (KerML
+        // 9.2); plain metadata adds none.
+        let semantic = self.semantically_annotated();
         charge(&mut Some(&mut *steps), 1)?;
         if !matches!(self.elements[root].ty, "Class" | "Behavior" | "Function") {
             return None;
@@ -2351,8 +2475,7 @@ impl Builder {
                 || raw.bad_bases.contains(&owner)
                 || !domains.owner_complete(owner)
                 || !imports.owner_complete(owner)
-                || raw.metadata_annotation_targets.contains(&owner)
-                || self.metadata_of.get(&owner).is_some_and(|v| !v.is_empty())
+                || semantic.contains(&owner)
                 || self
                     .elem_scope
                     .get(&owner)
@@ -2742,6 +2865,13 @@ fn add_edge(
         added.entry(source).or_default().push(target);
     }
     Some(())
+}
+
+/// Whether `f` is a case's objective (owned through an `ObjectiveMembership`).
+fn owned_as_objective(b: &Builder, f: usize) -> bool {
+    b.elements[f]
+        .owning_relationship
+        .is_some_and(|r| is_a!(b.elements[r], "ObjectiveMembership"))
 }
 
 /// A complete type's effective features: planned here, or by the library.

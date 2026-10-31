@@ -29,7 +29,11 @@
 //! term rescales into the left's unit, mirroring the evaluator's
 //! measurement-reference conversion; two different *dimensions* meeting
 //! in one operation — or on one variable — bail. Each variable still
-//! lives in a single unit; witnesses report it.
+//! lives in a single unit; witnesses report it. A tag from a folded
+//! constant also remembers the unit the constant reads in as written
+//! (`2 ['in'] * (3 ['in'])` folds to square metres, written `in**2`);
+//! that is display information for range reports and never reaches a
+//! term.
 
 use crate::term::{EnumSort, Op, Sort, Term};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -78,7 +82,7 @@ fn not_one_value(r: &mut ResolvedModel, elem: ElementRef, display: &str) -> Unsu
 
 /// [`not_one_value`] for a chain's intermediate feature.
 fn not_one_receiver(r: &mut ResolvedModel, elem: ElementRef, display: &str) -> Unsupported {
-    let name = r.render_value(&Value::Unbound(elem));
+    let name = r.render_value(&Value::Unbound(elem, Default::default()));
     if r.implicit_open_multiplicity(elem) {
         Unsupported::ordinary(format!(
             "a chain through `{name}`, which declares no multiplicity and so is a collection of any size; declare `[1]` on it for one value"
@@ -100,6 +104,10 @@ pub(crate) struct VarInfo {
     pub sort: Sort,
     /// Inferred measurement unit (display spelling), for witness output.
     pub unit: Option<String>,
+    /// The unit the variable's bounds were written in, when it differs
+    /// from [`Self::unit`]: the factor taking a magnitude in `unit` to
+    /// one in this unit, and its display spelling.
+    pub written: Option<(Rational, String)>,
     /// An auxiliary introduced by the translation itself (it names one
     /// step of a sequence fold and is defined by a side equality) — part
     /// of the variable space, never reported to callers.
@@ -113,6 +121,19 @@ pub(crate) struct VarInfo {
 #[derive(Clone, Debug)]
 struct UTag {
     key: String,
+    scale: Rational,
+    display: String,
+    /// The unit a folded constant reads in as written, when that is
+    /// another unit than this one (see
+    /// [`ResolvedModel::value_as_written`]). Display only: equality and
+    /// every term ignore it.
+    written: Option<WrittenTag>,
+}
+
+/// A unit a quantity was written in: its scale to the reference
+/// magnitude and its display spelling.
+#[derive(Clone, Debug)]
+struct WrittenTag {
     scale: Rational,
     display: String,
 }
@@ -582,10 +603,20 @@ impl<'m> Translator<'m> {
                 None => bail("a non-finite numeric value"),
             },
             Ok(Value::Quantity(n, u)) => {
+                let written = match self
+                    .read(|r| r.value_as_written(&Value::Quantity(n.clone(), u.clone())))
+                {
+                    Some(Value::Quantity(_, w)) => Some(WrittenTag {
+                        scale: w.scale().clone(),
+                        display: w.display().to_string(),
+                    }),
+                    _ => None,
+                };
                 let unit = Some(UTag {
                     key: u.dims_key(),
                     scale: u.scale().clone(),
                     display: u.display().to_string(),
+                    written,
                 });
                 let term = match *n {
                     Value::Integer(i) => Term::IntLit(i),
@@ -603,7 +634,7 @@ impl<'m> Translator<'m> {
                 Ok(Some(UT::plain(self.enum_term(el)?)))
             }
             Ok(Value::Element(_))
-            | Ok(Value::Unbound(_) | Value::UnboundMember(_))
+            | Ok(Value::Unbound(..) | Value::UnboundMember(..))
             | Ok(Value::Indeterminate)
             | Ok(Value::Instance { .. })
             | Ok(Value::Sequence(_))
@@ -689,6 +720,7 @@ impl<'m> Translator<'m> {
                         key: unit.dims_key(),
                         scale: unit.scale().clone(),
                         display: unit.display().to_string(),
+                        written: None,
                     }),
                 })
             }
@@ -792,6 +824,7 @@ impl<'m> Translator<'m> {
                         key: format!("({}^{k})", u.key),
                         scale: u.scale.pow_or_approx(k as i32),
                         display: format!("{}**{k}", u.display),
+                        written: None,
                     }),
                 };
                 Ok(UT { term: out, unit })
@@ -1750,19 +1783,19 @@ impl<'m> Translator<'m> {
         tval: Value,
         qn: &QualifiedName,
     ) -> Result<UT, Unsupported> {
-        if matches!(tval, Value::Indeterminate | Value::UnboundMember(_)) {
+        if matches!(tval, Value::Indeterminate | Value::UnboundMember(..)) {
             // A nested unknown member has no concrete featuring context.
             // Do not identify distinct receiver paths by their shared
             // declaration, or inline defaults from that declaration.
             return bail("a chain through an unknown receiver member");
         }
-        if let Value::Unbound(t) = &tval {
+        if let Value::Unbound(t, _) = &tval {
             if self.r.effective_cardinality(*t) != Some((1, Some(1))) {
                 return Err(not_one_receiver(self.r, *t, ""));
             }
         }
-        let unbound = matches!(&tval, Value::Unbound(t) if self.r.is_reference_feature(*t));
-        let (Value::Element(t) | Value::Unbound(t)) = tval else {
+        let unbound = matches!(&tval, Value::Unbound(t, _) if self.r.is_reference_feature(*t));
+        let (Value::Element(t) | Value::Unbound(t, _)) = tval else {
             return bail("a chain whose target is not a model element");
         };
         let Some((hit, sub)) = self.read(|r| r.member_of(t, qn)) else {
@@ -2261,6 +2294,10 @@ impl<'m> Translator<'m> {
                 sym: format!("v{i}_{}", sanitize(display)),
                 sort,
                 unit: self.var_units[i].as_ref().map(|u| u.display.clone()),
+                written: self.var_units[i].as_ref().and_then(|u| {
+                    let w = u.written.as_ref()?;
+                    Some((u.scale.div(&w.scale)?, w.display.clone()))
+                }),
                 aux: self.aux[i],
             });
         }
@@ -2311,6 +2348,7 @@ fn compose_mul(a: &Option<UTag>, b: &Option<UTag>) -> Option<UTag> {
                 key: format!("({}*{})", x.key, y.key),
                 scale: u.scale.mul(&v.scale),
                 display: format!("{}*{}", u.display, v.display),
+                written: None,
             })
         }
     }
@@ -2332,6 +2370,7 @@ fn compose_div(a: &Option<UTag>, b: &Option<UTag>) -> Option<UTag> {
                 key: format!("({nk}/{})", v.key),
                 scale: ns.div(&v.scale).unwrap_or_else(Rational::one),
                 display: format!("{nd}/{}", v.display),
+                written: None,
             })
         }
     }

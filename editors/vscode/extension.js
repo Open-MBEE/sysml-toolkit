@@ -16,7 +16,10 @@ function activate() {
     { command, args: ["lsp"] },
     {
       documentSelector: [{ language: "sysml" }, { language: "kerml" }],
-      initializationOptions: { numberFormat: config.get("numberFormat", "exact") },
+      initializationOptions: {
+        numberFormat: config.get("numberFormat", "exact"),
+        valueHintUnits: config.get("valueHintUnits", "si"),
+      },
     }
   );
   client.start();

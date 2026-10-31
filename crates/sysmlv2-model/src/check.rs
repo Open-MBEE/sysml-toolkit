@@ -674,10 +674,26 @@ pub struct ConstraintBinding {
     /// Rendered evaluated value; `None` when the reference does not
     /// evaluate on its own (an unbound feature).
     pub value: Option<String>,
+    /// [`Self::value`] in the units the value was written in, when that
+    /// reads differently (see
+    /// [`ResolvedModel::value_as_written`](crate::json::ResolvedModel::value_as_written)).
+    pub value_as_written: Option<String>,
     /// Declaration site of the referenced feature's name: (unit index,
     /// span of the name token). `None` when the reference does not
     /// resolve or the element is synthesized.
     pub site: Option<(usize, sysmlv2_syntax::span::Span)>,
+}
+
+impl ConstraintBinding {
+    /// The rendered value with quantities in the units `units` chooses.
+    pub fn value_in(&self, units: crate::eval::UnitDisplay) -> Option<&str> {
+        match units {
+            crate::eval::UnitDisplay::AsWritten => {
+                self.value_as_written.as_deref().or(self.value.as_deref())
+            }
+            crate::eval::UnitDisplay::Si => self.value.as_deref(),
+        }
+    }
 }
 
 /// The feature references of `c`'s result expression, each evaluated on
@@ -726,19 +742,27 @@ fn feature_bindings(
         // case for diagnostic purposes, not a value worth showing. A
         // reference *through* an unbound feature is undetermined for the
         // same reason and renders just as opaquely (`<indeterminate>`).
-        let value = match value {
+        let (value, value_as_written) = match value {
             Ok(
                 crate::eval::Value::Element(_)
-                | crate::eval::Value::Unbound(_)
-                | crate::eval::Value::UnboundMember(_)
+                | crate::eval::Value::Unbound(..)
+                | crate::eval::Value::UnboundMember(..)
                 | crate::eval::Value::Indeterminate,
             )
-            | Err(_) => None,
-            Ok(v) => Some(v.to_string()),
+            | Err(_) => (None, None),
+            // As written through a sequence's items and an instance's
+            // fields too, kept only when it reads differently.
+            Ok(v) => {
+                let shown = v.to_string();
+                let written = r.quantities_as_written(&v).to_string();
+                let differs = written != shown;
+                (Some(shown), differs.then_some(written))
+            }
         };
         out.push(ConstraintBinding {
             feature,
             value,
+            value_as_written,
             site,
         });
     }
@@ -862,7 +886,8 @@ fn bound_verdict(
     c: &crate::json::ConstraintInfo,
     overrides: &std::collections::HashMap<usize, crate::eval::Value>,
 ) -> ConstraintVerdict {
-    match r.evaluate_in_with(c.scope, &c.expr, overrides) {
+    let (result, receivers) = r.evaluate_in_explained(c.scope, &c.expr, overrides);
+    match result {
         Ok(crate::eval::Value::Boolean(b)) => {
             if b != c.negated {
                 ConstraintVerdict::Satisfied
@@ -870,11 +895,34 @@ fn bound_verdict(
                 ConstraintVerdict::Violated
             }
         }
-        Ok(crate::eval::Value::Indeterminate) => ConstraintVerdict::Undecided(
-            "result is indeterminate over unbound features".to_string(),
-        ),
+        Ok(crate::eval::Value::Indeterminate) => {
+            ConstraintVerdict::Undecided(indeterminate_reason(r, &receivers))
+        }
         Ok(other) => ConstraintVerdict::Undecided(format!("result is not a boolean: {other}")),
         Err(e) => ConstraintVerdict::Undecided(e.to_string()),
+    }
+}
+
+/// Why a constraint evaluated as indeterminate. When a chain stopped at a
+/// usage that is a collection only because it declares no multiplicity
+/// (one a package owns, see
+/// [`crate::json::ResolvedModel::implicit_open_multiplicity`]), the reason
+/// names it and the `[1]` that makes it one value.
+fn indeterminate_reason(
+    r: &mut crate::json::ResolvedModel,
+    receivers: &[crate::json::ElementRef],
+) -> String {
+    const UNBOUND: &str = "result is indeterminate over unbound features";
+    match receivers
+        .iter()
+        .copied()
+        .find(|&e| r.implicit_open_multiplicity(e))
+    {
+        Some(e) => format!(
+            "{UNBOUND}: a chain through `{}`, which declares no multiplicity and so is a collection of any size; declare `[1]` on it for one value",
+            r.render_value(&crate::eval::Value::Unbound(e, Default::default()))
+        ),
+        None => UNBOUND.to_string(),
     }
 }
 
@@ -1058,20 +1106,7 @@ pub fn constraint_verdict(
     r: &mut crate::json::ResolvedModel,
     c: &crate::json::ConstraintInfo,
 ) -> ConstraintVerdict {
-    match r.evaluate_in(c.scope, &c.expr) {
-        Ok(crate::eval::Value::Boolean(b)) => {
-            if b != c.negated {
-                ConstraintVerdict::Satisfied
-            } else {
-                ConstraintVerdict::Violated
-            }
-        }
-        Ok(crate::eval::Value::Indeterminate) => ConstraintVerdict::Undecided(
-            "result is indeterminate over unbound features".to_string(),
-        ),
-        Ok(other) => ConstraintVerdict::Undecided(format!("result is not a boolean: {other}")),
-        Err(e) => ConstraintVerdict::Undecided(e.to_string()),
-    }
+    bound_verdict(r, c, &std::collections::HashMap::new())
 }
 
 #[cfg(test)]

@@ -4,10 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use sysmlv2_parser::{
     full::model_to_full_json,
-    json::{
-        ClosurePolicy, Derived, DerivedValue, OperationError, Reference, ResolvedModel,
-        model_to_compact_json,
-    },
+    json::{ClosurePolicy, Derived, DerivedValue, Reference, ResolvedModel, model_to_compact_json},
     loader::load_document,
     model::Model,
 };
@@ -121,8 +118,11 @@ fn absent_succession_source_does_not_shift_the_target() {
     assert!(source.is_empty());
     assert_eq!(target.len(), 1);
 }
+/// A subsetting confers no name (KerML `Feature::namingFeature` reads the
+/// owned redefinitions), so `part :> named;` has a null effective name,
+/// answered rather than refused.
 #[test]
-fn effective_name_operations_dispatch_and_refuse_uncertified_inheritance() {
+fn effective_name_operations_dispatch_and_name_a_subsetting_feature_null() {
     let m = model("package <p> P { part <x> named; part :> named; }");
     let mut r = ResolvedModel::build(&m);
     let name = "Root-Elements-Element-effectiveName_";
@@ -149,10 +149,14 @@ fn effective_name_operations_dispatch_and_refuse_uncertified_inheritance() {
                     .is_none_or(|v| v.is_null())
         })
         .unwrap();
-    assert!(matches!(
-        r.invoke_operation(anonymous, name, &[]),
-        Err(OperationError::Incomplete { .. })
-    ));
+    let result = r.invoke_operation(anonymous, name, &[]).unwrap();
+    assert_eq!(result.effective, "Core-Features-Feature-effectiveName_");
+    assert_eq!(result.value, DerivedValue::Null);
+    assert_eq!(
+        r.invoke_operation(anonymous, short, &[]).unwrap().value,
+        DerivedValue::Null
+    );
+    assert_eq!(r.property(anonymous, "name").unwrap(), json!(null));
 }
 
 #[test]

@@ -1376,6 +1376,26 @@ fn fmt_i(x: i128) -> String {
     }
 }
 
+/// A real domain in another unit: every endpoint multiplied by
+/// `factor`, a positive exact rational, so the scaled interval holds
+/// the same quantities. `None` for any other domain or factor.
+pub(crate) fn scale_dom(d: &Dom, factor: &Rational) -> Option<Dom> {
+    let Dom::R(v) = d else {
+        return None;
+    };
+    if !factor.is_positive() {
+        return None;
+    }
+    if v.is_empty() {
+        return Some(d.clone());
+    }
+    let scale = |e: &Ext| match e {
+        Ext::Fin(x) => Ext::Fin(x.mul(factor)),
+        infinite => infinite.clone(),
+    };
+    Some(Dom::R(Ival::new(scale(&v.lo), scale(&v.hi))))
+}
+
 /// Render a domain as a closed range or set, non-terminating real
 /// endpoints in `format` (exact for [`crate::FeatureRange::range`], the
 /// configured format for [`crate::FeatureRange::range_approx`]). Enum

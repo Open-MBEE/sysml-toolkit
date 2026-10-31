@@ -124,10 +124,11 @@ fn read(b: &mut Builder, usage: usize, steps: &mut usize) -> Result<bool, UsageV
     if !structure.ids_unique {
         return Err(InvalidElement);
     }
+    // Semantic metadata adds a base the planner does not write (KerML 9.2);
+    // plain metadata adds none.
     if b.metadata_associations_incomplete
         || structure.annotations_incomplete
-        || structure.metadata_annotation_targets.contains(&usage)
-        || b.metadata_of.get(&usage).is_some_and(|v| !v.is_empty())
+        || b.semantically_annotated().contains(&usage)
     {
         return Err(UnsupportedMetadata);
     }

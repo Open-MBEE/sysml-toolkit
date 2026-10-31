@@ -691,6 +691,13 @@ pub(super) fn validate_directions(
                 if *kind != "Redefinition" || *e < r.b.lib_boundary {
                     return None;
                 }
+                // A flow end's flow feature redefines the feature the end
+                // names; its direction is the end's role (the source's
+                // output, the target's input), which the flow rules read,
+                // not a declared redefinition direction.
+                if g.owner[*e].is_some_and(|owner| r.b.elements[owner].ty == "FlowEnd") {
+                    return None;
+                }
                 let t = r.b.spec_resolved.get(i).copied().flatten()?;
                 let unit = r.b.unit_of_elem(*e);
                 (!model.is_library_unit(unit)).then_some((*e, t, unit, qn.span))

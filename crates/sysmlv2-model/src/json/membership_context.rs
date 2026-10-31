@@ -234,6 +234,69 @@ impl Builder {
         value
     }
 
+    /// Whether every chain among `scope`'s written bases is identified by a
+    /// stored chain feature among `element`'s specializations whose links
+    /// validate and whose last link's scope is one of `bases`.
+    fn chain_bases_identified(
+        &mut self,
+        element: usize,
+        scope: usize,
+        bases: &[usize],
+        context: &mut MembershipContext,
+    ) -> bool {
+        let Some(raw) =
+            super::structural_index::StoredStructure::for_query(self, &mut context.steps)
+        else {
+            return false;
+        };
+        let relationships = self.elements[element].owned_relationships.clone();
+        if !context.charge(relationships.len()) {
+            return false;
+        }
+        let mut identified = 0;
+        for relationship in relationships {
+            let relation = &self.elements[relationship];
+            if !is_a!(relation, "Specialization") {
+                continue;
+            }
+            let Some(target) = super::implied::specialization_target(relation)
+                .and_then(|id| raw.element_for_uuid(self, id))
+            else {
+                continue;
+            };
+            if self.elem_scope.contains_key(&target) {
+                continue;
+            }
+            let rows = &self.elements[target].owned_relationships;
+            if !rows
+                .iter()
+                .any(|&row| is_a!(self.elements[row], "FeatureChaining"))
+            {
+                continue;
+            }
+            let last = super::type_relations::checked_feature_target(
+                self,
+                &raw,
+                target,
+                rows,
+                self.elements.len(),
+                &mut context.steps,
+            );
+            match last {
+                Some(Some(last))
+                    if self
+                        .elem_scope
+                        .get(&last)
+                        .is_some_and(|last| bases.contains(last)) =>
+                {
+                    identified += 1;
+                }
+                _ => return false,
+            }
+        }
+        identified >= self.scopes[scope].chain_bases.len()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn contextual_inherited_uncached(
         &mut self,
@@ -277,7 +340,6 @@ impl Builder {
             }
         }
         if self.metadata_associations_incomplete
-            || scope.is_some_and(|scope| !self.scopes[scope].chain_bases.is_empty())
             || self
                 .metadata_of
                 .get(&element)
@@ -287,6 +349,14 @@ impl Builder {
         }
         let bases = if let Some(scope) = scope {
             let (mut bases, explicit) = self.base_scopes_split(scope);
+            // A chain among the written bases (`:> a.b`): the resolver's
+            // base is its last link's scope, admitted once the stored chain
+            // feature's links are validated and name that scope.
+            if !self.scopes[scope].chain_bases.is_empty()
+                && !self.chain_bases_identified(element, scope, &bases, context)
+            {
+                result.incomplete = true;
+            }
             if !include_implied {
                 bases.truncate(explicit);
             }

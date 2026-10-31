@@ -5,9 +5,11 @@
 //! visited non-conjugated type. Other families remain unknown; no unsupported
 //! base omission is a negative fact.
 use super::{Builder, provider_completeness::ProviderCompleteness, semantic_ownership};
+use crate::lift::usage_kind_of;
 use crate::metaclass::conforms;
 use crate::metaclass::is_a;
 use std::collections::{HashMap, HashSet};
+use sysmlv2_syntax::ast::Dialect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SupertypesFailure {
@@ -94,12 +96,24 @@ pub(super) fn composite_roles(
     owner: &str,
     object: bool,
     occurrence: bool,
+    composite: bool,
+    portion: bool,
     owner_types: CompositionOwner,
 ) -> Vec<&'static str> {
     let mut roles = Vec::new();
-    if (conforms(owner, "Class") || owner_types.occurrence || conforms(owner, "OccurrenceUsage"))
-        && (occurrence || conforms(kind, "OccurrenceUsage"))
-    {
+    let occurrence_owner =
+        conforms(owner, "Class") || owner_types.occurrence || conforms(owner, "OccurrenceUsage");
+    let occurrence_typed = occurrence || conforms(kind, "OccurrenceUsage");
+    // A portion typed by a Class in a Class or a Class-typed feature (KerML
+    // `checkFeaturePortionSpecialization`).
+    if portion && occurrence_typed && occurrence_owner {
+        roles.push("Occurrences::Occurrence::portions");
+    }
+    // The composition roles are a composite's.
+    if !composite {
+        return roles;
+    }
+    if occurrence_owner && occurrence_typed {
         roles.push("Occurrences::Occurrence::suboccurrences");
     }
     if (conforms(owner, "Structure") || owner_types.object) && object {
@@ -116,11 +130,520 @@ pub(super) fn composite_roles(
     roles
 }
 
-pub(super) const COMPOSITE_ROLES: [&str; 4] = [
+/// The owner contexts under which a composite member's typing adds the
+/// conditional composition roles (`composite_roles`): the planner plans
+/// them for a member under an exact FeatureMembership of one of these
+/// owners and for no other (`implied.rs`, `owned_typing_requirements`),
+/// so the checked audit requires them there and nowhere else.
+pub(super) fn composite_owner_context(owner: &str) -> bool {
+    matches!(
+        owner,
+        "Type"
+            | "Classifier"
+            | "Class"
+            | "Structure"
+            | "DataType"
+            | "Definition"
+            | "AttributeDefinition"
+            | "OccurrenceDefinition"
+            | "ItemDefinition"
+            | "PartDefinition"
+            | "Feature"
+            | "OccurrenceUsage"
+            | "ItemUsage"
+            | "PartUsage"
+    )
+}
+
+/// The library roles the audits name, each with the metaclass its
+/// declaration conforms to: the root types and features of the Kernel
+/// Semantic Library, the definitions and usage roles of the Systems
+/// Library (`implicit_def_bases`, `implicit_usage_bases`) and the
+/// conditional composition, flow, invariant and binary roles. A role is
+/// resolved among the loaded library's element names by its declared
+/// qualified name, once, under the same bounded identity authority as the
+/// rest of the proof; a replacement library that spells a role with
+/// another kind, twice or not at all leaves every audit naming it
+/// incomplete.
+const ROLE_KINDS: &[(&str, &str)] = &[
+    ("Base::Anything", "Classifier"),
+    ("Base::DataValue", "DataType"),
+    ("Base::things", "Feature"),
+    ("Base::dataValues", "Feature"),
+    ("Base::naturals", "Feature"),
+    ("Occurrences::Occurrence", "Class"),
+    ("Occurrences::HappensLink", "Association"),
+    ("Occurrences::occurrences", "Feature"),
+    ("Occurrences::happensBeforeLinks", "Feature"),
+    ("Occurrences::Occurrence::suboccurrences", "Feature"),
+    ("Occurrences::Occurrence::snapshots", "Feature"),
+    ("Occurrences::Occurrence::timeSlices", "Feature"),
+    ("Occurrences::Occurrence::portions", "Feature"),
+    (
+        "Occurrences::Occurrence::timeEnclosedOccurrences",
+        "Feature",
+    ),
+    ("Occurrences::Life", "Class"),
+    ("Objects::Object", "Structure"),
+    ("Objects::LinkObject", "AssociationStructure"),
+    ("Objects::objects", "Feature"),
+    ("Objects::Object::subobjects", "Feature"),
+    ("Links::Link", "Association"),
+    ("Links::BinaryLink", "Association"),
+    ("Links::SelfLink", "Association"),
+    ("Links::links", "Feature"),
+    ("Links::binaryLinks", "Feature"),
+    ("Performances::Performance", "Behavior"),
+    ("Performances::Evaluation", "Function"),
+    ("Performances::BooleanEvaluation", "Predicate"),
+    ("Performances::performances", "Step"),
+    ("Performances::evaluations", "Expression"),
+    ("Performances::booleanEvaluations", "Expression"),
+    ("Performances::trueEvaluations", "Expression"),
+    ("Performances::falseEvaluations", "Expression"),
+    ("Performances::literalEvaluations", "Expression"),
+    ("Performances::literalBooleanEvaluations", "Expression"),
+    ("Performances::literalIntegerEvaluations", "Expression"),
+    ("Performances::literalRationalEvaluations", "Expression"),
+    ("Performances::literalStringEvaluations", "Expression"),
+    ("Performances::nullEvaluations", "Expression"),
+    ("Performances::metadataAccessEvaluations", "Expression"),
+    ("Performances::constructorEvaluations", "Expression"),
+    ("Transfers::Transfer", "Interaction"),
+    ("Transfers::transfers", "Step"),
+    ("Transfers::flowTransfers", "Step"),
+    ("Transfers::flowTransfersBefore", "Step"),
+    ("Metaobjects::Metaobject", "Metaclass"),
+    ("Metaobjects::metaobjects", "Feature"),
+    ("Items::Item", "ItemDefinition"),
+    ("Items::items", "ItemUsage"),
+    ("Items::Item::subitems", "ItemUsage"),
+    ("Items::Item::subparts", "PartUsage"),
+    ("Items::Item::checkedConstraints", "ConstraintUsage"),
+    ("Parts::Part", "PartDefinition"),
+    ("Parts::parts", "PartUsage"),
+    ("Ports::Port", "PortDefinition"),
+    ("Ports::ports", "PortUsage"),
+    ("Actions::Action", "ActionDefinition"),
+    ("Actions::actions", "ActionUsage"),
+    ("Actions::acceptActions", "ActionUsage"),
+    ("Actions::sendActions", "ActionUsage"),
+    ("Actions::assignmentActions", "ActionUsage"),
+    ("Actions::terminateActions", "ActionUsage"),
+    ("Actions::ifThenActions", "ActionUsage"),
+    ("Actions::ifThenElseActions", "ActionUsage"),
+    ("Actions::whileLoopActions", "ActionUsage"),
+    ("Actions::forLoopActions", "ActionUsage"),
+    ("Actions::Action::merges", "ActionUsage"),
+    ("Actions::Action::decisions", "ActionUsage"),
+    ("Actions::Action::joins", "ActionUsage"),
+    ("Actions::Action::forks", "ActionUsage"),
+    ("Actions::Action::subactions", "ActionUsage"),
+    ("Actions::Action::whileLoops", "ActionUsage"),
+    ("Actions::Action::forLoops", "ActionUsage"),
+    ("Actions::Action::ifSubactions", "ActionUsage"),
+    ("Actions::Action::assignments", "ActionUsage"),
+    ("Actions::Action::sendSubactions", "ActionUsage"),
+    ("Actions::Action::acceptSubactions", "ActionUsage"),
+    ("Actions::Action::terminateSubactions", "ActionUsage"),
+    ("Actions::Action::decisionTransitions", "ActionUsage"),
+    ("Actions::TransitionAction::accepter", "ActionUsage"),
+    ("Actions::TransitionAction::effect", "ActionUsage"),
+    (
+        "TransitionPerformances::TransitionPerformance::guard",
+        "BooleanExpression",
+    ),
+    ("Actions::transitionActions", "ActionUsage"),
+    ("States::StateAction", "StateDefinition"),
+    ("States::stateActions", "StateUsage"),
+    ("States::StateAction::substates", "ActionUsage"),
+    ("States::StateAction::exclusiveStates", "StateUsage"),
+    ("States::StateAction::stateTransitions", "ActionUsage"),
+    ("States::StateAction::entryAction", "ActionUsage"),
+    ("States::StateAction::doAction", "ActionUsage"),
+    ("States::StateAction::exitAction", "ActionUsage"),
+    ("Parts::Part::ownedActions", "ActionUsage"),
+    ("Parts::Part::performedActions", "ActionUsage"),
+    ("Parts::Part::ownedStates", "StateUsage"),
+    ("Parts::Part::exhibitedStates", "StateUsage"),
+    ("Parts::Part::ownedPorts", "PortUsage"),
+    ("Ports::Port::subports", "PortUsage"),
+    ("Calculations::Calculation", "CalculationDefinition"),
+    ("Calculations::calculations", "CalculationUsage"),
+    (
+        "Calculations::Calculation::subcalculations",
+        "CalculationUsage",
+    ),
+    ("Constraints::ConstraintCheck", "ConstraintDefinition"),
+    ("Constraints::constraintChecks", "ConstraintUsage"),
+    ("Constraints::assertedConstraintChecks", "ConstraintUsage"),
+    ("Constraints::negatedConstraintChecks", "ConstraintUsage"),
+    ("Requirements::RequirementCheck", "RequirementDefinition"),
+    (
+        "Requirements::RequirementCheck::subrequirements",
+        "RequirementUsage",
+    ),
+    ("Requirements::RequirementCheck::concerns", "ConcernUsage"),
+    (
+        "Requirements::RequirementCheck::assumptions",
+        "ConstraintUsage",
+    ),
+    (
+        "Requirements::RequirementCheck::constraints",
+        "ConstraintUsage",
+    ),
+    ("Requirements::RequirementCheck::actors", "PartUsage"),
+    ("Requirements::RequirementCheck::stakeholders", "PartUsage"),
+    ("Requirements::ConcernCheck", "ConcernDefinition"),
+    ("Requirements::requirementChecks", "RequirementUsage"),
+    ("Requirements::concernChecks", "ConcernUsage"),
+    (
+        "Requirements::satisfiedRequirementChecks",
+        "RequirementUsage",
+    ),
+    (
+        "Requirements::notSatisfiedRequirementChecks",
+        "RequirementUsage",
+    ),
+    ("Cases::Case", "CaseDefinition"),
+    ("Cases::cases", "CaseUsage"),
+    ("Cases::Case::subcases", "CaseUsage"),
+    ("Cases::Case::actors", "PartUsage"),
+    ("AnalysisCases::AnalysisCase", "AnalysisCaseDefinition"),
+    ("AnalysisCases::analysisCases", "AnalysisCaseUsage"),
+    (
+        "AnalysisCases::AnalysisCase::subAnalysisCases",
+        "AnalysisCaseUsage",
+    ),
+    (
+        "VerificationCases::VerificationCase",
+        "VerificationCaseDefinition",
+    ),
+    (
+        "VerificationCases::verificationCases",
+        "VerificationCaseUsage",
+    ),
+    (
+        "VerificationCases::VerificationCase::subVerificationCases",
+        "VerificationCaseUsage",
+    ),
+    (
+        "VerificationCases::VerificationCase::obj::requirementVerifications",
+        "RequirementUsage",
+    ),
+    ("UseCases::UseCase", "UseCaseDefinition"),
+    ("UseCases::useCases", "UseCaseUsage"),
+    ("UseCases::UseCase::subUseCases", "UseCaseUsage"),
+    ("UseCases::UseCase::includedUseCases", "UseCaseUsage"),
+    ("Views::View", "ViewDefinition"),
+    ("Views::ViewpointCheck", "ViewpointDefinition"),
+    ("Views::Rendering", "RenderingDefinition"),
+    ("Views::views", "ViewUsage"),
+    ("Views::viewpointChecks", "ViewpointUsage"),
+    ("Views::renderings", "RenderingUsage"),
+    ("Views::View::subviews", "ViewUsage"),
+    ("Views::View::viewRendering", "RenderingUsage"),
+    ("Views::View::viewpointSatisfactions", "ViewpointUsage"),
+    ("Views::Rendering::subrenderings", "RenderingUsage"),
+    ("Connections::Connection", "ConnectionDefinition"),
+    ("Connections::BinaryConnection", "ConnectionDefinition"),
+    ("Connections::connections", "ConnectionUsage"),
+    ("Connections::binaryConnections", "ConnectionUsage"),
+    ("Interfaces::Interface", "InterfaceDefinition"),
+    ("Interfaces::BinaryInterface", "InterfaceDefinition"),
+    ("Interfaces::interfaces", "InterfaceUsage"),
+    ("Interfaces::binaryInterfaces", "InterfaceUsage"),
+    ("Allocations::Allocation", "AllocationDefinition"),
+    ("Allocations::allocations", "AllocationUsage"),
+    ("Flows::MessageAction", "FlowDefinition"),
+    ("Flows::messages", "FlowUsage"),
+    ("Flows::flows", "FlowUsage"),
+    ("Flows::successionFlows", "FlowUsage"),
+    ("Metadata::MetadataItem", "MetadataDefinition"),
+    ("Metadata::metadataItems", "ItemUsage"),
+];
+
+/// The library heritage a definition or plain Kernel type of `kind`
+/// implicitly has (SysML 8.4.2 Table 31, KerML Table 10), its own implied
+/// base first (`implicit_def_bases`) and then the bases that base declares
+/// in the standard library, down to `Base::Anything`: the audited
+/// obligations of a negative specialization proof, verified through the
+/// shared graph rather than assumed of a replacement library. A kind
+/// outside the table (a conjugated port definition) has no audited chain.
+fn definition_chain(kind: &str) -> Option<&'static [&'static str]> {
+    const ANYTHING: &[&str] = &["Base::Anything"];
+    const OCCURRENCE: &[&str] = &["Occurrences::Occurrence", "Base::Anything"];
+    const OBJECT: &[&str] = &[
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const DATA: &[&str] = &["Base::DataValue", "Base::Anything"];
+    const ITEM: &[&str] = &[
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const PART: &[&str] = &[
+        "Parts::Part",
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const PORT: &[&str] = &[
+        "Ports::Port",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const METACLASS: &[&str] = &[
+        "Metaobjects::Metaobject",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const METADATA: &[&str] = &[
+        "Metadata::MetadataItem",
+        "Metaobjects::Metaobject",
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const PERFORMANCE: &[&str] = &[
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const EVALUATION: &[&str] = &[
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const BOOLEAN_EVALUATION: &[&str] = &[
+        "Performances::BooleanEvaluation",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const LINK: &[&str] = &["Links::Link", "Base::Anything"];
+    const LINK_OBJECT: &[&str] = &[
+        "Objects::LinkObject",
+        "Links::Link",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const TRANSFER: &[&str] = &[
+        "Transfers::Transfer",
+        "Performances::Performance",
+        "Links::BinaryLink",
+        "Links::Link",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const ACTION: &[&str] = &[
+        "Actions::Action",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const STATE: &[&str] = &[
+        "States::StateAction",
+        "Actions::Action",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const CALCULATION: &[&str] = &[
+        "Calculations::Calculation",
+        "Actions::Action",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const CONSTRAINT: &[&str] = &[
+        "Constraints::ConstraintCheck",
+        "Performances::BooleanEvaluation",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const REQUIREMENT: &[&str] = &[
+        "Requirements::RequirementCheck",
+        "Constraints::ConstraintCheck",
+        "Performances::BooleanEvaluation",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const CONCERN: &[&str] = &[
+        "Requirements::ConcernCheck",
+        "Requirements::RequirementCheck",
+        "Constraints::ConstraintCheck",
+        "Performances::BooleanEvaluation",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const CASE: &[&str] = &[
+        "Cases::Case",
+        "Calculations::Calculation",
+        "Actions::Action",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const ANALYSIS: &[&str] = &[
+        "AnalysisCases::AnalysisCase",
+        "Cases::Case",
+        "Calculations::Calculation",
+        "Actions::Action",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const VERIFICATION: &[&str] = &[
+        "VerificationCases::VerificationCase",
+        "Cases::Case",
+        "Calculations::Calculation",
+        "Actions::Action",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const USE_CASE: &[&str] = &[
+        "UseCases::UseCase",
+        "Cases::Case",
+        "Calculations::Calculation",
+        "Actions::Action",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const CONNECTION: &[&str] = &[
+        "Connections::Connection",
+        "Objects::LinkObject",
+        "Links::Link",
+        "Parts::Part",
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const INTERFACE: &[&str] = &[
+        "Interfaces::Interface",
+        "Connections::Connection",
+        "Objects::LinkObject",
+        "Links::Link",
+        "Parts::Part",
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const ALLOCATION: &[&str] = &[
+        "Allocations::Allocation",
+        "Connections::BinaryConnection",
+        "Links::BinaryLink",
+        "Connections::Connection",
+        "Objects::LinkObject",
+        "Links::Link",
+        "Parts::Part",
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const FLOW: &[&str] = &[
+        "Flows::MessageAction",
+        "Actions::Action",
+        "Performances::Performance",
+        "Links::Link",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const VIEW: &[&str] = &[
+        "Views::View",
+        "Parts::Part",
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const VIEWPOINT: &[&str] = &[
+        "Views::ViewpointCheck",
+        "Requirements::RequirementCheck",
+        "Constraints::ConstraintCheck",
+        "Performances::BooleanEvaluation",
+        "Performances::Evaluation",
+        "Performances::Performance",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    const RENDERING: &[&str] = &[
+        "Views::Rendering",
+        "Parts::Part",
+        "Items::Item",
+        "Objects::Object",
+        "Occurrences::Occurrence",
+        "Base::Anything",
+    ];
+    Some(match kind {
+        "Type" | "Classifier" | "Definition" => ANYTHING,
+        "Class" | "OccurrenceDefinition" => OCCURRENCE,
+        "Structure" => OBJECT,
+        "DataType" | "AttributeDefinition" | "EnumerationDefinition" => DATA,
+        "ItemDefinition" => ITEM,
+        "PartDefinition" => PART,
+        "PortDefinition" => PORT,
+        "Metaclass" => METACLASS,
+        "MetadataDefinition" => METADATA,
+        "Behavior" => PERFORMANCE,
+        "Function" => EVALUATION,
+        "Predicate" => BOOLEAN_EVALUATION,
+        "Association" => LINK,
+        "AssociationStructure" => LINK_OBJECT,
+        "Interaction" => TRANSFER,
+        "ActionDefinition" => ACTION,
+        "StateDefinition" => STATE,
+        "CalculationDefinition" => CALCULATION,
+        "ConstraintDefinition" => CONSTRAINT,
+        "RequirementDefinition" => REQUIREMENT,
+        "ConcernDefinition" => CONCERN,
+        "CaseDefinition" => CASE,
+        "AnalysisCaseDefinition" => ANALYSIS,
+        "VerificationCaseDefinition" => VERIFICATION,
+        "UseCaseDefinition" => USE_CASE,
+        "ConnectionDefinition" => CONNECTION,
+        "InterfaceDefinition" => INTERFACE,
+        "AllocationDefinition" => ALLOCATION,
+        "FlowDefinition" => FLOW,
+        "ViewDefinition" => VIEW,
+        "ViewpointDefinition" => VIEWPOINT,
+        "RenderingDefinition" => RENDERING,
+        _ => return None,
+    })
+}
+
+pub(super) const COMPOSITE_ROLES: [&str; 5] = [
     "Occurrences::Occurrence::suboccurrences",
     "Objects::Object::subobjects",
     "Items::Item::subitems",
     "Items::Item::subparts",
+    "Occurrences::Occurrence::portions",
 ];
 
 fn charge(steps: &mut usize, amount: usize) -> Option<()> {
@@ -213,6 +736,80 @@ impl TypeRelations {
                 true
             }
         }
+    }
+
+    /// The features `feature` directly redefines, in order: the checked
+    /// targets of its owned Redefinitions, then the positional redefinition
+    /// targets the specification implies for a parameter, result or end
+    /// (the implied Redefinitions a complete model materializes). `None`
+    /// when a Redefinition endpoint is unchecked.
+    pub(super) fn direct_redefinitions(
+        &mut self,
+        b: &mut Builder,
+        feature: usize,
+        steps: &mut usize,
+    ) -> Option<Vec<usize>> {
+        charge(steps, 1)?;
+        if !conforms(b.elements.get(feature)?.ty, "Feature") {
+            return None;
+        }
+        let relationships = self.evidence.relationships(b, feature, steps)?;
+        let mut targets = Vec::new();
+        for relationship in relationships {
+            charge(steps, 1)?;
+            if !conforms(b.elements.get(relationship)?.ty, "Redefinition") {
+                continue;
+            }
+            let target = endpoint(
+                b,
+                feature,
+                relationship,
+                &["redefiningFeature", "subsettingFeature", "specific"],
+                &["redefinedFeature", "subsettedFeature", "general"],
+                "Feature",
+                steps,
+            )?;
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        if let Some(owner) = b.owner_elem(feature) {
+            let positional = b.positional_redefinition_targets(feature, owner);
+            charge(steps, positional.len())?;
+            for target in positional {
+                if target != feature && !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        Some(targets)
+    }
+
+    /// Every feature `feature` redefines, directly or transitively
+    /// (KerML `Feature::allRedefinedFeatures()` without `feature` itself),
+    /// direct targets first. `None` when any step is unchecked.
+    pub(super) fn checked_redefinition_closure(
+        &mut self,
+        b: &mut Builder,
+        feature: usize,
+        steps: &mut usize,
+    ) -> Option<Vec<usize>> {
+        let mut closure = Vec::new();
+        let mut seen = HashSet::from([feature]);
+        let mut queue = std::collections::VecDeque::from([feature]);
+        while let Some(current) = queue.pop_front() {
+            charge(steps, 1)?;
+            if closure.len() > super::MAX_RESOLUTION_DEPTH * 64 {
+                return None;
+            }
+            for target in self.direct_redefinitions(b, current, steps)? {
+                if seen.insert(target) {
+                    closure.push(target);
+                    queue.push_back(target);
+                }
+            }
+        }
+        Some(closure)
     }
 
     pub(super) fn specializes(
@@ -346,7 +943,7 @@ impl TypeRelations {
         }
     }
 
-    fn has_owned_feature(
+    pub(super) fn has_owned_feature(
         &mut self,
         b: &mut Builder,
         owner: usize,
@@ -397,8 +994,13 @@ impl TypeRelations {
         if !self.current(b) {
             return None;
         }
-        fn ordinary(b: &Builder, e: usize) -> Option<bool> {
-            if b.metadata_of.get(&e).is_some_and(|items| !items.is_empty()) {
+        let semantic = b.semantically_annotated();
+        fn ordinary(
+            b: &Builder,
+            semantic: &crate::layered::IdSet<usize>,
+            e: usize,
+        ) -> Option<bool> {
+            if semantic.contains(&e) {
                 return Some(false);
             }
             let e = b.elements.get(e)?;
@@ -412,7 +1014,7 @@ impl TypeRelations {
         }
         charge(steps, roots.len())?;
         for &root in roots {
-            if !ordinary(b, root)? {
+            if !ordinary(b, &semantic, root)? {
                 return Some(false);
             }
         }
@@ -423,7 +1025,7 @@ impl TypeRelations {
             if !seen.insert(feature) {
                 continue;
             }
-            if !ordinary(b, feature)? {
+            if !ordinary(b, &semantic, feature)? {
                 return Some(false);
             }
             self.evidence.index(b, steps)?;
@@ -492,8 +1094,35 @@ impl TypeRelations {
             .featuring_types(b, feature, &mut HashSet::new(), steps)
     }
 
+    /// The first chaining feature of a feature chain, `Some(None)` for a
+    /// feature that is not a chain, `None` where the chainings are not
+    /// checked.
+    pub(super) fn first_chaining_feature(
+        &mut self,
+        b: &mut Builder,
+        feature: usize,
+        steps: &mut usize,
+    ) -> Option<Option<usize>> {
+        if !self.current(b) {
+            return None;
+        }
+        self.evidence.first_chaining_feature(b, feature, steps)
+    }
+
     /// Applicability and canonical obligations shared by typing and negative
     /// specialization proofs. These are required witnessed paths, never edges.
+    ///
+    /// The obligations mirror the planner's implied specializations
+    /// (`implied.rs`, `required_implied_plan`): the generic feature role
+    /// (`Base::naturals` for a multiplicity, else `Base::things`), the step
+    /// and expression roles, the roles the feature's typing adds, the roles
+    /// of its SysML usage kind (`implicit_usage_bases`) and of the
+    /// occurrence, item and part families it conforms to, the flow,
+    /// succession, invariant and binary-connector roles, and the
+    /// composition roles under the planner's composite owner contexts
+    /// (`composite_owner_context`). A positional feature — an end, or a
+    /// parameter by direction or by membership kind — takes its positional
+    /// redefinition targets from its owner's membership certificate.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn feature_requirements(
         &mut self,
@@ -513,42 +1142,27 @@ impl TypeRelations {
         charge(steps, 1).ok_or(Unsupported)?;
         let structure = super::structural_index::StoredStructure::for_annotations(b, steps)
             .ok_or(InvalidRelationship)?;
+        // Plain metadata adds no base; semantic metadata adds one the
+        // planner does not write (KerML 9.2), so its targets stay out.
+        let semantic = b.semantically_annotated();
         let e = b.elements.get(feature).ok_or(InvalidRelationship)?;
         let ty = e.ty;
-        if !matches!(
-            ty,
-            "Feature"
-                | "Step"
-                | "Expression"
-                | "ReferenceUsage"
-                | "AttributeUsage"
-                | "OccurrenceUsage"
-                | "ItemUsage"
-                | "PartUsage"
-        ) || original.is_some()
+        // An instantiation expression's typing by its callee or constructed
+        // type is dynamic evidence the static audit does not see: its bases
+        // stay unaudited until the binding provider certifies them.
+        if !conforms(ty, "Feature")
+            || conforms(ty, "InstantiationExpression")
+            || original.is_some()
             || b.metadata_associations_incomplete
             || structure.annotations_incomplete
-            || structure.metadata_annotation_targets.contains(&feature)
-            || b.metadata_of.get(&feature).is_some_and(|v| !v.is_empty())
+            || semantic.contains(&feature)
         {
             return Err(Unsupported);
         }
-        // These flags activate unaudited conditional specialization families.
-        if e.props
-            .get("isPortion")
-            .is_some_and(|v| v.as_bool() != Some(false))
-        {
-            return Err(Unsupported);
-        }
-        if conforms(ty, "Usage")
-            && (e
-                .props
-                .get("isVariation")
-                .is_some_and(|v| v.as_bool() != Some(false))
-                || e.props.get("portionKind").is_some_and(|v| !v.is_null()))
-        {
-            return Err(Unsupported);
-        }
+        let portion = match e.props.get("isPortion") {
+            None => false,
+            Some(value) => value.as_bool().ok_or(Unsupported)?,
+        };
         let composite = match e.props.get("isComposite") {
             None => false,
             Some(value) => value.as_bool().ok_or(Unsupported)?,
@@ -557,6 +1171,16 @@ impl TypeRelations {
             None => false,
             Some(v) => v.as_bool().ok_or(Unsupported)?,
         };
+        let directed = match e.props.get("direction") {
+            None => false,
+            Some(value) if value.is_null() => false,
+            Some(value) => {
+                if !matches!(value.as_str(), Some("in" | "out" | "inout")) {
+                    return Err(Unsupported);
+                }
+                true
+            }
+        };
         // Usage redefines isVariable as a derived property. Its Boolean value
         // changes featuring, not the specialization obligations audited here.
         if e.props.get("isVariable").is_some_and(|v| {
@@ -564,48 +1188,69 @@ impl TypeRelations {
         }) {
             return Err(Unsupported);
         }
-        let ordinary_feature =
-            ty == "Feature" && !is_end && e.props.get("direction").is_none_or(|v| v.is_null());
+        let negated = if conforms(ty, "Invariant") {
+            Some(super::implied::invariant_negation(e).ok_or(Unsupported)?)
+        } else {
+            None
+        };
+        let positional = is_end || b.is_parameter(feature);
         let membership = e.owning_relationship.ok_or(Unsupported)?;
         self.evidence.index(b, steps).ok_or(InvalidRelationship)?;
-        let carrier = self
-            .evidence
-            .carrier(b, membership, steps)
-            .ok_or(InvalidRelationship)?
-            .ok_or(InvalidRelationship)?;
+        let membership_kind = b.elements[membership].ty;
+        let carrier = if conforms(membership_kind, "Specialization") {
+            self.specialization_owner(b, membership, steps)
+                .ok_or(InvalidRelationship)?
+        } else {
+            self.evidence
+                .carrier(b, membership, steps)
+                .ok_or(InvalidRelationship)?
+                .ok_or(InvalidRelationship)?
+        };
         let owner_kind = b.elements.get(carrier).ok_or(InvalidRelationship)?.ty;
         let namespace = matches!(owner_kind, "Namespace" | "Package" | "LibraryPackage");
         if namespace {
             if self.evidence.owning_type(b, feature, steps) != Some(None) {
                 return Err(InvalidRelationship);
             }
-        } else {
-            // Ordinary Usage families and undirected non-end Kernel Features
-            // have audited owner contexts. Exact owner kinds exclude behavior,
-            // result, flow and cross contexts; FeatureMembership excludes variant
-            // antecedents. Usage end order is certified by the shared reducer.
-            if !(conforms(ty, "Usage") || ordinary_feature)
-                || !(b.elements[membership].ty == "FeatureMembership"
-                    || (is_end && b.elements[membership].ty == "EndFeatureMembership"))
+        } else if !conforms(membership_kind, "FeatureMembership") {
+            // A feature a type owns outside a feature membership — a feature
+            // value's expression, a multiplicity range and its bounds, a
+            // chain a subsetting, reference or expression names, an end's
+            // cross feature — is not one of the type's features: its roles
+            // are the plain ones of its kind and it carries no positional
+            // role. A variant is owned otherwise and stays outside.
+            if !conforms(owner_kind, "Type")
                 || !(matches!(
-                    owner_kind,
-                    "Type"
-                        | "Classifier"
-                        | "Class"
-                        | "Structure"
-                        | "DataType"
-                        | "Definition"
-                        | "AttributeDefinition"
-                        | "OccurrenceDefinition"
-                        | "ItemDefinition"
-                        | "PartDefinition"
-                ) || (composite
-                    && conforms(ty, "OccurrenceUsage")
-                    && matches!(
-                        owner_kind,
-                        "Feature" | "OccurrenceUsage" | "ItemUsage" | "PartUsage"
-                    )
-                    && owner_types.is_some()))
+                    membership_kind,
+                    "FeatureValue" | "OwningMembership" | "VariantMembership"
+                ) || conforms(membership_kind, "Specialization"))
+                || positional
+            {
+                return Err(Unsupported);
+            }
+            if self.evidence.owning_type(b, feature, steps) != Some(None) {
+                return Err(InvalidRelationship);
+            }
+        } else {
+            // A feature of a Type of any kind under a feature membership of
+            // any kind: the plain memberships, the positional ones (end,
+            // parameter, return, subject, actor, stakeholder) and the SysML
+            // body memberships (state subaction, transition feature,
+            // requirement constraint, objective, result expression). A
+            // variant is owned otherwise and stays outside. A composite under
+            // a Feature that is one of the planner's composite owner contexts
+            // needs that owner's decided type facts.
+            if !conforms(membership_kind, "FeatureMembership")
+                || !conforms(owner_kind, "Type")
+                || (membership_kind == "EndFeatureMembership" && !is_end)
+            {
+                return Err(Unsupported);
+            }
+            if composite
+                && membership_kind == "FeatureMembership"
+                && composite_owner_context(owner_kind)
+                && is_a!(b.elements[carrier], "Feature")
+                && owner_types.is_none()
             {
                 return Err(Unsupported);
             }
@@ -618,16 +1263,22 @@ impl TypeRelations {
         for &relationship in owned {
             let kind = b.elements.get(relationship).ok_or(InvalidRelationship)?.ty;
             has_owned_typing |= conforms(kind, "FeatureTyping");
-            if conforms(kind, "FeatureValue")
-                || conforms(kind, "FeatureChaining")
-                || conforms(kind, "CrossSubsetting")
-                || conforms(kind, "FeatureInverting")
-                || matches!(kind, "Unioning" | "Differencing")
-            {
-                return Err(Unsupported);
-            }
+            // A FeatureValue binds the feature's value and adds no typing or
+            // specialization obligation; its expression is an owned member
+            // the membership proof admits on its own terms. A chain's one
+            // obligation is its last chaining feature, which the stored base
+            // projection carries as the final chain target. A cross
+            // subsetting is a stored base like any subsetting (the crossed
+            // chain): the crossing rules constrain the cross feature, not
+            // the end that crosses. A unioning, a differencing or a feature
+            // inverting places no specialization on the feature that owns
+            // it, and the resolver reads none of them as a base; the
+            // planner plans no role for any of these.
             if kind == "Intersecting" {
-                if !composite || !ordinary_feature {
+                // An intersection on an end or a directed feature stays
+                // outside; any other Kernel feature kind's is audited
+                // against its subsettings below.
+                if is_end || directed {
                     return Err(Unsupported);
                 }
                 if self.evidence.carrier(b, relationship, steps) != Some(Some(feature)) {
@@ -669,10 +1320,15 @@ impl TypeRelations {
                 }
             }
         }
-        // This composition audit covers ordinary Occurrence/Item/Part Usage
-        // families and Kernel Features with explicit owned typing. Inherited-only
-        // Kernel typing and other composite Feature kinds remain qualified.
-        if composite && !conforms(ty, "OccurrenceUsage") && !(ty == "Feature" && has_owned_typing) {
+        // This composition audit covers the occurrence usage families and
+        // Kernel features (a feature, a step, an expression) with explicit
+        // owned typing, which the planner's typing requirements read alike.
+        // Inherited-only Kernel typing and other composite usage kinds
+        // remain qualified.
+        if composite
+            && !conforms(ty, "OccurrenceUsage")
+            && (conforms(ty, "Usage") || !has_owned_typing)
+        {
             return Err(Unsupported);
         }
         charge(steps, typings.len()).ok_or(Unsupported)?;
@@ -686,35 +1342,130 @@ impl TypeRelations {
             occurrence |= conforms(target_ty, "Class");
             data |= conforms(target_ty, "DataType");
         }
-        let roles = [
-            (true, "Base::things"),
-            (conforms(ty, "Step"), "Performances::performances"),
-            (conforms(ty, "Expression"), "Performances::evaluations"),
-            (object, "Objects::objects"),
-            (occurrence, "Occurrences::occurrences"),
-            (data || ty == "AttributeUsage", "Base::dataValues"),
-            (conforms(ty, "OccurrenceUsage"), "Occurrences::occurrences"),
-            (conforms(ty, "ItemUsage"), "Items::items"),
-            (ty == "PartUsage", "Parts::parts"),
-        ];
-        let mut required = Vec::with_capacity(roles.iter().filter(|(needed, _)| *needed).count());
-        for (needed, name) in roles {
-            if needed {
+        let mut names: Vec<&'static str> = Vec::new();
+        let generic = if conforms(ty, "Multiplicity")
+            && self.required_role(b, "Base::naturals", steps).is_some()
+        {
+            "Base::naturals"
+        } else {
+            "Base::things"
+        };
+        names.push(generic);
+        if conforms(ty, "Step") {
+            names.push("Performances::performances");
+        }
+        if let Some(name) = super::implied::expression_implied_base(ty) {
+            names.push(name);
+            names.push("Performances::evaluations");
+        }
+        if let Some(name) = super::implied::additional_expression_base(ty) {
+            names.push(name);
+        }
+        if conforms(ty, "Expression") && super::implied::is_transition_guard(b, feature) {
+            names.push(super::implied::TRANSITION_GUARD);
+        }
+        // The roles a feature's own typing adds are planned on the canonical
+        // graph format only (`owned_typing_requirements`); the roles of the
+        // usage families below hold on both.
+        if b.graph_format == crate::model::GraphFormat::CanonicalV3 {
+            if object {
+                names.push("Objects::objects");
+            }
+            if occurrence {
+                names.push("Occurrences::occurrences");
+            }
+            if data {
+                names.push("Base::dataValues");
+            }
+        }
+        if conforms(ty, "OccurrenceUsage") {
+            names.push("Occurrences::occurrences");
+        }
+        if conforms(ty, "ItemUsage") {
+            names.push("Items::items");
+        }
+        if conforms(ty, "PartUsage") {
+            names.push("Parts::parts");
+        }
+        // Kernel Flow and Succession are not SysML usages; their bases follow.
+        // A usage's kind roles and owner roles come from the planner's one
+        // list (`implied::usage_roles`); a usage a namespace owns has kind
+        // roles alone.
+        if usage_kind_of(ty, Dialect::Sysml)
+            .filter(|_| !matches!(ty, "Flow" | "SuccessionFlow"))
+            .is_some()
+        {
+            let owner = (!namespace).then_some((membership, carrier));
+            b.ensure_ids();
+            names.extend(super::implied::usage_roles(b, feature, owner));
+            names.extend(super::implied::usage_redefinition_roles(b, feature, owner));
+        }
+        let owns_end = (conforms(ty, "Flow") || conforms(ty, "FlowUsage"))
+            && b.owned_member_elems(feature, true).into_iter().any(|end| {
+                b.elements[end].props.get("isEnd").and_then(|v| v.as_bool()) == Some(true)
+            });
+        if conforms(ty, "Flow") {
+            names.push("Transfers::transfers");
+            if owns_end {
+                names.push("Transfers::flowTransfers");
+            }
+        }
+        if conforms(ty, "FlowUsage") && owns_end {
+            names.push("Flows::flows");
+        }
+        if conforms(ty, "SuccessionFlow") {
+            names.push("Transfers::flowTransfersBefore");
+        }
+        if conforms(ty, "Succession") {
+            names.push("Occurrences::happensBeforeLinks");
+        }
+        if let Some(negated) = negated {
+            names.push(super::implied::invariant_implied_base(negated));
+            if conforms(ty, "AssertConstraintUsage") {
+                names.push(super::implied::assertion_implied_base(negated));
+            }
+            if conforms(ty, "SatisfyRequirementUsage") {
+                names.push(super::implied::satisfaction_implied_base(negated));
+            }
+        }
+        if let Some((base, false)) = b.binary_owned_base(feature) {
+            names.push(base);
+        }
+        charge(steps, names.len()).ok_or(Unsupported)?;
+        let mut required = Vec::with_capacity(names.len());
+        let mut seen = HashSet::new();
+        for name in names {
+            if seen.insert(name) {
                 required.push(self.required_role(b, name, steps).ok_or(Unsupported)?);
             }
         }
-        if composite {
+        // A variant specializes the variation it belongs to (a typing by
+        // the variation definition, a subsetting of the variation usage),
+        // which the planner plans unless it is written.
+        if membership_kind == "VariantMembership" {
+            required.push(carrier);
+        }
+        if (composite || portion)
+            && membership_kind == "FeatureMembership"
+            && composite_owner_context(owner_kind)
+        {
             for name in composite_roles(
                 ty,
                 owner_kind,
                 object,
                 occurrence,
+                composite,
+                portion,
                 owner_types.unwrap_or_default(),
             ) {
-                required.push(self.required_role(b, name, steps).ok_or(Unsupported)?);
+                let role = self.required_role(b, name, steps).ok_or(Unsupported)?;
+                // The library's own `portions` is the root of its role.
+                if role != feature {
+                    required.push(role);
+                }
             }
         }
-        if is_end && !namespace {
+        if positional && !namespace {
             // This is the same complete Membership/positional certificate used
             // by Type.feature. Its generated targets are required witnesses in
             // the shared semantic graph, never a second set of implicit edges.
@@ -727,30 +1478,33 @@ impl TypeRelations {
             }) {
                 return Err(InvalidRelationship);
             }
-            // An ordinary end with an owned crossing Feature activates separate
-            // crossing obligations. Do not certify their absence from a flag.
-            let domains = structure.membership_domains(b, steps).ok_or(Unsupported)?;
-            if !domains.owner_complete(feature) {
-                return Err(InvalidRelationship);
-            }
-            for &relationship in owned {
-                charge(steps, 1).ok_or(Unsupported)?;
-                let kind = b.elements[relationship].ty;
-                if conforms(kind, "OwningMembership") && !conforms(kind, "FeatureMembership") {
-                    let member = super::membership_evidence::member(
-                        b,
-                        &structure,
-                        feature,
-                        relationship,
-                        steps,
-                    )
-                    .ok_or(InvalidRelationship)?;
-                    let kind = b.elements[member].ty;
-                    if conforms(kind, "Feature")
-                        && !conforms(kind, "Multiplicity")
-                        && !conforms(kind, "MetadataFeature")
-                    {
-                        return Err(Unsupported);
+            if is_end {
+                // An ordinary end with an owned crossing Feature activates
+                // separate crossing obligations. Do not certify their absence
+                // from a flag.
+                let domains = structure.membership_domains(b, steps).ok_or(Unsupported)?;
+                if !domains.owner_complete(feature) {
+                    return Err(InvalidRelationship);
+                }
+                for &relationship in owned {
+                    charge(steps, 1).ok_or(Unsupported)?;
+                    let kind = b.elements[relationship].ty;
+                    if conforms(kind, "OwningMembership") && !conforms(kind, "FeatureMembership") {
+                        let member = super::membership_evidence::member(
+                            b,
+                            &structure,
+                            feature,
+                            relationship,
+                            steps,
+                        )
+                        .ok_or(InvalidRelationship)?;
+                        let kind = b.elements[member].ty;
+                        if conforms(kind, "Feature")
+                            && !conforms(kind, "Multiplicity")
+                            && !conforms(kind, "MetadataFeature")
+                        {
+                            return Err(Unsupported);
+                        }
                     }
                 }
             }
@@ -775,15 +1529,8 @@ impl TypeRelations {
         specific: usize,
         steps: &mut usize,
     ) -> Option<Vec<usize>> {
-        if matches!(
-            b.elements.get(specific)?.ty,
-            "Feature"
-                | "ReferenceUsage"
-                | "AttributeUsage"
-                | "OccurrenceUsage"
-                | "ItemUsage"
-                | "PartUsage"
-        ) {
+        let element = b.elements.get(specific)?;
+        if conforms(element.ty, "Feature") {
             let owned = self.evidence.relationships(b, specific, steps)?;
             let mut typings = Vec::new();
             for &relation in &owned {
@@ -800,63 +1547,148 @@ impl TypeRelations {
                     )?);
                 }
             }
+            let owner_types = self.composition_owner(b, specific, steps)?;
             let (mut feature_bases, type_bases) = self
-                .feature_requirements(b, specific, &owned, &typings, None, None, steps)
+                .feature_requirements(b, specific, &owned, &typings, None, owner_types, steps)
                 .ok()?;
             feature_bases.extend(type_bases);
             return Some(feature_bases);
         }
-        let element = b.elements.get(specific)?;
-        if is_a!(element, "Definition") {
-            for key in ["isVariation", "isIndividual"] {
-                if element
+        // An individual definition is a Life (the planner plans it); a
+        // variation adds no base of its own (its variants specialize it).
+        let individual = is_a!(element, "Definition") && super::implied::is_individual(element);
+        let names = definition_chain(element.ty)?;
+        charge(steps, names.len())?;
+        let mut required = names
+            .iter()
+            .map(|name| self.required_role(b, name, steps))
+            .collect::<Option<Vec<_>>>()?;
+        if individual {
+            required.push(self.required_role(b, super::implied::INDIVIDUAL_BASE, steps)?);
+        }
+        // A connection or interface definition with two owned ends is binary
+        // (the planner counts the owned ends the same way).
+        if let Some((base, true)) = b.binary_owned_base(specific) {
+            required.push(self.required_role(b, base, steps)?);
+        }
+        Some(required)
+    }
+
+    /// The owner of an element a Specialization owns (the chain a subsetting,
+    /// redefinition, typing or reference names): the specialization's owning
+    /// related element, which must own the specialization in turn.
+    fn specialization_owner(
+        &mut self,
+        b: &mut Builder,
+        relationship: usize,
+        steps: &mut usize,
+    ) -> Option<usize> {
+        charge(steps, 1)?;
+        self.evidence.index(b, steps)?;
+        if !self.evidence.ids_unique {
+            return None;
+        }
+        let relation = b.elements.get(relationship)?;
+        if !conforms(relation.ty, "Specialization") {
+            return None;
+        }
+        // The owning related element where the row spells it, else the
+        // specialization's source end: an owned specialization's owner.
+        let mut id = relation
+            .props
+            .get("owningRelatedElement")
+            .and_then(|value| value.as_reference());
+        if id.is_none() {
+            for key in [
+                "specific",
+                "subsettingFeature",
+                "redefiningFeature",
+                "referencingFeature",
+                "typedFeature",
+                "subclassifier",
+            ] {
+                if let Some(value) = relation
                     .props
                     .get(key)
-                    .is_some_and(|v| v.as_bool() != Some(false))
+                    .and_then(|value| value.as_reference())
                 {
-                    return None;
+                    id = Some(value);
+                    break;
                 }
             }
         }
-        let names: &[&str] = match element.ty {
-            "Type" | "Classifier" | "Definition" => &["Base::Anything"],
-            "Class" | "OccurrenceDefinition" => &["Occurrences::Occurrence", "Base::Anything"],
-            "ItemDefinition" => &[
-                "Items::Item",
-                "Objects::Object",
-                "Occurrences::Occurrence",
-                "Base::Anything",
-            ],
-            "PartDefinition" => &[
-                "Parts::Part",
-                "Items::Item",
-                "Objects::Object",
-                "Occurrences::Occurrence",
-                "Base::Anything",
-            ],
-            "Structure" => &[
-                "Objects::Object",
-                "Occurrences::Occurrence",
-                "Base::Anything",
-            ],
-            "DataType" | "AttributeDefinition" => &["Base::DataValue", "Base::Anything"],
-            "Behavior" => &[
-                "Performances::Performance",
-                "Occurrences::Occurrence",
-                "Base::Anything",
-            ],
-            "Function" => &[
-                "Performances::Evaluation",
-                "Performances::Performance",
-                "Occurrences::Occurrence",
-                "Base::Anything",
-            ],
-            _ => return None,
+        let owner = b.element_index_of_uuid(id?)?;
+        let rows = self.evidence.relationships(b, owner, steps)?;
+        rows.contains(&relationship).then_some(owner)
+    }
+
+    /// The body scope whose provider certifies an element's implied bases:
+    /// its own, or for an element the lowering gives no scope of its own (a
+    /// multiplicity range, a literal or other expression, the chain a
+    /// subsetting or reference names) the nearest enclosing one, reached
+    /// through the checked owners.
+    fn provider_scope(
+        &mut self,
+        b: &mut Builder,
+        element: usize,
+        steps: &mut usize,
+    ) -> Option<usize> {
+        let mut current = element;
+        for _ in 0..=super::MAX_RESOLUTION_DEPTH {
+            charge(steps, 1)?;
+            if let Some(&scope) = b.elem_scope.get(&current) {
+                return Some(scope);
+            }
+            let relationship = b.elements.get(current)?.owning_relationship?;
+            current = if conforms(b.elements[relationship].ty, "Specialization") {
+                self.specialization_owner(b, relationship, steps)?
+            } else {
+                self.evidence.index(b, steps)?;
+                self.evidence.carrier(b, relationship, steps)??
+            };
+        }
+        None
+    }
+
+    /// The composition-owner facts of a composite occurrence usage owned by
+    /// a Feature, for the conditional composition roles: whether the owner
+    /// decidedly specializes the library's object and occurrence classes,
+    /// through the same shared proof the roles are later verified by. Not
+    /// a composite under a Feature: no facts are needed. An undecided owner
+    /// leaves the usage's bases incomplete rather than guessing a role away.
+    fn composition_owner(
+        &mut self,
+        b: &mut Builder,
+        feature: usize,
+        steps: &mut usize,
+    ) -> Option<Option<CompositionOwner>> {
+        let element = b.elements.get(feature)?;
+        if !is_a!(element, "OccurrenceUsage")
+            || element.props.get("isComposite").and_then(|v| v.as_bool()) != Some(true)
+        {
+            return Some(None);
+        }
+        let Some(owner) = self
+            .evidence
+            .owning_type(b, feature, steps)?
+            .filter(|&owner| is_a!(b.elements[owner], "Feature"))
+        else {
+            return Some(None);
         };
-        names
-            .iter()
-            .map(|name| self.required_role(b, name, steps))
-            .collect()
+        charge(steps, 2)?;
+        let mut facts = CompositionOwner::default();
+        for (name, fact) in [
+            ("Objects::Object", &mut facts.object),
+            ("Occurrences::Occurrence", &mut facts.occurrence),
+        ] {
+            let role = self.required_role(b, name, steps)?;
+            *fact = match self.specializes(b, owner, role, steps) {
+                RelationFact::Yes => true,
+                RelationFact::No => false,
+                RelationFact::Unknown => return None,
+            };
+        }
+        Some(Some(facts))
     }
 
     /// Resolve a canonical loaded library role under the same bounded identity
@@ -887,93 +1719,43 @@ impl TypeRelations {
         charge(steps, 1)?;
         if self.required_library.is_none() {
             charge(steps, b.lib_qnames.len())?;
+            let mut by_last: HashMap<&'static str, Vec<(&'static str, &'static str)>> =
+                HashMap::new();
+            for &(role, kind) in ROLE_KINDS {
+                let last = role.rsplit("::").next().expect("a qualified role name");
+                by_last.entry(last).or_default().push((role, kind));
+            }
             let mut ids: HashMap<&'static str, Option<uuid::Uuid>> = HashMap::new();
             for (id, segments) in b.lib_qnames.iter() {
-                let name = match segments.as_slice() {
-                    [p, t, n]
-                        if p == "Occurrences" && t == "Occurrence" && n == "suboccurrences" =>
-                    {
-                        "Occurrences::Occurrence::suboccurrences"
-                    }
-                    [p, t, n] if p == "Objects" && t == "Object" && n == "subobjects" => {
-                        "Objects::Object::subobjects"
-                    }
-                    [p, t, n] if p == "Items" && t == "Item" && n == "subitems" => {
-                        "Items::Item::subitems"
-                    }
-                    [p, t, n] if p == "Items" && t == "Item" && n == "subparts" => {
-                        "Items::Item::subparts"
-                    }
-                    [p, n] if p == "Parts" && n == "parts" => "Parts::parts",
-                    [p, n] if p == "Items" && n == "items" => "Items::items",
-                    [p, n] if p == "Parts" && n == "Part" => "Parts::Part",
-                    [p, n] if p == "Items" && n == "Item" => "Items::Item",
-                    [p, n] if p == "Links" && n == "SelfLink" => "Links::SelfLink",
-                    [p, n] if p == "Occurrences" && n == "HappensLink" => {
-                        "Occurrences::HappensLink"
-                    }
-                    [p, n] if p == "Actions" && n == "Action" => "Actions::Action",
-                    [p, n] if p == "Base" && n == "Anything" => "Base::Anything",
-                    [p, n] if p == "Base" && n == "things" => "Base::things",
-                    [p, n] if p == "Base" && n == "dataValues" => "Base::dataValues",
-                    [p, n] if p == "Occurrences" && n == "occurrences" => {
-                        "Occurrences::occurrences"
-                    }
-                    [p, n] if p == "Objects" && n == "objects" => "Objects::objects",
-                    [p, n] if p == "Performances" && n == "performances" => {
-                        "Performances::performances"
-                    }
-                    [p, n] if p == "Performances" && n == "evaluations" => {
-                        "Performances::evaluations"
-                    }
-                    [p, n] if p == "Base" && n == "DataValue" => "Base::DataValue",
-                    [p, n] if p == "Occurrences" && n == "Occurrence" => "Occurrences::Occurrence",
-                    [p, n] if p == "Objects" && n == "Object" => "Objects::Object",
-                    [p, n] if p == "Performances" && n == "Performance" => {
-                        "Performances::Performance"
-                    }
-                    [p, n] if p == "Performances" && n == "Evaluation" => {
-                        "Performances::Evaluation"
-                    }
-                    _ => continue,
+                let Some(candidates) = segments.last().and_then(|last| by_last.get(last.as_str()))
+                else {
+                    continue;
                 };
-                ids.entry(name)
-                    .and_modify(|known| {
-                        if *known != Some(*id) {
-                            *known = None;
-                        }
-                    })
-                    .or_insert(Some(*id));
+                for &(role, _) in candidates {
+                    let mut parts = role.split("::");
+                    let matched = segments.iter().all(|s| parts.next() == Some(s.as_str()))
+                        && parts.next().is_none();
+                    if !matched {
+                        continue;
+                    }
+                    ids.entry(role)
+                        .and_modify(|known| {
+                            if *known != Some(*id) {
+                                *known = None;
+                            }
+                        })
+                        .or_insert(Some(*id));
+                }
             }
             let mut resolved = HashMap::new();
-            for (name, id) in ids {
-                let kind = match name {
-                    "Parts::parts" | "Items::Item::subparts" => "PartUsage",
-                    "Items::items" | "Items::Item::subitems" => "ItemUsage",
-                    "Occurrences::Occurrence::suboccurrences" | "Objects::Object::subobjects" => {
-                        "Feature"
-                    }
-                    "Parts::Part" => "PartDefinition",
-                    "Items::Item" => "ItemDefinition",
-                    "Occurrences::Occurrence" => "Class",
-                    "Links::SelfLink" | "Occurrences::HappensLink" => "Association",
-                    "Actions::Action" => "ActionDefinition",
-                    "Base::things"
-                    | "Base::dataValues"
-                    | "Occurrences::occurrences"
-                    | "Objects::objects" => "Feature",
-                    "Performances::performances" => "Step",
-                    "Performances::evaluations" => "Expression",
-                    "Objects::Object" => "Structure",
-                    "Base::DataValue" => "DataType",
-                    "Performances::Performance" => "Behavior",
-                    "Performances::Evaluation" => "Function",
-                    _ => "Classifier",
-                };
-                let target = id
+            for &(role, kind) in ROLE_KINDS {
+                let target = ids
+                    .get(role)
+                    .copied()
+                    .flatten()
                     .and_then(|id| b.element_index_of_uuid(id))
                     .filter(|&e| e < b.lib_boundary && b.elements[e].conforms(kind));
-                resolved.insert(name, target);
+                resolved.insert(role, target);
             }
             self.required_library = Some(resolved);
         }
@@ -1291,10 +2073,8 @@ impl TypeRelations {
             // The provider establishes the supported implied/positional base
             // evidence and preserves caller lookup state. An incomplete
             // provider does not invalidate an already proven explicit path.
-            let provider = b
-                .elem_scope
-                .get(&specific)
-                .copied()
+            let provider = self
+                .provider_scope(b, specific, steps)
                 .is_some_and(|scope| self.providers.scope(b, scope, steps));
             if provider && complete {
                 match b.value_context_bases(specific, steps) {
@@ -1583,11 +2363,13 @@ impl Builder {
             }
             Some(())
         }
-        budget(&mut steps, boundary.saturating_sub(start))?;
         let mut result = FeatureChainBases::default();
         if !chained {
+            // The one pass over the rows found no chaining: it is the work.
+            budget(&mut steps, boundary.saturating_sub(start))?;
             return Some(std::sync::Arc::new(result));
         }
+        // With chainings the loop below charges the pass, a row at a time.
         let mut local = 0;
         let raw = super::structural_index::StoredStructure::for_query(
             self,
@@ -2051,6 +2833,13 @@ impl FeaturingEvidence {
         };
         let membership = b.elements.get(rel)?;
         if !is_a!(membership, "OwningMembership") {
+            // The chain a specialization names (`:> a.b`): a feature the
+            // specialization owns has no owning feature membership, so no
+            // owning type.
+            if conforms(membership.ty, "Specialization") && *membership.children == [feature] {
+                self.carrier(b, rel, steps)??;
+                return Some(None);
+            }
             return None;
         }
         let owner = self.carrier(b, rel, steps)??;
@@ -2083,6 +2872,35 @@ impl FeaturingEvidence {
         }
     }
 
+    fn first_chaining_feature(
+        &mut self,
+        b: &mut Builder,
+        feature: usize,
+        steps: &mut usize,
+    ) -> Option<Option<usize>> {
+        self.index(b, steps)?;
+        if self.incomplete() {
+            return None;
+        }
+        for rel in self.relationships(b, feature, steps)? {
+            if !conforms(b.elements.get(rel)?.ty, "FeatureChaining") {
+                continue;
+            }
+            if self.carrier(b, rel, steps)? != Some(feature) {
+                return None;
+            }
+            return Some(Some(endpoint(
+                b,
+                feature,
+                rel,
+                &["featureChained"],
+                &["chainingFeature"],
+                "Feature",
+                steps,
+            )?));
+        }
+        Some(None)
+    }
     fn featuring_types(
         &mut self,
         b: &mut Builder,
@@ -2641,7 +3459,21 @@ mod ordinary_owned_feature_tests {
     }
     #[test]
     fn ordinary_owned_feature_keeps_contextual_families_and_malformed_ownership_qualified() {
-        for mutation in 0..7 {
+        // An end (0) takes its positional targets from its owner's
+        // certificate and a behaviour owner (5) is an audited context, so
+        // those negative proofs complete; an untyped composite (1), a
+        // variable Kernel feature (2), a malformed direction (3), an end
+        // membership of a non-end (4) and a lost membership (6) stay
+        // qualified.
+        for (mutation, expected) in [
+            (0, RelationFact::No),
+            (1, RelationFact::Unknown),
+            (2, RelationFact::Unknown),
+            (3, RelationFact::Unknown),
+            (4, RelationFact::Unknown),
+            (5, RelationFact::No),
+            (6, RelationFact::Unknown),
+        ] {
             let mut r = fixture(GraphFormat::CanonicalV3, "class Parent {feature slot;}");
             let parent = r.resolve_qualified("Parent").unwrap().0;
             let slot = r.resolve_qualified("Parent::slot").unwrap().0;
@@ -2661,16 +3493,18 @@ mod ordinary_owned_feature_tests {
             }
             assert_eq!(
                 TypeRelations::default().specializes(&mut r.b, slot, unrelated, &mut 0),
-                RelationFact::Unknown,
+                expected,
                 "mutation {mutation}"
             );
         }
+        // A feature value binds the feature's value and adds no
+        // specialization obligation: the negative proof stays complete.
         let mut r = fixture(GraphFormat::CanonicalV3, "class Parent {feature slot=4;}");
         let slot = r.resolve_qualified("Parent::slot").unwrap().0;
         let unrelated = r.resolve_qualified("Links::SelfLink").unwrap().0;
         assert_eq!(
             TypeRelations::default().specializes(&mut r.b, slot, unrelated, &mut 0),
-            RelationFact::Unknown
+            RelationFact::No
         );
     }
 }

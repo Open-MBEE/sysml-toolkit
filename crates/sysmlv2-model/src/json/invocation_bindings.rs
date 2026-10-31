@@ -630,10 +630,10 @@ mod tests {
                 .find(|&e| r.element_type(e) == "OperatorExpression")
                 .unwrap();
             assert!(r.invocation_binding_report(call).arguments.is_err());
-            assert!(matches!(
-                r.model_level_evaluability(call).classification,
-                Unknown(_)
-            ));
+            // The eligibility proof does not wait on the binding provider:
+            // the operator's designated function is resolved by name and the
+            // operands are the expression's own parameters' values.
+            assert_eq!(r.model_level_evaluability(call).classification, Evaluable);
             let _ = r.implied_relationships(call);
             if format == GraphFormat::CanonicalV3 {
                 let report = r.invocation_binding_report(call).arguments.unwrap();
@@ -649,6 +649,14 @@ mod tests {
                 ));
             } else {
                 assert!(r.invocation_binding_report(call).arguments.is_err());
+                assert_eq!(r.model_level_evaluability(call).classification, Evaluable);
+                r.b.elements[call.0]
+                    .props
+                    .insert("operator", serde_json::json!("missing"));
+                assert!(matches!(
+                    r.model_level_evaluability(call).classification,
+                    Unknown(_)
+                ));
             }
         }
     }

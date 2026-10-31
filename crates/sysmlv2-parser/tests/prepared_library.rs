@@ -356,8 +356,9 @@ fn prepared_negative_diagnostics_match_resolution_replay() {
     );
     fixtures.sort();
     assert_eq!(fixtures.len(), 462);
-    for path in fixtures {
-        let source = std::fs::read_to_string(&path).unwrap();
+    // Each fixture builds its own pair of models, so they run on every core.
+    sysmlv2_testkit::par_map(&fixtures, |path| {
+        let source = std::fs::read_to_string(path).unwrap();
         let mut replay = Model::new();
         replay.load_library_dir(&library).unwrap();
         replay.set_library_cache(cache.clone());
@@ -366,7 +367,7 @@ fn prepared_negative_diagnostics_match_resolution_replay() {
         replay.add_source(path.display().to_string(), &source);
         warm.add_source(path.display().to_string(), &source);
         assert_eq!(diags(&replay), diags(&warm), "{}", path.display());
-    }
+    });
 }
 
 #[test]

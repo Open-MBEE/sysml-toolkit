@@ -745,6 +745,9 @@ fn referential_root_shadows_library_root() {
 /// colliding with declared requirement names: three requirement-root references
 /// and one nested feature cease to be ambiguous, resolving three downstream
 /// requirement-chain references as well.
+/// -> (21, 20, 2, 2) once a case's objective redefines the objective of each
+/// case its owner specializes, so an objective's body inherits the
+/// redefined objective's members.
 #[test]
 fn corpus_referential_ratchet() {
     let root = sysmlv2_testkit::corpus_root();
@@ -779,7 +782,7 @@ fn corpus_referential_ratchet() {
         .count();
     assert_eq!(
         (unresolved, ambiguous, aliases, cycles),
-        (22, 20, 2, 2),
+        (21, 20, 2, 2),
         "referential ratchet moved — improvements should only lower these"
     );
 }
@@ -1052,6 +1055,55 @@ fn verdicts(src: &str) -> Vec<(Option<String>, sysmlv2_parser::check::Constraint
         .into_iter()
         .map(|c| (c.name, c.verdict))
         .collect()
+}
+
+/// A constraint left undecided by a chain through a usage that is a
+/// collection only because it declares no multiplicity (one a package
+/// owns) names it and the `[1]` that makes it one value. An explicitly
+/// open multiplicity is meant, so it gets no such hint.
+#[test]
+fn an_undecided_chain_through_a_collection_by_default_names_the_fix() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let checks = verdicts(
+        "package P {
+            part def Tank { attribute volume = 30; }
+            part def Rig { part tank : Tank; }
+            part tank : Tank;
+            part spare : Tank[1];
+            part reserve : Tank[0..*];
+            part rig : Rig;
+            assert constraint fits { tank.volume <= 40 }
+            assert constraint spareFits { spare.volume <= 40 }
+            assert constraint reserveFits { reserve.volume <= 40 }
+            assert constraint rigFits { rig.tank.volume <= 40 }
+            part r1 : Tank[0..*]; part r2 : Tank[0..*]; part r3 : Tank[0..*];
+            part r4 : Tank[0..*]; part r5 : Tank[0..*]; part r6 : Tank[0..*];
+            part r7 : Tank[0..*]; part r8 : Tank[0..*]; part r9 : Tank[0..*];
+            assert constraint allFit {
+                r1.volume + r2.volume + r3.volume + r4.volume + r5.volume + r6.volume
+                    + r7.volume + r8.volume + r9.volume + tank.volume <= 400
+            }
+        }",
+    );
+    let hint = |name: &str| {
+        Undecided(format!(
+            "result is indeterminate over unbound features: a chain through `{name}`, which declares no multiplicity and so is a collection of any size; declare `[1]` on it for one value"
+        ))
+    };
+    assert_eq!(
+        checks,
+        [
+            (Some("fits".to_string()), hint("tank")),
+            (Some("spareFits".to_string()), Satisfied),
+            (
+                Some("reserveFits".to_string()),
+                Undecided("result is indeterminate over unbound features".to_string())
+            ),
+            (Some("rigFits".to_string()), hint("rig")),
+            // Open multiplicities that are meant do not crowd it out.
+            (Some("allFit".to_string()), hint("tank")),
+        ]
+    );
 }
 
 #[test]
@@ -1398,6 +1450,27 @@ fn semantic_metadata_typing() {
     // Unresolved metadata types stay out of semantic findings (referential
     // checks own those).
     assert!(sem_warnings("package P { #Missing::M part def X; }").is_empty());
+}
+
+/// An enumeration body's metadata members annotate, as in any other body:
+/// only its enumerated values are literals the `EnumerationUsage` typing
+/// rule applies to.
+#[test]
+fn semantic_enum_body_metadata_annotates() {
+    for member in ["@M;", "@M { }", "metadata m : M;", "@M about a;"] {
+        let msgs = sem_warnings(&format!(
+            "package P {{ metadata def M; enum def E {{ {member} enum a; }} }}"
+        ));
+        assert!(msgs.is_empty(), "{member}: {msgs:#?}");
+    }
+    // The member is checked as metadata: a type that is not a metaclass
+    // is reported as such.
+    let msgs = sem_warnings("package P { part def D; enum def E { @D; enum a; } }");
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    assert!(
+        msgs[0].contains("metadata must be typed by a metadata definition"),
+        "{msgs:#?}"
+    );
 }
 
 #[test]
@@ -2206,6 +2279,37 @@ fn target_successions_must_be_adjacent_to_their_anchor() {
             .filter(|d| d.contains("must immediately follow"))
             .count(),
         2,
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_target_succession_with_a_multiplicity_is_one() {
+    // `then [1] b;` starts from the member it follows, as `then b;`
+    // does: it continues a run, and on its own it follows nothing.
+    let valid = check_sysml(
+        "action def A {
+            action a;
+            then [1] b;
+            then c;
+            action b;
+            action c;
+        }",
+    );
+    assert!(valid.is_empty(), "{valid:#?}");
+
+    let diagnostics = check_sysml(
+        "action def A {
+            then [1] orphan;
+            action b;
+        }",
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|d| d.contains("must immediately follow"))
+            .count(),
+        1,
         "{diagnostics:#?}"
     );
 }

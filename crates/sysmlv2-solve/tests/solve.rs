@@ -1087,8 +1087,7 @@ fn quantified_nested_collections_do_not_prove_singleton_size() {
     }
 }
 
-#[path = "common/collection_identity.rs"]
-mod collection_identity;
+use crate::collection_identity;
 
 #[test]
 fn contextual_member_formulas_do_not_capture_quantifier_bindings() {
@@ -1148,4 +1147,73 @@ fn scalar_admission_respects_body_and_named_multiplicity() {
             assert!(matches!(out, SolveOutcome::Unknown(_)), "{out:?}");
         }
     }
+}
+
+/// A witness for a feature whose bound folds through a product is in
+/// SI-coherent units; `SolverConfig::value_units` asking for the written
+/// units writes it in the unit the bound was written in, by the exact
+/// factor. The verdict is the same either way.
+#[test]
+fn witnesses_can_read_in_the_units_their_bounds_were_written_in() {
+    use sysmlv2_model::eval::UnitDisplay;
+    use sysmlv2_model::rational::Rational;
+    let src = "package P {
+        attribute m;
+        attribute 'in' {
+            attribute unitConversion { attribute referenceUnit = m; attribute conversionFactor = 0.0254; }
+        }
+        attribute area[1];
+        attribute count[1];
+        assert constraint c { area == 2 ['in'] * (3 ['in']) & count == 7 }
+    }";
+    let witness = |units: UnitDisplay| -> Option<Vec<(String, WitnessValue)>> {
+        let cfg = SolverConfig {
+            value_units: units,
+            ..Default::default()
+        };
+        if z3_version(&cfg).is_err() {
+            eprintln!("skipping: no z3 on PATH");
+            return None;
+        }
+        let mut model = Model::new();
+        model.add_source("test.sysml", src);
+        let solved = solve_constraints(&model, &cfg).expect("z3 available");
+        match solved.into_iter().find_map(|s| s.solve) {
+            Some(SolveOutcome::Satisfiable(w)) => Some(w),
+            other => panic!("expected satisfiable, got {other:?}"),
+        }
+    };
+    let Some(si) = witness(UnitDisplay::Si) else {
+        return;
+    };
+    let value = |w: &[(String, WitnessValue)], name: &str| {
+        w.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("{name} in {w:?}"))
+    };
+    assert_eq!(
+        value(&si, "area"),
+        WitnessValue::WithUnit(
+            Box::new(WitnessValue::Real(
+                Rational::parse_decimal("0.00387096").unwrap()
+            )),
+            "m**2".to_string(),
+        )
+    );
+    let written = witness(UnitDisplay::AsWritten).expect("z3 seen above");
+    assert_eq!(
+        value(&written, "area"),
+        WitnessValue::WithUnit(
+            Box::new(WitnessValue::Real(Rational::from_integer(6))),
+            "in**2".to_string(),
+        )
+    );
+    assert_eq!(value(&written, "area").to_string(), "6 [in**2]");
+    // A plain number has no unit to choose.
+    assert_eq!(value(&written, "count"), value(&si, "count"));
+    assert!(!matches!(
+        value(&written, "count"),
+        WitnessValue::WithUnit(..)
+    ));
 }

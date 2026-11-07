@@ -4060,6 +4060,13 @@
         "start": 234
       },
       {
+        "end": 235,
+        "message": "Only one return parameter is allowed [validateExpressionResultParameterMembership]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 234
+      },
+      {
         "end": 244,
         "message": "CalculationUsage must have exactly one non-redundant type; found 2",
         "severity": "Error",

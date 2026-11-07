@@ -1168,6 +1168,36 @@ mod tests {
         assert_eq!(shown(&on_threads), shown(&in_line));
     }
 
+    /// KerML 8.3.4.7 validateFunctionResultParameterMembership and
+    /// validateExpressionResultParameterMembership count the owned and
+    /// the inherited return parameters. An owned one redefines those of
+    /// the general types, so only the most specific owners count.
+    #[test]
+    fn inherited_return_parameters_count() {
+        let mut model = Model::new();
+        model.add_source(
+            "user.kerml",
+            "package P {
+                function F { return r; }
+                function H { return s; }
+                function G :> F, H;
+                function K :> F, H { return t; }
+                function M :> F;
+                function N :> M, F;
+                function T { return a; return b; }
+                expr X { return x; }
+                expr Y { return y; }
+                expr Z :> X, Y;
+            }",
+        );
+        let found: Vec<String> = findings(&model)
+            .into_iter()
+            .map(|(_, m)| m)
+            .filter(|m| m.contains("return parameter"))
+            .collect();
+        assert_eq!(found.len(), 3, "{found:?}");
+    }
+
     #[test]
     fn semantic_checks_walk_tables_without_copying_them() {
         // Fresh build: library rows and user rows share one storage.

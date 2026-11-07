@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A unary operator takes another unary expression as its operand (KerML 8.2.5.8.1: the operand is an `ArgumentMember`, so any expression), so `- -x`, `~~x` and `not not b` parse; the Pilot's Xtext narrows the operand to an `ExtentExpression`. `fmt`, which prints `-(-x)` as `--x`, no longer refuses such a file.
+
 ## v0.11.3
 
 ### Added

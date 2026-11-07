@@ -5262,7 +5262,10 @@ impl<'s> Parser<'s> {
         if let Some(op) = op {
             let start = self.cur().span;
             self.bump();
-            let operand = self.parse_extent()?;
+            // KerML 8.2.5.8.1: the operand is an ArgumentMember, so any
+            // expression, and `- -x` and `not not b` nest. The recursion
+            // is charged as one level deeper.
+            let operand = self.branch(|p| p.descend(Self::parse_unary))?;
             let span = start.join(operand.span);
             return Some(Expr {
                 kind: ExprKind::Unary {

@@ -559,6 +559,36 @@ fn unary_binds_tighter_than_exponentiation() {
 }
 
 #[test]
+fn unary_operators_nest() {
+    // KerML 8.2.5.8.1: the operand of a unary operator is any expression.
+    for (src, outer, inner) in [
+        ("- -x", UnaryOp::Minus, UnaryOp::Minus),
+        ("~~x", UnaryOp::Tilde, UnaryOp::Tilde),
+        ("not not x", UnaryOp::Not, UnaryOp::Not),
+        ("-~x", UnaryOp::Minus, UnaryOp::Tilde),
+    ] {
+        let ExprKind::Unary { op, operand } = value_expr(src).kind else {
+            panic!("{src}")
+        };
+        assert_eq!(op, outer, "{src}");
+        assert!(
+            matches!(operand.kind, ExprKind::Unary { op, .. } if op == inner),
+            "{src}"
+        );
+    }
+    // - -2 ** 3 parses as (-(-2)) ** 3, as -2 ** 3 does.
+    let ExprKind::Binary {
+        op: BinaryOp::Pow,
+        lhs,
+        ..
+    } = value_expr("- -2 ** 3").kind
+    else {
+        panic!()
+    };
+    assert!(matches!(lhs.kind, ExprKind::Unary { .. }));
+}
+
+#[test]
 fn logical_chain() {
     // a or b and c => or(a, and(b, c)) — `and` binds tighter.
     let ExprKind::Binary {

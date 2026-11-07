@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `validateStateDefinitionParallelSubactions` and `validateStateUsageParallelSubactions` report only transitions in a parallel state, not successions: SysML 8.3.18.5 and 8.3.18.6 forbid incoming and outgoing transitions of the substates, and 7.18.2 and 7.18.3 say the same. The Pilot Implementation also rejects a succession there; the opensysml fixtures `s33-parallel-state-usage-with-succession` and `p19-parallel-state-with-transition`, which hold a succession and no transition, move to unknown in both baselines.
+
 ## v0.11.3
 
 ### Added

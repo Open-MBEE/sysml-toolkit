@@ -2702,16 +2702,8 @@
     "status": "diagnostic baseline"
   },
   "negative/semantic/s33-parallel-state-usage-with-succession.sysml": {
-    "diagnostics": [
-      {
-        "end": 196,
-        "message": "A parallel state cannot own successions or transitions [validateStateUsageParallelSubactions]",
-        "severity": "Error",
-        "stage": "semantics",
-        "start": 195
-      }
-    ],
-    "status": "diagnostic baseline"
+    "diagnostics": [],
+    "status": "unknown"
   },
   "negative/semantic/s34-state-usage-two-entry-actions.sysml": {
     "diagnostics": [
@@ -3422,16 +3414,8 @@
     "status": "accepted (adjudicated)"
   },
   "negative/xpect/p19-parallel-state-with-transition.sysml": {
-    "diagnostics": [
-      {
-        "end": 215,
-        "message": "A parallel state cannot own successions or transitions [validateStateDefinitionParallelSubactions]",
-        "severity": "Error",
-        "stage": "semantics",
-        "start": 214
-      }
-    ],
-    "status": "diagnostic baseline"
+    "diagnostics": [],
+    "status": "unknown"
   },
   "negative/xpect/p20-connection-with-one-end.sysml": {
     "diagnostics": [
@@ -5416,7 +5400,7 @@
     "diagnostics": [
       {
         "end": 151,
-        "message": "A parallel state cannot own successions or transitions [validateStateDefinitionParallelSubactions]",
+        "message": "A parallel state cannot own transitions [validateStateDefinitionParallelSubactions]",
         "severity": "Error",
         "stage": "semantics",
         "start": 150
@@ -5452,7 +5436,7 @@
     "diagnostics": [
       {
         "end": 156,
-        "message": "A parallel state cannot own successions or transitions [validateStateUsageParallelSubactions]",
+        "message": "A parallel state cannot own transitions [validateStateUsageParallelSubactions]",
         "severity": "Error",
         "stage": "semantics",
         "start": 155

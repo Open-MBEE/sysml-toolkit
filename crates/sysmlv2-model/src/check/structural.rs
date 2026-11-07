@@ -582,9 +582,9 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                 }
             }
             if flag(b, e, "isParallel")
-                && g.members[e].iter().any(|&m| {
-                    is_a!(b.elements[m], "TransitionUsage") || is_a!(b.elements[m], "Succession")
-                })
+                && g.members[e]
+                    .iter()
+                    .any(|&m| is_a!(b.elements[m], "TransitionUsage"))
             {
                 report(
                     e,
@@ -594,7 +594,7 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                     } else {
                         "validateStateUsageParallelSubactions"
                     },
-                    "A parallel state cannot own successions or transitions",
+                    "A parallel state cannot own transitions",
                 );
             }
         }

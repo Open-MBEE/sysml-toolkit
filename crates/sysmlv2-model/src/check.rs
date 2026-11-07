@@ -1168,6 +1168,29 @@ mod tests {
         assert_eq!(shown(&on_threads), shown(&in_line));
     }
 
+    /// SysML 8.3.18.5 validateStateDefinitionParallelSubactions and
+    /// 8.3.18.6 validateStateUsageParallelSubactions forbid transitions of
+    /// the substates of a parallel state, not successions (7.18.2).
+    #[test]
+    fn a_parallel_state_may_own_successions() {
+        let mut model = Model::new();
+        model.add_source(
+            "user.sysml",
+            "package P {
+                state def S parallel { state a; state b; first a then b; }
+                state t parallel { state a; state b; first a then b; }
+                state def T parallel { state a; state b; transition first a then b; }
+                state u parallel { state a; state b; transition first a then b; }
+            }",
+        );
+        let found: Vec<String> = findings(&model)
+            .into_iter()
+            .map(|(_, m)| m)
+            .filter(|m| m.contains("ParallelSubactions"))
+            .collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
     #[test]
     fn semantic_checks_walk_tables_without_copying_them() {
         // Fresh build: library rows and user rows share one storage.

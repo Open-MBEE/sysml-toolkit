@@ -1168,6 +1168,44 @@ mod tests {
         assert_eq!(shown(&on_threads), shown(&in_line));
     }
 
+    /// KerML 8.3.4.5.3 validateConnectorRelatedFeatures and 8.3.4.5.2
+    /// validateBindingConnectorIsBinary hold without ends too. A message
+    /// is always abstract (SysML 7.16.2, 8.2.2.16), so it needs no ends.
+    #[test]
+    fn connectors_without_ends() {
+        let mut model = Model::new();
+        model.add_source(
+            "user.kerml",
+            "package P {
+                classifier C {
+                    connector c;
+                    abstract connector d;
+                    abstract binding b;
+                }
+            }",
+        );
+        model.add_source(
+            "user.sysml",
+            "package Q { item def M; part p { message m of M; } }",
+        );
+        let found: Vec<String> = findings(&model)
+            .into_iter()
+            .map(|(_, m)| m)
+            .filter(|m| m.contains("connector"))
+            .collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains("validateConnectorRelatedFeatures"))
+        );
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains("validateBindingConnectorIsBinary"))
+        );
+    }
+
     #[test]
     fn semantic_checks_walk_tables_without_copying_them() {
         // Fresh build: library rows and user rows share one storage.

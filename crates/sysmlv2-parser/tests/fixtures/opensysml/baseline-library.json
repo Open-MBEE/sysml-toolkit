@@ -2025,6 +2025,13 @@
         "severity": "Error",
         "stage": "semantics",
         "start": 322
+      },
+      {
+        "end": 392,
+        "message": "A binding connector must have exactly two ends [validateBindingConnectorIsBinary]",
+        "severity": "Error",
+        "stage": "semantics",
+        "start": 390
       }
     ],
     "status": "diagnostic baseline"

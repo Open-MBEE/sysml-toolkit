@@ -858,7 +858,7 @@ fn usage_typing_respects_metaclass_inheritance_and_single_type_rules() {
         );
     }
     assert!(!sem_warnings("attribute def D; occurrence x : D;").is_empty());
-    assert!(sem_warnings("interface def I; connection x : I;").is_empty());
+    assert!(sem_warnings("interface def I; abstract connection x : I;").is_empty());
     assert!(sem_warnings("requirement def R; constraint x : R;").is_empty());
     assert!(sem_warnings("calc def C; action x : C;").is_empty());
     assert!(sem_warnings("metadata def M; item x : M;").is_empty());

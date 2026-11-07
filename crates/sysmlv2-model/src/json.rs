@@ -5422,11 +5422,16 @@ impl Builder {
                 self.emit_multiplicity(cf, mult, body_scope);
             }
         }
-        // A variation is implicitly abstract (pilot `UsageAdapter.postProcess`).
+        // A variation is implicitly abstract (pilot `UsageAdapter.postProcess`),
+        // and so is a message (SysML 8.2.2.16 `{ isAbstract = true }`).
         self.set(
             e,
             "isAbstract",
-            json!(u.prefix.is_abstract || u.prefix.is_variation),
+            json!(
+                u.prefix.is_abstract
+                    || u.prefix.is_variation
+                    || matches!(u.kind, UsageKind::Message)
+            ),
         );
         if declares_variation(ty) {
             self.set(e, "isVariation", json!(u.prefix.is_variation));

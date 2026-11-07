@@ -25,6 +25,7 @@ use std::collections::HashMap;
 /// name against the pinned 2025-02 KerML/SysML metamodel and ratchets the
 /// total rule inventory, so coverage cannot drift silently.
 pub const IMPLEMENTED_NORMATIVE_VALIDATION_RULES: &[&str] = &[
+    "validateActorMembershipOwningType",
     "validateCaseDefinitionOnlyOneObjective",
     "validateCaseDefinitionOnlyOneSubject",
     "validateCaseDefinitionSubjectParameterPosition",
@@ -33,12 +34,18 @@ pub const IMPLEMENTED_NORMATIVE_VALIDATION_RULES: &[&str] = &[
     "validateCaseUsageSubjectParameterPosition",
     "validateFlowDefinitionFlowEnds",
     "validateImportTopLevelVisibility",
+    "validateNamespaceDistinguishibility",
     "validateObjectiveMembershipOwningType",
+    "validateRequirementConstraintMembershipOwningType",
     "validateRequirementDefinitionOnlyOneSubject",
     "validateRequirementDefinitionSubjectParameterPosition",
     "validateRequirementUsageOnlyOneSubject",
     "validateRequirementUsageSubjectParameterPosition",
+    "validateRequirementVerificationMembershipOwningType",
+    "validateStakeholderMembershipOwningType",
+    "validateStateSubactionMembershipOwningType",
     "validateSubjectMembershipOwningType",
+    "validateViewRenderingMembershipOwningType",
 ];
 
 /// Validate one parsed source unit; returns all body-context diagnostics.
@@ -54,9 +61,10 @@ pub fn validate(unit: &SourceUnit) -> Vec<Diagnostic> {
         if matches!(member.kind, MemberKind::Import(_))
             && member.visibility != Some(Visibility::Private)
         {
-            v.error(
+            v.rule_error(
                 member,
-                "validateImportTopLevelVisibility: a top-level import must be private".into(),
+                "validateImportTopLevelVisibility",
+                "a top-level import must be private",
             );
         }
     }
@@ -679,6 +687,12 @@ impl Validator {
         self.diags.push(Diagnostic::error(m.span, message));
     }
 
+    /// An error that a normative rule names, with the rule as its code.
+    fn rule_error(&mut self, m: &Member, rule: &'static str, message: &str) {
+        self.diags
+            .push(Diagnostic::error(m.span, format!("{rule}: {message}")).with_code(rule));
+    }
+
     fn walk_members(&mut self, members: &[Member], ctx: Ctx, owner_is_variation: bool) {
         self.check_duplicate_names(members);
         let mut target_succession_run = false;
@@ -715,33 +729,31 @@ impl Validator {
         }
     }
 
-    fn check_one_subject(&mut self, members: &[Member], rule: &str) {
+    fn check_one_subject(&mut self, members: &[Member], rule: &'static str) {
         let mut subjects = members
             .iter()
             .filter(|m| matches!(m.kind, MemberKind::Subject(_)));
         let _ = subjects.next();
         for duplicate in subjects {
-            self.error(
+            self.rule_error(
                 duplicate,
-                format!("{rule}: a requirement or case may own at most one subject"),
+                rule,
+                "a requirement or case may own at most one subject",
             );
         }
     }
 
-    fn check_one_objective(&mut self, members: &[Member], rule: &str) {
+    fn check_one_objective(&mut self, members: &[Member], rule: &'static str) {
         let mut objectives = members
             .iter()
             .filter(|m| matches!(m.kind, MemberKind::Objective(_)));
         let _ = objectives.next();
         for duplicate in objectives {
-            self.error(
-                duplicate,
-                format!("{rule}: a case may own at most one objective"),
-            );
+            self.rule_error(duplicate, rule, "a case may own at most one objective");
         }
     }
 
-    fn check_subject_position(&mut self, members: &[Member], rule: &str) {
+    fn check_subject_position(&mut self, members: &[Member], rule: &'static str) {
         let Some((subject_index, subject)) = members
             .iter()
             .enumerate()
@@ -758,9 +770,10 @@ impl Validator {
             _ => false,
         });
         if first_input != Some(subject_index) {
-            self.error(
+            self.rule_error(
                 subject,
-                format!("{rule}: the subject parameter must be the first input"),
+                rule,
+                "the subject parameter must be the first input",
             );
         }
     }
@@ -794,11 +807,10 @@ impl Validator {
             let _ = ends.next();
             let _ = ends.next();
             for excess in ends {
-                self.error(
+                self.rule_error(
                     excess,
-                    "validateFlowDefinitionFlowEnds: a flow definition may not \
-                     have more than two flow ends"
-                        .into(),
+                    "validateFlowDefinitionFlowEnds",
+                    "a flow definition may not have more than two flow ends",
                 );
             }
         }
@@ -857,15 +869,18 @@ impl Validator {
                     .copied()
                     .any(|p| !metaclasses_are_distinguishable(p, metaclass))
                 {
-                    self.diags.push(Diagnostic::error(
-                        name.span,
-                        format!(
-                            "the name `{}` is already used by an earlier member \
-                             of the same namespace whose metaclass is not \
-                             distinguishable from this member",
-                            name.value
-                        ),
-                    ));
+                    self.diags.push(
+                        Diagnostic::error(
+                            name.span,
+                            format!(
+                                "validateNamespaceDistinguishibility: the name `{}` is \
+                                 already used by an earlier member of the same namespace \
+                                 whose metaclass is not distinguishable from this member",
+                                name.value
+                            ),
+                        )
+                        .with_code("validateNamespaceDistinguishibility"),
+                    );
                 }
                 prior.push(metaclass);
             }
@@ -969,19 +984,31 @@ impl Validator {
         };
         if !ok {
             let rule = match m.kind {
-                MemberKind::Subject(_) => Some("validateSubjectMembershipOwningType: "),
-                MemberKind::Objective(_) => Some("validateObjectiveMembershipOwningType: "),
+                MemberKind::Subject(_) => Some("validateSubjectMembershipOwningType"),
+                MemberKind::Objective(_) => Some("validateObjectiveMembershipOwningType"),
+                MemberKind::Actor(_) => Some("validateActorMembershipOwningType"),
+                MemberKind::Stakeholder(_) => Some("validateStakeholderMembershipOwningType"),
+                MemberKind::RequirementConstraint { .. } => {
+                    Some("validateRequirementConstraintMembershipOwningType")
+                }
+                MemberKind::RequirementVerification(_) => {
+                    Some("validateRequirementVerificationMembershipOwningType")
+                }
+                MemberKind::StateSubaction { .. } => {
+                    Some("validateStateSubactionMembershipOwningType")
+                }
+                MemberKind::Render(_) => Some("validateViewRenderingMembershipOwningType"),
                 _ => None,
             };
-            self.error(
-                m,
-                format!(
-                    "{}{} is not allowed in {}",
-                    rule.unwrap_or(""),
-                    member_desc(&m.kind),
-                    ctx.describe()
-                ),
+            let message = format!(
+                "{} is not allowed in {}",
+                member_desc(&m.kind),
+                ctx.describe()
             );
+            match rule {
+                Some(rule) => self.rule_error(m, rule, &message),
+                None => self.error(m, message),
+            }
         }
     }
 

@@ -3444,6 +3444,73 @@ fn check_format_json_names_the_rule_a_semantic_finding_reports() {
 }
 
 #[test]
+fn check_format_json_names_the_rule_of_every_stage() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-check-json-rules-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("model.sysml");
+    fs::write(
+        &model,
+        "package P {
+    requirement def R { subject a; subject b; }
+    calc def C { actor x; return r; }
+    part def D { part y; part y; }
+    part def K;
+    part k { @K; }
+    attribute n = 1.5;
+    part w[n];
+    calc def F { in x; return r; }
+    attribute z = F(x = 1, x = 2);
+}
+",
+    )
+    .unwrap();
+
+    let out = sysmlv2(&["check", "--format", "json", model.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    let rules: Vec<(&str, &str, &str)> = doc["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["stage"].as_str().unwrap(),
+                f["severity"].as_str().unwrap(),
+                f["rule"].as_str().unwrap_or("null"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            (
+                "context",
+                "error",
+                "validateRequirementDefinitionOnlyOneSubject"
+            ),
+            ("context", "error", "validateActorMembershipOwningType"),
+            ("context", "error", "validateNamespaceDistinguishibility"),
+            ("semantic", "error", "validateMetadataFeatureMetaclass"),
+            (
+                "semantic",
+                "error",
+                "validateMultiplicityRangeBoundResultTypes"
+            ),
+            (
+                "semantic",
+                "warn",
+                "validateInvocationExpressionNoDuplicateParameterRedefinition"
+            ),
+        ],
+        "{doc}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn lint_format_json_locates_findings_past_a_parse_failure() {
     let dir = std::env::temp_dir().join(format!(
         "sysmlv2-cli-test-lint-json-mixed-{}",

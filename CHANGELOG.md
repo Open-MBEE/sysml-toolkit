@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `check --format json` names the rule of the context-stage findings and of four more semantic findings, where `rule` was null (follow-up to #10). The context stage sets `Diagnostic::code` for its rule-named findings, names the owning-type rules of an `actor`, `stakeholder`, `require`/`assume`, `verify`, `entry`/`do`/`exit` or `render` member in the wrong body (`validate…MembershipOwningType`) and the name clash (`validateNamespaceDistinguishibility`); the semantic stage names `validateMetadataFeatureMetaclass`, `validateMultiplicityRangeBoundResultTypes`, `validateConnectorBinarySpecialization` and the two invocation-argument rules. The messages of the newly named context findings start with the rule, as the others do; severities do not change.
+
 ## v0.11.3
 
 ### Added

@@ -89,8 +89,9 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
             if invalid {
                 out.push((
                     r.b.unit_of_elem(owner),
-                    Diagnostic::error(
+                    super::rule_error(
                         span,
+                        "validateMultiplicityRangeBoundResultTypes",
                         "multiplicity bound must be a Natural number (or `*` for the upper bound)",
                     ),
                 ));

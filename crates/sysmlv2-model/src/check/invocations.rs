@@ -71,10 +71,14 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
                     Some(name) => name.to_display_string(),
                     None => {
                         let Some(name) = params.get(positional) else {
-                            out.push((unit, Diagnostic::warning(span, format!(
-                                "invocation of `{}` supplies {} arguments for {} parameter(s)",
-                                qn.to_display_string(), args.len(), params.len()
-                            ))));
+                            out.push((unit, super::rule_warning(
+                                span,
+                                "validateInvocationExpressionParameterRedefinition",
+                                format!(
+                                    "invocation of `{}` supplies {} arguments for {} parameter(s)",
+                                    qn.to_display_string(), args.len(), params.len()
+                                ),
+                            )));
                             invalid = true;
                             break;
                         };
@@ -83,20 +87,26 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
                     }
                 };
                 let message = if !params.contains(&name) {
-                    Some(format!(
-                        "invocation of `{}` names unknown parameter `{name}`",
-                        qn.to_display_string()
+                    Some((
+                        "validateInvocationExpressionParameterRedefinition",
+                        format!(
+                            "invocation of `{}` names unknown parameter `{name}`",
+                            qn.to_display_string()
+                        ),
                     ))
                 } else if !bound.insert(name.clone()) {
-                    Some(format!(
-                        "invocation of `{}` binds parameter `{name}` more than once",
-                        qn.to_display_string()
+                    Some((
+                        "validateInvocationExpressionNoDuplicateParameterRedefinition",
+                        format!(
+                            "invocation of `{}` binds parameter `{name}` more than once",
+                            qn.to_display_string()
+                        ),
                     ))
                 } else {
                     None
                 };
-                if let Some(message) = message {
-                    out.push((unit, Diagnostic::warning(arg.value.span, message)));
+                if let Some((rule, message)) = message {
+                    out.push((unit, super::rule_warning(arg.value.span, rule, message)));
                     invalid = true;
                 }
             }

@@ -128,8 +128,9 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
         if !matches!(target_ty, "MetadataDefinition" | "Metaclass") {
             out.push((
                 unit,
-                Diagnostic::error(
+                super::rule_error(
                     qn.span,
+                    "validateMetadataFeatureMetaclass",
                     format!(
                         "metadata must be typed by a metadata definition or \
                          metaclass; `{}` is a {}",
@@ -398,8 +399,9 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
                 let ends = end_count(&r.b, *owner);
                 out.push((
                     r.b.unit_of_elem(*owner),
-                    Diagnostic::warning(
+                    super::rule_warning(
                         qn.span,
+                        "validateConnectorBinarySpecialization",
                         format!(
                             "connector with {ends} ends specializes a binary connector (a binary connector cannot have more than two ends)"
                         ),

@@ -94,7 +94,7 @@
     "diagnostics": [
       {
         "end": 356,
-        "message": "a `require` constraint member is not allowed in a definition or usage body",
+        "message": "validateRequirementConstraintMembershipOwningType: a `require` constraint member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 329
@@ -185,7 +185,7 @@
     "diagnostics": [
       {
         "end": 231,
-        "message": "an `entry` action member is not allowed in a definition or usage body",
+        "message": "validateStateSubactionMembershipOwningType: an `entry` action member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 223
@@ -204,7 +204,7 @@
     "diagnostics": [
       {
         "end": 219,
-        "message": "a `do` action member is not allowed in a definition or usage body",
+        "message": "validateStateSubactionMembershipOwningType: a `do` action member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 214
@@ -931,7 +931,7 @@
     "diagnostics": [
       {
         "end": 313,
-        "message": "an `actor` member is not allowed in a definition or usage body",
+        "message": "validateActorMembershipOwningType: an `actor` member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 289
@@ -967,7 +967,7 @@
     "diagnostics": [
       {
         "end": 333,
-        "message": "a `stakeholder` member is not allowed in a definition or usage body",
+        "message": "validateStakeholderMembershipOwningType: a `stakeholder` member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 306
@@ -979,7 +979,7 @@
     "diagnostics": [
       {
         "end": 268,
-        "message": "an `entry` action member is not allowed in a definition or usage body",
+        "message": "validateStateSubactionMembershipOwningType: an `entry` action member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 250
@@ -991,7 +991,7 @@
     "diagnostics": [
       {
         "end": 312,
-        "message": "a `render` member is not allowed in a definition or usage body",
+        "message": "validateViewRenderingMembershipOwningType: a `render` member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 285
@@ -1825,7 +1825,7 @@
     "diagnostics": [
       {
         "end": 353,
-        "message": "invocation of `F` supplies 2 arguments for 1 parameter(s)",
+        "message": "invocation of `F` supplies 2 arguments for 1 parameter(s) [validateInvocationExpressionParameterRedefinition]",
         "severity": "Warning",
         "stage": "semantics",
         "start": 346
@@ -1837,7 +1837,7 @@
     "diagnostics": [
       {
         "end": 351,
-        "message": "invocation of `F` binds parameter `x` more than once",
+        "message": "invocation of `F` binds parameter `x` more than once [validateInvocationExpressionNoDuplicateParameterRedefinition]",
         "severity": "Warning",
         "stage": "semantics",
         "start": 350
@@ -1928,7 +1928,7 @@
     "diagnostics": [
       {
         "end": 404,
-        "message": "metadata must be typed by a metadata definition or metaclass; `M` is a Class",
+        "message": "metadata must be typed by a metadata definition or metaclass; `M` is a Class [validateMetadataFeatureMetaclass]",
         "severity": "Error",
         "stage": "semantics",
         "start": 403
@@ -2627,7 +2627,7 @@
     "diagnostics": [
       {
         "end": 203,
-        "message": "metadata must be typed by a metadata definition or metaclass; `PD` is a PartDefinition",
+        "message": "metadata must be typed by a metadata definition or metaclass; `PD` is a PartDefinition [validateMetadataFeatureMetaclass]",
         "severity": "Error",
         "stage": "semantics",
         "start": 201
@@ -3811,7 +3811,7 @@
     "diagnostics": [
       {
         "end": 213,
-        "message": "an `actor` member is not allowed in a definition or usage body",
+        "message": "validateActorMembershipOwningType: an `actor` member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 201
@@ -5225,7 +5225,7 @@
     "diagnostics": [
       {
         "end": 231,
-        "message": "invocation of `F` binds parameter `x` more than once",
+        "message": "invocation of `F` binds parameter `x` more than once [validateInvocationExpressionNoDuplicateParameterRedefinition]",
         "severity": "Warning",
         "stage": "semantics",
         "start": 230
@@ -5265,7 +5265,7 @@
       },
       {
         "end": 276,
-        "message": "invocation of `F` names unknown parameter `y`",
+        "message": "invocation of `F` names unknown parameter `y` [validateInvocationExpressionParameterRedefinition]",
         "severity": "Warning",
         "stage": "semantics",
         "start": 275
@@ -5377,7 +5377,7 @@
     "diagnostics": [
       {
         "end": 154,
-        "message": "metadata must be typed by a metadata definition or metaclass; `NotAMetaclass` is a Class",
+        "message": "metadata must be typed by a metadata definition or metaclass; `NotAMetaclass` is a Class [validateMetadataFeatureMetaclass]",
         "severity": "Error",
         "stage": "semantics",
         "start": 141
@@ -5401,7 +5401,7 @@
     "diagnostics": [
       {
         "end": 185,
-        "message": "metadata must be typed by a metadata definition or metaclass; `NotMetadata` is a PartDefinition",
+        "message": "metadata must be typed by a metadata definition or metaclass; `NotMetadata` is a PartDefinition [validateMetadataFeatureMetaclass]",
         "severity": "Error",
         "stage": "semantics",
         "start": 174
@@ -5413,7 +5413,7 @@
     "diagnostics": [
       {
         "end": 132,
-        "message": "multiplicity bound must be a Natural number (or `*` for the upper bound)",
+        "message": "multiplicity bound must be a Natural number (or `*` for the upper bound) [validateMultiplicityRangeBoundResultTypes]",
         "severity": "Error",
         "stage": "semantics",
         "start": 127
@@ -5425,7 +5425,7 @@
     "diagnostics": [
       {
         "end": 135,
-        "message": "the name `A` is already used by an earlier member of the same namespace whose metaclass is not distinguishable from this member",
+        "message": "validateNamespaceDistinguishibility: the name `A` is already used by an earlier member of the same namespace whose metaclass is not distinguishable from this member",
         "severity": "Error",
         "stage": "structure",
         "start": 134
@@ -5710,7 +5710,7 @@
     "diagnostics": [
       {
         "end": 202,
-        "message": "a `require` constraint member is not allowed in a definition or usage body",
+        "message": "validateRequirementConstraintMembershipOwningType: a `require` constraint member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 177
@@ -5866,7 +5866,7 @@
     "diagnostics": [
       {
         "end": 220,
-        "message": "a `stakeholder` member is not allowed in a definition or usage body",
+        "message": "validateStakeholderMembershipOwningType: a `stakeholder` member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 202
@@ -5902,7 +5902,7 @@
     "diagnostics": [
       {
         "end": 208,
-        "message": "an `entry` action member is not allowed in a definition or usage body",
+        "message": "validateStateSubactionMembershipOwningType: an `entry` action member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 190
@@ -6273,7 +6273,7 @@
     "diagnostics": [
       {
         "end": 200,
-        "message": "a `render` member is not allowed in a definition or usage body",
+        "message": "validateViewRenderingMembershipOwningType: a `render` member is not allowed in a definition or usage body",
         "severity": "Error",
         "stage": "structure",
         "start": 185

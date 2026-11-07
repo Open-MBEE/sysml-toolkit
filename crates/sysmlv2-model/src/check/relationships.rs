@@ -85,7 +85,7 @@ pub(super) fn validate(
                 Vec::new()
             };
         if is_a!(b.elements[e], "BindingConnector") {
-            if !ends.is_empty() && ends.len() != 2 {
+            if ends.len() != 2 {
                 report(
                     "validateBindingConnectorIsBinary",
                     "A binding connector must have exactly two ends",
@@ -95,7 +95,7 @@ pub(super) fn validate(
                 bindings.push((unit, span, g.typed(b, *a), g.typed(b, *z)));
             }
         }
-        if is_a!(b.elements[e], "Connector") && !flag(b, e, "isAbstract") && ends.len() == 1 {
+        if is_a!(b.elements[e], "Connector") && !flag(b, e, "isAbstract") && ends.len() < 2 {
             report(
                 "validateConnectorRelatedFeatures",
                 "A concrete connector must relate at least two features",

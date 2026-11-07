@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A message is abstract (SysML 8.2.2.16 `Message : FlowUsage = ... { isAbstract = true }`, 7.16.2 "A message is always abstract"): `message m of M;` exports `isAbstract: true`. The full-form baseline moves for the corpus's 40 messages.
+- `validateConnectorRelatedFeatures` reports a concrete connector with no ends, and `validateBindingConnectorIsBinary` a binding connector with no ends, abstract or not (KerML 8.3.4.5.3, 8.3.4.5.2); both reported only one end before. The opensysml fixture `k49-binding-connector-with-three-ends` gains the finding on its `abstract binding b2;`.
+
 ## v0.11.3
 
 ### Added

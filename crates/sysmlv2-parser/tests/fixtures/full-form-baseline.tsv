@@ -3990,7 +3990,7 @@ FlowUsage	inheritedMembership	6739ccf89892f02c	138	0
 FlowUsage	input	6739ccf89892f02c	138	0
 FlowUsage	interaction	437960690ffe330c	138	8
 FlowUsage	intersectingType	6739ccf89892f02c	138	0
-FlowUsage	isAbstract	7a1270115d01d5aa	138	0
+FlowUsage	isAbstract	27db29890d44d382	138	40
 FlowUsage	isComposite	d6f5f34e0a9981d7	138	137
 FlowUsage	isConjugated	7a1270115d01d5aa	138	0
 FlowUsage	isConstant	7a1270115d01d5aa	138	0

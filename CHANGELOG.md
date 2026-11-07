@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `validateFunctionResultParameterMembership` and `validateExpressionResultParameterMembership` count the inherited return parameters too (KerML 8.3.4.7.3, 8.3.4.7.4: "owned or inherited"), so `function G :> F, H;` is reported where `F` and `H` each own one. An owned return parameter redefines those of the general types (`checkFeatureResultRedefinition`), so only the most specific owners count; owners in the library are left out, because the checks do not read the implied specializations that link a type to its library base.
+
 ## v0.11.3
 
 ### Added

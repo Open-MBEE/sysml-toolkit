@@ -475,14 +475,36 @@ pub(super) fn validate(r: &ResolvedModel, model: &Model, g: &Facts) -> Vec<(usiz
                     "Only one owned or inherited result expression is allowed",
                 );
             }
-            let returns = g.members[e]
+            // An owned return parameter redefines those of the general
+            // types, so only the most specific owners in the closure count.
+            // The facts hold no implied specializations, which link a type
+            // to its library base, so owners in the library are left out.
+            let owned_returns = |t: usize| {
+                g.members[t]
+                    .iter()
+                    .filter(|&&m| {
+                        b.elements[m]
+                            .owning_relationship
+                            .is_some_and(|r| b.elements[r].ty == "ReturnParameterMembership")
+                    })
+                    .count()
+            };
+            let owners: Vec<(usize, usize)> = g
+                .closure(e)
+                .into_iter()
+                .filter(|&t| t >= b.lib_boundary)
+                .map(|t| (t, owned_returns(t)))
+                .filter(|&(_, n)| n > 0)
+                .collect();
+            let returns: usize = owners
                 .iter()
-                .filter(|&&m| {
-                    b.elements[m]
-                        .owning_relationship
-                        .is_some_and(|r| b.elements[r].ty == "ReturnParameterMembership")
+                .filter(|&&(t, _)| {
+                    !owners
+                        .iter()
+                        .any(|&(u, _)| u != t && g.closure_shared(u).contains(&t))
                 })
-                .count();
+                .map(|&(_, n)| n)
+                .sum();
             if returns > 1 {
                 report(
                     e,

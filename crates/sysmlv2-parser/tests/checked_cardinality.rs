@@ -87,7 +87,11 @@ fn checked_collection_bounds_preserve_actual_library_and_prepared_results() {
                     Some(1),
                     "{name} {format:?} {mode}"
                 );
-                assert_eq!(report.implicit_singletons, vec![e]);
+                // The singleton is the owned default multiplicity (SysML
+                // 7.6.3), not the implicit rule any more.
+                assert_eq!(report.implicit_singletons, Vec::new(), "{name}");
+                assert_eq!(report.multiplicities.len(), 1, "{name}");
+                assert_eq!(r.owner(report.multiplicities[0]), Some(e), "{name}");
             }
             let sequence = Value::Sequence(vec![
                 Value::Unbound(fixed, Default::default()),

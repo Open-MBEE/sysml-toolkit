@@ -102,9 +102,14 @@ fn payload_type_dereference_preserves_dependency_qualification() {
         Derived::Value(DerivedValue::References(vec![]))
     );
     assert_eq!(derives("Flow", "payloadType"), Derives::Passthrough);
+    // The checked read rides on the payload feature's complete type report,
+    // which this library-less model cannot establish: the refusal names the
+    // missing families rather than the static approximation.
     assert_eq!(
         r.derived_exact(holder, "payloadType"),
-        Err(PropertyError::Approximate)
+        Err(PropertyError::IncompleteTypeProjection(
+            crate::json::FeatureTypeIssue::MissingRequiredFamilies
+        ))
     );
     assert_eq!(r.derived(holder, "payloadType"), compatibility);
 }

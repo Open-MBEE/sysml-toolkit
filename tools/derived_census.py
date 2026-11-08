@@ -38,7 +38,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from xmi_props import SOURCES, XMI_ID, XMI_IDREF, XMI_TYPE, closure, load, ref_of  # noqa: E402
+from xmi_props import SOURCES, XMI_ID, XMI_IDREF, XMI_TYPE, closure, load, ref_of, require  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 EMITTER = ROOT / "crates/sysmlv2-model/src/full.rs"
@@ -75,7 +75,7 @@ def read_xmi():
     ids = {}  # xmi id -> element name (classes and properties)
     derived = defaultdict(lambda: {"declaring": [], "types": set(), "rules": {}})
     rules_by_class = defaultdict(dict)  # class name -> rule name -> body
-    roots = [(src, ET.parse(src).getroot()) for src in SOURCES]
+    roots = [(src, ET.parse(require(src)).getroot()) for src in SOURCES]
     for _, root in roots:
         for el in root.iter():
             if el.get(XMI_ID) and el.get("name"):

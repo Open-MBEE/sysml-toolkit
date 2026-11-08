@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// A reference expression held as a value, and one held as a trigger's
-/// argument: a parameter of the trigger's invocation.
+/// argument: the value of the trigger invocation's parameter.
 const REFERENCES: &str = "package P {
     attribute n;
     attribute v = n;
@@ -64,7 +64,7 @@ fn a_reference_expressions_names_and_owners_defer_the_implied_relationships() {
         .iter()
         .map(|&e| r.b.elements[r.b.elements[e.0].owning_relationship.unwrap()].ty)
         .collect();
-    assert_eq!(held_by, ["FeatureValue", "ParameterMembership"]);
+    assert_eq!(held_by, ["FeatureValue", "FeatureValue"]);
     let v = r.resolve_qualified("P::v").unwrap();
     for &e in &expressions {
         let before = names_and_owners(&mut r, e);

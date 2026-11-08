@@ -37,10 +37,9 @@ const BOOKKEEPING: [&str; 2] = ["@type", "@id"];
 
 /// Every `validate…` rule the pinned metamodel XMI declares.
 fn pinned_rules() -> BTreeSet<String> {
-    let root = testkit::workspace_root();
     let mut rules = BTreeSet::new();
-    for file in ["spec-refs/KerML.xmi", "spec-refs/SysML.xmi"] {
-        let text = std::fs::read_to_string(root.join(file)).unwrap();
+    for file in ["KerML.xmi", "SysML.xmi"] {
+        let text = std::fs::read_to_string(testkit::spec_ref(file)).unwrap();
         for line in text.lines().filter(|line| line.contains("<ownedRule ")) {
             let Some(name) = line
                 .split(" name=\"")

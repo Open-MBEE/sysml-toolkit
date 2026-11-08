@@ -871,7 +871,10 @@ pub fn satisfaction_checks(
                 name: c.name.clone(),
                 element_type: c.element_type,
                 asserted: true,
-                verdict: bound_verdict(r, c, &s.overrides),
+                verdict: match &s.self_bound {
+                    Some(reason) => ConstraintVerdict::Undecided(reason.clone()),
+                    None => bound_verdict(r, c, &s.overrides),
+                },
                 bindings: Vec::new(),
                 context: s.context.clone(),
             });
@@ -981,7 +984,10 @@ pub fn satisfaction_claims(
         }
         let mut constraints = Vec::with_capacity(s.constraints.len());
         for (i, c) in s.constraints.iter().enumerate() {
-            let verdict = bound_verdict(r, c, &s.overrides);
+            let verdict = match &s.self_bound {
+                Some(reason) => ConstraintVerdict::Undecided(reason.clone()),
+                None => bound_verdict(r, c, &s.overrides),
+            };
             let bindings = match verdict {
                 ConstraintVerdict::Satisfied => Vec::new(),
                 _ => feature_bindings(r, c, Some(&s.overrides)),

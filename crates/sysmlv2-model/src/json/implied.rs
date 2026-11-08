@@ -1491,6 +1491,194 @@ impl Builder {
             .expect("unbounded implied planning cannot exhaust its budget")
     }
 
+    /// The implied specializations semantic metadata gives (KerML 9.2,
+    /// `Metaobjects::SemanticMetadata`): a type annotated by a metadata
+    /// usage whose definition conforms to it specializes the metadata's
+    /// `baseType` value — a classifier a classifier by a Subclassification,
+    /// a feature a feature by a Subsetting, a feature a classifier by a
+    /// FeatureTyping — planned as rows beside the kind roles, from `floor`
+    /// on, so the checked lists certify them and the full form writes them
+    /// (the resolver already inherits through them, `base_scopes`). A base
+    /// that does not resolve plans nothing, and the audit keeps the element
+    /// out ([`super::Builder::semantically_annotated`]).
+    fn semantic_base_candidates(
+        &mut self,
+        floor: usize,
+        steps: &mut Option<&mut usize>,
+    ) -> Option<Vec<(usize, PlannedEdge)>> {
+        let end = self.explicit_len();
+        let mut annotated: Vec<usize> = self
+            .metadata_of
+            .iter()
+            .filter(|(owner, metas)| **owner >= floor && **owner < end && !metas.is_empty())
+            .map(|(owner, _)| *owner)
+            .collect();
+        annotated.sort_unstable();
+        planning_charge(steps, annotated.len())?;
+        let mut out = Vec::new();
+        for owner in annotated {
+            if !self.is_authored(owner) || !is_a!(self.elements[owner], "Type") {
+                continue;
+            }
+            let targets = self.semantic_base_targets(owner, 0);
+            planning_charge(steps, 1 + targets.len())?;
+            let feature = is_a!(self.elements[owner], "Feature");
+            let classifier = is_a!(self.elements[owner], "Classifier");
+            for target in targets {
+                let edge = match (
+                    feature,
+                    is_a!(self.elements[target], "Feature"),
+                    is_a!(self.elements[target], "Classifier"),
+                ) {
+                    (false, false, true) if classifier => {
+                        ("Subclassification", "subclassifier", "superclassifier")
+                    }
+                    // A classifier whose base is a feature (`baseType =
+                    // systemContexts meta SysML::Type`, the library's own
+                    // idiom) specializes the feature's declared types.
+                    (false, true, _) if classifier => {
+                        let types = self.direct_typing_elems(target);
+                        planning_charge(steps, types.len())?;
+                        for ty in types {
+                            if is_a!(self.elements[ty], "Classifier") {
+                                out.push((
+                                    owner,
+                                    (
+                                        "Subclassification",
+                                        "subclassifier",
+                                        "superclassifier",
+                                        self.elements[ty].id,
+                                    ),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    (true, true, _) => ("Subsetting", "subsettingFeature", "subsettedFeature"),
+                    (true, false, true) => ("FeatureTyping", "typedFeature", "type"),
+                    _ => continue,
+                };
+                out.push((owner, (edge.0, edge.1, edge.2, self.elements[target].id)));
+            }
+        }
+        Some(out)
+    }
+
+    /// The callee an instantiation expression is typed by (KerML 8.3.4.8,
+    /// `InstantiationExpression::instantiatedType`), read as the planner
+    /// and the audit read it: for an OperatorExpression the library
+    /// Function the operator names (`BaseFunctions`, then `DataFunctions`,
+    /// then `ControlFunctions`; the chain's dot function; `**` and `^`
+    /// each their own), for a TriggerInvocationExpression the `Triggers` function its
+    /// kind names, for an InvocationExpression the member of its function
+    /// membership (the `fn` member the lowering writes), a Type of the
+    /// model. A constructor types its result, not itself (the dynamic
+    /// family's row on the canonical graph format), and has no callee
+    /// here. `None` when the callee does not resolve to an element of the
+    /// model — the operator or trigger function must be a loaded library
+    /// Function — so the planner plans nothing and the audit keeps the
+    /// expression out.
+    pub(super) fn instantiation_callee(
+        &mut self,
+        e: usize,
+        names: &HashMap<String, Uuid>,
+    ) -> Option<usize> {
+        let ty = self.elements[e].ty;
+        if !conforms(ty, "InstantiationExpression") || conforms(ty, "ConstructorExpression") {
+            return None;
+        }
+        if conforms(ty, "OperatorExpression") {
+            // The operator as written (`**` and `^` are two library
+            // functions, KerML `OperatorExpression::instantiatedType()`).
+            let operator = match self.elements[e].props.get("operator") {
+                Some(value) => value.as_str()?.to_owned(),
+                None if ty == "FeatureChainExpression" => ".".to_owned(),
+                None => return None,
+            };
+            return ["BaseFunctions", "DataFunctions", "ControlFunctions"]
+                .iter()
+                .find_map(|package| {
+                    self.library_function(names, &format!("{package}::{operator}"))
+                });
+        }
+        if ty == "TriggerInvocationExpression" {
+            let name = match self.elements[e].props.get("kind").and_then(|v| v.as_str()) {
+                Some("when") => "TriggerWhen",
+                Some("at") => "TriggerAt",
+                _ => "TriggerAfter",
+            };
+            return self.library_function(names, &format!("Triggers::{name}"));
+        }
+        let membership = self.elements[e]
+            .owned_relationships
+            .iter()
+            .copied()
+            .find(|&r| {
+                self.is_authored(r)
+                    && is_a!(self.elements[r], "Membership")
+                    && !is_a!(self.elements[r], "FeatureMembership")
+            })?;
+        let id = self.elements[membership]
+            .props
+            .get("memberElement")?
+            .as_reference()?;
+        let target = self.element_index_of_uuid(id)?;
+        is_a!(self.elements[target], "Type").then_some(target)
+    }
+
+    /// The loaded library Function `names` lists under `name`.
+    fn library_function(&mut self, names: &HashMap<String, Uuid>, name: &str) -> Option<usize> {
+        let id = *names.get(name)?;
+        let target = self.element_index_of_uuid(id)?;
+        (target < self.lib_boundary && is_a!(self.elements[target], "Function")).then_some(target)
+    }
+
+    /// The implied specialization of each instantiation expression of
+    /// `rows` by its callee (KerML 8.3.4.8: an invocation, operator or
+    /// trigger expression specializes its `instantiatedType` — a typing by
+    /// a Type, a subsetting of a Feature), planned as rows beside the kind
+    /// roles like the semantic metadata bases, so the checked lists certify
+    /// them, the positional planner pairs the arguments with the callee's
+    /// parameters, and the full form writes them. A chain's typing by the
+    /// dot function is the kind arm's ([`Self::required_implied_plan`]); an
+    /// expression whose callee does not resolve plans nothing, and the
+    /// library's own expressions are left out (see below).
+    fn instantiation_candidates(
+        &mut self,
+        rows: &[usize],
+        names: &HashMap<String, Uuid>,
+        steps: &mut Option<&mut usize>,
+    ) -> Option<Vec<(usize, PlannedEdge)>> {
+        planning_charge(steps, rows.len())?;
+        // A duplicate identity makes every callee row unusable, as it does
+        // the kind roles' witnesses.
+        if self.literal_identities_unique(steps.as_deref_mut()) != Some(true) {
+            return Some(Vec::new());
+        }
+        let mut out = Vec::new();
+        for &e in rows {
+            // The library's own expressions keep their kind roles alone:
+            // pairing their arguments with their callees' parameters costs
+            // the cold library plan half a million steps of positional work
+            // it does not have under the shared budget, and no read of a
+            // model asks for a library expression's callee.
+            if self.elements[e].ty == "FeatureChainExpression" || e < self.lib_boundary {
+                continue;
+            }
+            let Some(target) = self.instantiation_callee(e, names) else {
+                continue;
+            };
+            planning_charge(steps, 1)?;
+            let edge = if is_a!(self.elements[target], "Feature") {
+                ("Subsetting", "subsettingFeature", "subsettedFeature")
+            } else {
+                ("FeatureTyping", "typedFeature", "type")
+            };
+            out.push((e, (edge.0, edge.1, edge.2, self.elements[target].id)));
+        }
+        Some(out)
+    }
+
     fn supported_implied_specializations_with_budget(
         &mut self,
         names: &HashMap<String, Uuid>,
@@ -1531,6 +1719,7 @@ impl Builder {
         }
         planning_charge(&mut steps, self.elements.len())?;
         let mut requirement_candidates = Vec::new();
+        let mut instantiations = Vec::new();
         for (i, element) in self.elements.iter().enumerate() {
             planning_charge(&mut steps, element.owned_relationships.len())?;
             // All kind-based requirements belong to Types. Variant ownership
@@ -1545,6 +1734,9 @@ impl Builder {
                     }))
             {
                 requirement_candidates.push(i);
+                if is_a!(element, "InstantiationExpression") {
+                    instantiations.push(i);
+                }
             }
         }
         let owners = self.specialization_relation_owners();
@@ -1575,6 +1767,8 @@ impl Builder {
                 ),
             ));
         }
+        candidates.extend(self.semantic_base_candidates(0, &mut steps)?);
+        candidates.extend(self.instantiation_candidates(&instantiations, names, &mut steps)?);
         let chain_bases = self.checked_chain_bases(self.explicit_len(), steps.as_deref_mut())?;
         let (retained, graph) = self.required_specialization_edges_with_chain_bases(
             &candidates,
@@ -1628,6 +1822,7 @@ impl Builder {
         let end = self.explicit_len();
         planning_charge(&mut steps, end - floor)?;
         let mut requirement_candidates = Vec::new();
+        let mut instantiations = Vec::new();
         for i in floor..end {
             let element = &self.elements[i];
             planning_charge(&mut steps, element.owned_relationships.len())?;
@@ -1639,6 +1834,9 @@ impl Builder {
                 })
             {
                 requirement_candidates.push(i);
+                if is_a!(element, "InstantiationExpression") {
+                    instantiations.push(i);
+                }
             }
         }
         let owners = self.specialization_relation_owners_from(floor);
@@ -1667,6 +1865,8 @@ impl Builder {
                 ),
             ));
         }
+        candidates.extend(self.semantic_base_candidates(floor, &mut steps)?);
+        candidates.extend(self.instantiation_candidates(&instantiations, names, &mut steps)?);
         let chains =
             self.checked_chain_bases_from(floor, end, library.chained, steps.as_deref_mut())?;
         let (retained, graph) = self.required_edges_on_library(
@@ -3082,6 +3282,25 @@ impl Builder {
                 }
             }
         }
+        // A synthesized default multiplicity subsets the library range it
+        // stands for: a usage's `exactlyOne` (SysML 7.6.3), an individual
+        // definition's `zeroOrOne`. Both subset `naturals`, so the generic
+        // obligation below is reached through this one and minimized away.
+        if let Some(role) = self.elements[i]
+            .owning_relationship
+            .and_then(|rel| Some((rel, rel_owner.get(rel).copied().flatten()?)))
+            .and_then(|(rel, owner)| {
+                default_multiplicity_role(
+                    &self.elements[i],
+                    &self.elements[rel],
+                    &self.elements[owner],
+                )
+            })
+        {
+            if let Some(&id) = names.get(role) {
+                out.push(("Subsetting", "subsettingFeature", "subsettedFeature", id));
+            }
+        }
         // Append the inherited generic obligation independently of narrower
         // roles, then let the shared minimizer preserve only necessary edges.
         // A Multiplicity's generic obligation is `Base::naturals` itself
@@ -3538,8 +3757,10 @@ mod invocation_static_tests {
         let expression = invocation(&r);
         let callee = r.resolve_qualified("F").unwrap();
         let rows = r.implied_relationships(ElementRef(expression));
-        assert_eq!(rows.len(), 1);
+        // The callee typing, then the generated result membership.
+        assert_eq!(rows.len(), 2);
         assert_eq!(r.b.elements[rows[0].0].ty, "FeatureTyping");
+        assert_eq!(r.b.elements[rows[1].0].ty, "ReturnParameterMembership");
         assert_eq!(
             specialization_target(&r.b.elements[rows[0].0]),
             Some(r.element_id(callee))
@@ -3551,14 +3772,25 @@ mod invocation_static_tests {
         for mut r in models() {
             let expression = invocation(&r);
             let decoy = r.resolve_qualified("decoy").unwrap();
+            let callee = r.resolve_qualified("F").unwrap();
             let fake =
                 HashMap::from([("Performances::evaluations".to_owned(), r.element_id(decoy))]);
             let plan = r.b.supported_implied_specializations(&fake, false);
-            assert!(
-                !plan
-                    .candidates
-                    .iter()
-                    .any(|((owner, _), _)| owner == expression)
+            // The callee typing is the function membership's, not a role
+            // the name table could relabel; no role candidate remains.
+            let candidates: Vec<_> = plan
+                .candidates
+                .iter()
+                .filter_map(|((owner, edge), _)| (owner == expression).then_some(edge))
+                .collect();
+            assert_eq!(
+                candidates,
+                vec![(
+                    "FeatureTyping",
+                    "typedFeature",
+                    "type",
+                    r.element_id(callee)
+                )]
             );
         }
     }
@@ -3586,8 +3818,9 @@ mod invocation_static_tests {
                 .filter_map(|((owner, edge), _)| (owner == expression).then_some(edge.3))
                 .collect();
             // Losing the Expression role does not remove the independent
-            // Step and Feature requirements. Duplicate identity still makes
-            // every specialization candidate unusable.
+            // Step and Feature requirements, nor the callee typing. Duplicate
+            // identity still makes every specialization candidate unusable.
+            let callee = r.resolve_qualified("F").unwrap();
             assert_eq!(
                 actual,
                 if duplicate_uuid {
@@ -3596,6 +3829,7 @@ mod invocation_static_tests {
                     vec![
                         configuration["Performances::performances"],
                         configuration["Base::things"],
+                        r.element_id(callee),
                     ]
                 }
             );
@@ -3646,6 +3880,49 @@ impl ResolvedModel {
         self.short_name_memo.clear();
         self.redefiner_index = None;
         self.import_truncated.clear();
+    }
+
+    /// Whether the result family generates `e`'s result parameter: a
+    /// feature reference expression, or an operator, invocation or trigger
+    /// expression of the model's own rows that writes no result of its own
+    /// (see [`super::owned_results::generated_result_kind`]).
+    pub(super) fn generates_owned_result(&self, e: ElementRef) -> bool {
+        let ty = self.b.elements[e.0].ty;
+        ty == "FeatureReferenceExpression"
+            || (super::owned_results::generated_result_kind(ty)
+                && e.0 >= self.b.lib_boundary
+                && !self.b.elements[e.0].owned_relationships.iter().any(|&r| {
+                    self.b
+                        .elements
+                        .get(r)
+                        .is_none_or(|row| is_a!(row, "ReturnParameterMembership"))
+                }))
+    }
+
+    /// The owned result the checked `Expression::result` answers: the
+    /// generated one where the projection is ready, else a written one (a
+    /// cast's, an extent's). `None` leaves the read qualified.
+    pub(super) fn certified_owned_result(&mut self, e: ElementRef) -> Option<ElementRef> {
+        if self.generates_owned_result(e) {
+            if !self.owned_result_projection_ready(e) {
+                return None;
+            }
+            let view = self.b.semantic_ownership.as_ref()?;
+            return view.result(e.0).map(|result| ElementRef(result.feature));
+        }
+        let membership = self.b.elements[e.0]
+            .owned_relationships
+            .iter()
+            .copied()
+            .find(|&r| {
+                self.b.is_authored(r) && is_a!(self.b.elements[r], "ReturnParameterMembership")
+            })?;
+        match &*self.b.elements[membership].children {
+            [feature] if self.b.elements[*feature].owning_relationship == Some(membership) => {
+                Some(ElementRef(*feature))
+            }
+            _ => None,
+        }
     }
 
     /// Positive evidence only. Missing, malformed, colliding and work-limited
@@ -5301,7 +5578,7 @@ impl Builder {
         let before = self.elements.observe_revision();
         let before_epoch = self.publication.revision();
         let mut result_steps = 0;
-        let plans = super::owned_results::plan_reference_results(self, &mut result_steps);
+        let plans = super::owned_results::plan_expression_results(self, &mut result_steps);
         let result_state = if plans.is_some() {
             OwnedResultState::Attempted
         } else {
@@ -5396,7 +5673,9 @@ impl Builder {
                 }
             }
         }
-        if !result_edges.is_empty() {
+        // The result redefinitions below add their edges to this graph too,
+        // so a result without a subsetting of its own still needs it.
+        if !result_edges.is_empty() || !result_roles.is_empty() {
             let graph =
                 graph.get_or_insert_with(|| self.implied.as_ref().unwrap().specializations.clone());
             for (specific, general) in result_edges {
@@ -8108,6 +8387,65 @@ pub(super) fn is_portion(element: &Elem) -> bool {
 /// Whether a definition is declared `individual`.
 pub(super) fn is_individual(element: &Elem) -> bool {
     element.props.get("isIndividual").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// The library range a usage's default multiplicity subsets (SysML 7.6.3:
+/// an end feature, or an attribute, item or port usage its owning type
+/// features, with no written multiplicity, subsetting or redefinition, is
+/// `[1..1]`).
+pub(crate) const DEFAULT_MULTIPLICITY_BASE: &str = "Base::exactlyOne";
+/// The library range an individual definition's multiplicity subsets: an
+/// `individual` definition classifies at most one individual.
+pub(crate) const INDIVIDUAL_MULTIPLICITY_BASE: &str = "Base::zeroOrOne";
+
+/// The library range a default multiplicity member subsets
+/// (`Builder::emit_default_multiplicity`, and the same shape in a
+/// payload, as the pilot implementation exports it under every usage): an
+/// unnamed, bound-less `Multiplicity` owning no relationship of its own,
+/// under an OwningMembership of a SysML usage, subsets
+/// [`DEFAULT_MULTIPLICITY_BASE`]; of an individual definition,
+/// [`INDIVIDUAL_MULTIPLICITY_BASE`]. The metaclass gates the dialect: the
+/// KerML lowering never writes the shape, so the same shape under a plain
+/// KerML `Feature` in a payload gets nothing here, as a range, a named
+/// multiplicity and one that subsets something itself get nothing; their
+/// `naturals` obligation is the generic one.
+pub(crate) fn default_multiplicity_role(
+    multiplicity: &Elem,
+    membership: &Elem,
+    owner: &Elem,
+) -> Option<&'static str> {
+    if multiplicity.ty != "Multiplicity"
+        || !multiplicity.owned_relationships.is_empty()
+        || multiplicity
+            .props
+            .get("declaredName")
+            .is_some_and(|v| !v.is_null())
+        || multiplicity
+            .props
+            .get("declaredShortName")
+            .is_some_and(|v| !v.is_null())
+        || membership.ty != "OwningMembership"
+    {
+        return None;
+    }
+    if conforms(owner.ty, "Usage") {
+        Some(DEFAULT_MULTIPLICITY_BASE)
+    } else if conforms(owner.ty, "Definition") && is_individual(owner) {
+        Some(INDIVIDUAL_MULTIPLICITY_BASE)
+    } else {
+        None
+    }
+}
+
+/// The bounds of the library range [`default_multiplicity_role`] names:
+/// what the evaluator reads for a synthesized default multiplicity
+/// without materializing its implied Subsetting.
+pub(crate) fn default_multiplicity_bounds(role: &'static str) -> (i128, Option<i128>) {
+    if role == INDIVIDUAL_MULTIPLICITY_BASE {
+        (0, Some(1))
+    } else {
+        (1, Some(1))
+    }
 }
 
 /// The owner roles [`roles_of`] gives, beside the kind roles of

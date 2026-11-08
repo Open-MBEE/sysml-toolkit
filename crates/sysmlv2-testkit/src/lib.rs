@@ -21,6 +21,48 @@ pub fn xmi_metaclass(name: &str) -> Option<(bool, &'static [xmi_props::XmiProp])
         })
 }
 
+/// The published `SysML.schema.json` under `spec-refs/`, parsed.
+pub fn published_schema() -> serde_json::Value {
+    let path = workspace_root().join("spec-refs/SysML.schema.json");
+    serde_json::from_str(&fs::read_to_string(&path).expect("the published schema is vendored"))
+        .expect("the published schema is JSON")
+}
+
+/// Validate every full-form element of `elements` against the
+/// *exact-type* variant of its metaclass definition in `schema` (the
+/// published schema, [`published_schema`]): detailed per-property errors,
+/// at most four per element, stopping after 25 in all. Empty when every
+/// element validates.
+pub fn validate_elements(
+    schema: &serde_json::Value,
+    elements: &[serde_json::Value],
+) -> Vec<String> {
+    let mut validators: std::collections::HashMap<String, jsonschema::Validator> =
+        Default::default();
+    let mut failures = Vec::new();
+    for el in elements {
+        let t = el["@type"].as_str().unwrap_or("").to_string();
+        let validator = validators.entry(t.clone()).or_insert_with(|| {
+            let def = &schema["$defs"][&t];
+            let exact = if def.get("anyOf").is_some() {
+                def["anyOf"][0].clone()
+            } else {
+                def.clone()
+            };
+            let mut mini = exact;
+            mini["$defs"] = schema["$defs"].clone();
+            jsonschema::validator_for(&mini).expect("the published schema compiles")
+        });
+        for err in validator.iter_errors(el).take(4) {
+            failures.push(format!("{t} @ {}: {err}", err.instance_path()));
+        }
+        if failures.len() > 25 {
+            break;
+        }
+    }
+    failures
+}
+
 /// The workspace root (parent of `crates/`).
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -28,6 +70,22 @@ pub fn workspace_root() -> PathBuf {
         .nth(2)
         .expect("crates/sysmlv2-testkit sits two levels below the root")
         .to_path_buf()
+}
+
+/// A pinned normative file under `spec-refs/` (the metamodel XMI and the
+/// JSON schemas: `KerML.xmi`, `SysML.xmi`, `KerML.schema.json`,
+/// `SysML.schema.json`). Their publication terms do not allow reposting
+/// them, so the repository pins their digests and `tools/fetch-spec-refs`
+/// downloads them; panics with that instruction when the file is absent.
+pub fn spec_ref(name: &str) -> PathBuf {
+    let path = workspace_root().join("spec-refs").join(name);
+    assert!(
+        path.is_file(),
+        "{} not found — it is fetched against a pinned digest, not tracked: \
+         run\n  python3 tools/fetch-spec-refs\nor see spec-refs/README.md",
+        path.display()
+    );
+    path
 }
 
 /// `spec-refs/SysML-v2-Release` — the vendored corpus checkout (a git

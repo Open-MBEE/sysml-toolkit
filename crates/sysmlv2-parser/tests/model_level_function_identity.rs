@@ -204,20 +204,26 @@ fn spelling_does_not_designate_user_functions_or_wrong_library_metaclasses() {
 }
 
 #[test]
-fn exponentiation_spellings_resolve_to_the_same_designated_function() {
+fn exponentiation_spellings_are_two_designated_functions() {
+    // `OperatorExpression::instantiatedType()` resolves the operator as
+    // written, and the library declares `'**'` beside `'^'`: each spelling
+    // designates its own function, and each is evaluable.
     for (_, mut r) in models(
-        "package DataFunctions { function '^' { in x; in y; return r; } }",
+        "package DataFunctions { function '^' { in x; in y; return r; } function '**' { in x; in y; return r; } }",
         "feature caret=2^3; feature stars=2**3;",
     ) {
-        let function = r.resolve_qualified("DataFunctions::'^'").unwrap();
-        for name in ["caret", "stars"] {
+        for (name, operator) in [("caret", "^"), ("stars", "**")] {
+            let function = r
+                .resolve_qualified(&format!("DataFunctions::'{operator}'"))
+                .unwrap();
             let expression = value(&mut r, name);
-            assert!(evaluable(&mut r, expression));
+            assert!(evaluable(&mut r, expression), "{name}");
             assert_eq!(
                 r.derived(expression, "instantiatedType"),
                 Derived::Value(DerivedValue::Reference(
                     sysmlv2_parser::json::Reference::Element(function)
-                ))
+                )),
+                "{name}"
             );
         }
     }

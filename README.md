@@ -51,6 +51,7 @@ sysmlv2 query model.sysml 'ownedFeature(Demo::Vehicle)->select { in p; p istype 
 sysmlv2 refactor extract model.sysml Demo::car # usage↔definition refactorings (extract / split / inline)
 sysmlv2 payload after.s2c --delta-from before.s2c -o commit.s2c  # inspect, diff, and apply interchange payloads
 sysmlv2 describe model.sysml Demo::car         # one element: metaclass, owner, typing, position
+sysmlv2 tree model.sysml Demo::car --lib sysml.library/  # the ownership tree: elements, relationships, references
 sysmlv2 viz model.sysml --view mixed --color | java -jar plantuml.jar -tsvg -p > model.svg
 sysmlv2 lsp                            # the language server over stdio
 sysmlv2 parse model.sysml --ast        # debug AST dump
@@ -130,7 +131,7 @@ Alongside the crates:
 | Multi-file models + standard-library resolution | ✅ `model::Model`; 99.92% of corpus references resolve |
 | Normative library element IDs (KerML 9.1) | ✅ verified against published OMG XMI |
 | Textual printer + formatter (`sysmlv2 fmt`) | ✅ idempotency/semantic/note gates over the corpus |
-| `sysmlv2` CLI with example-rich `--help` | ✅ convert / payload / fmt / check / lint / verify / eval / query / describe / members / parse / viz / refactor / lsp |
+| `sysmlv2` CLI with example-rich `--help` | ✅ convert / payload / fmt / check / lint / verify / eval / query / describe / members / tree / parse / viz / refactor / lsp |
 | JSON reader (`lift`) + conversion matrix: text ⇄ compact JSON, full-JSON input normalized | ✅ corpus round-trip gate (`emit∘parse∘print∘lift = id`) |
 | Full JSON form (derived props + implied relationships, `--to full-json`) | ✅ 52,048 corpus elements validate against the published schema |
 | Binary interchange (`--to compact-cbor` / `full-cbor`, `.s2c`) | ✅ deterministic, byte-for-byte reconstructable; elided ids; digest-verified deltas |
@@ -205,6 +206,7 @@ Rust 1.97 or newer is required. Development and CI use the toolchain pinned in `
 
 ```sh
 git submodule update --init --filter=blob:none   # the corpus (sparse checkout is enough; see spec-refs/README.md)
+python3 tools/fetch-spec-refs                     # the OMG metamodel XMI + JSON schemas (pinned, not redistributed)
 cargo test                                    # all suites incl. the 345-file corpus gate
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --example failstats  -- <dir>       # parse-coverage stats for a corpus dir
@@ -224,6 +226,6 @@ Apache License 2.0 — Copyright 2026 Planetary Utilities (see [LICENSE](LICENSE
 
 Third-party material keeps its upstream license and is not covered by the above:
 
-- `spec-refs/` — the vendored grammars (EPL-2.0), the OMG schemas and metamodel XMI (OMG specification terms), and two corpus submodules whose files this repository references by pinned revision rather than copies (EPL-2.0 and MPL-2.0). See [spec-refs/README.md](spec-refs/README.md).
+- `spec-refs/` — the vendored grammars (EPL-2.0), the OMG schemas and metamodel XMI (OMG specification terms; fetched from the OMG by `tools/fetch-spec-refs` against pinned digests, not redistributed), and two corpus submodules whose files this repository references by pinned revision rather than copies (EPL-2.0 and MPL-2.0). See [spec-refs/README.md](spec-refs/README.md).
 - `crates/sysmlv2-parser/tests/fixtures/opensysml/` — external test fixtures under Apache-2.0, with their upstream copyright notice in that directory's [LICENSE](crates/sysmlv2-parser/tests/fixtures/opensysml/LICENSE).
 - The npm package bundles the SysML v2 standard library, which stays under EPL-2.0; the package ships that license as `LICENSE-EPL-2.0` and the upstream copyright notices in `THIRD-PARTY-NOTICES.md`.

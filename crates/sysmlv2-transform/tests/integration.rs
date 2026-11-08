@@ -13,6 +13,7 @@ mod eligibility;
 mod exposure_roundtrip;
 mod extract;
 mod format_transport_adversarial;
+mod full_json_policy;
 mod graph_format;
 mod inherited_lookup_provenance;
 mod inline;

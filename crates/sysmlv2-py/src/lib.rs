@@ -147,6 +147,14 @@ impl Element {
     }
 }
 
+/// Where an ownership tree starts (`Session.tree_json`, `tree_text`):
+/// an element handle, or a qualified name the session resolves.
+#[derive(FromPyObject)]
+enum TreeRoot {
+    Handle(Element),
+    Name(String),
+}
+
 /// A derived-property target outside the model (see `Session.derived`):
 /// an element of an unloaded library or a foreign payload by its
 /// interchange id, or a reference that never resolved by its spelling.
@@ -414,6 +422,41 @@ impl Session {
         Ok(())
     }
 
+    /// The nodes of the ownership tree under `root` (see `tree_json`).
+    fn tree_nodes(
+        &mut self,
+        root: Option<TreeRoot>,
+        depth: Option<usize>,
+        references: bool,
+        implied: bool,
+        ids: bool,
+    ) -> PyResult<Vec<sysmlv2_model::inspect::TreeNode>> {
+        let root = match root {
+            None => None,
+            Some(TreeRoot::Handle(e)) => {
+                self.guard(e.gen)?;
+                Some(e.e)
+            }
+            Some(TreeRoot::Name(name)) => Some(
+                self.inner
+                    .resolved()
+                    .resolve_qualified(&name)
+                    .ok_or_else(|| refused(format!("element not found: {name}")))?,
+            ),
+        };
+        let options = sysmlv2_model::inspect::TreeOptions {
+            depth,
+            references,
+            implied,
+            ids,
+        };
+        Ok(sysmlv2_model::inspect::tree(
+            self.inner.resolved(),
+            root,
+            &options,
+        ))
+    }
+
     /// `v` with its quantities in the module's units (`set_value_units`).
     fn in_value_units(&mut self, v: EvalValue) -> EvalValue {
         match value_units_mode() {
@@ -475,26 +518,66 @@ impl Session {
     }
 }
 
+/// A graph format by its Python name: `"legacy"` (scheme 2, the default)
+/// or `"canonical"` (the opt-in scheme 3 of IDS.md).
+fn parse_graph_format(name: &str) -> PyResult<sysmlv2_transform::GraphFormat> {
+    match name {
+        "legacy" => Ok(sysmlv2_transform::GraphFormat::LegacyV2),
+        "canonical" => Ok(sysmlv2_transform::GraphFormat::CanonicalV3),
+        other => Err(refused(format!(
+            "unknown graph format {other:?}: legacy or canonical"
+        ))),
+    }
+}
+
+fn graph_format_name(format: sysmlv2_transform::GraphFormat) -> &'static str {
+    match format {
+        sysmlv2_transform::GraphFormat::LegacyV2 => "legacy",
+        sysmlv2_transform::GraphFormat::CanonicalV3 => "canonical",
+        _ => "unknown",
+    }
+}
+
 #[pymethods]
 impl Session {
-    /// Open a session over `.sysml` / `.kerml` files.
+    /// Open a session over `.sysml` / `.kerml` files. `graph_format` is
+    /// `"legacy"` (the default) or `"canonical"`: the opt-in contract in
+    /// which a conditional operand is a reference to an owned expression
+    /// and a constructor's arguments belong to its result feature (see
+    /// IDS.md); the session keeps it through `load_library` and edits, and
+    /// a library directory is prepared and cached per format.
     #[staticmethod]
-    fn from_files(paths: Vec<String>) -> PyResult<Session> {
+    #[pyo3(signature = (paths, graph_format = "legacy"))]
+    fn from_files(paths: Vec<String>, graph_format: &str) -> PyResult<Session> {
+        let format = parse_graph_format(graph_format)?;
         let paths: Vec<std::path::PathBuf> =
             paths.into_iter().map(std::path::PathBuf::from).collect();
-        Ok(Session {
-            inner: TSession::open(&paths).map_err(failed)?,
-            gen: 0,
-        })
+        let inner = match format {
+            sysmlv2_transform::GraphFormat::LegacyV2 => TSession::open(&paths),
+            format => TSession::open_with_graph_format(&paths, None, format),
+        }
+        .map_err(failed)?;
+        Ok(Session { inner, gen: 0 })
     }
 
-    /// Open a session over in-memory `(unit name, text)` sources.
+    /// Open a session over in-memory `(unit name, text)` sources;
+    /// `graph_format` as in `from_files`.
     #[staticmethod]
-    fn from_sources(sources: Vec<(String, String)>) -> PyResult<Session> {
-        Ok(Session {
-            inner: TSession::from_sources(sources).map_err(failed)?,
-            gen: 0,
-        })
+    #[pyo3(signature = (sources, graph_format = "legacy"))]
+    fn from_sources(sources: Vec<(String, String)>, graph_format: &str) -> PyResult<Session> {
+        let format = parse_graph_format(graph_format)?;
+        let inner = match format {
+            sysmlv2_transform::GraphFormat::LegacyV2 => TSession::from_sources(sources),
+            format => TSession::from_sources_with_graph_format(sources, None, format),
+        }
+        .map_err(failed)?;
+        Ok(Session { inner, gen: 0 })
+    }
+
+    /// The graph format this session was opened under: `"legacy"` or
+    /// `"canonical"`.
+    fn graph_format(&self) -> &'static str {
+        graph_format_name(self.inner.graph_format())
     }
 
     /// Open a session over an interchange JSON document (compact or full
@@ -908,10 +991,33 @@ impl Session {
     /// serialize as dangling ids also carry their source spelling, so a
     /// partial model survives emit → reload losslessly (the Flexo
     /// change-record path).
-    #[pyo3(signature = (recover_refs = true))]
-    fn to_full_json(&self, recover_refs: bool) -> String {
-        serde_json::to_string_pretty(&self.inner.to_full_json_with(recover_refs))
-            .expect("serializable")
+    ///
+    /// `closures` selects the values of the inheritance-aware properties:
+    /// `"passthrough"` (the default) writes the owned side and `[]` for
+    /// the four closure names whatever `isImpliedIncluded` says;
+    /// `"closure"` writes the specification's values over the written
+    /// heritage, `"closure-implied"` with the implied library heritage too
+    /// (the session's own `closure_policy` is the reads' and does not
+    /// select the export's). The closure levels raise `RefusedError` for
+    /// an element whose inheritance walk exceeds the resolver's depth
+    /// budget.
+    #[pyo3(signature = (recover_refs = true, closures = "passthrough"))]
+    fn to_full_json(&self, recover_refs: bool, closures: &str) -> PyResult<String> {
+        use sysmlv2_model::full::{EmissionPolicy, UnresolvedReferencePolicy};
+        let closures = parse_closure_policy(closures)?;
+        let unresolved = if recover_refs {
+            UnresolvedReferencePolicy::Preserve
+        } else {
+            UnresolvedReferencePolicy::LegacyDanglingId
+        };
+        let value = self
+            .inner
+            .to_full_json_with_policy(EmissionPolicy {
+                unresolved,
+                closures,
+            })
+            .map_err(refused)?;
+        Ok(serde_json::to_string_pretty(&value).expect("serializable"))
     }
 
     /// Checked owned/derived property as JSON, with references encoded by ID.
@@ -930,6 +1036,23 @@ impl Session {
         self.inner
             .to_full_json_strict()
             .map(|v| v.to_string())
+            .map_err(refused)
+    }
+
+    /// `to_full_json_strict` with the refusals beside the rows instead of
+    /// in place of them, as one JSON document `{"elements": [...],
+    /// "issues": [{"elementId", "property", "kind", "reason"}, ...]}`:
+    /// every admitted element's row with the properties the checked reader
+    /// answered, every refused property absent from its row and listed
+    /// once. The rows are schema-invalid wherever a required property is
+    /// missing: a report of what can be certified, not an interchange
+    /// document (`to_full_json` is that). Raises `RefusedError` only for
+    /// what stops the export before the property reads.
+    #[allow(clippy::wrong_self_convention)] // Lazy semantic caches require mutable access.
+    fn to_full_json_checked(&mut self) -> PyResult<String> {
+        self.inner
+            .to_full_json_checked()
+            .map(|export| export.to_json().to_string())
             .map_err(refused)
     }
 
@@ -1154,6 +1277,58 @@ impl Session {
             .with_std_color(std_color)
             .with_link_template(link_template);
         Ok(sysmlv2_viz::plantuml(self.inner.resolved(), root, &opts))
+    }
+
+    /// The ownership tree under `root` as JSON text — the document
+    /// `sysmlv2 tree --format json` writes: a list of nodes
+    /// `{metaclass, name?, qualifiedName?, id?, library?, site?,
+    /// references?, relationships: [{metaclass, id?, implied?,
+    /// references?, children}], truncated?}`. Ownership makes the
+    /// hierarchy — an element lists the relationships it owns, a
+    /// relationship the elements it owns in turn — and every other end
+    /// of a relationship (a typing's `type`, a subclassification's
+    /// `superclassifier`, an import's namespace, an alias's `memberElement`) is
+    /// a reference `{property, target: {metaclass, name?,
+    /// qualifiedName?, library?, outside?, id?, spelling?}}`, never
+    /// expanded, so a library is entered only through a chosen root.
+    /// `root` is an element handle or a qualified name; `None` starts
+    /// at every top-level element. `depth` bounds the ownership levels
+    /// (a node past it is `truncated`); `references=False` keeps the
+    /// ownership alone; `implied=True` adds the implied relationships
+    /// (the library specializations of each kind, the positional
+    /// redefinitions) and the elements they generate; `ids=True`
+    /// carries the interchange ids. Raises `sysmlv2.RefusedError` for a
+    /// name that does not resolve or a stale handle.
+    #[pyo3(signature = (root = None, depth = None, references = true, implied = false, ids = false))]
+    fn tree_json(
+        &mut self,
+        root: Option<TreeRoot>,
+        depth: Option<usize>,
+        references: bool,
+        implied: bool,
+        ids: bool,
+    ) -> PyResult<String> {
+        let nodes = self.tree_nodes(root, depth, references, implied, ids)?;
+        Ok(serde_json::to_string(&nodes).expect("serializable"))
+    }
+
+    /// The ownership tree under `root` as the box-drawing text
+    /// `sysmlv2 tree` prints: the root by its qualified name, each owned
+    /// element by its name, `property → qualified name [Metaclass]
+    /// [library]` per reference, `(unresolved)` on a spelling that did
+    /// not resolve, `(implied)` on an implied relationship and `…` where
+    /// `depth` cut the walk. The arguments are `tree_json`'s.
+    #[pyo3(signature = (root = None, depth = None, references = true, implied = false, ids = false))]
+    fn tree_text(
+        &mut self,
+        root: Option<TreeRoot>,
+        depth: Option<usize>,
+        references: bool,
+        implied: bool,
+        ids: bool,
+    ) -> PyResult<String> {
+        let nodes = self.tree_nodes(root, depth, references, implied, ids)?;
+        Ok(sysmlv2_model::inspect::render(&nodes))
     }
 
     fn __repr__(&self) -> String {

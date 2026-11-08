@@ -770,7 +770,7 @@ $ printf 'part def Vehicle { attribute mass : Real; }\n' | $sysmlv2 convert - --
 ]
 ```
 
-(6 elements for this snippet: namespace, membership, part definition, feature membership, attribute usage, feature typing.)
+(8 elements for this snippet: namespace, membership, part definition, feature membership, attribute usage, feature typing, and the attribute's default multiplicity with its membership — a usage its type features owns the `[1..1]` of SysML 7.6.3 as an unnamed `Multiplicity` member.)
 
 The same source always produces the same JSON — IDs are graph-derived (chained UUIDv5 through ownership and names, `IDS.md`), so conversion is reproducible. On the full vehicle model:
 
@@ -782,12 +782,12 @@ doc = json.load(open('vehicle.json'))
 print(len(doc), 'elements')
 for t, n in collections.Counter(e['@type'] for e in doc).most_common(5):
     print(f'{n:>6}  {t}')"
-6435 elements
+7117 elements
+   860  OwningMembership
    696  FeatureMembership
-   521  OwningMembership
-   496  FeatureValue
-   487  Feature
-   418  ParameterMembership
+   500  FeatureValue
+   489  Feature
+   416  ParameterMembership
 ```
 
 ---
@@ -807,6 +807,18 @@ $ $sysmlv2 convert m.sysml --to compact-json --lib "$lib" | grep -A1 '"type"'
 Library elements participate in resolution but are not serialized — the output stays scoped to your model.
 
 Native directory loading saves a build- and content-identified `.prepared` snapshot and shares a live prepared library across SDK sessions. Warm loads reuse the resolved graph and static facts; source trees reconstruct on demand. Set `SYSMLV2_CACHE_DIR` to choose the cache directory or `SYSMLV2_LIB_CACHE=off` to disable library caching. A fresh process with a populated disk cache is warm; a retained SDK session also avoids disk decoding, and so does a later session in a process whose earlier sessions closed, since the two most recently decoded libraries stay in memory (`SYSMLV2_LIB_RETAIN=off` keeps none). On Windows the cache falls back to `%LOCALAPPDATA%\sysmlv2`, then `%USERPROFILE%\.cache\sysmlv2`, when none of the variables is set. Neither means the operating-system file cache is cold. In-memory/WASM bundles use the separate resolution-only snapshot API.
+
+### `--graph-format` — the canonical graph contract
+
+Every verb that builds a model takes the global `--graph-format legacy|canonical` (before or after the verb; `SYSMLV2_GRAPH_FORMAT` sets the same). `legacy`, the default, is the scheme-2 graph of `IDS.md`; `canonical` is the opt-in scheme 3, in which the second operand of `and`, `or`, `implies` and `??` and both branches of `if` are references to owned expressions, as the KerML grammar builds them, and a constructor's arguments belong to its `out` result feature. The ids of those subtrees differ between the formats, so a document is read back under the format it was written in (compact CBOR carries it in its header; JSON does not, keep the choice beside the file). A library directory is prepared and cached once per format (`stdlib-<key>.v3.prepared` beside the legacy snapshot); `prepare` writes the default format's snapshot and `lsp` serves the default.
+
+```console
+$ printf 'package Cond { class C { feature ready; feature hot; feature ok = ready and not hot; } }\n' > cond.kerml
+$ $sysmlv2 convert cond.kerml --to compact-json | grep -c FeatureReferenceExpression
+2
+$ $sysmlv2 --graph-format canonical convert cond.kerml --to compact-json | grep -c FeatureReferenceExpression
+3
+```
 
 ### Shipping the snapshot — `prepare`
 
@@ -877,6 +889,27 @@ Compare: the compact form carries ~12 properties per element; the full form carr
 
 If a work-in-progress model contains unresolved textual references, full JSON and full CBOR preserve their exact spelling by default using schema-valid `TextualRepresentation` annotations. This behavior does not depend on `--flexo`; Flexo changes only the outer payload envelope.
 
+### `--closures` — the inheritance-aware properties
+
+The default full form is the **passthrough level**: the inheritance-aware properties (`feature`, `featureMembership`, `membership`, `member`, `input`, `output`, `endFeature`, `directedFeature` and every property defined over them) carry the owned side, and the four closure names — `inheritedMembership`, `inheritedFeature`, `importedMembership`, `featuringType` — are written as `[]`. That is a contract of the default, not a gap: the payload stays proportional to the model, and `isImpliedIncluded: true` speaks of the implied relationships (present whenever `--lib` is given), not of these closures. The published schema admits no key that would record the level, so a document cannot say which it was written at; a consumer that needs the specification's values asks for them. `--closures closure` writes the specification's definition over the written inheritance and import closures; `--closures closure-implied` includes the implied library heritage too (every part inherits `Parts::Part`'s members). Neither adds a row or moves an id — the same elements carry more values:
+
+```console
+$ printf 'package Closures { part def Box { attribute a; } part def Big :> Box; }\n' > closures.sysml
+$ $sysmlv2 convert closures.sysml --to full-json --lib "$lib" -o passthrough.json
+$ $sysmlv2 convert closures.sysml --to full-json --lib "$lib" --closures closure -o closure.json
+$ $sysmlv2 convert closures.sysml --to full-json --lib "$lib" --closures closure-implied -o implied.json
+$ python3 -c "
+import json
+for name in ['passthrough', 'closure', 'implied']:
+    big = [e for e in json.load(open(name + '.json')) if e.get('declaredName') == 'Big'][0]
+    print(name, 'inheritedFeature:', len(big['inheritedFeature']), 'feature:', len(big['feature']), 'isImpliedIncluded:', big['isImpliedIncluded'])"
+passthrough inheritedFeature: 0 feature: 0 isImpliedIncluded: True
+closure inheritedFeature: 1 feature: 1 isImpliedIncluded: True
+implied inheritedFeature: 90 feature: 90 isImpliedIncluded: True
+```
+
+The closure levels refuse (exit 1, no output) an element whose inheritance or import walk exceeds the resolver's depth budget rather than writing a cut closure; the default never refuses. `--closures` applies to `--to full-json` and `--to full-cbor`; the corpus measures the closure form at ×1.25 the passthrough payload over the written heritage and ×2.31 with the implied heritage (INTEROP.md). The same choice is `Session::to_full_json_with_policy` in Rust, `to_full_json(closures=…)` in Python and `toFullJson(recoverRefs, closures)` in JavaScript (API.md §6).
+
 ---
 
 ## 7. JSON → text
@@ -920,7 +953,7 @@ Feeding full-form JSON anywhere accepts JSON works — implied relationships are
 
 ```console
 $ $sysmlv2 convert full.json --to compact-json | python3 -c "import json,sys; print(len(json.load(sys.stdin)), 'compact elements')"
-6 compact elements
+8 compact elements
 ```
 
 (The one warning this can print — `cannot name reference target …` — flags an implied-relationship target outside the document; the implied relationship is dropped by normalization anyway.)
@@ -1621,7 +1654,7 @@ $ $sysmlv2 convert v1.sysml --to compact-cbor -o base.s2c
 $ $sysmlv2 convert v2.sysml --to compact-cbor --delta-base base.s2c -o commit.s2c
 $ ls -l base.s2c commit.s2c | awk '{print $5, $9}'
 265 base.s2c
-212 commit.s2c
+272 commit.s2c
 ```
 
 The delta names its base by content digest and refuses a wrong base hard; applying it reproduces the target exactly:
@@ -1649,7 +1682,7 @@ The base may come from any producer or invocation shape. Ids re-derive on every 
 $ $sysmlv2 payload commit.s2c | jq '.delta | {baseDigest, resultDigest}'
 {
   "baseDigest": "76ee91ca-4c74-5e9d-b657-3a761d2af71f",
-  "resultDigest": "aed59321-92b3-545a-ae23-7cb1122a28d5"
+  "resultDigest": "e6c8f20f-d9da-5999-a6fd-76ed8ad22d07"
 }
 $ $sysmlv2 payload base.s2c | jq .stateDigest
 "76ee91ca-4c74-5e9d-b657-3a761d2af71f"
@@ -1772,10 +1805,10 @@ $ export SYSMLV2_AMBIENT=off  # measure the 94-unit official library alone
 $ $sysmlv2 convert --library --lib "$lib" --to compact-json -o stdlib.json
 $ $sysmlv2 convert --library --lib "$lib" --to compact-cbor -o stdlib.s2c
 $ jq length stdlib.json
-91407
+91705
 $ ls -l stdlib.json stdlib.s2c | awk '{print $5, $9}'
-45435243 stdlib.json
-3586034 stdlib.s2c
+45562383 stdlib.json
+3595357 stdlib.s2c
 ```
 
 (The binary form also benefits from implied ownership backpointers — `CBOR.md`, flag 0x20: backpointers that match their derivation from the forward ownership lists never reach the wire, ~10% of this payload.)
@@ -1784,12 +1817,32 @@ The export is deterministic, internally complete (no dangling references; its on
 
 ```console
 $ $sysmlv2 payload stdlib.json | jq .stateDigest
-"940eb782-e7b9-545d-a547-e4355ae1da97"
+"dcdb0112-cd0d-59ac-9d00-53f22057197b"
 $ $sysmlv2 payload stdlib.s2c | jq .stateDigest
-"940eb782-e7b9-545d-a547-e4355ae1da97"
+"dcdb0112-cd0d-59ac-9d00-53f22057197b"
 ```
 
-Named library elements carry ids derived from their qualified names (KerML 9.1 — identical across conforming implementations, stable across releases while the name is stable). Truly unnamed elements keep this toolkit's deterministic path-based ids: the norm's positional ids count an implementation's implied-relationship closure, so no portable spelling exists for them — and most are never the target of a cross-model reference; text reaches the others only by the name their membership implies (a `return : T;` is `result`, a `subject : V;` is `subj`). Unset `SYSMLV2_AMBIENT` after reproducing these official-library-only numbers to restore ambient libraries. Byte counts and digests above use the pinned library. `--library` takes no inputs (the `--lib` directory is the input) and targets `compact-json` and `compact-cbor`.
+Named library elements carry ids derived from their qualified names (KerML 9.1 — identical across conforming implementations, stable across releases while the name is stable). Truly unnamed elements keep this toolkit's deterministic path-based ids: the norm's positional ids count an implementation's implied-relationship closure, so no portable spelling exists for them — and most are never the target of a cross-model reference; text reaches the others only by the name their membership implies (a `return : T;` is `result`, a `subject : V;` is `subj`). `--library` takes no inputs (the `--lib` directory is the input) and targets `compact-json`, `compact-cbor`, `full-json` and `full-cbor`.
+
+The full form of the library is the same elements with their derived properties and the implied relationships the prepared library materialized for them — the library specializations of each kind, the positional redefinitions, the owned results — written under their owners and appended to the array, as a user model's are, `isImpliedIncluded: true`. It is emitted from the resolved library's own rows, never from a lifted payload, so no row is paired or dropped on the way; its only dangling ids are the library's own unresolved spellings, which ride recovery notes as a user model's do (section 6). `--closures` applies (section 6), so `--closures closure` writes each library type's inherited memberships and features:
+
+```console
+$ $sysmlv2 convert --library --lib "$lib" --to full-json -o stdlib-full.json
+$ jq length stdlib-full.json
+171267
+$ jq '[.[] | select(.isImplied == true)] | length' stdlib-full.json
+69558
+$ jq -c '.[] | select(.qualifiedName == "Parts::Part") | {owned: (.ownedFeature | length), inherited: (.inheritedFeature | length)}' stdlib-full.json
+{"owned":8,"inherited":0}
+$ $sysmlv2 convert --library --lib "$lib" --to full-json --closures closure -o stdlib-full-closure.json
+$ jq -c '.[] | select(.qualifiedName == "Parts::Part") | {owned: (.ownedFeature | length), inherited: (.inheritedFeature | length)}' stdlib-full-closure.json
+{"owned":8,"inherited":81}
+$ ls -l stdlib-full.json stdlib-full-closure.json | awk '{print $5, $9}'
+507758455 stdlib-full-closure.json
+391882850 stdlib-full.json
+```
+
+Unset `SYSMLV2_AMBIENT` after reproducing these official-library-only numbers to restore ambient libraries. Byte counts and digests above use the pinned library.
 
 ## 16. Ambient model and library directories
 
@@ -1884,6 +1937,92 @@ mass                         AttributeUsage
 ```
 
 `position` counts owned members only (import memberships are not members of the importing namespace); an unresolved name exits 1 with `error: cannot resolve \`…\``.
+
+### `tree` — the ownership tree
+
+`describe` and `members` answer one element at a time. `tree` prints the resolved model as the abstract syntax holds it: an element with the relationships it owns, each relationship with the elements it owns in turn, and every other end — a typing's type, a specialization's general, an import's namespace, the feature an expression names — as a reference, spelled `property → qualified name [Metaclass]` and never expanded. The walk follows ownership alone, so it cannot cycle. A value expression hangs under its feature value, and the memberships inside it say which features its operands resolved to:
+
+```console
+$ $sysmlv2 -q tree Rover::totalMass
+Rover::totalMass [AttributeUsage]
+└─ FeatureValue
+   └─ (anonymous) [OperatorExpression]
+      ├─ ParameterMembership
+      │  └─ (anonymous) [Feature]
+      │     └─ FeatureValue
+      │        └─ (anonymous) [FeatureChainExpression]
+      │           ├─ ParameterMembership
+      │           │  └─ (anonymous) [Feature]
+      │           │     └─ FeatureValue
+      │           │        └─ (anonymous) [FeatureReferenceExpression]
+      │           │           └─ Membership
+      │           │              └─ memberElement → Rover::base [PartUsage]
+      │           └─ Membership
+      │              └─ memberElement → Chassis::Frame::mass [AttributeUsage]
+      └─ ParameterMembership
+         └─ (anonymous) [Feature]
+            └─ FeatureValue
+               └─ (anonymous) [FeatureReferenceExpression]
+                  └─ Membership
+                     └─ memberElement → Rover::payload [AttributeUsage]
+```
+
+Without a name the tree starts at every top-level element of the model; `--depth N` expands N ownership levels and marks what it left out with `…`:
+
+```console
+$ $sysmlv2 -q tree --depth 1
+Chassis [Package]
+└─ OwningMembership
+   └─ Frame [PartDefinition] …
+Rover [Package]
+├─ NamespaceImport
+│  └─ importedNamespace → Chassis [Package]
+├─ OwningMembership
+│  └─ base [PartUsage] …
+├─ OwningMembership
+│  └─ payload [AttributeUsage] …
+└─ OwningMembership
+   └─ totalMass [AttributeUsage] …
+```
+
+`--implied` adds the relationships the specification implies but the text does not write — the library specializations of each kind, the positional redefinitions — and the elements they generate. A library target is marked `[library]` and stays a reference; to walk a library element, name it as the root (`tree ScalarValues::Real --lib "$lib" --depth 1`):
+
+```console
+$ $sysmlv2 -q tree Rover::base --lib "$lib" --implied
+Rover::base [PartUsage]
+├─ FeatureTyping
+│  └─ type → Chassis::Frame [PartDefinition]
+├─ OwningMembership
+│  └─ (anonymous) [MultiplicityRange]
+│     ├─ OwningMembership
+│     │  └─ (anonymous) [LiteralInteger]
+│     │     └─ Subsetting (implied)
+│     │        └─ subsettedFeature → Performances::literalIntegerEvaluations [Expression] [library]
+│     └─ Subsetting (implied)
+│        └─ subsettedFeature → Base::naturals [Feature] [library]
+└─ Subsetting (implied)
+   └─ subsettedFeature → Parts::parts [PartUsage] [library]
+```
+
+`--ids` carries the interchange ids, `--no-references` keeps the ownership alone, and `--format json` writes the same tree as one document for a program to read: an array of root nodes, each `{metaclass, name, qualifiedName, site, references: [{property, target}], relationships: [{metaclass, implied, references, children: [...]}]}`, with absent and false fields left out; a target outside the model carries `outside` and its id, a reference that did not resolve its `spelling`:
+
+```console
+$ $sysmlv2 -q tree Rover::base --format json | jq '.[0].relationships[0]'
+{
+  "metaclass": "FeatureTyping",
+  "references": [
+    {
+      "property": "type",
+      "target": {
+        "metaclass": "PartDefinition",
+        "name": "Frame",
+        "qualifiedName": "Chassis::Frame"
+      }
+    }
+  ],
+  "children": []
+}
+```
 
 ## 18. `refactor` — extract / split / inline
 

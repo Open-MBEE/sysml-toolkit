@@ -483,15 +483,18 @@ pub fn view_directed(
     } else {
         reach.inherited_members(r, &exposed)
     };
-    // Connector end features and metadata usages drop *before* the
-    // granularity pass — they render through their owners, and an
+    // Connector end features, metadata usages and multiplicities drop
+    // *before* the granularity pass — they render through their owners
+    // (a multiplicity as its owner's row suffix, never as a box), and an
     // exposed connector must not read as a container just because its
-    // own ends were enumerated. Inherited members drop there as well, so
+    // own ends were enumerated, nor a usage because its default
+    // multiplicity member was. Inherited members drop there as well, so
     // a definition the view exposes whole is not taken apart for them.
     let exposed: Vec<ElementRef> = exposed
         .into_iter()
         .filter(|&x| {
             r.element_type(x) != "MetadataUsage"
+                && !matches!(r.element_type(x), "Multiplicity" | "MultiplicityRange")
                 && r.owning_membership_type(x) != Some("EndFeatureMembership")
                 && !(unowned.contains(&x) && inherited.contains(&x))
         })

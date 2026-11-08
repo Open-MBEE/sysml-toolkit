@@ -45,7 +45,23 @@ fn owned_match(
     if public_only {
         values.retain(|m| m.visibility == "public");
     }
-    find(r, values, name, steps, effective)
+    charge(steps, values.len(), effective)?;
+    let mut found: Option<Membership> = None;
+    for value in values {
+        if member_names(r, &value, steps, effective)?
+            .iter()
+            .any(|n| n == name)
+        {
+            if found
+                .as_ref()
+                .is_some_and(|m| m.relationship != value.relationship)
+            {
+                return Err(blocked(effective, value.relationship));
+            }
+            found = Some(value);
+        }
+    }
+    Ok(found)
 }
 /// Whether any source-unit root owns a public Import: only then can a root's
 /// imports bind a global name that another root's owned member also binds,
@@ -363,6 +379,33 @@ mod tests {
             DerivedValue::Reference(Reference::Element(ElementRef(alias)))
         );
     }
+    #[test]
+    fn duplicate_owned_global_names_in_one_unit_are_refused() {
+        for source in [
+            "package R; package R; package Q;",
+            "package R; alias R for R; package Q;",
+        ] {
+            let mut model = Model::new();
+            model.add_source("duplicates.kerml", source);
+            let mut r = ResolvedModel::build(&model);
+            let q = r.resolve_qualified("Q").unwrap();
+            assert!(
+                matches!(
+                    call(&mut r, q, "resolveGlobal", "R"),
+                    Err(OperationError::Incomplete {
+                        blocker: Some(_),
+                        ..
+                    })
+                ),
+                "{source}"
+            );
+            assert_eq!(
+                call(&mut r, q, "resolveGlobal", "Q").unwrap(),
+                member(&mut r, "Q")
+            );
+        }
+    }
+
     const KERNEL: &str = "standard library package Base { classifier Anything; datatype DataValue specializes Anything; feature things : Anything; } standard library package Occurrences { class Occurrence specializes Base::Anything; feature occurrences : Occurrence subsets Base::things; }";
     fn kernel_fixture(source: &str) -> ResolvedModel {
         let mut model = Model::new();

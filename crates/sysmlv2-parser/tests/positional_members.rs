@@ -22,11 +22,13 @@ use sysmlv2_parser::model::Model;
 /// Implied targets only the planner pairs — library features reached
 /// through bases the heritage does not read — measured over the library
 /// and the corpus.
-// 81 accept payloads + 29 accept receivers + 4 connection-usage ends.
+// 81 accept payloads + 14 accept receivers (`via`; a trigger is the
+// payload's value, not a parameter, so it pairs with nothing) + 4
+// connection-usage ends.
 // Binary definition ancestry removes 70 former exceptions: 68 implied
 // targets now agree directly, and two Causation targets now resolve
 // explicitly, making their former implied edges redundant.
-const TOLERATED_LIBRARY_ONLY: usize = 114;
+const TOLERATED_LIBRARY_ONLY: usize = 99;
 // Corrected succession specialization adds these end pairings. Keep them
 // separate so their addition cannot hide a change in the older families.
 const SUCCESSION_LIBRARY_ONLY: usize = 782;

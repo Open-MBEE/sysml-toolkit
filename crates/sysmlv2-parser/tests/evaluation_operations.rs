@@ -1,8 +1,8 @@
 //! The model-level evaluation operations through `invoke_operation` over
 //! the standard library: `evaluate`, `checkCondition`,
 //! `modelLevelEvaluable`, the `instantiatedType` bodies, the multiplicity
-//! bound operations and the metadata feature operations (KerML 8.3.4.1.3,
-//! 8.3.4.8, 8.3.4.13, 8.3.4.14).
+//! bound operations, the metadata feature operations and the metadata
+//! access bodies (KerML 8.3.4.1.3, 8.3.4.8, 8.3.4.13, 8.3.4.14).
 
 #![cfg(feature = "json")]
 
@@ -23,6 +23,9 @@ const NODE_BOUNDS: &str =
 const EVALUATE_FEATURE: &str = "Kernel-Metadata-MetadataFeature-evaluateFeature_Feature";
 const SEMANTIC: &str = "Kernel-Metadata-MetadataFeature-isSemantic_";
 const SYNTACTIC: &str = "Kernel-Metadata-MetadataFeature-isSyntactic_";
+const SYNTAX_ELEMENT: &str = "Kernel-Metadata-MetadataFeature-syntaxElement_";
+const METADATA_EVALUATE: &str = "Kernel-Expressions-MetadataAccessExpression-evaluate_Element";
+const METACLASS_FEATURE: &str = "Kernel-Expressions-MetadataAccessExpression-metaclassFeature_";
 
 fn model() -> ResolvedModel {
     let mut model = Model::new();
@@ -48,8 +51,11 @@ fn model() -> ResolvedModel {
             action def Go { accept at 1.0; fork f; }
             metadata def Tag { attribute level : ScalarValues::Integer = 0; }
             metadata def Marker :> Metaobjects::SemanticMetadata;
-            part tagged : Rover { @Tag { :>> level = 3; } @Marker; @KerML::Package; }
+            part tagged : Rover { @Tag { :>> level = 3; } @Marker; @KerML::Package; @SysML::PartUsage; }
             part plain : Rover { @Tag; }
+            metadata def MyPart :> SysML::PartUsage;
+            part mine : Rover { @MyPart; }
+            attribute probe = tagged.metadata;
         }",
     );
     assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
@@ -324,4 +330,75 @@ fn metadata_features_answer_their_kind_and_their_values() {
         r.invoke_operation(bare, EVALUATE_FEATURE, &argument),
         Err(OperationError::Incomplete { .. })
     ));
+}
+
+/// KerML 8.3.4.8.8: `tagged.metadata` evaluates to the metadata features
+/// the part owns that annotate it, then its metaclass feature, answered
+/// by the reflective metaclass that types it (`SysML::PartUsage`), which
+/// `metaclassFeature` answers alone. KerML 8.3.4.14: the reflective
+/// annotation's syntax element is the part; a `KerML::Package` annotation
+/// on a part represents nothing; a semantic annotation is not syntactic;
+/// a metadata definition specializing a reflective metaclass is syntactic
+/// through it.
+#[test]
+fn metadata_access_evaluates_over_the_reflection_library() {
+    let mut r = model();
+    let probe = value_expression(&mut r, "Eval::probe");
+    let tagged = r.resolve_qualified("Eval::tagged").unwrap();
+    let part_usage = r.resolve_qualified("SysML::PartUsage").unwrap();
+    let tag = metadata(&mut r, "Eval::tagged", "Eval::Tag");
+    let marker = metadata(&mut r, "Eval::tagged", "Eval::Marker");
+    let package = metadata(&mut r, "Eval::tagged", "KerML::Package");
+    let reflective = metadata(&mut r, "Eval::tagged", "SysML::PartUsage");
+    let target = [DerivedValue::Element(tagged)];
+    let result = r
+        .invoke_operation(probe, METADATA_EVALUATE, &target)
+        .unwrap();
+    assert_eq!(result.effective, METADATA_EVALUATE);
+    assert_eq!(
+        result.value,
+        DerivedValue::References(
+            [tag, marker, package, reflective, part_usage]
+                .map(Reference::Element)
+                .to_vec()
+        )
+    );
+    assert_eq!(
+        r.invoke_operation(probe, EVALUATE, &target)
+            .unwrap()
+            .effective,
+        METADATA_EVALUATE
+    );
+    assert_eq!(
+        r.invoke_operation(probe, METACLASS_FEATURE, &[])
+            .unwrap()
+            .value,
+        DerivedValue::Reference(Reference::Element(part_usage))
+    );
+    assert_eq!(
+        r.invoke_operation(reflective, SYNTAX_ELEMENT, &[])
+            .unwrap()
+            .value,
+        DerivedValue::Reference(Reference::Element(tagged))
+    );
+    assert_eq!(
+        r.invoke_operation(package, SYNTAX_ELEMENT, &[])
+            .unwrap()
+            .value,
+        DerivedValue::Null
+    );
+    assert_eq!(
+        r.invoke_operation(tag, SYNTAX_ELEMENT, &[]).unwrap().value,
+        DerivedValue::Null
+    );
+    // A metadata definition of the model that specializes a reflective
+    // metaclass is syntactic through it: its feature represents the part.
+    let mine = r.resolve_qualified("Eval::mine").unwrap();
+    let my_part = metadata(&mut r, "Eval::mine", "Eval::MyPart");
+    assert_eq!(
+        r.invoke_operation(my_part, SYNTAX_ELEMENT, &[])
+            .unwrap()
+            .value,
+        DerivedValue::Reference(Reference::Element(mine))
+    );
 }

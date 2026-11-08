@@ -7,7 +7,7 @@
     "elementId": "8ca0dd78-7c4d-51d9-9772-6207ed2fd292",
     "isAbstract": false,
     "isImpliedIncluded": false,
-    "isSufficient": false,
+    "isSufficient": true,
     "isVariation": false,
     "ownedRelationship": [
       {

@@ -10,10 +10,12 @@ mod api;
 mod batch_reads;
 mod compact_emission;
 mod full_within;
+mod graph_format;
 mod implied_conformance;
 mod prepared_library;
 mod settled;
 mod stack;
+mod tree;
 
 #[test]
 fn every_test_file_is_declared() {

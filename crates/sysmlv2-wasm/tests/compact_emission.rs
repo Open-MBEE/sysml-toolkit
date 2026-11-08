@@ -51,7 +51,7 @@ fn read_everything(session: &mut Session) {
     }
     let _ = session.verify(None);
     let _ = session.lint(None);
-    let _ = session.to_full_json(true);
+    let _ = session.to_full_json(true, None).unwrap();
     let _ = session.to_full_json_strict();
     let _ = session.units();
     let _ = session.unresolved_count();

@@ -91,7 +91,20 @@ fn triggered_accept_payload_name_is_not_a_typing() {
             .into_iter()
             .all(|typing| { typing["typedFeature"]["@id"] != *payload_id })
     );
+    // The trigger is the payload's value, not a parameter of the accept.
+    let trigger = find(&elements, "TriggerInvocationExpression");
     assert_eq!(all(&elements, "TriggerInvocationExpression").len(), 1);
+    let value = by_id(&elements, &trigger["owningRelationship"]);
+    assert_eq!(value["@type"], "FeatureValue");
+    assert_eq!(value["owningRelatedElement"]["@id"], *payload_id);
+    let accept = find(&elements, "AcceptActionUsage");
+    let parameters = accept["ownedRelationship"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|rel| by_id(&elements, rel)["@type"] == "ParameterMembership")
+        .count();
+    assert_eq!(parameters, 1);
 }
 
 #[test]

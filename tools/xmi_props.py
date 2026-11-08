@@ -25,6 +25,25 @@ XMI_TYPE = "{http://www.omg.org/spec/XMI/20161101}type"
 ROOT = Path(__file__).resolve().parent.parent
 SOURCES = [ROOT / "spec-refs" / "KerML.xmi", ROOT / "spec-refs" / "SysML.xmi"]
 OUT = ROOT / "crates" / "sysmlv2-testkit" / "src" / "xmi_props.rs"
+FETCH_HINT = "python3 tools/fetch-spec-refs"
+
+
+def require(path):
+    """`path`, or exit naming the fetch when it is absent.
+
+    The metamodel XMI and the JSON schemas are fetched against pinned
+    digests (tools/fetch-spec-refs.pins), not tracked, because their
+    publication terms do not allow reposting them.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise SystemExit(f"{path.relative_to(ROOT) if path.is_relative_to(ROOT) else path} not found; it is fetched against a pinned digest, not tracked: run `{FETCH_HINT}` (see spec-refs/README.md)")
+    return path
+
+
+def spec_ref(name):
+    """A pinned normative file below spec-refs/ (see `require`)."""
+    return require(ROOT / "spec-refs" / name)
 
 FLAG_DERIVED = 1
 FLAG_DEFAULT = 2
@@ -46,7 +65,7 @@ def load(path, prop_names):
     `redefinedProperty` idrefs/hrefs can be resolved to names later.
     """
     classes = {}
-    root = ET.parse(path).getroot()
+    root = ET.parse(require(path)).getroot()
     for p in root.iter("ownedAttribute"):
         if p.get(XMI_TYPE) == "uml:Property":
             prop_names[p.get(XMI_ID)] = p.get("name")

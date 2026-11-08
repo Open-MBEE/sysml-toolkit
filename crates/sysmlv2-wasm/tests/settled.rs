@@ -29,7 +29,7 @@ fn sources(units: &[(String, String)]) -> String {
 fn answers(session: &mut Session) -> String {
     [
         session.to_compact_json(),
-        session.to_full_json(true),
+        session.to_full_json(true, None).unwrap(),
         session.check(),
         session.warnings(),
         session.units(),

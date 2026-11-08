@@ -237,12 +237,11 @@ fn multiplicities_stop_at_the_nearest_declared_ones() {
         ),
         ("Spec::rover", vec!["Parts::parts[MultiplicityRange]"]),
         ("Spec::Rover", vec![]),
+        // An end feature owns its default multiplicity (SysML 7.6.3), the
+        // nearest declared one; the library ends' ranges lie behind it.
         (
             "Spec::Mount::wheel",
-            vec![
-                "Parts::parts[MultiplicityRange]",
-                "Links::BinaryLink::source[MultiplicityRange]",
-            ],
+            vec!["Spec::Mount::wheel[Multiplicity]"],
         ),
         ("Conj::h", vec!["Base::things[MultiplicityRange]"]),
     ] {

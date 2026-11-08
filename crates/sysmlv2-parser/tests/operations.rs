@@ -127,16 +127,20 @@ fn constant_families_preserve_identity_order_and_empty_results_across_replay_mod
                         .unwrap();
                     assert_eq!(eligible.value, DerivedValue::Bool(true), "{name}");
                     if name == "m" {
-                        assert!(matches!(
-                            r.invoke_operation(
-                                expression,
-                                EVALUATE,
-                                &[DerivedValue::Element(target)]
-                            ),
-                            Err(OperationError::Unsupported {
-                                effective: "Kernel-Expressions-MetadataAccessExpression-evaluate_Element"
-                            })
-                        ));
+                        // The metadata access override has a body; without
+                        // the reflection library its referenced element has
+                        // no reflective metaclass, so it refuses as
+                        // incomplete at that element rather than as
+                        // unsupported.
+                        let refused = r.invoke_operation(
+                            expression,
+                            EVALUATE,
+                            &[DerivedValue::Element(target)],
+                        );
+                        assert!(
+                            matches!(refused, Err(OperationError::Incomplete { .. })),
+                            "{refused:?}"
+                        );
                     } else {
                         let output = r
                             .invoke_operation(

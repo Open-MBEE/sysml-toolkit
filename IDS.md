@@ -8,11 +8,7 @@ Named standard-library elements keep their normative KerML 9.1 name-based UUIDs.
 
 ## Opt-in canonical graphs
 
-Existing constructors retain `GraphFormat::LegacyV2`. Rust clients can choose
-`Model::with_graph_format(GraphFormat::CanonicalV3)` or
-`Session::from_sources_with_graph_format(sources, library, format)` before loading
-sources. Prepared libraries must use the same format; cache entries are separated.
-Sessions retain the choice through edits and library reloads.
+Existing constructors retain `GraphFormat::LegacyV2`. Rust clients can choose `Model::with_graph_format(GraphFormat::CanonicalV3)`, `Session::from_sources_with_graph_format(sources, library, format)` or the path-based `Session::open_with_graph_format(paths, library, format)` before loading sources; `Session::graph_format()` reads the choice back. Prepared libraries must use the same format (a prepared library's plans are made in its own format and extended by the builds on it, in either format); cache entries are separated, and a prepared snapshot decodes under the format it was written in (`Library::prepared_snapshot_with_format`, `prepared_snapshot_in`, `prepared_snapshot_chunks_in`; a mismatch is refused naming both formats). Sessions retain the choice through edits and library reloads. Outside Rust: the CLI's global `--graph-format legacy|canonical` (`SYSMLV2_GRAPH_FORMAT`, an unknown value refused) on every verb that builds a model, the WebAssembly `PreparedLibrary.withGraphFormat(…)`, `PreparedLibrary.fromSnapshotWithGraphFormat(…)`, `Session.fromSourcesWithGraphFormat(…)` and `Session.fromSourcesWithPreparedLibrary` on a library prepared under the format, and Python's `Session.from_files(paths, graph_format="canonical")` and `Session.from_sources(sources, graph_format="canonical")`.
 
 Canonical lowering inserts an authored `FeatureReferenceExpression` and its
 `FeatureMembership` between each lazy operand's `FeatureValue` and expression.
@@ -55,7 +51,7 @@ JSON loaders retain their warning/recovery behavior for foreign graphs; unmatche
 identities can be lost there, so use the format-aware API to preserve canonical
 structure and identities. Format validation is not a general
 lossless-import or whole-model conformance certificate. Ordinary constructors continue to load legacy explicit-ID documents. Changing the default requires a
-separate release migration; the opt-in is currently exposed through the Rust APIs.
+separate release migration (the shipped prepared snapshots regenerated, the persisted ids migrated; the checklist is in `HANDOFF.md`); the opt-in is exposed through the Rust, CLI, WebAssembly and Python surfaces named above.
 
 ## The derivation
 
@@ -110,8 +106,15 @@ The transition from scheme 1 to scheme 2 changed freshly derived ids for affecte
 - **Derivable:** `sysmlv2_model::ids::derive_ids` recomputes every non-root user id from a compact element array + an external-name lookup; the corpus gate (`tests/ids_derive.rs`) holds it equal to the builder's assignment across every golden fixture. This function is the decoder-side twin the CBOR id-elision mode verifies against.
 - **Edit stability:** renaming an element changes its own subtree's ids (its membership included — the membership is named by its member); inserting a member disturbs only *positional* later siblings — named members and their memberships chain past the ordinal entirely, so an insertion-sized edit produces an insertion-sized delta.
 - **Ids are per-emission, not per-lifetime:** the metamodel wants an element's id immutable for the element's lifetime and set by tooling; under a derived scheme the honest reading is that each payload is a fresh emission — identity *across* commits is owned by the delta machinery (`rebase_ids`, portable applies) and, once elements live in a repository, by the service holding them.
+- **Synthesized members come last:** a member the lowering writes on its own (a usage's or an individual definition's default multiplicity, an OwningMembership owning a bound-less `Multiplicity`) is appended after every written relationship and body member of its owner, so it takes the last positional ordinal and moves no written sibling's id; a member written later shifts it, never the reverse.
 - **Not portable across implementations:** positional segments count this implementation's relationship materialization, like the normative positional scheme they replace. Named-chain ids are stable for any producer that agrees on the segment grammar above.
 - **Explicit ids are read back verbatim:** a persisted interchange payload keeps its ids on lift; re-emitting from text derives ids afresh, so external references into stored payloads re-map by qualified name (`Session::id_map_from`).
+
+## Lowering changes that moved ids
+
+The derivation above did not change in these; the authored graph shape under an element did, so the positional segments below it, and every id chained from them, moved. Payloads of the previous shape keep their explicit ids on lift.
+
+- 2026-11-06, accept triggers (#64): the `TriggerInvocationExpression` of `accept x at t` / `after d` / `when c` and its argument moved from a second `ParameterMembership` of the accept (beside the payload parameter) to the payload parameter's `FeatureValue`, and the argument is now wrapped as a parameter `Feature` owning a `FeatureValue`, like every other argument; a `via` parameter after the trigger drops one position in the accept's `ownedRelationship` array, so its membership's and its subtree's positional ids move too. Goldens and the full-form baseline were regenerated with the change (CHANGELOG, Unreleased).
 
 ## Backlog: stable identity across renames
 

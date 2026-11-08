@@ -504,6 +504,7 @@ impl super::Builder {
                 || semantic.contains(&feature)
                 || !b.dynamic_evidence_current(feature)
                 || !b.result_redefinition_evidence_current(feature)
+                || !b.generated_result_certified(feature)
             {
                 return Err(TypeInputIssue::IncompleteProvider);
             }
@@ -632,7 +633,13 @@ impl super::Builder {
                     )
                     .flatten()
                     .ok_or(TypeInputIssue::InvalidRelationship)?;
-                    if !is_a!(b.elements[owner], "Type") {
+                    // A feature a namespace owns (a package-level usage, a
+                    // unit such as `SI::kg`) that a node only names — a
+                    // reference expression's referent — is a feature of no
+                    // node; it keeps its own redefinitions below.
+                    if !is_a!(b.elements[owner], "Type")
+                        && !(is_a!(b.elements[owner], "Namespace") && referenced.contains(&feature))
+                    {
                         return Err(TypeInputIssue::IncompleteProvider);
                     }
                     if membership_evidence::member(b, &raw, owner, membership, steps)
@@ -656,19 +663,38 @@ impl super::Builder {
                 charge(steps, 1)?;
                 feature_owners.insert(feature, owner);
             }
+            let mut external_positional: Option<Vec<usize>> = None;
             if !nodes.contains_key(&owner) && !imported_features.contains(&feature) {
                 // A feature owned elsewhere that a node only names (an
                 // alias, a reference expression's referent) keeps its own
-                // redefinitions; one with a positional role would need its
-                // owner's plan, which this walk does not establish.
-                let positional = referenced.contains(&feature)
-                    && (b.is_parameter(feature)
-                        || b.elements[feature]
-                            .props
-                            .get("isEnd")
-                            .is_some_and(|v| v.as_bool() != Some(false)));
-                if !referenced.contains(&feature) || positional {
+                // redefinitions; one with a positional role (a referenced
+                // parameter or end) takes its positional targets from its
+                // owner's membership certificate, and names them through it.
+                if !referenced.contains(&feature) {
                     return Err(TypeInputIssue::IncompleteProvider);
+                }
+                let positional = b.is_parameter(feature)
+                    || b.elements[feature]
+                        .props
+                        .get("isEnd")
+                        .is_some_and(|v| v.as_bool() != Some(false));
+                if positional {
+                    let sequence = b
+                        .checked_type_memberships_with_relations(owner, steps, relations)
+                        .map_err(|issue| match issue {
+                            TypeInputIssue::WorkLimit => TypeInputIssue::WorkLimit,
+                            _ => TypeInputIssue::IncompleteProvider,
+                        })?;
+                    let targets = sequence
+                        .required_positional
+                        .get(&feature)
+                        .cloned()
+                        .unwrap_or_default();
+                    charge(steps, targets.len())?;
+                    for &target in &targets {
+                        referenced.insert(target);
+                    }
+                    external_positional = Some(targets);
                 }
             }
             if !domains.owner_complete(owner)
@@ -731,6 +757,9 @@ impl super::Builder {
                             .ok_or(TypeInputIssue::IncompleteProvider)?,
                     );
                 }
+            }
+            if let Some(external) = external_positional {
+                targets.extend(external);
             }
             authored.insert(feature, authored_targets);
             charge(steps, targets.len().saturating_mul(2))?;

@@ -15,6 +15,7 @@ pub mod eval;
 pub mod full;
 mod id_graph;
 pub mod ids;
+pub mod inspect;
 pub mod json;
 mod layered;
 pub mod libcache;

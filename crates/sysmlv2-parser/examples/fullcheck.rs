@@ -24,8 +24,10 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn main() {
     let root = Path::new("spec-refs/SysML-v2-Release");
-    let schema: Value =
-        serde_json::from_str(&fs::read_to_string("spec-refs/SysML.schema.json").unwrap()).unwrap();
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(sysmlv2_testkit::spec_ref("SysML.schema.json")).unwrap(),
+    )
+    .unwrap();
     let mut validators: std::collections::HashMap<String, jsonschema::Validator> =
         Default::default();
 

@@ -112,6 +112,20 @@ assert.equal(rows[0]["property:isComposite"], true);
 assert.ok(rows[0].errors["property:nope"], "a failed read is reported, not thrown");
 assert.equal(rows[1], null);
 assert.throws(() => session.rows("[]", JSON.stringify(["nope"])), /unknown row field/);
+// The ownership tree: the model layer's walk as JSON and as text, rooted
+// by a qualified name or an element id, or at every top-level element.
+const tree = JSON.parse(session.tree(JSON.stringify({ root: "Flashlight::flashlight" })));
+assert.equal(tree[0].qualifiedName, "Flashlight::flashlight");
+assert.deepEqual(tree[0].relationships.map(r => [r.metaclass, r.children[0].name]), [["FeatureMembership", "body"]]);
+assert.equal(tree[0].relationships[0].children[0].relationships[0].references[0].target.qualifiedName, "Flashlight::Body");
+const flashlightPart = session.resolve("Flashlight::flashlight");
+const flashlightText = session.treeText(JSON.stringify({ root: "Flashlight::flashlight" }));
+assert.equal(session.treeText(JSON.stringify({ root: { elementId: session.elementId(flashlightPart) } })), flashlightText);
+assert.ok(flashlightText.startsWith("Flashlight::flashlight [PartUsage]\n└─ FeatureMembership\n"), flashlightText);
+assert.ok(session.treeText().startsWith("Flashlight [Package]\n"), "no root: every top-level element");
+assert.equal(JSON.parse(session.tree(JSON.stringify({ depth: 0 })))[0].truncated, true);
+assert.throws(() => session.tree(JSON.stringify({ nope: 1 })), /bad options/);
+assert.throws(() => session.tree(JSON.stringify({ root: "Flashlight::Nope" })), /element not found/);
 const fullGraph = session.toGraph(JSON.stringify({ view: "tree" }));
 const within = JSON.parse(session.toGraph(JSON.stringify({ view: "tree", summary: { open: [], fullWithin: 1000 } })));
 assert.equal(within.full, true);

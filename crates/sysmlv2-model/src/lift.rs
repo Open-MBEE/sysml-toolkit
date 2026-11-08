@@ -1591,6 +1591,44 @@ impl<'a> Lifter<'a> {
         Dialect::Sysml
     }
 
+    /// Whether `el` is a default multiplicity member: an unnamed,
+    /// bound-less `Multiplicity` owning nothing, under an OwningMembership
+    /// of a SysML usage or of an `individual` definition. The shape has no
+    /// text spelling (`multiplicity;` in a SysML body is a reference usage
+    /// of that name), so leaving it out loses nothing the text could keep:
+    /// the lowering writes it again where SysML 7.6.3 selects
+    /// (`Builder::takes_default_multiplicity`), and the pilot
+    /// implementation, which writes it under every usage, redefining and
+    /// subsetting ones included, reads the same `[1..1]` where the toolkit
+    /// reads the usage's heritage.
+    fn is_default_multiplicity(&self, el: El<'a>) -> bool {
+        use crate::metaclass::conforms;
+        if ty(el) != "Multiplicity"
+            || Self::declared_name(el).is_some()
+            || !self.stored_rels(el).is_empty()
+        {
+            return false;
+        }
+        let Some(membership) = el
+            .get("owningRelationship")
+            .and_then(ref_id)
+            .and_then(|id| self.by_id.get(id))
+        else {
+            return false;
+        };
+        if ty(membership) != "OwningMembership" {
+            return false;
+        }
+        let Some(owner) = self.owner_of(el) else {
+            return false;
+        };
+        let owner_ty = ty(owner);
+        if conforms(owner_ty, "Definition") {
+            return bval(owner, "isIndividual");
+        }
+        conforms(owner_ty, "Usage")
+    }
+
     fn owner_of(&self, el: El<'a>) -> Option<El<'a>> {
         let rel_id = el.get("owningRelationship").and_then(ref_id)?;
         let rel = self.by_id.get(rel_id)?;
@@ -1928,8 +1966,25 @@ impl<'a> Lifter<'a> {
         el.get("qualifiedName").is_some()
     }
 
-    /// Owned relationships of `el`, in order, skipping implied ones.
+    /// Owned relationships of `el`, in order, skipping implied ones and
+    /// the membership of a default multiplicity the SysML lowering writes
+    /// again from the text (`is_default_multiplicity`): neither is
+    /// spelled, so neither shapes a member, a connector end or a body.
     fn owned_rels(&self, el: El<'a>) -> Vec<El<'a>> {
+        let mut rels = self.stored_rels(el);
+        if self.dialect == Dialect::Sysml {
+            rels.retain(|rel| {
+                ty(rel) != "OwningMembership"
+                    || !self
+                        .first_related(rel)
+                        .is_some_and(|member| self.is_default_multiplicity(member))
+            });
+        }
+        rels
+    }
+
+    /// Owned relationships of `el`, in order, skipping implied ones.
+    fn stored_rels(&self, el: El<'a>) -> Vec<El<'a>> {
         let rels = match el.get("ownedRelationship") {
             Some(Value::Array(rels)) => rels.as_slice(),
             Some(one @ Value::Object(_)) => std::slice::from_ref(one),
@@ -2988,19 +3043,16 @@ impl<'a> Lifter<'a> {
             id: Self::identification(el),
             specializes,
             is_parallel: bval(el, "isParallel"),
-            // Association-family definitions are sufficient by rule and the
-            // full form materializes that (mirrors the emitter) — `all`
-            // only prints from a compact/textual spelling.
-            is_sufficient: bval(el, "isSufficient")
-                && !(Self::is_full_form(el)
-                    && matches!(
-                        ty(el),
-                        "InterfaceDefinition"
-                            | "ConnectionDefinition"
-                            | "AllocationDefinition"
-                            | "Association"
-                            | "AssociationStructure"
-                    )),
+            // `all` is a KerML spelling: the SysML grammar has none outside
+            // `import all`, so a SysML definition never prints it, whatever
+            // the payload says. `ConnectionDefinition`, `InterfaceDefinition`
+            // and `AllocationDefinition` declare `isSufficient` true by
+            // default and by rule, so a compact payload writes it, or a
+            // graph-normal store elides it, and both read as sufficient; a
+            // `part def` marked sufficient has no spelling either. A KerML
+            // definition prints `all` from the value both interchange forms
+            // carry as written (`assoc all` against `assoc`).
+            is_sufficient: bval(el, "isSufficient") && self.dialect == Dialect::Kerml,
             multiplicity,
             conjugates,
             disjoint_from,
@@ -3177,7 +3229,9 @@ impl<'a> Lifter<'a> {
                 .and_then(|v| v.as_bool())
                 .map(|u| !u)
                 .unwrap_or(false),
-            is_sufficient: bval(el, "isSufficient"),
+            // `all` on a feature is a KerML spelling (`feature all f`,
+            // `connector all …`); a SysML usage never prints it.
+            is_sufficient: bval(el, "isSufficient") && self.dialect == Dialect::Kerml,
             ..Default::default()
         };
         let mut value = None;
@@ -3784,34 +3838,29 @@ impl<'a> Lifter<'a> {
                 is_default: false,
             },
             UsageKind::Accept => {
-                // Payload is a ParameterMembership-owned parameter (legacy
-                // emissions used FeatureMembership → flow_payload);
-                // trigger/via also arrive as params.
+                // The payload is the first ParameterMembership-owned
+                // parameter (legacy emissions used FeatureMembership →
+                // flow_payload) and carries the trigger as its FeatureValue
+                // (pilot TriggerValuePart); `via` is the parameter after it.
+                // A legacy payload lowered the trigger as a
+                // TriggerInvocationExpression that was itself a parameter
+                // member between the two: it still lifts.
                 let mut payload_part = flow_payload;
                 let mut trigger_part = None;
                 let mut via = None;
                 for rel in params {
-                    if let Some(inner) = self.first_related(rel) {
-                        if ty(inner) == "TriggerInvocationExpression" {
-                            let kind = match sval(inner, "kind") {
-                                Some("at") => TriggerKind::At,
-                                Some("after") => TriggerKind::After,
-                                _ => TriggerKind::When,
-                            };
-                            for arel in self.owned_rels(inner) {
-                                if ty(arel) == "ParameterMembership" {
-                                    if let Some(ex) = self.first_related(arel) {
-                                        if let Some(expr) = self.lift_expr(ex) {
-                                            trigger_part = Some(Trigger { kind, expr });
-                                        }
-                                    }
-                                }
-                            }
-                        } else if let Some(expr) = self.param_value(inner) {
-                            via = Some(expr);
-                        } else if payload_part.is_none() {
-                            payload_part = self.lift_payload(inner);
+                    let Some(inner) = self.first_related(rel) else {
+                        continue;
+                    };
+                    if ty(inner) == "TriggerInvocationExpression" {
+                        trigger_part = self.lift_trigger(inner);
+                    } else if payload_part.is_none() {
+                        if let Some(te) = self.payload_trigger(inner) {
+                            trigger_part = self.lift_trigger(te);
                         }
+                        payload_part = self.lift_payload(inner);
+                    } else {
+                        via = self.param_value(inner);
                     }
                 }
                 UsageDetail::Accept {
@@ -3959,6 +4008,34 @@ impl<'a> Lifter<'a> {
             _ if t == "OccurrenceUsage" => UsageDetail::None,
             _ => UsageDetail::None,
         }
+    }
+
+    /// The TriggerInvocationExpression an accept payload holds as its
+    /// value (`accept x at t`), if any.
+    fn payload_trigger(&self, payload_el: El<'a>) -> Option<El<'a>> {
+        self.owned_rels(payload_el)
+            .into_iter()
+            .filter(|rel| ty(rel) == "FeatureValue")
+            .filter_map(|rel| self.first_related(rel))
+            .find(|ex| ty(ex) == "TriggerInvocationExpression")
+    }
+
+    /// An accept trigger from its TriggerInvocationExpression: the kind
+    /// and the argument its first ParameterMembership carries — a
+    /// parameter Feature's value, or (legacy payloads) the bare expression.
+    fn lift_trigger(&mut self, trigger_el: El<'a>) -> Option<Trigger> {
+        let kind = match sval(trigger_el, "kind") {
+            Some("at") => TriggerKind::At,
+            Some("after") => TriggerKind::After,
+            _ => TriggerKind::When,
+        };
+        let argument = self
+            .owned_rels(trigger_el)
+            .into_iter()
+            .filter(|rel| ty(rel) == "ParameterMembership")
+            .find_map(|rel| self.param_expr_el(rel))?;
+        let expr = self.lift_expr(argument)?;
+        Some(Trigger { kind, expr })
     }
 
     /// The expression bound as a parameter's FeatureValue.
@@ -4125,7 +4202,12 @@ impl<'a> Lifter<'a> {
                     }
                 }
                 "FeatureValue" => {
-                    if let Some(ex) = self.first_related(rel) {
+                    // An accept payload's trigger value is lifted by the
+                    // accept (`lift_trigger`), not as a written `= value`.
+                    if let Some(ex) = self
+                        .first_related(rel)
+                        .filter(|ex| ty(ex) != "TriggerInvocationExpression")
+                    {
                         if let Some(expr) = self.lift_expr(ex) {
                             payload.value = Some(Box::new(FeatureValue {
                                 kind: ValueKind::Bound,
@@ -5171,6 +5253,97 @@ mod omitted_dialect_tests {
     }
 
     #[test]
+    fn sufficient_connection_definitions_lift_without_all() {
+        // A connection definition is sufficient by rule; the graph-normal
+        // spelling elides `isSufficient: true` (its default), and a compact
+        // payload may carry it explicitly. Neither prints `all`, which a
+        // SysML definition cannot spell.
+        for sufficient in [None, Some(true)] {
+            let mut mounting = json!(
+                {"@id":"c","@type":"ConnectionDefinition","declaredName":"Mounting",
+                 "owningRelationship":{"@id":"m2"}});
+            if let Some(b) = sufficient {
+                mounting["isSufficient"] = json!(b);
+            }
+            let document = json!([
+                {"@id":"pkg","@type":"Package","declaredName":"P",
+                 "ownedRelationship":[{"@id":"m1"},{"@id":"m2"}]},
+                {"@id":"m1","@type":"OwningMembership",
+                 "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"a"}]},
+                {"@id":"a","@type":"PartDefinition","declaredName":"A",
+                 "owningRelationship":{"@id":"m1"}},
+                {"@id":"m2","@type":"OwningMembership",
+                 "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"c"}]},
+                mounting
+            ]);
+            let lifted = from_compact_json(&document).unwrap();
+            assert!(
+                lifted.errors.is_empty(),
+                "{sufficient:?}: {:?}",
+                lifted.errors
+            );
+            let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+            assert!(
+                text.contains("connection def Mounting"),
+                "{sufficient:?}: {text}"
+            );
+            assert!(!text.contains(" all "), "{sufficient:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn all_prints_in_kerml_only() {
+        // `all` is a KerML spelling. A SysML definition or usage carrying
+        // `isSufficient: true` never prints it, whatever its metaclass (a
+        // `part def` can spell it no more than a `connection def` can); a
+        // KerML classifier or feature prints it from a compact spelling
+        // and stays bare without one.
+        let sysml = json!([
+            {"@id":"pkg","@type":"Package","declaredName":"P",
+             "ownedRelationship":[{"@id":"m1"},{"@id":"m2"}]},
+            {"@id":"m1","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"a"}]},
+            {"@id":"a","@type":"PartDefinition","declaredName":"A","isSufficient":true,
+             "owningRelationship":{"@id":"m1"}},
+            {"@id":"m2","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"u"}]},
+            {"@id":"u","@type":"PartUsage","declaredName":"a","isSufficient":true,
+             "isComposite":true,"owningRelationship":{"@id":"m2"}}
+        ]);
+        let lifted = from_compact_json(&sysml).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        assert_eq!(lifted.unit.dialect, Dialect::Sysml);
+        let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+        assert!(text.contains("part def A;"), "{text}");
+        assert!(text.contains("part a;"), "{text}");
+        assert!(!text.contains(" all "), "{text}");
+
+        let kerml = json!([
+            {"@id":"pkg","@type":"Package","declaredName":"P",
+             "ownedRelationship":[{"@id":"m1"},{"@id":"m2"},{"@id":"m3"}]},
+            {"@id":"m1","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"s"}]},
+            {"@id":"s","@type":"Structure","declaredName":"S","isSufficient":true,
+             "owningRelationship":{"@id":"m1"}},
+            {"@id":"m2","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"t"}]},
+            {"@id":"t","@type":"Structure","declaredName":"T",
+             "owningRelationship":{"@id":"m2"}},
+            {"@id":"m3","@type":"OwningMembership",
+             "owningRelatedElement":{"@id":"pkg"},"ownedRelatedElement":[{"@id":"f"}]},
+            {"@id":"f","@type":"Feature","declaredName":"f","isSufficient":true,
+             "owningRelationship":{"@id":"m3"}}
+        ]);
+        let lifted = from_compact_json(&kerml).unwrap();
+        assert!(lifted.errors.is_empty(), "{:?}", lifted.errors);
+        assert_eq!(lifted.unit.dialect, Dialect::Kerml);
+        let text = sysmlv2_syntax::print::print_source(&lifted.unit);
+        assert!(text.contains("struct all S;"), "{text}");
+        assert!(text.contains("struct T;"), "{text}");
+        assert!(text.contains("feature all f;"), "{text}");
+    }
+
+    #[test]
     fn implied_subtrees_do_not_select_a_dialect_or_become_roots() {
         // Both a root implied marker and a marker below an implied carrier
         // with an absent owner are omitted. Child flags are not required.
@@ -5763,10 +5936,12 @@ mod kerml_only_member_tests {
     }
 
     /// The pilot exporter gives each usage a bound-less `Multiplicity`
-    /// (its default) through an `OwningMembership`; SysML parses the
-    /// anonymous `multiplicity ;` that lifts from it.
+    /// (its default) through an `OwningMembership`; the lift leaves the
+    /// shape out under any SysML usage, a namespace-owned one included
+    /// (SysML has no spelling for it: `multiplicity ;` is a reference
+    /// usage of that name), and an anonymous bounded one still prints.
     #[test]
-    fn an_anonymous_multiplicity_lifts_in_sysml() {
+    fn an_anonymous_default_multiplicity_is_not_spelled_in_sysml() {
         let document = json!([
             {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
             {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
@@ -5780,8 +5955,9 @@ mod kerml_only_member_tests {
         ]);
         let (text, errors) = lift_and_reparse(&document);
         assert!(errors.is_empty(), "{errors:?}");
-        assert!(text.contains("multiplicity"), "{text}");
-        // Written as SysML text, an anonymous bounded one round-trips too.
+        assert!(!text.contains("multiplicity"), "{text}");
+        assert!(text.contains("attribute a;"), "{text}");
+        // Written as SysML text, an anonymous bounded one round-trips.
         let parsed = sysmlv2_syntax::parser::parse_source(
             "package P { attribute a { multiplicity [1..2]; } }",
         );
@@ -5789,6 +5965,74 @@ mod kerml_only_member_tests {
         let (text, errors) = lift_and_reparse(&crate::json::to_compact_json(&parsed.unit));
         assert!(errors.is_empty(), "{errors:?}");
         assert!(text.contains("multiplicity[1..2]"), "{text}");
+    }
+
+    /// The pilot exporter's default under a usage a type features is the
+    /// one the lowering writes again: the lift leaves it out, and the
+    /// re-lowered text owns the default once.
+    #[test]
+    fn a_default_multiplicity_under_a_featured_usage_is_not_spelled() {
+        let document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+             "ownedRelatedElement":[{"@id":"d"}]},
+            {"@id":"d","@type":"PartDefinition","declaredName":"D",
+             "owningRelationship":{"@id":"m"},"ownedRelationship":[{"@id":"fm"}]},
+            {"@id":"fm","@type":"FeatureMembership","owningRelatedElement":{"@id":"d"},
+             "ownedRelatedElement":[{"@id":"a"}]},
+            {"@id":"a","@type":"AttributeUsage","declaredName":"a",
+             "owningRelationship":{"@id":"fm"},"ownedRelationship":[{"@id":"mm"}]},
+            {"@id":"mm","@type":"OwningMembership","owningRelatedElement":{"@id":"a"},
+             "ownedRelatedElement":[{"@id":"x"}]},
+            {"@id":"x","@type":"Multiplicity","owningRelationship":{"@id":"mm"},
+             "ownedRelationship":[],"isUnique":true,"isOrdered":false}
+        ]);
+        let (text, errors) = lift_and_reparse(&document);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!text.contains("multiplicity"), "{text}");
+        assert!(text.contains("attribute a;"), "{text}");
+    }
+
+    /// The pilot writes the default under every usage, a subsetting part
+    /// and a reference usage included, where the lowering writes none:
+    /// the lift leaves the shape out all the same (it has no spelling).
+    #[test]
+    fn a_default_multiplicity_under_any_usage_is_not_spelled() {
+        let document = json!([
+            {"@id":"root","@type":"Namespace","ownedRelationship":[{"@id":"m"}]},
+            {"@id":"m","@type":"OwningMembership","owningRelatedElement":{"@id":"root"},
+             "ownedRelatedElement":[{"@id":"d"}]},
+            {"@id":"d","@type":"PartDefinition","declaredName":"D",
+             "owningRelationship":{"@id":"m"},
+             "ownedRelationship":[{"@id":"fx"},{"@id":"fu"},{"@id":"fr"}]},
+            {"@id":"fx","@type":"FeatureMembership","owningRelatedElement":{"@id":"d"},
+             "ownedRelatedElement":[{"@id":"x"}]},
+            {"@id":"x","@type":"PartUsage","declaredName":"x",
+             "owningRelationship":{"@id":"fx"},"ownedRelationship":[]},
+            {"@id":"fu","@type":"FeatureMembership","owningRelatedElement":{"@id":"d"},
+             "ownedRelatedElement":[{"@id":"u"}]},
+            {"@id":"u","@type":"PartUsage","declaredName":"u",
+             "owningRelationship":{"@id":"fu"},"ownedRelationship":[{"@id":"sub"},{"@id":"mu"}]},
+            {"@id":"sub","@type":"Subsetting","owningRelatedElement":{"@id":"u"},
+             "subsettingFeature":{"@id":"u"},"subsettedFeature":{"@id":"x"}},
+            {"@id":"mu","@type":"OwningMembership","owningRelatedElement":{"@id":"u"},
+             "ownedRelatedElement":[{"@id":"mux"}]},
+            {"@id":"mux","@type":"Multiplicity","owningRelationship":{"@id":"mu"},
+             "ownedRelationship":[],"isUnique":true,"isOrdered":false},
+            {"@id":"fr","@type":"FeatureMembership","owningRelatedElement":{"@id":"d"},
+             "ownedRelatedElement":[{"@id":"r"}]},
+            {"@id":"r","@type":"ReferenceUsage","declaredName":"r",
+             "owningRelationship":{"@id":"fr"},"ownedRelationship":[{"@id":"mr"}]},
+            {"@id":"mr","@type":"OwningMembership","owningRelatedElement":{"@id":"r"},
+             "ownedRelatedElement":[{"@id":"mrx"}]},
+            {"@id":"mrx","@type":"Multiplicity","owningRelationship":{"@id":"mr"},
+             "ownedRelationship":[],"isUnique":true,"isOrdered":false}
+        ]);
+        let (text, errors) = lift_and_reparse(&document);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!text.contains("multiplicity"), "{text}");
+        assert!(text.contains("part u :> "), "{text}");
+        assert!(text.contains("\n    r;"), "{text}");
     }
 
     #[test]

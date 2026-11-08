@@ -20,7 +20,10 @@ fn parity(lib: &[(&str, &str)], users: &[(&str, &str)], snapshot: Option<Vec<u8>
         cold.set_closure_policy(policy).unwrap();
         warm.set_closure_policy(policy).unwrap();
         assert_eq!(cold.to_compact_json(), warm.to_compact_json());
-        assert_eq!(cold.to_full_json(true), warm.to_full_json(true));
+        assert_eq!(
+            cold.to_full_json(true, None).unwrap(),
+            warm.to_full_json(true, None).unwrap()
+        );
         assert_eq!(cold.check(), warm.check());
         assert_eq!(cold.units(), warm.units());
         for kind in ["Feature", "Class", "PartUsage"] {

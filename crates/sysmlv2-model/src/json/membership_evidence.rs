@@ -252,9 +252,6 @@ pub(super) fn parameter_direction<'a>(
             _ => None,
         };
     }
-    if element.ty == "TriggerInvocationExpression" {
-        return Some(None);
-    }
     Some(super::behavior::parameter_direction_default(relation.ty))
 }
 

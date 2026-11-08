@@ -402,6 +402,48 @@ pub(super) fn prepare(
     let raw = StoredStructure::for_query(b, steps).ok_or_else(|| incomplete(steps))?;
     let metadata = b.metadata_association_generation.clone();
     let (bases, target) = canonical_witness(b, steps)?;
+    // Each root's result: the canonical roots' is `Evaluation::result`; an
+    // instantiation expression's callee (its typing or feature-callee
+    // subsetting, a Function or an Expression) has its own effective
+    // result, read off the planner's bases as the positional planner reads
+    // a type's result role (KerML `checkFeatureResultRedefinition`: the
+    // result redefines the result of each direct supertype that is a
+    // Function or Expression). A feature reference's referent stays out:
+    // its result subsets the referent.
+    let mut witnesses: IdMap<usize, usize> = bases.iter().map(|&root| (root, target)).collect();
+    let mut callee_roots = Vec::new();
+    for role in roles {
+        if b.elements[role.anchor].ty == "FeatureReferenceExpression" {
+            continue;
+        }
+        for relation in relationships(b, role.anchor, steps)? {
+            if !is_a!(b.elements[relation], "Specialization") {
+                continue;
+            }
+            match specialization(b, &raw, role.anchor, relation, steps) {
+                Ok(callee)
+                    if !witnesses.contains_key(&callee)
+                        && !callee_roots.contains(&callee)
+                        && (is_a!(b.elements[callee], "Function")
+                            || is_a!(b.elements[callee], "Expression")) =>
+                {
+                    callee_roots.push(callee);
+                }
+                Err(Refusal::WorkLimit) => return Err(Refusal::WorkLimit),
+                _ => {}
+            }
+        }
+    }
+    if !callee_roots.is_empty() {
+        charge(steps, callee_roots.len())?;
+        let (direct_bases, incomplete_bases) = b
+            .positional_direct_bases_with_budget(Some(steps))
+            .ok_or_else(|| incomplete(steps))?;
+        let candidates = b
+            .plan_unique_result_candidates(&direct_bases, &incomplete_bases, &callee_roots, steps)
+            .ok_or_else(|| incomplete(steps))?;
+        witnesses.extend(candidates);
+    }
     let mut ids = IdSet::default();
     for row in rows {
         if raw.element_for_uuid(b, row.id).is_some() || !ids.insert(row.id) {
@@ -421,61 +463,71 @@ pub(super) fn prepare(
         if role.target != role.anchor || !super::local_featuring::valid(b, rows, role) {
             return Err(Refusal::Stale);
         }
-        let mut proven = false;
+        // The results the anchor's direct bases give, in the bases' order,
+        // each once.
+        let mut targets: Vec<usize> = Vec::new();
         for relation in relationships(b, role.anchor, steps)? {
             if !is_a!(b.elements[relation], "Specialization") {
                 continue;
             }
             match specialization(b, &raw, role.anchor, relation, steps) {
-                Ok(target) if bases.contains(&target) => proven = true,
+                Ok(base) => {
+                    if let Some(&result) = witnesses.get(&base) {
+                        if !targets.contains(&result) {
+                            targets.push(result);
+                        }
+                    }
+                }
                 Err(Refusal::WorkLimit) => return Err(Refusal::WorkLimit),
                 _ => {}
             }
         }
-        if !proven {
+        if targets.is_empty() {
             continue;
         }
         if !plan.evidence.sources.insert(role.source) {
             return Err(Refusal::Stale);
         }
         let source = &rows[role.source - b.elements.len()];
-        let target_id = b.elements[target].id;
-        let id = uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            format!("{}/implied/Redefinition/{target_id}", source.id).as_bytes(),
-        );
-        if raw.element_for_uuid(b, id).is_some() || !ids.insert(id) {
-            return Err(Refusal::Collision);
-        }
         charge(steps, source.owned_relationships.len())?;
-        let index = b.elements.len() + rows.len() + plan.rows.len();
         let mut owned = source.owned_relationships.to_vec();
-        owned.push(index);
+        for target in targets {
+            let target_id = b.elements[target].id;
+            let id = uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{}/implied/Redefinition/{target_id}", source.id).as_bytes(),
+            );
+            if raw.element_for_uuid(b, id).is_some() || !ids.insert(id) {
+                return Err(Refusal::Collision);
+            }
+            let index = b.elements.len() + rows.len() + plan.rows.len();
+            owned.push(index);
+            plan.roles.push(role);
+            plan.evidence.relationships.insert(index);
+            plan.edges.push((source.id, target_id));
+            let mut props = crate::properties::Properties::new();
+            props.insert("isImplied", serde_json::json!(true));
+            for (key, id) in [
+                ("owningRelatedElement", source.id),
+                ("redefiningFeature", source.id),
+                ("redefinedFeature", target_id),
+            ] {
+                props.insert(key, serde_json::json!({"@id":id.to_string()}));
+            }
+            plan.rows.push(super::Elem {
+                ty: "Redefinition",
+                meta: crate::metaclass::meta_of("Redefinition"),
+                id,
+                path: String::new(),
+                path_parent: None,
+                props,
+                owned_relationships: Default::default(),
+                children: Default::default(),
+                owning_relationship: None,
+            });
+        }
         plan.replacements
             .push((role.source - b.elements.len(), owned));
-        plan.roles.push(role);
-        plan.evidence.relationships.insert(index);
-        plan.edges.push((source.id, target_id));
-        let mut props = crate::properties::Properties::new();
-        props.insert("isImplied", serde_json::json!(true));
-        for (key, id) in [
-            ("owningRelatedElement", source.id),
-            ("redefiningFeature", source.id),
-            ("redefinedFeature", target_id),
-        ] {
-            props.insert(key, serde_json::json!({"@id":id.to_string()}));
-        }
-        plan.rows.push(super::Elem {
-            ty: "Redefinition",
-            meta: crate::metaclass::meta_of("Redefinition"),
-            id,
-            path: String::new(),
-            path_parent: None,
-            props,
-            owned_relationships: Default::default(),
-            children: Default::default(),
-            owning_relationship: None,
-        });
     }
     let metadata_current = match (&metadata, &b.metadata_association_generation) {
         (None, None) => true,

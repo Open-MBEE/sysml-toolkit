@@ -2,42 +2,81 @@
 //!
 //! Planning runs over the unchanged source graph and shared carrier index.
 //! Publication happens only after all endpoints and generated IDs are admitted.
-//! This implements the result/Subsetting obligation of FeatureReferenceExpression;
-//! It also supplies the owned binary BindingConnector obligation. Required
-//! connector library ancestry/featuring and broader expression rules remain qualified.
+//! This implements the result/Subsetting obligation of FeatureReferenceExpression
+//! with its owned binary BindingConnector obligation, and the result parameter
+//! the grammar gives every operator, invocation and trigger expression (KerML
+//! `EmptyResultMember`): a feature chain expression's result subsets the
+//! chain's target (`checkFeatureChainExpressionResultSpecialization`), the
+//! others' redefine the results of their callee and of `Performances::
+//! Evaluation` through the result-redefinition family. Required connector
+//! library ancestry/featuring and broader expression rules remain qualified.
 use super::{
     Builder, Elem, semantic_ownership::SemanticOwnership, structural_index::StoredStructure,
 };
 use crate::layered::IdSet;
+use crate::metaclass::{conforms, is_a};
 use crate::properties::Properties;
 use serde_json::json;
 use std::collections::HashSet;
 use uuid::Uuid;
+
+/// Whether `ty` is an expression kind whose result parameter the family
+/// generates when the expression owns none: an operator (a chain, index,
+/// select or collect expression among them), invocation or trigger
+/// expression. A constructor's result is authored on the canonical graph
+/// format and stays out on the legacy one; a feature reference's result is
+/// the reference family's.
+pub(super) fn generated_result_kind(ty: &str) -> bool {
+    (conforms(ty, "OperatorExpression") || conforms(ty, "InvocationExpression"))
+        && !conforms(ty, "ConstructorExpression")
+}
 
 fn charge(steps: &mut usize, amount: usize) -> Option<()> {
     *steps = steps.saturating_add(amount);
     (*steps <= crate::eval::MAX_STEPS).then_some(())
 }
 
-/// The only plan admitted by the first result increment. Existing owned results
-/// are left unchanged; absence from this plan is never a completeness claim.
+/// What a generated result is beside its membership and feature.
+pub(super) enum ResultShape {
+    /// A feature reference's: the result subsets the referent and a
+    /// binding connector binds the two.
+    Reference {
+        referent: usize,
+        subsetting_id: Uuid,
+        binding_ids: [Uuid; 8],
+    },
+    /// An operator, invocation or trigger expression's: the membership and
+    /// the feature alone; its redefinitions are the result-redefinition
+    /// family's.
+    Instantiation,
+    /// A feature chain expression's: the result subsets the chain's target.
+    Chain { target: usize, subsetting_id: Uuid },
+}
+
+/// One admitted result. Existing owned results are left unchanged; absence
+/// from this plan is never a completeness claim.
 pub(super) struct OwnedResultPlan {
     expression: usize,
-    referent: usize,
     membership_id: Uuid,
     result_id: Uuid,
-    specialization_id: Uuid,
-    binding_ids: [Uuid; 8],
-    relationship_type: &'static str,
-    source_key: &'static str,
-    target_key: &'static str,
+    shape: ResultShape,
 }
 
 impl OwnedResultPlan {
     pub(super) fn ids(&self) -> impl Iterator<Item = Uuid> + '_ {
-        [self.membership_id, self.result_id, self.specialization_id]
+        let (specialization, bindings): (Option<Uuid>, &[Uuid]) = match &self.shape {
+            ResultShape::Reference {
+                subsetting_id,
+                binding_ids,
+                ..
+            } => (Some(*subsetting_id), binding_ids),
+            ResultShape::Instantiation => (None, &[]),
+            ResultShape::Chain { subsetting_id, .. } => (Some(*subsetting_id), &[]),
+        };
+        [self.membership_id, self.result_id]
             .into_iter()
-            .chain(self.binding_ids)
+            .chain(specialization)
+            .chain(bindings.iter().copied())
     }
 }
 
@@ -46,7 +85,7 @@ impl OwnedResultPlan {
 /// None is an interrupted proof: discard every prepared plan, so budget order
 /// cannot publish a prefix of this family. Some does not certify unsupported
 /// expressions; only each returned plan is a positive admission.
-pub(super) fn plan_reference_results(
+pub(super) fn plan_expression_results(
     b: &mut Builder,
     steps: &mut usize,
 ) -> Option<Vec<OwnedResultPlan>> {
@@ -67,7 +106,72 @@ pub(super) fn plan_reference_results(
     )?;
     let mut assigned_ids = HashSet::new();
     for expression in b.authored_rows() {
-        if b.elements[expression].ty != "FeatureReferenceExpression" {
+        let ty = b.elements[expression].ty;
+        if ty != "FeatureReferenceExpression" {
+            // The instantiation expressions' results: the model's own rows
+            // (the library's expressions keep what they have, as for their
+            // callee typings), where no result is written (a cast's, an
+            // extent's).
+            if expression < b.lib_boundary
+                || !generated_result_kind(ty)
+                || b.elements[expression].owned_relationships.iter().any(|&r| {
+                    b.elements
+                        .get(r)
+                        .is_none_or(|row| is_a!(row, "ReturnParameterMembership"))
+                })
+            {
+                continue;
+            }
+            let expression_id = b.elements[expression].id;
+            let result_id = Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!("{expression_id}/implied/ownedResult").as_bytes(),
+            );
+            let membership_id = Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!("{expression_id}/implied/returnMembership").as_bytes(),
+            );
+            let target = if ty == "FeatureChainExpression" {
+                chain_target(b, &raw, expression, steps)
+            } else {
+                None
+            };
+            if *steps > crate::eval::MAX_STEPS {
+                return None;
+            }
+            let shape = match target {
+                Some(target) => ResultShape::Chain {
+                    target,
+                    subsetting_id: Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!("{result_id}/implied/Subsetting/{}", b.elements[target].id)
+                            .as_bytes(),
+                    ),
+                },
+                None => ResultShape::Instantiation,
+            };
+            let ids: Vec<Uuid> = match &shape {
+                ResultShape::Chain { subsetting_id, .. } => {
+                    vec![membership_id, result_id, *subsetting_id]
+                }
+                _ => vec![membership_id, result_id],
+            };
+            charge(steps, ids.len())?;
+            let unique: HashSet<_> = ids.iter().copied().collect();
+            if unique.len() != ids.len()
+                || ids
+                    .iter()
+                    .any(|id| b.element_index_of_uuid(*id).is_some() || assigned_ids.contains(id))
+            {
+                continue;
+            }
+            assigned_ids.extend(ids);
+            plans.push(OwnedResultPlan {
+                expression,
+                membership_id,
+                result_id,
+                shape,
+            });
             continue;
         }
         let Some(referent) = reference_referent(b, &raw, expression, steps) else {
@@ -153,20 +257,72 @@ pub(super) fn plan_reference_results(
         assigned_ids.extend(ids);
         plans.push(OwnedResultPlan {
             expression,
-            referent,
             membership_id,
             result_id,
-            specialization_id: subsetting_id,
-            binding_ids,
-            relationship_type: "Subsetting",
-            source_key: "subsettingFeature",
-            target_key: "subsettedFeature",
+            shape: ResultShape::Reference {
+                referent,
+                subsetting_id,
+                binding_ids,
+            },
         });
         if *steps > crate::eval::MAX_STEPS {
             return None;
         }
     }
     Some(plans)
+}
+
+/// The feature a chain expression's result subsets: the chain member's
+/// final link — the member of the expression's chain membership (an owned
+/// feature chain, or the referenced feature), through its chainings where
+/// it has any. `None` where the member does not resolve or its chain is
+/// not decided: the result is then generated without a subsetting.
+fn chain_target(
+    b: &mut Builder,
+    raw: &StoredStructure,
+    expression: usize,
+    steps: &mut usize,
+) -> Option<usize> {
+    charge(steps, b.elements[expression].owned_relationships.len())?;
+    let membership = b.elements[expression]
+        .owned_relationships
+        .iter()
+        .copied()
+        .find(|&r| {
+            b.is_authored(r)
+                && is_a!(b.elements[r], "Membership")
+                && !is_a!(b.elements[r], "FeatureMembership")
+        })?;
+    let member = match b.elements[membership].children.first() {
+        Some(&owned) => owned,
+        None => {
+            let id = b.elements[membership]
+                .props
+                .get("memberElement")?
+                .as_reference()?;
+            b.element_index_of_uuid(id)?
+        }
+    };
+    if !is_a!(b.elements[member], "Feature") {
+        return None;
+    }
+    let relationships = b.elements[member].owned_relationships.clone();
+    let chained = relationships.iter().any(|&r| {
+        b.elements
+            .get(r)
+            .is_some_and(|row| is_a!(row, "FeatureChaining"))
+    });
+    if !chained {
+        return Some(member);
+    }
+    super::type_relations::checked_feature_target(
+        b,
+        raw,
+        member,
+        &relationships,
+        b.explicit_len(),
+        steps,
+    )?
 }
 
 fn reference_referent(
@@ -187,8 +343,11 @@ fn reference_referent(
 }
 
 pub(super) struct StagedResult {
-    pub specializations: [(Uuid, Uuid); 3],
-    pub featuring: [super::local_featuring::Role; 3],
+    /// The specialization edges the rows add, `(specific, general)` ids.
+    pub specializations: Vec<(Uuid, Uuid)>,
+    /// The featuring roles the rows take: the result's by its expression
+    /// first, then a binding's ends' by the binding.
+    pub featuring: Vec<super::local_featuring::Role>,
 }
 
 /// Called after generic implied relationships have been registered. Only new
@@ -204,56 +363,50 @@ pub(super) fn stage_owned_result(
     let result = membership + 1;
     let subsetting = membership + 2;
     let source_id = b.elements[plan.expression].id;
-    let target_id = b.elements[plan.referent].id;
+    // The subsetted feature and the subsetting's id, where the shape has one.
+    let subsetted = match &plan.shape {
+        ResultShape::Reference {
+            referent,
+            subsetting_id,
+            ..
+        } => Some((*referent, *subsetting_id)),
+        ResultShape::Chain {
+            target,
+            subsetting_id,
+        } => Some((*target, *subsetting_id)),
+        ResultShape::Instantiation => None,
+    };
     let mut member_props = Properties::new();
     member_props.insert("isImplied", json!(true));
     member_props.insert("owningRelatedElement", json!({"@id":source_id.to_string()}));
     member_props.insert("visibility", json!("public"));
     let mut result_props = Properties::new();
     result_props.insert("direction", json!("out"));
-    let mut subsetting_props = Properties::new();
-    subsetting_props.insert("isImplied", json!(true));
-    subsetting_props.insert(
-        "owningRelatedElement",
-        json!({"@id":plan.result_id.to_string()}),
-    );
-    subsetting_props.insert(plan.source_key, json!({"@id":plan.result_id.to_string()}));
-    subsetting_props.insert(plan.target_key, json!({"@id":target_id.to_string()}));
-    let rows = [
-        Elem {
-            ty: "ReturnParameterMembership",
-            meta: crate::metaclass::meta_of("ReturnParameterMembership"),
-            id: plan.membership_id,
-            path: String::new(),
-            path_parent: None,
-            props: member_props,
-            owned_relationships: Default::default(),
-            children: vec![result].into(),
-            owning_relationship: None,
-        },
-        Elem {
-            ty: "Feature",
-            meta: crate::metaclass::meta_of("Feature"),
-            id: plan.result_id,
-            path: String::new(),
-            path_parent: None,
-            props: result_props,
-            owned_relationships: vec![subsetting].into(),
-            children: Default::default(),
-            owning_relationship: Some(membership),
-        },
-        Elem {
-            ty: plan.relationship_type,
-            meta: crate::metaclass::meta_of(plan.relationship_type),
-            id: plan.specialization_id,
-            path: String::new(),
-            path_parent: None,
-            props: subsetting_props,
-            owned_relationships: Default::default(),
-            children: Default::default(),
-            owning_relationship: None,
-        },
-    ];
+    output.push(Elem {
+        ty: "ReturnParameterMembership",
+        meta: crate::metaclass::meta_of("ReturnParameterMembership"),
+        id: plan.membership_id,
+        path: String::new(),
+        path_parent: None,
+        props: member_props,
+        owned_relationships: Default::default(),
+        children: vec![result].into(),
+        owning_relationship: None,
+    });
+    output.push(Elem {
+        ty: "Feature",
+        meta: crate::metaclass::meta_of("Feature"),
+        id: plan.result_id,
+        path: String::new(),
+        path_parent: None,
+        props: result_props,
+        owned_relationships: subsetted
+            .map(|_| vec![subsetting])
+            .unwrap_or_default()
+            .into(),
+        children: Default::default(),
+        owning_relationship: Some(membership),
+    });
     // The plan and sequential materializer establish these invariants before
     // publication. No user payload can invoke an arbitrary owner override.
     ownership
@@ -262,47 +415,80 @@ pub(super) fn stage_owned_result(
     ownership
         .register(result, None, plan.expression, false)
         .expect("ordered result feature");
-    ownership
-        .register(subsetting, Some(result), plan.expression, false)
-        .expect("ordered result specialization");
-    output.extend(rows);
+    let mut specializations = Vec::new();
+    let mut featuring = vec![super::local_featuring::Role {
+        source: result,
+        target: plan.expression,
+        anchor: plan.expression,
+    }];
+    let mut next = start + 2;
+    if let Some((target, subsetting_id)) = subsetted {
+        let target_id = b.elements[target].id;
+        let mut subsetting_props = Properties::new();
+        subsetting_props.insert("isImplied", json!(true));
+        subsetting_props.insert(
+            "owningRelatedElement",
+            json!({"@id":plan.result_id.to_string()}),
+        );
+        subsetting_props.insert(
+            "subsettingFeature",
+            json!({"@id":plan.result_id.to_string()}),
+        );
+        subsetting_props.insert("subsettedFeature", json!({"@id":target_id.to_string()}));
+        output.push(Elem {
+            ty: "Subsetting",
+            meta: crate::metaclass::meta_of("Subsetting"),
+            id: subsetting_id,
+            path: String::new(),
+            path_parent: None,
+            props: subsetting_props,
+            owned_relationships: Default::default(),
+            children: Default::default(),
+            owning_relationship: None,
+        });
+        ownership
+            .register(subsetting, Some(result), plan.expression, false)
+            .expect("ordered result specialization");
+        specializations.push((plan.result_id, target_id));
+        next = start + 3;
+    }
     ownership
         .record_result(plan.expression, membership, result)
         .expect("unique admitted result projection");
-    let (binding, first, second) = stage_binding(
-        b,
-        ownership,
-        plan.expression,
-        plan.expression,
-        plan.referent,
-        plan.result_id,
-        &plan.binding_ids,
-        start + 3,
-        output,
-    );
+    if let ResultShape::Reference {
+        referent,
+        binding_ids,
+        ..
+    } = &plan.shape
+    {
+        let target_id = b.elements[*referent].id;
+        let (binding, first, second) = stage_binding(
+            b,
+            ownership,
+            plan.expression,
+            plan.expression,
+            *referent,
+            plan.result_id,
+            binding_ids,
+            next,
+            output,
+        );
+        specializations.push((binding_ids[3], target_id));
+        specializations.push((binding_ids[6], plan.result_id));
+        featuring.push(super::local_featuring::Role {
+            source: first,
+            target: binding,
+            anchor: plan.expression,
+        });
+        featuring.push(super::local_featuring::Role {
+            source: second,
+            target: binding,
+            anchor: plan.expression,
+        });
+    }
     StagedResult {
-        specializations: [
-            (plan.result_id, target_id),
-            (plan.binding_ids[3], target_id),
-            (plan.binding_ids[6], plan.result_id),
-        ],
-        featuring: [
-            super::local_featuring::Role {
-                source: result,
-                target: plan.expression,
-                anchor: plan.expression,
-            },
-            super::local_featuring::Role {
-                source: first,
-                target: binding,
-                anchor: plan.expression,
-            },
-            super::local_featuring::Role {
-                source: second,
-                target: binding,
-                anchor: plan.expression,
-            },
-        ],
+        specializations,
+        featuring,
     }
 }
 
@@ -685,7 +871,7 @@ mod tests {
         assert_eq!(r.b.elements[membership].ty, "Membership");
         for bad_kind in ["OwningMembership", "FeatureMembership"] {
             r.b.elements[membership].set_ty(bad_kind);
-            let plans = plan_reference_results(&mut r.b, &mut 0).unwrap();
+            let plans = plan_expression_results(&mut r.b, &mut 0).unwrap();
             assert!(!plans.iter().any(|p| p.expression == expression));
         }
     }
@@ -695,13 +881,13 @@ mod tests {
         let (r, _) = model();
         let mut measured = r.b.clone();
         let mut used = 0;
-        let plans = plan_reference_results(&mut measured, &mut used).unwrap();
+        let plans = plan_expression_results(&mut measured, &mut used).unwrap();
         assert_eq!(plans.len(), 2);
         assert!(used > 1 && used < crate::eval::MAX_STEPS);
         let mut limited = r.b.clone();
         let count = limited.elements.len();
         let mut steps = crate::eval::MAX_STEPS - used + 1;
-        assert!(plan_reference_results(&mut limited, &mut steps).is_none());
+        assert!(plan_expression_results(&mut limited, &mut steps).is_none());
         assert!(steps > crate::eval::MAX_STEPS);
         assert_eq!(
             limited.elements.len(),

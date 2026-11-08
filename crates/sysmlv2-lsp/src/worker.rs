@@ -521,9 +521,156 @@ pub(crate) fn uri_for_path(path: &std::path::Path) -> String {
 /// the name percent-encoded as a uri path. A host serves the unit's
 /// text as a read-only document under it. Navigation answers that land
 /// in a library unit carry it, and so does the session binding's
-/// find-usages, so both name the same unit the same way.
+/// find-usages, so both name the same unit the same way. A host that
+/// serves the library's units as files of a directory instead names
+/// them under it ([`library_uri_under`]).
 pub fn library_uri(unit_name: &str) -> String {
-    format!("sysmlv2-lib:/{}", encode_uri_path(unit_name))
+    library_uri_under(None, unit_name)
+}
+
+/// [`library_uri`] under a host's library directory: the unit is the
+/// file at `<root><unit name>`, the name percent-encoded as a path, its
+/// first directory renamed where the host shows it under another name
+/// (see [`LibraryRoot`]). Without a root, the `sysmlv2-lib:` scheme.
+pub fn library_uri_under(root: Option<&LibraryRoot>, unit_name: &str) -> String {
+    match root {
+        Some(root) => root.uri_of(unit_name),
+        None => format!("sysmlv2-lib:/{}", encode_uri_path(unit_name)),
+    }
+}
+
+/// The library unit a uri names — the file under a host's library
+/// directory (see [`LibraryRoot::unit_named`]), or `sysmlv2-lib:/<name>`
+/// — its name as the library spells it, percent-escapes resolved.
+/// `None` for any other uri. Compared decoded: a client and the server
+/// need not agree on which characters of a name they escape.
+pub fn library_unit_name(root: Option<&LibraryRoot>, uri: &str) -> Option<String> {
+    root.and_then(|root| root.unit_named(uri)).or_else(|| {
+        let decoded = decode(uri)?;
+        let name = decoded.strip_prefix("sysmlv2-lib:/")?;
+        (!name.is_empty()).then(|| name.to_string())
+    })
+}
+
+/// The directory a host serves the library's units under, as the server
+/// keeps it: the uri the host gave, ending in exactly one `/`, so a
+/// unit's uri is the root followed by its name — and the bundle
+/// directories the host shows under another name, so a unit under one of
+/// them is named under the host's name for it and a document under the
+/// host's name is read as the bundle's unit. The host's `libraryRoot`
+/// and `libraryDirs` initialization options, decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryRoot {
+    uri: String,
+    /// `(the bundle's directory, the host's directory)`, for the first
+    /// directory of a unit's name. A host's name must not be another
+    /// bundle directory's: a document under it would read as the renamed
+    /// directory's unit.
+    dirs: Vec<(String, String)>,
+}
+
+impl LibraryRoot {
+    /// A root under `uri`, no directory renamed. `None` for a value that
+    /// is no uri — nothing could be served under it.
+    pub fn new(uri: &str) -> Option<LibraryRoot> {
+        let trimmed = uri.trim_end_matches('/');
+        if trimmed.is_empty() || lsp_types::Uri::from_str(trimmed).is_err() {
+            return None;
+        }
+        Some(LibraryRoot {
+            uri: format!("{trimmed}/"),
+            dirs: Vec::new(),
+        })
+    }
+
+    /// The root with `dirs`, `(bundle directory, host directory)` each,
+    /// renaming the first directory of a unit's name both ways. `None`
+    /// when a name is empty or carries a `/` — a directory is one path
+    /// segment. Duplicate names and a host name that hides another bundle
+    /// directory are refused too, so the mapping can be inverted.
+    pub fn with_dirs(mut self, dirs: impl IntoIterator<Item = (String, String)>) -> Option<Self> {
+        self.dirs = dirs.into_iter().collect();
+        let mut bundles = std::collections::HashSet::new();
+        let mut hosts = std::collections::HashSet::new();
+        for (bundle, host) in &self.dirs {
+            if [bundle, host]
+                .iter()
+                .any(|d| d.is_empty() || d.contains('/') || matches!(d.as_str(), "." | ".."))
+                || !bundles.insert(bundle.as_str())
+                || !hosts.insert(host.as_str())
+            {
+                return None;
+            }
+        }
+        // A renamed directory must not hide another bundle directory.
+        if self
+            .dirs
+            .iter()
+            .any(|(bundle, host)| bundle != host && bundles.contains(host.as_str()))
+        {
+            return None;
+        }
+        Some(self)
+    }
+
+    /// The directory's uri, ending in `/`.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// The uri of the library unit `name`: `<root><name>`, the name
+    /// percent-encoded as a path, its first directory renamed to the
+    /// host's where the host renames it.
+    pub fn uri_of(&self, name: &str) -> String {
+        let shown = rename_directory(
+            name,
+            self.dirs.iter().map(|(b, h)| (b.as_str(), h.as_str())),
+        );
+        format!("{}{}", self.uri, encode_uri_path(&shown))
+    }
+
+    /// The library unit `uri` names, when it lies under the root: the
+    /// path below it, percent-escapes resolved, its first directory
+    /// renamed back to the bundle's where the host renames it. `None`
+    /// for a uri elsewhere, for the directory itself, and under the
+    /// bundle's own name of a directory the host shows under another —
+    /// the host has no file there. Compared decoded: a client and the
+    /// server need not agree on which characters of a name they escape.
+    pub fn unit_named(&self, uri: &str) -> Option<String> {
+        let decoded = decode(uri)?;
+        let root = decode(&self.uri)?;
+        let shown = decoded.strip_prefix(root.as_str())?;
+        if shown.is_empty() {
+            return None;
+        }
+        let dir = shown.split_once('/').map(|(dir, _)| dir);
+        if self
+            .dirs
+            .iter()
+            .any(|(bundle, host)| Some(bundle.as_str()) == dir && host != bundle)
+        {
+            return None;
+        }
+        Some(rename_directory(
+            shown,
+            self.dirs.iter().map(|(b, h)| (h.as_str(), b.as_str())),
+        ))
+    }
+}
+
+/// `path` with its first directory renamed through `from_to`, where it
+/// has an entry; a path without a directory stays.
+fn rename_directory<'a>(
+    path: &str,
+    mut from_to: impl Iterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let Some((dir, rest)) = path.split_once('/') else {
+        return path.to_string();
+    };
+    match from_to.find(|(from, _)| *from == dir) {
+        Some((_, to)) => format!("{to}/{rest}"),
+        None => path.to_string(),
+    }
 }
 
 /// Percent-encode a uri path. Everything RFC 3986 allows in a path
@@ -950,5 +1097,137 @@ mod tests {
         );
         overlay_source(&mut sources, "file:///w/c.sysml", "package C;");
         assert_eq!(sources.len(), 3, "a unit the walk did not find is added");
+    }
+
+    /// A library unit is named under the host's library directory when
+    /// one is given and under the `sysmlv2-lib:` scheme otherwise, and
+    /// either uri names the unit back — however the client escaped it.
+    /// A root is kept with one trailing separator; a value that is no
+    /// uri is refused.
+    #[test]
+    fn library_units_are_named_under_the_root_and_named_back() {
+        let name = "Mini Lib/MiniLib.sysml";
+        assert_eq!(library_uri(name), "sysmlv2-lib:/Mini%20Lib/MiniLib.sysml");
+        assert_eq!(
+            LibraryRoot::new("file:///w/.libs").map(|r| r.uri().to_string()),
+            Some("file:///w/.libs/".to_string())
+        );
+        assert_eq!(
+            LibraryRoot::new("file:///w/.libs//").map(|r| r.uri().to_string()),
+            Some("file:///w/.libs/".to_string())
+        );
+        assert_eq!(LibraryRoot::new(""), None);
+        assert_eq!(LibraryRoot::new("not a uri"), None);
+        let root = LibraryRoot::new("file:///w/.libs").unwrap();
+        let uri = library_uri_under(Some(&root), name);
+        assert_eq!(uri, "file:///w/.libs/Mini%20Lib/MiniLib.sysml");
+        assert_eq!(library_unit_name(Some(&root), &uri).as_deref(), Some(name));
+        // The client's own escaping, and a root given escaped.
+        assert_eq!(
+            library_unit_name(Some(&root), "file:///w/.libs/Mini%20Lib/Mini%4Cib.sysml").as_deref(),
+            Some(name)
+        );
+        let escaped = LibraryRoot::new("file:///w/%2Elibs/").unwrap();
+        assert_eq!(
+            library_unit_name(Some(&escaped), &uri).as_deref(),
+            Some(name)
+        );
+        // The scheme still names the unit beside a root; other uris and
+        // the directory itself name none.
+        assert_eq!(
+            library_unit_name(Some(&root), &library_uri(name)).as_deref(),
+            Some(name)
+        );
+        assert_eq!(
+            library_unit_name(None, &library_uri(name)).as_deref(),
+            Some(name)
+        );
+        assert_eq!(library_unit_name(None, &uri), None);
+        assert_eq!(library_unit_name(Some(&root), "file:///w/m.sysml"), None);
+        assert_eq!(library_unit_name(Some(&root), "file:///w/.libs/"), None);
+        assert_eq!(
+            library_unit_name(Some(&root), "file:///w/.libsx/a.sysml"),
+            None
+        );
+    }
+
+    #[test]
+    fn ambiguous_library_directory_mappings_are_refused() {
+        for dirs in [
+            vec![("A", "B"), ("B", "C")],
+            vec![("A", "X"), ("B", "X")],
+            vec![("A", "X"), ("A", "Y")],
+            vec![("A", "..")],
+        ] {
+            assert!(
+                LibraryRoot::new("file:///w/libs")
+                    .unwrap()
+                    .with_dirs(dirs.into_iter().map(|(a, b)| (a.into(), b.into())))
+                    .is_none()
+            );
+        }
+        let root = LibraryRoot::new("file:///w/libs")
+            .unwrap()
+            .with_dirs([("A".into(), "X".into()), ("B".into(), "B".into())])
+            .unwrap();
+        for unit in ["A/Test.sysml", "B/Test.sysml", "C/Test.sysml"] {
+            assert_eq!(root.unit_named(&root.uri_of(unit)).as_deref(), Some(unit));
+        }
+    }
+
+    /// A bundle directory the host shows under another name: a unit under
+    /// it is named under the host's name, a document under the host's
+    /// name reads as the bundle's unit, and other directories and a unit
+    /// without a directory keep their names. A directory name that is
+    /// empty or spans segments is refused.
+    #[test]
+    fn a_renamed_directory_is_named_both_ways() {
+        let root = LibraryRoot::new("file:///w/.libs")
+            .unwrap()
+            .with_dirs([("local".to_string(), "Own Libraries".to_string())])
+            .unwrap();
+        assert_eq!(
+            library_uri_under(Some(&root), "local/Meta.sysml"),
+            "file:///w/.libs/Own%20Libraries/Meta.sysml"
+        );
+        assert_eq!(
+            library_unit_name(Some(&root), "file:///w/.libs/Own%20Libraries/Meta.sysml").as_deref(),
+            Some("local/Meta.sysml")
+        );
+        assert_eq!(
+            library_uri_under(Some(&root), "Mini Lib/MiniLib.sysml"),
+            "file:///w/.libs/Mini%20Lib/MiniLib.sysml"
+        );
+        assert_eq!(
+            library_unit_name(Some(&root), "file:///w/.libs/Mini%20Lib/MiniLib.sysml").as_deref(),
+            Some("Mini Lib/MiniLib.sysml")
+        );
+        assert_eq!(
+            library_uri_under(Some(&root), "Top.sysml"),
+            "file:///w/.libs/Top.sysml"
+        );
+        // The bundle's own name of a renamed directory has no file there.
+        assert_eq!(
+            library_unit_name(Some(&root), "file:///w/.libs/local/Meta.sysml"),
+            None
+        );
+        // Only the first directory is renamed, and only whole.
+        assert_eq!(
+            library_uri_under(Some(&root), "Mini Lib/local/X.sysml"),
+            "file:///w/.libs/Mini%20Lib/local/X.sysml"
+        );
+        assert_eq!(
+            library_uri_under(Some(&root), "localized/X.sysml"),
+            "file:///w/.libs/localized/X.sysml"
+        );
+        let refused = |dirs: [(&str, &str); 1]| {
+            LibraryRoot::new("file:///w/.libs")
+                .unwrap()
+                .with_dirs(dirs.map(|(b, h)| (b.to_string(), h.to_string())))
+        };
+        assert_eq!(refused([("", "x")]), None);
+        assert_eq!(refused([("a", "")]), None);
+        assert_eq!(refused([("a/b", "x")]), None);
+        assert_eq!(refused([("a", "x/y")]), None);
     }
 }

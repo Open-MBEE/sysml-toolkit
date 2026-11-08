@@ -237,7 +237,13 @@ pub(super) fn validate(r: &mut ResolvedModel, model: &Model) -> Vec<(usize, Diag
             if tt < r.b.lib_boundary {
                 continue; // may conform via implied bases
             }
-            if own_types.iter().any(|&ot| r.b.conforms_upward(ot, tt)) {
+            // The walk follows a semantic metadata annotation's base as
+            // well as the written edges (KerML 9.2): a definition tagged
+            // `#systemContext` conforms to the base's type.
+            if own_types
+                .iter()
+                .any(|&ot| r.b.conforms_upward_semantic(ot, tt))
+            {
                 continue;
             }
             out.push((

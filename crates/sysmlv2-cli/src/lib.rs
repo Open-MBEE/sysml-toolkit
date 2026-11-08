@@ -16,8 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use sysmlv2_parser::Diagnostic;
 use sysmlv2_parser::ast::Dialect;
-use sysmlv2_parser::full::{model_to_full_json_with, to_full_json_with};
-use sysmlv2_parser::json::{library_name_map, model_to_compact_json_with_units, to_compact_json};
+use sysmlv2_parser::full::{EmissionPolicy, UnresolvedReferencePolicy};
+use sysmlv2_parser::json::{
+    ClosurePolicy, library_name_map, model_to_compact_json_with_units, to_compact_json,
+};
 use sysmlv2_parser::lift::from_compact_json_with_names;
 use sysmlv2_parser::model::Model;
 use sysmlv2_parser::parser::{Parse, parse_kerml_source, parse_source};
@@ -70,12 +72,10 @@ fn session_library(path: &Path) -> std::io::Result<sysmlv2_transform::Library> {
     if !bundle::is_bundle(path) {
         return Ok(sysmlv2_transform::Library::dir(path));
     }
-    Ok(
-        match load_bundle(path, sysmlv2_parser::model::GraphFormat::default())? {
-            bundle::Bundle::Prepared(library) => sysmlv2_transform::Library::Prepared(library),
-            bundle::Bundle::Sources(units) => sysmlv2_transform::Library::sources(units),
-        },
-    )
+    Ok(match load_bundle(path, graph_format())? {
+        bundle::Bundle::Prepared(library) => sysmlv2_transform::Library::Prepared(library),
+        bundle::Bundle::Sources(units) => sysmlv2_transform::Library::sources(units),
+    })
 }
 
 /// Say what a library load could not do with its cache. One cache
@@ -277,6 +277,110 @@ struct Cli {
     /// with nothing [env: SYSMLV2_UNIT_SPELLINGS=off]
     #[arg(long = "no-unit-spellings", global = true)]
     no_unit_spellings: bool,
+    /// The graph format the model is lowered and emitted under: legacy
+    /// (the default, scheme 2) or canonical (the opt-in scheme 3, in
+    /// which a conditional operand is a reference to an owned expression
+    /// and a constructor's arguments belong to its result feature; see
+    /// IDS.md). A library directory is prepared and cached per format;
+    /// `lsp` and `prepare` take the default and say so
+    #[arg(
+        long = "graph-format",
+        global = true,
+        value_name = "FORMAT",
+        env = "SYSMLV2_GRAPH_FORMAT"
+    )]
+    graph_format: Option<GraphFormatArg>,
+}
+
+/// `--graph-format`: which lowering and identity contract a verb builds
+/// its model under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum GraphFormatArg {
+    Legacy,
+    Canonical,
+}
+
+impl From<GraphFormatArg> for sysmlv2_parser::model::GraphFormat {
+    fn from(format: GraphFormatArg) -> Self {
+        match format {
+            GraphFormatArg::Legacy => Self::LegacyV2,
+            GraphFormatArg::Canonical => Self::CanonicalV3,
+        }
+    }
+}
+
+thread_local! {
+    /// The `--graph-format` of the command running on this thread, set by
+    /// [`with_graph_format`] around its dispatch only; anything else
+    /// (library callers of the `run_*` functions) builds the default.
+    static GRAPH_FORMAT: std::cell::Cell<sysmlv2_parser::model::GraphFormat> =
+        const { std::cell::Cell::new(sysmlv2_parser::model::GraphFormat::LegacyV2) };
+}
+
+/// The graph format the verb on this thread builds under.
+fn graph_format() -> sysmlv2_parser::model::GraphFormat {
+    GRAPH_FORMAT.with(std::cell::Cell::get)
+}
+
+/// Run `body` with `format` as this thread's graph format, restoring the
+/// previous one after.
+fn with_graph_format<T>(format: sysmlv2_parser::model::GraphFormat, body: impl FnOnce() -> T) -> T {
+    let previous = GRAPH_FORMAT.with(|slot| slot.replace(format));
+    let out = body();
+    GRAPH_FORMAT.with(|slot| slot.set(previous));
+    out
+}
+
+/// Say that `verb` builds under the default graph format whatever
+/// `--graph-format` asked: `prepare` writes the default format's snapshot
+/// and `lsp` builds its models on threads of its own.
+fn warn_default_graph_format(verb: &str, quiet: bool) {
+    if !quiet && graph_format() != sysmlv2_parser::model::GraphFormat::LegacyV2 {
+        eprintln!("warning: {verb} takes the default graph format; --graph-format is ignored");
+    }
+}
+
+/// An empty model in the verb's graph format: every verb that builds a
+/// model starts from one.
+fn new_model() -> Model {
+    Model::with_graph_format(graph_format())
+}
+
+/// A session over `sources` in the verb's graph format, resolved against
+/// `lib` in the same build: the legacy entry under the default (its
+/// foreign-payload recovery kept), the format-aware one under canonical.
+fn open_session(
+    sources: Vec<(String, String)>,
+    lib: Option<sysmlv2_transform::Library>,
+) -> Result<sysmlv2_transform::Session, sysmlv2_transform::SessionError> {
+    match graph_format() {
+        sysmlv2_parser::model::GraphFormat::LegacyV2 => {
+            sysmlv2_transform::Session::from_sources_with_library(sources, lib)
+        }
+        format => sysmlv2_transform::Session::from_sources_with_graph_format(sources, lib, format),
+    }
+}
+
+/// A session over an interchange document in the verb's graph format
+/// (see [`open_session`]); `unit_names` as
+/// [`sysmlv2_transform::Session::from_interchange_json_named`] takes them.
+fn open_interchange_session(
+    value: &serde_json::Value,
+    lib: Option<&sysmlv2_transform::Library>,
+    unit_names: &[String],
+) -> Result<sysmlv2_transform::Session, sysmlv2_transform::SessionError> {
+    match graph_format() {
+        sysmlv2_parser::model::GraphFormat::LegacyV2 => {
+            sysmlv2_transform::Session::from_interchange_json_named(value, lib, unit_names)
+        }
+        format => sysmlv2_transform::Session::from_interchange_json_with_graph_format(
+            value,
+            lib,
+            unit_names,
+            Indent::default(),
+            format,
+        ),
+    }
 }
 
 /// `--number-format` for the commands that print computed values.
@@ -412,6 +516,38 @@ enum Target {
     Kpar,
 }
 
+/// Which values the full form writes for the inheritance-aware
+/// properties (`convert --closures`).
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum ClosureLevel {
+    /// The owned side of the inheritance-aware properties and `[]` for
+    /// the four closure names: the payload stays proportional to the
+    /// model (the default)
+    Passthrough,
+    /// The specification's values over the written inheritance and
+    /// import closures: `inheritedMembership`, `inheritedFeature`,
+    /// `importedMembership`, `featuringType` written, `feature`,
+    /// `membership`, `member`, … over the inherited memberships
+    Closure,
+    /// As `closure`, with the implied library heritage included (every
+    /// part inherits `Parts::Part`'s members)
+    ClosureImplied,
+}
+
+impl ClosureLevel {
+    fn policy(self) -> ClosurePolicy {
+        match self {
+            Self::Passthrough => ClosurePolicy::Passthrough,
+            Self::Closure => ClosurePolicy::Closure {
+                include_implied: false,
+            },
+            Self::ClosureImplied => ClosurePolicy::Closure {
+                include_implied: true,
+            },
+        }
+    }
+}
+
 /// How `check` and `lint` report their findings.
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
 enum ReportFormat {
@@ -423,6 +559,18 @@ enum ReportFormat {
     /// status is the text mode's (--strict fails on any finding at
     /// all; a refused --fix counts as an error), which the summary's
     /// per-severity counts do not encode
+    Json,
+}
+
+/// How `tree` prints the ownership tree.
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+pub enum TreeFormat {
+    /// Box-drawing text: one line per element, relationship and reference
+    Tree,
+    /// One JSON document on stdout: the array of root nodes, each
+    /// `{metaclass, name?, qualifiedName?, id?, library?, site?,
+    /// references?, relationships: [{metaclass, id?, implied?,
+    /// references?, children: [...]}], truncated?}`
     Json,
 }
 
@@ -507,6 +655,7 @@ enum Command {
                       \x20 sysmlv2 convert full.json --to compact-json     # normalize full → compact\n\
                       \x20 sysmlv2 convert model.sysml --to compact-cbor -o model.s2c\n\
                       \x20 sysmlv2 convert model.s2c --to text             # binary → textual notation\n\
+                      \x20 sysmlv2 convert model.sysml --to full-json --closures closure --lib sysml.library/\n\
                       \x20 sysmlv2 convert model.sysml --to compact-json --lib spec-refs/SysML-v2-Release/sysml.library"
     )]
     Convert {
@@ -563,12 +712,27 @@ enum Command {
         /// (default 4)
         #[arg(long, value_parser = parse_indent_arg, default_value = "4")]
         indent: Indent,
+        /// --to full-json / full-cbor only: which values the
+        /// inheritance-aware properties carry. The default,
+        /// `passthrough`, writes the owned side and `[]` for the four
+        /// closure names (`inheritedMembership`, `inheritedFeature`,
+        /// `importedMembership`, `featuringType`) whatever
+        /// `isImpliedIncluded` says; `closure` writes the specification's
+        /// values over the written heritage, `closure-implied` with the
+        /// implied library heritage too. Nothing in the document records
+        /// the level (the schema has no key for it); an element whose
+        /// inheritance walk exceeds the resolver's depth budget refuses
+        /// the closure levels
+        #[arg(long, value_enum, default_value_t = ClosureLevel::Passthrough)]
+        closures: ClosureLevel,
         /// Emit the resolved standard library itself — every element
         /// of the --lib units, each under its normative KerML 9.1 id —
         /// instead of converting a model. The complement of a normal
         /// conversion, whose output holds just the user units' elements
         /// while its library references dangle by design. Takes no
-        /// inputs; targets compact-json and compact-cbor
+        /// inputs; targets compact-json, compact-cbor, full-json and
+        /// full-cbor (the full form carries the library's derived
+        /// properties and its implied relationships; --closures applies)
         #[arg(
             long,
             requires = "lib",
@@ -1013,6 +1177,57 @@ enum Command {
         /// Standard-library directory or bundle file for reference resolution
         #[arg(long, env = "SYSMLV2_LIB_DIR")]
         lib: Option<PathBuf>,
+    },
+    /// Print the ownership tree: elements, the relationships they own,
+    /// and every other end as a reference
+    #[command(
+        long_about = "Print the resolved model as an ownership tree, the abstract-syntax\n\
+                      elements and the relationships that connect them: an element lists\n\
+                      the relationships it owns (memberships, typings, specializations,\n\
+                      imports, feature values, …), a relationship the elements it owns in\n\
+                      turn, and every other end (a typing's type, a specialization's\n\
+                      general, an import's namespace) as a reference, spelled\n\
+                      `property → qualified name [Metaclass]` and never expanded. A\n\
+                      library element is reached only as a reference, or as the chosen\n\
+                      root. Without a qualified name the tree starts at every top-level\n\
+                      element of the input files.",
+        after_help = "EXAMPLES:\n\
+                      \x20 sysmlv2 tree model.sysml Demo::Vehicle --lib sysml.library/\n\
+                      \x20 sysmlv2 tree model.sysml --depth 2\n\
+                      \x20 sysmlv2 tree model.sysml Demo::Vehicle --implied --ids --format json\n\
+                      \x20 sysmlv2 tree Demo::Vehicle                (SYSMLV2_MODEL_DIR set)"
+    )]
+    Tree {
+        /// Input file (.sysml or .kerml), or `-` for stdin; optional when
+        /// SYSMLV2_MODEL_DIR is set (a leading qualified name is then a
+        /// name, not a file)
+        input: Option<PathBuf>,
+        /// The ::-qualified name of the element to start at (optional);
+        /// arguments ending in `.sysml`/`.kerml` are further files joining
+        /// the model
+        args: Vec<String>,
+        /// Standard-library directory or bundle file for reference resolution
+        #[arg(long, env = "SYSMLV2_LIB_DIR")]
+        lib: Option<PathBuf>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = TreeFormat::Tree)]
+        format: TreeFormat,
+        /// Ownership levels below the root to expand: 0 shows the root
+        /// alone, 1 its relationships and their elements, and so on
+        #[arg(long, value_name = "N")]
+        depth: Option<usize>,
+        /// Show the interchange id of every element, relationship and
+        /// reference target
+        #[arg(long)]
+        ids: bool,
+        /// Include the implied relationships (the library specializations
+        /// of each kind, positional redefinitions) and the elements they
+        /// generate
+        #[arg(long)]
+        implied: bool,
+        /// Leave out the references (the non-owning ends)
+        #[arg(long)]
+        no_references: bool,
     },
     /// Parse one file and dump diagnostics (and optionally the AST)
     #[command(after_help = "EXAMPLES:\n\
@@ -1786,7 +2001,7 @@ fn load_library_id_names(
     let Some(dir) = lib else {
         return Ok(Default::default());
     };
-    let mut model = Model::new();
+    let mut model = new_model();
     match load_library(&mut model, dir) {
         Ok(cache) => {
             let names = library_name_map(&model)
@@ -2120,7 +2335,7 @@ pub fn load_model(
     quiet: bool,
 ) -> Result<LoadedModel, CliError> {
     let files = resolve_inputs(files, quiet)?;
-    let mut model = Model::new();
+    let mut model = new_model();
     let mut lib_cache = None;
     if let Some(lib) = lib {
         lib_cache = load_library(&mut model, lib)
@@ -2413,7 +2628,7 @@ fn refactor_session(
         let src = read(path)?;
         sources.push((path.display().to_string(), src));
     }
-    let mut session = match sysmlv2_transform::Session::from_sources(sources.clone()) {
+    let mut session = match open_session(sources.clone(), None) {
         Ok(s) => s,
         Err(sysmlv2_transform::SessionError::Parse { unit, diagnostics }) => {
             match sources.iter().find(|(n, _)| *n == unit) {
@@ -3020,6 +3235,7 @@ fn ambient_help(mut cmd: clap::Command) -> clap::Command {
                     | "query"
                     | "describe"
                     | "members"
+                    | "tree"
                     | "parse"
                     | "viz"
                     | "refactor"
@@ -3351,6 +3567,7 @@ struct ConvertArgs {
     delta_base: Option<PathBuf>,
     delta_portable: bool,
     indent: Indent,
+    closures: ClosureLevel,
     library: bool,
 }
 
@@ -3368,21 +3585,40 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
         delta_base,
         delta_portable,
         indent,
+        closures,
         library,
     } = args;
+    let closures = closures.policy();
+    if closures != ClosurePolicy::Passthrough && !matches!(to, Target::FullJson | Target::FullCbor)
+    {
+        eprintln!("error: --closures applies to --to full-json or full-cbor");
+        return ExitCode::FAILURE;
+    }
+    // The full form's emission policy: unresolved references keep their
+    // spelling in recovery annotations (full interchange is lossless by
+    // default, --flexo or not), the closures as asked.
+    let emission = EmissionPolicy {
+        unresolved: UnresolvedReferencePolicy::Preserve,
+        closures,
+    };
     if library {
         if !inputs.is_empty() {
             eprintln!("error: --library takes no inputs (the --lib directory is the input)");
             return ExitCode::FAILURE;
         }
-        if !matches!(to, Target::CompactJson | Target::CompactCbor) {
-            eprintln!("error: --library targets compact-json or compact-cbor");
+        if !matches!(
+            to,
+            Target::CompactJson | Target::CompactCbor | Target::FullJson | Target::FullCbor
+        ) {
+            eprintln!(
+                "error: --library targets compact-json, compact-cbor, full-json or full-cbor"
+            );
             return ExitCode::FAILURE;
         }
         // Which flags --library composes with, and that it needs
         // --lib, are declared on the arguments themselves.
         let dir = lib.as_ref().expect("--library requires --lib");
-        let mut model = Model::new();
+        let mut model = new_model();
         let lib_cache_path = match load_library(&mut model, dir) {
             Ok(p) => p,
             Err(e) => {
@@ -3391,9 +3627,32 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             }
         };
         save_library_cache(&model, lib_cache_path);
+        if matches!(to, Target::FullJson | Target::FullCbor) {
+            // The library in the full form: its own rows with the derived
+            // properties and the implied relationships the prepared
+            // library materialized for them (no payload lift on the way).
+            let (json, units) =
+                match sysmlv2_parser::full::library_to_full_json_with_units(&model, emission) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        eprintln!("error: cannot write the full form: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            if matches!(to, Target::FullCbor) {
+                return match sysmlv2_cbor::to_full_cbor_with_format(&json, &units, graph_format()) {
+                    Ok(bytes) => exit_status(write_bytes(output.as_deref(), &bytes)),
+                    Err(e) => {
+                        eprintln!("error: cannot encode CBOR: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            return exit_status(write_json(output.as_deref(), &json));
+        }
         let (json, units) = sysmlv2_parser::json::library_to_compact_json_with_units(&model);
         if matches!(to, Target::CompactCbor) {
-            return match sysmlv2_cbor::to_compact_cbor_with_units(&json, &units) {
+            return match sysmlv2_cbor::to_compact_cbor_with_format(&json, &units, graph_format()) {
                 Ok(bytes) => exit_status(write_bytes(output.as_deref(), &bytes)),
                 Err(e) => {
                     eprintln!("error: cannot encode CBOR: {e}");
@@ -3556,17 +3815,14 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let mut session = match sysmlv2_transform::Session::from_interchange_json_named(
-                    &value,
-                    library.as_ref(),
-                    &unit_names,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("error: cannot lift JSON: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
+                let mut session =
+                    match open_interchange_session(&value, library.as_ref(), &unit_names) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("error: cannot lift JSON: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
                 for w in session.warnings() {
                     eprintln!("warning: {w}");
                 }
@@ -3597,7 +3853,7 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             }
             let names = match lib {
                 Some(dir) => {
-                    let mut model = Model::new();
+                    let mut model = new_model();
                     let lib_cache_path = match load_library(&mut model, &dir) {
                         Ok(p) => p,
                         Err(e) => {
@@ -3706,13 +3962,17 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             // effective-name chains (roots-only exception maps);
             // filled when a library is loaded below.
             let mut elide_names: std::collections::HashMap<String, String> = Default::default();
-            // One no-lib file keeps the single-unit fast path;
-            // anything else builds a model (one root namespace per
-            // file, cross-file references resolved). Binary targets
-            // also carry the unit structure: each unit root's
-            // element index paired with its source path.
-            let (json, unit_paths) = if lib.is_some() || sources.len() > 1 {
-                let mut model = Model::new();
+            // One no-lib file in the default graph format keeps the
+            // single-unit fast path; anything else builds a model (one
+            // root namespace per file, cross-file references resolved,
+            // the model's graph format). Binary targets also carry the
+            // unit structure: each unit root's element index paired
+            // with its source path.
+            let (json, unit_paths) = if lib.is_some()
+                || sources.len() > 1
+                || graph_format() != sysmlv2_parser::model::GraphFormat::LegacyV2
+            {
+                let mut model = new_model();
                 let lib_cache_path = if let Some(lib) = &lib {
                     match load_library(&mut model, lib) {
                         Ok(p) => p,
@@ -3747,7 +4007,13 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                     // Full interchange is lossless by default:
                     // unresolved textual references need recovery
                     // carriers independently of the Flexo envelope.
-                    model_to_full_json_with(&model, true)
+                    match sysmlv2_parser::full::model_to_full_json_with_emission(&model, emission) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            eprintln!("error: cannot write the full form: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 } else {
                     compact.clone()
                 };
@@ -3777,7 +4043,20 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                         "note: no --lib given — implied relationships are omitted \
                                  (isImpliedIncluded: false); derived properties are included"
                     );
-                    let json = to_full_json_with(&parse.unit, true);
+                    // The unit's compact form completed in place: the
+                    // ids are the fast path's at every closure level (a
+                    // one-unit model would seed its root from the unit
+                    // name and move every id).
+                    let json = match sysmlv2_parser::full::to_full_json_with_emission(
+                        &parse.unit,
+                        emission,
+                    ) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            eprintln!("error: cannot write the full form: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
                     let unit_paths = remap_units(&compact, &units, &json);
                     (json, unit_paths)
                 } else {
@@ -3799,7 +4078,7 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             };
             if matches!(to, Target::CompactCbor | Target::FullCbor) {
                 let encoded = if matches!(to, Target::FullCbor) {
-                    sysmlv2_cbor::to_full_cbor_with_units(&json, &unit_paths)
+                    sysmlv2_cbor::to_full_cbor_with_format(&json, &unit_paths, graph_format())
                 } else if let Some(base_path) = delta_base
                     .as_ref()
                     .filter(|_| matches!(to, Target::CompactCbor))
@@ -3830,7 +4109,9 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                         sysmlv2_cbor::delta_compact_cbor_elided(
                             &base,
                             &json,
-                            &sysmlv2_cbor::DeltaOptions::new().with_units(units),
+                            &sysmlv2_cbor::DeltaOptions::new()
+                                .with_graph_format(graph_format())
+                                .with_units(units),
                             &|s| elide_names.get(s).cloned(),
                         )
                     } else {
@@ -3838,18 +4119,20 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                             &base,
                             &json,
                             &sysmlv2_cbor::DeltaOptions::new()
+                                .with_graph_format(graph_format())
                                 .with_portable(delta_portable)
                                 .with_units(units),
                         )
                     }
                 } else if elide_ids {
-                    sysmlv2_cbor::to_compact_cbor_elided_with_units(
+                    sysmlv2_cbor::to_compact_cbor_elided_with_format(
                         &json,
                         &|s| elide_names.get(s).cloned(),
                         &unit_paths,
+                        graph_format(),
                     )
                 } else {
-                    sysmlv2_cbor::to_compact_cbor_with_units(&json, &unit_paths)
+                    sysmlv2_cbor::to_compact_cbor_with_format(&json, &unit_paths, graph_format())
                 };
                 return match encoded {
                     Ok(bytes) => exit_status(write_bytes(output.as_deref(), &bytes)),
@@ -3952,10 +4235,7 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                 },
                 None => None,
             };
-            let session = match sysmlv2_transform::Session::from_interchange_json_with(
-                &value,
-                library.as_ref(),
-            ) {
+            let session = match open_interchange_session(&value, library.as_ref(), &[]) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: cannot load the payload: {e}");
@@ -3965,9 +4245,15 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             for w in session.warnings() {
                 eprintln!("warning: {w}");
             }
-            let json = session.to_full_json_with(true);
+            let json = match session.to_full_json_with_policy(emission) {
+                Ok(json) => json,
+                Err(e) => {
+                    eprintln!("error: cannot write the full form: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             if matches!(to, Target::FullCbor) {
-                return match sysmlv2_cbor::to_full_cbor(&json) {
+                return match sysmlv2_cbor::to_full_cbor_with_format(&json, &[], graph_format()) {
                     Ok(bytes) => exit_status(write_bytes(output.as_deref(), &bytes)),
                     Err(e) => {
                         eprintln!("error: cannot encode CBOR: {e}");
@@ -4000,7 +4286,26 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             for w in &lifted.errors {
                 eprintln!("warning: {w}");
             }
-            let json = to_compact_json(&lifted.unit);
+            let json = if graph_format() == sysmlv2_parser::model::GraphFormat::LegacyV2 {
+                to_compact_json(&lifted.unit)
+            } else {
+                // The unit emitter is legacy-only. Rebuild the lifted syntax
+                // under the selected format, keeping its dialect rather than
+                // inferring one from the JSON/CBOR input's extension. A stable
+                // name keeps normalization independent of the input filename.
+                let name = match lifted.unit.dialect {
+                    Dialect::Kerml => "model.kerml",
+                    Dialect::Sysml => "model.sysml",
+                };
+                let source = print_source_opts(&lifted.unit, PrintOptions::default());
+                let mut model = new_model();
+                let unit = model.add_source(name, &source);
+                if !unit.diagnostics.is_empty() {
+                    report(Path::new(name), &source, &unit.diagnostics);
+                    return ExitCode::FAILURE;
+                }
+                model_to_compact_json_with_units(&model).0
+            };
             if matches!(to, Target::CompactCbor) {
                 // Hermetic normalize path: elision without a
                 // resolver is always safe — library-effective
@@ -4023,20 +4328,27 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                         sysmlv2_cbor::delta_compact_cbor_elided(
                             &base,
                             &json,
-                            &Default::default(),
+                            &sysmlv2_cbor::DeltaOptions::new().with_graph_format(graph_format()),
                             &|_| None,
                         )
                     } else {
                         sysmlv2_cbor::delta_compact_cbor(
                             &base,
                             &json,
-                            &sysmlv2_cbor::DeltaOptions::new().with_portable(delta_portable),
+                            &sysmlv2_cbor::DeltaOptions::new()
+                                .with_graph_format(graph_format())
+                                .with_portable(delta_portable),
                         )
                     }
                 } else if elide_ids {
-                    sysmlv2_cbor::to_compact_cbor_elided(&json, &|_| None)
+                    sysmlv2_cbor::to_compact_cbor_elided_with_format(
+                        &json,
+                        &|_| None,
+                        &[],
+                        graph_format(),
+                    )
                 } else {
-                    sysmlv2_cbor::to_compact_cbor(&json)
+                    sysmlv2_cbor::to_compact_cbor_with_format(&json, &[], graph_format())
                 };
                 return match encoded {
                     Ok(bytes) => exit_status(write_bytes(output.as_deref(), &bytes)),
@@ -4546,7 +4858,7 @@ fn run_check(
     // resolution, but basic local constraints must not disappear
     // merely because `--lib` was omitted.
     if !sources.is_empty() {
-        let mut model = Model::new();
+        let mut model = new_model();
         let lib_cache_path = if let Some(lib) = lib {
             match load_library(&mut model, lib) {
                 Ok(p) => p,
@@ -4701,7 +5013,7 @@ fn run_lint(args: LintArgs, quiet: bool) -> ExitCode {
         sources.push((i, path, src));
         parsed.push(parse);
     }
-    let mut model = Model::new();
+    let mut model = new_model();
     let mut lib_cache_path = None;
     if let Some(lib) = &lib {
         lib_cache_path = match load_library(&mut model, lib) {
@@ -5077,6 +5389,46 @@ pub fn run_members(
     Ok(())
 }
 
+/// `tree`: the ownership tree under one element, or under every
+/// top-level element, as text or as JSON.
+pub fn run_tree(
+    input: Option<PathBuf>,
+    args: Vec<String>,
+    lib: Option<&Path>,
+    format: TreeFormat,
+    options: &sysmlv2_parser::inspect::TreeOptions,
+    quiet: bool,
+) -> Result<(), CliError> {
+    let (files, names) = split_files_and_names(input, args);
+    if names.len() > 1 {
+        return Err(fail(format!(
+            "expected at most one qualified name, got {}",
+            names.len()
+        )));
+    }
+    let mut resolved = load_model(files, lib, quiet)?.into_resolved();
+    let root = match names.first() {
+        Some(qname) => Some(
+            resolved
+                .resolve_qualified(qname)
+                .ok_or_else(|| fail(format!("cannot resolve `{qname}`")))?,
+        ),
+        None => None,
+    };
+    let nodes = sysmlv2_parser::inspect::tree(&mut resolved, root, options);
+    let mut out = stdout_writer();
+    let written = match format {
+        TreeFormat::Tree => out.write_all(sysmlv2_parser::inspect::render(&nodes).as_bytes()),
+        TreeFormat::Json => serde_json::to_writer_pretty(&mut out, &nodes)
+            .map_err(io::Error::from)
+            .and_then(|()| writeln!(out)),
+    }
+    .and_then(|()| out.flush());
+    stdout_result(written)?;
+    leave_to_exit(resolved);
+    Ok(())
+}
+
 /// `parse`: a per-file loop — each file parses (and reports) on its
 /// own, and any diagnostic anywhere fails the run.
 pub fn run_parse(input: Option<PathBuf>, ast: bool, quiet: bool) -> Result<(), CliError> {
@@ -5209,6 +5561,12 @@ where
         }
     };
     let quiet = cli.quiet;
+    // The graph format: the flag, else `SYSMLV2_GRAPH_FORMAT` (clap reads
+    // it and refuses an unknown value as it refuses one on the flag),
+    // else the default.
+    let graph_format = cli
+        .graph_format
+        .map_or(sysmlv2_parser::model::GraphFormat::LegacyV2, Into::into);
     // Spelled power-product unit expansion is on by default; the flag or
     // `SYSMLV2_UNIT_SPELLINGS=off` opts out. The switch is process-wide
     // and this function is a library entry point, so every run sets it
@@ -5219,7 +5577,7 @@ where
     sysmlv2_parser::eval::set_unit_spelling_expansion(expand_unit_spellings);
     let code =
         sysmlv2_parser::parser::on_parsing_stack("sysmlv2", say_the_stack_was_refused, move || {
-            dispatch(cli.command, quiet)
+            with_graph_format(graph_format, || dispatch(cli.command, quiet))
         });
     // The library cache a cold run writes while the verb runs: joined
     // here, so the files are complete when the process ends, and what
@@ -5289,6 +5647,7 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             delta_base,
             delta_portable,
             indent,
+            closures,
             library,
         } => run_convert(
             ConvertArgs {
@@ -5302,6 +5661,7 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
                 delta_base,
                 delta_portable,
                 indent,
+                closures,
                 library,
             },
             quiet,
@@ -5343,7 +5703,10 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             stdout,
             indent,
         } => run_fmt(files, check, stdout, indent, quiet),
-        Command::Prepare { lib, out } => run_prepare(lib.as_deref(), &out, quiet),
+        Command::Prepare { lib, out } => {
+            warn_default_graph_format("prepare", quiet);
+            run_prepare(lib.as_deref(), &out, quiet)
+        }
         Command::Check {
             files,
             lib,
@@ -5422,6 +5785,32 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             finish(run_members(input, args, lib.as_deref(), quiet))
         }
 
+        Command::Tree {
+            input,
+            args,
+            lib,
+            format,
+            depth,
+            ids,
+            implied,
+            no_references,
+        } => {
+            let options = sysmlv2_parser::inspect::TreeOptions {
+                depth,
+                references: !no_references,
+                implied,
+                ids,
+            };
+            finish(run_tree(
+                input,
+                args,
+                lib.as_deref(),
+                format,
+                &options,
+                quiet,
+            ))
+        }
+
         Command::Refactor { op } => run_refactor(op, quiet),
         Command::Parse { input, ast } => finish(run_parse(input, ast, quiet)),
         #[cfg(feature = "viz")]
@@ -5471,6 +5860,7 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             number_format,
             value_hint_units,
         } => {
+            warn_default_graph_format("lsp", quiet);
             // The language server reads a library directory's files for its
             // navigation; a bundle is refused here rather than half served.
             if let Some(lib) = lib.as_deref().filter(|lib| bundle::is_bundle(lib)) {

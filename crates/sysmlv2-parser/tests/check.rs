@@ -1833,6 +1833,108 @@ fn satisfaction_claims_expand_to_bound_verdicts() {
     );
 }
 
+/// Binding to the subject itself is reported even without constraints or a
+/// library; a qualified target and an unresolved target do not trigger it.
+#[test]
+fn self_bound_satisfaction_is_a_check_warning() {
+    for (subject, target, expected) in [
+        ("battery", "battery", true),
+        ("battery", "BatteryRequirements::battery", false),
+        ("pack", "battery", false),
+        ("battery", "missing", false),
+    ] {
+        let source = format!(
+            "package BatteryRequirements {{
+            part def Battery;
+            requirement def Limit {{ subject {subject} : Battery; }}
+            part battery : Battery;
+            requirement limit : Limit;
+            satisfy limit by {target};
+        }}"
+        );
+        let mut model = Model::new();
+        model.add_source("binding.sysml", &source);
+        assert!(!model.has_errors());
+        let findings = sysmlv2_parser::check::validate_semantics(&model);
+        let matching: Vec<_> = findings
+            .iter()
+            .filter(|(_, d)| d.code == Some("selfBoundSatisfaction"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            usize::from(expected),
+            "{source}: {findings:?}"
+        );
+        if expected {
+            let (unit, diagnostic) = matching[0];
+            assert_eq!(*unit, 0);
+            assert_eq!(diagnostic.severity, sysmlv2_parser::diag::Severity::Warning);
+            assert!(
+                source[diagnostic.span.start as usize..diagnostic.span.end as usize]
+                    .contains("satisfy limit by battery")
+            );
+            assert!(diagnostic.message.contains("own subject"));
+            assert!(diagnostic.message.contains("shadows"));
+        }
+    }
+}
+
+/// Lib-gated: a claim whose `by` names the requirement's own subject
+/// (`satisfy massLimit by battery;` under `subject battery : Battery;`)
+/// binds that subject to itself: inside the claim the inherited subject
+/// shadows the package's `battery`. The claim is undecided and says so,
+/// instead of reading the subject's type defaults as the part's values;
+/// a subject of another name leaves the part in reach, and the claim
+/// decides.
+#[test]
+fn satisfaction_by_the_requirements_own_subject_is_undecided() {
+    use sysmlv2_parser::check::ConstraintVerdict::*;
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let source = |subject: &str| {
+        format!(
+            "package BatteryRequirements {{
+                part def Battery {{ attribute massKg : Real = 0.24; }}
+                requirement def MassLimit {{
+                    attribute massBudgetKg : Real = 0.25;
+                    subject {subject} : Battery;
+                    require constraint {{ {subject}.massKg <= massBudgetKg }}
+                }}
+                part battery : Battery {{ attribute :>> massKg = 0.3; }}
+                requirement massLimit : MassLimit;
+                satisfy massLimit by battery;
+            }}"
+        )
+    };
+    for (subject, expected) in [("battery", None), ("pack", Some(false))] {
+        let mut model = Model::new();
+        model.load_library_dir(&lib).unwrap();
+        model.add_source("battery-requirements.sysml", &source(subject));
+        assert!(!model.has_errors(), "{subject}");
+        let checks = sysmlv2_parser::check::check_constraints(&model);
+        let bound: Vec<_> = checks
+            .iter()
+            .filter(|c| c.context.as_deref() == Some("BatteryRequirements::massLimit"))
+            .collect();
+        assert_eq!(bound.len(), 1, "{subject}: {bound:#?}");
+        match (expected, &bound[0].verdict) {
+            (None, Undecided(reason)) => {
+                assert!(
+                    reason.contains("own subject `BatteryRequirements::MassLimit::battery`")
+                        && reason.contains("shadows `BatteryRequirements::battery`"),
+                    "{reason}"
+                );
+            }
+            // 0.3 <= 0.25 fails: the part's value, not the type's default.
+            (Some(false), Violated) => {}
+            (_, verdict) => panic!("{subject}: {verdict:?}"),
+        }
+    }
+}
+
 /// Lib-gated: a claim that declares its own requirement (`satisfy
 /// requirement : R by x;`) has no reference to follow: it is itself the
 /// satisfied requirement, so `R`'s constraints evaluate with its subject

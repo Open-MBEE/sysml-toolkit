@@ -2,7 +2,8 @@
 //! not construct semantic relationships or certify missing property families.
 use super::certified_types::Stamp;
 use super::{
-    CheckedRow, ElementRef, PropertyError, PropertyIssue, ResolvedModel, SemanticExportError,
+    CheckedExport, CheckedRow, ElementRef, PropertyError, PropertyIssue, ResolvedModel,
+    SemanticExportError,
 };
 use crate::json::{publication, semantic_ownership, structural_index::StoredStructure};
 use crate::metaclass::is_a;
@@ -226,7 +227,24 @@ impl Snapshot {
     }
 }
 
+/// The strict export: the checked rows when every property of every
+/// admitted element answered, else the issue list.
 pub(super) fn full(r: &mut ResolvedModel) -> Result<Value, SemanticExportError> {
+    let export = checked(r)?;
+    if export.issues.is_empty() {
+        Ok(export.elements)
+    } else {
+        Err(SemanticExportError {
+            issues: export.issues,
+        })
+    }
+}
+
+/// The checked export with its issues beside it: every admitted element's
+/// row with the properties that answered, each refused property absent
+/// from its row and listed once in `issues`. A snapshot that cannot be
+/// established refuses before any row is read.
+pub(super) fn checked(r: &mut ResolvedModel) -> Result<CheckedExport, SemanticExportError> {
     let mut steps = 0;
     for attempt in 0..2 {
         let mut snapshot =
@@ -284,11 +302,10 @@ pub(super) fn full(r: &mut ResolvedModel) -> Result<Value, SemanticExportError> 
         if let Err(issue) = snapshot.finish(r, &output) {
             issues.push(issue);
         }
-        if issues.is_empty() {
-            return Ok(Value::Array(output));
-        } else {
-            return Err(SemanticExportError { issues });
-        }
+        return Ok(CheckedExport {
+            elements: Value::Array(output),
+            issues,
+        });
     }
     unreachable!("the final export attempt returns or refuses")
 }

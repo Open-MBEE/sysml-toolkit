@@ -1,8 +1,31 @@
 //! Checked Usage definitions reuse the complete Feature typing closure.
 use sysmlv2_parser::{
-    json::{ClosurePolicy, ResolvedModel},
+    json::{ClosurePolicy, Derived, DerivedValue, ElementRef, Reference, ResolvedModel},
     model::{GraphFormat, Model},
 };
+
+/// The compatibility reader's element references as the checked reader
+/// writes them.
+fn derived_ids(r: &mut ResolvedModel, e: ElementRef, name: &str) -> serde_json::Value {
+    let Derived::Value(value) = r.derived(e, name) else {
+        panic!("{name} is not derived");
+    };
+    let id = |e| serde_json::json!({"@id": r.element_id(e).to_string()});
+    match value {
+        DerivedValue::Element(e) => id(e),
+        DerivedValue::Elements(es) => serde_json::Value::Array(es.iter().map(|&e| id(e)).collect()),
+        DerivedValue::Reference(Reference::Element(e)) => id(e),
+        DerivedValue::References(refs) => serde_json::Value::Array(
+            refs.iter()
+                .map(|reference| match reference {
+                    Reference::Element(e) => id(*e),
+                    other => panic!("{name}: {other:?} leaves the model"),
+                })
+                .collect(),
+        ),
+        other => panic!("{name}: {other:?}"),
+    }
+}
 
 #[test]
 fn structural_usage_types_and_definition_subsets_use_the_real_library() {
@@ -28,6 +51,11 @@ fn structural_usage_types_and_definition_subsets_use_the_real_library() {
             ref occurrence occurrenceValue : Event;
             attribute def Data :> Base::DataValue;
             ref attribute data : Data :> Base::dataValues;
+            port def CmdPort;
+            part def Device { port pOut : CmdPort; port pIn : ~CmdPort; }
+            connection def Link { end a : Device; end b : Device; }
+            interface def Iface { end port a : CmdPort; end port b : CmdPort; }
+            part sys { part d1 : Device; part d2 : Device; connection lk : Link connect d1 to d2; interface itf : Iface connect d1.pOut to d2.pIn; }
         }",
         );
         assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
@@ -67,6 +95,26 @@ fn structural_usage_types_and_definition_subsets_use_the_real_library() {
                 "P::Data",
                 &["type", "definition", "attributeDefinition"][..],
             ),
+            (
+                "P::Device::pOut",
+                "P::CmdPort",
+                &[
+                    "type",
+                    "definition",
+                    "occurrenceDefinition",
+                    "portDefinition",
+                ][..],
+            ),
+            (
+                "P::sys::lk",
+                "P::Link",
+                &["type", "connectionDefinition"][..],
+            ),
+            (
+                "P::sys::itf",
+                "P::Iface",
+                &["type", "connectionDefinition", "interfaceDefinition"][..],
+            ),
         ] {
             let e = r.resolve_qualified(path).unwrap();
             let target = r.resolve_qualified(target).unwrap();
@@ -78,6 +126,21 @@ fn structural_usage_types_and_definition_subsets_use_the_real_library() {
                     "{format:?} {path}.{property}"
                 );
             }
+        }
+        // A conjugated port's type is the conjugated port definition.
+        let conjugated = r.resolve_qualified("P::Device::pIn").unwrap();
+        let compatibility = derived_ids(&mut r, conjugated, "type");
+        for property in [
+            "type",
+            "definition",
+            "occurrenceDefinition",
+            "portDefinition",
+        ] {
+            assert_eq!(
+                r.property(conjugated, property),
+                Ok(compatibility.clone()),
+                "{format:?} pIn.{property}"
+            );
         }
         let mixed = r.resolve_qualified("P::mixed").unwrap();
         let part = r.resolve_qualified("Parts::Part").unwrap();

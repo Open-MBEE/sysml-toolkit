@@ -5,6 +5,10 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from xmi_props import spec_ref  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 NS = "{http://www.omg.org/spec/XMI/20161101}"
 OUT = ROOT / "crates/sysmlv2-model/src/operation_catalog.rs"
@@ -25,7 +29,7 @@ def ref(e):
 
 
 def generate():
-    roots = [ET.parse(ROOT / f"spec-refs/{name}.xmi").getroot() for name in ("KerML", "SysML")]
+    roots = [ET.parse(spec_ref(f"{name}.xmi")).getroot() for name in ("KerML", "SysML")]
     ids = {e.get(NS + "id"): e for root in roots for e in root.iter() if e.get(NS + "id")}
     operations = sorted((op.get(NS + "id"), c, op) for c in ids.values()
                         if c.get(NS + "type") == "uml:Class" for op in c.findall("ownedOperation"))

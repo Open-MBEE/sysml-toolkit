@@ -20,40 +20,15 @@ use sysmlv2_parser::full::{from_compact_value, model_to_full_json, to_full_json}
 use sysmlv2_parser::model::Model;
 use sysmlv2_parser::parser::{parse_kerml_source, parse_source};
 
+/// The published schema compiles as a whole (the per-element checks go
+/// through `sysmlv2_testkit::validate_elements`, shared with the CLI's
+/// library export test).
 fn schema_validator() -> jsonschema::Validator {
-    let path = sysmlv2_testkit::workspace_root().join("spec-refs/SysML.schema.json");
-    let schema: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    jsonschema::validator_for(&schema).expect("published schema compiles")
+    jsonschema::validator_for(&sysmlv2_testkit::published_schema())
+        .expect("published schema compiles")
 }
 
-/// Validate every element against the *exact-type* variant of its
-/// metaclass definition (detailed per-property errors).
-fn validate_elements(validator_schema: &Value, elements: &[Value]) -> Vec<String> {
-    let mut validators: std::collections::HashMap<String, jsonschema::Validator> =
-        Default::default();
-    let mut failures = Vec::new();
-    for el in elements {
-        let t = el["@type"].as_str().unwrap().to_string();
-        let validator = validators.entry(t.clone()).or_insert_with(|| {
-            let def = &validator_schema["$defs"][&t];
-            let exact = if def.get("anyOf").is_some() {
-                def["anyOf"][0].clone()
-            } else {
-                def.clone()
-            };
-            let mut mini = exact;
-            mini["$defs"] = validator_schema["$defs"].clone();
-            jsonschema::validator_for(&mini).unwrap()
-        });
-        for err in validator.iter_errors(el).take(4) {
-            failures.push(format!("{t} @ {}: {err}", err.instance_path()));
-        }
-        if failures.len() > 25 {
-            break;
-        }
-    }
-    failures
-}
+use sysmlv2_testkit::validate_elements;
 
 #[test]
 fn full_form_validates_against_published_schema() {
@@ -127,10 +102,7 @@ fn full_form_validates_against_published_schema() {
 
     // Schema validation of every element.
     let schema: Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            sysmlv2_testkit::workspace_root().join("spec-refs/SysML.schema.json"),
-        )
-        .unwrap(),
+        &std::fs::read_to_string(sysmlv2_testkit::spec_ref("SysML.schema.json")).unwrap(),
     )
     .unwrap();
     let failures = validate_elements(&schema, elements);
@@ -151,10 +123,7 @@ fn full_form_validates_against_published_schema() {
 #[test]
 fn target_transition_source_membership_is_schema_valid() {
     let schema: Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            sysmlv2_testkit::workspace_root().join("spec-refs/SysML.schema.json"),
-        )
-        .unwrap(),
+        &std::fs::read_to_string(sysmlv2_testkit::spec_ref("SysML.schema.json")).unwrap(),
     )
     .unwrap();
     for with_library in [false, true] {
@@ -332,7 +301,7 @@ fn recovery_annotations_are_schema_valid_and_round_trip() {
     assert_eq!(bodies, ["Missing", "UnknownType", "unknownAttr"]);
 
     // Schema validity of the whole document, injected elements included.
-    let path = sysmlv2_testkit::workspace_root().join("spec-refs/SysML.schema.json");
+    let path = sysmlv2_testkit::spec_ref("SysML.schema.json");
     let schema: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let failures = validate_elements(&schema, &elements);
     assert!(failures.is_empty(), "{failures:#?}");
@@ -362,6 +331,183 @@ fn recovery_annotations_are_schema_valid_and_round_trip() {
             .count(),
         3
     );
+}
+
+/// The unit route under a closure level reads the closures from the
+/// loaded document's projection and keeps the compact route's ids; when
+/// the loader cannot keep that projection (a row it cannot pair) the
+/// closure levels refuse with `EmissionError::ClosuresUnavailable` and its
+/// reason, where the passthrough level still writes the document with the
+/// array-level derivation and `[]` closures.
+#[test]
+fn unit_route_closure_level_refuses_without_a_projection() {
+    use sysmlv2_parser::full::{
+        EmissionError, EmissionPolicy, UnresolvedReferencePolicy, from_compact_value_with_emission,
+    };
+    use sysmlv2_parser::json::ClosurePolicy;
+    let src = "package Export {\n    port def Out { out attribute v : ScalarValues::Real; }\n    part def Box {\n        port i : ~Out;\n        attribute a : ScalarValues::Real = 1.0;\n        attribute sum : ScalarValues::Real = a + 2.0;\n    }\n    part def Big :> Box;\n}\n";
+    let parse = parse_source(src);
+    assert!(parse.diagnostics.is_empty());
+    let compact = sysmlv2_parser::json::to_compact_json(&parse.unit);
+    let closure = EmissionPolicy {
+        unresolved: UnresolvedReferencePolicy::Preserve,
+        closures: ClosurePolicy::Closure {
+            include_implied: false,
+        },
+    };
+    let big = |v: &Value| -> Option<usize> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["declaredName"] == "Big")
+            .map(|e| e["inheritedFeature"].as_array().unwrap().len())
+    };
+    let ids = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["@id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // The intact unit: the closures written, the ids the compact route's.
+    let passthrough = from_compact_value_with_emission(
+        compact.clone(),
+        &HashMap::new(),
+        EmissionPolicy::default(),
+    )
+    .unwrap();
+    let closed =
+        from_compact_value_with_emission(compact.clone(), &HashMap::new(), closure).unwrap();
+    assert_eq!(closed.as_array().unwrap().len(), 65);
+    assert_eq!(big(&closed), Some(3));
+    assert_eq!(big(&passthrough), Some(0));
+    assert_eq!(ids(&passthrough), ids(&closed));
+    assert_eq!(
+        passthrough.as_array().unwrap().len(),
+        closed.as_array().unwrap().len()
+    );
+    // The same document with one orphan row the loader cannot pair: the
+    // projection is dropped, so a closure level refuses with the reason.
+    let mut tampered = compact;
+    tampered.as_array_mut().unwrap().push(json!({
+        "@id": "11111111-2222-5333-8444-555555555555",
+        "@type": "Feature",
+        "declaredName": "orphan"
+    }));
+    let err =
+        from_compact_value_with_emission(tampered.clone(), &HashMap::new(), closure).unwrap_err();
+    let EmissionError::ClosuresUnavailable { warnings } = &err else {
+        panic!("{err:?}");
+    };
+    assert!(!warnings.is_empty());
+    let text = err.to_string();
+    assert!(text.contains("closures cannot be written"), "{text}");
+    assert!(
+        text.contains("11111111-2222-5333-8444-555555555555"),
+        "the reason names the row the loader could not place: {text}"
+    );
+    // The passthrough level still writes it, with `[]` for the closures.
+    let fallback =
+        from_compact_value_with_emission(tampered, &HashMap::new(), EmissionPolicy::default())
+            .unwrap();
+    assert_eq!(fallback.as_array().unwrap().len(), 49);
+    assert_eq!(big(&fallback), Some(0));
+    assert!(
+        fallback
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["declaredName"] == "orphan")
+    );
+}
+
+/// A recovery annotation hangs off the referencing element's document
+/// root, a reference written on a relationship included (#56): the walk
+/// to the root continues through the element that owns a typing, a
+/// specialization or a membership, so no note is owned by a relationship,
+/// one note serves every reference of a name in the document, and the
+/// ids keep their recipe over the root's id. The editor's writer mirrors
+/// this walk byte for byte.
+#[test]
+fn recovery_annotations_hang_off_the_document_root() {
+    let src = "package P {
+        part def Box;
+        part broken : Missing;
+        part def D :> Missing2 { attribute a :> Missing3; attribute b : Missing; }
+        alias Ali for Missing4;
+    }";
+    let parse = parse_source(src);
+    assert!(parse.diagnostics.is_empty());
+    let full = sysmlv2_parser::full::to_full_json_with(&parse.unit, true);
+    let elements = full.as_array().unwrap();
+    let root = elements
+        .iter()
+        .find(|e| e["@type"] == "Namespace" && e["owningRelationship"].is_null())
+        .expect("the unit's root namespace");
+    let root_id = root["@id"].as_str().unwrap();
+    let notes: Vec<&Value> = elements
+        .iter()
+        .filter(|e| e["language"] == sysmlv2_parser::full::UNRESOLVED_REP_LANGUAGE)
+        .collect();
+    let mut bodies: Vec<&str> = notes.iter().map(|n| n["body"].as_str().unwrap()).collect();
+    bodies.sort_unstable();
+    assert_eq!(
+        bodies,
+        ["Missing", "Missing2", "Missing3", "Missing4"],
+        "one note per name, however many references spell it"
+    );
+    for note in &notes {
+        let name = note["body"].as_str().unwrap();
+        let membership = find_id(
+            elements,
+            ref_of_prop(note, "owningRelationship").unwrap().as_str(),
+        );
+        assert_eq!(membership["@type"], "OwningMembership");
+        assert_eq!(
+            ref_of_prop(membership, "owningRelatedElement").as_deref(),
+            Some(root_id),
+            "{name}'s note hangs off the root namespace"
+        );
+        let recipe = |prefix: &str| {
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{prefix}:{root_id}:{name}").as_bytes(),
+            )
+            .to_string()
+        };
+        assert_eq!(membership["@id"], recipe("unresolved-rep-m"));
+        assert_eq!(note["@id"], recipe("unresolved-rep"));
+        assert!(
+            refs_of_prop(root, "ownedRelationship").contains(&elem_id(membership)),
+            "the root lists {name}'s membership"
+        );
+    }
+    // No relationship owns a note.
+    for e in elements {
+        if e["@type"] == "OwningMembership"
+            && refs_of_prop(e, "ownedRelatedElement")
+                .iter()
+                .any(|id| notes.iter().any(|n| elem_id(n) == *id))
+        {
+            let owner = find_id(
+                elements,
+                ref_of_prop(e, "owningRelatedElement").unwrap().as_str(),
+            );
+            assert_eq!(owner["@id"], root_id, "{}", owner["@type"]);
+        }
+    }
+    // The lift still restores every spelling.
+    let lifted = sysmlv2_parser::lift::from_compact_json(&full).unwrap();
+    assert!(lifted.errors.is_empty(), "{:#?}", lifted.errors);
+    let text = sysmlv2_parser::print::print_source(&lifted.unit);
+    for spelling in [
+        ": Missing;",
+        ":> Missing2",
+        ":> Missing3",
+        "alias Ali for Missing4",
+    ] {
+        assert!(text.contains(spelling), "{spelling}: {text}");
+    }
 }
 
 /// A `doc`, `comment`, `rep`, or `dependency` written with an
@@ -586,7 +732,26 @@ fn owning_properties_and_multiplicity_derive() {
         .find(|e| e.get("@id").and_then(Value::as_str) == Some(mult.as_str()))
         .unwrap();
     assert_eq!(mr.get("@type").unwrap(), "MultiplicityRange");
-    assert!(by_name("mass").get("multiplicity").unwrap().is_null());
+    // An attribute without a written one owns the default (SysML 7.6.3):
+    // a bound-less Multiplicity, its last owned member.
+    let mult = ref_id(by_name("mass"), "multiplicity").expect("mass has the default multiplicity");
+    let m = elements
+        .iter()
+        .find(|e| e.get("@id").and_then(Value::as_str) == Some(mult.as_str()))
+        .unwrap();
+    assert_eq!(m.get("@type").unwrap(), "Multiplicity");
+    assert!(m.get("declaredName").unwrap().is_null());
+    assert_eq!(
+        by_name("mass")
+            .get("ownedMember")
+            .and_then(Value::as_array)
+            .and_then(|members| members.last())
+            .and_then(|last| last.get("@id"))
+            .and_then(Value::as_str),
+        Some(mult.as_str())
+    );
+    // A package-owned usage has no owning type and takes no default.
+    assert!(v.get("multiplicity").unwrap().is_null());
 }
 
 fn find_named<'a>(elements: &'a [Value], name: &str) -> &'a Value {
@@ -1317,8 +1482,8 @@ fn full_export_preserves_owned_scalar_defaults_and_explicit_values() {
 }
 
 #[test]
-fn operator_result_exports_the_library_return_parameter() {
-    use sysmlv2_parser::json::{Derived, DerivedValue, ResolvedModel};
+fn operator_result_exports_its_generated_result_parameter() {
+    use sysmlv2_parser::json::{ClosurePolicy, Derived, DerivedValue, ResolvedModel};
     let mut model = Model::new();
     assert!(model.add_library_source("operators.kerml", "standard library package DataFunctions { function '+' { in x; in y; return sum; } }").diagnostics.is_empty());
     assert!(
@@ -1328,7 +1493,10 @@ fn operator_result_exports_the_library_return_parameter() {
             .is_empty()
     );
     let mut resolved = ResolvedModel::build(&model);
-    let result = resolved
+    resolved.set_closure_policy(ClosurePolicy::Closure {
+        include_implied: true,
+    });
+    let library_result = resolved
         .resolve_qualified("DataFunctions::'+'::sum")
         .unwrap();
     let full = model_to_full_json(&model);
@@ -1341,17 +1509,38 @@ fn operator_result_exports_the_library_return_parameter() {
     let e = resolved
         .element_by_id(operator["@id"].as_str().unwrap())
         .unwrap();
+    // The operator owns its result (the grammar's empty result member,
+    // generated); the library function's result is what it redefines, not
+    // what `result` answers.
+    let Derived::Value(DerivedValue::Element(result)) = resolved.derived(e, "result") else {
+        panic!("the operator derives its result");
+    };
+    assert_ne!(result, library_result);
+    let membership = resolved
+        .implied_relationships(e)
+        .into_iter()
+        .find(|&row| resolved.element_type(row) == "ReturnParameterMembership")
+        .expect("the generated result membership");
     assert_eq!(
-        resolved.derived(e, "result"),
-        Derived::Value(DerivedValue::Element(result))
+        resolved.relationship_ends(membership).1,
+        vec![sysmlv2_parser::json::Reference::Element(result)]
     );
     assert_eq!(
         operator["result"],
         json!({"@id": resolved.element_id(result).to_string()})
     );
-    assert_ne!(operator["result"]["@id"], operator["@id"]);
-    // The compatibility improvement does not claim complete checked expression evidence.
-    assert!(resolved.property(e, "result").is_err());
+    let generated = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["@id"] == operator["result"]["@id"])
+        .expect("the generated result is exported");
+    assert_eq!(generated["@type"], "Feature");
+    assert_eq!(generated["direction"], "out");
+    assert_eq!(
+        resolved.property(e, "result").unwrap(),
+        json!({"@id": resolved.element_id(result).to_string()})
+    );
 }
 
 #[test]
@@ -1372,11 +1561,10 @@ fn missing_port_and_operator_targets_remain_unavailable_to_checked_reads() {
         .elements()
         .filter_map(|e| match resolved.element_type(e) {
             "ConjugatedPortTyping" => Some((e, "portDefinition")),
-            "OperatorExpression" => Some((e, "result")),
             _ => None,
         })
         .collect();
-    assert_eq!(receivers.len(), 2);
+    assert_eq!(receivers.len(), 1);
     for (e, property) in receivers {
         assert_eq!(
             resolved.derived(e, property),
@@ -1384,4 +1572,19 @@ fn missing_port_and_operator_targets_remain_unavailable_to_checked_reads() {
         );
         assert!(resolved.property(e, property).is_err());
     }
+    // The operator's result is its own generated parameter, whatever its
+    // function resolves to; its function stays unavailable.
+    let operator = resolved
+        .elements()
+        .find(|&e| resolved.element_type(e) == "OperatorExpression")
+        .unwrap();
+    assert!(matches!(
+        resolved.derived(operator, "result"),
+        Derived::Value(DerivedValue::Element(_))
+    ));
+    assert_eq!(
+        resolved.derived(operator, "function"),
+        Derived::Value(DerivedValue::Null)
+    );
+    assert!(resolved.property(operator, "function").is_err());
 }

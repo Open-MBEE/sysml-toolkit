@@ -40,10 +40,14 @@ fn ref_is(row: &Elem, key: &str, id: Uuid) -> bool {
 /// The recipe factory supplies roles; this gate validates their complete local
 /// membership path and the nonvariable defaults that justify owned featuring.
 pub(super) fn valid(b: &Builder, rows: &[Elem], role: Role) -> bool {
-    b.elements
-        .get(role.anchor)
-        .is_some_and(|anchor| anchor.ty == "FeatureReferenceExpression")
-        && valid_path(b, rows, role, role.anchor, true)
+    // The anchors the result family generates results for: a feature
+    // reference's (with its binding's ends), an operator, invocation,
+    // trigger or chain expression's result alone.
+    b.elements.get(role.anchor).is_some_and(|anchor| {
+        anchor.ty == "FeatureReferenceExpression"
+            || (super::owned_results::generated_result_kind(anchor.ty)
+                && role.target == role.anchor)
+    }) && valid_path(b, rows, role, role.anchor, true)
 }
 
 /// The result factory's BindingConnector is owned by the referenced expression
@@ -270,7 +274,7 @@ mod tests {
         ResolvedModel::build(&m)
     }
     fn staging(r: &mut ResolvedModel) -> (Vec<Elem>, Vec<Role>, SemanticOwnership) {
-        let plans = super::super::owned_results::plan_reference_results(&mut r.b, &mut 0).unwrap();
+        let plans = super::super::owned_results::plan_expression_results(&mut r.b, &mut 0).unwrap();
         let mut rows = Vec::new();
         let mut roles = Vec::new();
         let mut view = SemanticOwnership::new(r.b.elements.len(), None);
@@ -361,6 +365,7 @@ mod tests {
             .filter(|&e| r.element_type(e) == "FeatureReferenceExpression")
             .collect();
         assert_eq!(calls.len(), 2);
+        let staged_from = r.b.elements.len();
         let (old, _, _) = staging(&mut r);
         let call = r
             .user_elements()
@@ -368,18 +373,26 @@ mod tests {
             .unwrap();
         r.implied_relationships(call);
         let boundary = r.b.implied.as_ref().unwrap().owned_results_from;
+        // The invocation's callee typing and its argument's redefinition
+        // are static rows before the result tail: the rows staged against
+        // the authored length alone sit that much further on.
+        let shift = boundary - staged_from;
         let dynamic = r.b.dynamic_graph.as_ref().unwrap();
         assert_eq!(dynamic.outcome, Outcome::Accepted);
         assert_eq!(dynamic.local_featuring_outcome, Outcome::Accepted);
         let dynamic_len = dynamic.plan.as_ref().unwrap().tail.len();
         let auxiliary = boundary + old.len() + dynamic_len;
-        assert_eq!(r.b.elements.len(), auxiliary + 6);
+        // Three featuring rows per reference, one for the invocation's result.
+        assert_eq!(r.b.elements.len(), auxiliary + 7);
         for (offset, prior) in old.iter().enumerate() {
             let row = &r.b.elements[boundary + offset];
             assert_eq!(row.id, prior.id);
             assert_eq!(row.ty, prior.ty);
             assert_eq!(row.props.to_json(), prior.props.to_json());
-            assert_eq!(row.owning_relationship, prior.owning_relationship);
+            assert_eq!(
+                row.owning_relationship,
+                prior.owning_relationship.map(|i| i + shift)
+            );
             assert!(
                 row.owned_relationships
                     .iter()
@@ -389,7 +402,7 @@ mod tests {
                         &prior
                             .owned_relationships
                             .iter()
-                            .copied()
+                            .map(|&i| i + shift)
                             .collect::<Vec<_>>()
                     )
             );
@@ -428,10 +441,12 @@ mod tests {
         let snapshot = r.b.dynamic_graph.as_ref().unwrap();
         assert!(matches!(snapshot.outcome, Outcome::Declined(_)));
         assert_eq!(snapshot.local_featuring_outcome, Outcome::Accepted);
-        assert_eq!(snapshot.local_featuring.as_ref().unwrap().len(), 3);
+        // The reference's result and binding ends, and the invocation's
+        // result (generated whatever its callee resolves to).
+        assert_eq!(snapshot.local_featuring.as_ref().unwrap().len(), 4);
         assert_eq!(
             r.b.elements.len() - r.b.implied.as_ref().unwrap().owned_results_from,
-            14
+            17
         );
         let result =
             r.b.semantic_ownership

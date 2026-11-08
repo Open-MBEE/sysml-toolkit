@@ -33,6 +33,16 @@ fn checked_properties_and_strict_export() {
     let i = s.resolve("P::I").unwrap();
     assert_eq!(s.property(&i, "isSufficient").unwrap(), "true");
     assert!(s.to_full_json_strict().is_err());
+    // The checked export keeps the rows and lists the refusals beside them.
+    let checked: serde_json::Value =
+        serde_json::from_str(&s.to_full_json_checked().unwrap()).unwrap();
+    assert!(!checked["elements"].as_array().unwrap().is_empty());
+    let issues = checked["issues"].as_array().unwrap();
+    assert!(!issues.is_empty());
+    assert!(issues.iter().all(|i| i["elementId"].is_string()
+        && i["property"].is_string()
+        && i["kind"].is_string()
+        && i["reason"].is_string()));
     let mut s = Session::from_sources(&sources(&[("m.sysml", "package P;")])).unwrap();
     assert!(
         s.to_full_json_strict()
@@ -106,7 +116,27 @@ fn units_and_interchange_roundtrip() {
             .contains("part def Battery")
     );
 
-    let full = s.to_full_json(true);
+    let full = s.to_full_json(true, None).unwrap();
+    // The closures are an option of the export: the default writes `[]`
+    // for the closure names (`featuringType` of `body` among them),
+    // "closure" their values.
+    let body_row = |doc: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(doc)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["declaredName"] == "body")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(body_row(&full)["featuringType"], serde_json::json!([]));
+    let closed = s.to_full_json(true, Some("closure".into())).unwrap();
+    assert_eq!(
+        body_row(&closed)["featuringType"].as_array().unwrap().len(),
+        1
+    );
+    assert!(s.to_full_json(true, Some("all".into())).is_err());
     let mut back = Session::from_interchange_json(&full, None, None, None, None).unwrap();
     assert!(back.resolve("Flashlight::flashlight::battery").is_some());
     assert_eq!(back.unresolved_count(), 0);
@@ -1333,6 +1363,91 @@ fn references_name_library_units_as_the_language_server_does() {
         })
         .collect();
     assert_eq!(from_session, from_server);
+}
+
+/// With the host's library directory set on the module and given to the
+/// language server as its `libraryRoot`, both name a library unit as the
+/// file under that directory; cleared, both name it under the scheme
+/// again. A root that is no uri is refused and changes nothing.
+#[test]
+fn a_library_root_names_library_units_as_files_on_both_sides() {
+    let lib_unit = (
+        "Mini Lib/MiniLib.sysml",
+        "package MiniLib {\n    part def Widget;\n}\n",
+    );
+    let user = "file:///w/m.sysml";
+    let user_text = "package P {\n    part g : MiniLib::Widget;\n}\n";
+    let library = sources(&[lib_unit]);
+    let mut s = Session::from_sources(&sources(&[(user, user_text)])).unwrap();
+    s.load_library_sources(&library, None).unwrap();
+    let declared_in = |s: &mut Session| {
+        let report: serde_json::Value =
+            serde_json::from_str(&s.references("MiniLib::Widget").unwrap()).unwrap();
+        report["declaration"]["unit"].as_str().unwrap().to_string()
+    };
+    assert_eq!(sysmlv2_wasm::library_root(), None);
+    assert_eq!(declared_in(&mut s), "sysmlv2-lib:/Mini%20Lib/MiniLib.sysml");
+    sysmlv2_wasm::set_library_root(Some("file:///w/.libs".to_string()), None).unwrap();
+    assert_eq!(
+        sysmlv2_wasm::library_root().as_deref(),
+        Some("file:///w/.libs/")
+    );
+    assert_eq!(
+        declared_in(&mut s),
+        "file:///w/.libs/Mini%20Lib/MiniLib.sysml"
+    );
+    assert!(sysmlv2_wasm::set_library_root(Some("no uri".to_string()), None).is_err());
+    assert!(
+        sysmlv2_wasm::set_library_root(
+            Some("file:///w/.libs".to_string()),
+            Some("[\"Mini Lib\"]".to_string())
+        )
+        .is_err()
+    );
+    assert_eq!(
+        sysmlv2_wasm::library_root().as_deref(),
+        Some("file:///w/.libs/")
+    );
+    let mut lsp = sysmlv2_wasm::LspServer::with_library(&library, None).unwrap();
+    lsp.handle(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},
+            "initializationOptions":{"libraryRoot":"file:///w/.libs"}}}"#,
+    )
+    .unwrap();
+    lsp.handle(
+        &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            "textDocument": {"uri": user, "languageId": "sysml", "version": 1, "text": user_text}}})
+        .to_string(),
+    )
+    .unwrap();
+    let request =
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/definition",
+        "params": {"textDocument": {"uri": user}, "position": {"line": 1, "character": 23}}})
+        .to_string();
+    let response = lsp
+        .handle(&request)
+        .unwrap()
+        .into_iter()
+        .map(|m| serde_json::from_str::<serde_json::Value>(&m).unwrap())
+        .find(|m| m["id"] == 2)
+        .expect("a response");
+    assert_eq!(
+        response["result"]["uri"].as_str(),
+        Some("file:///w/.libs/Mini%20Lib/MiniLib.sysml")
+    );
+    // A directory the host shows under another name.
+    sysmlv2_wasm::set_library_root(
+        Some("file:///w/.libs".to_string()),
+        Some(r#"{"Mini Lib": "Own Libraries"}"#.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        declared_in(&mut s),
+        "file:///w/.libs/Own%20Libraries/MiniLib.sysml"
+    );
+    sysmlv2_wasm::set_library_root(None, None).unwrap();
+    assert_eq!(sysmlv2_wasm::library_root(), None);
+    assert_eq!(declared_in(&mut s), "sysmlv2-lib:/Mini%20Lib/MiniLib.sysml");
 }
 
 #[test]

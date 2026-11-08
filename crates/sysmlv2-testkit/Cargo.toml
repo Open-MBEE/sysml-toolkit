@@ -9,3 +9,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The published interchange schema, for the full-form validation helper.
+jsonschema.workspace = true
+serde_json.workspace = true

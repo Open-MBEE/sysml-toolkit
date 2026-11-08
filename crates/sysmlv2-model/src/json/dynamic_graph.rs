@@ -167,6 +167,34 @@ impl Builder {
                 || snapshot.result_redefinition_current(self)
         })
     }
+    /// Whether a generated result feature's redefinitions are published:
+    /// the result-redefinition family accepted it and is current. Any other
+    /// feature is unaffected. A list over an expression whose generated
+    /// result lacks its redefinitions would show the inherited result
+    /// beside it, so the lists refuse until the family has it.
+    pub(super) fn generated_result_certified(&self, feature: usize) -> bool {
+        let generated = self.semantic_ownership.as_ref().is_some_and(|view| {
+            view.contains(feature)
+                && self.elements[feature]
+                    .owning_relationship
+                    .is_some_and(|membership| {
+                        crate::metaclass::is_a!(
+                            self.elements[membership],
+                            "ReturnParameterMembership"
+                        )
+                    })
+        });
+        if !generated {
+            return true;
+        }
+        self.dynamic_graph.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .result_redefinition
+                .as_ref()
+                .is_some_and(|evidence| evidence.sources.contains(&feature))
+                && snapshot.result_redefinition_current(self)
+        })
+    }
     pub(super) fn result_redefinition_row_current(&self, row: usize) -> bool {
         self.dynamic_graph.as_ref().is_none_or(|snapshot| {
             !snapshot
@@ -200,13 +228,27 @@ impl Builder {
         if let Some(value) = snapshot.typing.get() {
             return Some(Arc::clone(value));
         }
+        // The prepared library's own materialized rows come first, as they
+        // do among a build's fixed recipes: a library feature's retained
+        // typing and subsetting lie there, not in the build's static rows
+        // (a quantity attribute's `type` reads its library bases through
+        // them).
+        let library = self.prefix_static_candidates();
         *steps = steps
+            .saturating_add(library.len())
             .saturating_add(plan.static_prefix.rows.len())
             .saturating_add(plan.tail.len());
         if *steps > crate::eval::MAX_STEPS {
             return None;
         }
         let mut values = super::implied::RetainedTypings::default();
+        for &(owner, (kind, _, _, target)) in library.iter() {
+            if crate::metaclass::conforms(kind, "FeatureTyping")
+                || crate::metaclass::conforms(kind, "Subsetting")
+            {
+                values.entry(owner).or_default().push((kind, target));
+            }
+        }
         for edge in plan.static_prefix.rows.iter().chain(&plan.tail) {
             if crate::metaclass::conforms(edge.kind, "FeatureTyping")
                 || crate::metaclass::conforms(edge.kind, "Subsetting")
@@ -376,17 +418,28 @@ mod tests {
                 .unwrap()
                 .contains(&f.0)
         );
+        // The callee typing and the argument's redefinition are the static
+        // plan's rows; the dynamic plan adds nothing over them.
         assert!(
-            plan.tail
+            plan.static_prefix
+                .rows
+                .iter()
+                .any(|e| e.owner == call.0 && e.target == r.element_id(f))
+        );
+        assert!(
+            !plan
+                .tail
                 .iter()
                 .any(|e| e.owner == call.0 && e.target == r.element_id(f))
         );
         let parameter = plan
-            .tail
+            .static_prefix
+            .rows
             .iter()
             .find(|e| e.kind == "Redefinition" && e.target == r.element_id(p))
             .unwrap()
             .owner;
+        assert!(plan.tail.is_empty());
         assert!(
             r.b.cardinality_positional_targets(parameter, &mut 0)
                 .unwrap()
@@ -423,11 +476,14 @@ mod tests {
         );
         assert_eq!(
             r.b.elements.len() - r.b.implied.as_ref().unwrap().owned_results_from,
-            14
+            17
         );
     }
     #[test]
-    fn explicit_dynamic_and_result_ids_keep_handles_and_logical_endpoints() {
+    fn explicit_static_and_result_ids_keep_handles_and_logical_endpoints() {
+        // The callee typing is the static plan's row; an explicit id on it,
+        // on a generated result and on the callee keeps the handles and
+        // the logical endpoints through the snapshot's remap.
         let mut r = fixture(
             "function F {in p; return result;} feature n; feature read=n; feature call=F(1);",
         );
@@ -443,7 +499,22 @@ mod tests {
         r.implied_relationships(call);
         let snapshot = r.b.dynamic_graph.clone().unwrap();
         assert_eq!(snapshot.outcome, Outcome::Accepted);
-        let dynamic_id = snapshot.plan.as_ref().unwrap().tail[0].id;
+        assert!(snapshot.plan.as_ref().unwrap().tail.is_empty());
+        let dynamic_id = r
+            .implied_relationships(call)
+            .into_iter()
+            .map(|row| r.element_id(row))
+            .find(|&id| {
+                snapshot
+                    .plan
+                    .as_ref()
+                    .unwrap()
+                    .static_prefix
+                    .rows
+                    .iter()
+                    .any(|e| e.id == id && e.kind == "FeatureTyping")
+            })
+            .unwrap();
         let dynamic_handle = r.element_by_id(&dynamic_id.to_string()).unwrap();
         let result =
             r.b.semantic_ownership
@@ -473,23 +544,15 @@ mod tests {
         let current = r.b.dynamic_graph.as_ref().unwrap();
         assert!(!Arc::ptr_eq(&snapshot, current));
         assert!(current.epoch.same_as(&r.b.publication.revision()));
-        assert!(
-            current
-                .plan
-                .as_ref()
-                .unwrap()
-                .tail
-                .iter()
-                .any(|e| e.id == new_dynamic)
-        );
-        assert!(
-            current
-                .plan
-                .as_ref()
-                .unwrap()
-                .tail
-                .iter()
-                .any(|e| e.target == new_f)
+        let rows = &current.plan.as_ref().unwrap().static_prefix.rows;
+        assert!(rows.iter().any(|e| e.id == new_dynamic));
+        assert!(rows.iter().any(|e| e.target == new_f));
+        assert_eq!(
+            r.b.elements[dynamic_handle.0]
+                .props
+                .get("type")
+                .and_then(|v| v.as_reference()),
+            Some(new_f)
         );
         r.implied_relationships(call);
         assert_eq!(r.b.elements.len(), before);
@@ -758,14 +821,20 @@ mod replay_tests {
             );
         }
         r.implied_relationships(call);
+        // The callee resolves now, so the static plan predicts its typing
+        // row, which the rows materialized before the binding lack: a
+        // changed static prediction cannot rewrite old rows, so the dynamic
+        // plan declines until a rebuild (binding is to precede the first
+        // implied read, see `bind_id_spelled_references`); the result
+        // family rebuilds on its own.
         assert_eq!(
             r.b.dynamic_graph.as_ref().unwrap().outcome,
-            Outcome::Accepted
+            Outcome::Declined(Refusal::StaticMismatch)
         );
+        // The stale static rows prove no bases either.
         assert!(
             r.b.value_context_bases(call.0, &mut 0)
-                .unwrap()
-                .contains(&f.0)
+                .is_none_or(|bases| !bases.contains(&f.0))
         );
         assert_eq!(
             r.b.elements
@@ -1028,7 +1097,10 @@ mod refusal_tests {
         ResolvedModel::build(&m)
     }
     #[test]
-    fn dynamic_row_collision_preserves_admitted_result_family() {
+    fn static_recipe_collision_is_a_duplicate_identity() {
+        // The callee typing is the static plan's row: a source element
+        // carrying its recipe id makes the identities ambiguous, and no
+        // semantic family certifies anything over them.
         let mut r = fixture();
         let f = r.resolve_qualified("F").unwrap();
         let spare = r.resolve_qualified("spare").unwrap();
@@ -1053,26 +1125,17 @@ mod refusal_tests {
         r.implied_relationships(call);
         assert!(matches!(
             r.b.dynamic_graph.as_ref().unwrap().outcome,
-            Outcome::Declined(Refusal::Collision)
+            Outcome::Declined(_)
         ));
+        assert_eq!(r.b.literal_identities_unique(None), Some(false));
         assert!(
             r.b.semantic_ownership
                 .as_ref()
                 .unwrap()
                 .result(reference.0)
-                .is_some()
+                .is_none()
         );
-        assert_eq!(
-            r.b.elements
-                .iter()
-                .filter(|e| e.ty == "BindingConnector")
-                .count(),
-            1
-        );
-        assert_eq!(
-            r.b.elements.len() - r.b.implied.as_ref().unwrap().owned_results_from,
-            14
-        );
+        assert!(r.property(call, "type").is_err());
     }
     #[test]
     fn exhausted_dynamic_preparation_preserves_admitted_result_family_and_is_cached() {
@@ -1105,7 +1168,7 @@ mod refusal_tests {
         );
         assert_eq!(
             r.b.elements.len() - r.b.implied.as_ref().unwrap().owned_results_from,
-            14
+            17
         );
         let count = r.b.elements.len();
         r.implied_relationships(call);

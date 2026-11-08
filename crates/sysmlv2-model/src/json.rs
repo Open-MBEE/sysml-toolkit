@@ -112,8 +112,10 @@ pub use operations::{
 pub use parameter_context::RuntimeParameterSelection;
 pub use parameters::{ParameterBinding, ReferenceIdentity};
 pub use runtime_frames::{RuntimeFrame, RuntimeFrameProof};
-pub use semantic::{ConditionalPropertyCapability, conditional_property_capability};
-pub use semantic::{PropertyError, PropertyIssue, SemanticExportError};
+pub use semantic::{CheckedExport, PropertyError, PropertyIssue, SemanticExportError};
+pub use semantic::{
+    ConditionalPropertyCapability, FeatureStructureIssue, conditional_property_capability,
+};
 pub use value_context::{ValueScopeDecision, ValueScopeResolver};
 
 use serde_json::{Map, Value, json};
@@ -4216,6 +4218,53 @@ impl Builder {
         );
     }
 
+    /// The feature chain a chain step's multi-link member names, each link
+    /// resolving in the context of the step's static spine and the links
+    /// before it (the contexts the folded chain gives its links), so the
+    /// member of `(x as T).a.b` is `a` in `T` and `b` in `a`; a `$::`-rooted
+    /// link resolves absolutely and anchors the links after it. The same
+    /// elements the generic reference path writes (the owning membership,
+    /// the chain feature, one FeatureChaining per link), so no id moves.
+    fn chain_member_links(
+        &mut self,
+        m: usize,
+        scope: usize,
+        links: &[QualifiedName],
+        base_spine: &[QualifiedName],
+    ) {
+        if self.elements[m].ty == "Membership" {
+            self.elements[m].set_ty("OwningMembership");
+        }
+        let feature = self.new_owned_element("Feature", m, "memberElement.chain");
+        for (i, link) in links.iter().enumerate() {
+            let fc = self.new_relationship("FeatureChaining", feature, &format!("chaining{i}"));
+            self.set(fc, "isImplied", json!(false));
+            let (exclude, declared_only, chain) = if link.is_global {
+                (None, false, None)
+            } else {
+                let mut c: Vec<QualifiedName> = base_spine.to_vec();
+                c.extend_from_slice(&links[..i]);
+                if let Some(g) = c.iter().rposition(|q| q.is_global) {
+                    c.drain(..g);
+                }
+                let chain = if c.is_empty() { None } else { Some(c) };
+                (self.pending_exclude, true, chain)
+            };
+            self.pending.push(PendingRef {
+                elem: fc,
+                key: "chainingFeature".to_string(),
+                scope,
+                qn: link.clone(),
+                exclude,
+                declared_only,
+                spec_idx: None,
+                chain,
+            });
+        }
+        let feature_id = self.elements[feature].id;
+        self.set(m, "memberElement", id_ref(feature_id));
+    }
+
     /// Reference another element by qualified name: resolve now if possible,
     /// otherwise record for the post-pass.
     fn set_ref(&mut self, elem: usize, key: &str, scope: usize, target: &TargetRef) {
@@ -5081,7 +5130,18 @@ impl Builder {
         if declares_variation(ty) {
             self.set(e, "isVariation", json!(is_variation));
         }
-        self.set(e, "isSufficient", json!(d.is_sufficient));
+        // `ConnectionDefinition` declares `isSufficient` true by default
+        // and by rule (`validateConnectionDefinitionIsSufficient`), and
+        // `InterfaceDefinition` and `AllocationDefinition` inherit both;
+        // the SysML grammar has no spelling for it, so the bit is the
+        // metamodel's, not the text's. Every other definition carries
+        // what the text spells (KerML `all`).
+        let is_sufficient = d.is_sufficient
+            || matches!(
+                d.kind,
+                DefKind::Connection | DefKind::Interface | DefKind::Allocation
+            );
+        self.set(e, "isSufficient", json!(is_sufficient));
         if let Some(mult) = &d.multiplicity {
             self.emit_multiplicity(e, mult, scope);
         }
@@ -5196,6 +5256,15 @@ impl Builder {
                 };
                 self.register_leaf(body_scope, &id, cpd);
             }
+        }
+        // An individual definition owns the multiplicity of its one
+        // individual (the planner subsets `Base::zeroOrOne`), after its
+        // body, unless the body already owns a multiplicity member.
+        if self.dialect == Dialect::Sysml
+            && implied::is_individual(&self.elements[e])
+            && self.local_multiplicity(e) == Some(None)
+        {
+            self.emit_default_multiplicity(e);
         }
     }
 
@@ -5732,7 +5801,12 @@ impl Builder {
         if let Some(mult) = &u.declaration.multiplicity {
             self.emit_multiplicity(e, mult, scope);
         }
-        self.finish_usage_element(u, e, scope, body_scope)
+        let e = self.finish_usage_element(u, e, scope, body_scope);
+        // After the body: the default multiplicity is the last member.
+        if self.takes_default_multiplicity(u, rel, e) {
+            self.emit_default_multiplicity(e);
+        }
+        e
     }
 
     /// Specialization clauses of a feature declaration → relationship
@@ -6094,6 +6168,84 @@ impl Builder {
         self.build_expr(&mult.upper, m, scope, "bound");
     }
 
+    /// The multiplicity a usage or an individual definition owns without
+    /// writing one (SysML 7.6.3 for a usage, the one individual of an
+    /// `individual` definition): an OwningMembership owning an unnamed,
+    /// bound-less `Multiplicity` with no relationships of its own (the
+    /// shape the pilot implementation's exports write), appended after
+    /// everything the text wrote, so no positional id moves (IDS.md) and
+    /// no member extent is recorded for it. Its bounds are the implied
+    /// Subsetting the planner gives that shape
+    /// (`implied::default_multiplicity_role`: `Base::exactlyOne` under a
+    /// feature, `Base::zeroOrOne` under an individual definition), which
+    /// the evaluator reads the same way without the row. The membership
+    /// is a stored member, not an implied relationship: the lift drops
+    /// the shape where the lowering writes it again, so the text
+    /// round-trips, and the payload loader pairs the row with its
+    /// re-lowered twin as it pairs every stored row (an implied row is
+    /// left out of that pairing).
+    fn emit_default_multiplicity(&mut self, owner: usize) {
+        let om = self.new_relationship("OwningMembership", owner, "multiplicity");
+        self.set(om, "isImplied", json!(false));
+        self.set(om, "visibility", json!("public"));
+        self.new_owned_element("Multiplicity", om, "default");
+    }
+
+    /// Whether a usage takes the default multiplicity (SysML 7.6.3): an
+    /// end feature, or an attribute, item or port usage
+    /// (`structural_usage`: connections and reference usages excluded)
+    /// that its owning type features (a FeatureMembership-family
+    /// membership; a variant and a namespace-owned usage have no owning
+    /// type) and that neither declares a multiplicity nor subsets,
+    /// redefines or references another feature. That third condition is
+    /// the specification's; the evaluator's default (`default_cardinality`
+    /// after `cardinality_subset_targets`) reads it the same way, where
+    /// the pilot implementation writes the default under a subsetting
+    /// usage too. A body that declares its own `multiplicity` member keeps
+    /// that one (`validateTypeOwnedMultiplicity`), and KerML features take
+    /// no default.
+    fn takes_default_multiplicity(&self, u: &Usage, rel: usize, e: usize) -> bool {
+        if self.dialect != Dialect::Sysml
+            || u.declaration.multiplicity.is_some()
+            || self.local_multiplicity(e) != Some(None)
+        {
+            return false;
+        }
+        if u.prefix.is_end {
+            return true;
+        }
+        self.structural_usage(e)
+            && is_a!(self.elements[rel], "FeatureMembership")
+            && u.declaration
+                .specializations
+                .iter()
+                .all(|s| matches!(s, FeatureSpecialization::TypedBy(_)))
+    }
+
+    /// The library multiplicity a synthesized default multiplicity member
+    /// (`emit_default_multiplicity`) subsets, read off its membership and
+    /// owner as the planner reads it; `None` for any other element.
+    pub(crate) fn default_multiplicity_role(&mut self, m: usize) -> Option<&'static str> {
+        let membership = self.elements[m].owning_relationship?;
+        let owner = self.elements[membership]
+            .props
+            .get("owningRelatedElement")?
+            .as_reference()?;
+        let owner = self.element_index_of_uuid(owner)?;
+        implied::default_multiplicity_role(
+            &self.elements[m],
+            &self.elements[membership],
+            &self.elements[owner],
+        )
+    }
+
+    /// The bounds of a synthesized default multiplicity member: those of
+    /// the library range its planned Subsetting names, without the row.
+    pub(crate) fn default_multiplicity_bounds(&mut self, m: usize) -> Option<(i128, Option<i128>)> {
+        self.default_multiplicity_role(m)
+            .map(implied::default_multiplicity_bounds)
+    }
+
     /// The metaclass of anonymous reference features (connector ends, node
     /// parameters): ReferenceUsage in SysML, plain Feature in KerML.
     /// SysML usages spell defaultless `isVariation` even when synthesized
@@ -6180,16 +6332,28 @@ impl Builder {
             let ru_id = self.elements[ru].id;
             self.set(rs, "subsettingFeature", id_ref(ru_id));
         }
+        // A connector end is an end feature: the default multiplicity
+        // (SysML 7.6.3), after its reference.
+        if self.dialect == Dialect::Sysml && end.multiplicity.is_none() {
+            self.emit_default_multiplicity(ru);
+        }
         ru
     }
 
     /// Payload feature of flows/messages/accept actions. Flow payloads own
     /// via FeatureMembership (pilot PayloadFeatureMember); accept payloads
-    /// are `inout` parameters (pilot PayloadParameterMember).
+    /// are `inout` parameters (pilot PayloadParameterMember). An accept's
+    /// trigger (`accept x at t`) is the payload parameter's value (pilot
+    /// `TriggerValuePart`: a FeatureValue owning the
+    /// TriggerInvocationExpression, whose argument sits under a
+    /// ParameterMembership as a parameter Feature owning a FeatureValue,
+    /// like every other argument); a written `= value` and a trigger are
+    /// mutually exclusive by the grammar.
     fn emit_payload(
         &mut self,
         parent: usize,
         payload: &PayloadPart,
+        trigger: Option<&Trigger>,
         scope: usize,
         ty: &'static str,
     ) {
@@ -6259,6 +6423,20 @@ impl Builder {
             let fv = self.new_relationship("FeatureValue", e, "value");
             self.set(fv, "isImplied", json!(false));
             self.build_expr(&value.expr, fv, scope, "expr");
+        } else if let Some(t) = trigger {
+            let kind = match t.kind {
+                TriggerKind::At => "at",
+                TriggerKind::After => "after",
+                TriggerKind::When => "when",
+            };
+            let fv = self.new_relationship("FeatureValue", e, "value");
+            self.set(fv, "isImplied", json!(false));
+            let te = self.new_owned_element("TriggerInvocationExpression", fv, "expr");
+            self.contract_exprs.insert(te, (scope, t.expr.clone()));
+            self.set(te, "kind", json!(kind));
+            let am = self.new_relationship("ParameterMembership", te, "arg");
+            self.set(am, "isImplied", json!(false));
+            self.param_wrapped_expr(am, &t.expr, scope, false);
         }
     }
 
@@ -6331,7 +6509,7 @@ impl Builder {
                 target,
             } => {
                 if let Some(p) = payload {
-                    self.emit_payload(e, p, scope, "PayloadFeature");
+                    self.emit_payload(e, p, None, scope, "PayloadFeature");
                 }
                 let mut ends = Vec::new();
                 for (i, end) in [source, target].into_iter().flatten().enumerate() {
@@ -6407,6 +6585,11 @@ impl Builder {
                         self.elem_scope.insert(elem, s);
                         self.scopes[s].owner = Some(elem);
                     }
+                    // A flow end is an end feature: the default
+                    // multiplicity (SysML 7.6.3), after its flow feature.
+                    if self.dialect == Dialect::Sysml {
+                        self.emit_default_multiplicity(fe);
+                    }
                     ends.push(fe);
                     // The flow feature's redefinition is a written one for
                     // the positional check's side table too: the end's
@@ -6480,22 +6663,10 @@ impl Builder {
                 trigger,
                 via,
             } => {
-                self.emit_payload(e, payload, scope, "ReferenceUsage");
-                if let Some(t) = trigger {
-                    let kind = match t.kind {
-                        TriggerKind::At => "at",
-                        TriggerKind::After => "after",
-                        TriggerKind::When => "when",
-                    };
-                    let pm = self.new_relationship("ParameterMembership", e, "trigger");
-                    self.set(pm, "isImplied", json!(false));
-                    let te = self.new_owned_element("TriggerInvocationExpression", pm, "trigger");
-                    self.contract_exprs.insert(te, (scope, t.expr.clone()));
-                    self.set(te, "kind", json!(kind));
-                    let am = self.new_relationship("ParameterMembership", te, "arg");
-                    self.set(am, "isImplied", json!(false));
-                    self.build_expr(&t.expr, am, scope, "expr");
-                }
+                // The trigger rides the payload parameter as its value, so
+                // the accept's parameters are the payload and, after it,
+                // the `via` receiver (pilot AcceptParameterPart).
+                self.emit_payload(e, payload, trigger.as_deref(), scope, "ReferenceUsage");
                 if let Some(via) = via {
                     // The `via` target is the accept's `receiver` parameter
                     // (pilot NodeParameterMember — an `in` parameter whose
@@ -7008,9 +7179,17 @@ impl Builder {
                             spec_idx: None,
                         });
                     }
-                    TargetRef::Chain(_) => {
-                        self.set_ref(m, "memberElement", scope, member);
-                    }
+                    // A member of several links after a static spine (a
+                    // cast's type, a name chain) resolves each link in the
+                    // spine's context, as the folded chain does; the generic
+                    // reference path resolved the first link lexically, so
+                    // `(x as T).a.b` and `(x meta T).a.b` lost their cast.
+                    TargetRef::Chain(links) => match chain_spine(target) {
+                        Some(base_spine) => {
+                            self.chain_member_links(m, scope, links, &base_spine);
+                        }
+                        None => self.set_ref(m, "memberElement", scope, member),
+                    },
                 }
                 e
             }
@@ -12196,12 +12375,14 @@ impl Builder {
     }
 
     /// The elements a semantic metadata annotation gives an implied base
-    /// (KerML 9.2 metaobject semantics): each element annotated by a
-    /// metadata usage whose definition conforms to
-    /// `Metaobjects::SemanticMetadata`. The planner does not write that
-    /// base (it is resolution-only, [`Self::semantic_base_targets`]), so the
-    /// checked audit keeps such elements out; plain metadata adds no base
-    /// and keeps nothing out. Memoized per metadata association generation.
+    /// the planner cannot write (KerML 9.2 metaobject semantics): each
+    /// element annotated by a metadata usage whose definition conforms to
+    /// `Metaobjects::SemanticMetadata` while none of its `baseType` values
+    /// resolves ([`Self::semantic_base_targets`] is empty), so the checked
+    /// audit keeps such elements out. A base that resolves is planned as a
+    /// row and required like a kind role, and plain metadata adds no base,
+    /// so neither keeps anything out. Memoized per metadata association
+    /// generation and row revision.
     pub(crate) fn semantically_annotated(
         &mut self,
     ) -> std::sync::Arc<crate::layered::IdSet<usize>> {
@@ -12244,7 +12425,7 @@ impl Builder {
                         .into_iter()
                         .any(|def| self.conforms_upward(def, sem))
                 });
-                if semantic {
+                if semantic && self.semantic_base_targets(owner, 0).is_empty() {
                     set.insert(owner);
                 }
             }
@@ -12445,7 +12626,10 @@ impl Builder {
     /// annotation even though no explicit edge is recorded. The
     /// metadata-definition conformance test inside
     /// [`Self::semantic_base_targets`] stays on the explicit walk, so the
-    /// mutual recursion terminates.
+    /// mutual recursion terminates. From a classifier the walk steps onto a
+    /// feature base and on through every explicit supertype of that
+    /// feature, where the planner specializes the feature's declared types
+    /// alone: a slightly wider walk, never narrower than the written one.
     pub(crate) fn conforms_upward_semantic(&mut self, e: usize, target: usize) -> bool {
         if e == target {
             return true;
@@ -13041,9 +13225,11 @@ fn chain_spine(e: &Expr) -> Option<Vec<QualifiedName>> {
         // chain-context path or the round-trip flips resolution outcomes.
         ExprKind::Ref(qn) => Some(vec![qn.clone()]),
         // A cast spine types the step: the member of `(x as T).m` — and of
-        // the filter idiom `(as T).m` — is a member of `T`.
+        // the filter idiom `(as T).m` — is a member of `T`; so is the
+        // member of `(x meta T).m`, a feature of the metaclass `T` (the
+        // boolean tests `istype`, `hastype`, `@` and `@@` type nothing).
         ExprKind::Classification {
-            op: ClassificationOp::As,
+            op: ClassificationOp::As | ClassificationOp::Meta,
             ty,
             ..
         } => Some(vec![ty.as_name()?.clone()]),
@@ -13866,6 +14052,13 @@ pub struct SatisfactionInfo {
     /// Subject bindings: every subject parameter in the satisfied
     /// requirement's explicit closure → the satisfaction target.
     pub overrides: std::collections::HashMap<usize, crate::eval::Value>,
+    /// Why the claim binds nothing: its `by` target is the requirement's
+    /// own subject (`satisfy r by battery;` under `requirement def R {
+    /// subject battery; }`, where the inherited subject shadows a
+    /// `battery` outside the claim), so every constraint of the claim is
+    /// undecided with this reason rather than read against the subject's
+    /// defaults.
+    pub self_bound: Option<String>,
 }
 
 /// A model lowered to the element graph with all names resolved — the
@@ -15698,6 +15891,21 @@ impl ResolvedModel {
             .collect()
     }
 
+    /// The elements `e` owns as a relationship
+    /// (`Relationship::ownedRelatedElement`): a membership's owned member,
+    /// a feature value's expression, an annotation's comment, …, in
+    /// order; empty for an element that is no relationship. With the
+    /// relationships of [`Self::owned_relationships`] this is the
+    /// ownership tree: element, relationship, element.
+    pub fn owned_related_elements(&self, e: ElementRef) -> Vec<ElementRef> {
+        self.b.elements[e.0]
+            .children
+            .iter()
+            .copied()
+            .map(ElementRef)
+            .collect()
+    }
+
     /// The already-materialized semantic ownership view. Mutable entry points
     /// establish readiness; immutable source navigation deliberately stays raw.
     pub(super) fn projected_owned_relationships(&self, e: ElementRef) -> Vec<ElementRef> {
@@ -16797,6 +17005,15 @@ impl ResolvedModel {
     /// the only seeded value — everything else flows through ordinary
     /// feature-value evaluation (unbound stays honestly undecided).
     pub fn satisfactions(&mut self) -> Vec<SatisfactionInfo> {
+        self.satisfactions_inner(true)
+    }
+
+    /// Self-bound claims for diagnostics, without traversing their constraints.
+    pub(crate) fn self_bound_satisfactions(&mut self) -> Vec<SatisfactionInfo> {
+        self.satisfactions_inner(false)
+    }
+
+    fn satisfactions_inner(&mut self, collect_constraints: bool) -> Vec<SatisfactionInfo> {
         self.ensure_by_id();
         // Only user claims are evaluated; the library rows stay untouched
         // behind their shared prefix.
@@ -16845,18 +17062,61 @@ impl ResolvedModel {
                     overrides.insert(subj, crate::eval::Value::Element(ElementRef(bound)));
                 }
             }
+            // The `by` target resolves from the claim's body, where the
+            // requirement's subject is inherited: a subject of the same
+            // name as the intended feature shadows it, and the claim binds
+            // the subject to itself. Say so instead of reading the
+            // subject's defaults as the satisfying feature's values.
+            let self_bound = overrides.contains_key(&bound).then(|| {
+                let subject = self
+                    .element_qualified_name(ElementRef(bound))
+                    .unwrap_or_else(|| "its subject".to_string());
+                let shadowed = self
+                    .b
+                    .owner_scope_of(sat)
+                    .and_then(|outer| match &by {
+                        TargetRef::Name(qn) => self.b.resolve(outer, qn, 0),
+                        TargetRef::Chain(_) => None,
+                    })
+                    .filter(|&outer| outer != bound)
+                    .and_then(|outer| self.element_qualified_name(ElementRef(outer)));
+                let spelled = match &by {
+                    TargetRef::Name(qn) => qn.to_display_string(),
+                    TargetRef::Chain(links) => links
+                        .iter()
+                        .map(|l| l.to_display_string())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                };
+                match shadowed {
+                    Some(shadowed) => format!(
+                        "`by {spelled}` names the requirement's own subject `{subject}`, which the claim inherits and which shadows `{shadowed}` there, so the subject is bound to itself; name the satisfying feature by a path the claim does not shadow, or rename the subject"
+                    ),
+                    None => format!(
+                        "`by {spelled}` names the requirement's own subject `{subject}`, so the subject is bound to itself; name the satisfying feature instead"
+                    ),
+                }
+            });
+            if self_bound.is_some() {
+                overrides.clear();
+            }
+            if !collect_constraints && self_bound.is_none() {
+                continue;
+            }
             let mut constraints = Vec::new();
             let mut nodes = vec![SatisfactionNode::default()];
             let mut seen: std::collections::HashSet<(usize, usize)> =
                 std::collections::HashSet::new();
             let entry_scope = self.b.elem_scope.get(&req).copied().unwrap_or(scope);
-            self.collect_satisfaction_constraints(
-                req,
-                entry_scope,
-                &mut seen,
-                (&mut constraints, &mut nodes, 0),
-                0,
-            );
+            if collect_constraints {
+                self.collect_satisfaction_constraints(
+                    req,
+                    entry_scope,
+                    &mut seen,
+                    (&mut constraints, &mut nodes, 0),
+                    0,
+                );
+            }
             // Source order, with the nodes' indices following the moves.
             let mut order: Vec<usize> = (0..constraints.len()).collect();
             order.sort_by_key(|&i| (constraints[i].unit, constraints[i].span.start));
@@ -16911,6 +17171,7 @@ impl ResolvedModel {
                 constraints,
                 nodes,
                 overrides,
+                self_bound,
             });
         }
         out
@@ -18464,6 +18725,9 @@ mod derived_reads_tests;
 
 #[cfg(test)]
 mod built_rows_tests;
+
+#[cfg(test)]
+mod canonical_reads_tests;
 
 /// The element rows as columns the snapshot carries in bulk: a byte per
 /// row for the metaclass, the identifiers, the flag words, the owners, the

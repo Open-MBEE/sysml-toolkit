@@ -61,7 +61,7 @@ fn top_level_help_documents_conversion_matrix_and_examples() {
 fn every_subcommand_help_has_examples() {
     for sub in [
         "convert", "payload", "fmt", "check", "lint", "verify", "parse", "query", "describe",
-        "members", "lsp",
+        "members", "tree", "lsp",
     ] {
         let out = sysmlv2(&[sub, "--help"]);
         assert!(out.status.success(), "{sub} --help failed");
@@ -102,6 +102,144 @@ fn convert_to_compact_json() {
         .unwrap();
     assert_eq!(def["qualifiedName"], "P::V");
     assert!(def.as_object().unwrap().len() >= 84);
+}
+
+/// `--graph-format canonical` lowers under the opt-in contract: the second
+/// operand of a conditional `and` is a reference expression to an owned
+/// expression, where the default's operand is the expression itself; the
+/// flag is global, so it sits before or after the verb, and the
+/// environment variable selects the same.
+#[test]
+fn graph_format_switch_selects_the_canonical_lowering() {
+    let dir = std::env::temp_dir().join(format!(
+        "sysmlv2-cli-test-graph-format-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("cond.kerml");
+    fs::write(
+        &input,
+        "package Cond { class C { feature ready; feature hot; feature ok = ready and not hot; } }",
+    )
+    .unwrap();
+    let operand_kinds = |out: &Output| -> Vec<String> {
+        assert!(out.status.success(), "{}", stderr(out));
+        let json: serde_json::Value = serde_json::from_str(&stdout(out)).expect("valid JSON");
+        let elements = json.as_array().unwrap();
+        let by_id = |id: &serde_json::Value| {
+            elements
+                .iter()
+                .find(|e| &e["@id"] == id)
+                .unwrap_or_else(|| panic!("element {id}"))
+        };
+        let and = elements
+            .iter()
+            .find(|e| e["@type"] == "OperatorExpression" && e["operator"] == "and")
+            .expect("the conditional and");
+        // The operands: the owned parameter of each ParameterMembership, in
+        // order (the compact form spells the member as the membership's
+        // owned related element).
+        and["ownedRelationship"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| by_id(&r["@id"]))
+            .filter(|m| m["@type"] == "ParameterMembership")
+            .map(|m| {
+                let parameter = by_id(&m["ownedRelatedElement"][0]["@id"]);
+                let value = parameter["ownedRelationship"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| by_id(&r["@id"]))
+                    .find(|r| r["@type"] == "FeatureValue")
+                    .expect("the parameter's value");
+                by_id(&value["ownedRelatedElement"][0]["@id"])["@type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let legacy = sysmlv2(&["convert", input.to_str().unwrap(), "--to", "compact-json"]);
+    assert_eq!(
+        operand_kinds(&legacy),
+        ["FeatureReferenceExpression", "OperatorExpression"]
+    );
+    let canonical = sysmlv2(&[
+        "--graph-format",
+        "canonical",
+        "convert",
+        input.to_str().unwrap(),
+        "--to",
+        "compact-json",
+    ]);
+    assert_eq!(
+        operand_kinds(&canonical),
+        ["FeatureReferenceExpression", "FeatureReferenceExpression"]
+    );
+    let after_verb = sysmlv2(&[
+        "convert",
+        input.to_str().unwrap(),
+        "--to",
+        "compact-json",
+        "--graph-format",
+        "canonical",
+    ]);
+    assert_eq!(stdout(&after_verb), stdout(&canonical));
+    let from_env = sysmlv2_env(
+        &["convert", input.to_str().unwrap(), "--to", "compact-json"],
+        &[("SYSMLV2_GRAPH_FORMAT", "canonical")],
+    );
+    assert_eq!(stdout(&from_env), stdout(&canonical));
+    let explicit_legacy = sysmlv2(&[
+        "--graph-format",
+        "legacy",
+        "convert",
+        input.to_str().unwrap(),
+        "--to",
+        "compact-json",
+    ]);
+    assert_eq!(stdout(&explicit_legacy), stdout(&legacy));
+    let unknown = sysmlv2(&[
+        "--graph-format",
+        "v4",
+        "convert",
+        input.to_str().unwrap(),
+        "--to",
+        "compact-json",
+    ]);
+    assert!(!unknown.status.success());
+    assert!(
+        stderr(&unknown).contains("canonical"),
+        "{}",
+        stderr(&unknown)
+    );
+    // An unknown value in the environment is refused the same, never
+    // silently the default.
+    let typo = sysmlv2_env(
+        &["convert", input.to_str().unwrap(), "--to", "compact-json"],
+        &[("SYSMLV2_GRAPH_FORMAT", "cannonical")],
+    );
+    assert!(!typo.status.success());
+    assert!(stderr(&typo).contains("canonical"), "{}", stderr(&typo));
+    // `prepare` takes the default and says so.
+    let out = dir.join("out");
+    let prepare = sysmlv2(&[
+        "--graph-format",
+        "canonical",
+        "prepare",
+        "--lib",
+        dir.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        stderr(&prepare).contains("takes the default graph format"),
+        "{}",
+        stderr(&prepare)
+    );
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -2678,7 +2816,7 @@ fn convert_library_exports_the_resolved_stdlib() {
     let out = sysmlv2(&["convert", "--library", "--lib", &lib, "--to", "text"]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("compact-json or compact-cbor"),
+        stderr(&out).contains("compact-json, compact-cbor, full-json or full-cbor"),
         "{}",
         stderr(&out)
     );
@@ -2701,6 +2839,293 @@ fn convert_library_exports_the_resolved_stdlib() {
             stderr(&out)
         );
     }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn convert_library_full_form_validates_and_carries_the_heritage() {
+    // --library --to full-json: the standard library itself in the full
+    // form — every element of the --lib units with its derived
+    // properties and the implied relationships the prepared library
+    // materialized, schema-valid, internally complete but for the
+    // library's own unresolved spellings (which ride recovery notes as
+    // a user model's do), and under a closure level the inherited
+    // memberships of its types.
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let lib = lib.to_str().unwrap().to_string();
+    let dir = std::env::temp_dir().join(format!("sysmlv2-libfull-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let export = |name: &str, extra: &[&str]| -> Vec<serde_json::Value> {
+        let path = dir.join(name);
+        let mut args = vec![
+            "convert",
+            "--library",
+            "--lib",
+            &lib,
+            "--to",
+            "full-json",
+            "-o",
+            path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let out = sysmlv2_env(&args, &[("SYSMLV2_AMBIENT", "off")]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).ok();
+        match serde_json::from_str::<serde_json::Value>(&text).unwrap() {
+            serde_json::Value::Array(els) => els,
+            other => panic!("not an element array: {other}"),
+        }
+    };
+    let els = export("stdlib-full.json", &[]);
+    assert!(els.len() > 150_000, "{} elements", els.len());
+    let ids: std::collections::HashSet<&str> =
+        els.iter().map(|e| e["@id"].as_str().unwrap()).collect();
+    assert_eq!(ids.len(), els.len(), "ids are unique");
+    assert!(
+        ids.contains("14c0aa22-5489-59b5-b438-ded26e83ba31"),
+        "normative ScalarValues::Real id"
+    );
+    // The prepared library's implied relationships are in the array and
+    // under their owners.
+    let implied: Vec<&serde_json::Value> = els.iter().filter(|e| e["isImplied"] == true).collect();
+    assert!(
+        implied.len() > 50_000,
+        "{} implied relationships",
+        implied.len()
+    );
+    assert!(els.iter().all(|e| e["isImpliedIncluded"] == true));
+    let by_id: std::collections::HashMap<&str, &serde_json::Value> = els
+        .iter()
+        .map(|e| (e["@id"].as_str().unwrap(), e))
+        .collect();
+    for rel in implied.iter().take(500) {
+        // Owned by an element (a specialization, a redefinition) or, a
+        // connector, by a membership: either owner lists it.
+        let (owner, list) = match rel["owningRelatedElement"]["@id"].as_str() {
+            Some(owner) => (owner, "ownedRelationship"),
+            None => (
+                rel["owningRelationship"]["@id"].as_str().unwrap(),
+                "ownedRelatedElement",
+            ),
+        };
+        let listed = by_id[owner][list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["@id"] == rel["@id"]);
+        assert!(listed, "{owner}.{list} lists its implied {}", rel["@id"]);
+    }
+    // Internally complete, but for the library's own unresolved
+    // spellings: every dangling id is one a recovery note spells.
+    let noted: std::collections::HashSet<String> = els
+        .iter()
+        .filter(|e| e["language"] == "x-sysmlv2-unresolved-reference")
+        .map(|e| {
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("unresolved:{}", e["body"].as_str().unwrap()).as_bytes(),
+            )
+            .to_string()
+        })
+        .collect();
+    let mut dangling = std::collections::BTreeSet::new();
+    for e in &els {
+        for (_, v) in e.as_object().unwrap() {
+            let refs = v
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(std::slice::from_ref(v));
+            for r in refs {
+                if let Some(id) = r.get("@id").and_then(serde_json::Value::as_str) {
+                    if !ids.contains(id) && !noted.contains(id) {
+                        dangling.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    assert!(dangling.is_empty(), "dangling references: {dangling:?}");
+    // Schema-valid, the same check the corpus full form passes, with the
+    // one documented departure (INTEROP.md): a numeric literal no JSON
+    // number denotes exactly keeps its own spelling as a string where the
+    // schema wants a number (the library's `pi` carries one such).
+    let schema = sysmlv2_testkit::published_schema();
+    let failures: Vec<String> = sysmlv2_testkit::validate_elements(&schema, &els)
+        .into_iter()
+        .filter(|f| {
+            !(f.starts_with("LiteralRational @ /value: \"")
+                || f.starts_with("LiteralInteger @ /value: \""))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} schema violations:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    // Parts::Part: its own features at the passthrough level, the
+    // inherited ones under a closure level.
+    let part = els
+        .iter()
+        .find(|e| e["qualifiedName"] == "Parts::Part")
+        .expect("Parts::Part");
+    assert_eq!(part["ownedFeature"].as_array().unwrap().len(), 8);
+    assert_eq!(part["inheritedFeature"], serde_json::json!([]));
+    let closed = export("stdlib-full-closure.json", &["--closures", "closure"]);
+    assert_eq!(
+        closed.len(),
+        els.len(),
+        "a closure level adds values, never rows"
+    );
+    let part = closed
+        .iter()
+        .find(|e| e["qualifiedName"] == "Parts::Part")
+        .expect("Parts::Part");
+    let inherited = part["inheritedFeature"].as_array().unwrap();
+    assert!(
+        inherited.len() > 50,
+        "{} inherited features",
+        inherited.len()
+    );
+    let names: Vec<&str> = inherited
+        .iter()
+        .filter_map(|r| closed.iter().find(|e| e["@id"] == r["@id"]))
+        .filter_map(|e| e["declaredName"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"portionOf") && names.contains(&"timeEnclosedOccurrences"),
+        "Occurrences and Items features arrive through the written heritage: {names:?}"
+    );
+    assert_eq!(
+        part["feature"].as_array().unwrap().len(),
+        8 + inherited.len()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn convert_closures_writes_the_inheritance_closures_on_request() {
+    // The default full form is the passthrough level: `[]` for the four
+    // closure names and the owned side for `feature`, whatever
+    // `isImpliedIncluded` says. `--closures closure` writes the
+    // specification's values over the written heritage, `closure-implied`
+    // with the implied library heritage too; neither adds a row or moves
+    // an id. The option belongs to the full form alone.
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let lib = lib.to_str().unwrap().to_string();
+    let dir = std::env::temp_dir().join(format!("sysmlv2-closures-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("export.sysml");
+    fs::write(
+        &model,
+        "package Export {\n    port def Out { out attribute v : ScalarValues::Real; }\n    part def Box {\n        port i : ~Out;\n        attribute a : ScalarValues::Real = 1.0;\n        attribute sum : ScalarValues::Real = a + 2.0;\n    }\n    part def Big :> Box;\n}\n",
+    )
+    .unwrap();
+    let export = |closures: Option<&str>| -> Vec<serde_json::Value> {
+        let mut args = vec![
+            "convert",
+            model.to_str().unwrap(),
+            "--to",
+            "full-json",
+            "--lib",
+            &lib,
+        ];
+        if let Some(level) = closures {
+            args.extend(["--closures", level]);
+        }
+        let out = sysmlv2(&args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        serde_json::from_str::<serde_json::Value>(&stdout(&out))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let big = |els: &[serde_json::Value]| -> serde_json::Value {
+        els.iter()
+            .find(|e| e["declaredName"] == "Big")
+            .expect("Big")
+            .clone()
+    };
+    let default = export(None);
+    let passthrough = export(Some("passthrough"));
+    assert_eq!(default, passthrough, "passthrough is the default");
+    let b = big(&default);
+    assert_eq!(b["isImpliedIncluded"], true);
+    assert_eq!(b["inheritedMembership"], serde_json::json!([]));
+    assert_eq!(b["inheritedFeature"], serde_json::json!([]));
+    assert_eq!(b["feature"], serde_json::json!([]));
+    let written = export(Some("closure"));
+    let b = big(&written);
+    assert_eq!(b["inheritedMembership"].as_array().unwrap().len(), 3);
+    assert_eq!(b["inheritedFeature"].as_array().unwrap().len(), 3);
+    assert_eq!(b["feature"].as_array().unwrap().len(), 3);
+    let implied = export(Some("closure-implied"));
+    let b = big(&implied);
+    assert!(
+        b["inheritedMembership"].as_array().unwrap().len() > 50,
+        "{}",
+        b["inheritedMembership"]
+    );
+    // Values only: the rows and their ids are the default's.
+    let ids = |els: &[serde_json::Value]| -> Vec<String> {
+        els.iter()
+            .map(|e| e["@id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids(&default), ids(&written));
+    assert_eq!(ids(&default), ids(&implied));
+    // Without a library (the single-unit path) the written heritage is
+    // still there, and the ids are the default export's at every level.
+    let export_nolib = |closures: Option<&str>| -> Vec<serde_json::Value> {
+        let mut args = vec!["convert", model.to_str().unwrap(), "--to", "full-json"];
+        if let Some(level) = closures {
+            args.extend(["--closures", level]);
+        }
+        let out = sysmlv2(&args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        serde_json::from_str::<serde_json::Value>(&stdout(&out))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let nolib_default = export_nolib(None);
+    let nolib_written = export_nolib(Some("closure"));
+    let nolib_implied = export_nolib(Some("closure-implied"));
+    assert_eq!(ids(&nolib_default), ids(&nolib_written));
+    assert_eq!(ids(&nolib_default), ids(&nolib_implied));
+    assert_eq!(
+        big(&nolib_default)["inheritedFeature"],
+        serde_json::json!([])
+    );
+    let b = big(&nolib_written);
+    assert_eq!(b["inheritedFeature"].as_array().unwrap().len(), 3);
+    assert_eq!(nolib_default.len(), nolib_written.len());
+    // A compact target has no closures to write.
+    let out = sysmlv2(&[
+        "convert",
+        model.to_str().unwrap(),
+        "--to",
+        "compact-json",
+        "--closures",
+        "closure",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("--closures applies to --to full-json or full-cbor"),
+        "{}",
+        stderr(&out)
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -4223,4 +4648,149 @@ fn foreign_exports_get_past_ownership_and_dialect_handling() {
         other.join("\n")
     );
     assert!(regressions.is_empty(), "{}", regressions.join("\n"));
+}
+
+#[test]
+fn tree_prints_the_ownership_tree_as_text_and_json() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-cli-test-tree-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.sysml");
+    fs::write(
+        &input,
+        "package Demo {\n    attribute def Mass;\n    part def Vehicle {\n        attribute mass : Mass;\n    }\n}\n",
+    )
+    .unwrap();
+    let path = input.to_str().unwrap();
+
+    // One element: its relationships, their elements, the ends as references.
+    let out = sysmlv2(&["tree", path, "Demo::Vehicle"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "Demo::Vehicle [PartDefinition]\n\
+         └─ FeatureMembership\n\
+         \x20  └─ mass [AttributeUsage]\n\
+         \x20     ├─ FeatureTyping\n\
+         \x20     │  └─ type → Demo::Mass [AttributeDefinition]\n\
+         \x20     └─ OwningMembership\n\
+         \x20        └─ (anonymous) [Multiplicity]\n"
+    );
+
+    // No name: every top-level element.
+    let out = sysmlv2(&["tree", path]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("Demo [Package]\n├─ OwningMembership\n│  └─ Mass [AttributeDefinition]\n"),
+        "{text}"
+    );
+    // The attribute's last member is its default multiplicity.
+    assert!(text.ends_with("└─ (anonymous) [Multiplicity]\n"), "{text}");
+
+    // The depth limit marks what it leaves out.
+    let out = sysmlv2(&["tree", path, "Demo::Vehicle", "--depth", "1"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).ends_with("mass [AttributeUsage] …\n"),
+        "{}",
+        stdout(&out)
+    );
+
+    // JSON carries the same tree, ids on request.
+    let out = sysmlv2(&["tree", path, "Demo::Vehicle", "--format", "json", "--ids"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    let vehicle = &json[0];
+    assert_eq!(vehicle["metaclass"], "PartDefinition");
+    assert_eq!(vehicle["qualifiedName"], "Demo::Vehicle");
+    assert!(vehicle["id"].is_string(), "{vehicle}");
+    let typing = &vehicle["relationships"][0]["children"][0]["relationships"][0];
+    assert_eq!(typing["metaclass"], "FeatureTyping");
+    assert_eq!(typing["references"][0]["property"], "type");
+    assert_eq!(
+        typing["references"][0]["target"]["qualifiedName"],
+        "Demo::Mass"
+    );
+    assert!(
+        typing["references"][0]["target"]["id"].is_string(),
+        "{typing}"
+    );
+
+    // References can be left out.
+    let out = sysmlv2(&["tree", path, "Demo::Vehicle", "--no-references"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stdout(&out).contains('→'), "{}", stdout(&out));
+
+    // An unknown name and a second name are errors.
+    let out = sysmlv2(&["tree", path, "Demo::Nope"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("cannot resolve `Demo::Nope`"),
+        "{}",
+        stderr(&out)
+    );
+    let out = sysmlv2(&["tree", path, "Demo::Vehicle", "Demo::Mass"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("at most one qualified name"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn tree_with_the_library_spells_library_targets_and_implied_relationships() {
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let dir =
+        std::env::temp_dir().join(format!("sysmlv2-cli-test-tree-lib-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.sysml");
+    fs::write(
+        &input,
+        "package Demo {\n    part def Vehicle {\n        attribute mass : ScalarValues::Real;\n    }\n}\n",
+    )
+    .unwrap();
+    let path = input.to_str().unwrap();
+    let lib = lib.to_str().unwrap();
+
+    // A library target is spelled, with its metaclass, and never expanded.
+    let out = sysmlv2(&["tree", path, "Demo::Vehicle", "--lib", lib]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("└─ type → ScalarValues::Real [DataType] [library]\n"),
+        "{text}"
+    );
+    assert!(!text.contains("(implied)"), "{text}");
+
+    // The implied relationships are opt-in: the kind's library base.
+    let out = sysmlv2(&["tree", path, "Demo::Vehicle", "--lib", lib, "--implied"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Subclassification (implied)\n"), "{text}");
+    assert!(
+        text.contains("superclassifier → Parts::Part [PartDefinition] [library]\n"),
+        "{text}"
+    );
+
+    // A library element as the root walks the library.
+    let out = sysmlv2(&[
+        "tree",
+        path,
+        "ScalarValues::Real",
+        "--lib",
+        lib,
+        "--depth",
+        "1",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("ScalarValues::Real [DataType] [library]\n"),
+        "{text}"
+    );
 }

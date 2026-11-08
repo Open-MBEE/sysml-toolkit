@@ -49,6 +49,7 @@ fn evaluable_function_name(package: &str, name: &str) -> bool {
                 | "/"
                 | "%"
                 | "^"
+                | "**"
                 | ".."
         ),
         "ControlFunctions" => matches!(

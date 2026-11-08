@@ -24,14 +24,17 @@ fn standalone_typing_and_subsetting_use_source_identity_not_relationship_carrier
     );
 }
 #[test]
-fn callee_membership_alone_never_becomes_an_expression_function() {
+fn callee_typing_without_a_library_cannot_certify_the_function() {
+    // The callee typing is the planner's row even without a library, but
+    // the expression's kind roles have no library to be required from.
     let mut r = model("function F; feature call=F();");
     let call = r.resolve_qualified("call").unwrap();
+    let f = r.resolve_qualified("F").unwrap().0;
     let expression = r.members_via(call, "FeatureValue")[0];
     let mut steps = 0;
     let mut evidence = RepositoryTyping::new(&mut r.b, &mut steps).unwrap();
     let projection = evidence.project(expression.0, &mut steps);
-    assert!(projection.candidates.is_empty());
+    assert_eq!(projection.candidates, vec![f]);
     assert_eq!(
         projection.function(&evidence),
         Err(Incomplete::MissingRequiredFamilies)

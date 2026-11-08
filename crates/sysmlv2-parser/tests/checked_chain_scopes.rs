@@ -106,12 +106,6 @@ fn features(r: &mut ResolvedModel, e: ElementRef) -> Vec<String> {
     ids(r, &value)
 }
 
-fn refuses(r: &mut ResolvedModel, e: ElementRef, reason: &str) {
-    let what = qualified(r, e);
-    let err = r.property(e, "feature").expect_err(&what).to_string();
-    assert!(err.contains(reason), "{what}: {err}");
-}
-
 fn supertypes(
     r: &mut ResolvedModel,
     e: ElementRef,
@@ -361,12 +355,13 @@ fn succession_ends_and_the_library_ends_they_redefine_answer() {
 }
 
 #[test]
-fn an_operator_expressions_operands_still_refuse() {
+fn an_operator_expressions_operands_answer_through_its_callee() {
     let mut r = model();
     let a = named(&mut r, "Ch::A");
     let for_loop = owned(&mut r, "ForLoopActionUsage", a)[0];
-    // The `seq` parameter answers; the operands of its `1..3` value do
-    // not, their typing by the operator's function being dynamic.
+    // The `seq` parameter answers, and so do the operands of its `1..3`
+    // value: the operator's typing by its function is the planner's row,
+    // and each operand redefines the function's input at its position.
     let seq = owned(&mut r, "ReferenceUsage", for_loop)
         .into_iter()
         .find(|&e| r.property(e, "declaredName").unwrap().is_null())
@@ -377,10 +372,11 @@ fn an_operator_expressions_operands_still_refuse() {
         .into_iter()
         .find(|&e| r.owner(e) == Some(seq))
         .expect("the range expression");
+    features(&mut r, range);
     let operands = owned(&mut r, "Feature", range);
     assert_eq!(operands.len(), 2);
     for operand in operands {
-        refuses(&mut r, operand, "incomplete");
+        features(&mut r, operand);
     }
 }
 

@@ -72,6 +72,15 @@ its immutable graph. Each session keeps its own resolver state:
 import { PreparedLibrary, Session } from "@sysml/wasm/sysmlv2.js";
 const library = new PreparedLibrary(bundle, snapshot);
 const session = Session.fromSourcesWithPreparedLibrary(sources, library);
+// The opt-in canonical graph format (IDS.md): a library prepared under it opens
+// canonical sessions; `graphFormat()` on either reads the choice back.
+const canonical = PreparedLibrary.withGraphFormat(bundle, snapshot, "canonical");
+const canonicalSession = Session.fromSourcesWithPreparedLibrary(sources, canonical);
+// `fromSnapshot` and `fromSnapshotStream` decode legacy snapshots; a canonical
+// deployment decodes a snapshot written under canonical with
+// `PreparedLibrary.fromSnapshotWithGraphFormat(prepared, bundle, libcache, "canonical")`
+// (a snapshot of the other format is refused, naming it). `sysmlv2 prepare`
+// writes the default (legacy) snapshot.
 const findings = JSON.parse(session.check());
 library.free(); // the session retains the library through subsequent edits
 session.free();

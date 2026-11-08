@@ -7,6 +7,7 @@
 //! `cargo test -p sysmlv2-cli --test integration cli::`.
 
 mod cli;
+mod conversion_graph_format;
 mod fulljson_roundtrip;
 mod inprocess;
 mod library_bundle;

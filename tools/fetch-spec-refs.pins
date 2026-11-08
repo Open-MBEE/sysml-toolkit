@@ -1,0 +1,9 @@
+# Normative machine-readable files of the KerML 1.0 and SysML 2.0
+# specifications (metamodel 20250201) that `tools/fetch-spec-refs` places
+# under spec-refs/. One file per line: SHA-256 of the file after its line
+# ends are folded to LF, its path below spec-refs/, and the URL it is
+# published at. Lines starting with `#` and blank lines are ignored.
+45b18775afe2b2fcdc70e24f37c6d2f344defcc3f38a02075a193354e2d7b466  KerML.xmi          https://www.omg.org/spec/KerML/20250201/KerML.xmi
+e454fe4b7c04f3d95874b6c1a4e6ef056ea5874c71fd3d17e3180319c2f58ab2  KerML.schema.json  https://www.omg.org/spec/KerML/20250201/KerML.json
+caa65d54f56798bf7582d173f7567e1eea37a49c45984f8bd7df145011cf8c6f  SysML.xmi          https://www.omg.org/spec/SysML/20250201/SysML.xmi
+bb0d8af159cf2cbe4a0df4ed6b903505a57e33d047068e5a50a7008a18d546c5  SysML.schema.json  https://www.omg.org/spec/SysML/20250201/SysML.json

@@ -19,9 +19,13 @@ payload = sysmlv2.Session.from_interchange_json(json_text, flexo=True)   # Flexo
 json_out = payload.to_compact_json()
 ```
 
+`from_files` and `from_sources` take `graph_format="legacy"` (the default) or `"canonical"`, the opt-in graph contract of `IDS.md` (a conditional operand is a reference to an owned expression, a constructor's arguments belong to its result feature; the ids of those subtrees differ); `graph_format()` reads a session's back, and the choice holds through `load_library` and edits.
+
 Element and reference handles belong to one committed state of the session; a successful commit invalidates them (methods raise on stale handles) — re-resolve after committing.
 
 Everything the module raises derives from `sysmlv2.Error`, so `except sysmlv2.Error` catches the toolkit's failures and nothing else. A refusal — an argument the toolkit cannot use, a handle from a superseded session state, an edit naming a read-only library element, an edit whose commit would change what an untouched reference denotes — is `sysmlv2.RefusedError`, which derives from `sysmlv2.Error` and from `ValueError`, so `except ValueError` keeps catching every refusal it caught before.
+
+`Session.tree_text(root)` draws the ownership tree under an element (a handle or a qualified name; none for the whole model) — the relationships it owns, the elements those own in turn, and every other end as a reference, never expanded — and `tree_json(root, depth=None, references=True, implied=False, ids=False)` is the same tree as JSON text, the document `sysmlv2 tree --format json` writes. [The tour](../../SDK.md#2-navigation) shows both.
 
 `Session.to_plantuml(view=…)` renders any of seven PlantUML views (structure tree, interconnection, state, action, sequence, use case, mixed) with options for notes, metadata, inherited members, colors, and clickable source hyperlinks; `sysmlv2.check(sources, lib=None)` runs parse and structural checks in-process, adding referential and semantic checks when `lib` is supplied (a path string or a `pathlib.Path`); it releases the interpreter lock while it runs — a library-backed check takes seconds — so other threads keep going. It does not include the CLI’s unused-private-import analysis. See [the checking API](../../SDK.md#8-checking-models).
 

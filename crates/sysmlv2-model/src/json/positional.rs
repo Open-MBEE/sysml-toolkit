@@ -1214,7 +1214,17 @@ impl Builder {
         for (&owner, node) in nodes {
             self.positional_charge_members(owner, &mut budget)?;
             charge(&mut budget, node.owned.len() + node.owned_memberships.len())?;
-            if self.owned_member_elems(owner, true) != node.owned {
+            // The checked node lists the generated result feature of an
+            // expression too; the positional planner reads the authored
+            // rows, and the result's own redefinitions are the result
+            // family's.
+            let authored_owned: Vec<usize> = node
+                .owned
+                .iter()
+                .copied()
+                .filter(|&f| self.is_authored(f))
+                .collect();
+            if self.owned_member_elems(owner, true) != authored_owned {
                 return None;
             }
             let memberships = self.positional_owned_memberships(owner, &mut budget)?;
@@ -1869,7 +1879,20 @@ impl Builder {
                         &mut steps,
                         parameters.len().min(base_roles.parameters.len()),
                     )?;
-                    let base_parameters = base_roles.parameters.iter().copied();
+                    // An invocation's parameters are its arguments, and each
+                    // redefines an input parameter of the callee (KerML
+                    // `validateInvocationExpressionParameterRedefinition`):
+                    // they pair with the base's inputs in order, an output
+                    // among the base's parameters taking no position.
+                    let invocation = self.elements[e].conforms("InvocationExpression");
+                    if invocation {
+                        charge(&mut steps, base_roles.parameters.len())?;
+                    }
+                    let base_parameters = base_roles
+                        .parameters
+                        .iter()
+                        .copied()
+                        .filter(|&f| !invocation || self.positional_is_input(f));
                     for (&source, target) in parameters.iter().zip(base_parameters) {
                         charge(
                             &mut steps,
@@ -2726,6 +2749,18 @@ impl Builder {
             .is_some_and(|r| is_a!(self.elements[r], "ReturnParameterMembership"))
     }
 
+    /// Whether a parameter is an input: its written direction `in` or
+    /// `inout`, or none written under a parameter membership, whose default
+    /// is `in` (a return parameter membership's is `out`).
+    pub(super) fn positional_is_input(&self, e: usize) -> bool {
+        match self.elements[e].props.get("direction") {
+            Some(value) => matches!(value.as_str(), Some("in" | "inout")),
+            None => self.elements[e].owning_relationship.is_some_and(|r| {
+                super::behavior::parameter_direction_default(self.elements[r].ty) == Some("in")
+            }),
+        }
+    }
+
     fn positional_owned_memberships(
         &mut self,
         owner: usize,
@@ -3246,10 +3281,13 @@ mod tests {
 
     #[test]
     fn supplied_local_callee_bases_do_not_publish_candidate_positional_rows() {
+        // Without a library the operator's function is nothing to the
+        // static plan; a caller supplying a callee base plans the pairing
+        // for itself without publishing it.
         let mut model = crate::model::Model::new();
         model.add_source(
             "positional.kerml",
-            "function F {in p; return result;} feature call=F(1);",
+            "function F {in p; return result;} feature sum=1+2;",
         );
         assert!(!model.has_errors());
         let mut r = super::super::ResolvedModel::build(&model);
@@ -3258,7 +3296,7 @@ mod tests {
         let invocation =
             r.b.elements
                 .iter()
-                .position(|e| e.ty == "InvocationExpression")
+                .position(|e| e.ty == "OperatorExpression")
                 .unwrap();
         let argument =
             r.b.owned_member_elems(invocation, true)

@@ -3,7 +3,9 @@
 //! 8.3.4.13, 8.3.4.14; SysML 8.3.17, 8.3.21): `evaluate`,
 //! `checkCondition`, `modelLevelEvaluable`, `instantiatedType`,
 //! `valueOf`, `hasBounds`, `multiplicityHasBounds`, `evaluateFeature`,
-//! `isSemantic` and `isSyntactic`. Model-level eligibility is the shared
+//! `isSemantic`, `isSyntactic` and `syntaxElement`, and the metadata
+//! access bodies `metaclassFeature` and the `evaluate` override (KerML
+//! 8.3.4.8.8, 9.2). Model-level eligibility is the shared
 //! proof; evaluation is the toolkit's evaluator over the expression as
 //! written, from the scope the target opens. A result that is an element
 //! is returned as a reference; one that is a literal is returned as the
@@ -42,6 +44,9 @@ pub(super) enum Body {
     EvaluateFeature,
     IsSemantic,
     IsSyntactic,
+    SyntaxElement,
+    MetadataEvaluate,
+    MetaclassFeature,
 }
 
 const INVOCATION_EVALUATE: &str = "Kernel-Expressions-InvocationExpression-evaluate_Element";
@@ -647,6 +652,231 @@ fn evaluate_feature(
     Ok(DerivedValue::References(Vec::new()))
 }
 
+/// The element a metadata access expression refers to: the member of
+/// its first owned membership that is not a feature membership (KerML
+/// 8.3.4.8.8), refusing where the expression's membership domain is not
+/// certified or the reference does not resolve.
+fn referenced_element(
+    r: &mut ResolvedModel,
+    raw: &StoredStructure,
+    expression: usize,
+    effective: &'static str,
+    steps: &mut usize,
+) -> Result<usize, OperationError> {
+    let memberships =
+        namespaces::owned_memberships_of_namespace(&r.b, raw, expression, steps, effective)?;
+    charge(steps, memberships.len(), effective)?;
+    memberships
+        .iter()
+        .find(|m| !is_a!(r.b.elements[m.relationship], "FeatureMembership"))
+        .map(|m| m.member)
+        .ok_or_else(|| blocked(effective, expression))
+}
+/// `MetadataAccessExpression::metaclassFeature()`: the reflective
+/// metaclass feature of the referenced element. The toolkit materializes
+/// no result elements, so the feature is answered by the reflective
+/// metaclass that types it: the metaclass of the standard reflection
+/// libraries named like the element's own (`SysML::PartUsage`,
+/// `KerML::Class`), the type the evaluator's metaobject instance carries.
+/// Refuses at the referenced element when no reflective metaclass names
+/// it: the reflection library is not loaded, or a user namespace shadows
+/// it.
+fn metaclass_feature(
+    r: &mut ResolvedModel,
+    referenced: usize,
+    effective: &'static str,
+    steps: &mut usize,
+) -> Result<usize, OperationError> {
+    charge(steps, 8, effective)?;
+    let ty = r.b.elements[referenced].ty;
+    r.b.reflection_metaclass(ty)
+        .filter(|&metaclass| r.b.is_reflection_target(metaclass))
+        .ok_or_else(|| blocked(effective, referenced))
+}
+/// `MetadataAccessExpression::evaluate(target)`: the metadata features
+/// the referenced element owns that annotate it, in declaration order,
+/// then its metaclass feature. The body does not read the target. The
+/// annotation associations are complete under the stable evidence, so
+/// the recorded annotations of the referenced element decide which of
+/// its owned metadata features annotate it (a `@M about other;` in its
+/// body does not).
+fn metadata_access(
+    r: &mut ResolvedModel,
+    raw: &StoredStructure,
+    expression: usize,
+    effective: &'static str,
+    steps: &mut usize,
+) -> Result<Vec<usize>, OperationError> {
+    let referenced = referenced_element(r, raw, expression, effective, steps)?;
+    let annotating: Vec<usize> =
+        r.b.metadata_of
+            .get(&referenced)
+            .cloned()
+            .unwrap_or_default();
+    let rows = semantic_ownership::owned_relationships(&r.b, referenced)
+        .ok_or_else(|| blocked(effective, referenced))?;
+    charge(
+        steps,
+        rows.len().saturating_add(annotating.len()),
+        effective,
+    )?;
+    let rows: Vec<usize> = rows.iter().collect();
+    let mut out = Vec::new();
+    for relationship in rows {
+        for &child in &r.b.elements[relationship].children {
+            if is_a!(r.b.elements[child], "MetadataFeature") && annotating.contains(&child) {
+                out.push(child);
+            }
+        }
+    }
+    out.push(metaclass_feature(r, referenced, effective, steps)?);
+    Ok(out)
+}
+/// The elements a metadata feature annotates: the targets of its
+/// Annotations (the owning one in the prefix shape, then the owned
+/// ones), else its owner (KerML 8.3.2.1.2). The stable evidence has
+/// already refused a model whose annotation targets do not all resolve;
+/// a target this read still cannot place refuses at its Annotation.
+fn annotated_elements(
+    r: &mut ResolvedModel,
+    receiver: usize,
+    effective: &'static str,
+    steps: &mut usize,
+) -> Result<Vec<usize>, OperationError> {
+    r.ensure_by_id();
+    let is_annotation = |r: &ResolvedModel, rel: usize| r.b.elements[rel].ty == "Annotation";
+    let mut annotations: Vec<usize> = r.b.elements[receiver]
+        .owning_relationship
+        .filter(|&rel| is_annotation(r, rel))
+        .into_iter()
+        .collect();
+    annotations.extend(
+        r.b.elements[receiver]
+            .owned_relationships
+            .iter()
+            .copied()
+            .filter(|&rel| is_annotation(r, rel)),
+    );
+    charge(steps, annotations.len().saturating_add(2), effective)?;
+    if annotations.is_empty() {
+        return Ok(r
+            .owner(ElementRef(receiver))
+            .map(|o| o.0)
+            .into_iter()
+            .collect());
+    }
+    let mut out = Vec::new();
+    for annotation in annotations {
+        let target = if r.b.elements[annotation]
+            .props
+            .get("annotatedElement")
+            .is_some()
+        {
+            r.prop_target(annotation, "annotatedElement")
+        } else {
+            r.owner(ElementRef(annotation)).map(|o| o.0)
+        };
+        out.push(target.ok_or_else(|| blocked(effective, annotation))?);
+    }
+    Ok(out)
+}
+/// A type and every type its written specializations reach, each once,
+/// nearest first, through the checked explicit projection. The
+/// reflective abstract-syntax chain is written (`metadata def PartUsage
+/// :> ItemUsage`, `metaclass Class :> Classifier`, a model's `:>
+/// SysML::PartUsage`); the implied bases are library roles, none an
+/// abstract-syntax metaclass, and a minimal reflection library leaves
+/// them uncertified.
+fn written_supertype_closure(
+    r: &mut ResolvedModel,
+    receiver: usize,
+    effective: &'static str,
+    steps: &mut usize,
+) -> Result<Vec<usize>, OperationError> {
+    let mut relations = TypeRelations::default();
+    let mut order = vec![receiver];
+    let mut seen = HashSet::from([receiver]);
+    let mut next = 0;
+    while let Some(&current) = order.get(next) {
+        next += 1;
+        charge(steps, 1, effective)?;
+        let bases = relations.checked_supertypes(&mut r.b, current, true, steps);
+        charge(steps, 0, effective)?;
+        for base in bases.map_err(|_| blocked(effective, current))? {
+            if seen.insert(base) {
+                order.push(base);
+            }
+        }
+    }
+    Ok(order)
+}
+/// `MetadataFeature::syntaxElement()`: the element a syntactic metadata
+/// feature reflectively represents. Its precondition is `isSyntactic()`;
+/// a feature that is not syntactic answers null. A syntactic feature
+/// represents the one element it annotates when that element's own
+/// metaclass conforms to the most specific reflective abstract-syntax
+/// metaclass in the written supertype closure of its one typing (the
+/// metaclass itself, or the one a metadata definition of the model
+/// specializes), else nothing. A feature whose typing is not one certified type refuses at
+/// the feature; one whose reflective metaclasses are incomparable, or
+/// that annotates several elements, refuses as an unsupported
+/// configuration, since the result is at most one element.
+fn syntax_element(
+    r: &mut ResolvedModel,
+    raw: &StoredStructure,
+    receiver: usize,
+    effective: &'static str,
+    parameter: &'static str,
+    steps: &mut usize,
+) -> Result<DerivedValue, OperationError> {
+    let syntactic = specializes_library(r, raw, receiver, &["KerML", "Element"], effective, steps)?;
+    if syntactic == DerivedValue::Bool(false) {
+        return Ok(DerivedValue::Null);
+    }
+    charge(steps, 8, effective)?;
+    let types = r.b.direct_typing_elems(receiver);
+    let &[metaclass] = types.as_slice() else {
+        return Err(blocked(effective, receiver));
+    };
+    // The reflective abstract-syntax metaclasses the typing reaches,
+    // nearest first (`Metaobjects::Metaobject` and the model's own
+    // metaclasses are not among them); the most specific is the one every
+    // other one generalizes.
+    let mut names = Vec::new();
+    for general in written_supertype_closure(r, metaclass, effective, steps)? {
+        charge(steps, 1, effective)?;
+        if r.b.is_reflection_target(general) {
+            let name =
+                r.b.effective_name(general)
+                    .ok_or_else(|| blocked(effective, general))?;
+            if crate::metaclass::lookup(&name).is_some() {
+                names.push(name);
+            }
+        }
+    }
+    let Some(name) = names
+        .iter()
+        .find(|name| names.iter().all(|other| conforms(name, other)))
+        .cloned()
+    else {
+        return Err(if names.is_empty() {
+            blocked(effective, receiver)
+        } else {
+            unsupported(effective, parameter)
+        });
+    };
+    let represented = match annotated_elements(r, receiver, effective, steps)?.as_slice() {
+        [] => return Ok(DerivedValue::Null),
+        &[one] => one,
+        _ => return Err(unsupported(effective, parameter)),
+    };
+    Ok(if conforms(r.b.elements[represented].ty, &name) {
+        DerivedValue::Reference(Reference::Element(ElementRef(represented)))
+    } else {
+        DerivedValue::Null
+    })
+}
+
 pub(super) fn invoke(
     r: &mut ResolvedModel,
     receiver: ElementRef,
@@ -751,6 +981,16 @@ pub(super) fn invoke(
             )?,
             Body::IsSyntactic => {
                 specializes_library(r, raw, receiver.0, &["KerML", "Element"], effective, steps)?
+            }
+            Body::SyntaxElement => syntax_element(r, raw, receiver.0, effective, parameter, steps)?,
+            Body::MetadataEvaluate => {
+                references(metadata_access(r, raw, receiver.0, effective, steps)?)
+            }
+            Body::MetaclassFeature => {
+                let referenced = referenced_element(r, raw, receiver.0, effective, steps)?;
+                DerivedValue::Reference(Reference::Element(ElementRef(metaclass_feature(
+                    r, referenced, effective, steps,
+                )?)))
             }
         })
     })?;

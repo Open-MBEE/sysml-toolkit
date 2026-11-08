@@ -422,6 +422,13 @@ impl PushServer {
         nav.set_snippet_completions(crate::snippet_completions(&init));
         nav.set_insert_replace_completions(crate::insert_replace_completions(&init));
         nav.set_signature_label_offsets(crate::signature_label_offsets(&init));
+        match crate::library_root(&init) {
+            Some(Ok(root)) => nav.set_library_root(Some(root)),
+            Some(Err(err)) => {
+                let _ = connection.sender.send(crate::library_root_refused(&err));
+            }
+            None => {}
+        }
         self.server = Some(Server {
             connection,
             encoding,
@@ -3212,6 +3219,512 @@ mod tests {
         );
         assert_eq!(loc["range"]["start"]["line"], 1, "{loc:?}");
         assert_eq!(loc["range"]["start"]["character"], 13, "{loc:?}");
+    }
+
+    /// The two-unit library the library-root tests share: a part
+    /// definition specializing one declared in the other unit, and a
+    /// member typed by a definition declared later in its own unit.
+    fn two_unit_library() -> Vec<(String, String)> {
+        vec![
+            (
+                "Mini Lib/Items.sysml".to_string(),
+                "package Items {\n    part def Item;\n}\n".to_string(),
+            ),
+            (
+                "Mini Lib/Parts.sysml".to_string(),
+                "package Parts {\n    private import Items::*;\n    part def Part :> Item {\n        \
+                 attribute kind : Kind;\n    }\n    enum def Kind { a; b; }\n}\n"
+                    .to_string(),
+            ),
+        ]
+    }
+
+    /// `initialize` with `initializationOptions.libraryRoot` set to a
+    /// directory (spelled without its trailing separator, as a host's
+    /// uri comes), UTF-8 positions.
+    fn initialize_with_root(s: &mut PushServer) -> Vec<serde_json::Value> {
+        responses(
+            s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}},
+                           "initializationOptions": {"libraryRoot": "file:///w/.libs"}}}),
+        )
+    }
+
+    /// A position request's result.
+    fn at(
+        s: &mut PushServer,
+        method: &str,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({"textDocument": {"uri": uri},
+                                            "position": {"line": line, "character": character}});
+        if method == "textDocument/references" {
+            params["context"] = serde_json::json!({"includeDeclaration": true});
+        }
+        responses(
+            s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params}),
+        )[0]["result"]
+            .clone()
+    }
+
+    /// With a library root, a location inside a library unit is the
+    /// unit's file under that directory — the uri a host serving the
+    /// library's units as files opens — in place of the `sysmlv2-lib:`
+    /// scheme; definition and references name it the same way.
+    #[test]
+    fn library_locations_land_under_the_library_root() {
+        let mut s = PushServer::with_library_sources(two_unit_library(), None);
+        initialize_with_root(&mut s);
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                 "version": 1,
+                                 "text": "package P {\n    private import Items::*;\n    part w : Item;\n}\n"}}}),
+        );
+        let loc = at(
+            &mut s,
+            "textDocument/definition",
+            "file:///w/m.sysml",
+            2,
+            14,
+        );
+        assert_eq!(
+            loc["uri"], "file:///w/.libs/Mini%20Lib/Items.sysml",
+            "{loc:?}"
+        );
+        assert_eq!(loc["range"]["start"]["line"], 1, "{loc:?}");
+        assert_eq!(loc["range"]["start"]["character"], 13, "{loc:?}");
+        let refs = at(
+            &mut s,
+            "textDocument/references",
+            "file:///w/m.sysml",
+            2,
+            14,
+        );
+        let uris: Vec<&str> = refs
+            .as_array()
+            .expect("locations")
+            .iter()
+            .filter_map(|l| l["uri"].as_str())
+            .collect();
+        assert_eq!(
+            uris,
+            [
+                "file:///w/.libs/Mini%20Lib/Items.sysml",
+                "file:///w/m.sysml"
+            ],
+            "{refs:?}"
+        );
+    }
+
+    /// A document under the library root is a read-only copy of the
+    /// unit the library already provides: opening, changing and closing
+    /// it adds no source to the workspace — the library's declarations
+    /// are not declared a second time, so references into the library
+    /// stay what they were — and the workspace's symbols list nothing
+    /// of it. What it opened with is irrelevant: requests answer from
+    /// the library's text.
+    #[test]
+    fn a_library_document_is_never_a_source() {
+        let mut s = PushServer::with_library_sources(two_unit_library(), None);
+        initialize_with_root(&mut s);
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                 "version": 1,
+                                 "text": "package P {\n    private import Items::*;\n    part w : Item;\n}\n"}}}),
+        );
+        let before = at(
+            &mut s,
+            "textDocument/references",
+            "file:///w/m.sysml",
+            2,
+            14,
+        );
+        let lib = "file:///w/.libs/Mini%20Lib/Items.sysml";
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": lib, "languageId": "sysml", "version": 1,
+                                 "text": "package Items {\n    part def Item;\n}\n"}}}),
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+                "textDocument": {"uri": lib, "version": 2},
+                "contentChanges": [{"text": "package Garbage;"}]}}),
+        );
+        assert_eq!(
+            s.server.as_ref().expect("initialized").docs.len(),
+            1,
+            "the user document alone"
+        );
+        assert_eq!(
+            at(
+                &mut s,
+                "textDocument/references",
+                "file:///w/m.sysml",
+                2,
+                14
+            ),
+            before
+        );
+        let symbols = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "workspace/symbol",
+                "params": {"query": "Item"}}),
+        );
+        let uris: Vec<&str> = symbols[0]["result"]
+            .as_array()
+            .expect("symbols")
+            .iter()
+            .filter_map(|s| s["location"]["uri"].as_str())
+            .collect();
+        assert!(
+            uris.iter().all(|u| *u == "file:///w/m.sysml"),
+            "{symbols:?}"
+        );
+        // The library's text, not the garbage it was opened with.
+        let hover = at(&mut s, "textDocument/hover", lib, 1, 14);
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .is_some_and(|v| v.contains("Items::Item")),
+            "{hover}"
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didClose", "params": {
+                "textDocument": {"uri": lib}}}),
+        );
+        assert_eq!(s.server.as_ref().expect("initialized").docs.len(), 1);
+        // A uri under the root that names no library unit is an
+        // ordinary document.
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/.libs/notes.sysml", "languageId": "sysml",
+                                 "version": 1, "text": "package Notes;"}}}),
+        );
+        assert_eq!(s.server.as_ref().expect("initialized").docs.len(), 2);
+    }
+
+    #[test]
+    fn seeded_library_copies_do_not_break_navigation() {
+        // Hosts may seed before initialize, or refresh their workspace later.
+        for before_initialize in [false, true] {
+            let mut s = PushServer::with_library_sources(two_unit_library(), None);
+            let main = (
+                "file:///w/m.sysml".to_string(),
+                "package P { part w : Items::Item; }".to_string(),
+            );
+            let mut units = vec![main.clone()];
+            units.extend(two_unit_library().into_iter().map(|(name, text)| {
+                (
+                    format!("file:///w/.libs/{}", name.replace(' ', "%20")),
+                    text,
+                )
+            }));
+            units.push((
+                "file:///w/.libs/notes.sysml".into(),
+                "package Notes;".into(),
+            ));
+            if before_initialize {
+                s.set_workspace_sources(units.clone());
+            }
+            initialize_with_root(&mut s);
+            responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc":"2.0", "method":"textDocument/didOpen",
+                "params":{"textDocument":{"uri":main.0,"text":main.1,"version":1,"languageId":"sysml"}}}),
+            );
+            if !before_initialize {
+                let before = at(&mut s, "textDocument/definition", &main.0, 0, 28);
+                assert_eq!(before["uri"], "file:///w/.libs/Mini%20Lib/Items.sysml");
+                s.set_workspace_sources(units);
+            }
+            let location = at(&mut s, "textDocument/definition", &main.0, 0, 28);
+            assert_eq!(
+                location["uri"], "file:///w/.libs/Mini%20Lib/Items.sysml",
+                "{location}"
+            );
+        }
+    }
+
+    /// Inside a library document — a unit the model records no
+    /// reference sites in — hover and definition answer on declared
+    /// names and on the names written in them: a specialization reaching
+    /// another library unit, a typing reaching a definition declared
+    /// later in the same unit (the chained jump), the outline and the
+    /// semantic tokens of the unit's text, and a highlight of the name
+    /// under the cursor. Completion, rename and code actions offer
+    /// nothing for the read-only copy. A prepared library answers as its
+    /// sources do, and the `sysmlv2-lib:` scheme keeps answering beside
+    /// the root.
+    #[test]
+    fn navigation_answers_inside_a_library_document() {
+        let parts = "file:///w/.libs/Mini%20Lib/Parts.sysml";
+        let answers = |mut s: PushServer| {
+            initialize_with_root(&mut s);
+            responses(
+                &mut s,
+                &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                    "textDocument": {"uri": parts, "languageId": "sysml", "version": 1,
+                                     "text": two_unit_library()[1].1}}}),
+            );
+            let mut out = vec![
+                // The declared name.
+                at(&mut s, "textDocument/hover", parts, 2, 13),
+                // The specialization target, in another unit.
+                at(&mut s, "textDocument/hover", parts, 2, 21),
+                at(&mut s, "textDocument/definition", parts, 2, 21),
+                // The typing, declared later in this unit.
+                at(&mut s, "textDocument/definition", parts, 3, 25),
+                at(&mut s, "textDocument/documentHighlight", parts, 2, 21),
+                at(&mut s, "textDocument/completion", parts, 3, 29),
+                // Off every name.
+                at(&mut s, "textDocument/hover", parts, 1, 4),
+                // The scheme beside the root.
+                at(
+                    &mut s,
+                    "textDocument/definition",
+                    "sysmlv2-lib:/Mini%20Lib/Parts.sysml",
+                    2,
+                    21,
+                ),
+            ];
+            for (method, params) in [
+                (
+                    "textDocument/documentSymbol",
+                    serde_json::json!({"textDocument": {"uri": parts}}),
+                ),
+                (
+                    "textDocument/semanticTokens/full",
+                    serde_json::json!({"textDocument": {"uri": parts}}),
+                ),
+                (
+                    "textDocument/rename",
+                    serde_json::json!({"textDocument": {"uri": parts},
+                    "position": {"line": 2, "character": 13}, "newName": "Piece"}),
+                ),
+                (
+                    "textDocument/codeAction",
+                    serde_json::json!({"textDocument": {"uri": parts},
+                    "range": {"start": {"line": 2, "character": 13}, "end": {"line": 2, "character": 17}},
+                    "context": {"diagnostics": []}}),
+                ),
+            ] {
+                out.push(
+                    responses(
+                        &mut s,
+                        &serde_json::json!({"jsonrpc": "2.0", "id": 8, "method": method, "params": params}),
+                    )[0]["result"]
+                        .clone(),
+                );
+            }
+            out
+        };
+        let prepared =
+            sysmlv2_transform::Library::prepared_sources(two_unit_library(), None).unwrap();
+        let expected = answers(PushServer::with_library_sources(two_unit_library(), None));
+        assert_eq!(answers(PushServer::with_library(prepared)), expected);
+        let [
+            declared,
+            hover,
+            definition,
+            chained,
+            highlights,
+            completion,
+            off,
+            scheme,
+            symbols,
+            tokens,
+            rename,
+            actions,
+        ] = <[serde_json::Value; 12]>::try_from(expected).unwrap();
+        let card =
+            |v: &serde_json::Value| v["contents"]["value"].as_str().unwrap_or("").to_string();
+        assert!(card(&declared).contains("Parts::Part"), "{declared}");
+        assert!(card(&declared).contains("PartDefinition"), "{declared}");
+        assert_eq!(declared["range"]["start"]["character"], 13, "{declared}");
+        assert!(card(&hover).contains("Items::Item"), "{hover}");
+        assert_eq!(hover["range"]["start"]["line"], 2, "{hover}");
+        assert_eq!(hover["range"]["start"]["character"], 21, "{hover}");
+        assert_eq!(hover["range"]["end"]["character"], 25, "{hover}");
+        assert_eq!(
+            definition["uri"], "file:///w/.libs/Mini%20Lib/Items.sysml",
+            "{definition}"
+        );
+        assert_eq!(definition["range"]["start"]["line"], 1, "{definition}");
+        assert_eq!(
+            definition["range"]["start"]["character"], 13,
+            "{definition}"
+        );
+        assert_eq!(chained["uri"], parts, "{chained}");
+        assert_eq!(chained["range"]["start"]["line"], 5, "{chained}");
+        assert_eq!(chained["range"]["start"]["character"], 13, "{chained}");
+        assert_eq!(
+            highlights,
+            serde_json::json!([{"range": {"start": {"line": 2, "character": 21},
+                                          "end": {"line": 2, "character": 25}}, "kind": 1}])
+        );
+        assert_eq!(completion, serde_json::json!([]));
+        assert_eq!(off, serde_json::Value::Null);
+        assert_eq!(
+            scheme["uri"], "file:///w/.libs/Mini%20Lib/Items.sysml",
+            "{scheme}"
+        );
+        let names: Vec<&str> = symbols[0]["children"]
+            .as_array()
+            .expect("the package's members")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(symbols[0]["name"], "Parts", "{symbols}");
+        assert_eq!(names, ["Items", "Part", "Kind"], "{symbols}");
+        assert!(
+            tokens["data"].as_array().is_some_and(|d| !d.is_empty()),
+            "{tokens}"
+        );
+        assert_eq!(rename, serde_json::Value::Null);
+        assert_eq!(actions, serde_json::json!([]));
+    }
+
+    /// A library root that is no uri is refused with a shown warning,
+    /// and library units keep the scheme.
+    #[test]
+    fn a_library_root_that_is_no_uri_is_refused() {
+        let mut s = PushServer::with_library_sources(two_unit_library(), None);
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}},
+                           "initializationOptions": {"libraryRoot": 7}}}),
+        );
+        let warning = out
+            .iter()
+            .find(|m| m["method"] == "window/showMessage")
+            .expect("a warning");
+        assert!(
+            warning["params"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("library root ignored")),
+            "{warning}"
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                 "version": 1,
+                                 "text": "package P {\n    private import Items::*;\n    part w : Item;\n}\n"}}}),
+        );
+        let loc = at(
+            &mut s,
+            "textDocument/definition",
+            "file:///w/m.sysml",
+            2,
+            14,
+        );
+        assert_eq!(loc["uri"], "sysmlv2-lib:/Mini%20Lib/Items.sysml", "{loc:?}");
+    }
+
+    /// `initializationOptions.libraryDirs` renames a bundle directory to
+    /// the one the host shows it under: a location in a unit under it
+    /// comes out under the host's name, and a document under the host's
+    /// name reads as the bundle's unit, hover and definition answering
+    /// from it. Directories that are no object of names are refused
+    /// together with the root (a root without the host's names would
+    /// name the renamed units where the host has no files), so library
+    /// units keep the scheme.
+    #[test]
+    fn library_directories_are_renamed_both_ways() {
+        let mut s = PushServer::with_library_sources(two_unit_library(), None);
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}},
+                           "initializationOptions": {"libraryRoot": "file:///w/.libs",
+                                                     "libraryDirs": {"Mini Lib": "Own Libraries"}}}}),
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                 "version": 1,
+                                 "text": "package P {\n    private import Items::*;\n    part w : Item;\n}\n"}}}),
+        );
+        let loc = at(
+            &mut s,
+            "textDocument/definition",
+            "file:///w/m.sysml",
+            2,
+            14,
+        );
+        assert_eq!(
+            loc["uri"], "file:///w/.libs/Own%20Libraries/Items.sysml",
+            "{loc:?}"
+        );
+        let parts = "file:///w/.libs/Own%20Libraries/Parts.sysml";
+        let hover = at(&mut s, "textDocument/hover", parts, 2, 21);
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .is_some_and(|v| v.contains("Items::Item")),
+            "{hover}"
+        );
+        let definition = at(&mut s, "textDocument/definition", parts, 2, 21);
+        assert_eq!(
+            definition["uri"], "file:///w/.libs/Own%20Libraries/Items.sysml",
+            "{definition}"
+        );
+        // The bundle's own name is no document of the tree.
+        assert_eq!(
+            at(
+                &mut s,
+                "textDocument/hover",
+                "file:///w/.libs/Mini%20Lib/Parts.sysml",
+                2,
+                21
+            ),
+            serde_json::Value::Null
+        );
+        // Refused directories take the root with them.
+        let mut s = PushServer::with_library_sources(two_unit_library(), None);
+        let out = responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {"general": {"positionEncodings": ["utf-8"]}},
+                           "initializationOptions": {"libraryRoot": "file:///w/.libs",
+                                                     "libraryDirs": ["Mini Lib"]}}}),
+        );
+        assert!(
+            out.iter().any(|m| m["method"] == "window/showMessage"
+                && m["params"]["message"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("libraryDirs"))),
+            "{out:?}"
+        );
+        responses(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+                "textDocument": {"uri": "file:///w/m.sysml", "languageId": "sysml",
+                                 "version": 1,
+                                 "text": "package P {\n    private import Items::*;\n    part w : Item;\n}\n"}}}),
+        );
+        let loc = at(
+            &mut s,
+            "textDocument/definition",
+            "file:///w/m.sysml",
+            2,
+            14,
+        );
+        assert_eq!(loc["uri"], "sysmlv2-lib:/Mini%20Lib/Items.sysml", "{loc:?}");
     }
 
     /// The half-typed import is an outline node named by the typed word

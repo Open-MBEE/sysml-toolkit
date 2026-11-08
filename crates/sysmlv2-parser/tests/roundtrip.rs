@@ -155,15 +155,10 @@ fn corpus_omitted_back_references_are_refused_then_derived_exactly() {
 /// that the lift must ignore — view `filter` clauses and
 /// positional invocation arguments regressed exactly there.
 ///
-/// One measured loss is normalized away: associations are `isSufficient`
-/// at the model level whatever the text spells (see INTEROP.md), so the
-/// full form cannot recover a KerML `assoc all` keyword — the lift
-/// canonicalizes it off, and the comparison drops it from the reference too.
-fn drop_assoc_all(text: &str) -> String {
-    text.replace("assoc all ", "assoc ")
-        .replace("assoc struct all ", "assoc struct ")
-}
-
+/// A KerML `assoc all` is part of the comparison: the full form carries
+/// `isSufficient` as the text spells it on an `Association` or
+/// `AssociationStructure` (the override to `true` is for the three SysML
+/// metaclasses that declare it), so the keyword survives the full leg.
 #[test]
 fn corpus_full_json_lift_matches_compact() {
     let files = sysmlv2_testkit::corpus_files();
@@ -182,7 +177,7 @@ fn corpus_full_json_lift_matches_compact() {
         // is only the reference text; skip files it cannot produce.
         let compact = to_compact_json(&original.unit);
         let reference = match from_compact_json(&compact) {
-            Ok(l) if l.errors.is_empty() => drop_assoc_all(&print_source(&l.unit)),
+            Ok(l) if l.errors.is_empty() => print_source(&l.unit),
             _ => continue,
         };
 
@@ -209,7 +204,7 @@ fn corpus_full_json_lift_matches_compact() {
             ));
             continue;
         }
-        let text = drop_assoc_all(&print_source(&lifted.unit));
+        let text = print_source(&lifted.unit);
         if text != reference {
             let diff = text
                 .lines()
@@ -1157,9 +1152,20 @@ fn expression_budget_roundtrips_without_changing_operands() {
                 assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
                 let compact = to_compact_json(&parsed.unit);
                 let full = sysmlv2_parser::full::to_full_json(&parsed.unit);
-                assert_eq!(
-                    compact.as_array().unwrap().len(),
-                    full.as_array().unwrap().len()
+                // The full form adds the operators' generated result
+                // parameters; every compact element is still there.
+                let full_ids: std::collections::HashSet<_> = full
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["@id"].as_str().unwrap().to_string())
+                    .collect();
+                assert!(
+                    compact
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|e| full_ids.contains(e["@id"].as_str().unwrap()))
                 );
                 for json in [&compact, &full] {
                     let lifted = from_compact_json(json).unwrap_or_else(|e| panic!("{e}"));
@@ -1200,7 +1206,17 @@ fn full_form_preserves_elements_the_lifter_cannot_reconstruct() {
             .expect("every input element survives full-form enrichment");
         assert_eq!(output["@type"], element["@type"]);
         assert_eq!(output["declaredName"], element["declaredName"]);
-        assert_eq!(output["ownedRelationship"], element["ownedRelationship"]);
+        // The full form lists the written relationships first, then the
+        // implied ones (the operator's generated result membership).
+        let written = element["ownedRelationship"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let listed = output["ownedRelationship"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(listed.starts_with(&written), "{listed:?} vs {written:?}");
     }
 }
 

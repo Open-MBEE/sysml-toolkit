@@ -82,6 +82,11 @@ pub enum EmissionError {
     /// their closures would be incomplete, and a cut enumeration is not
     /// written as the closure.
     TruncatedClosures { elements: Vec<String> },
+    /// Under [`ClosurePolicy::Closure`], the payload route could not keep
+    /// a resolved projection to read the closures from: the loader warned
+    /// (the document's rows did not all pair with the rebuilt model), so
+    /// the array-level derivation would have written `[]` for them.
+    ClosuresUnavailable { warnings: Vec<String> },
 }
 
 impl std::fmt::Display for EmissionError {
@@ -93,6 +98,11 @@ impl std::fmt::Display for EmissionError {
                 "the inheritance walk of {} element(s) exceeded the depth budget, so their closures cannot be written: {}",
                 elements.len(),
                 elements.join(", ")
+            ),
+            Self::ClosuresUnavailable { warnings } => write!(
+                f,
+                "the closures cannot be written: the document did not load as a resolved model ({})",
+                warnings.join("; ")
             ),
         }
     }
@@ -151,6 +161,52 @@ pub fn model_to_full_json_with_policy(
     resolved_to_full_json_with_policy(&mut resolved, model, policy)
 }
 
+/// [`model_to_full_json_with_policy`] with a full [`EmissionPolicy`]: the
+/// model is resolved afresh and emitted through [`resolved_to_full_json`],
+/// so under [`ClosurePolicy::Closure`] the four closure names and the
+/// inheritance-aware properties carry their specification values. The
+/// default export is the passthrough level (`EmissionPolicy::default()`):
+/// the owned side of the inheritance-aware properties and the type-correct
+/// empty value for the closure names, whatever `isImpliedIncluded` says
+/// (that flag speaks of the implied relationships, not of the closures);
+/// nothing in the document records which level was written, since the
+/// schema admits no key for it.
+pub fn model_to_full_json_with_emission(
+    model: &Model,
+    policy: EmissionPolicy,
+) -> Result<Value, EmissionError> {
+    let mut resolved = crate::json::ResolvedModel::build(model);
+    resolved_to_full_json(&mut resolved, model, policy)
+}
+
+/// The standard library itself in the full form, with its unit structure
+/// (each unit root's index in the array paired with its unit name): the
+/// complement of [`model_to_full_json_with_emission`], whose output holds
+/// the user units' elements alone. Every element of `model`'s library
+/// units is emitted under its normative id, with its derived properties
+/// projected from the resolved model and the implied relationships the
+/// prepared library materialized for its own elements (the library
+/// specializations of each kind, the positional redefinitions) written
+/// under their owners and appended to the array, as a user model's are;
+/// `isImpliedIncluded` is `true`. The emission is the full form's, so the
+/// same `policy` applies: the closure levels write the library's inherited
+/// and imported memberships, and the unresolved-reference policy meets the
+/// library's few unresolved spellings. The compact rows are the model's
+/// own (`library_to_compact_json_with_units`), never a payload lifted and
+/// reparsed, so no row is paired or dropped on the way.
+pub fn library_to_full_json_with_units(
+    model: &Model,
+    policy: EmissionPolicy,
+) -> Result<(Value, Vec<(usize, String)>), EmissionError> {
+    let (compact, units) = crate::json::library_to_compact_json_with_units(model);
+    let mut resolved = crate::json::ResolvedModel::build(model);
+    // The emitter appends the implied relationships and the recovery
+    // annotations after the compact rows, so the unit roots keep their
+    // indices.
+    let full = resolved_compact_to_full_json_impl(&mut resolved, model, compact, policy, false)?;
+    Ok((full, units))
+}
+
 /// [`model_to_full_json_with_policy`] over an already resolved model:
 /// the derived properties the derivation layer computes
 /// ([`crate::json::computed_names`]) are projected from it, the rest
@@ -173,7 +229,9 @@ pub fn resolved_to_full_json_with_policy(
     ) {
         Ok(v) => Ok(v),
         Err(EmissionError::UnresolvedReferences(e)) => Err(e),
-        Err(EmissionError::TruncatedClosures { .. }) => {
+        Err(
+            EmissionError::TruncatedClosures { .. } | EmissionError::ClosuresUnavailable { .. },
+        ) => {
             unreachable!("no closure is written at the passthrough level")
         }
     }
@@ -294,6 +352,20 @@ pub fn to_full_json_with_policy(
     from_compact_value_with_policy(crate::json::to_compact_json(unit), &HashMap::new(), policy)
 }
 
+/// [`to_full_json_with_policy`] with a full [`EmissionPolicy`]: the same
+/// in-place completion of the unit's compact form — the ids the compact
+/// route derives, whatever the closure level — with the closures written
+/// under [`ClosurePolicy::Closure`]. A closure level refuses when the
+/// loaded document kept no resolved projection
+/// ([`EmissionError::ClosuresUnavailable`]) or a walk hit the depth
+/// budget ([`EmissionError::TruncatedClosures`]).
+pub fn to_full_json_with_emission(
+    unit: &SourceUnit,
+    policy: EmissionPolicy,
+) -> Result<Value, EmissionError> {
+    from_compact_value_with_emission(crate::json::to_compact_json(unit), &HashMap::new(), policy)
+}
+
 /// Language tag of the recovery annotations emitted by the
 /// `recover_refs` mode: a `TextualRepresentation` whose `body` is the
 /// unresolved reference's exact source spelling.
@@ -339,13 +411,42 @@ pub fn from_compact_value_with_policy(
     lib_by_name: &HashMap<String, String>,
     policy: UnresolvedReferencePolicy,
 ) -> Result<Value, UnresolvedReferenceError> {
-    if policy == UnresolvedReferencePolicy::Reject {
+    match from_compact_value_with_emission(
+        compact,
+        lib_by_name,
+        EmissionPolicy {
+            unresolved: policy,
+            closures: ClosurePolicy::Passthrough,
+        },
+    ) {
+        Ok(v) => Ok(v),
+        Err(EmissionError::UnresolvedReferences(e)) => Err(e),
+        Err(
+            EmissionError::TruncatedClosures { .. } | EmissionError::ClosuresUnavailable { .. },
+        ) => {
+            unreachable!("no closure is written at the passthrough level")
+        }
+    }
+}
+
+/// [`from_compact_value_with_policy`] with a full [`EmissionPolicy`]: the
+/// payload's ids are kept whatever the closure level; under
+/// [`ClosurePolicy::Closure`] the closures are read from the loaded
+/// model's projection, and the emission refuses when the loader kept none
+/// ([`EmissionError::ClosuresUnavailable`]) rather than writing `[]` for
+/// them.
+pub fn from_compact_value_with_emission(
+    compact: Value,
+    lib_by_name: &HashMap<String, String>,
+    policy: EmissionPolicy,
+) -> Result<Value, EmissionError> {
+    if policy.unresolved == UnresolvedReferencePolicy::Reject {
         let mut references = Vec::new();
         unresolved_ref_spellings(&compact, &mut references, false);
         references.sort();
         references.dedup();
         if !references.is_empty() {
-            return Err(UnresolvedReferenceError { references });
+            return Err(UnresolvedReferenceError { references }.into());
         }
     }
     // The payload path goes through the model: the document is loaded
@@ -362,23 +463,53 @@ pub fn from_compact_value_with_policy(
     // source of the emitted owned elements. In particular, an unsupported
     // or over-budget subtree must not disappear during full-form export.
     let loaded = crate::loader::load_document(&compact, &names);
-    let mut projection = loaded.ok().and_then(|(_, mut resolved, _, warnings)| {
+    let mut dropped: Vec<String> = Vec::new();
+    let mut projection = match loaded {
         // A normalized or incomplete model can carry relationships absent
         // from the original payload. Do not project those phantom ids;
         // derive directly from the original array when the loader warns.
-        warnings.is_empty().then(|| {
+        Ok((_, mut resolved, _, warnings)) if warnings.is_empty() => {
             resolved.set_library_names(&names);
-            resolved
-        })
-    });
-    full_from_compact_policy(
+            Some(resolved)
+        }
+        Ok((_, _, _, warnings)) => {
+            dropped = warnings;
+            None
+        }
+        Err(e) => {
+            dropped = vec![e.to_string()];
+            None
+        }
+    };
+    if policy.closures != ClosurePolicy::Passthrough && projection.is_none() {
+        return Err(EmissionError::ClosuresUnavailable { warnings: dropped });
+    }
+    let previous = projection
+        .as_ref()
+        .map(|resolved| resolved.closure_policy());
+    if let Some(resolved) = projection.as_mut() {
+        resolved.set_closure_policy(policy.closures);
+    }
+    let mut truncated = Vec::new();
+    let result = full_from_compact_policy(
         compact,
         lib_by_name,
-        policy,
+        policy.unresolved,
         projection.as_mut(),
-        ClosurePolicy::Passthrough,
-        &mut Vec::new(),
-    )
+        policy.closures,
+        &mut truncated,
+    );
+    if let (Some(resolved), Some(previous)) = (projection.as_mut(), previous) {
+        resolved.set_closure_policy(previous);
+    }
+    let value = result?;
+    if truncated.is_empty() {
+        Ok(value)
+    } else {
+        Err(EmissionError::TruncatedClosures {
+            elements: truncated,
+        })
+    }
 }
 
 /// A derived value of the layer as the full form spells it.
@@ -1843,9 +1974,14 @@ fn full_from_compact_with_reference_mode(
                 }
             }
             // Association-family definitions: the end lists derive from the
-            // owned end features, and associations are always sufficient at
-            // the model level whatever the text spells (no `all` keyword) —
-            // except flow definitions, which the pilot leaves insufficient.
+            // owned end features. `ConnectionDefinition` declares
+            // `isSufficient` true by default and by rule
+            // (`validateConnectionDefinitionIsSufficient`), and
+            // `InterfaceDefinition` and `AllocationDefinition` inherit both,
+            // so those three read sufficient whatever the payload holds; a
+            // KerML `Association` or `AssociationStructure` carries the
+            // written value (`assoc all` against `assoc`), and a flow
+            // definition stays insufficient.
             "InterfaceDefinition"
             | "ConnectionDefinition"
             | "AllocationDefinition"
@@ -1864,7 +2000,10 @@ fn full_from_compact_with_reference_mode(
                         derived.insert("interfaceEnd".into(), Value::Array(ends));
                     }
                 }
-                if t != "FlowDefinition" {
+                if matches!(
+                    t.as_str(),
+                    "InterfaceDefinition" | "ConnectionDefinition" | "AllocationDefinition"
+                ) {
                     overrides.insert("isSufficient".into(), Value::Bool(true));
                 }
             }
@@ -2173,8 +2312,10 @@ fn full_from_compact_with_reference_mode(
 /// Unresolved-reference recovery (compact-space pre-pass): for every
 /// `{"@ref": name}` about to become a dangling `@id`, attach one
 /// `TextualRepresentation` (language [`UNRESOLVED_REP_LANGUAGE`], body =
-/// `name`) to the referencing element's document root, deduplicated per
-/// (root, name). Injected in compact shape so the ordinary full-form
+/// `name`) to the referencing element's document root — the top of the
+/// ownership walk through owning relationships and their owners, a
+/// relationship's included — deduplicated per (root, name). Injected in
+/// compact shape so the ordinary full-form
 /// derivation completes ownership lists, defaults, and derived properties
 /// exactly as for hand-written `rep` members.
 fn inject_unresolved_reps(elements: &mut Vec<Map<String, Value>>, lexical_uuid_names: bool) {
@@ -2204,26 +2345,32 @@ fn inject_unresolved_reps(elements: &mut Vec<Map<String, Value>>, lexical_uuid_n
         }
     }
     // Document root of element `i`: follow owningRelationship →
-    // owningRelatedElement to the top.
+    // owningRelatedElement to the top. A relationship written on its
+    // owner's side (a typing, a specialization, a membership) has no
+    // owning relationship of its own: the walk continues through the
+    // element that owns it, so the note hangs off the document's root
+    // namespace and never off a relationship (#56). The editor's writer
+    // (`web/src/flexo/unresolved-references.ts`) walks the same way.
     let root_of = |mut i: usize| -> usize {
+        let index_of = |el: &Map<String, Value>, key: &str| -> Option<usize> {
+            el.get(key)
+                .and_then(|v| v.get("@id"))
+                .and_then(|v| v.as_str())
+                .and_then(|id| by_id.get(id))
+                .copied()
+        };
         for _ in 0..elements.len() {
-            let Some(rel) = elements[i]
-                .get("owningRelationship")
-                .and_then(|v| v.get("@id"))
-                .and_then(|v| v.as_str())
-                .and_then(|id| by_id.get(id))
-            else {
-                return i;
+            let Some(rel) = index_of(&elements[i], "owningRelationship") else {
+                let Some(owner) = index_of(&elements[i], "owningRelatedElement") else {
+                    return i;
+                };
+                i = owner;
+                continue;
             };
-            let Some(owner) = elements[*rel]
-                .get("owningRelatedElement")
-                .and_then(|v| v.get("@id"))
-                .and_then(|v| v.as_str())
-                .and_then(|id| by_id.get(id))
-            else {
-                return *rel;
+            let Some(owner) = index_of(&elements[rel], "owningRelatedElement") else {
+                return rel;
             };
-            i = *owner;
+            i = owner;
         }
         i
     };
@@ -2519,8 +2666,9 @@ fn invocation_arg_name(
         .filter_map(|id| index.get(&id).copied())
         .collect();
     // An accept action's reference parameters are its payload and receiver
-    // (pilot AcceptParameterPart; trigger invocations are expressions and
-    // don't count positions).
+    // (pilot AcceptParameterPart; the trigger is the payload's value, and a
+    // legacy payload's trigger owned as a parameter member is an expression
+    // that counts no position).
     if ty(&elements[owner]) == "AcceptActionUsage" {
         let ref_params: Vec<usize> = owner_rels
             .iter()

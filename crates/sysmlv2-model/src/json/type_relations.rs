@@ -171,6 +171,8 @@ const ROLE_KINDS: &[(&str, &str)] = &[
     ("Base::things", "Feature"),
     ("Base::dataValues", "Feature"),
     ("Base::naturals", "Feature"),
+    ("Base::exactlyOne", "Feature"),
+    ("Base::zeroOrOne", "Feature"),
     ("Occurrences::Occurrence", "Class"),
     ("Occurrences::HappensLink", "Association"),
     ("Occurrences::occurrences", "Feature"),
@@ -1147,11 +1149,13 @@ impl TypeRelations {
         let semantic = b.semantically_annotated();
         let e = b.elements.get(feature).ok_or(InvalidRelationship)?;
         let ty = e.ty;
-        // An instantiation expression's typing by its callee or constructed
-        // type is dynamic evidence the static audit does not see: its bases
-        // stay unaudited until the binding provider certifies them.
+        // A constructor's typing by its constructed type is on its result,
+        // the dynamic family's row the static audit does not see: its bases
+        // stay unaudited until the binding provider certifies them. The
+        // other instantiation expressions' callee typings are the planner's
+        // rows, required below.
         if !conforms(ty, "Feature")
-            || conforms(ty, "InstantiationExpression")
+            || conforms(ty, "ConstructorExpression")
             || original.is_some()
             || b.metadata_associations_incomplete
             || structure.annotations_incomplete
@@ -1351,6 +1355,12 @@ impl TypeRelations {
             "Base::things"
         };
         names.push(generic);
+        // A synthesized default multiplicity's range (the planner's
+        // `default_multiplicity_role`): `exactlyOne` under a SysML usage,
+        // `zeroOrOne` under an individual definition.
+        if let Some(role) = b.default_multiplicity_role(feature) {
+            names.push(role);
+        }
         if conforms(ty, "Step") {
             names.push("Performances::performances");
         }
@@ -1445,6 +1455,25 @@ impl TypeRelations {
         if membership_kind == "VariantMembership" {
             required.push(carrier);
         }
+        // Semantic metadata's base (KerML 9.2): the planner's row.
+        for target in b.semantic_base_targets(feature, 0) {
+            charge(steps, 1).ok_or(Unsupported)?;
+            required.push(target);
+        }
+        // An instantiation expression's callee (KerML 8.3.4.8): the
+        // planner's row; an expression whose callee does not resolve stays
+        // out.
+        let mut required_types = Vec::new();
+        if conforms(ty, "InstantiationExpression") {
+            charge(steps, 2).ok_or(Unsupported)?;
+            let names = b.implied_names();
+            let callee = b.instantiation_callee(feature, &names).ok_or(Unsupported)?;
+            if is_a!(b.elements[callee], "Feature") {
+                required.push(callee);
+            } else {
+                required_types.push(callee);
+            }
+        }
         if (composite || portion)
             && membership_kind == "FeatureMembership"
             && composite_owner_context(owner_kind)
@@ -1516,7 +1545,8 @@ impl TypeRelations {
         let anything = self
             .required_role(b, "Base::Anything", steps)
             .ok_or(Unsupported)?;
-        Ok((required, vec![anything]))
+        required_types.push(anything);
+        Ok((required, required_types))
     }
 
     // Audited family obligations for complete negative specialization paths.
@@ -1565,6 +1595,22 @@ impl TypeRelations {
             .collect::<Option<Vec<_>>>()?;
         if individual {
             required.push(self.required_role(b, super::implied::INDIVIDUAL_BASE, steps)?);
+        }
+        // Semantic metadata's base (KerML 9.2): the planner's row — a
+        // feature base stands for its declared types on a classifier.
+        for target in b.semantic_base_targets(specific, 0) {
+            charge(steps, 1)?;
+            if is_a!(b.elements[target], "Feature") {
+                let types = b.direct_typing_elems(target);
+                charge(steps, types.len())?;
+                required.extend(
+                    types
+                        .into_iter()
+                        .filter(|&ty| is_a!(b.elements[ty], "Classifier")),
+                );
+            } else {
+                required.push(target);
+            }
         }
         // A connection or interface definition with two owned ends is binary
         // (the planner counts the owned ends the same way).
@@ -3370,24 +3416,22 @@ mod annotation_completeness_tests {
         r
     }
     #[test]
-    fn standalone_metadata_annotation_cannot_supply_negative_specialization_evidence() {
+    fn semantic_metadata_annotation_supplies_specialization_evidence() {
         for about in [false, true] {
             for explicit in [false, true] {
                 let mut r = fixture(about, explicit);
                 let c = r.resolve_qualified("C").unwrap().0;
                 let a = r.resolve_qualified("A").unwrap().0;
-                // Both annotation spellings now share positive association
-                // storage. The checked specialization provider still does not
-                // certify the full semantic-metadata evaluator.
+                // Both annotation spellings share positive association
+                // storage, and the semantic metadata's base is a planned
+                // row (KerML 9.2), so the checked specialization provider
+                // certifies it whether or not the specialization is written.
                 assert_eq!(r.b.metadata_of.get(&c).map(Vec::len), Some(1));
                 let mut proof = TypeRelations::default();
                 assert_eq!(
                     proof.specializes(&mut r.b, c, a, &mut 0),
-                    if explicit {
-                        RelationFact::Yes
-                    } else {
-                        RelationFact::Unknown
-                    }
+                    RelationFact::Yes,
+                    "about {about}, explicit {explicit}"
                 );
             }
         }

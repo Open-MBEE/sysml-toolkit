@@ -11,6 +11,10 @@ import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from xmi_props import spec_ref  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 NS = "{http://www.omg.org/spec/XMI/20161101}"
 OUT = ROOT / "crates/sysmlv2-model/src/semantic_catalog.rs"
@@ -21,7 +25,7 @@ def ref(e):
 
 
 def generate():
-    roots = [ET.parse(ROOT / f"spec-refs/{name}.xmi").getroot() for name in ("KerML", "SysML")]
+    roots = [ET.parse(spec_ref(f"{name}.xmi")).getroot() for name in ("KerML", "SysML")]
     ids = {e.get(NS + "id"): e for r in roots for e in r.iter() if e.get(NS + "id")}
     classes = {i: e for i, e in ids.items() if e.get(NS + "type") == "uml:Class"}
     props = {p.get(NS + "id"): (i, p) for i, c in classes.items() for p in c.findall("ownedAttribute")}

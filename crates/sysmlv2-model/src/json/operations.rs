@@ -579,6 +579,21 @@ static SIGNATURES: &[OperationExecutionSignature] = &[
         inputs: &[],
         result: "Kernel-Metadata-MetadataFeature-isSyntactic_-",
     },
+    OperationExecutionSignature {
+        declaration: "Kernel-Metadata-MetadataFeature-syntaxElement_",
+        inputs: &[],
+        result: "Kernel-Metadata-MetadataFeature-syntaxElement_-",
+    },
+    OperationExecutionSignature {
+        declaration: "Kernel-Expressions-MetadataAccessExpression-evaluate_Element",
+        inputs: &["Kernel-Expressions-MetadataAccessExpression-evaluate_Element-target"],
+        result: "Kernel-Expressions-MetadataAccessExpression-evaluate_Element-result",
+    },
+    OperationExecutionSignature {
+        declaration: "Kernel-Expressions-MetadataAccessExpression-metaclassFeature_",
+        inputs: &[],
+        result: "Kernel-Expressions-MetadataAccessExpression-metaclassFeature_-",
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -971,6 +986,15 @@ fn handler(id: &str) -> Option<Handler> {
         }
         "Kernel-Metadata-MetadataFeature-isSemantic_" => Evaluation(evaluation::Body::IsSemantic),
         "Kernel-Metadata-MetadataFeature-isSyntactic_" => Evaluation(evaluation::Body::IsSyntactic),
+        "Kernel-Metadata-MetadataFeature-syntaxElement_" => {
+            Evaluation(evaluation::Body::SyntaxElement)
+        }
+        "Kernel-Expressions-MetadataAccessExpression-evaluate_Element" => {
+            Evaluation(evaluation::Body::MetadataEvaluate)
+        }
+        "Kernel-Expressions-MetadataAccessExpression-metaclassFeature_" => {
+            Evaluation(evaluation::Body::MetaclassFeature)
+        }
         "Kernel-Expressions-LiteralExpression-evaluate_Element" => SelfSequence,
         "Kernel-Expressions-NullExpression-evaluate_Element" => EmptySequence,
         "Kernel-Expressions-LiteralExpression-modelLevelEvaluable_Feature"
@@ -1540,9 +1564,9 @@ mod tests {
                 .iter()
                 .filter(|o| handler(o.id).is_some())
                 .count(),
-            100
+            103
         );
-        assert_eq!(SIGNATURES.len(), 100); // every signature has a body
+        assert_eq!(SIGNATURES.len(), 103); // every signature has a body
         for signature in SIGNATURES {
             let operation = metamodel::operation(signature.declaration).unwrap();
             let ids: HashSet<_> = signature
@@ -1900,6 +1924,201 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect()
+    }
+    const REFLECTION: &str = "standard library package KerML { abstract metaclass Element; metaclass Namespace :> Element; metaclass Type :> Namespace; metaclass Classifier :> Type; metaclass Class :> Classifier; metaclass Feature :> Type; metaclass Package :> Namespace; }
+         standard library package Metaobjects { abstract struct Metaobject; abstract struct SemanticMetadata :> Metaobject; }";
+    const METADATA_MODEL: &str = "package M {
+             metaclass Tag;
+             class Other;
+             class Rover { @Tag; @KerML::Class; @KerML::Package; @KerML::Class about Other; }
+             feature rover : Rover;
+             @KerML::Class about Rover, Other;
+             feature probe = Rover.metadata;
+             feature probeFeature = rover.metadata;
+             feature probeOther = Other.metadata;
+         }";
+    const METADATA_EVALUATE: &str = "Kernel-Expressions-MetadataAccessExpression-evaluate_Element";
+    const EVALUATE: &str = "Kernel-Functions-Expression-evaluate_Element";
+    const METACLASS_FEATURE: &str = "Kernel-Expressions-MetadataAccessExpression-metaclassFeature_";
+    const SYNTAX_ELEMENT: &str = "Kernel-Metadata-MetadataFeature-syntaxElement_";
+    fn reflection_fixture(library: &str, source: &str) -> ResolvedModel {
+        let mut model = crate::model::Model::new();
+        assert!(
+            model
+                .add_library_source("kernel.kerml", KERNEL)
+                .diagnostics
+                .is_empty()
+        );
+        if !library.is_empty() {
+            assert!(
+                model
+                    .add_library_source("reflection.kerml", library)
+                    .diagnostics
+                    .is_empty()
+            );
+        }
+        let unit = model.add_source("metadata.kerml", source);
+        assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+        ResolvedModel::build(&model)
+    }
+    /// The value expression of a feature: the child of its FeatureValue.
+    fn value_expression(r: &mut ResolvedModel, feature: &str) -> ElementRef {
+        let feature = r.resolve_qualified(feature).unwrap();
+        let value = r.b.elements[feature.0]
+            .owned_relationships
+            .iter()
+            .copied()
+            .find(|&rel| r.b.elements[rel].ty == "FeatureValue")
+            .unwrap();
+        let expression = r.b.elements[value].children[0];
+        assert_eq!(r.b.elements[expression].ty, "MetadataAccessExpression");
+        ElementRef(expression)
+    }
+    /// The metadata features a namespace owns, in declaration order.
+    fn owned_metadata(r: &mut ResolvedModel, owner: &str) -> Vec<ElementRef> {
+        let owner = r.resolve_qualified(owner).unwrap();
+        r.b.elements[owner.0]
+            .owned_relationships
+            .iter()
+            .flat_map(|&rel| r.b.elements[rel].children.iter().copied())
+            .filter(|&e| conforms(r.b.elements[e].ty, "MetadataFeature"))
+            .map(ElementRef)
+            .collect()
+    }
+    fn reference(e: ElementRef) -> DerivedValue {
+        DerivedValue::Reference(Reference::Element(e))
+    }
+    /// KerML 8.3.4.8.8: `x.metadata` evaluates to the metadata features
+    /// `x` owns that annotate it, then its metaclass feature, answered by
+    /// the reflective metaclass that types it; the base `evaluate`
+    /// dispatches to the override. KerML 8.3.4.14: a syntactic metadata
+    /// feature's syntax element is the one element it annotates when
+    /// that element's metaclass is the one named.
+    #[test]
+    fn metadata_access_reads_annotations_and_the_reflective_metaclass() {
+        let mut r = reflection_fixture(REFLECTION, METADATA_MODEL);
+        let probe = value_expression(&mut r, "M::probe");
+        let class = r.resolve_qualified("KerML::Class").unwrap();
+        let feature = r.resolve_qualified("KerML::Feature").unwrap();
+        let rover = r.resolve_qualified("M::Rover").unwrap();
+        let other = r.resolve_qualified("M::Other").unwrap();
+        let rover_metadata = owned_metadata(&mut r, "M::Rover");
+        assert_eq!(rover_metadata.len(), 4);
+        let package_metadata = owned_metadata(&mut r, "M");
+        assert_eq!(package_metadata.len(), 1);
+        let target = [DerivedValue::Element(rover)];
+        // The one `about Other` in Rover's body annotates Other, not Rover;
+        // the package-level one annotates Rover but is not owned by it.
+        let expected: Vec<Reference> = rover_metadata[..3]
+            .iter()
+            .copied()
+            .chain([class])
+            .map(Reference::Element)
+            .collect();
+        let result = r
+            .invoke_operation(probe, METADATA_EVALUATE, &target)
+            .unwrap();
+        assert_eq!(result.value, DerivedValue::References(expected.clone()));
+        let through_base = r.invoke_operation(probe, EVALUATE, &target).unwrap();
+        assert_eq!(through_base.effective, METADATA_EVALUATE);
+        assert_eq!(through_base.value, DerivedValue::References(expected));
+        assert_eq!(
+            r.invoke_operation(probe, METACLASS_FEATURE, &[])
+                .unwrap()
+                .value,
+            reference(class)
+        );
+        // An element without annotations: the metaclass feature alone.
+        let probe_feature = value_expression(&mut r, "M::probeFeature");
+        assert_eq!(
+            r.invoke_operation(probe_feature, METADATA_EVALUATE, &target)
+                .unwrap()
+                .value,
+            DerivedValue::References(vec![Reference::Element(feature)])
+        );
+        let probe_other = value_expression(&mut r, "M::probeOther");
+        assert_eq!(
+            r.invoke_operation(probe_other, METADATA_EVALUATE, &target)
+                .unwrap()
+                .value,
+            DerivedValue::References(vec![Reference::Element(class)])
+        );
+        // syntaxElement: `@KerML::Class` on a class represents the class;
+        // `@KerML::Package` on it represents nothing; `@Tag` is not
+        // syntactic; `about Other` represents Other; two targets refuse.
+        // A model metaclass specializing a reflective one is the full
+        // library's case (`evaluation_operations.rs`): here its feature's
+        // closure is uncertified, like `@Tag`'s.
+        let [tag, class_on_rover, package_on_rover, about_other] = rover_metadata[..] else {
+            unreachable!()
+        };
+        assert_eq!(
+            r.invoke_operation(class_on_rover, SYNTAX_ELEMENT, &[])
+                .unwrap()
+                .value,
+            reference(rover)
+        );
+        assert_eq!(
+            r.invoke_operation(package_on_rover, SYNTAX_ELEMENT, &[])
+                .unwrap()
+                .value,
+            DerivedValue::Null
+        );
+        // The user metaclass's feature: the minimal library leaves its
+        // supertype closure uncertified, so `isSyntactic` refuses and the
+        // precondition carries that refusal (the full library decides it:
+        // `evaluation_operations.rs`).
+        assert_eq!(
+            r.invoke_operation(tag, SYNTAX_ELEMENT, &[]),
+            Err(OperationError::Incomplete {
+                effective: SYNTAX_ELEMENT,
+                blocker: Some(tag)
+            })
+        );
+        assert!(matches!(
+            r.invoke_operation(tag, "Kernel-Metadata-MetadataFeature-isSyntactic_", &[]),
+            Err(OperationError::Incomplete { blocker: Some(b), .. }) if b == tag
+        ));
+        assert_eq!(
+            r.invoke_operation(about_other, SYNTAX_ELEMENT, &[])
+                .unwrap()
+                .value,
+            reference(other)
+        );
+        assert!(matches!(
+            r.invoke_operation(package_metadata[0], SYNTAX_ELEMENT, &[]),
+            Err(OperationError::UnsupportedConfiguration {
+                effective: SYNTAX_ELEMENT,
+                ..
+            })
+        ));
+    }
+    /// Without the reflection library no metaclass names the element:
+    /// the metadata access bodies refuse at the referenced element rather
+    /// than answer a partial sequence.
+    #[test]
+    fn metadata_access_refuses_without_the_reflection_library() {
+        let mut r = reflection_fixture(
+            "",
+            "package M { metaclass Tag; class Rover { @Tag; } feature probe = Rover.metadata; }",
+        );
+        let probe = value_expression(&mut r, "M::probe");
+        let rover = r.resolve_qualified("M::Rover").unwrap();
+        let target = [DerivedValue::Element(rover)];
+        assert_eq!(
+            r.invoke_operation(probe, METACLASS_FEATURE, &[]),
+            Err(OperationError::Incomplete {
+                effective: METACLASS_FEATURE,
+                blocker: Some(rover)
+            })
+        );
+        assert_eq!(
+            r.invoke_operation(probe, METADATA_EVALUATE, &target),
+            Err(OperationError::Incomplete {
+                effective: METADATA_EVALUATE,
+                blocker: Some(rover)
+            })
+        );
     }
     const SPECIALIZES: &str = "Core-Types-Type-specializes_Type";
     const COMPATIBLE: &str = "Core-Types-Type-isCompatibleWith_Type";

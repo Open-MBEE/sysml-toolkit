@@ -67,15 +67,93 @@ pub fn conditional_property_capability(declaration: &str) -> Option<ConditionalP
         }
         "Systems-Items-ItemUsage-itemDefinition" => "Systems-Items-ItemUsage-itemDefinition",
         "Systems-Parts-PartUsage-partDefinition" => "Systems-Parts-PartUsage-partDefinition",
+        "Systems-Ports-PortUsage-portDefinition" => "Systems-Ports-PortUsage-portDefinition",
+        "Systems-Connections-ConnectionUsage-connectionDefinition" => {
+            "Systems-Connections-ConnectionUsage-connectionDefinition"
+        }
+        "Systems-Interfaces-InterfaceUsage-interfaceDefinition" => {
+            "Systems-Interfaces-InterfaceUsage-interfaceDefinition"
+        }
         "Core-Features-Feature-type" => "Core-Features-Feature-type",
         "Kernel-Behaviors-Step-behavior" => "Kernel-Behaviors-Step-behavior",
         "Kernel-Functions-Expression-function" => "Kernel-Functions-Expression-function",
+        "Kernel-Connectors-Connector-connectorEnd" => "Kernel-Connectors-Connector-connectorEnd",
+        "Kernel-Connectors-Connector-relatedFeature" => {
+            "Kernel-Connectors-Connector-relatedFeature"
+        }
+        "Kernel-Connectors-Connector-sourceFeature" => "Kernel-Connectors-Connector-sourceFeature",
+        "Kernel-Connectors-Connector-targetFeature" => "Kernel-Connectors-Connector-targetFeature",
+        "Kernel-Interactions-Flow-payloadType" => "Kernel-Interactions-Flow-payloadType",
+        "Systems-Actions-AcceptActionUsage-payloadParameter" => {
+            "Systems-Actions-AcceptActionUsage-payloadParameter"
+        }
+        "Systems-Requirements-RequirementUsage-subjectParameter" => {
+            "Systems-Requirements-RequirementUsage-subjectParameter"
+        }
+        "Systems-Requirements-RequirementDefinition-subjectParameter" => {
+            "Systems-Requirements-RequirementDefinition-subjectParameter"
+        }
+        "Systems-Cases-CaseUsage-subjectParameter" => "Systems-Cases-CaseUsage-subjectParameter",
+        "Systems-Cases-CaseDefinition-subjectParameter" => {
+            "Systems-Cases-CaseDefinition-subjectParameter"
+        }
+        "Systems-Requirements-RequirementUsage-requirementDefinition" => {
+            "Systems-Requirements-RequirementUsage-requirementDefinition"
+        }
+        "Systems-Requirements-SatisfyRequirementUsage-satisfyingFeature" => {
+            "Systems-Requirements-SatisfyRequirementUsage-satisfyingFeature"
+        }
         _ => return None,
     };
     Some(ConditionalPropertyCapability {
         declaration,
         requires_full_closure: true,
     })
+}
+
+/// The declarations read over a receiver's certified member lists (its
+/// ends, directed features or feature memberships) or through one of its
+/// members' own structure: attempted on the receiver kinds whose member
+/// lists are certified, like the Type sequences.
+fn member_structure_capability(declaration: &str) -> bool {
+    matches!(
+        declaration,
+        "Kernel-Connectors-Connector-connectorEnd"
+            | "Kernel-Connectors-Connector-relatedFeature"
+            | "Kernel-Connectors-Connector-sourceFeature"
+            | "Kernel-Connectors-Connector-targetFeature"
+            | "Kernel-Interactions-Flow-payloadType"
+            | "Systems-Actions-AcceptActionUsage-payloadParameter"
+            | "Systems-Requirements-SatisfyRequirementUsage-satisfyingFeature"
+    ) || subject_parameter_capability(declaration)
+}
+fn subject_parameter_capability(declaration: &str) -> bool {
+    matches!(
+        declaration,
+        "Systems-Requirements-RequirementUsage-subjectParameter"
+            | "Systems-Requirements-RequirementDefinition-subjectParameter"
+            | "Systems-Cases-CaseUsage-subjectParameter"
+            | "Systems-Cases-CaseDefinition-subjectParameter"
+    )
+}
+
+/// Why a property read through a member's own structure could not be
+/// certified: what the structure lacks, named so a caller can tell a
+/// connector with no second end from an end that references nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FeatureStructureIssue {
+    /// The end at `position` (in end order, from 0) owns several
+    /// ReferenceSubsettings, so it references no one feature.
+    AmbiguousEndReference { position: usize },
+    /// The subject parameter owns no FeatureValue that binds it.
+    SubjectWithoutValue,
+    /// The subject parameter's value is not a feature reference expression.
+    ValueNotFeatureReference,
+    /// The feature reference expression names no referent feature.
+    ReferentMissing,
+    /// A relationship row of the structure is not consistently owned.
+    InvalidRelationship,
 }
 fn same_arc<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
     match (a, b) {
@@ -309,7 +387,9 @@ impl CheckedRow {
             "Core-Types-Type-input" => &p.inputs,
             "Core-Types-Type-output" => &p.outputs,
             "Core-Types-Type-directedFeature" => &p.directed_features,
-            "Core-Types-Type-endFeature" => &p.end_features,
+            "Core-Types-Type-endFeature" | "Kernel-Connectors-Connector-connectorEnd" => {
+                &p.end_features
+            }
             "Core-Types-Type-feature" => &p.features,
             "Core-Types-Type-featureMembership" => &p.feature_memberships,
             "Core-Types-Type-inheritedFeature" => &p.inherited_features,
@@ -389,44 +469,14 @@ impl CheckedRow {
         r: &mut ResolvedModel,
         owner: ElementRef,
     ) -> Result<serde_json::Value, PropertyError> {
-        use crate::json::{publication, semantic_ownership, structural_index::StoredStructure};
-        if r.b.ensure_semantic_graph() != publication::Status::Ready {
-            return Err(PropertyError::Approximate);
-        }
-        r.sync_semantic_publication();
-        let raw = StoredStructure::for_query(&mut r.b, &mut self.steps)
-            .ok_or(PropertyError::Approximate)?;
-        if !raw.ids_unique {
-            return Err(PropertyError::InvalidValue(
-                "duplicate element identity".into(),
-            ));
-        }
-        let rows = semantic_ownership::owned_relationships(&r.b, owner.0)
-            .ok_or(PropertyError::Approximate)?;
-        self.steps = self.steps.saturating_add(rows.len().saturating_mul(12));
-        if self.steps > crate::eval::MAX_STEPS {
-            return Err(PropertyError::Approximate);
-        }
-        let mut seen = std::collections::HashSet::new();
-        let mut values = Vec::with_capacity(rows.len());
-        for relationship in rows.iter() {
-            if !seen.insert(relationship)
-                || semantic_ownership::checked_relationship_carrier(
-                    &r.b,
-                    &raw,
-                    relationship,
-                    &mut self.steps,
-                ) != Some(Some(owner.0))
-            {
-                return Err(PropertyError::InvalidValue(
-                    "inconsistent owned relationship carrier".into(),
-                ));
-            }
-            values.push(
-                serde_json::json!({"@id": r.element_id(ElementRef(relationship)).to_string()}),
-            );
-        }
-        Ok(serde_json::Value::Array(values))
+        let rows = self.checked_owned_relationships(r, owner)?;
+        Ok(serde_json::Value::Array(
+            rows.into_iter()
+                .map(|relationship| {
+                    serde_json::json!({"@id": r.element_id(relationship).to_string()})
+                })
+                .collect(),
+        ))
     }
 
     pub(super) fn read(
@@ -469,7 +519,8 @@ impl CheckedRow {
                     | "Systems-DefinitionAndUsage-Definition-directedUsage"
                     | "Systems-DefinitionAndUsage-Usage-usage"
                     | "Systems-DefinitionAndUsage-Usage-directedUsage"
-            ))
+            )
+            || member_structure_capability(effective.id))
             && effective.id != "Core-Types-Type-input"
             && !crate::json::type_features::supported_root(r.element_type(e))
         {
@@ -482,10 +533,50 @@ impl CheckedRow {
         ) && (r.element_type(e) != "ConstructorExpression"
             || r.b.graph_format != crate::model::GraphFormat::CanonicalV3)
         {
+            // An expression's own result — written, or generated by the
+            // result family — is certified; the inherited one is not.
+            if effective.id == "Kernel-Functions-Expression-result"
+                && r.element_type(e) != "ConstructorExpression"
+            {
+                return Some(self.owned_result(r, e, requested, effective));
+            }
             return None;
         }
         Some(self.read_known(r, e, requested, effective))
     }
+    /// `Expression::result` where the expression owns its result: the
+    /// generated one once the result family published it, else a written
+    /// one; qualified otherwise.
+    fn owned_result(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+        requested: &semantic_catalog::PropertySpec,
+        effective: &semantic_catalog::PropertySpec,
+    ) -> Result<DerivedValue, PropertyError> {
+        if r.closure_policy()
+            != (ClosurePolicy::Closure {
+                include_implied: true,
+            })
+        {
+            return Err(PropertyError::Approximate);
+        }
+        if r.b.ensure_semantic_graph() != crate::json::publication::Status::Ready {
+            return Err(PropertyError::Approximate);
+        }
+        r.sync_semantic_publication();
+        self.steps = self.steps.saturating_add(12);
+        if self.steps > crate::eval::MAX_STEPS {
+            return Err(PropertyError::Approximate);
+        }
+        let result = r
+            .certified_owned_result(e)
+            .ok_or(PropertyError::Approximate)?;
+        validate_references(r, effective, &[result])?;
+        validate_references(r, requested, &[result])?;
+        Ok(DerivedValue::Reference(Reference::Element(result)))
+    }
+
     fn read_known(
         &mut self,
         r: &mut ResolvedModel,
@@ -501,7 +592,9 @@ impl CheckedRow {
             return Err(PropertyError::Approximate);
         }
         // These read the implied relationships without making them: a
-        // deferred demand is met first, as for any derived read.
+        // deferred demand is met first, as for any derived read (the lists
+        // have the semantic graph made before the row is taken, see
+        // `ResolvedModel::property`).
         r.make_deferred_implied();
         if effective.id == "Systems-DefinitionAndUsage-Usage-mayTimeVary" {
             return self
@@ -589,6 +682,22 @@ impl CheckedRow {
                     refs.into_iter().map(Reference::Element).collect(),
                 ));
             }
+            if r.element_type(e) == "ConstructorExpression" {
+                let refs = self.constructor_arguments(r, e)?;
+                validate_references(r, effective, &refs)?;
+                validate_references(r, requested, &refs)?;
+                return Ok(DerivedValue::References(
+                    refs.into_iter().map(Reference::Element).collect(),
+                ));
+            }
+            // The arguments' positional redefinitions are the planner's
+            // rows: the semantic graph is materialized first, as it is for
+            // the owned relationships, so a first read does not refuse what
+            // a later one answers.
+            if r.b.ensure_semantic_graph() != crate::json::publication::Status::Ready {
+                return Err(PropertyError::Approximate);
+            }
+            r.sync_semantic_publication();
             let report = r.invocation_binding_report_with_budget(e, self.steps);
             self.steps = report.steps;
             let args = report
@@ -640,6 +749,88 @@ impl CheckedRow {
                 handles.into_iter().map(Reference::Element).collect(),
             ));
         }
+        if effective.id == "Kernel-Connectors-Connector-connectorEnd" {
+            let value = self.read_features(r, e, effective.id)?;
+            let handles = local_handles(&value);
+            validate_references(r, effective, &handles)?;
+            validate_references(r, requested, &handles)?;
+            return Ok(value);
+        }
+        if effective.id == "Kernel-Connectors-Connector-relatedFeature" {
+            // `Connector::relatedFeature` (KerML `deriveConnectorRelatedFeature`):
+            // the feature each end references, in end order, an end without
+            // a reference contributing nothing; an ordered, non-unique
+            // sequence, so nothing is deduplicated. A connector's
+            // `relatedElement` reads here too.
+            let mut refs: Vec<Reference> = Vec::new();
+            for reference in self.related_features(r, e)?.into_iter().flatten() {
+                refs.push(reference?);
+            }
+            validate_mixed_references(r, effective, &refs)?;
+            validate_mixed_references(r, requested, &refs)?;
+            return Ok(shaped(refs, requested));
+        }
+        if matches!(
+            effective.id,
+            "Kernel-Connectors-Connector-sourceFeature"
+                | "Kernel-Connectors-Connector-targetFeature"
+        ) {
+            let mut related = self.related_features(r, e)?.into_iter();
+            let refs: Vec<Reference> = if effective.name == "sourceFeature" {
+                // The first end's feature; null when that end references
+                // nothing.
+                related.next().flatten().transpose()?.into_iter().collect()
+            } else {
+                // The later ends' features as an ordered set.
+                let mut targets: Vec<Reference> = Vec::new();
+                for reference in related.skip(1).flatten() {
+                    let reference = reference?;
+                    if !targets.contains(&reference) {
+                        targets.push(reference);
+                    }
+                }
+                targets
+            };
+            validate_mixed_references(r, effective, &refs)?;
+            validate_mixed_references(r, requested, &refs)?;
+            return Ok(shaped(refs, requested));
+        }
+        if effective.id == "Kernel-Interactions-Flow-payloadType" {
+            let types = match self.payload_feature(r, e)? {
+                Some(payload) => self.type_projection(r, payload)?,
+                None => Vec::new(),
+            };
+            validate_references(r, effective, &types)?;
+            validate_references(r, requested, &types)?;
+            return Ok(DerivedValue::References(
+                types.into_iter().map(Reference::Element).collect(),
+            ));
+        }
+        if effective.id == "Systems-Actions-AcceptActionUsage-payloadParameter" {
+            let value = self.read_features(r, e, "Core-Types-Type-directedFeature")?;
+            let refs: Vec<_> = local_handles(&value).into_iter().take(1).collect();
+            validate_references(r, effective, &refs)?;
+            validate_references(r, requested, &refs)?;
+            return Ok(shaped(
+                refs.into_iter().map(Reference::Element).collect(),
+                requested,
+            ));
+        }
+        if subject_parameter_capability(effective.id) {
+            let refs: Vec<_> = self.subject_parameter(r, e)?.into_iter().collect();
+            validate_references(r, effective, &refs)?;
+            validate_references(r, requested, &refs)?;
+            return Ok(shaped(
+                refs.into_iter().map(Reference::Element).collect(),
+                requested,
+            ));
+        }
+        if effective.id == "Systems-Requirements-SatisfyRequirementUsage-satisfyingFeature" {
+            let refs: Vec<_> = self.satisfying_feature(r, e)?.into_iter().collect();
+            validate_mixed_references(r, effective, &refs)?;
+            validate_mixed_references(r, requested, &refs)?;
+            return Ok(shaped(refs, requested));
+        }
         if effective.id.starts_with("Core-Types-Type-") {
             let value = self.read_features(r, e, effective.id)?;
             if let DerivedValue::References(refs) = &value {
@@ -655,6 +846,85 @@ impl CheckedRow {
             }
             return Ok(value);
         }
+        self.ensure_type_report(r, e)?;
+        let report = self.cached.get(&e.0).expect("established current report");
+        let refs: Result<&[ElementRef], FeatureTypeIssue> = match effective.id {
+            "Core-Features-Feature-type"
+            | "Systems-DefinitionAndUsage-Usage-definition"
+            | "Systems-Attributes-AttributeUsage-attributeDefinition"
+            | "Systems-Occurrences-OccurrenceUsage-occurrenceDefinition"
+            | "Systems-Items-ItemUsage-itemDefinition"
+            | "Systems-Parts-PartUsage-partDefinition"
+            | "Systems-Ports-PortUsage-portDefinition"
+            | "Systems-Connections-ConnectionUsage-connectionDefinition"
+            | "Systems-Interfaces-InterfaceUsage-interfaceDefinition"
+            | "Systems-Requirements-RequirementUsage-requirementDefinition" => {
+                report.types.as_ref().map(Vec::as_slice).map_err(|e| *e)
+            }
+            "Kernel-Behaviors-Step-behavior" => {
+                report.behavior.as_ref().map(Vec::as_slice).map_err(|e| *e)
+            }
+            "Kernel-Functions-Expression-function" => report
+                .function
+                .as_ref()
+                .map(|v| v.as_slice())
+                .map_err(|e| *e),
+            _ => unreachable!("audited capability identity"),
+        };
+        let refs: Vec<ElementRef> = refs
+            .map_err(PropertyError::IncompleteTypeProjection)?
+            .to_vec();
+
+        // Report output, effective/requested validation and JSON reference
+        // conversion all have bounded passes over fixed-length UUID identities.
+        // Charge before cloning or serializing even when the report is cached.
+        let amount = refs.len().saturating_mul(12).saturating_add(1);
+        let used = self.steps.saturating_add(amount);
+        if used > crate::eval::MAX_STEPS {
+            self.steps = used;
+            return Err(PropertyError::IncompleteTypeProjection(
+                FeatureTypeIssue::WorkLimit,
+            ));
+        }
+        self.steps = used;
+        // Item, Part and Requirement definitions subset the complete type
+        // collection; the other Usage declarations (a port's, a connection's
+        // and an interface's among them) redefine it and must validate
+        // every type.
+        let subset_kind = match effective.id {
+            "Systems-Items-ItemUsage-itemDefinition" => Some("Structure"),
+            "Systems-Parts-PartUsage-partDefinition" => Some("PartDefinition"),
+            "Systems-Requirements-RequirementUsage-requirementDefinition" => {
+                Some("RequirementDefinition")
+            }
+            _ => None,
+        };
+        let refs: Vec<_> = refs
+            .iter()
+            .copied()
+            .filter(|e| {
+                subset_kind.is_none_or(|kind| crate::metaclass::conforms(r.element_type(*e), kind))
+            })
+            .collect();
+        if (effective.upper == Some(1) || requested.upper == Some(1)) && refs.len() > 1 {
+            return Err(PropertyError::InvalidValue(
+                "multiple values for a single-valued redefinition".into(),
+            ));
+        }
+        validate_references(r, effective, &refs)?;
+        validate_references(r, requested, &refs)?;
+        Ok(shaped(
+            refs.into_iter().map(Reference::Element).collect(),
+            requested,
+        ))
+    }
+    /// Make the receiver's complete type report, kept on the row once made
+    /// (`cached`), unless the row cannot make one now.
+    fn ensure_type_report(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<(), PropertyError> {
         self.charge(1)?;
         if r.b.positional_planning {
             return Err(PropertyError::IncompleteTypeProjection(
@@ -673,74 +943,308 @@ impl CheckedRow {
             self.cached.insert(e.0, report);
             note_certificate();
         }
-        let report = self.cached.get(&e.0).expect("established current report");
-        let refs: Result<&[ElementRef], FeatureTypeIssue> = match effective.id {
-            "Core-Features-Feature-type"
-            | "Systems-DefinitionAndUsage-Usage-definition"
-            | "Systems-Attributes-AttributeUsage-attributeDefinition"
-            | "Systems-Occurrences-OccurrenceUsage-occurrenceDefinition"
-            | "Systems-Items-ItemUsage-itemDefinition"
-            | "Systems-Parts-PartUsage-partDefinition" => {
-                report.types.as_ref().map(Vec::as_slice).map_err(|e| *e)
-            }
-            "Kernel-Behaviors-Step-behavior" => {
-                report.behavior.as_ref().map(Vec::as_slice).map_err(|e| *e)
-            }
-            "Kernel-Functions-Expression-function" => report
-                .function
-                .as_ref()
-                .map(|v| v.as_slice())
-                .map_err(|e| *e),
-            _ => unreachable!("audited capability identity"),
-        };
-        let refs = refs.map_err(PropertyError::IncompleteTypeProjection)?;
-        if (effective.upper == Some(1) || requested.upper == Some(1)) && refs.len() > 1 {
+        Ok(())
+    }
+    /// The complete `Feature::type` of `e`, from its kept type report.
+    fn type_projection(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<Vec<ElementRef>, PropertyError> {
+        self.ensure_type_report(r, e)?;
+        let types = self
+            .cached
+            .get(&e.0)
+            .expect("established current report")
+            .types
+            .as_ref()
+            .map_err(|issue| PropertyError::IncompleteTypeProjection(*issue))?
+            .clone();
+        self.charge(types.len().saturating_mul(12).saturating_add(1))?;
+        Ok(types)
+    }
+    /// The relationships `owner` owns in the published model, each checked
+    /// to be carried by `owner`: the rows the structural reads below walk.
+    fn checked_owned_relationships(
+        &mut self,
+        r: &mut ResolvedModel,
+        owner: ElementRef,
+    ) -> Result<Vec<ElementRef>, PropertyError> {
+        use crate::json::{publication, semantic_ownership, structural_index::StoredStructure};
+        if r.b.ensure_semantic_graph() != publication::Status::Ready {
+            return Err(PropertyError::Approximate);
+        }
+        r.sync_semantic_publication();
+        let raw = StoredStructure::for_query(&mut r.b, &mut self.steps)
+            .ok_or(PropertyError::Approximate)?;
+        if !raw.ids_unique {
             return Err(PropertyError::InvalidValue(
-                "multiple values for a single-valued redefinition".into(),
+                "duplicate element identity".into(),
             ));
         }
-
-        // Report output, effective/requested validation and JSON reference
-        // conversion all have bounded passes over fixed-length UUID identities.
-        // Charge before cloning or serializing even when the report is cached.
-        let amount = refs.len().saturating_mul(12).saturating_add(1);
-        let used = self.steps.saturating_add(amount);
-        if used > crate::eval::MAX_STEPS {
-            self.steps = used;
-            return Err(PropertyError::IncompleteTypeProjection(
-                FeatureTypeIssue::WorkLimit,
-            ));
+        let rows = semantic_ownership::owned_relationships(&r.b, owner.0)
+            .ok_or(PropertyError::Approximate)?;
+        self.steps = self.steps.saturating_add(rows.len().saturating_mul(12));
+        if self.steps > crate::eval::MAX_STEPS {
+            return Err(PropertyError::Approximate);
         }
-        self.steps = used;
-        // Item and Part definitions subset the complete type collection;
-        // the other Usage declarations redefine it and must validate every type.
-        let subset_kind = match effective.id {
-            "Systems-Items-ItemUsage-itemDefinition" => Some("Structure"),
-            "Systems-Parts-PartUsage-partDefinition" => Some("PartDefinition"),
-            _ => None,
-        };
-        let refs: Vec<_> = refs
-            .iter()
-            .copied()
-            .filter(|e| {
-                subset_kind.is_none_or(|kind| crate::metaclass::conforms(r.element_type(*e), kind))
-            })
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for relationship in rows.iter() {
+            if !seen.insert(relationship)
+                || semantic_ownership::checked_relationship_carrier(
+                    &r.b,
+                    &raw,
+                    relationship,
+                    &mut self.steps,
+                ) != Some(Some(owner.0))
+            {
+                return Err(PropertyError::InvalidValue(
+                    "inconsistent owned relationship carrier".into(),
+                ));
+            }
+            out.push(ElementRef(relationship));
+        }
+        Ok(out)
+    }
+    /// `Connector::relatedFeature` by end position: the feature each
+    /// certified end references through its owned ReferenceSubsetting, or
+    /// `None` at an end that owns none. The positions are kept, as the
+    /// compatibility read keeps them: the source end is the first end and
+    /// the target ends the later ones whatever each references, so an end
+    /// declared without a reference leaves its position empty rather than
+    /// promoting the next end's feature (KerML's `deriveConnectorRelatedFeature`
+    /// selects the non-null subsettings, a compaction that would lose the
+    /// end order the source and target names mean). An end that references
+    /// several things, a reference the model cannot read and a reference
+    /// that never resolved hold their position as an error, so
+    /// `sourceFeature` and `targetFeature` refuse only the positions they
+    /// read; a target outside the model is reported as it is.
+    #[allow(clippy::type_complexity)]
+    fn related_features(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<Vec<Option<Result<Reference, PropertyError>>>, PropertyError> {
+        use FeatureStructureIssue as Issue;
+        let structure = PropertyError::IncompleteFeatureStructure;
+        let value = self.read_features(r, e, "Kernel-Connectors-Connector-connectorEnd")?;
+        let ends = local_handles(&value);
+        r.ensure_by_id();
+        let mut related = Vec::with_capacity(ends.len());
+        for (position, end) in ends.into_iter().enumerate() {
+            let rows = self.checked_owned_relationships(r, end)?;
+            self.charge(1)?;
+            let mut subsettings = rows
+                .into_iter()
+                .filter(|&rel| r.element_type(rel) == "ReferenceSubsetting");
+            let Some(rel) = subsettings.next() else {
+                related.push(None);
+                continue;
+            };
+            if subsettings.next().is_some() {
+                related.push(Some(Err(structure(Issue::AmbiguousEndReference {
+                    position,
+                }))));
+                continue;
+            }
+            let reference = r.b.elements[rel.0]
+                .props
+                .get("referencedFeature")
+                .and_then(|atom| r.reference_of(atom));
+            related.push(Some(match reference {
+                None => Err(structure(Issue::InvalidRelationship)),
+                Some(Reference::Unresolved(spelling)) => {
+                    Err(PropertyError::UnresolvedReference(spelling))
+                }
+                Some(reference) => Ok(reference),
+            }));
+        }
+        Ok(related)
+    }
+    /// `InstantiationExpression::argument` on a constructor expression of
+    /// the default graph format, where the constructor owns its argument
+    /// parameters directly (the canonical format hangs them under the
+    /// authored result and reads them through the constructor binding
+    /// report): KerML derives the arguments as the owned parameters'
+    /// feature values (`ownedFeature.valuation.value`), so each
+    /// ParameterMembership among the certified owned relationships must own
+    /// an `in` parameter owning one FeatureValue that is neither a default
+    /// nor an initial value, whose value is the argument. Any other shape
+    /// refuses as an unsupported constructor configuration, a membership
+    /// or value without a member as an invalid relationship.
+    fn constructor_arguments(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<Vec<ElementRef>, PropertyError> {
+        use crate::json::ConstructorBindingIssue as Issue;
+        let incomplete = PropertyError::IncompleteConstructorBindings;
+        let rows = self.checked_owned_relationships(r, e)?;
+        self.charge(rows.len())?;
+        let memberships: Vec<ElementRef> = rows
+            .into_iter()
+            .filter(|&m| r.element_type(m) == "ParameterMembership")
             .collect();
-        validate_references(r, effective, &refs)?;
-        validate_references(r, requested, &refs)?;
-        if requested.upper == Some(1) {
-            Ok(refs
-                .first()
-                .map(|&e| DerivedValue::Reference(Reference::Element(e)))
-                .unwrap_or(DerivedValue::Null))
-        } else {
-            Ok(DerivedValue::References(
-                refs.into_iter().map(Reference::Element).collect(),
-            ))
+        let mut arguments = Vec::new();
+        for membership in memberships {
+            let parameter = r
+                .d_owned_member_element(membership)
+                .ok_or(incomplete(Issue::InvalidRelationship))?;
+            let inward = r.b.elements[parameter.0]
+                .props
+                .get("direction")
+                .and_then(|atom| atom.as_str())
+                == Some("in");
+            if !inward {
+                return Err(incomplete(Issue::UnsupportedConfiguration));
+            }
+            let parameter_rows = self.checked_owned_relationships(r, parameter)?;
+            self.charge(parameter_rows.len().saturating_add(1))?;
+            let mut values = parameter_rows
+                .into_iter()
+                .filter(|&rel| r.element_type(rel) == "FeatureValue");
+            let (Some(value), None) = (values.next(), values.next()) else {
+                return Err(incomplete(Issue::UnsupportedConfiguration));
+            };
+            let flagged = ["isDefault", "isInitial"].iter().any(|name| {
+                r.b.elements[value.0]
+                    .props
+                    .get(name)
+                    .and_then(|atom| atom.as_bool())
+                    .unwrap_or(false)
+            });
+            if flagged {
+                return Err(incomplete(Issue::UnsupportedConfiguration));
+            }
+            arguments.push(
+                r.d_owned_member_element(value)
+                    .ok_or(incomplete(Issue::InvalidRelationship))?,
+            );
         }
+        Ok(arguments)
+    }
+    /// `Flow::payloadFeature`: the first PayloadFeature among the owned
+    /// features, read over the checked owned feature memberships.
+    fn payload_feature(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<Option<ElementRef>, PropertyError> {
+        let rows = self.checked_owned_relationships(r, e)?;
+        self.charge(rows.len())?;
+        Ok(rows
+            .into_iter()
+            .filter(|&m| r.is_kind(m, "FeatureMembership"))
+            .filter_map(|m| r.d_owned_member_element(m))
+            .find(|&f| r.element_type(f) == "PayloadFeature"))
+    }
+    /// The subject parameter of a requirement or case (definition or
+    /// usage): the owned member of the first SubjectMembership among its
+    /// certified feature memberships, the inherited ones included.
+    fn subject_parameter(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<Option<ElementRef>, PropertyError> {
+        let value = self.read_features(r, e, "Core-Types-Type-featureMembership")?;
+        let memberships = local_handles(&value);
+        self.charge(memberships.len())?;
+        Ok(memberships
+            .into_iter()
+            .find(|&m| r.element_type(m) == "SubjectMembership")
+            .and_then(|m| r.d_owned_member_element(m)))
+    }
+    /// `SatisfyRequirementUsage::satisfyingFeature`: the feature the subject
+    /// parameter is bound to — in this lowering the subject's FeatureValue
+    /// is a FeatureReferenceExpression whose referent's feature target it
+    /// is. A subject without a value, a value of another kind and a
+    /// reference without a referent are refused with that reason.
+    fn satisfying_feature(
+        &mut self,
+        r: &mut ResolvedModel,
+        e: ElementRef,
+    ) -> Result<Option<Reference>, PropertyError> {
+        use FeatureStructureIssue as Issue;
+        let structure = PropertyError::IncompleteFeatureStructure;
+        let Some(subject) = self.subject_parameter(r, e)? else {
+            return Ok(None);
+        };
+        let rows = self.checked_owned_relationships(r, subject)?;
+        self.charge(rows.len().saturating_add(4))?;
+        let value = rows
+            .into_iter()
+            .find(|&rel| r.element_type(rel) == "FeatureValue")
+            .and_then(|fv| r.d_owned_member_element(fv))
+            .ok_or(structure(Issue::SubjectWithoutValue))?;
+        if r.element_type(value) != "FeatureReferenceExpression" {
+            return Err(structure(Issue::ValueNotFeatureReference));
+        }
+        let referent = r
+            .d_referent(value)
+            .ok_or(structure(Issue::ReferentMissing))?;
+        let target = match referent {
+            Reference::Element(f) => r.d_feature_target(f),
+            outside => outside,
+        };
+        if let Reference::Unresolved(spelling) = target {
+            return Err(PropertyError::UnresolvedReference(spelling));
+        }
+        Ok(Some(target))
     }
 }
 
+/// The local handles a certified sequence value carries.
+fn local_handles(value: &DerivedValue) -> Vec<ElementRef> {
+    let DerivedValue::References(refs) = value else {
+        unreachable!("certified Type sequences are reference lists")
+    };
+    refs.iter()
+        .map(|reference| match reference {
+            Reference::Element(e) => *e,
+            _ => unreachable!("certified local handles"),
+        })
+        .collect()
+}
+
+/// The shape the requested declaration gives a reference value: one
+/// reference (or null) for a single-valued declaration, the list otherwise.
+fn shaped(refs: Vec<Reference>, requested: &semantic_catalog::PropertySpec) -> DerivedValue {
+    if requested.upper == Some(1) {
+        refs.into_iter()
+            .next()
+            .map(DerivedValue::Reference)
+            .unwrap_or(DerivedValue::Null)
+    } else {
+        DerivedValue::References(refs)
+    }
+}
+
+/// [`validate_references`] over references that may leave the model: the
+/// cardinality holds over all of them, and the kind and uniqueness checks
+/// over the local handles (an element outside the model cannot be
+/// classified here and is reported as it is).
+fn validate_mixed_references(
+    r: &ResolvedModel,
+    spec: &semantic_catalog::PropertySpec,
+    refs: &[Reference],
+) -> Result<(), PropertyError> {
+    if refs.len() < spec.lower {
+        return Err(PropertyError::MissingRequiredValue);
+    }
+    if spec.upper.is_some_and(|upper| refs.len() > upper) {
+        return Err(PropertyError::InvalidValue(
+            "multiple values for a single-valued redefinition".into(),
+        ));
+    }
+    let local: Vec<ElementRef> = refs.iter().filter_map(Reference::element).collect();
+    let relaxed = semantic_catalog::PropertySpec {
+        lower: 0,
+        upper: None,
+        ..*spec
+    };
+    validate_references(r, &relaxed, &local)
+}
 /// Certified local handles avoid the independent ResolvedModel by_id map.
 /// This enforces the same reference cardinality, uniqueness and target-kind
 /// constraints as JSON property validation without a cold whole-model rebuild.

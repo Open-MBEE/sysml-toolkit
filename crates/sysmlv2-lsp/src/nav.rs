@@ -20,6 +20,7 @@
 
 use crate::accept::Accept;
 use crate::position::{Mapper, UnitMappers, offset32};
+use crate::worker::LibraryRoot;
 use crate::{Document, Encoding, Report};
 use lsp_types::{Location, Position, Range, TextEdit, Uri, WorkspaceEdit};
 use std::collections::{BTreeMap, HashMap};
@@ -98,6 +99,8 @@ struct Tolerant {
 struct ReadSession<'a> {
     session: &'a mut Session,
     written: Option<&'a [(String, String)]>,
+    /// The host's library directory (see [`Nav::set_library_root`]).
+    root: Option<&'a LibraryRoot>,
 }
 
 impl ReadSession<'_> {
@@ -118,7 +121,7 @@ impl ReadSession<'_> {
                 uri: Uri::from_str(name).ok()?,
                 range: Mapper::new(text, enc).range(span),
             }),
-            None => Nav::location_static(self.session, unit, span, enc),
+            None => Nav::location_static(self.root, self.session, unit, span, enc),
         }
     }
 }
@@ -447,6 +450,12 @@ pub struct Nav {
     /// The measurement-unit types the library declares (see
     /// [`crate::kinds::unit_types`]), built with the library's table.
     library_unit_types: Arc<std::collections::HashSet<String>>,
+    /// The directory a host serves the library's units under (see
+    /// [`LibraryRoot`]): locations in a library unit are named under it,
+    /// and a document under it is that unit, never a source of its own.
+    /// `None` names them `sysmlv2-lib:/<unit name>`. Hosts set it via
+    /// `initializationOptions.libraryRoot` (and `libraryDirs`).
+    library_root: Option<LibraryRoot>,
     /// Workspace root: on-disk units under it join every session build
     /// (open documents overlaid), so navigation crosses into units the
     /// client never opened. Re-read at rebuild time — the worker tier's
@@ -612,6 +621,7 @@ impl Nav {
             library,
             library_symbols: None,
             library_unit_types: Arc::default(),
+            library_root: None,
             root: None,
             workspace: None,
             workspace_seed_symbols: None,
@@ -736,6 +746,49 @@ impl Nav {
     /// determines (on by default).
     pub fn set_infer_unit_types(&mut self, on: bool) {
         self.infer_unit_types = on;
+    }
+
+    /// Set the directory the host serves the library's units under (see
+    /// [`LibraryRoot`]) — `None` for the `sysmlv2-lib:` scheme. Answers
+    /// given before name library units the old way; the host sets it
+    /// once, at `initialize`.
+    pub fn set_library_root(&mut self, root: Option<LibraryRoot>) {
+        if self.library_root != root {
+            self.library_root = root;
+            self.workspace_seed_symbols = None;
+            self.workspace_rest = None;
+            self.invalidate();
+        }
+    }
+
+    /// Whether `uri` is a read-only copy of a library unit the host
+    /// serves (see [`Self::set_library_root`]): a document that is never
+    /// a source of the workspace — the library already provides its unit,
+    /// and a copy opened as a source would declare everything in it
+    /// twice — and whose requests answer from that unit. A uri under the
+    /// root that names no unit of the library is an ordinary document.
+    pub fn is_library_document(&self, uri: &Uri) -> bool {
+        self.library_text(uri).is_some()
+    }
+
+    /// The text of the library unit `uri` is a copy of (see
+    /// [`Self::is_library_document`]): what the syntax tier reads for it
+    /// in place of an open document's text. `None` for every other uri,
+    /// and for a directory library, whose units are files the host opens
+    /// as its own.
+    pub fn library_text(&self, uri: &Uri) -> Option<&str> {
+        let name = crate::worker::library_unit_name(self.library_root.as_ref(), uri.as_str())?;
+        match self.library.as_ref()? {
+            Library::Prepared(library) => library
+                .sources()
+                .find(|(n, _)| *n == name)
+                .map(|(_, text)| text),
+            Library::Sources { units, .. } => units
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, text)| text.as_str()),
+            Library::Dir(_) => None,
+        }
     }
 
     /// Replace the in-memory workspace units (filesystem-less hosts).
@@ -1377,9 +1430,11 @@ impl Nav {
     /// each unit.
     fn read_session(&mut self, docs: &BTreeMap<Uri, Document>) -> Option<ReadSession<'_>> {
         if self.session(docs).is_some() {
+            let root = self.library_root.as_ref();
             return self.session.as_mut().map(|session| ReadSession {
                 session,
                 written: None,
+                root,
             });
         }
         let fp = Self::fingerprint_of(docs);
@@ -1414,6 +1469,7 @@ impl Nav {
         Some(ReadSession {
             session: t.session.as_mut()?,
             written: Some(&t.written),
+            root: self.library_root.as_ref(),
         })
     }
 
@@ -1435,7 +1491,13 @@ impl Nav {
             let uri = Uri::from_str(u).unwrap();
             crate::worker::overlay_source(&mut sources, u, &docs[&uri].text);
         }
+        sources.retain(|(name, _)| !self.is_library_source(name));
         sources
+    }
+
+    fn is_library_source(&self, name: &str) -> bool {
+        name.parse::<Uri>()
+            .is_ok_and(|uri| self.is_library_document(&uri))
     }
 
     /// A session over `sources`, the configured library loaded. `None`
@@ -1820,10 +1882,124 @@ impl Nav {
         enc: Encoding,
     ) -> Option<Location> {
         let read = self.read_session(docs)?;
-        let unit = Self::unit_of_static(uri, read.session)?;
-        let (target, _) = Self::element_at(read.session, unit, offset)?;
+        let unit = Self::unit_or_library_of(read.root, uri, read.session)?;
+        let (target, _, _) = Self::element_under(read.session, unit, offset)?;
         let (dunit, dspan) = read.session.resolved().declaration_site(target)?;
         read.location(dunit, dspan, enc)
+    }
+
+    /// [`Self::element_at`], and inside a library unit, whose own
+    /// references the model does not record, the element a qualified
+    /// name written at `offset` resolves to (see
+    /// [`Self::library_reference_at`]) with that name's span.
+    fn element_under(
+        session: &mut Session,
+        unit: usize,
+        offset: u32,
+    ) -> Option<(ElementRef, Option<RefSite>, Option<Span>)> {
+        if let Some((target, site)) = Self::element_at(session, unit, offset) {
+            return Some((target, site, None));
+        }
+        let (target, span) = Self::library_reference_at(session, unit, offset)?;
+        Some((target, None, Some(span)))
+    }
+
+    /// The element a qualified name written at `offset` in a *library*
+    /// unit names, with the span of the segment under the cursor. The
+    /// model records reference sites in the user units only, so a
+    /// reference inside a library unit is read off the unit's syntax:
+    /// the name's segments up to the cursor's, resolved from the scope
+    /// of the innermost declaration whose text holds it, the way the
+    /// model resolved it — a specialization or typing written in that
+    /// declaration's own head resolves with the declaration itself
+    /// shielded, as its own did. A declaration that cannot be found in
+    /// the model (an anonymous one in an expression body) resolves from
+    /// the nearest named one around it. `None` outside a library unit,
+    /// off a name, or for a name that resolves to nothing.
+    fn library_reference_at(
+        session: &mut Session,
+        unit: usize,
+        offset: u32,
+    ) -> Option<(ElementRef, Span)> {
+        use sysmlv2_parser::ast::QualifiedName;
+        let (name, text) = session.library_unit(unit)?;
+        let (name, text) = (name.to_string(), text.to_string());
+        let parse = if crate::is_kerml(&name) {
+            sysmlv2_parser::parser::parse_kerml_source(&text)
+        } else {
+            sysmlv2_parser::parser::parse_source(&text)
+        };
+        // The innermost qualified name holding the offset: a chain step
+        // or a filter nests names inside an expression naming others.
+        struct Find<'a> {
+            at: u32,
+            found: Option<&'a QualifiedName>,
+        }
+        impl<'a> sysmlv2_parser::visit::Visit<'a> for Find<'a> {
+            fn visit_qualified_name(&mut self, n: &'a QualifiedName) {
+                if n.span.start <= self.at
+                    && self.at < n.span.end
+                    && self.found.is_none_or(|f| n.span.len() <= f.span.len())
+                {
+                    self.found = Some(n);
+                }
+            }
+        }
+        let mut find = Find {
+            at: offset,
+            found: None,
+        };
+        find.visit_unit(&parse.unit);
+        let written = find.found?;
+        let segment = written
+            .segments
+            .iter()
+            .position(|n| n.span.start <= offset && offset < n.span.end)?;
+        let qn = QualifiedName {
+            is_global: written.is_global,
+            segments: written.segments[..=segment].to_vec(),
+            span: written.span,
+        };
+        let span = written.segments[segment].span;
+        let (around, body) = crate::kinds::enclosing(&parse.unit, offset);
+        let resolved = session.resolved();
+        // The innermost declaration the model knows: by the qualified
+        // name the named ones spell, else by where it is declared.
+        let owner = around
+            .iter()
+            .rev()
+            .enumerate()
+            .find_map(|(from_end, innermost)| {
+                let outer = &around[..around.len() - from_end];
+                let names: Option<Vec<String>> = outer
+                    .iter()
+                    .map(|e| e.name.as_deref().map(sysmlv2_parser::ast::escape_name))
+                    .collect();
+                names
+                    .and_then(|names| resolved.resolve_qualified(&names.join("::")))
+                    .or_else(|| {
+                        let start = innermost.span.start;
+                        resolved.elements().find(|&e| {
+                            resolved
+                                .member_extent(e)
+                                .is_some_and(|(u, s)| u == unit && s.start == start)
+                        })
+                    })
+            });
+        let Some(owner) = owner else {
+            // At the unit's top level the name resolves from the root.
+            return resolved
+                .resolve_qualified(&qn.to_ref_string())
+                .map(|target| (target, span));
+        };
+        let scope = resolved.element_scope(owner)?;
+        // In the declaration's head (before its body's first member)
+        // the declaration itself is shielded from the lookup, as the
+        // model shields a specialization target from capturing the
+        // element it specializes.
+        let in_head = body.first().is_none_or(|m| offset < m.span.start);
+        let target = resolved.resolve_in_excluding(scope, &qn, in_head.then_some(owner))?;
+        Some((target, span))
     }
 
     /// document highlights: where the element under the cursor is
@@ -1837,9 +2013,11 @@ impl Nav {
         enc: Encoding,
     ) -> Option<Vec<lsp_types::DocumentHighlight>> {
         let read = self.read_session(docs)?;
-        let unit = Self::unit_of_static(uri, read.session)?;
-        let (target, _) = Self::element_at(read.session, unit, offset)?;
+        let unit = Self::unit_or_library_of(read.root, uri, read.session)?;
+        let (target, _, written) = Self::element_under(read.session, unit, offset)?;
         let resolved = read.session.resolved();
+        // Inside a library unit the model records no sites: the name
+        // under the cursor is the one highlight besides the declaration.
         let spans: Vec<Span> = resolved
             .declaration_site(target)
             .filter(|(u, _)| *u == unit)
@@ -1852,6 +2030,7 @@ impl Nav {
                     .filter(|s| s.unit == unit)
                     .map(|s| s.name_span),
             )
+            .chain(written)
             .collect();
         let locations = spans
             .into_iter()
@@ -1870,18 +2049,26 @@ impl Nav {
         include_declaration: bool,
         enc: Encoding,
     ) -> Option<Vec<Location>> {
+        let root = self.library_root.clone();
+        let root = root.as_ref();
         let session = self.session(docs)?;
-        let unit = Self::unit_of_static(uri, session)?;
-        let (target, _) = Self::element_at(session, unit, offset)?;
+        let unit = Self::unit_or_library_of(root, uri, session)?;
+        let (target, _, _) = Self::element_under(session, unit, offset)?;
         let sites = session.resolved().references_to(target);
         let mut out = Vec::new();
         if include_declaration {
             if let Some((dunit, dspan)) = session.resolved().declaration_site(target) {
-                out.extend(Self::location_static(session, dunit, dspan, enc));
+                out.extend(Self::location_static(root, session, dunit, dspan, enc));
             }
         }
         for s in sites {
-            out.extend(Self::location_static(session, s.unit, s.name_span, enc));
+            out.extend(Self::location_static(
+                root,
+                session,
+                s.unit,
+                s.name_span,
+                enc,
+            ));
         }
         Some(out)
     }
@@ -1986,8 +2173,8 @@ impl Nav {
         let units = self.value_hint_units;
         let read = self.read_session(docs)?;
         let session = &mut *read.session;
-        let unit = Self::unit_of_static(uri, session)?;
-        let (target, site) = Self::element_at(session, unit, offset)?;
+        let unit = Self::unit_or_library_of(read.root, uri, session)?;
+        let (target, site, written) = Self::element_under(session, unit, offset)?;
         let resolved = session.resolved();
         let metaclass = resolved.element_type(target);
         let qn = resolved
@@ -2146,7 +2333,7 @@ impl Nav {
         } else {
             format!("{text}\n\n---\n{}", bodies.join("\n\n"))
         };
-        let span = site.map(|s| s.name_span).or_else(|| {
+        let span = site.map(|s| s.name_span).or(written).or_else(|| {
             resolved
                 .declaration_site(target)
                 .filter(|(u, _)| *u == unit)
@@ -2155,6 +2342,7 @@ impl Nav {
         let range = ReadSession {
             session,
             written: read.written,
+            root: read.root,
         }
         .location(unit, span, enc)?
         .range;
@@ -2901,7 +3089,10 @@ impl Nav {
                     if let Some(units) = &self.workspace {
                         let mut seed: Vec<QualifiedSymbol> = Vec::new();
                         let mut seed_links = Links::default();
-                        for (name, text) in units.iter() {
+                        for (name, text) in units
+                            .iter()
+                            .filter(|(name, _)| !self.is_library_source(name))
+                        {
                             let kerml = crate::is_kerml(name);
                             collect_unit(text, kerml, Some(name), enc, &mut seed, &mut seed_links);
                         }
@@ -4539,7 +4730,28 @@ impl Nav {
             .map(|(i, _, _)| i)
     }
 
+    /// [`Self::unit_of_static`], else the *library* unit a document
+    /// under the host's library directory (`root`, see
+    /// [`Self::set_library_root`]) or the `sysmlv2-lib:` scheme is a
+    /// copy of: read-only navigation answers inside a library unit from
+    /// the unit the session already holds. Nothing for a uri naming no
+    /// unit of either kind.
+    fn unit_or_library_of(
+        root: Option<&LibraryRoot>,
+        uri: &Uri,
+        session: &Session,
+    ) -> Option<usize> {
+        Self::unit_of_static(uri, session).or_else(|| {
+            let name = crate::worker::library_unit_name(root, uri.as_str())?;
+            // Library units fill the model's indices below the user units.
+            (0..)
+                .map_while(|unit| session.library_unit(unit))
+                .position(|(n, _)| n == name)
+        })
+    }
+
     fn location_static(
+        root: Option<&LibraryRoot>,
         session: &Session,
         unit: usize,
         span: Span,
@@ -4552,23 +4764,26 @@ impl Nav {
                 range: mapper.range(span),
             });
         }
-        Self::library_location(session, unit, span, enc)
+        Self::library_location(root, session, unit, span, enc)
     }
 
     /// A location inside a *library* unit — definitions of standard-
-    /// library symbols land here. In-memory libraries get the
+    /// library symbols land here. In-memory libraries are named under
+    /// the host's library directory when it serves their units as files
+    /// there (`root`, see [`Self::set_library_root`]), else under the
     /// `sysmlv2-lib:/<unit name>` scheme (hosts serve the text as a
     /// read-only virtual document; browser hosts ship the same bundle
     /// the server was seeded with); directory libraries get real
     /// `file://` uris.
     fn library_location(
+        root: Option<&LibraryRoot>,
         session: &Session,
         unit: usize,
         span: Span,
         enc: Encoding,
     ) -> Option<Location> {
         if let Some((name, text)) = session.library_unit(unit) {
-            let uri = crate::worker::library_uri(name);
+            let uri = crate::worker::library_uri_under(root, name);
             let mapper = Mapper::new(text, enc);
             return Some(Location {
                 uri: Uri::from_str(&uri).ok()?,
@@ -6777,5 +6992,39 @@ mod library_table_tests {
         );
         assert_eq!(spelled(&table), spelled(&parsed.table));
         assert_eq!(nav.library_unit_types, parsed.unit_types);
+    }
+}
+
+#[cfg(test)]
+mod hosted_library_sources_tests {
+    use super::*;
+
+    #[test]
+    fn disk_discovered_library_copies_are_excluded() {
+        let root = std::env::temp_dir().join(format!(
+            "sysmlv2-library-review-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("libs/Mini")).unwrap();
+        std::fs::write(root.join("libs/Mini/Items.sysml"), "package Items;").unwrap();
+        std::fs::write(root.join("libs/notes.sysml"), "package Notes;").unwrap();
+        std::fs::write(root.join("main.sysml"), "package P;").unwrap();
+        let mut nav = Nav::new_with(Some(Library::sources(vec![(
+            "Mini/Items.sysml".into(),
+            "package Items;".into(),
+        )])));
+        nav.root = Some(root.clone());
+        nav.set_library_root(LibraryRoot::new(&crate::worker::uri_for_path(
+            &root.join("libs"),
+        )));
+        let sources = nav.assemble_sources(&BTreeMap::new(), &[]);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources.iter().any(|(_, text)| text == "package Notes;"));
+        assert!(sources.iter().any(|(_, text)| text == "package P;"));
     }
 }

@@ -1,11 +1,22 @@
 #![cfg(feature = "json")]
 use sysmlv2_parser::{
-    json::{ClosurePolicy, ModelLevelEvaluability, ResolvedModel, model_to_compact_json},
+    json::{
+        ClosurePolicy, FeatureTypeIssue, ModelLevelEvaluability, ResolvedModel,
+        model_to_compact_json,
+    },
     model::Model,
 };
 
+/// The callee typing (or feature-callee subsetting) and the arguments'
+/// positional redefinitions of an invocation are the static planner's rows
+/// now: their stored properties carry the source and the target, as every
+/// kind-role row's do (the owner is the ownership view's, written by the
+/// full form), the expression owns its generated result membership among
+/// its implied relationships and no written one, and a user function keeps
+/// the expression outside model-level evaluability; its checked `type`
+/// refuses here only because no library supplies the roles to require.
 #[test]
-fn public_dynamic_callee_and_argument_edges_preserve_source_and_report_qualification() {
+fn public_callee_and_argument_rows_preserve_source_and_report_qualification() {
     let mut model = Model::new();
     assert!(model.add_source("dynamic-sdk.kerml", "function F {in p; return result;} feature callee {feature nested;} feature call=F(1); feature other=callee();").diagnostics.is_empty());
     let compact = model_to_compact_json(&model);
@@ -35,7 +46,6 @@ fn public_dynamic_callee_and_argument_edges_preserve_source_and_report_qualifica
             ("FeatureTyping", f, "type"),
             ("Subsetting", callee, "subsettedFeature"),
         ]) {
-            assert!(r.feature_type_report(call).types.is_err());
             let rows: Vec<_> = r
                 .implied_relationships(call)
                 .into_iter()
@@ -46,16 +56,32 @@ fn public_dynamic_callee_and_argument_edges_preserve_source_and_report_qualifica
                 .collect();
             assert_eq!(rows.len(), 1);
             edges.push(r.element_id(rows[0]));
-            assert_eq!(
-                r.element_properties(rows[0])["owningRelatedElement"]["@id"],
-                r.element_id(call).to_string()
+            // A static row stores its source and target; its owner is the
+            // ownership view's.
+            assert!(
+                r.element_properties(rows[0])
+                    .get("owningRelatedElement")
+                    .is_none()
             );
+            assert_eq!(r.owner(rows[0]), Some(call));
+            // The result membership is generated, never written.
             assert!(
                 !r.owned_relationships(call)
                     .iter()
                     .any(|&row| r.element_type(row) == "ReturnParameterMembership")
             );
-            assert!(r.feature_type_report(call).types.is_err());
+            assert!(
+                r.implied_relationships(call)
+                    .iter()
+                    .any(|&row| r.element_type(row) == "ReturnParameterMembership")
+            );
+            // The checked type still refuses here for the library's absence
+            // (no `Base::things` role to require), not for the callee: with a
+            // library the row certifies it (instantiation_callee_typing.rs).
+            assert_eq!(
+                r.feature_type_report(call).types,
+                Err(FeatureTypeIssue::MissingRequiredFamilies)
+            );
             assert!(matches!(
                 r.model_level_evaluability(call).classification,
                 ModelLevelEvaluability::Unknown(_)

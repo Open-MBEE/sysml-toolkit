@@ -1660,11 +1660,14 @@ mod tests {
                 Some(Vec::new())
             );
             assert_eq!(r.effective_cardinality(parameter), Some((1, Some(1))));
+            // The singleton is the parameter's owned default multiplicity
+            // (SysML 7.6.3), a stored member: corrupting the generated
+            // positional row no longer reaches the answer.
             let id = r.b.elements[original.0].id;
             r.b.elements[generated]
                 .props
                 .insert("specific", json!({"@id": id.to_string()}));
-            assert_eq!(r.effective_cardinality(parameter), None);
+            assert_eq!(r.effective_cardinality(parameter), Some((1, Some(1))));
         }
     }
 
@@ -1679,21 +1682,17 @@ mod tests {
             .find(|&e| r.element_type(e) == "InvocationExpression")
             .unwrap();
         r.implied_relationships(invocation);
+        // The argument's redefinition of `p` is the static plan's row.
         let parameter =
-            r.b.elements
-                .iter()
-                .enumerate()
-                .find_map(|(i, e)| {
-                    (e.ty == "Redefinition" && i >= r.b.explicit_len())
-                        .then(|| {
-                            e.props
-                                .get("owningRelatedElement")
-                                .and_then(|v| v.as_reference())
-                        })
-                        .flatten()
-                })
+            r.b.owned_member_elems(invocation.0, true)
+                .into_iter()
+                .find(|&f| r.b.is_parameter(f))
                 .unwrap();
-        let parameter = r.b.element_index_of_uuid(parameter).unwrap();
+        assert!(
+            r.implied_relationships(ElementRef(parameter))
+                .iter()
+                .any(|&row| r.b.elements[row.0].ty == "Redefinition")
+        );
         assert!(r.b.cardinality_subset_targets(parameter, &mut 0).is_some());
         let rows = r.b.elements.observe_revision();
         r.b.lib_qnames.push((

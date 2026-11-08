@@ -91,7 +91,7 @@ A `Session` owns the parsed, resolved model and every handle into it. Open one f
 0
 ```
 
-`from_files([...])` does the same for paths (dialect by extension, `.kerml` → KerML). To resolve names from the OMG standard library, call `load_library(dir)` with a checkout of its `sysml.library/` directory — native directory loading shares the CLI’s prepared graph and static-analysis cache, with library source trees reconstructed on demand, and quantity values (`10 [mm]`) then evaluate to `(magnitude, unit)` tuples.
+`from_files([...])` does the same for paths (dialect by extension, `.kerml` → KerML). Both take `graph_format="legacy"` (the default) or `"canonical"`, the opt-in contract of `IDS.md` in which a conditional operand is a reference to an owned expression and a constructor's arguments belong to its result feature; `graph_format()` reads a session's back, and the choice holds through `load_library` and edits (a library directory is prepared and cached once per format). The ids under the two formats differ for those subtrees, so a document is read back under the format it was written in. To resolve names from the OMG standard library, call `load_library(dir)` with a checkout of its `sysml.library/` directory — native directory loading shares the CLI’s prepared graph and static-analysis cache, with library source trees reconstructed on demand, and quantity values (`10 [mm]`) then evaluate to `(magnitude, unit)` tuples.
 
 `units()` lists the model's units as `(index, name, source)`; `source(i)` returns one unit's current text:
 
@@ -131,6 +131,26 @@ False
 3
 >>> s.is_library_element(wheel)
 False
+```
+
+`tree_text(root)` draws what the text lowered to — the ownership tree under an element: the relationships it owns, the elements those own in turn, and every other end of a relationship (a typing's `type`, a specialization's `superclassifier`, an import's namespace) as a reference, never expanded. `root` is a handle or a qualified name; none starts at every top-level element. `tree_json` is the same tree as JSON text, the document the CLI's `sysmlv2 tree --format json` writes, and both take `depth` (the ownership levels to show; a node past it is marked `…` in the text and `truncated` in the JSON), `references`, `implied` (the implied relationships, with a library loaded) and `ids`:
+
+```pycon
+>>> print(s.tree_text("Defs::SpareWheel"), end="")
+Defs::SpareWheel [PartDefinition]
+└─ Subclassification
+   └─ superclassifier → Defs::Wheel [PartDefinition]
+>>> print(s.tree_text(vehicle, depth=1), end="")
+Rig::Vehicle [PartDefinition]
+├─ FeatureMembership
+│  └─ front [PartUsage] …
+├─ FeatureMembership
+│  └─ spare [PartUsage] …
+└─ FeatureMembership
+   └─ wheelCount [AttributeUsage] …
+>>> import json
+>>> json.loads(s.tree_json(vehicle, depth=1))[0]["relationships"][0]["children"][0]["truncated"]
+True
 ```
 
 `element_id(e)` returns the element's interchange id — the same UUID the JSON emitters use. Every derived property of the abstract syntax is reachable by its specification name through `s.derived(e, "ownedFeature")`, `s.derived(e, "owningNamespace")`, `s.derived(e, "name")`, …; `Session.derives(metaclass, name)` says in advance whether a name is computed (`"exact"`, `"passthrough"`, `"not-computed"`) or not a derived property there (`"not-declared"`), and `s.set_closure_policy("closure")` extends the inheritance-aware properties over inherited and imported memberships without upgrading their fidelity to exact.
@@ -326,7 +346,7 @@ Refusals are named `sysmlv2.RefusedError`s — an ineligible kind or header, a t
 
 ## 6. Interchange JSON sessions
 
-`property_json(element, name)` reads a specification property using the checked semantic catalog. `to_full_json_strict()` refuses unavailable semantics or unresolved references instead of inserting placeholders. Many valid Type/Usage models are still refused because their derived dependencies are incomplete; these APIs do not certify whole-model validity.
+`property_json(element, name)` reads a specification property using the checked semantic catalog. `to_full_json_strict()` refuses unavailable semantics or unresolved references instead of inserting placeholders. Many valid Type/Usage models are still refused because their derived dependencies are incomplete; these APIs do not certify whole-model validity. `to_full_json_checked()` is the same export with the refusals beside the rows: one JSON document `{"elements": [...], "issues": [{"elementId", "property", "kind", "reason"}, ...]}` (`kind` one of `not-declared`, `not-computed`, `approximate`, `incomplete-type-projection`, `incomplete-usage-variability`, `incomplete-type-input`, `incomplete-type-features`, `incomplete-invocation-bindings`, `incomplete-constructor-bindings`, `incomplete-function-result`, `incomplete-feature-structure`, `missing-required-value`, `unresolved-reference`, `invalid-value`; `reason` the text), every row holding the properties the checked reader answered and each refused property absent from it — schema-invalid wherever a required property is missing, so a report to read, not a payload to store (`to_full_json()` is that).
 
 Sessions round-trip through KerML interchange JSON. `to_compact_json()` / `to_full_json()` emit the current state; `from_interchange_json` opens a session from a compact or full element list — including Flexo MMS `{payload, identity}` change records — by lifting it back to text:
 

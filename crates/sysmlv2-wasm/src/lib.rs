@@ -20,14 +20,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
-use sysmlv2_lsp::{Encoding, Mapper, library_uri};
+use sysmlv2_lsp::{Encoding, Mapper, library_uri_under};
 use sysmlv2_model::check::ConstraintVerdict;
 use sysmlv2_model::eval::Value as EvalValue;
 use sysmlv2_model::json::ElementRef;
 use sysmlv2_solve::{PropagateConfig, PropagateOutcome};
 use sysmlv2_syntax::parser::parse_expression;
 use sysmlv2_syntax::span::{LineIndex, Span};
-use sysmlv2_transform::{Indent, Library, Session as TSession, check_sources_with_library};
+use sysmlv2_transform::{
+    GraphFormat, Indent, Library, Session as TSession, check_sources_with_library,
+};
 
 /// Stack reserved for the module, in bytes (16 MiB).
 ///
@@ -131,6 +133,27 @@ fn parse_sources(json: &str) -> Result<Vec<(String, String)>, String> {
         ));
     }
     Ok(sources.into_iter().map(|s| (s.name, s.text)).collect())
+}
+
+/// A graph format by its name on the JavaScript side: `"legacy"` (scheme 2,
+/// the default) or `"canonical"` (the opt-in scheme 3); an absent or empty
+/// name is the default.
+fn parse_graph_format(name: Option<&str>) -> Result<GraphFormat, String> {
+    match name {
+        None | Some("" | "legacy") => Ok(GraphFormat::LegacyV2),
+        Some("canonical") => Ok(GraphFormat::CanonicalV3),
+        Some(other) => Err(format!(
+            "unknown graph format {other:?}: legacy or canonical"
+        )),
+    }
+}
+
+fn graph_format_name(format: GraphFormat) -> &'static str {
+    match format {
+        GraphFormat::LegacyV2 => "legacy",
+        GraphFormat::CanonicalV3 => "canonical",
+        _ => "unknown",
+    }
 }
 
 fn parse_library(json: &str, snapshot: Option<Vec<u8>>) -> Result<Library, String> {
@@ -270,6 +293,23 @@ fn default_note_budget() -> usize {
 
 fn default_leaf_budget() -> usize {
     500
+}
+
+/// [`Session::tree`]'s options: the root selection and the CLI's
+/// `--depth`, `--no-references`, `--implied` and `--ids`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TreeIn {
+    #[serde(default)]
+    root: Option<Selector>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default = "yes")]
+    references: bool,
+    #[serde(default)]
+    implied: bool,
+    #[serde(default)]
+    ids: bool,
 }
 
 /// [`Session::outline`]'s budgets: `{outlineNodes?, outlineDepth?,
@@ -441,6 +481,66 @@ thread_local! {
     /// request names its own: [`set_value_units`].
     static VALUE_UNITS: std::cell::Cell<sysmlv2_model::eval::UnitDisplay> =
         const { std::cell::Cell::new(sysmlv2_model::eval::UnitDisplay::Si) };
+    /// The directory the host serves the library's units under, as the
+    /// language server keeps it, under which this module names a library
+    /// unit in a position answer; `None` names it under the `sysmlv2-lib:`
+    /// scheme: [`set_library_root`].
+    static LIBRARY_ROOT: std::cell::RefCell<Option<sysmlv2_lsp::LibraryRoot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where this module names a library unit in a position answer (find-
+/// usages' `unit`): under the host's library directory when one is set,
+/// else under the `sysmlv2-lib:` scheme.
+fn library_unit_uri(name: &str) -> String {
+    LIBRARY_ROOT.with_borrow(|root| library_uri_under(root.as_ref(), name))
+}
+
+/// Name library units in position answers under `root`, the directory
+/// the host serves the library's units as files of, as a uri (`null` or
+/// an empty string names them under the `sysmlv2-lib:` scheme again, the
+/// default). `dirs_json`, when given, is a JSON object naming, for each
+/// bundle directory the host shows under another name, that name
+/// (`{"local-packages": "Own Libraries"}`), applied to the first
+/// directory of a unit's name both ways. The language server's
+/// `initializationOptions.libraryRoot` and `libraryDirs` are the same
+/// settings for its locations; a host that serves the library as a
+/// directory gives both the same, so a `Session`'s find-usages and the
+/// server's references name a library unit the same way. Throws on a
+/// root that is no uri, or directories that are not an object of
+/// single-segment names. Module-wide, like
+/// [`setUnitSpellingExpansion`](set_unit_spelling_expansion).
+#[wasm_bindgen(js_name = setLibraryRoot)]
+pub fn set_library_root(root: Option<String>, dirs_json: Option<String>) -> Result<(), String> {
+    let root = match root.as_deref().filter(|r| !r.is_empty()) {
+        Some(uri) => {
+            let root = sysmlv2_lsp::LibraryRoot::new(uri)
+                .ok_or_else(|| format!("library root `{uri}` is not a uri"))?;
+            let dirs: std::collections::BTreeMap<String, String> = match dirs_json.as_deref() {
+                Some(json) if !json.trim().is_empty() => {
+                    serde_json::from_str(json).map_err(|e| {
+                        format!("library directories: expected an object of names: {e}")
+                    })?
+                }
+                _ => std::collections::BTreeMap::new(),
+            };
+            Some(root.with_dirs(dirs).ok_or_else(|| {
+                "library directories: directory names must be non-empty path segments with unique, non-conflicting mappings".to_string()
+            })?)
+        }
+        None => None,
+    };
+    LIBRARY_ROOT.with_borrow_mut(|slot| *slot = root);
+    Ok(())
+}
+
+/// The library root [`setLibraryRoot`](set_library_root) set, as kept
+/// (ending in `/`); `null` when library units are named under the
+/// `sysmlv2-lib:` scheme.
+#[must_use]
+#[wasm_bindgen(js_name = libraryRoot)]
+pub fn library_root() -> Option<String> {
+    LIBRARY_ROOT.with_borrow(|root| root.as_ref().map(|r| r.uri().to_string()))
 }
 
 /// A `valueUnits` option: `"si"` or `"asWritten"`; absent, the module's
@@ -468,8 +568,9 @@ fn unit_line_index<'a>(
 /// JSON `{unit, line, col, endLine, endCol}` — the unit's name, 1-based
 /// lines, and columns counted in UTF-16 code units — which is the
 /// language server's location for the same span, one-based. A unit of
-/// an in-memory library is named as the server names it, under the
-/// `sysmlv2-lib:/` scheme a host serves the library's text under.
+/// an in-memory library is named as the server names it: under the
+/// library directory the host set ([`set_library_root`]), else under
+/// the `sysmlv2-lib:/` scheme a host serves the library's text under.
 /// `mappers` memoizes a unit's line table across the sites of one
 /// answer. A unit whose text the session does not hold has no position.
 fn unit_location<'a>(
@@ -488,7 +589,7 @@ fn unit_location<'a>(
                 .or_else(|| {
                     session
                         .library_unit(unit)
-                        .map(|(name, text)| (library_uri(name), text))
+                        .map(|(name, text)| (library_unit_uri(name), text))
                 })?;
             Some((name, Mapper::new(text, Encoding::Utf16)))
         })
@@ -653,6 +754,26 @@ enum ResolvedOp {
     MoveMember(ElementRef, ElementRef, Option<usize>),
 }
 
+/// A closure policy by its name (`closurePolicy`, `setClosurePolicy`,
+/// `toFullJson`): `"passthrough"`, `"closure"` or `"closure-implied"`.
+fn parse_closure_policy(name: &str) -> Result<sysmlv2_model::json::ClosurePolicy, String> {
+    use sysmlv2_model::json::ClosurePolicy;
+    Ok(match name {
+        "passthrough" => ClosurePolicy::Passthrough,
+        "closure" => ClosurePolicy::Closure {
+            include_implied: false,
+        },
+        "closure-implied" => ClosurePolicy::Closure {
+            include_implied: true,
+        },
+        other => {
+            return Err(format!(
+                "unknown closure policy {other:?}: passthrough, closure or closure-implied"
+            ));
+        }
+    })
+}
+
 /// A set of model sources (text or interchange JSON) with their resolved
 /// model — `sysmlv2_transform::Session` behind a JS-shaped API.
 #[wasm_bindgen]
@@ -679,6 +800,37 @@ impl Session {
             );
         }
         Ok(())
+    }
+
+    /// The nodes of the ownership tree the options select (see
+    /// [`Self::tree`]).
+    fn tree_nodes(
+        &mut self,
+        opts_json: Option<&str>,
+    ) -> Result<Vec<sysmlv2_model::inspect::TreeNode>, String> {
+        let opts: TreeIn =
+            serde_json::from_str(opts_json.filter(|s| !s.is_empty()).unwrap_or("{}"))
+                .map_err(|e| format!("bad options: {e}"))?;
+        let root = match &opts.root {
+            Some(sel) => Some(resolve_selector(self.inner.resolved(), sel).ok_or_else(
+                || match sel {
+                    Selector::Name(name) => format!("element not found: {name}"),
+                    Selector::Id { element_id } => format!("element not found: {element_id}"),
+                },
+            )?),
+            None => None,
+        };
+        let options = sysmlv2_model::inspect::TreeOptions {
+            depth: opts.depth,
+            references: opts.references,
+            implied: opts.implied,
+            ids: opts.ids,
+        };
+        Ok(sysmlv2_model::inspect::tree(
+            self.inner.resolved(),
+            root,
+            &options,
+        ))
     }
 
     /// Resolve a diagram's `roots` selection (`::`-qualified top-level
@@ -1006,6 +1158,65 @@ impl PreparedLibrary {
         })
     }
 
+    /// [`Self::new`] under a graph format: `"legacy"` (the default) or
+    /// `"canonical"` (the opt-in contract of IDS.md, in which a conditional
+    /// operand is a reference to an owned expression and a constructor's
+    /// arguments belong to its result feature). A session opened on the
+    /// handle takes the handle's format (`fromSourcesWithPreparedLibrary`);
+    /// a snapshot recorded under another format is passed over and the
+    /// library prepared from source.
+    #[wasm_bindgen(js_name = withGraphFormat)]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn with_graph_format(
+        sources_json: &str,
+        snapshot: Option<Vec<u8>>,
+        #[wasm_bindgen(js_name = graphFormat)] graph_format: Option<String>,
+    ) -> Result<PreparedLibrary, String> {
+        let format = parse_graph_format(graph_format.as_deref())?;
+        Ok(Self {
+            inner: Library::prepared_sources_with_format(
+                parse_sources(sources_json)?,
+                snapshot,
+                format,
+            )
+            .map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// [`Self::from_snapshot`] under a graph format: `"legacy"` (the
+    /// default, what `fromSnapshot` and `fromSnapshotStream` decode) or
+    /// `"canonical"`. A snapshot prepared under the other format is refused
+    /// with a message naming it (a canonical deployment ships a snapshot
+    /// written under canonical; one written by `sysmlv2 prepare` is legacy).
+    #[wasm_bindgen(js_name = fromSnapshotWithGraphFormat)]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_snapshot_with_graph_format(
+        snapshot: Vec<u8>,
+        sources_json: &str,
+        recording: Option<Vec<u8>>,
+        #[wasm_bindgen(js_name = graphFormat)] graph_format: Option<String>,
+        #[wasm_bindgen(js_name = keepHostParts)] keep_host_parts: Option<bool>,
+    ) -> Result<PreparedLibrary, String> {
+        let format = parse_graph_format(graph_format.as_deref())?;
+        Ok(Self {
+            inner: Library::prepared_snapshot_in(
+                parse_sources(sources_json)?,
+                &snapshot,
+                recording,
+                format,
+                keeps_host_parts(keep_host_parts),
+            )
+            .map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// The graph format this library was prepared under: `"legacy"` or
+    /// `"canonical"`.
+    #[wasm_bindgen(js_name = graphFormat)]
+    pub fn graph_format(&self) -> String {
+        graph_format_name(library_graph_format(&self.inner)).to_string()
+    }
+
     /// [`Self::from_snapshot`] reading the snapshot where it lies: `view` stays
     /// in the host's memory and is copied into this module one window at a
     /// time, so the module's memory never holds the whole snapshot (which it
@@ -1081,22 +1292,74 @@ impl PreparedLibrary {
     }
 }
 
+/// The graph format a library was prepared under (`LegacyV2` for source
+/// and directory libraries, which are prepared when a session takes them).
+fn library_graph_format(library: &Library) -> GraphFormat {
+    match library {
+        Library::Prepared(prepared) => prepared.graph_format(),
+        _ => GraphFormat::LegacyV2,
+    }
+}
+
 #[wasm_bindgen]
 impl Session {
-    /// Open sources against a shared prepared library in one model build.
+    /// Open sources against a shared prepared library in one model build,
+    /// under the library's graph format (a library prepared with
+    /// `PreparedLibrary.withGraphFormat` opens canonical sessions).
     #[wasm_bindgen(js_name = fromSourcesWithPreparedLibrary)]
     pub fn from_sources_with_prepared_library(
         sources_json: &str,
         library: &PreparedLibrary,
     ) -> Result<Session, String> {
-        Ok(Session {
-            inner: TSession::from_sources_with_library(
-                parse_sources(sources_json)?,
+        let sources = parse_sources(sources_json)?;
+        let inner = match library_graph_format(&library.inner) {
+            GraphFormat::LegacyV2 => {
+                TSession::from_sources_with_library(sources, Some(library.inner.clone()))
+            }
+            format => TSession::from_sources_with_graph_format(
+                sources,
                 Some(library.inner.clone()),
+                format,
+            ),
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Session { inner, gen: 0 })
+    }
+
+    /// [`Self::from_sources_with_library`] under a graph format: `"legacy"`
+    /// (the default) or `"canonical"` (see `PreparedLibrary.withGraphFormat`).
+    /// The session lowers, emits and encodes under that format, keeps it
+    /// through edits and library reloads, and refuses incoming snapshots
+    /// and deltas of the other.
+    #[allow(clippy::needless_pass_by_value)]
+    #[wasm_bindgen(js_name = fromSourcesWithGraphFormat)]
+    pub fn from_sources_with_graph_format(
+        sources_json: &str,
+        lib_sources_json: Option<String>,
+        lib_snapshot: Option<Vec<u8>>,
+        #[wasm_bindgen(js_name = graphFormat)] graph_format: Option<String>,
+    ) -> Result<Session, String> {
+        let format = parse_graph_format(graph_format.as_deref())?;
+        let lib = lib_sources_json
+            .as_deref()
+            .map(|s| parse_library(s, lib_snapshot))
+            .transpose()?;
+        Ok(Session {
+            inner: TSession::from_sources_with_graph_format(
+                parse_sources(sources_json)?,
+                lib,
+                format,
             )
             .map_err(|e| e.to_string())?,
             gen: 0,
         })
+    }
+
+    /// The graph format this session was opened under: `"legacy"` or
+    /// `"canonical"`.
+    #[wasm_bindgen(js_name = graphFormat)]
+    pub fn graph_format(&self) -> String {
+        graph_format_name(self.inner.graph_format()).to_string()
     }
 
     /// Open interchange JSON against a shared prepared library; `flexo`
@@ -1434,8 +1697,15 @@ impl Session {
             let qualified = r.element_qualified_name(view);
             let id = r.element_id(view).to_string();
             let rendering = r.view_rendering(view);
-            let exposed: Vec<serde_json::Value> = r
-                .view_exposed_elements(view)
+            // A multiplicity member (a usage's default, SysML 7.6.3, or a
+            // written range) is exposed with its owner's members and
+            // renders through its owner, never as a row of its own.
+            let exposed: Vec<ElementRef> = r.view_exposed_elements(view);
+            let exposed: Vec<ElementRef> = exposed
+                .into_iter()
+                .filter(|&e| !matches!(r.element_type(e), "Multiplicity" | "MultiplicityRange"))
+                .collect();
+            let exposed: Vec<serde_json::Value> = exposed
                 .into_iter()
                 .map(|e| {
                     json!({
@@ -1592,6 +1862,23 @@ impl Session {
             .map_err(|e| e.to_string())
     }
 
+    /// `toFullJsonStrict` with the refusals beside the rows instead of in
+    /// place of them, as one JSON document `{"elements": [...], "issues":
+    /// [{"elementId", "property", "kind", "reason"}, ...]}`: every
+    /// admitted element's row with the properties the checked reader
+    /// answered, every refused property absent from its row and listed
+    /// once. The rows are schema-invalid wherever a required property is
+    /// missing: a report of what can be certified, not an interchange
+    /// document (`toFullJson` is that). Throws only for what stops the
+    /// export before the property reads.
+    #[wasm_bindgen(js_name = toFullJsonChecked)]
+    pub fn to_full_json_checked(&mut self) -> Result<String, String> {
+        self.inner
+            .to_full_json_checked()
+            .map(|export| export.to_json().to_string())
+            .map_err(|e| e.to_string())
+    }
+
     /// The element handles of the derived property `name` of `e`: the
     /// element of a single-valued value, the elements of a list, the
     /// in-model targets of a reference-typed value — a target outside the
@@ -1679,21 +1966,7 @@ impl Session {
     /// Set the closure policy (see `closurePolicy`).
     #[wasm_bindgen(js_name = setClosurePolicy)]
     pub fn set_closure_policy(&mut self, policy: &str) -> Result<(), String> {
-        use sysmlv2_model::json::ClosurePolicy;
-        let policy = match policy {
-            "passthrough" => ClosurePolicy::Passthrough,
-            "closure" => ClosurePolicy::Closure {
-                include_implied: false,
-            },
-            "closure-implied" => ClosurePolicy::Closure {
-                include_implied: true,
-            },
-            other => {
-                return Err(format!(
-                    "unknown closure policy {other:?}: passthrough, closure or closure-implied"
-                ));
-            }
-        };
+        let policy = parse_closure_policy(policy)?;
         self.inner.resolved().set_closure_policy(policy);
         Ok(())
     }
@@ -2014,6 +2287,49 @@ impl Session {
         .map_err(|e| e.to_string())
     }
 
+    /// The ownership tree under `root` as JSON — the document `sysmlv2
+    /// tree --format json` writes: an array of nodes `{metaclass, name?,
+    /// qualifiedName?, id?, library?, site?, references?, relationships:
+    /// [{metaclass, id?, implied?, references?, children}], truncated?}`.
+    /// Ownership makes the hierarchy — an element lists the
+    /// relationships it owns, a relationship the elements it owns in
+    /// turn — and every other end of a relationship (a typing's `type`,
+    /// a subclassification's `superclassifier`, an import's namespace, an alias's
+    /// `memberElement`) is a reference `{property, target: {metaclass,
+    /// name?, qualifiedName?, library?, outside?, id?, spelling?}}`,
+    /// never expanded, so a library is entered only through a chosen
+    /// root.
+    ///
+    /// Options JSON (absent or empty = every default): `{root?, depth?:
+    /// number, references?: true, implied?: false, ids?: false}` —
+    /// `root` is a `::`-qualified name or `{elementId}` for an element
+    /// without one (absent, the tree starts at every top-level element,
+    /// the `roots()`); `depth` bounds the ownership levels (a node past
+    /// it is `truncated`); `references: false` keeps the ownership
+    /// alone; `implied` adds the implied relationships (the library
+    /// specializations of each kind, the positional redefinitions) and
+    /// the elements they generate; `ids` carries the interchange ids.
+    /// Errors on a root that does not resolve or malformed options.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn tree(&mut self, opts_json: Option<String>) -> Result<String, String> {
+        let nodes = self.tree_nodes(opts_json.as_deref())?;
+        serde_json::to_string(&nodes).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::tree`] as the box-drawing text `sysmlv2 tree` prints: the
+    /// root by its qualified name, each owned element by its name,
+    /// `property → qualified name [Metaclass] [library]` per reference,
+    /// `(unresolved)` on a spelling that did not resolve, `(implied)` on
+    /// an implied relationship and `…` where `depth` cut the walk. The
+    /// options are `tree`'s.
+    #[wasm_bindgen(js_name = treeText)]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn tree_text(&mut self, opts_json: Option<String>) -> Result<String, String> {
+        let nodes = self.tree_nodes(opts_json.as_deref())?;
+        Ok(sysmlv2_model::inspect::render(&nodes))
+    }
+
     /// Per-element reads for many elements in one call, as JSON.
     ///
     /// `ids_json` is an array of interchange ids and `fields_json` an
@@ -2248,9 +2564,39 @@ impl Session {
     /// relationships). With `recover_refs`, references that serialize as
     /// dangling ids also carry their source spelling, so a partial model
     /// survives emit → reload losslessly (the Flexo change-record path).
+    /// `closures` selects the values of the inheritance-aware properties:
+    /// `"passthrough"` (the default, and `undefined`) writes the owned side
+    /// and `[]` for the four closure names whatever `isImpliedIncluded`
+    /// says; `"closure"` writes the specification's values over the
+    /// written heritage, `"closure-implied"` with the implied library
+    /// heritage too (the session's own `closurePolicy` is the reads' and
+    /// does not select the export's). The closure levels throw for an
+    /// element whose inheritance walk exceeds the resolver's depth budget.
+    // The export boundary converts an optional string only when owned.
+    #[allow(clippy::needless_pass_by_value)]
     #[wasm_bindgen(js_name = toFullJson)]
-    pub fn to_full_json(&self, recover_refs: bool) -> String {
-        self.inner.to_full_json_with(recover_refs).to_string()
+    pub fn to_full_json(
+        &self,
+        recover_refs: bool,
+        closures: Option<String>,
+    ) -> Result<String, String> {
+        use sysmlv2_model::full::{EmissionPolicy, UnresolvedReferencePolicy};
+        let closures = match closures.as_deref() {
+            None => Default::default(),
+            Some(name) => parse_closure_policy(name)?,
+        };
+        let unresolved = if recover_refs {
+            UnresolvedReferencePolicy::Preserve
+        } else {
+            UnresolvedReferencePolicy::LegacyDanglingId
+        };
+        self.inner
+            .to_full_json_with_policy(EmissionPolicy {
+                unresolved,
+                closures,
+            })
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
     }
 
     /// Full-form CBOR (a `Uint8Array`) — the binary re-encoding of
@@ -2647,9 +2993,10 @@ impl Session {
     /// owner}]}`. `unit` is the unit's name, as `check` findings carry
     /// it; a library unit is `sysmlv2-lib:/` and its name percent-encoded
     /// as a uri path, the uri the server gives it and a host serves the
-    /// library's text under. Lines and columns are 1-based, columns
-    /// counted in UTF-16 code units as an editor counts them, the end
-    /// exclusive.
+    /// library's text under — or, where the host set a library directory
+    /// ([`setLibraryRoot`](set_library_root)), the unit's file under it.
+    /// Lines and columns are 1-based, columns counted in UTF-16 code
+    /// units as an editor counts them, the end exclusive.
     ///
     /// The declaration's `site` is `name` when its range is the declared
     /// name, or `extent` when the element declares no name and the range

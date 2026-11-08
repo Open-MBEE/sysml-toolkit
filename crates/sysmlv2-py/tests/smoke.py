@@ -38,6 +38,51 @@ assert s.typings(front) == [wheel]
 assert len(s.elements_of_metaclass("PartDefinition")) == 3
 assert not s.is_library_element(wheel)
 
+# --- the ownership tree ---
+# `tree_text` draws what the text lowered to: an element's owned
+# relationships, the elements they own in turn, every other end as a
+# reference; `tree_json` is the same tree as `sysmlv2 tree --format json`.
+# (a usage its type features owns its default multiplicity, SysML 7.6.3,
+# as its last member)
+VEHICLE_TREE = """Rig::Vehicle [PartDefinition]
+├─ FeatureMembership
+│  └─ front [PartUsage]
+│     ├─ FeatureTyping
+│     │  └─ type → Defs::Wheel [PartDefinition]
+│     └─ OwningMembership
+│        └─ (anonymous) [Multiplicity]
+├─ FeatureMembership
+│  └─ spare [PartUsage]
+│     ├─ FeatureTyping
+│     │  └─ type → Defs::SpareWheel [PartDefinition]
+│     └─ OwningMembership
+│        └─ (anonymous) [Multiplicity]
+└─ FeatureMembership
+   └─ count [AttributeUsage]
+      ├─ FeatureValue
+      │  └─ (anonymous) [LiteralInteger]
+      └─ OwningMembership
+         └─ (anonymous) [Multiplicity]
+"""
+assert s.tree_text(vehicle) == VEHICLE_TREE
+assert s.tree_text("Rig::Vehicle") == VEHICLE_TREE      # a qualified name roots it too
+assert s.tree_text().startswith("Defs [Package]\n")     # no root: every top-level element
+assert "\nRig [Package]\n" in s.tree_text()
+assert "→" not in s.tree_text(references=False)
+tree = json.loads(s.tree_json(vehicle, depth=1, ids=True))
+assert tree[0]["id"] == s.element_id(vehicle)
+assert [r["children"][0]["name"] for r in tree[0]["relationships"]] == ["front", "spare", "count"]
+assert tree[0]["relationships"][0]["children"][0]["truncated"] is True   # the depth cut the walk
+assert "…" in s.tree_text(vehicle, depth=1)
+assert json.loads(s.tree_json(front))[0]["relationships"][0]["references"] == [
+    {"property": "type", "target": {"metaclass": "PartDefinition", "name": "Wheel", "qualifiedName": "Defs::Wheel"}}
+]
+try:
+    s.tree_text("Rig::Nope")
+    raise AssertionError("an unknown root must raise")
+except sysmlv2.RefusedError as e:
+    assert "element not found" in str(e), e
+
 # --- derived properties by specification name ---
 assert [s.name(f) for f in s.derived(vehicle, "ownedFeature")] == ["front", "spare", "count"]
 assert s.derived(vehicle, "name") == "Vehicle"
@@ -75,6 +120,28 @@ closure_edit.rename(w, "renamed")
 s2.commit(closure_edit)
 assert s2.closure_policy() == "closure"
 s2.set_closure_policy("passthrough")
+# The full form's closures are an option of the export, not the session's
+# read policy: the default writes `[]`, `closures="closure"` the heritage.
+b_row = lambda doc: next(e for e in json.loads(doc) if e.get("declaredName") == "B")
+assert b_row(s2.to_full_json())["inheritedFeature"] == []
+assert len(b_row(s2.to_full_json(closures="closure"))["inheritedFeature"]) == 1
+try:
+    s2.to_full_json(closures="everything")
+    raise AssertionError("an unknown closure level is refused")
+except ValueError as e:
+    assert "unknown closure policy" in str(e), e
+# The strict export refuses the whole document; the checked export keeps the
+# rows and lists the refusals beside them (schema-invalid where a required
+# property is missing).
+try:
+    s2.to_full_json_strict()
+    raise AssertionError("a model with an unresolved typing is refused strictly")
+except sysmlv2.RefusedError as e:
+    assert "strict export refused" in str(e), e
+checked = json.loads(s2.to_full_json_checked())
+assert len(checked["elements"]) == len(json.loads(s2.to_compact_json()))
+assert checked["issues"] and all(set(i) == {"elementId", "property", "kind", "reason"} for i in checked["issues"])
+assert any(i["kind"] == "unresolved-reference" for i in checked["issues"])
 
 # --- find-usages ---
 refs = s.references(wheel)
@@ -117,6 +184,11 @@ assert s.unresolved_count() == 0
 try:
     s.name(wheel)
     raise AssertionError("stale handle must raise")
+except ValueError:
+    pass
+try:
+    s.tree_text(wheel)
+    raise AssertionError("a stale tree root must raise")
 except ValueError:
     pass
 
@@ -334,6 +406,13 @@ if LIBRARY.is_dir():
     lb.load_library(str(LIBRARY))
     real = lb.resolve("ScalarValues::Real")
     assert lb.is_library_element(real)
+    # The tree spells library targets without expanding them, adds the
+    # implied relationships on request, and takes a library root.
+    implied = lb.tree_text("U::x", implied=True)
+    assert "type → U::A [AttributeDefinition]" in implied, implied
+    assert "(implied)" in implied and "[library]" in implied, implied
+    assert "(implied)" not in lb.tree_text("U::x")
+    assert lb.tree_text(real, depth=1).startswith("ScalarValues::Real [DataType] [library]\n")
     for stage in (
         lambda b: b.rename(real, "Reel"),
         lambda b: b.remove(real),

@@ -350,6 +350,8 @@ def main():
     ap.add_argument("--tables-version", type=int, help="the CBOR_TABLES_VERSION to write; required when the spec inputs changed")
     args = ap.parse_args()
 
+    for path in list(XP.SOURCES) + SCHEMAS:
+        XP.require(path)
     committed_version, committed_digest = committed_version_and_digest()
     digest = source_digest()
     rows, enum_ids = build_tables()

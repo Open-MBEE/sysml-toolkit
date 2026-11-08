@@ -876,11 +876,16 @@ fn implied_positional_names() {
         .into_iter()
         .find(|&e| r.element_type(e) == "InvocationExpression")
         .expect("invocation");
+    // The generated result parameter follows them, named by what it
+    // redefines.
     let args: Vec<String> = many(&mut r, invocation, "ownedFeature")
         .into_iter()
         .filter_map(|f| string(&mut r, f, "name"))
         .collect();
-    assert_eq!(args, vec!["p".to_string(), "q".to_string()]);
+    assert_eq!(
+        args,
+        vec!["p".to_string(), "q".to_string(), "result".to_string()]
+    );
     // An unnamed input parameter holds its position; `inout` counts.
     let arg_names = |r: &mut ResolvedModel, owner: &str| -> Vec<Option<String>> {
         let e = elem(r, owner);
@@ -896,9 +901,14 @@ fn implied_positional_names() {
     let gapped = arg_names(&mut r, "P::gapped");
     assert!(gapped.contains(&Some("q".to_string())));
     assert!(!gapped.contains(&Some("p".to_string())));
-    assert_eq!(gapped.iter().flatten().count(), 1);
+    // The named argument and the generated result, which follows last.
+    assert_eq!(gapped.iter().flatten().count(), 2);
+    assert_eq!(gapped.last().cloned().flatten().as_deref(), Some("result"));
     let both: Vec<String> = arg_names(&mut r, "P::both").into_iter().flatten().collect();
-    assert_eq!(both, vec!["m".to_string(), "n".to_string()]);
+    assert_eq!(
+        both,
+        vec!["m".to_string(), "n".to_string(), "result".to_string()]
+    );
     // An actor parameter's reference carries no name.
     let u = elem(&mut r, "P::U");
     let actor = many(&mut r, u, "ownedFeature")
@@ -1532,7 +1542,15 @@ fn perform_and_expression_structure() {
         .find(|&e| r.element_type(e) == "InvocationExpression")
         .expect("invocation");
     assert_eq!(one(&mut r, invocation, "instantiatedType"), Some(f));
-    assert_eq!(one(&mut r, invocation, "result"), None);
+    // The invocation owns its generated result, which redefines F's.
+    let result = one(&mut r, invocation, "result").expect("generated result");
+    assert_eq!(string(&mut r, result, "name").as_deref(), Some("result"));
+    assert_ne!(result, ret);
+    assert!(
+        r.implied_relationships(invocation)
+            .iter()
+            .any(|&row| r.element_type(row) == "ReturnParameterMembership")
+    );
     let args = many(&mut r, invocation, "argument");
     assert_eq!(args.len(), 1);
     assert_eq!(r.element_type(args[0]), "LiteralInteger");
@@ -1836,8 +1854,8 @@ fn kind_tests_pass_unknowable_targets() {
     );
 }
 
-/// Review follow-ups: an accept's trigger is not an input parameter and
-/// stands in for the payload argument; a trigger invocation's
+/// Review follow-ups: an accept's trigger is the payload parameter's
+/// value, so it is the payload argument and not a parameter; a trigger invocation's
 /// instantiated type and argument; constructor arguments by the type's
 /// features; the positional fallback for a callee whose parameters are
 /// inherited; the operator function by name table; `input` agrees with
@@ -1863,7 +1881,8 @@ fn parameters_after_review() {
             part e : Lib::Earth;
         }",
     );
-    // The accept: the trigger is not counted, so `via` is the receiver.
+    // The accept: the trigger is the payload's value, so `via` is the
+    // receiver.
     let a2 = elem(&mut r, "P::A::a2");
     let receiver = one(&mut r, a2, "receiverArgument").expect("receiver");
     assert!(r.element_type(receiver).contains("Expression"));

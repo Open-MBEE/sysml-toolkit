@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 pub(super) mod certified_types;
 mod export;
 use certified_types::CheckedRow;
-pub use certified_types::{ConditionalPropertyCapability, conditional_property_capability};
+pub use certified_types::{
+    ConditionalPropertyCapability, FeatureStructureIssue, conditional_property_capability,
+};
 
 /// Why a specification property cannot be returned as an exact value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +33,9 @@ pub enum PropertyError {
     IncompleteConstructorBindings(super::ConstructorBindingIssue),
     /// Complete ordinary Function result selection could not be established.
     IncompleteFunctionResult(super::TypeInputIssue),
+    /// A property read through a member's own structure (a connector end's
+    /// reference, a subject's value) found that structure incomplete.
+    IncompleteFeatureStructure(FeatureStructureIssue),
     MissingRequiredValue,
     UnresolvedReference(String),
     InvalidValue(String),
@@ -61,6 +66,9 @@ impl std::fmt::Display for PropertyError {
             Self::IncompleteFunctionResult(reason) => {
                 write!(f, "Function.result is incomplete: {reason:?}")
             }
+            Self::IncompleteFeatureStructure(reason) => {
+                write!(f, "feature structure is incomplete: {reason:?}")
+            }
             Self::MissingRequiredValue => f.write_str("required property has no value"),
             Self::UnresolvedReference(s) => write!(f, "unresolved reference: {s}"),
             Self::InvalidValue(s) => write!(f, "invalid property value: {s}"),
@@ -70,12 +78,82 @@ impl std::fmt::Display for PropertyError {
 
 impl std::error::Error for PropertyError {}
 
+impl PropertyError {
+    /// The refusal's kind as a stable token (`"not-computed"`,
+    /// `"approximate"`, `"unresolved-reference"`, …): what a consumer of
+    /// the issue list sorts by; [`std::fmt::Display`] carries the detail.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotDeclared => "not-declared",
+            Self::NotComputed => "not-computed",
+            Self::Approximate => "approximate",
+            Self::IncompleteTypeProjection(_) => "incomplete-type-projection",
+            Self::IncompleteUsageVariability(_) => "incomplete-usage-variability",
+            Self::IncompleteTypeInput(_) => "incomplete-type-input",
+            Self::IncompleteTypeFeatures(_) => "incomplete-type-features",
+            Self::IncompleteInvocationBindings(_) => "incomplete-invocation-bindings",
+            Self::IncompleteConstructorBindings(_) => "incomplete-constructor-bindings",
+            Self::IncompleteFunctionResult(_) => "incomplete-function-result",
+            Self::IncompleteFeatureStructure(_) => "incomplete-feature-structure",
+            Self::MissingRequiredValue => "missing-required-value",
+            Self::UnresolvedReference(_) => "unresolved-reference",
+            Self::InvalidValue(_) => "invalid-value",
+        }
+    }
+}
+
 /// A field that prevented strict full-form export.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyIssue {
     pub element_id: uuid::Uuid,
     pub property: String,
     pub reason: PropertyError,
+}
+
+impl PropertyIssue {
+    /// The issue as the bindings carry it: `{"elementId", "property",
+    /// "kind", "reason"}`, `kind` the token of [`PropertyError::kind`] and
+    /// `reason` its text.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "elementId": self.element_id.to_string(),
+            "property": self.property,
+            "kind": self.reason.kind(),
+            "reason": self.reason.to_string(),
+        })
+    }
+}
+
+/// The checked export with its refusals beside it
+/// ([`ResolvedModel::to_full_json_checked`]): `elements` holds one row per
+/// admitted element with the properties the checked reader answered, and
+/// `issues` lists every property it refused — per element, per property,
+/// with the reason — each absent from its row. A row missing a property
+/// the schema requires is **schema-invalid by construction**: this is a
+/// report of what the checked reader can certify, not an interchange
+/// document; the schema-valid full form is `to_full_json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedExport {
+    pub elements: Value,
+    pub issues: Vec<PropertyIssue>,
+}
+
+impl CheckedExport {
+    /// Whether every property answered, so `elements` is what the strict
+    /// export returns.
+    pub fn is_complete(&self) -> bool {
+        self.issues.is_empty()
+    }
+
+    /// The export as one document, the shape the bindings return:
+    /// `{"elements": [...], "issues": [{"elementId", "property", "kind",
+    /// "reason"}, ...]}`.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "elements": self.elements,
+            "issues": self.issues.iter().map(PropertyIssue::to_json).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// Strict export never substitutes placeholders. Unavailable fields are
@@ -105,6 +183,27 @@ impl std::fmt::Display for SemanticExportError {
 }
 impl std::error::Error for SemanticExportError {}
 
+/// The properties whose checked reads list a type's features or members,
+/// an expression's generated result among them.
+const LIST_FAMILY: &[&str] = &[
+    "feature",
+    "featureMembership",
+    "inheritedMembership",
+    "inheritedFeature",
+    "input",
+    "output",
+    "directedFeature",
+    "endFeature",
+    "parameter",
+    "member",
+    "membership",
+    "importedMembership",
+    "ownedMember",
+    "ownedFeature",
+    "usage",
+    "directedUsage",
+];
+
 impl ResolvedModel {
     /// Export specification properties through the checked semantic reader.
     /// No recovery annotations or invented references are inserted. Incomplete
@@ -112,6 +211,18 @@ impl ResolvedModel {
     /// The current closure policy is preserved and never implicitly promoted.
     pub fn to_full_json_strict(&mut self) -> Result<Value, SemanticExportError> {
         export::full(self)
+    }
+
+    /// [`Self::to_full_json_strict`] with the refusals beside the rows
+    /// instead of in place of them: the same snapshot and the same checked
+    /// reads, every row kept with the properties that answered, every
+    /// refused property absent from its row and listed in
+    /// [`CheckedExport::issues`]. Refuses only what stops the export before
+    /// the property reads (an unavailable semantic publication, missing
+    /// stored evidence). The rows are schema-invalid wherever a required
+    /// property is missing; see [`CheckedExport`].
+    pub fn to_full_json_checked(&mut self) -> Result<CheckedExport, SemanticExportError> {
+        export::checked(self)
     }
 
     /// Read an owned or derived property by its specification name. Inherited
@@ -123,6 +234,17 @@ impl ResolvedModel {
     /// compatibility values remain available through [`Self::derived`].
     /// Other external UUIDs are preserved; their target type cannot be verified locally.
     pub fn property(&mut self, e: ElementRef, name: &str) -> Result<Value, PropertyError> {
+        // The member lists of an expression whose result the result family
+        // generates read that generated row: the semantic graph is
+        // materialized before the row is taken, as it is for the owned
+        // relationships, so a first read answers what a later one would and
+        // the row's certificates are stamped against the rows it reads. A
+        // graph that cannot be made leaves the stored rows to answer, as
+        // before.
+        if LIST_FAMILY.contains(&name) && self.generates_owned_result(e) {
+            let _ = self.b.ensure_semantic_graph();
+            self.sync_semantic_publication();
+        }
         let mut row = self.take_checked_row();
         let result = self.property_with_row(e, name, &mut row);
         self.checked_row = row;
@@ -174,13 +296,13 @@ impl ResolvedModel {
         spec: &PropertySpec,
         row: &mut CheckedRow,
     ) -> Result<Value, PropertyError> {
-        let ty = self.element_type(e);
-        if ty == "FeatureReferenceExpression"
-            && matches!(spec.name, "ownedRelationship" | "isImpliedIncluded")
+        if matches!(spec.name, "ownedRelationship" | "isImpliedIncluded")
+            && self.generates_owned_result(e)
             && !self.owned_result_projection_ready(e)
         {
             return Err(PropertyError::Approximate);
         }
+        let ty = self.element_type(e);
         // Fixed constraints override the concrete syntax's default bits.
         if spec.name == "isSufficient" && super::metaclass_conforms(ty, "ConnectionDefinition") {
             return Ok(json!(true));
@@ -392,7 +514,7 @@ impl ResolvedModel {
         if let Some(result) = row.read(self, e, name) {
             return result;
         }
-        if self.element_type(e) == "FeatureReferenceExpression" {
+        if self.generates_owned_result(e) {
             // Local result/binding additions do not certify every required
             // family or existing-result expression, so entire collections
             // remain qualified.

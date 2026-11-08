@@ -755,17 +755,17 @@ impl ResolvedModel {
     /// arm, so callers hold the invariant.
     pub(crate) fn derived_computable(&mut self, e: ElementRef, name: &str) -> Derived {
         let ty = self.b.elements[e.0].ty;
-        // A feature-reference expression's result comes with the implied
-        // relationships, which are materialized for the whole model at
-        // once; a read of what the expression owns or specializes needs
-        // them, a read of its names or of its owners does not. Such a read
-        // defers them instead: the next read that may depend on them, of
-        // any element, makes them first, so it answers as it would have
-        // had this read made them.
-        if ty == "FeatureReferenceExpression" || self.implied_deferred {
+        // A feature-reference, operator, invocation or chain expression's
+        // result comes with the implied relationships, which are
+        // materialized for the whole model at once; a read of what the
+        // expression owns or specializes needs them, a read of its names or
+        // of its owners does not. Such a read defers them instead: the next
+        // read that may depend on them, of any element, makes them first,
+        // so it answers as it would have had this read made them.
+        if self.implied_deferred || self.generates_owned_result(e) {
             if !NAMES_AND_OWNERS.contains(&name) {
                 self.ensure_implied();
-            } else if ty == "FeatureReferenceExpression" {
+            } else {
                 self.implied_deferred = true;
             }
         }
@@ -907,9 +907,6 @@ impl ResolvedModel {
             "thenAction" | "bodyAction" => opt(self.d_parameter_as(e, 2, "ActionUsage")),
             "elseAction" => opt(self.d_parameter_as(e, 3, "ActionUsage")),
             "untilArgument" => opt(self.d_parameter_as(e, 3, "Expression")),
-            "payloadArgument" if ty == "AcceptActionUsage" => {
-                opt(self.d_accept_payload_argument(e))
-            }
             "seqArgument"
             | "targetArgument"
             | "terminatedOccurrenceArgument"

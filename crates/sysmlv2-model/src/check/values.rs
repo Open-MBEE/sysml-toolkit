@@ -13,6 +13,16 @@ pub(super) fn validate(
     g: &Facts,
 ) -> Vec<(usize, Diagnostic)> {
     let mut out = Vec::new();
+    for claim in r.self_bound_satisfactions() {
+        if !model.is_library_unit(claim.unit) {
+            if let Some(reason) = claim.self_bound {
+                out.push((
+                    claim.unit,
+                    Diagnostic::warning(claim.span, reason).with_code("selfBoundSatisfaction"),
+                ));
+            }
+        }
+    }
     // End features that a connector claims, indexed once for the walk.
     let connected: std::collections::HashSet<usize> =
         r.b.connector_ends.iter().map(|(_, end, _)| *end).collect();

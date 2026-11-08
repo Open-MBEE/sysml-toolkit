@@ -70,7 +70,7 @@ pub use nav::ship_library_table;
 pub use outline::{document_symbols, spell_name, spell_symbols};
 pub use position::{Encoding, Mapper};
 pub use push::PushServer;
-pub use worker::library_uri;
+pub use worker::{LibraryRoot, library_unit_name, library_uri, library_uri_under};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -276,6 +276,13 @@ fn serve(
     nav.set_snippet_completions(snippet_completions(&init));
     nav.set_insert_replace_completions(insert_replace_completions(&init));
     nav.set_signature_label_offsets(signature_label_offsets(&init));
+    match crate::library_root(&init) {
+        Some(Ok(root)) => nav.set_library_root(Some(root)),
+        Some(Err(err)) => {
+            let _ = connection.sender.send(library_root_refused(&err));
+        }
+        None => {}
+    }
     let client = connection.sender.clone();
     let server = Server {
         connection,
@@ -415,6 +422,64 @@ pub(crate) fn publish_diagnostics(init: &InitializeParams) -> Option<bool> {
         .as_ref()
         .and_then(|o| o.get("publishDiagnostics"))
         .and_then(|v| v.as_bool())
+}
+
+/// `initializationOptions.libraryRoot`: the directory the host serves
+/// the standard library's units under, as a uri (for example
+/// `file:///w/.libraries/`), the unit at `<root><unit name>`. The server
+/// then names a location inside a library unit under it instead of the
+/// `sysmlv2-lib:` scheme, and a document opened under it is that unit:
+/// never a source of the workspace (the library already provides it;
+/// a copy opened as a source would declare everything in it twice),
+/// answering hover, definition, references, highlights, symbols and
+/// semantic tokens from the unit the library holds. Beside it,
+/// `initializationOptions.libraryDirs`: an object naming, for each
+/// bundle directory the host shows under another name, that name
+/// (`{"local-packages": "Own Libraries"}`), applied to the first
+/// directory of a unit's name both ways. `None` when the client sent no
+/// root or `null`; an error when the root is not a uri string or the
+/// directories are not an object of directory names.
+pub(crate) fn library_root(init: &InitializeParams) -> Option<Result<worker::LibraryRoot, String>> {
+    let options = init.initialization_options.as_ref()?;
+    let value = options.get("libraryRoot").filter(|v| !v.is_null())?;
+    let read = || {
+        let uri = value
+            .as_str()
+            .ok_or_else(|| "expected a uri string".to_string())?;
+        let root = worker::LibraryRoot::new(uri).ok_or_else(|| format!("`{uri}` is not a uri"))?;
+        let dirs = match options.get("libraryDirs").filter(|v| !v.is_null()) {
+            None => Vec::new(),
+            Some(dirs) => dirs
+                .as_object()
+                .ok_or_else(|| "libraryDirs: expected an object of directory names".to_string())?
+                .iter()
+                .map(|(bundle, shown)| {
+                    shown
+                        .as_str()
+                        .map(|shown| (bundle.clone(), shown.to_string()))
+                        .ok_or_else(|| format!("libraryDirs: `{bundle}` names no directory"))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        };
+        root.with_dirs(dirs)
+            .ok_or_else(|| "libraryDirs: directory names must be non-empty path segments with unique, non-conflicting mappings".to_string())
+    };
+    Some(read())
+}
+
+/// The warning for an `initializationOptions.libraryRoot` the server
+/// could not use: library units keep the `sysmlv2-lib:` scheme, and a
+/// document under the directory would be a source. Shown, like a refused
+/// number format — a host setting that silently did nothing would read
+/// as navigation that does not work.
+pub(crate) fn library_root_refused(err: &str) -> Message {
+    Message::Notification(Notification::new(
+        lsp_types::notification::ShowMessage::METHOD.to_string(),
+        lsp_types::ShowMessageParams {
+            typ: lsp_types::MessageType::WARNING,
+            message: format!("sysmlv2: library root ignored: {err}"),
+        },
+    ))
 }
 
 /// `initializationOptions.inferUnitTypes`: accepting a unit completion
@@ -723,6 +788,27 @@ impl Server {
     /// is still answered.
     fn respond(&mut self, req: Request) -> Result<Response, Response> {
         Ok(match req.method.as_str() {
+            // A library document is a read-only copy of a unit the host
+            // serves: what reads it answers from the library's unit (the
+            // handlers below), and what would edit it — completion,
+            // signature help on what is being typed, rename, code actions
+            // — has nothing to offer there.
+            Completion::METHOD
+            | SignatureHelpRequest::METHOD
+            | Rename::METHOD
+            | CodeActionRequest::METHOD
+                if self.is_library_request(&req) =>
+            {
+                let empty = match req.method.as_str() {
+                    Completion::METHOD => {
+                        serde_json::to_value(lsp_types::CompletionResponse::Array(Vec::new()))
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    CodeActionRequest::METHOD => serde_json::Value::Array(Vec::new()),
+                    _ => serde_json::Value::Null,
+                };
+                Response::new_ok(req.id, empty)
+            }
             Formatting::METHOD => {
                 let (id, params): (_, DocumentFormattingParams) = cast(req)?;
                 let (edits, refusal) = self.format(&params.text_document.uri);
@@ -952,6 +1038,14 @@ impl Server {
     }
 
     fn dispatch_notification(&mut self, n: Notification) -> Result<(), Error> {
+        // A library document (see [`library_root`]) is a read-only copy
+        // of a unit the library already provides: opened as a source it
+        // would declare everything in it a second time, so its open,
+        // change and close move nothing here — requests for it answer
+        // from the library's unit.
+        if self.is_library_notification(&n) {
+            return Ok(());
+        }
         match n.method.as_str() {
             DidOpenTextDocument::METHOD => {
                 let Some(p): Option<DidOpenTextDocumentParams> = self.notification_params(n) else {
@@ -1125,18 +1219,54 @@ impl Server {
         Ok(())
     }
 
+    /// Whether a request's `textDocument` is a library document (see
+    /// [`library_root`]), read off its parameters before they are cast.
+    fn is_library_request(&self, req: &Request) -> bool {
+        self.is_library_text_document(&req.params)
+    }
+
+    /// Whether a document notification's `textDocument` is a library
+    /// document (see [`library_root`]).
+    fn is_library_notification(&self, n: &Notification) -> bool {
+        [
+            DidOpenTextDocument::METHOD,
+            DidChangeTextDocument::METHOD,
+            DidCloseTextDocument::METHOD,
+        ]
+        .contains(&n.method.as_str())
+            && self.is_library_text_document(&n.params)
+    }
+
+    /// Whether `params.textDocument.uri` names a library document.
+    fn is_library_text_document(&self, params: &serde_json::Value) -> bool {
+        params["textDocument"]["uri"]
+            .as_str()
+            .and_then(|uri| uri.parse::<Uri>().ok())
+            .is_some_and(|uri| self.nav.is_library_document(&uri))
+    }
+
+    /// The text the syntax tier reads for `uri`: the open document's,
+    /// else — for a library document (see [`library_root`]), which is
+    /// never opened as a source — the library unit's.
+    fn text_of(&self, uri: &Uri) -> Option<&str> {
+        match self.docs.get(uri) {
+            Some(doc) => Some(&doc.text),
+            None => self.nav.library_text(uri),
+        }
+    }
+
     /// Document outline: the syntax AST as nested symbols —
     /// works on broken documents too (the parse tree is partial, never
     /// absent), which is exactly what keeps the Outline view alive while
     /// typing.
     fn symbols(&self, uri: &Uri) -> Option<DocumentSymbolResponse> {
-        let doc = self.docs.get(uri)?;
+        let text = self.text_of(uri)?;
         let parse = match dialect_of(uri) {
-            Dialect::Kerml => parse_kerml_source(&doc.text),
-            Dialect::Sysml => parse_source(&doc.text),
+            Dialect::Kerml => parse_kerml_source(text),
+            Dialect::Sysml => parse_source(text),
         };
-        let mapper = Mapper::new(&doc.text, self.encoding);
-        let mut symbols = outline::document_symbols(&parse.unit, &doc.text, &mapper);
+        let mapper = Mapper::new(text, self.encoding);
+        let mut symbols = outline::document_symbols(&parse.unit, text, &mapper);
         outline::spell_symbols(&mut symbols);
         Some(DocumentSymbolResponse::Nested(symbols))
     }
@@ -1735,27 +1865,28 @@ impl Server {
             .map_err(SplitRefusal::Refused)
     }
 
-    /// A position's byte offset in an open document.
+    /// A position's byte offset in an open document, or in the library
+    /// unit a library document is a copy of.
     fn offset_of(&self, uri: &Uri, pos: lsp_types::Position) -> Option<u32> {
-        let doc = self.docs.get(uri)?;
-        Some(nav::offset_in(&doc.text, pos, self.encoding))
+        let text = self.text_of(uri)?;
+        Some(nav::offset_in(text, pos, self.encoding))
     }
 
     /// Semantic tokens: exact dialect-aware highlighting — see
     /// `tokens` for the classification scheme.
     fn semantic_tokens(&self, uri: &Uri) -> Option<lsp_types::SemanticTokensResult> {
-        let doc = self.docs.get(uri)?;
+        let text = self.text_of(uri)?;
         let parse = match dialect_of(uri) {
-            Dialect::Kerml => parse_kerml_source(&doc.text),
-            Dialect::Sysml => parse_source(&doc.text),
+            Dialect::Kerml => parse_kerml_source(text),
+            Dialect::Sysml => parse_source(text),
         };
-        let toks = tokens::lex(&doc.text);
-        let classified = tokens::classify(&parse.unit, &doc.text, &toks);
-        let mapper = Mapper::new(&doc.text, self.encoding);
+        let toks = tokens::lex(text);
+        let classified = tokens::classify(&parse.unit, text, &toks);
+        let mapper = Mapper::new(text, self.encoding);
         Some(lsp_types::SemanticTokensResult::Tokens(
             lsp_types::SemanticTokens {
                 result_id: None,
-                data: tokens::encode(classified, &doc.text, &mapper),
+                data: tokens::encode(classified, text, &mapper),
             },
         ))
     }

@@ -108,18 +108,21 @@ impl super::Builder {
         batch: &mut super::constructor_bindings::ConstructorBatchEvidence,
     ) -> Result<InvocationBindings, InvocationBindingIssue> {
         charge(steps, 1)?;
-        let operator =
-            self.elements.get(receiver).ok_or(InvalidElement)?.ty == "OperatorExpression";
+        // A feature chain expression is the `'.'` operator's: its one
+        // source parameter binds through the same static callee row.
+        let kind = self.elements.get(receiver).ok_or(InvalidElement)?.ty;
+        let operator = matches!(kind, "OperatorExpression" | "FeatureChainExpression");
         if (!operator && self.elements[receiver].ty != "InvocationExpression")
-            || (operator && self.graph_format != crate::model::GraphFormat::CanonicalV3)
             || self.positional_planning
         {
             return Err(UnsupportedConfiguration);
         }
         let raw = StoredStructure::for_query(self, steps).ok_or(IncompleteProvider)?;
         let callee = if operator {
-            batch
-                .numeric_target(self, receiver, steps)
+            // The operator's function is the static plan's typing row (the
+            // function the operator names in the base, data or control
+            // function library): an operator without one stays out.
+            self.static_operator_callee(receiver, steps)
                 .ok_or(UnsupportedConfiguration)?
         } else {
             membership_evidence::first_unowned_member(
@@ -328,18 +331,25 @@ impl super::Builder {
                     {
                         return Err(UnsupportedConfiguration);
                     }
-                    let plan = self.effective_dynamic_plan().ok_or(StaleEvidence)?;
-                    if !plan.affected_owners.contains(&parameter)
-                        || plan.incomplete_bases.contains(&receiver)
-                        || plan.positional.incomplete.contains(&receiver)
+                    // The row is the positional planner's, over the callee
+                    // typing the static plan gives the receiver, or the
+                    // dynamic plan's where that plan is in effect: the
+                    // effective positional table is the proof either way,
+                    // and a stale dynamic plan over this receiver is none.
+                    if !self.dynamic_evidence_current(receiver) {
+                        return Err(StaleEvidence);
+                    }
+                    let positional = self
+                        .effective_positional_redefinitions()
+                        .ok_or(StaleEvidence)?;
+                    if self
+                        .effective_dynamic_plan()
+                        .is_some_and(|plan| plan.incomplete_bases.contains(&receiver))
+                        || positional.incomplete.contains(&receiver)
                     {
                         return Err(IncompleteProvider);
                     }
-                    let targets = plan
-                        .positional
-                        .targets
-                        .get(&parameter)
-                        .ok_or(UnmappedArgument)?;
+                    let targets = positional.targets.get(&parameter).ok_or(UnmappedArgument)?;
                     charge(steps, targets.len().saturating_add(1))?;
                     if targets.as_slice() != [mapped_input] {
                         return Err(UnsupportedConfiguration);
@@ -385,164 +395,40 @@ impl super::Builder {
     }
 }
 
-/// Shared exact loaded-library identity used by the evaluator's designated
-/// Function lookup. Only ordinary numeric operators enter this bounded domain.
-pub(super) fn numeric_operator_name(b: &super::Builder, receiver: usize) -> Option<&'static str> {
-    if b.graph_format != crate::model::GraphFormat::CanonicalV3
-        || b.elements.get(receiver)?.ty != "OperatorExpression"
-    {
-        return None;
+impl super::Builder {
+    /// The function an operator expression's static callee typing names,
+    /// read as the planner planned it and required to stand as a current
+    /// row of the expression: `None` where the operator resolves to no
+    /// loaded library function, or the row is not there or not current.
+    pub(super) fn static_operator_callee(
+        &mut self,
+        receiver: usize,
+        steps: &mut usize,
+    ) -> Option<usize> {
+        charge(steps, 2).ok()?;
+        let names = self.implied_names();
+        let callee = self.instantiation_callee(receiver, &names)?;
+        if !is_a!(self.elements[callee], "Function") {
+            return None;
+        }
+        let callee_id = self.elements[callee].id;
+        let rows: Vec<usize> = semantic_ownership::owned_relationships(self, receiver)?
+            .iter()
+            .collect();
+        charge(steps, rows.len()).ok()?;
+        rows.into_iter()
+            .any(|row| {
+                is_a!(self.elements[row], "FeatureTyping")
+                    && !self.is_authored(row)
+                    && self.static_chain_row_current(row)
+                    && self.elements[row]
+                        .props
+                        .get("type")
+                        .and_then(|v| v.as_reference())
+                        == Some(callee_id)
+            })
+            .then_some(callee)
     }
-    let operator = b.elements[receiver].props.get("operator")?.as_str()?;
-    Some(match operator {
-        "+" => "+",
-        "-" => "-",
-        "*" => "*",
-        "/" => "/",
-        "%" => "%",
-        "^" => "^",
-        _ => return None,
-    })
-}
-pub(super) fn numeric_operator_target(
-    b: &mut super::Builder,
-    receiver: usize,
-    steps: &mut usize,
-) -> Option<usize> {
-    let operator = numeric_operator_name(b, receiver)?;
-    let raw = StoredStructure::for_query(b, steps)?;
-    if !raw.ids_unique || raw.annotations_incomplete || b.metadata_associations_incomplete {
-        return None;
-    }
-    // The global roots and external package lookup use the same reciprocal
-    // membership authority as checked Namespace operations. This bounded
-    // direct-name subset never interprets a compatibility-resolver miss as an
-    // absence certificate, or enters its unbudgeted import/alias traversal.
-    charge(steps, b.unit_starts.len()).ok()?;
-    let roots: Vec<_> = b.unit_starts.iter().map(|&(root, _)| root).collect();
-    let mut base = None;
-    let mut data = None;
-    for root in roots {
-        if b.elements[root].ty != "Namespace" || b.elements[root].owning_relationship.is_some() {
-            return None;
-        }
-        for (name, selected) in [("BaseFunctions", &mut base), ("DataFunctions", &mut data)] {
-            if let Some(found) = direct_designated_member(b, &raw, root, name, false, steps)? {
-                if selected.replace(found).is_some() {
-                    return None;
-                }
-            }
-        }
-    }
-    // OperatorExpression::instantiatedType searches BaseFunctions first. Its
-    // absence is established over the complete public direct-name domain.
-    if let Some(base) = base {
-        if !matches!(b.elements[base].ty, "Package" | "LibraryPackage")
-            || direct_designated_member(b, &raw, base, operator, true, steps)?.is_some()
-        {
-            return None;
-        }
-    }
-    let data = data?;
-    if !matches!(b.elements[data].ty, "Package" | "LibraryPackage") {
-        return None;
-    }
-    let target = direct_designated_member(b, &raw, data, operator, true, steps)??;
-    charge(steps, b.lib_qnames.len()).ok()?;
-    let mut names = b
-        .lib_qnames
-        .iter()
-        .filter(|(_, name)| name.as_slice() == ["DataFunctions", operator]);
-    let (id, _) = names.next()?;
-    (target < b.lib_boundary
-        && b.elements[target].ty == "Function"
-        && *id == b.elements[target].id
-        && names.next().is_none())
-    .then_some(target)
-}
-
-/// A deliberately narrow, complete subset of Namespace name selection. Public
-/// imports and aliases need the contextual provider and remain qualified here.
-/// Valid private imports cannot contribute an externally visible member.
-fn direct_designated_member(
-    b: &super::Builder,
-    raw: &StoredStructure,
-    owner: usize,
-    name: &str,
-    external: bool,
-    steps: &mut usize,
-) -> Option<Option<usize>> {
-    if !raw.membership_domains(b, steps)?.owner_complete(owner)
-        || !raw.import_domains(b, steps)?.owner_complete(owner)
-        || raw.metadata_annotation_targets.contains(&owner)
-        || b.metadata_of.get(&owner).is_some_and(|v| !v.is_empty())
-    {
-        return None;
-    }
-    let relationships = semantic_ownership::owned_relationships(b, owner)?;
-    charge(steps, relationships.len()).ok()?;
-    let mut seen = HashSet::new();
-    let mut result = None;
-    for relationship in relationships.iter() {
-        if !seen.insert(relationship)
-            || semantic_ownership::checked_relationship_carrier(b, raw, relationship, steps)?
-                != Some(owner)
-        {
-            return None;
-        }
-        let relation = &b.elements[relationship];
-        let visibility = match relation.props.get("visibility") {
-            None if is_a!(relation, "Import") => "private",
-            None => "public",
-            Some(value) => value.as_str()?,
-        };
-        if !matches!(visibility, "private" | "protected" | "public") {
-            return None;
-        }
-        if is_a!(relation, "Import") {
-            super::import_memberships::checked_import_target(b, raw, owner, relationship, steps)?;
-            if !external || visibility == "public" {
-                return None;
-            }
-            continue;
-        }
-        if matches!(relation.ty, "ElementFilterMembership") || is_a!(relation, "Specialization") {
-            return None;
-        }
-        if !is_a!(relation, "Membership") {
-            continue;
-        }
-        let member = membership_evidence::member(b, raw, owner, relationship, steps)?;
-        if external && visibility != "public" {
-            continue;
-        }
-        // Restrict names to literal declaration names; effective names and
-        // alias providers retain explicit qualification, never false absence.
-        if !is_a!(relation, "OwningMembership")
-            || raw.metadata_annotation_targets.contains(&member)
-            || b.metadata_of.get(&member).is_some_and(|v| !v.is_empty())
-        {
-            return None;
-        }
-        let row = &b.elements[member];
-        let mut named = false;
-        let mut matches = false;
-        for key in ["declaredName", "declaredShortName"] {
-            if let Some(value) = row.props.get(key).filter(|v| !v.is_null()) {
-                let value = value.as_str()?;
-                charge(steps, value.len()).ok()?;
-                named = true;
-                matches |= value == name;
-            }
-        }
-        if !named && is_a!(row, "Feature") {
-            return None;
-        }
-        if matches && result.replace(member).is_some() {
-            return None;
-        }
-    }
-    Some(result)
 }
 
 #[cfg(test)]
@@ -579,14 +465,13 @@ mod tests {
         );
         r.implied_relationships(call);
         assert!(r.invocation_binding_report(call).arguments.is_ok());
-        let old_ids: Vec<_> =
-            r.b.effective_dynamic_plan()
-                .unwrap()
-                .tail
-                .iter()
-                .map(|edge| edge.id)
-                .collect();
-        assert!(!old_ids.is_empty());
+        let f = r.resolve_qualified("F").unwrap();
+        assert_eq!(r.feature_type_report(call).function, Ok(Some(f)));
+        // The callee typing and the argument's redefinition are the static
+        // plan's rows; the dynamic plan lists the call and adds nothing.
+        let current = r.b.effective_dynamic_plan().unwrap();
+        assert!(current.affected_owners.contains(&call.0));
+        assert!(current.tail.is_empty());
         let callee = r.b.elements[call.0]
             .owned_relationships
             .iter()
@@ -605,67 +490,86 @@ mod tests {
         // dynamic rows under a new accepted plan with a smaller owner set.
         r.discard_owned_result_tail();
         r.implied_relationships(call);
-        let current = r.b.effective_dynamic_plan().unwrap();
-        assert!(current.incomplete_bases.contains(&call.0));
-        assert!(!current.affected_owners.contains(&call.0));
-        assert!(current.tail.iter().all(|edge| !old_ids.contains(&edge.id)));
-        assert!(r.b.elements.iter().all(|row| !old_ids.contains(&row.id)));
+        // The static prediction changed with the callee (no typing row for
+        // it now), which cannot rewrite the old rows: the dynamic plan
+        // declines until a rebuild, and the stale rows certify nothing —
+        // the audit reads the callee from the membership, which names
+        // nothing.
+        assert!(r.b.effective_dynamic_plan().is_none());
         assert!(r.invocation_binding_report(call).arguments.is_err());
+        assert!(r.feature_type_report(call).function.is_err());
     }
 
     #[test]
-    fn numeric_operator_bindings_require_canonical_shared_publication() {
+    fn operator_bindings_follow_the_static_callee_row_on_both_formats() {
         use crate::json::ModelLevelEvaluability::{Evaluable, Unknown};
         for format in [GraphFormat::LegacyV2, GraphFormat::CanonicalV3] {
             let mut m = Model::with_graph_format(format);
             m.add_library_source("binding-library.kerml", LIB);
             m.add_library_source(
                 "numeric-functions.kerml",
-                "standard library package DataFunctions {function '+' {in a; in b; return r;}} ",
+                "standard library package DataFunctions {function '+' {in a; in b; return r;} function '<' {in a; in b; return r;}} ",
             );
-            m.add_source("operator.kerml", "feature sum=1+2;");
+            m.add_source("operator.kerml", "feature sum=1+2; feature less=1<2;");
             let mut r = ResolvedModel::build(&m);
-            let call = r
+            let calls: Vec<_> = r
                 .elements()
-                .find(|&e| r.element_type(e) == "OperatorExpression")
-                .unwrap();
-            assert!(r.invocation_binding_report(call).arguments.is_err());
+                .filter(|&e| r.element_type(e) == "OperatorExpression")
+                .collect();
+            assert_eq!(calls.len(), 2);
+            // Before the rows exist no positional proof is published.
+            assert!(r.invocation_binding_report(calls[0]).arguments.is_err());
             // The eligibility proof does not wait on the binding provider:
             // the operator's designated function is resolved by name and the
             // operands are the expression's own parameters' values.
-            assert_eq!(r.model_level_evaluability(call).classification, Evaluable);
-            let _ = r.implied_relationships(call);
-            if format == GraphFormat::CanonicalV3 {
+            assert_eq!(
+                r.model_level_evaluability(calls[0]).classification,
+                Evaluable
+            );
+            for (call, name) in calls.iter().copied().zip(["+", "<"]) {
+                let _ = r.implied_relationships(call);
                 let report = r.invocation_binding_report(call).arguments.unwrap();
-                assert_eq!(report.bindings.len(), 2);
-                assert_eq!(r.model_level_evaluability(call).classification, Evaluable);
-                r.b.elements[call.0]
-                    .props
-                    .insert("operator", serde_json::json!("missing"));
-                assert!(r.invocation_binding_report(call).arguments.is_err());
-                assert!(matches!(
-                    r.model_level_evaluability(call).classification,
-                    Unknown(_)
-                ));
-            } else {
-                assert!(r.invocation_binding_report(call).arguments.is_err());
-                assert_eq!(r.model_level_evaluability(call).classification, Evaluable);
-                r.b.elements[call.0]
-                    .props
-                    .insert("operator", serde_json::json!("missing"));
-                assert!(matches!(
-                    r.model_level_evaluability(call).classification,
-                    Unknown(_)
-                ));
+                assert_eq!(report.bindings.len(), 2, "{format:?} {name}");
+                let function = r
+                    .resolve_qualified(&format!("DataFunctions::'{name}'"))
+                    .unwrap();
+                assert_eq!(report.callee, function, "{format:?} {name}");
             }
+            assert_eq!(
+                r.model_level_evaluability(calls[0]).classification,
+                Evaluable
+            );
+            // An operator naming no library function has no row and no
+            // bindings.
+            r.b.elements[calls[0].0]
+                .props
+                .insert("operator", serde_json::json!("missing"));
+            assert!(r.invocation_binding_report(calls[0]).arguments.is_err());
+            assert!(matches!(
+                r.model_level_evaluability(calls[0]).classification,
+                Unknown(_)
+            ));
         }
     }
     #[test]
-    fn numeric_operator_absence_requires_complete_earlier_package() {
-        for earlier in [
-            "standard library package BaseFunctions {public import Missing::*;}",
-            "standard library package BaseFunctions {function '+' {in a; in b; return r;}}",
-            "standard library package BaseFunctions {alias '+' for Missing::unknown;}",
+    fn operator_callee_is_the_first_library_package_declaring_it() {
+        // The callee is the planner's: `BaseFunctions` before
+        // `DataFunctions`, by the loaded library's declared names; a package
+        // that declares nothing of the name (an import, an alias to nothing)
+        // does not take the operator.
+        for (earlier, package) in [
+            (
+                "standard library package BaseFunctions {public import Missing::*;}",
+                "DataFunctions",
+            ),
+            (
+                "standard library package BaseFunctions {function '+' {in a; in b; return r;}}",
+                "BaseFunctions",
+            ),
+            (
+                "standard library package BaseFunctions {alias '+' for Missing::unknown;}",
+                "DataFunctions",
+            ),
         ] {
             let mut m = Model::with_graph_format(GraphFormat::CanonicalV3);
             m.add_library_source("binding-library.kerml", LIB);
@@ -681,10 +585,12 @@ mod tests {
                 .find(|&e| r.element_type(e) == "OperatorExpression")
                 .unwrap();
             r.implied_relationships(call);
-            assert!(
-                r.invocation_binding_report(call).arguments.is_err(),
-                "{earlier}"
-            );
+            let report = r
+                .invocation_binding_report(call)
+                .arguments
+                .unwrap_or_else(|e| panic!("{earlier}: {e:?}"));
+            let function = r.resolve_qualified(&format!("{package}::'+'")).unwrap();
+            assert_eq!(report.callee, function, "{earlier}");
         }
         // The real designated packages use private imports. They cannot
         // contribute an externally selected operator and do not block proof.
@@ -897,17 +803,32 @@ mod tests {
         });
         let _ = r.to_full_json_strict();
         assert!(r.invocation_binding_report(call).arguments.is_ok());
-        for source in [
+        // An output before the input takes no position: the argument binds
+        // `a` (KerML `validateInvocationExpressionParameterRedefinition`).
+        let (mut r, call) = fixture(
             "function F {out feature priorOutput; in a; return r;} feature x=F(1);",
+            GraphFormat::LegacyV2,
+        );
+        r.set_closure_policy(ClosurePolicy::Closure {
+            include_implied: true,
+        });
+        let _ = r.to_full_json_strict();
+        let report = r.invocation_binding_report(call).arguments.unwrap();
+        assert_eq!(report.bindings.len(), 1);
+        assert_eq!(
+            report.bindings[0].input,
+            r.resolve_qualified("F::a").unwrap()
+        );
+        // A third argument with two inputs stays unmapped.
+        let (mut r, call) = fixture(
             "function F {in a; in b; return r;} feature x=F(1,2,3);",
-        ] {
-            let (mut r, call) = fixture(source, GraphFormat::LegacyV2);
-            r.set_closure_policy(ClosurePolicy::Closure {
-                include_implied: true,
-            });
-            let _ = r.to_full_json_strict();
-            assert!(r.invocation_binding_report(call).arguments.is_err());
-        }
+            GraphFormat::LegacyV2,
+        );
+        r.set_closure_policy(ClosurePolicy::Closure {
+            include_implied: true,
+        });
+        let _ = r.to_full_json_strict();
+        assert!(r.invocation_binding_report(call).arguments.is_err());
         let (mut r, call) = fixture(
             "function F {in a; return r;} feature x=F(a=1);",
             GraphFormat::LegacyV2,

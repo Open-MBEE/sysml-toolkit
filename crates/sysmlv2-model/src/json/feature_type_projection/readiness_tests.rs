@@ -175,11 +175,24 @@ fn metadata_valuation_owned_context_and_invocation_remain_outside_bounded_domain
     assert!(proof.project(feature, &mut 0).function(&proof).is_ok());
 }
 #[test]
-fn invocation_waits_for_accepted_dynamic_typing_lifecycle() {
-    // A feature value's expression is inside the domain, but an invocation's
-    // typing by its callee is dynamic evidence: without it the static audit
-    // would certify the generic evaluation as its function, so it refuses.
+fn invocation_function_is_its_callee_through_the_static_typing() {
+    // An invocation's typing by its callee is the static plan's row
+    // (KerML `checkInvocationExpressionSpecialization`): the audit requires
+    // it and the projection answers the callee, never the generic
+    // evaluation alone. An unresolved callee keeps the expression out.
     let mut r = fixture("function F specializes Performances::Evaluation; feature call=F();");
+    let invocation =
+        r.b.elements
+            .iter()
+            .position(|e| e.ty == "InvocationExpression")
+            .unwrap();
+    let f = r.resolve_qualified("F").unwrap().0;
+    let mut proof = RepositoryTyping::new(&mut r.b, &mut 0).unwrap();
+    assert_eq!(
+        proof.project(invocation, &mut 0).function(&proof),
+        Ok(Some(f))
+    );
+    let mut r = fixture("feature call=Missing();");
     let invocation =
         r.b.elements
             .iter()

@@ -173,10 +173,7 @@ fn checked_constructor_obligations_preserve_actual_library_replay_results() {
                 }
             }
             let schema: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(
-                    sysmlv2_testkit::workspace_root().join("spec-refs/SysML.schema.json"),
-                )
-                .unwrap(),
+                &std::fs::read_to_string(sysmlv2_testkit::spec_ref("SysML.schema.json")).unwrap(),
             )
             .unwrap();
             let mut validators = std::collections::HashMap::new();

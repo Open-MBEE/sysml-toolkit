@@ -181,6 +181,87 @@ fn strict_export_refuses_incomplete_semantics_without_recovery() {
     assert_eq!(r.closure_policy(), before);
 }
 
+const ISSUE57: &str = "package Export {\n    port def Out { out attribute v : ScalarValues::Real; }\n    part def Box {\n        port i : ~Out;\n        attribute a : ScalarValues::Real = 1.0;\n        attribute sum : ScalarValues::Real = a + 2.0;\n    }\n    part def Big :> Box;\n}\n";
+
+/// The checked export keeps every row and lists the refusals beside them
+/// (#57): the strict export's issue list, each refused property absent
+/// from its row, every answered property the checked reader's value.
+#[test]
+fn checked_export_keeps_the_rows_and_lists_the_refusals() {
+    let lib = sysmlv2_testkit::library_dir();
+    for with_library in [false, lib.exists()] {
+        let mut model = Model::new();
+        if with_library {
+            model.load_library_dir(&lib).unwrap();
+        }
+        model.add_source("export.sysml", ISSUE57);
+        let mut r = ResolvedModel::build(&model);
+        let strict = r.to_full_json_strict().unwrap_err();
+        let checked = r.to_full_json_checked().unwrap();
+        assert!(!checked.is_complete());
+        assert_eq!(checked.issues, strict.issues, "library {with_library}");
+        let rows = checked.elements.as_array().unwrap();
+        // Every user element has its row, in the strict export's shape
+        // (the snapshot admits the generated user-owned rows beside them).
+        let user: Vec<_> = r.user_elements().collect();
+        assert!(rows.len() >= user.len(), "library {with_library}");
+        for &e in &user {
+            let id = r.element_id(e).to_string();
+            let row = rows
+                .iter()
+                .find(|row| row["@id"] == id)
+                .unwrap_or_else(|| panic!("row of {id}"));
+            assert_eq!(row["@type"], r.element_type(e));
+        }
+        // A refused property is absent from its row; the issue names the
+        // element, the property and the reason.
+        for issue in &checked.issues {
+            let id = issue.element_id.to_string();
+            let row = rows.iter().find(|row| row["@id"] == id).unwrap();
+            assert!(
+                row.get(&issue.property).is_none(),
+                "{id}.{} refused ({}) yet written",
+                issue.property,
+                issue.reason
+            );
+            assert!(!issue.reason.kind().is_empty());
+        }
+        // What the issue asks for: the refusals per element and property,
+        // the model's `directedFeature` and `type` among them.
+        let properties: std::collections::BTreeSet<&str> =
+            checked.issues.iter().map(|i| i.property.as_str()).collect();
+        assert!(
+            properties.contains("directedFeature"),
+            "library {with_library}: {properties:?}"
+        );
+        let big = r.resolve_qualified("Export::Big").unwrap();
+        let big_id = r.element_id(big).to_string();
+        let big_row = rows.iter().find(|row| row["@id"] == big_id).unwrap();
+        // The answered properties are the checked reader's values.
+        for (name, value) in big_row.as_object().unwrap() {
+            if matches!(name.as_str(), "@id" | "@type" | "aliasIds") {
+                continue;
+            }
+            assert_eq!(&r.property(big, name).unwrap(), value, "{name}");
+        }
+        assert!(
+            big_row.get("isAbstract").is_some(),
+            "an owned property answers"
+        );
+        // The document shape the bindings return.
+        let doc = checked.to_json();
+        assert_eq!(doc["elements"], checked.elements);
+        assert_eq!(
+            doc["issues"].as_array().unwrap().len(),
+            checked.issues.len()
+        );
+        let first = &doc["issues"][0];
+        for key in ["elementId", "property", "kind", "reason"] {
+            assert!(first[key].is_string(), "{key}: {first}");
+        }
+    }
+}
+
 #[test]
 fn strict_export_of_structural_namespace_has_no_placeholders() {
     let mut model = Model::new();

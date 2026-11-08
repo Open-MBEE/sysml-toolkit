@@ -720,6 +720,44 @@ pub enum Library {
     },
 }
 
+/// A decoded prepared snapshot under the format the caller selected: one
+/// that did not decode was made by another toolkit build or from other
+/// units; one that decoded under another graph format says which.
+fn decoded_in_format(
+    decoded: Option<sysmlv2_model::prepared::PreparedLibrary>,
+    format: GraphFormat,
+) -> Result<sysmlv2_model::prepared::PreparedLibrary, SessionError> {
+    let refused = |message: String| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        ))
+    };
+    let library = decoded.ok_or_else(|| {
+        refused(
+            "the prepared snapshot was made by another toolkit build or from other library units"
+                .into(),
+        )
+    })?;
+    if library.graph_format() != format {
+        return Err(refused(format!(
+            "the prepared snapshot was made under the {} graph format; this library is {}",
+            graph_format_name(library.graph_format()),
+            graph_format_name(format)
+        )));
+    }
+    Ok(library)
+}
+
+/// A graph format's name in messages.
+fn graph_format_name(format: GraphFormat) -> &'static str {
+    match format {
+        GraphFormat::LegacyV2 => "legacy",
+        GraphFormat::CanonicalV3 => "canonical",
+        _ => "unknown",
+    }
+}
+
 impl Library {
     /// Prepare ordered in-memory library sources once for repeated session builds.
     /// The optional resolution snapshot has the same fallback behavior as
@@ -821,24 +859,40 @@ impl Library {
         recording: Option<Vec<u8>>,
         keep_host_parts: bool,
     ) -> Result<Library, SessionError> {
+        Self::prepared_snapshot_chunks_in(
+            units,
+            len,
+            fill,
+            recording,
+            GraphFormat::LegacyV2,
+            keep_host_parts,
+        )
+    }
+
+    /// [`Self::prepared_snapshot_chunks_with`] under the selected graph
+    /// format: a snapshot prepared under another is refused, naming it.
+    pub fn prepared_snapshot_chunks_in<F: FnMut(&mut [u8]) -> usize>(
+        units: Vec<(String, String)>,
+        len: usize,
+        fill: F,
+        recording: Option<Vec<u8>>,
+        format: GraphFormat,
+        keep_host_parts: bool,
+    ) -> Result<Library, SessionError> {
         let key = libcache::hash_units(
             units
                 .iter()
                 .map(|(name, text)| (name.as_str(), text.as_str())),
         );
-        let library = sysmlv2_model::prepared::PreparedLibrary::from_chunks_with(
-            len,
-            fill,
-            key,
-            keep_host_parts,
-        )
-            .filter(|library| library.graph_format() == GraphFormat::LegacyV2)
-            .ok_or_else(|| {
-                SessionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the prepared snapshot was made by another toolkit build or from other library units",
-                ))
-            })?;
+        let library = decoded_in_format(
+            sysmlv2_model::prepared::PreparedLibrary::from_chunks_with(
+                len,
+                fill,
+                key,
+                keep_host_parts,
+            ),
+            format,
+        )?;
         let library = match recording {
             Some(bytes) => library.with_lazy_recording(bytes),
             None => library,
@@ -858,6 +912,19 @@ impl Library {
         Self::decode_prepared(units, snapshot, recording, format, false)
     }
 
+    /// [`Self::prepared_snapshot_with_format`], keeping what hosts shipped
+    /// with the library when `keep_host_parts` (see
+    /// [`Self::prepared_snapshot_with`]).
+    pub fn prepared_snapshot_in(
+        units: Vec<(String, String)>,
+        snapshot: &[u8],
+        recording: Option<Vec<u8>>,
+        format: GraphFormat,
+        keep_host_parts: bool,
+    ) -> Result<Library, SessionError> {
+        Self::decode_prepared(units, snapshot, recording, format, keep_host_parts)
+    }
+
     /// A snapshot held whole, decoded under `format`, its hosts' parts kept
     /// when `keep_host_parts`.
     fn decode_prepared(
@@ -872,18 +939,14 @@ impl Library {
                 .iter()
                 .map(|(name, text)| (name.as_str(), text.as_str())),
         );
-        let library = sysmlv2_model::prepared::PreparedLibrary::from_bytes_with(
-            snapshot,
-            key,
-            keep_host_parts,
-        )
-            .filter(|library| library.graph_format() == format)
-            .ok_or_else(|| {
-                SessionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the prepared snapshot was made by another toolkit build or from other library units",
-                ))
-            })?;
+        let library = decoded_in_format(
+            sysmlv2_model::prepared::PreparedLibrary::from_bytes_with(
+                snapshot,
+                key,
+                keep_host_parts,
+            ),
+            format,
+        )?;
         let library = match recording {
             Some(bytes) => library.with_lazy_recording(bytes),
             None => library,
@@ -2238,6 +2301,29 @@ impl Session {
         Session::from_sources(sources)
     }
 
+    /// [`Self::open`] resolved against `lib` in the same build, under the
+    /// selected graph format (see [`Self::from_sources_with_graph_format`]):
+    /// the path-based opener of the opt-in canonical format. The selection
+    /// survives edits, library reloads and binary snapshots.
+    pub fn open_with_graph_format(
+        paths: &[PathBuf],
+        lib: Option<Library>,
+        format: GraphFormat,
+    ) -> Result<Session, SessionError> {
+        let mut sources = Vec::with_capacity(paths.len());
+        for p in paths {
+            sources.push((p.display().to_string(), std::fs::read_to_string(p)?));
+        }
+        Self::from_sources_with_graph_format(sources, lib, format)
+    }
+
+    /// The graph format this session lowers and emits under: the one it
+    /// was opened with (`LegacyV2` unless a format-aware constructor chose
+    /// `CanonicalV3`), kept through edits and library reloads.
+    pub fn graph_format(&self) -> GraphFormat {
+        self.model.graph_format()
+    }
+
     /// Open a session over in-memory sources: `(unit name, text)` pairs.
     /// Unit names ending in `.kerml` parse as KerML.
     pub fn from_sources(sources: Vec<(String, String)>) -> Result<Session, SessionError> {
@@ -3173,12 +3259,62 @@ impl Session {
         self.resolved.to_full_json_strict()
     }
 
+    /// [`Self::to_full_json_strict`] with the refusals beside the rows
+    /// instead of in place of them: every admitted element's row with the
+    /// properties the checked reader answered, every refused property
+    /// absent from its row and listed in
+    /// [`sysmlv2_model::json::CheckedExport::issues`] (per element, per
+    /// property, with the reason). Refuses only what stops the export
+    /// before the property reads. The rows are schema-invalid wherever a
+    /// required property is missing: a report of what can be certified,
+    /// not an interchange document.
+    pub fn to_full_json_checked(
+        &mut self,
+    ) -> Result<sysmlv2_model::json::CheckedExport, sysmlv2_model::json::SemanticExportError> {
+        self.resolved.to_full_json_checked()
+    }
+
     /// [`Self::to_full_json`] with unresolved-reference recovery
     /// annotations: when `recover_refs` is set, every reference that
     /// serializes as a dangling id also carries its source spelling, so
     /// a partial model survives emit → lift losslessly (the Flexo
     /// change-record path).
     pub fn to_full_json_with(&self, recover_refs: bool) -> serde_json::Value {
+        let unresolved = if recover_refs {
+            sysmlv2_model::full::UnresolvedReferencePolicy::Preserve
+        } else {
+            sysmlv2_model::full::UnresolvedReferencePolicy::LegacyDanglingId
+        };
+        self.to_full_json_with_policy(sysmlv2_model::full::EmissionPolicy {
+            unresolved,
+            closures: Default::default(),
+        })
+        .expect("the boolean compatibility policies cannot reject at the passthrough level")
+    }
+
+    /// [`Self::to_full_json_with`] with a full [`EmissionPolicy`](sysmlv2_model::full::EmissionPolicy)
+    /// (`sysmlv2_model::full`): the unresolved-reference policy
+    /// ([`UnresolvedReferencePolicy::Reject`] refuses a model with
+    /// unresolved references) and the closure policy. The default export
+    /// is the passthrough level: the owned side of the inheritance-aware
+    /// properties and `[]` for the four closure names (`inheritedMembership`,
+    /// `inheritedFeature`, `importedMembership`, `featuringType`), whatever
+    /// `isImpliedIncluded` says. Under [`ClosurePolicy::Closure`] those
+    /// names are written and the inheritance-aware families carry their
+    /// specification values, with or without the implied library heritage;
+    /// an element whose walk hit the resolver's depth budget refuses the
+    /// emission ([`EmissionError::TruncatedClosures`]) rather than writing a
+    /// cut closure. The resolved model's own closure policy
+    /// (`self.resolved().set_closure_policy(..)`) is the reads' and does not
+    /// select the export's; this argument does. Explicit ids are preserved.
+    ///
+    /// [`UnresolvedReferencePolicy::Reject`]: sysmlv2_model::full::UnresolvedReferencePolicy::Reject
+    /// [`ClosurePolicy::Closure`]: sysmlv2_model::json::ClosurePolicy::Closure
+    /// [`EmissionError::TruncatedClosures`]: sysmlv2_model::full::EmissionError::TruncatedClosures
+    pub fn to_full_json_with_policy(
+        &self,
+        policy: sysmlv2_model::full::EmissionPolicy,
+    ) -> Result<serde_json::Value, sysmlv2_model::full::EmissionError> {
         if self.uses_lexical_references() {
             let mut resolved = ResolvedModel::build(&self.model);
             let mut ids = self.explicit_ids.clone();
@@ -3203,20 +3339,12 @@ impl Session {
                 &mut resolved,
                 &self.model,
                 compact,
-                sysmlv2_model::full::EmissionPolicy {
-                    unresolved: if recover_refs {
-                        sysmlv2_model::full::UnresolvedReferencePolicy::Preserve
-                    } else {
-                        sysmlv2_model::full::UnresolvedReferencePolicy::LegacyDanglingId
-                    },
-                    closures: Default::default(),
-                },
-            )
-            .expect("the boolean compatibility policies cannot reject");
+                policy,
+            );
         }
-        let mut v = sysmlv2_model::full::model_to_full_json_with(&self.model, recover_refs);
+        let mut v = sysmlv2_model::full::model_to_full_json_with_emission(&self.model, policy)?;
         self.overlay(&mut v);
-        v
+        Ok(v)
     }
 
     /// Emit the session's model as **full-form CBOR** — the binary

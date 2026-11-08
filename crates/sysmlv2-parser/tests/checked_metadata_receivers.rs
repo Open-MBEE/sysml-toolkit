@@ -2,7 +2,9 @@
 //! plain metadata (`#Tag part p;`, `@Tag { … }`) adds no base and keeps
 //! nothing out; semantic metadata (a definition conforming to
 //! `Metaobjects::SemanticMetadata`) gives the annotated element an implied
-//! base the planner does not write, so such an element still refuses.
+//! specialization of the metadata's `baseType` value (KerML 9.2), planned
+//! as a row: a feature subsets a feature base, a classifier subclassifies a
+//! classifier base, and the member lists answer through it.
 
 #![cfg(feature = "json")]
 
@@ -21,6 +23,8 @@ const SOURCE: &str = "package Mt {
     part bases : Base[*];
     metadata def Sem :> SemanticMetadata { :>> baseType = bases meta SysML::Usage; }
     #Sem part sem;
+    metadata def SemDef :> SemanticMetadata { :>> baseType = Base meta SysML::Definition; }
+    #SemDef part def Derived;
 }";
 
 fn model() -> ResolvedModel {
@@ -93,9 +97,38 @@ fn plainly_annotated_elements_answer_the_member_lists() {
 }
 
 #[test]
-fn semantically_annotated_elements_still_refuse() {
+fn semantically_annotated_elements_specialize_their_base() {
     let mut r = model();
+    // `#Sem part sem;` subsets `bases` (a feature base), so it inherits the
+    // base's features and answers its lists.
     let sem = named(&mut r, "Mt::sem");
-    assert!(r.property(sem, "feature").is_err());
-    assert!(r.property(sem, "member").is_err());
+    let features = names(&mut r, sem, "feature");
+    assert!(
+        features.contains(&"Mt::Base::b".to_string()),
+        "{features:?}"
+    );
+    let implied = implied_targets(&mut r, sem);
+    assert!(implied.contains(&"Mt::bases".to_string()), "{implied:?}");
+    // `#SemDef part def Derived;` subclassifies `Base` (a classifier base).
+    let derived = named(&mut r, "Mt::Derived");
+    let features = names(&mut r, derived, "feature");
+    assert!(
+        features.contains(&"Mt::Base::b".to_string()),
+        "{features:?}"
+    );
+    let implied = implied_targets(&mut r, derived);
+    assert!(implied.contains(&"Mt::Base".to_string()), "{implied:?}");
+}
+
+/// The targets of the implied relationships `e` owns, by qualified name.
+fn implied_targets(r: &mut ResolvedModel, e: ElementRef) -> Vec<String> {
+    let mut out = Vec::new();
+    for edge in r.implied_relationships(e) {
+        for target in r.relationship_ends(edge).1 {
+            if let sysmlv2_parser::json::Reference::Element(t) = target {
+                out.push(r.element_qualified_name(t).unwrap_or_default());
+            }
+        }
+    }
+    out
 }

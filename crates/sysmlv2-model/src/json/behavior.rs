@@ -17,13 +17,10 @@
 //! `directedFeature`/`parameter` families read too), as the pilot's
 //! lowering of the action kinds relies on (a node's expression and body
 //! parameters carry no direction on the wire). `argument(i)` is
-//! `inputParameter(i)`'s `FeatureValue.value`. One lowering shape is
-//! compensated for rather than read literally: an accept action's
-//! trigger (`accept x at t`) is lowered as a TriggerInvocationExpression
-//! that is itself a parameter member, where the pilot's grammar makes it
-//! the payload parameter's value — it is not counted
-//! as an input parameter, and an accept's `payloadArgument` falls back to
-//! it.
+//! `inputParameter(i)`'s `FeatureValue.value`. An accept action's trigger
+//! (`accept x at t`) is the payload parameter's value, as the pilot's
+//! grammar makes it, so `payloadArgument = argument(1)` reads it like any
+//! other argument and `via` is the second parameter, the receiver.
 
 use super::derived::{Reference, dangling_id};
 use super::{ElementRef, ResolvedModel};
@@ -120,15 +117,10 @@ impl ResolvedModel {
     /// The feature's direction as the specification constrains it: the
     /// spelled `direction`, else the default of its owning
     /// ParameterMembership (`in`; `out` for a ReturnParameterMembership),
-    /// else none. A TriggerInvocationExpression owned as a parameter
-    /// member is an accept action's trigger value, not a parameter (see
-    /// the module documentation), and has none.
+    /// else none.
     pub(super) fn effective_direction(&self, f: ElementRef) -> Option<&str> {
         if let Some(d) = self.prop_str(f.0, "direction") {
             return Some(d);
-        }
-        if self.b.elements[f.0].ty == "TriggerInvocationExpression" {
-            return None;
         }
         let m = self.b.elements[f.0].owning_relationship?;
         let ty = self.b.elements[m].ty;
@@ -159,40 +151,9 @@ impl ResolvedModel {
         self.d_argument_of(p)
     }
 
-    /// The argument an input parameter carries: its FeatureValue's value
-    /// — or, for a trigger invocation's argument, which this lowering owns
-    /// as the parameter itself without the Feature-and-FeatureValue
-    /// wrapper, the expression that is the parameter.
+    /// The argument an input parameter carries: its FeatureValue's value.
     fn d_argument_of(&self, p: ElementRef) -> Option<ElementRef> {
-        self.d_feature_value_of(p).or_else(|| {
-            let owner = self.b.elements[p.0]
-                .owning_relationship
-                .and_then(|m| self.d_owning_related_element_ro(m))?;
-            (self.is_kind(p, "Expression")
-                && self.b.elements[owner].ty == "TriggerInvocationExpression")
-                .then_some(p)
-        })
-    }
-
-    /// The owner of a relationship, read without building the owner map:
-    /// the element whose owned relationships list it.
-    fn d_owning_related_element_ro(&self, rel: usize) -> Option<usize> {
-        self.b.elements[rel]
-            .props
-            .get("owningRelatedElement")
-            .and_then(|v| v.as_reference())
-            .and_then(|id| self.by_id.get(&id).copied())
-    }
-
-    /// `AcceptActionUsage::payloadArgument = argument(1)`: the payload
-    /// parameter's value, else the trigger this lowering owns beside the
-    /// payload (the pilot's grammar makes the trigger the payload's value).
-    pub(super) fn d_accept_payload_argument(&self, e: ElementRef) -> Option<ElementRef> {
-        self.d_argument(e, 1).or_else(|| {
-            self.d_owned_features(e)
-                .into_iter()
-                .find(|&f| self.b.elements[f.0].ty == "TriggerInvocationExpression")
-        })
+        self.d_feature_value_of(p)
     }
 
     /// The value expression of the feature's owned FeatureValue.
@@ -276,10 +237,11 @@ impl ResolvedModel {
     // ---- expressions and functions ----
 
     /// `Expression::result` / `Function::result`: the owned member
-    /// parameter of the first ReturnParameterMembership (the inherited
-    /// result waits for the closure policy). Operators use their library
-    /// Function's result even under passthrough. Supported scope-less literals
-    /// and metadata access inherit the actual semantic-library return identity.
+    /// parameter of the first ReturnParameterMembership — written, or the
+    /// generated one of a reference, operator, invocation or chain
+    /// expression under the implied closure (the inherited result waits for
+    /// the closure policy). Supported scope-less literals and metadata
+    /// access inherit the actual semantic-library return identity.
     pub(super) fn d_result(&mut self, e: ElementRef) -> Option<ElementRef> {
         if !self.b.elem_scope.contains_key(&e.0)
             && super::implied::literal_implied_base(self.b.elements[e.0].ty).is_some()
@@ -294,23 +256,10 @@ impl ResolvedModel {
                 .literal_inherited_result(&inherited, &mut super::MembershipContext::default())
                 .map(ElementRef);
         }
-        let result = self
-            .d_feature_memberships(e)
+        self.d_feature_memberships(e)
             .into_iter()
             .find(|&m| self.is_kind(m, "ReturnParameterMembership"))
-            .and_then(|m| self.d_owned_member_element(m));
-        if result.is_some() || self.element_type(e) != "OperatorExpression" {
-            return result;
-        }
-        // An operator specializes its library Function. Its return parameter
-        // remains a real reference even when passthrough emission leaves the
-        // inherited-member lists empty. A missing library/function/result is
-        // still unavailable, and no result identity is synthesized here.
-        let function = self.d_instantiated_type(e)?.element()?;
-        if self.element_type(function) != "Function" {
-            return None;
-        }
-        self.d_result(function)
+            .and_then(|m| self.d_owned_member_element(m))
     }
 
     /// The types of `e` of the given kind: `Expression::function`,
@@ -335,10 +284,10 @@ impl ResolvedModel {
     pub(super) fn d_instantiated_type(&mut self, e: ElementRef) -> Option<Reference> {
         self.ensure_by_id();
         if self.is_kind(e, "OperatorExpression") {
-            let operator = self.prop_str(e.0, "operator")?;
-            // The two exponentiation spellings share the normative '^'
-            // library endpoint (KerML 1.0, Table 5).
-            let operator = if operator == "**" { "^" } else { operator }.to_string();
+            // The operator as written: `OperatorExpression::instantiatedType()`
+            // resolves `'<operator>'` literally, and the library declares
+            // `'**'` beside `'^'`.
+            let operator = self.prop_str(e.0, "operator")?.to_string();
             let candidates: Vec<(String, String)> =
                 ["BaseFunctions", "DataFunctions", "ControlFunctions"]
                     .iter()

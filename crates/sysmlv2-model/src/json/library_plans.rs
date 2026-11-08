@@ -13,8 +13,11 @@
 //! claim no library row, and leave those facts as the library's rows give
 //! them therefore derives for the library's types what the library derives
 //! alone. Such a build plans only its own rows on top of the library's plans;
-//! any other build, and any build of the canonical graph format, plans every
-//! row.
+//! any other build plans every row. The plans are the library's in its own
+//! graph format: a canonical library's builds extend canonical plans (its
+//! positional planning reads the checked import algebra over the library's
+//! rows, which a build that claims none of them leaves as they are; pinned by
+//! the equality tests under both formats).
 //!
 //! The plans are made by the first build that plans on the library, on a
 //! build of the library with no units of its own, and are not charged to that
@@ -109,13 +112,10 @@ impl RowFacts {
 
 impl LibraryPlans {
     /// Plan the library's own rows, on a build of it with no units of its
-    /// own; `None` for the canonical graph format.
+    /// own, in the library's graph format.
     pub(crate) fn plan(library: &Arc<PreparedLibrary>) -> Option<Self> {
         #[cfg(test)]
         PLANNINGS.with(|count| count.set(count.get() + 1));
-        if library.graph_format() != crate::model::GraphFormat::LegacyV2 {
-            return None;
-        }
         let mut model = crate::model::Model::with_graph_format(library.graph_format());
         Arc::clone(library).install(&mut model).ok()?;
         let mut r = ResolvedModel::build(&model);
@@ -275,9 +275,6 @@ impl LibraryPlans {
         library: &Arc<PreparedLibrary>,
         wire: LibraryPlansWire,
     ) -> Option<Self> {
-        if library.graph_format() != crate::model::GraphFormat::LegacyV2 {
-            return None;
-        }
         let mut model = crate::model::Model::with_graph_format(library.graph_format());
         Arc::clone(library).install(&mut model).ok()?;
         let mut r = ResolvedModel::build(&model);
@@ -374,7 +371,7 @@ impl Builder {
         prepared: &Arc<PreparedLibrary>,
         steps: Option<&mut usize>,
     ) -> Option<Option<Arc<LibraryPlans>>> {
-        if self.graph_format != crate::model::GraphFormat::LegacyV2
+        if self.graph_format != prepared.graph_format()
             || !self.external_implied_names.is_empty()
             || self.library_refs_to_users
             || !self.elements.base_untouched()
@@ -488,7 +485,7 @@ mod tests {
     use super::super::positional::PlannedTypes;
     use super::*;
     use crate::layered::IdMap;
-    use crate::model::Model;
+    use crate::model::{GraphFormat, Model};
     use std::path::Path;
 
     /// The plans of every row of `r`'s build, as the planners make them now:
@@ -713,8 +710,15 @@ mod tests {
         read
     }
 
+    /// Both graph formats: a library's plans are made in its own.
+    const FORMATS: [GraphFormat; 2] = [GraphFormat::LegacyV2, GraphFormat::CanonicalV3];
+
     fn prepared(units: &[(&str, &str)]) -> Arc<PreparedLibrary> {
-        let mut base = Model::new();
+        prepared_in(GraphFormat::LegacyV2, units)
+    }
+
+    fn prepared_in(format: GraphFormat, units: &[(&str, &str)]) -> Arc<PreparedLibrary> {
+        let mut base = Model::with_graph_format(format);
         for (name, text) in units {
             let parsed = base.add_library_source(*name, text);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -723,7 +727,7 @@ mod tests {
     }
 
     fn on(library: &Arc<PreparedLibrary>, units: &[(&str, &str)]) -> Model {
-        let mut model = Model::new();
+        let mut model = Model::with_graph_format(library.graph_format());
         Arc::clone(library).install(&mut model).unwrap();
         for (name, text) in units {
             let parsed = model.add_source(*name, text);
@@ -755,16 +759,34 @@ mod tests {
 
     #[test]
     fn a_build_extends_its_librarys_plans_like_a_plan_of_every_row() {
-        let library = prepared(&[("lib.kerml", KERNEL)]);
-        let model = on(&library, &[("user.kerml", KERNEL_USER)]);
-        assert!(assert_extended_plans_equal_whole(&model, "kernel"));
-        // A second build shares the library's plans.
-        let first = library.library_plans().unwrap();
+        for format in FORMATS {
+            let library = prepared_in(format, &[("lib.kerml", KERNEL)]);
+            let model = on(&library, &[("user.kerml", KERNEL_USER)]);
+            assert!(
+                assert_extended_plans_equal_whole(&model, "kernel"),
+                "{format:?}"
+            );
+            // A second build shares the library's plans.
+            let first = library.library_plans().unwrap();
+            let mut r = ResolvedModel::build(&on(&library, &[("user.kerml", KERNEL_USER)]));
+            let Some(Some(second)) = r.b.library_plans(None) else {
+                panic!("{format:?}: extended");
+            };
+            assert!(Arc::ptr_eq(&first, &second));
+        }
+    }
+
+    /// A build of one graph format on a library prepared in the other
+    /// cannot be installed, so a build never extends plans of another
+    /// format; the guard reads the library's format all the same.
+    #[test]
+    fn a_build_extends_plans_of_its_own_graph_format_only() {
+        let library = prepared_in(GraphFormat::CanonicalV3, &[("lib.kerml", KERNEL)]);
+        let mut other = Model::with_graph_format(GraphFormat::LegacyV2);
+        assert!(Arc::clone(&library).install(&mut other).is_err());
         let mut r = ResolvedModel::build(&on(&library, &[("user.kerml", KERNEL_USER)]));
-        let Some(Some(second)) = r.b.library_plans(None) else {
-            panic!("extended");
-        };
-        assert!(Arc::ptr_eq(&first, &second));
+        r.b.graph_format = GraphFormat::LegacyV2;
+        assert_eq!(r.b.library_plans(None).map(|p| p.is_some()), Some(false));
     }
 
     /// The library's planning keeps what it derived for every type it
@@ -793,14 +815,19 @@ mod tests {
     /// what the planners derive for that element: the build plans every row.
     #[test]
     fn a_row_specializing_a_library_type_plans_every_row() {
-        let library = prepared(&[("lib.kerml", KERNEL)]);
-        for user in [
-            "package U { specialization S subclassifier L::K specializes L::B; }",
-            "package U { featuring L::K::f by L::B; }",
-            "package U { metaclass N; @N about L::K; }",
-        ] {
-            let model = on(&library, &[("user.kerml", user)]);
-            assert!(!assert_extended_plans_equal_whole(&model, user), "{user}");
+        for format in FORMATS {
+            let library = prepared_in(format, &[("lib.kerml", KERNEL)]);
+            for user in [
+                "package U { specialization S subclassifier L::K specializes L::B; }",
+                "package U { featuring L::K::f by L::B; }",
+                "package U { metaclass N; @N about L::K; }",
+            ] {
+                let model = on(&library, &[("user.kerml", user)]);
+                assert!(
+                    !assert_extended_plans_equal_whole(&model, user),
+                    "{format:?}: {user}"
+                );
+            }
         }
     }
 
@@ -823,16 +850,21 @@ mod tests {
     /// loads the standard library, plans the same way.
     #[test]
     fn a_build_on_a_decoded_library_extends_its_plans() {
-        let library = prepared(&[("lib.kerml", KERNEL)]);
-        let decoded =
-            Arc::new(PreparedLibrary::from_bytes(&library.to_bytes(7).unwrap(), 7).unwrap());
-        let model = on(&decoded, &[("user.kerml", KERNEL_USER)]);
-        assert!(assert_extended_plans_equal_whole(&model, "decoded"));
-        let source = on(&library, &[("user.kerml", KERNEL_USER)]);
-        let (mut a, mut b) = (ResolvedModel::build(&model), ResolvedModel::build(&source));
-        let (a, b) = (planned(&mut a), planned(&mut b));
-        assert!(a.implied.difference(&b.implied).is_none());
-        assert!(a.positional.targets == b.positional.targets);
+        for format in FORMATS {
+            let library = prepared_in(format, &[("lib.kerml", KERNEL)]);
+            let decoded =
+                Arc::new(PreparedLibrary::from_bytes(&library.to_bytes(7).unwrap(), 7).unwrap());
+            let model = on(&decoded, &[("user.kerml", KERNEL_USER)]);
+            assert!(
+                assert_extended_plans_equal_whole(&model, "decoded"),
+                "{format:?}"
+            );
+            let source = on(&library, &[("user.kerml", KERNEL_USER)]);
+            let (mut a, mut b) = (ResolvedModel::build(&model), ResolvedModel::build(&source));
+            let (a, b) = (planned(&mut a), planned(&mut b));
+            assert!(a.implied.difference(&b.implied).is_none());
+            assert!(a.positional.targets == b.positional.targets);
+        }
     }
 
     /// The plans' build is cut to the library's source rows; its index of
@@ -988,12 +1020,16 @@ mod tests {
     }
 
     fn standard_library() -> Option<Arc<PreparedLibrary>> {
+        standard_library_in(GraphFormat::LegacyV2)
+    }
+
+    fn standard_library_in(format: GraphFormat) -> Option<Arc<PreparedLibrary>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../spec-refs/SysML-v2-Release/sysml.library");
         if !path.exists() {
             return None;
         }
-        let mut model = Model::new();
+        let mut model = Model::with_graph_format(format);
         model.load_library_dir(&path).unwrap();
         Some(model.prepare_library().unwrap())
     }
@@ -1043,13 +1079,16 @@ mod tests {
 
     #[test]
     fn builds_on_the_standard_library_extend_its_plans_like_plans_of_every_row() {
-        let Some(library) = standard_library() else {
-            return;
-        };
-        let model = on(&library, &[("vehicle.sysml", VEHICLE)]);
-        assert!(assert_extended_plans_equal_whole(&model, "vehicle"));
-        assert!(assert_lookup_tables_equal_whole(&model, "vehicle"));
-        assert!(assert_inherited_equal_whole(&model, "vehicle") > 0);
+        for format in FORMATS {
+            let Some(library) = standard_library_in(format) else {
+                return;
+            };
+            let model = on(&library, &[("vehicle.sysml", VEHICLE)]);
+            let label = format!("vehicle {format:?}");
+            assert!(assert_extended_plans_equal_whole(&model, &label));
+            assert!(assert_lookup_tables_equal_whole(&model, &label));
+            assert!(assert_inherited_equal_whole(&model, &label) > 0);
+        }
     }
 
     /// Every directory of the corpus's example, training and validation
@@ -1057,7 +1096,13 @@ mod tests {
     /// on the prepared standard library.
     #[test]
     fn corpus_workspaces_extend_the_standard_librarys_plans_like_plans_of_every_row() {
-        let Some(library) = standard_library() else {
+        for format in FORMATS {
+            corpus_workspaces_extend_the_plans_in(format);
+        }
+    }
+
+    fn corpus_workspaces_extend_the_plans_in(format: GraphFormat) {
+        let Some(library) = standard_library_in(format) else {
             return;
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec-refs");
@@ -1097,7 +1142,7 @@ mod tests {
         let (mut checked, mut extended, mut shared, mut inherited) = (0, 0, 0, 0);
         for (dir, mut files) in workspaces {
             files.sort();
-            let mut model = Model::new();
+            let mut model = Model::with_graph_format(format);
             Arc::clone(&library).install(&mut model).unwrap();
             for file in &files {
                 let text = std::fs::read_to_string(file).unwrap();
@@ -1106,7 +1151,7 @@ mod tests {
                     &text,
                 );
             }
-            let label = dir.display().to_string();
+            let label = format!("{} {format:?}", dir.display());
             checked += 1;
             assert_verify_inputs_equal_whole(&model, &label);
             if assert_lookup_tables_equal_whole(&model, &label) {
@@ -1117,12 +1162,18 @@ mod tests {
                 extended += 1;
             }
         }
-        assert!(checked > 80, "{checked} workspaces");
-        assert!(shared * 10 >= checked * 9, "{shared} of {checked} shared");
-        assert!(inherited > checked, "{inherited} library scopes read");
+        assert!(checked > 80, "{format:?}: {checked} workspaces");
+        assert!(
+            shared * 10 >= checked * 9,
+            "{format:?}: {shared} of {checked} shared"
+        );
+        assert!(
+            inherited > checked,
+            "{format:?}: {inherited} library scopes read"
+        );
         assert!(
             extended * 10 >= checked * 9,
-            "{extended} of {checked} extended"
+            "{format:?}: {extended} of {checked} extended"
         );
     }
 

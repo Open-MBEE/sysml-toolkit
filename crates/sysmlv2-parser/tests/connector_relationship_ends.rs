@@ -75,6 +75,24 @@ fn policies() -> [ClosurePolicy; 3] {
     ]
 }
 
+/// The certified `relatedElement` of a connector: through the connector arm
+/// it answers the related features when the ends certify, refuses the
+/// member lists when they cannot (`IncompleteTypeFeatures`), and keeps
+/// `Approximate` short of the full closure; never a value other than the
+/// related features.
+fn certified_related_element(r: &mut ResolvedModel, e: ElementRef, related: &[Reference]) {
+    use sysmlv2_parser::json::PropertyError;
+    match r.derived_exact(e, "relatedElement") {
+        Ok(DerivedValue::References(found)) => assert_eq!(found, related),
+        Ok(other) => panic!("relatedElement: {other:?}"),
+        Err(PropertyError::IncompleteTypeFeatures(_) | PropertyError::Approximate) => {}
+        Err(PropertyError::UnresolvedReference(spelling)) => {
+            assert!(related.contains(&Reference::Unresolved(spelling)))
+        }
+        Err(other) => panic!("relatedElement: {other:?}"),
+    }
+}
+
 #[test]
 fn connector_generic_ends_agree_with_typed_projections_and_keep_repeated_related_features() {
     let source = "package P {
@@ -125,11 +143,11 @@ fn connector_generic_ends_agree_with_typed_projections_and_keep_repeated_related
                 assert_eq!(refs(&mut r, e, "targetFeature"), *targets);
                 assert_eq!(refs(&mut r, e, "relatedFeature"), *related);
                 assert_eq!(refs(&mut r, e, "relatedElement"), *related);
-                assert_eq!(
-                    r.derived_exact(e, "relatedElement"),
-                    Err(sysmlv2_parser::json::PropertyError::Approximate),
-                    "generic alias cannot certify more than relatedFeature"
-                );
+                // The generic alias reads through the connector arm now:
+                // it answers the related features where the ends certify
+                // (with the library's roles), refuses the member lists
+                // without them, and requires the full closure.
+                certified_related_element(&mut r, e, related);
             }
             let full = resolved_to_full_json(
                 &mut r,
@@ -188,10 +206,7 @@ fn connector_generic_ends_follow_the_existing_inherited_end_policy() {
                 vec![a.clone(), b.clone()]
             };
             assert_eq!(refs(&mut r, child, "relatedElement"), expected);
-            assert_eq!(
-                r.derived_exact(child, "relatedElement"),
-                Err(sysmlv2_parser::json::PropertyError::Approximate)
-            );
+            certified_related_element(&mut r, child, &expected);
             assert_eq!(
                 r.relationship_ends(child),
                 (
@@ -213,10 +228,7 @@ fn connector_generic_ends_preserve_unresolved_reference_identity() {
             let e = r.resolve_qualified("P::missing").unwrap();
             let a = Reference::Element(r.resolve_qualified("P::a").unwrap());
             let missing = Reference::Unresolved("Absent".into());
-            assert_eq!(
-                r.derived_exact(e, "relatedElement"),
-                Err(sysmlv2_parser::json::PropertyError::Approximate)
-            );
+            certified_related_element(&mut r, e, &[a.clone(), missing.clone()]);
             assert_eq!(
                 r.relationship_ends(e),
                 (vec![a.clone()], vec![missing.clone()])

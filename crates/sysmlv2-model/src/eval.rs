@@ -3583,6 +3583,12 @@ impl Evaluator<'_> {
                     ),
                 });
             }
+            // A synthesized default multiplicity (SysML 7.6.3, an
+            // individual definition's) stores no row: its bounds are
+            // those of the library range its planned Subsetting names.
+            if bounds.is_none() {
+                bounds = self.b.default_multiplicity_bounds(e);
+            }
             let (lower, upper) = bounds?;
             upper.is_none_or(|hi| lower <= hi).then_some((lower, upper))
         })();

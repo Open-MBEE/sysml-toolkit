@@ -68,6 +68,11 @@
 #   trees we never read), pinned to the submodule gitlink SHA so the
 #   corpus and the code always move together. The Apollo submodule and
 #   z3 are installed too, so every self-skipping gate actually runs.
+# - The normative metamodel XMI and JSON schemas are not redistributed (their
+#   publication terms do not allow reposting them): the test and lint
+#   jobs run tools/fetch-spec-refs, which downloads them against the
+#   SHA-256 pins in tools/fetch-spec-refs.pins, behind an actions/cache
+#   entry keyed on that pin file.
 # - The workspace has zero native dependencies (Z3 is a runtime
 #   subprocess, never linked), so cross-target builds need no extra
 #   system libraries beyond musl-tools for the static Linux build.
@@ -125,6 +130,21 @@ jobs:
           git checkout "$sha"
       - name: Fetch the Apollo 11 validation corpus
         run: git submodule update --init spec-refs/apollo-11-sysml-v2
+      # The metamodel XMI and JSON schemas the property-audit and
+      # schema-validation tests read are fetched against pins (their terms
+      # do not allow reposting; see spec-refs/README.md). The cache holds
+      # one copy per pin-file revision; the fetch verifies whatever it finds
+      # and downloads only what is missing, so a cache hit costs no network.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            spec-refs/KerML.xmi
+            spec-refs/SysML.xmi
+            spec-refs/KerML.schema.json
+            spec-refs/SysML.schema.json
+          key: spec-refs-${{ hashFiles('tools/fetch-spec-refs.pins') }}
+      - name: Fetch the normative metamodel XMI and JSON schemas (pinned)
+        run: python3 tools/fetch-spec-refs
       - name: Install z3, jq and xxd
         # z3 for the solver gates; jq and xxd for the CLI.md tour.
         run: sudo apt-get update && sudo apt-get install -y z3 jq xxd
@@ -138,7 +158,19 @@ jobs:
         with:
           save-if: ${{ github.event_name == 'pull_request' }}
       - name: Run the full test suite
-        run: cargo test --release
+        # The parser crate's corpus-wide tests each hold gigabytes (the
+        # closure-policy corpus test 6.9 GiB, the read-API parity test 4.9,
+        # round trip, lift, the XMI audit and the baseline 2.3 to 2.7) and
+        # the binary keeps growing across them (9.7 GiB over a single-thread
+        # run); four of them together passed 12 GiB and the runner killed
+        # the step mid-suite. The rest of the workspace runs as before; the
+        # parser crate runs on one thread, which bounds its peak to the
+        # single-thread figure at about five minutes of serial time. The
+        # Python crate is not a default member (its own job builds it), so
+        # the workspace form leaves it out as the plain command did.
+        run: |
+          cargo test --release --workspace --exclude sysmlv2-parser --exclude sysmlv2-py
+          cargo test --release -p sysmlv2-parser -- --test-threads=1
       - name: Ambient library (strict candidate check; resolves without naming its file)
         # The binary the test step built (the CLI's tests run it). A
         # `cargo run -p sysmlv2-cli` here would resolve features for that
@@ -164,6 +196,21 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+      # The metamodel XMI and JSON schemas the catalog generators
+      # (`--check` below) read are fetched against pins (their terms
+      # do not allow reposting; see spec-refs/README.md). The cache holds
+      # one copy per pin-file revision; the fetch verifies whatever it finds
+      # and downloads only what is missing, so a cache hit costs no network.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            spec-refs/KerML.xmi
+            spec-refs/SysML.xmi
+            spec-refs/KerML.schema.json
+            spec-refs/SysML.schema.json
+          key: spec-refs-${{ hashFiles('tools/fetch-spec-refs.pins') }}
+      - name: Fetch the normative metamodel XMI and JSON schemas (pinned)
+        run: python3 tools/fetch-spec-refs
       - name: Install the pinned toolchain (rust-toolchain.toml)
         shell: bash
         run: |

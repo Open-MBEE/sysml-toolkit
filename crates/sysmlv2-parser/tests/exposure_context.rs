@@ -46,7 +46,11 @@ fn check(library: &str, user: &str, cases: &[(&str, &[&str])]) {
                 let names: Vec<_> = resolved
                     .view_exposed_elements(view)
                     .into_iter()
-                    .map(|element| resolved.element_qualified_name(element).unwrap())
+                    .map(|element| {
+                        resolved
+                            .element_qualified_name(element)
+                            .unwrap_or_else(|| resolved.element_type(element).to_string())
+                    })
                     .collect();
                 assert_eq!(names, expected, "mode={mode}");
             }
@@ -177,7 +181,8 @@ fn contextual_projection_preserves_previously_supported_positive_bases() {
     check(
         "part def Frame {part cell {attribute rating;}} part def Housing {part slot : Frame;}",
         "part merged :> Housing::slot.cell; view v {expose merged::*;}",
-        &[("v", &["Frame::cell::rating"])],
+        // `cell`'s members: its attribute and its default multiplicity.
+        &[("v", &["Frame::cell::rating", "Multiplicity"])],
     );
     check(
         "part def A {part x;}",

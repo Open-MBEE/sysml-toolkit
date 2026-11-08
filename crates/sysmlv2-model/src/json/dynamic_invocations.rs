@@ -440,11 +440,32 @@ pub(super) fn prepare_with_workspace(
     for source in unresolved {
         charge(steps, 1)?;
         // A source's immediate owning Type consumes its feature-domain
-        // projection. Do not recursively lift that qualification: a nested
-        // feature's signature is not the outer owner's own specialization or
-        // slot direction. Actual nested consumers remain checked by the final
-        // specialization/delta dependency audit.
+        // projection when the source takes part in it: a positional source
+        // (an end, a parameter) the owner's input sequence pairs by
+        // position, or a source whose unresolved row is a redefinition,
+        // which decides which inherited feature the owner's domain leaves
+        // out. An ordinary feature's unresolved typing or subsetting
+        // qualifies the feature alone: its owner's memberships and
+        // specializations read none of it (#61). Do not recursively lift
+        // that qualification: a nested feature's signature is not the outer
+        // owner's own specialization or slot direction. Actual nested
+        // consumers remain checked by the final specialization/delta
+        // dependency audit.
         if !is_a!(b.elements[source], "Feature") {
+            continue;
+        }
+        let positional = b.elements[source]
+            .props
+            .get("isEnd")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+            || b.is_parameter(source);
+        charge(steps, b.elements[source].owned_relationships.len())?;
+        let redefines_unresolved = b.elements[source].owned_relationships.iter().any(|&r| {
+            is_a!(b.elements[r], "Redefinition")
+                && super::implied::specialization_target(&b.elements[r]).is_none()
+        });
+        if !positional && !redefines_unresolved {
             continue;
         }
         if let Some(owner) = owning
@@ -1013,9 +1034,14 @@ mod tests {
             .unwrap()
     }
     #[test]
-    fn canonical_nested_signature_qualification_tracks_actual_consumers() {
-        for (feature, succeeds) in [("feature n", true), ("in p", false)] {
-            let parameter = if succeeds { "in p;" } else { "" };
+    fn canonical_nested_signature_is_the_static_plans_to_pair() {
+        // The callee typing and the argument's pairing are the static
+        // plan's rows, as for any step: the dynamic family certifies no
+        // positional edge here, so a parameter with an unresolved nested
+        // redefinition qualifies nothing in it; the checked lists audit that
+        // parameter's own domain when they are read.
+        for feature in ["feature n", "in p"] {
+            let parameter = if feature == "feature n" { "in p;" } else { "" };
             let source = format!(
                 "function F {{{feature} {{feature nested redefines Missing::q;}} {parameter} return result;}} feature call=F(1);"
             );
@@ -1024,12 +1050,19 @@ mod tests {
             let parsed = model.add_source("nested-signature.kerml", &source);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let mut r = ResolvedModel::build(&model);
+            let p = r.resolve_qualified("F::p").unwrap().0;
             let prefix = static_prefix(&mut r);
-            assert_eq!(
-                prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0).is_ok(),
-                succeeds,
+            assert!(
+                prefix
+                    .positional
+                    .targets
+                    .values()
+                    .any(|targets| targets.contains(&p)),
                 "{source}"
             );
+            let plan = prepare(&mut r.b, prefix, &IdSet::default(), None, &mut 0)
+                .unwrap_or_else(|refusal| panic!("{source}: {refusal:?}"));
+            assert!(plan.tail.is_empty(), "{source}");
         }
     }
 
@@ -1144,18 +1177,23 @@ mod tests {
                 old.as_ref().map(|p| &p.targets)
             );
             assert!(plan.direct_bases.get(&inv).unwrap().contains(&f));
+            // The callee typing is the static plan's row, which the dynamic
+            // candidate is minimized behind.
             assert!(
-                plan.tail
+                prefix
+                    .rows
                     .iter()
                     .any(|e| e.owner == inv && e.target == r.b.elements[f].id)
             );
+            assert!(plan.tail.is_empty());
             for (&source, old) in &prefix.positional.targets {
                 assert!(plan.positional.targets[&source].starts_with(old));
             }
             if source.contains("in p") {
                 let p = r.resolve_qualified("F::p").unwrap().0;
                 assert!(
-                    plan.tail
+                    prefix
+                        .rows
                         .iter()
                         .any(|e| e.kind == "Redefinition" && e.target == r.b.elements[p].id)
                 );
@@ -1163,7 +1201,10 @@ mod tests {
         }
     }
     #[test]
-    fn failure_and_colliding_other_tail_ids_never_publish_a_prefix() {
+    fn failure_never_publishes_a_prefix() {
+        // The callee typing is the static plan's row, so the dynamic plan
+        // of a plain invocation carries no tail rows to collide; a failed
+        // preparation still publishes nothing.
         let mut r = fixture("function F {return result;} feature call=F();");
         let prefix = static_prefix(&mut r);
         let plan = prepare(
@@ -1174,12 +1215,8 @@ mod tests {
             &mut 0,
         )
         .unwrap();
+        assert!(plan.tail.is_empty());
         let n = r.b.elements.len();
-        let collision = IdSet::from_iter([plan.tail[0].id]);
-        assert!(matches!(
-            prepare(&mut r.b, Arc::clone(&prefix), &collision, None, &mut 0),
-            Err(Refusal::Collision)
-        ));
         let mut exhausted = crate::eval::MAX_STEPS;
         assert!(matches!(
             prepare(
@@ -1337,11 +1374,20 @@ mod indirect_tests {
                 .get(&q)
                 .is_some_and(|targets| targets.contains(&p))
         );
+        // The static plan subsets the invocation to its feature callee and
+        // pairs the argument with the end the indirect path reaches.
         assert!(
-            plan.tail.iter().any(|edge| edge.owner == argument
-                && edge.kind == "Redefinition"
-                && edge.target == r.b.elements[z].id),
+            plan.positional
+                .targets
+                .get(&argument)
+                .is_some_and(|targets| targets.contains(&z)),
             "effective-end pairing must see the actual indirect path"
+        );
+        assert!(
+            !plan
+                .tail
+                .iter()
+                .any(|edge| edge.owner == argument && edge.kind == "Redefinition")
         );
         assert_eq!(r.b.elements.len(), n);
     }
@@ -1515,14 +1561,17 @@ mod named_callee_chain_gap_tests {
             Err(Refusal::WorkLimit)
         ));
         let accepted = plan(&mut r, &mut 0).unwrap();
+        // Both invocations' arguments redefine `p`: the static plan's rows.
         assert_eq!(
             accepted
-                .tail
-                .iter()
-                .filter(|e| e.kind == "Redefinition" && e.target == r.b.elements[p].id)
+                .positional
+                .targets
+                .values()
+                .filter(|targets| targets.contains(&p))
                 .count(),
             2
         );
+        assert!(accepted.tail.is_empty());
         let n = r.b.elements.len();
         assert!(r.b.implied.is_none());
         assert!(plan(&mut r, &mut 0).is_ok());
@@ -1553,10 +1602,19 @@ mod input_direction_tests {
         prepare(&mut r.b, prefix, &IdSet::default(), None, steps)
     }
     #[test]
-    fn output_before_input_refuses_entire_new_batch() {
+    fn output_before_input_pairs_the_argument_with_the_input() {
+        // An invocation's argument redefines an input of the callee (KerML
+        // `validateInvocationExpressionParameterRedefinition`): an output
+        // before it takes no position, and the callee typing stands.
         let mut r = fixture("out ignored; in p;", "1");
+        let p = r.resolve_qualified("F::p").unwrap().0;
+        let ignored = r.resolve_qualified("F::ignored").unwrap().0;
+        let f = r.resolve_qualified("F").unwrap().0;
         let rows = r.b.elements.len();
-        assert!(matches!(plan(&mut r, &mut 0), Err(Refusal::Incomplete)));
+        let accepted = plan(&mut r, &mut 0).unwrap();
+        let targets: Vec<_> = accepted.positional.targets.values().flatten().collect();
+        assert!(targets.contains(&&p));
+        assert!(!targets.contains(&&ignored));
         assert_eq!(r.b.elements.len(), rows);
         assert!(r.b.implied.is_none());
         let call =
@@ -1565,12 +1623,14 @@ mod input_direction_tests {
                 .position(|e| e.ty == "InvocationExpression")
                 .unwrap();
         let emitted = r.implied_relationships(ElementRef(call));
-        assert!(
-            !emitted
-                .iter()
-                .any(|e| r.b.elements[e.0].ty == "FeatureTyping")
-        );
-        assert!(r.feature_type_report(ElementRef(call)).function.is_err());
+        assert!(emitted.iter().any(|e| {
+            r.b.elements[e.0].ty == "FeatureTyping"
+                && r.b.elements[e.0]
+                    .props
+                    .get("type")
+                    .and_then(|v| v.as_reference())
+                    == Some(r.b.elements[f].id)
+        }));
     }
     #[test]
     fn input_inout_and_named_argument_controls_preserve_correct_identity() {
@@ -1583,20 +1643,10 @@ mod input_direction_tests {
             let p = r.resolve_qualified("F::p").unwrap().0;
             let ignored = r.resolve_qualified("F::ignored").unwrap().0;
             let accepted = plan(&mut r, &mut 0).unwrap();
-            assert!(
-                !accepted
-                    .tail
-                    .iter()
-                    .any(|e| e.kind == "Redefinition" && e.target == r.b.elements[ignored].id)
-            );
-            if args == "1" {
-                assert!(
-                    accepted
-                        .tail
-                        .iter()
-                        .any(|e| e.kind == "Redefinition" && e.target == r.b.elements[p].id)
-                );
-            }
+            let targets: Vec<_> = accepted.positional.targets.values().flatten().collect();
+            assert!(!targets.contains(&&ignored), "{params} / {args}");
+            assert_eq!(targets.contains(&&p), args == "1", "{params} / {args}");
+            assert!(accepted.tail.is_empty(), "{params} / {args}");
         }
     }
     #[test]
@@ -1638,8 +1688,23 @@ mod input_direction_tests {
                 let raw = StoredStructure::for_query(&mut r.b, &mut 0).unwrap();
                 assert!(membership_evidence::parameter_direction(&r.b, &raw, p, &mut 0).is_none());
             } else {
-                let result = plan(&mut r, &mut 0);
-                assert_eq!(result.is_ok(), bad == 0, "case {bad}");
+                // A written null or malformed direction makes no input, so
+                // the argument pairs with nothing; the absent direction takes
+                // the parameter membership's default.
+                let rows = r.b.elements.len();
+                let accepted = plan(&mut r, &mut 0).unwrap_or_else(|refusal| {
+                    panic!("case {bad}: {refusal:?}");
+                });
+                assert_eq!(r.b.elements.len(), rows);
+                assert_eq!(
+                    accepted
+                        .positional
+                        .targets
+                        .values()
+                        .any(|targets| targets.contains(&p)),
+                    bad == 0 || bad == 3,
+                    "case {bad}"
+                );
             }
         }
     }

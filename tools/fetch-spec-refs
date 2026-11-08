@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Fetch the normative specification files that spec-refs/ does not carry.
+
+The OMG publishes the KerML 1.0 and SysML 2.0 metamodel XMI and JSON
+schemas under terms that do not allow reposting them, so this repository
+pins them instead of carrying copies: `tools/fetch-spec-refs.pins` lists,
+per file, the SHA-256 of its content with line ends folded to LF, its
+path below spec-refs/, and the URL it is published at. This script
+downloads each file from that URL, folds CRLF to LF, verifies the pin and
+places the file under spec-refs/. A file already in place that matches
+its pin is left alone, so running it again costs no network.
+
+Who needs them: the property-audit and schema-validation tests
+(`cargo test -p sysmlv2-parser --test integration -- xmi_audit full_json
+checked_constructors`), `cargo run --example fullcheck`, and the catalog
+generators under tools/ (xmi_props.py, gen_cbor_tables.py,
+derived_census.py, gen_metaclass_hierarchy.py, semantic_catalog.py,
+operation_catalog.py). CI runs this script before them.
+
+Usage (from anywhere; paths are resolved from the script's location):
+  python3 tools/fetch-spec-refs            fetch what is missing or stale
+  python3 tools/fetch-spec-refs --check    verify the files in place, no network
+  python3 tools/fetch-spec-refs --force    download every file again
+  python3 tools/fetch-spec-refs --dest D   place the files under D instead of spec-refs/
+
+Exit status 0 when every pinned file is in place and matches; 1 when a
+file is missing (--check), fails to download, or does not match its pin
+(the file in place, if any, is left untouched: the download is verified
+in a temporary file first).
+"""
+
+import argparse
+import hashlib
+import http.client
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PINS = Path(__file__).resolve().with_name("fetch-spec-refs.pins")
+DEFAULT_DEST = ROOT / "spec-refs"
+HINT = "python3 tools/fetch-spec-refs"
+
+
+def read_pins(path=PINS):
+    """[(sha256, relative path, url)] from the pin file, in file order."""
+    pins = []
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3 or len(parts[0]) != 64:
+            raise SystemExit(f"{path}:{lineno}: expected `<sha256> <path> <url>`, got: {raw}")
+        pins.append((parts[0].lower(), parts[1], parts[2]))
+    return pins
+
+
+def normalize(data):
+    """Fold CRLF line ends to LF; idempotent on LF content."""
+    return data.replace(b"\r\n", b"\n")
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_matches(path, sha):
+    return path.is_file() and digest(normalize(path.read_bytes())) == sha
+
+
+def download(url, timeout):
+    request = urllib.request.Request(url, headers={"User-Agent": "sysmlv2-fetch-spec-refs"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def place(data, target):
+    """Write `data` to `target` through a temporary file in the same directory."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".part", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--check", action="store_true", help="verify the files in place against the pins without downloading")
+    parser.add_argument("--force", action="store_true", help="download every file even when the one in place matches")
+    parser.add_argument("--dest", type=Path, default=DEFAULT_DEST, help="directory to place the files in (default: spec-refs/)")
+    parser.add_argument("--timeout", type=float, default=120.0, help="seconds per download (default: 120)")
+    args = parser.parse_args()
+    if args.check and args.force:
+        parser.error("--check takes no --force")
+
+    pins = read_pins()
+    failures = 0
+    fetched = 0
+    for sha, rel, url in pins:
+        target = args.dest / rel
+        if not args.force and file_matches(target, sha):
+            print(f"ok       {rel}")
+            continue
+        if args.check:
+            state = "stale" if target.exists() else "missing"
+            print(f"{state:8} {rel}", file=sys.stderr)
+            failures += 1
+            continue
+        try:
+            data = normalize(download(url, args.timeout))
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            print(f"failed   {rel}: {url}: {error}", file=sys.stderr)
+            failures += 1
+            continue
+        got = digest(data)
+        if got != sha:
+            print(f"mismatch {rel}: {url} has sha256 {got}, pinned {sha}; left untouched", file=sys.stderr)
+            failures += 1
+            continue
+        place(data, target)
+        fetched += 1
+        print(f"fetched  {rel}  ({len(data)} bytes)")
+
+    if failures:
+        if args.check:
+            print(f"{failures} of {len(pins)} pinned file(s) missing or stale under {args.dest}; run `{HINT}`", file=sys.stderr)
+        else:
+            print(f"{failures} of {len(pins)} pinned file(s) not placed", file=sys.stderr)
+        return 1
+    print(f"{len(pins)} pinned file(s) in place under {args.dest} ({fetched} fetched)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

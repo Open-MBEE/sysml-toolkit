@@ -18,6 +18,9 @@
     "ownedRelationship": [
       {
         "@id": "573e4f00-535a-549f-8879-0c519d683a6a"
+      },
+      {
+        "@id": "b1e07d66-ad72-5652-8db4-c9a75e053f17"
       }
     ],
     "owningRelationship": {

@@ -58,6 +58,7 @@ fn view_spellings_round_trip() {
         (View::Action, "action"),
         (View::Sequence, "sequence"),
         (View::Case, "case"),
+        (View::Context, "context"),
         (View::Mixed, "mixed"),
     ];
     for (view, spelling) in all {
@@ -113,7 +114,7 @@ fn unknown_spellings_report_the_alternatives() {
     assert_eq!(e.expected().first(), Some(&"tree"));
     assert_eq!(
         e.to_string(),
-        "unknown view: treee (expected tree, interconnection, state, action, sequence, case, or mixed)"
+        "unknown view: treee (expected tree, interconnection, state, action, sequence, case, context, or mixed)"
     );
 
     let e = "dotted".parse::<LineStyle>().unwrap_err();
@@ -137,7 +138,7 @@ fn graph_reports_the_view_it_cannot_draw() {
         assert_eq!(g["view"].as_str(), Some(view.as_str()));
     }
 
-    for view in [View::Sequence, View::Case, View::Mixed] {
+    for view in [View::Sequence, View::Case, View::Context, View::Mixed] {
         let e = graph(&mut r, None, &VizOptions::default().with_view(view)).unwrap_err();
         assert_eq!(e, GraphError::UnsupportedView(view));
         assert_eq!(

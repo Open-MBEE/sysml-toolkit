@@ -1,6 +1,6 @@
 # sysmlv2-viz
 
-PlantUML emission for OMG SysML v2 / KerML models, over the [sysmlv2](https://github.com/Open-MBEE/sysml-toolkit) toolkit's resolved model. Seven deterministic views, each tolerant of unresolved references — feed the text to any PlantUML build for SVG/PNG; this crate has no rendering stage of its own.
+PlantUML emission for OMG SysML v2 / KerML models, over the [sysmlv2](https://github.com/Open-MBEE/sysml-toolkit) toolkit's resolved model. Eight deterministic views, each tolerant of unresolved references — feed the text to any PlantUML build for SVG/PNG; this crate has no rendering stage of its own.
 
 | View | Renders |
 |---|---|
@@ -10,6 +10,7 @@ PlantUML emission for OMG SysML v2 / KerML models, over the [sysmlv2](https://gi
 | `action` | action flows: actions, fork/join/choice control nodes, successions, dashed payload-labelled flows |
 | `sequence` | lifelines and `->>` messages, ordered by the events' succession partial order, boxed per owning definition |
 | `case` | use cases: actors, `<<subject>>` rectangles, objectives as notes, `«include»` edges |
+| `context` | system context: parts around the most connected one, edges labelled by connector definition, no ports |
 | `mixed` | everything on one canvas: structure, connectors, behavior edges, cases, typing |
 
 Cross-view options (`VizOptions`): comment/doc bodies as attached notes, prefix metadata as extra node stereotypes, `^`-marked inherited compartment lines, referenced library types as marked nodes, `«import»` edges, polyline/ortho line routing, a stereotype-keyed color palette, and `[[hyperlink]]` templates (`{file}`/`{line}`/`{col}`/`{qname}`/`{id}`) that PlantUML carries into rendered SVG — diagram nodes click through to their source declarations. Options are built from `VizOptions::default()` with one `with_…` setter per option, so a later option does not break callers. `View` and `LineStyle` carry their host spellings (`tree`, `interconnection` / `ic`, …) through `FromStr`, `Display` and serde, so a host does not have to spell out its own table.

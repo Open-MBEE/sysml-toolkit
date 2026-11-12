@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `viz --view context`, the system context diagram (Rust `View::Context`, Python `"context"`). The part usages of a context render as rectangles: its own, then those of its definitions (for a usage) or written generals (for a definition), with a redefined part drawn once; the part with the most connections is the centre (`<<system>>`, the first declared on a tie); each connector with two ends on two different parts is one edge labelled by its definition, else by its name. Ports stay off the diagram: an end attaches to the part its feature chain starts at. The centre's neighbours take `-up-` and `-down-` in turn, so the other parts form a row above and a row below it; stereotypes are hidden and a bold border marks the centre. The structured graph has no emitter for it (`GraphError::UnsupportedView`).
+
 ## v0.11.3
 
 ### Added

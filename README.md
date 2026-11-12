@@ -12,7 +12,7 @@ A Rust toolchain for [OMG SysML v2](https://www.omg.org/sysml/sysmlv2/) and KerM
 - **Evaluate** expressions exactly: rational arithmetic with no rounding (`0.1 + 0.2 == 0.3`), KerML Function Library intrinsics, lambdas, quantities with exact unit conversion, user-defined calculations, featuring-context rollups.
 - **Verify constraints** to satisfied / violated / undecided verdicts, and **solve** the undecided ones with Z3 (witnesses, unsatisfiability and validity proofs) or the built-in interval propagator.
 - **Transform** — rename, set value, insert, remove, retarget, extract and inline definitions as span-anchored text splices that preserve formatting and notes byte-for-byte, with commits that reparse, re-resolve, and verify untouched references kept their targets.
-- **Visualize** as PlantUML — seven views (structure tree, interconnection, state, action, sequence, use case, mixed) with comment notes, metadata stereotypes, inherited members, color palettes, and clickable source hyperlinks carried into rendered SVG.
+- **Visualize** as PlantUML — eight views (structure tree, interconnection, state, action, sequence, use case, context, mixed) with comment notes, metadata stereotypes, inherited members, color palettes, and clickable source hyperlinks carried into rendered SVG.
 - **Edit** with a Language Server (diagnostics, outline, semantic tokens, formatting, navigation, completion, inlay hints, code lenses, refactorings) and its VS Code client extension.
 
 Worked tours with real outputs: [`CLI.md`](CLI.md) walks every subcommand; [`SDK.md`](SDK.md) walks the transformation SDK from Python. [`CBOR.md`](CBOR.md) specifies the binary interchange form and carries its measured numbers; [`IDS.md`](IDS.md) specifies element identity; [`INTEROP.md`](INTEROP.md) records the interchange representation rules.
@@ -102,7 +102,7 @@ The repository is a Cargo workspace licensed under Apache-2.0; the bindings ship
 | [`sysmlv2-lint`](crates/sysmlv2-lint) | Configurable lint rules over the resolved model with optional auto-fixes |
 | [`sysmlv2-cbor`](crates/sysmlv2-cbor) | The s2c binary interchange codec: table-driven, deterministic, byte-for-byte reconstructable; elided ids, full-form emit, delta payloads |
 | [`sysmlv2-transform`](crates/sysmlv2-transform) | Span-splice transformation engine: semantic navigation, minimal text edits, and a commit pipeline that verifies resolution outcomes are preserved; sessions over text or interchange payloads |
-| [`sysmlv2-viz`](crates/sysmlv2-viz) | PlantUML emission, seven views |
+| [`sysmlv2-viz`](crates/sysmlv2-viz) | PlantUML emission, eight views |
 | [`sysmlv2-lsp`](crates/sysmlv2-lsp) | The Language Server Protocol server (stdio and an embeddable push-driven core) |
 | [`sysmlv2-parser`](crates/sysmlv2-parser) | Compatibility facade re-exporting `sysmlv2-syntax` and `sysmlv2-model` under one crate; hosts the corpus test suites and triage examples |
 | [`sysmlv2-cli`](crates/sysmlv2-cli) | The `sysmlv2` binary — every capability above as subcommands, plus `.kpar` project archives, Flexo change-record payloads, and a wasi build for browsers; the verbs are also a library (`run(args)` and one function per verb) so a host drives them in process |
@@ -143,7 +143,7 @@ Alongside the crates:
 | Constraint solving (`sysmlv2 verify --solve`, Z3) | ✅ witnesses for unbound features, unsatisfiability/validity proofs — the `sysmlv2-solve` crate drives the `z3` binary as a subprocess (no libz3 link); interval propagation answers without a solver where it can |
 | Ad-hoc model queries (`sysmlv2 query`) | ✅ KerML expressions evaluated at the root namespace, plus query-only extensions: closed-world `istype` on model elements and the reflection functions `ownedMember(x)` / `ownedFeature(x)` — find parts by usage type in one line |
 | Transformation engine (`sysmlv2-transform`) | ✅ rename / set value / insert / remove / retarget / extract / inline as span-anchored text splices — notes and formatting preserved byte-for-byte outside the edit; commits reparse, re-resolve, and verify untouched references kept their targets (or roll back), reporting old→new element ids; interchange payloads (compact, full, or Flexo change records) open as sessions and re-emit id-stable |
-| PlantUML emission (`sysmlv2 viz`) | ✅ seven views, deterministic, tolerant of unresolved references |
+| PlantUML emission (`sysmlv2 viz`) | ✅ eight views, deterministic, tolerant of unresolved references |
 | Language server (`sysmlv2 lsp`) + VS Code extension | ✅ diagnostics, outline, semantic tokens, formatting, navigation, completion, hover, inlay hints, code lenses, refactorings; syntax tier standalone, semantic tier with a library |
 | Python binding (`sysmlv2-py`, module `sysmlv2`) | ✅ the whole session surface from Python — abi3 wheels via maturin, generation-guarded handles (stale ones raise instead of mis-resolving) |
 | WebAssembly binding (`sysmlv2-wasm`) | ✅ the same session surface plus the language server for browsers and Node, standard library bundled with a sealed resolution snapshot |

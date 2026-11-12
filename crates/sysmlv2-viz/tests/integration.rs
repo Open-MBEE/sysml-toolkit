@@ -6,6 +6,7 @@
 //! fails for a file in neither place. One file's tests:
 //! `cargo test -p sysmlv2-viz --test integration emitter_walks::`.
 
+mod context;
 mod emitter_walks;
 mod endpoint_semantics;
 mod escaping;

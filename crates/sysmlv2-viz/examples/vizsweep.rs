@@ -21,6 +21,7 @@ const VIEWS: &[(View, &str)] = &[
     (View::Action, "action"),
     (View::Sequence, "seq"),
     (View::Case, "case"),
+    (View::Context, "context"),
     (View::Mixed, "mixed"),
 ];
 

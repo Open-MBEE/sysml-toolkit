@@ -1361,7 +1361,7 @@ What stays undecided is honestly undecided — a contingent constraint reports a
 
 ## 13. `viz` — PlantUML diagrams
 
-`viz` renders one view of a model as PlantUML text (`--view tree|interconnection|state|action|sequence|case|mixed`, default `tree`; `ic` and `seq` are accepted short spellings). Feed the output to any PlantUML build for SVG/PNG; the toolkit itself has no rendering stage.
+`viz` renders one view of a model as PlantUML text (`--view tree|interconnection|state|action|sequence|case|context|mixed`, default `tree`; `ic` and `seq` are accepted short spellings). Feed the output to any PlantUML build for SVG/PNG; the toolkit itself has no rendering stage.
 
 The **tree** view is the structure diagram: packages, definitions, and usages with attribute compartments, plus composition (`*--`), typing (`..>`), and specialization (`--|>`) edges.
 
@@ -1490,6 +1490,34 @@ n2 ->> n3 : deliver_message
 ```
 
 The **case** view is a use-case diagram: case-family definitions and usages as `usecase` nodes, `actor` members with association edges, subjects as `<<subject>>` rectangles, objectives as attached notes carrying their doc bodies, and `include` references as `«include»` edges.
+
+The **context** view is a system context diagram: the part usages of a context as rectangles (its own, then those of its definitions or written generals; a redefinition keeps one node), the part with the most connections in the centre (`<<system>>`, the first declared on a tie), and each two-ended connector between two different parts as one edge labelled by its definition, else by its name. Ports stay off the diagram: an end attaches to the part its feature chain starts at. The centre's neighbours take `-up-` and `-down-` in turn, which places the other parts in one row above and one row below it; the stereotypes stay hidden, and a bold border marks the centre.
+
+```console
+$ printf 'package Site {
+    port def P;
+    interface def Link { end a : P; end b : ~P; }
+    part def Site {
+        part hub { port x : P; port y : P; }
+        part user { port x : ~P; }
+        part sensor[0..*] { port y : ~P; }
+        interface : Link connect hub.x to user.x;
+        interface radio connect hub.y to sensor.y;
+    }
+}' | $sysmlv2 viz - --view context --element Site::Site
+@startuml
+hide stereotype
+skinparam rectangle {
+  BorderThickness<<system>> 2.5
+  FontStyle<<system>> bold
+}
+rectangle "hub" as n1 <<part>> <<system>>
+rectangle "user" as n2 <<part>>
+rectangle "sensor [0..*]" as n3 <<part>>
+n1 -up- n2 : Link
+n1 -down- n3 : radio
+@enduml
+```
 
 The **mixed** view puts everything on one canvas — the Pilot's MIXED mode: nested part rectangles with ports and connector edges, states/actions as stereotyped rectangles with succession/transition edges (`trigger [guard] / effect`), cases and actors, plus typing (`..>`) and specialization (`--|>`) edges. Attribute compartments stay in the tree view (the component dialect has none).
 

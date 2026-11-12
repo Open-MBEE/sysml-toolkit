@@ -445,6 +445,9 @@ pub enum DiagramView {
     Sequence,
     /// Use cases: actors, subjects, objectives, «include» edges
     Case,
+    /// System context: parts around the most connected one, labelled
+    /// connector edges, no ports
+    Context,
     /// Everything on one canvas: structure, connectors, behaviors,
     /// cases, typing
     Mixed,
@@ -460,6 +463,7 @@ impl From<DiagramView> for sysmlv2_viz::View {
             DiagramView::Action => sysmlv2_viz::View::Action,
             DiagramView::Sequence => sysmlv2_viz::View::Sequence,
             DiagramView::Case => sysmlv2_viz::View::Case,
+            DiagramView::Context => sysmlv2_viz::View::Context,
             DiagramView::Mixed => sysmlv2_viz::View::Mixed,
         }
     }

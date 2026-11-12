@@ -1,6 +1,6 @@
 //! PlantUML emission for SysML v2 / KerML models.
 //!
-//! Seven views over the resolved model, all deterministic (aliases in
+//! Eight views over the resolved model, all deterministic (aliases in
 //! declaration order) and all tolerant of unresolved references:
 //!
 //! - **Tree** (structure) — packages as `package` blocks,
@@ -26,6 +26,9 @@
 //! - **Case** (`case`) — the use-case diagram: `usecase` nodes,
 //!   actors, `<<subject>>` rectangles, objectives as notes,
 //!   `«include»` edges.
+//! - **Context** (`context`) — the system context diagram: the parts
+//!   of a context as nodes around the most connected one, connectors as
+//!   edges labelled by their definition, no ports.
 //! - **Mixed** (`interconnect` with `mixed`) — everything on
 //!   one canvas: structure, ports, connectors, behavior edges, cases,
 //!   typing/specialization.
@@ -45,6 +48,7 @@
 
 mod behavior;
 mod case;
+mod context;
 mod graph;
 mod interconnect;
 mod sequence;
@@ -99,6 +103,9 @@ pub enum View {
     Sequence,
     /// Use cases: actors, subjects, objectives, includes.
     Case,
+    /// System context: parts as nodes around the most connected one,
+    /// connectors as labelled edges, no ports.
+    Context,
     /// Everything on one canvas: structure, ports, connectors,
     /// behaviors, cases, typing/specialization.
     Mixed,
@@ -113,6 +120,7 @@ impl View {
         ("action", View::Action),
         ("sequence", View::Sequence),
         ("case", View::Case),
+        ("context", View::Context),
         ("mixed", View::Mixed),
     ];
 
@@ -132,6 +140,7 @@ impl View {
             View::Action => "action",
             View::Sequence => "sequence",
             View::Case => "case",
+            View::Context => "context",
             View::Mixed => "mixed",
         }
     }
@@ -650,6 +659,7 @@ pub fn plantuml(r: &mut ResolvedModel, root: Option<ElementRef>, opts: &VizOptio
         View::Action => behavior::emit(r, &tops, opts, View::Action),
         View::Sequence => sequence::emit(r, &tops, opts),
         View::Case => case::emit(r, &tops, opts),
+        View::Context => context::emit(r, &tops, opts),
         View::Mixed => interconnect::emit(r, &tops, opts, true),
     }
 }

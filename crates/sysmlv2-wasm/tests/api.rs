@@ -1574,6 +1574,84 @@ fn verify_reports_one_verdict_per_satisfaction_claim() {
 }
 
 #[test]
+fn verify_rows_say_which_element_they_are_about() {
+    // A row's position is its expression's, which an assert typed by a
+    // definition shares with that definition; the qualified name and id
+    // tell the two apart, and an unnamed constraint still has its id.
+    let src = "package P {\n\
+               \x20   part def Thing { attribute m; }\n\
+               \x20   constraint def Under { in a; in b; a <= b }\n\
+               \x20   part box {\n\
+               \x20       attribute m = 3;\n\
+               \x20       assert constraint fits : Under { in a = m; in b = 5; }\n\
+               \x20   }\n\
+               \x20   requirement def Cap {\n\
+               \x20       subject t : Thing;\n\
+               \x20       require constraint { t.m <= 5 }\n\
+               \x20   }\n\
+               \x20   requirement cap : Cap;\n\
+               \x20   part big : Thing { attribute :>> m = 9; }\n\
+               \x20   part site {\n\
+               \x20       satisfy cap by big;\n\
+               \x20       satisfy requirement : Cap by big;\n\
+               \x20   }\n\
+               }\n";
+    let mut s = Session::from_sources(&sources(&[("t.sysml", src)])).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&s.verify(None).unwrap()).unwrap();
+    let mut id_of = |qn: &str| {
+        let e = s.resolve(qn).unwrap_or_else(|| panic!("{qn} resolves"));
+        s.element_id(&e).unwrap()
+    };
+    let rows = report["constraints"].as_array().unwrap();
+    let row = |name: &str| {
+        rows.iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("a row named {name}"))
+    };
+    let (def, assert) = (row("Under"), row("fits"));
+    assert_eq!(
+        (&def["line"], &def["col"]),
+        (&assert["line"], &assert["col"])
+    );
+    assert_eq!(def["qualifiedName"], "P::Under");
+    assert_eq!(assert["qualifiedName"], "P::box::fits");
+    assert_eq!(def["elementId"], id_of("P::Under"));
+    assert_eq!(assert["elementId"], id_of("P::box::fits"));
+    assert_eq!(assert["status"], "satisfied");
+    let unnamed = rows
+        .iter()
+        .find(|r| r["name"].is_null())
+        .expect("the requirement's unnamed constraint");
+    assert!(unnamed["qualifiedName"].is_null());
+    assert!(
+        unnamed["elementId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+
+    // A claim names its own element, the requirement it satisfies and the
+    // feature `by` resolves to.
+    let claims = report["satisfactions"].as_array().unwrap();
+    assert_eq!(claims.len(), 2);
+    let referenced = &claims[0];
+    assert_eq!(referenced["requirement"], "P::cap");
+    assert_eq!(referenced["requirementId"], id_of("P::cap"));
+    assert_ne!(referenced["elementId"], referenced["requirementId"]);
+    assert_eq!(referenced["by"], "big");
+    assert_eq!(referenced["byQualifiedName"], "P::big");
+    assert_eq!(referenced["byId"], id_of("P::big"));
+    let part = &referenced["constraints"][0];
+    assert!(part["qualifiedName"].is_null());
+    assert_eq!(part["elementId"], unnamed["elementId"]);
+    // One that declares its requirement in place is that requirement.
+    let declared = &claims[1];
+    assert_eq!(declared["requirement"], "P::Cap");
+    assert_eq!(declared["requirementId"], declared["elementId"]);
+    assert_ne!(declared["elementId"], referenced["elementId"]);
+    assert_eq!(declared["byQualifiedName"], "P::big");
+}
+
+#[test]
 fn lint_reports_configurable_findings_with_positions_and_fixes() {
     // A dead calc input (unused-parameter, default warn, deleting fix)
     // and a snake_case definition (naming-convention, default warn) —

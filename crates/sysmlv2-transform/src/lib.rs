@@ -3316,25 +3316,7 @@ impl Session {
         policy: sysmlv2_model::full::EmissionPolicy,
     ) -> Result<serde_json::Value, sysmlv2_model::full::EmissionError> {
         if self.uses_lexical_references() {
-            let mut resolved = ResolvedModel::build(&self.model);
-            let mut ids = self.explicit_ids.clone();
-            let mut bindings = self.id_reference_bindings.clone();
-            let mut values = self.id_reference_values.clone();
-            let mut warnings = Vec::new();
-            let sites = self.resolved.bound_id_reference_sites();
-            apply_explicit_ids(
-                &mut resolved,
-                &mut ids,
-                IdBindingMode {
-                    enabled: self.binds_ids,
-                    strict: true,
-                    rebound_sites: Some(&sites),
-                },
-                &mut bindings,
-                &mut values,
-                &mut warnings,
-            );
-            let compact = self.compact_json_overlaid();
+            let (mut resolved, compact) = self.lexical_emission_inputs();
             return sysmlv2_model::full::resolved_compact_to_full_json(
                 &mut resolved,
                 &self.model,
@@ -3345,6 +3327,71 @@ impl Session {
         let mut v = sysmlv2_model::full::model_to_full_json_with_emission(&self.model, policy)?;
         self.overlay(&mut v);
         Ok(v)
+    }
+
+    /// [`Self::to_full_json_with_policy`] as text: the bytes
+    /// `serde_json::to_string` (or `to_string_pretty`, by `layout`) gives
+    /// for that value. The rows are written as they are derived, so the
+    /// document value (one map per reference, several times its text
+    /// under the closure policies) is never held: a host that wants the
+    /// text asks for it here. A session whose emitted ids are rewritten
+    /// after the derivation (the older payload-binding fallback) builds
+    /// the value as before; the text is the same either way.
+    pub fn to_full_json_text_with_policy(
+        &self,
+        policy: sysmlv2_model::full::EmissionPolicy,
+        layout: sysmlv2_model::full::TextLayout,
+    ) -> Result<String, sysmlv2_model::full::EmissionError> {
+        use sysmlv2_model::full::TextLayout;
+        if self.uses_lexical_references() {
+            let (resolved, compact) = self.lexical_emission_inputs();
+            return sysmlv2_model::full::resolved_compact_to_full_json_text(
+                resolved,
+                &self.model,
+                compact,
+                policy,
+                layout,
+            );
+        }
+        if !self.overlays_ids() {
+            return sysmlv2_model::full::model_to_full_json_text_with_emission(
+                &self.model,
+                policy,
+                layout,
+            );
+        }
+        let value = self.to_full_json_with_policy(policy)?;
+        let text = match layout {
+            TextLayout::Compact => serde_json::to_string(&value),
+            TextLayout::Indented => serde_json::to_string_pretty(&value),
+        };
+        Ok(text.expect("a JSON value serializes to memory"))
+    }
+
+    /// What a session whose references are lexical emits the full form
+    /// from: a model resolved afresh with the explicit ids and the
+    /// payload's reference bindings applied, and the compact rows under
+    /// the same ids.
+    fn lexical_emission_inputs(&self) -> (ResolvedModel, serde_json::Value) {
+        let mut resolved = ResolvedModel::build(&self.model);
+        let mut ids = self.explicit_ids.clone();
+        let mut bindings = self.id_reference_bindings.clone();
+        let mut values = self.id_reference_values.clone();
+        let mut warnings = Vec::new();
+        let sites = self.resolved.bound_id_reference_sites();
+        apply_explicit_ids(
+            &mut resolved,
+            &mut ids,
+            IdBindingMode {
+                enabled: self.binds_ids,
+                strict: true,
+                rebound_sites: Some(&sites),
+            },
+            &mut bindings,
+            &mut values,
+            &mut warnings,
+        );
+        (resolved, self.compact_json_overlaid())
     }
 
     /// Emit the session's model as **full-form CBOR** — the binary

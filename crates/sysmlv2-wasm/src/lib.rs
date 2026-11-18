@@ -2580,7 +2580,7 @@ impl Session {
         recover_refs: bool,
         closures: Option<String>,
     ) -> Result<String, String> {
-        use sysmlv2_model::full::{EmissionPolicy, UnresolvedReferencePolicy};
+        use sysmlv2_model::full::{EmissionPolicy, TextLayout, UnresolvedReferencePolicy};
         let closures = match closures.as_deref() {
             None => Default::default(),
             Some(name) => parse_closure_policy(name)?,
@@ -2590,12 +2590,16 @@ impl Session {
         } else {
             UnresolvedReferencePolicy::LegacyDanglingId
         };
+        // Written row by row: the document value is several times the
+        // size of its text, and this memory does not shrink again.
         self.inner
-            .to_full_json_with_policy(EmissionPolicy {
-                unresolved,
-                closures,
-            })
-            .map(|v| v.to_string())
+            .to_full_json_text_with_policy(
+                EmissionPolicy {
+                    unresolved,
+                    closures,
+                },
+                TextLayout::Compact,
+            )
             .map_err(|e| e.to_string())
     }
 
@@ -3117,10 +3121,14 @@ impl Session {
     /// `in**2`, `[1, 6]` for bounds folded to `m**2` — and each binding's
     /// `value`, in `bindings` and in a `detail`'s `(with …)`, in the units
     /// it was written in). Returns a JSON report: `{constraints:
-    /// [{unit, unitName, name, elementType, asserted, line, col,
-    /// endLine, endCol, status, method, detail, bindings, features}]
-    /// (`method` = which stage decided: evaluation|propagation, null
-    /// while undecided), ranges:
+    /// [{unit, unitName, name, qualifiedName, elementId, elementType,
+    /// asserted, line, col, endLine, endCol, status, method, detail,
+    /// bindings, features}]
+    /// (`qualifiedName`, null for an element without one, and `elementId`
+    /// say which element the row is about: an assert that takes its
+    /// expression from a definition is positioned over the definition's
+    /// text and identified as itself; `method` = which stage decided:
+    /// evaluation|propagation, null while undecided), ranges:
     /// [{feature, unit, range, rangeApprox, narrowed}], summary: {satisfied,
     /// violated, undecided}}` — positions 1-based over the result
     /// expression; `status` folds definitive propagation conclusions
@@ -3133,13 +3141,20 @@ impl Session {
     /// `features` = the free features the propagation term references
     /// (the keys into `ranges`). `satisfactions` holds one verdict per
     /// `satisfy R by x;` claim, decided at the evaluation tier with R's
-    /// subjects bound to `x`: `{unit, unitName, requirement, by, negated,
-    /// line, col, endLine, endCol, status, vacuous, detail, constraints}`,
-    /// positioned over the whole `satisfy` statement; `vacuous` = satisfied
-    /// only because an assumption does not hold; `constraints` = the
-    /// verdicts it combines, `{unit, unitName, name, elementType, assumed,
-    /// line, col, endLine, endCol, status, detail, bindings}` (bindings
-    /// evaluated under the subject binding, chains like `x.mass` whole).
+    /// subjects bound to `x`: `{unit, unitName, elementId, requirement,
+    /// requirementId, by, byQualifiedName, byId, negated, line, col,
+    /// endLine, endCol, status, vacuous, detail, constraints}`,
+    /// positioned over the whole `satisfy` statement; `elementId` = the
+    /// `satisfy` statement's own element, `requirementId` = the satisfied
+    /// requirement's (the statement's again when it declares its
+    /// requirement in place, which `requirement` then labels by the
+    /// declared type), `byQualifiedName` (nullable) and `byId` = the
+    /// feature `by` resolves to, a chain's last feature; `vacuous` =
+    /// satisfied only because an assumption does not hold; `constraints` =
+    /// the verdicts it combines, `{unit, unitName, name, qualifiedName,
+    /// elementId, elementType, assumed, line, col, endLine, endCol, status,
+    /// detail, bindings}` (bindings evaluated under the subject binding,
+    /// chains like `x.mass` whole).
     /// The summary counts claims alongside constraints.
     // The export boundary converts an optional string only when owned.
     #[allow(clippy::needless_pass_by_value)]
@@ -3171,6 +3186,38 @@ impl Session {
         let report = sysmlv2_solve::verify_constraints_with(resolved, model, None, &cfg)
             .map_err(|e| e.to_string())?;
 
+        // Which element each row is about, by qualified name and id: a
+        // row's position is its expression's, which a bodiless assert
+        // shares with the definition it takes the expression from.
+        let resolved = self.inner.resolved();
+        let mut identity = |e: ElementRef| {
+            (
+                resolved.element_qualified_name(e),
+                resolved.element_id(e).to_string(),
+            )
+        };
+        let constraint_ids: Vec<_> = report
+            .constraints
+            .iter()
+            .map(|c| identity(c.element))
+            .collect();
+        let claim_ids: Vec<_> = report
+            .satisfactions
+            .iter()
+            .map(|claim| {
+                (
+                    identity(claim.element).1,
+                    identity(claim.requirement_element).1,
+                    identity(claim.by_element),
+                    claim
+                        .constraints
+                        .iter()
+                        .map(|c| identity(c.check.element))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+
         let names: std::collections::HashMap<usize, String> = self
             .inner
             .units()
@@ -3184,7 +3231,8 @@ impl Session {
         let constraints: Vec<serde_json::Value> = report
             .constraints
             .iter()
-            .map(|c| {
+            .zip(&constraint_ids)
+            .map(|(c, (qualified_name, element_id))| {
                 let (status, mut detail) = verify_status(&c.verdict, c.propagate.as_ref());
                 match status {
                     "satisfied" => sat += 1,
@@ -3219,6 +3267,8 @@ impl Session {
                     "unit": c.unit,
                     "unitName": names.get(&c.unit),
                     "name": c.name,
+                    "qualifiedName": qualified_name,
+                    "elementId": element_id,
                     "elementType": c.element_type,
                     "asserted": c.asserted,
                     "line": start.line,
@@ -3254,7 +3304,9 @@ impl Session {
             })
             .collect();
         let mut satisfactions: Vec<serde_json::Value> = Vec::new();
-        for claim in &report.satisfactions {
+        for (claim, (element_id, requirement_id, (by_qualified_name, by_id), constraint_ids)) in
+            report.satisfactions.iter().zip(&claim_ids)
+        {
             let (status, detail) = match &claim.verdict {
                 ConstraintVerdict::Satisfied if claim.vacuous => (
                     "satisfied",
@@ -3268,7 +3320,7 @@ impl Session {
                 _ => und += 1,
             }
             let mut constraints: Vec<serde_json::Value> = Vec::new();
-            for c in &claim.constraints {
+            for (c, (qualified_name, element_id)) in claim.constraints.iter().zip(constraint_ids) {
                 let (status, mut detail) = verify_status(&c.check.verdict, None);
                 if status == "violated" {
                     detail = with_values(detail, &c.check.bindings, value_units);
@@ -3282,6 +3334,8 @@ impl Session {
                     "unit": c.check.unit,
                     "unitName": names.get(&c.check.unit),
                     "name": c.check.name,
+                    "qualifiedName": qualified_name,
+                    "elementId": element_id,
                     "elementType": c.check.element_type,
                     "assumed": c.assumed,
                     "line": start.line,
@@ -3298,8 +3352,12 @@ impl Session {
             satisfactions.push(json!({
                 "unit": claim.unit,
                 "unitName": names.get(&claim.unit),
+                "elementId": element_id,
                 "requirement": claim.requirement,
+                "requirementId": requirement_id,
                 "by": claim.by,
+                "byQualifiedName": by_qualified_name,
+                "byId": by_id,
                 "negated": claim.negated,
                 "line": start.line,
                 "col": start.col,

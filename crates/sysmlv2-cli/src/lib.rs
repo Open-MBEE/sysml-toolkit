@@ -2103,6 +2103,29 @@ fn write_bytes(output: Option<&Path>, bytes: &[u8]) -> Result<(), ExitCode> {
     }
 }
 
+/// Write a document already serialized, with a trailing newline, to a
+/// file or to stdout: what [`write_json`] writes for the value `text` is
+/// the indented serialization of.
+fn write_json_text(output: Option<&Path>, text: &str) -> Result<(), ExitCode> {
+    fn emit(w: &mut dyn Write, text: &str) -> io::Result<()> {
+        w.write_all(text.as_bytes())?;
+        w.write_all(b"\n")?;
+        w.flush()
+    }
+    match output {
+        Some(path) => std::fs::File::create(path)
+            .and_then(|mut file| emit(&mut file, text))
+            .map_err(|e| {
+                eprintln!("error: cannot write {}: {e}", path.display());
+                ExitCode::FAILURE
+            }),
+        None => {
+            let mut out = stdout_writer();
+            stdout_result(emit(out.as_mut(), text))
+        }
+    }
+}
+
 /// Write one JSON document, pretty-printed with a trailing newline, to
 /// a file or to stdout — serialized straight into the destination, never
 /// through an intermediate string of the whole document.
@@ -3999,6 +4022,26 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                                  (isImpliedIncluded: false); derived properties are included"
                     );
                 }
+                if matches!(to, Target::FullJson) && !flexo {
+                    // The document alone, as text: written row by row, so
+                    // the document value (several times its text under
+                    // the closure policies) is never held. A refusal
+                    // still writes nothing: the text reaches the output
+                    // only once whole.
+                    let text = match sysmlv2_parser::full::model_to_full_json_text_with_emission(
+                        &model,
+                        emission,
+                        sysmlv2_parser::full::TextLayout::Indented,
+                    ) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            eprintln!("error: cannot write the full form: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    save_library_cache(&model, lib_cache_path);
+                    return exit_status(write_json_text(output.as_deref(), &text));
+                }
                 let (compact, units) = model_to_compact_json_with_units(&model);
                 let json = if full {
                     // --flexo commits must survive read-back even
@@ -4244,6 +4287,23 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
             };
             for w in session.warnings() {
                 eprintln!("warning: {w}");
+            }
+            if matches!(to, Target::FullJson) && !flexo {
+                // The document alone, as text: written row by row, so the
+                // document value (several times its text under the
+                // closure policies) is never held. A refusal still writes
+                // nothing: the text reaches the output only once whole.
+                let text = match session.to_full_json_text_with_policy(
+                    emission,
+                    sysmlv2_parser::full::TextLayout::Indented,
+                ) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        eprintln!("error: cannot write the full form: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                return exit_status(write_json_text(output.as_deref(), &text));
             }
             let json = match session.to_full_json_with_policy(emission) {
                 Ok(json) => json,

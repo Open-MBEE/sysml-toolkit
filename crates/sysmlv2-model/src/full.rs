@@ -203,7 +203,8 @@ pub fn library_to_full_json_with_units(
     // The emitter appends the implied relationships and the recovery
     // annotations after the compact rows, so the unit roots keep their
     // indices.
-    let full = resolved_compact_to_full_json_impl(&mut resolved, model, compact, policy, false)?;
+    let full =
+        resolved_compact_to_full_json_impl(&mut resolved, model, compact, policy, Emit::default())?;
     Ok((full, units))
 }
 
@@ -252,7 +253,7 @@ pub fn resolved_to_full_json(
     policy: EmissionPolicy,
 ) -> Result<Value, EmissionError> {
     let compact = model_to_compact_json(model);
-    resolved_compact_to_full_json_impl(resolved, model, compact, policy, false)
+    resolved_compact_to_full_json_impl(resolved, model, compact, policy, Emit::default())
 }
 
 /// Full-form emission from a compact array and a matching resolved projection.
@@ -268,7 +269,7 @@ pub fn resolved_compact_to_full_json(
     compact: Value,
     policy: EmissionPolicy,
 ) -> Result<Value, EmissionError> {
-    resolved_compact_to_full_json_impl(resolved, model, compact, policy, true)
+    resolved_compact_to_full_json_impl(resolved, model, compact, policy, Emit::lexical())
 }
 
 fn resolved_compact_to_full_json_impl(
@@ -276,7 +277,7 @@ fn resolved_compact_to_full_json_impl(
     model: &Model,
     compact: Value,
     policy: EmissionPolicy,
-    lexical_uuid_names: bool,
+    emit: Emit<'_>,
 ) -> Result<Value, EmissionError> {
     // Elements only: membership ids share their member's qualified name and
     // must not win the name→id inversion (implied bases target elements).
@@ -295,7 +296,7 @@ fn resolved_compact_to_full_json_impl(
         Some(resolved),
         policy.closures,
         &mut truncated,
-        lexical_uuid_names,
+        emit,
     );
     resolved.set_closure_policy(previous);
     let value = result?;
@@ -306,6 +307,340 @@ fn resolved_compact_to_full_json_impl(
             elements: truncated,
         })
     }
+}
+
+/// What a derivation run does beside building the array.
+#[derive(Default)]
+struct Emit<'a> {
+    /// Every `@ref` left in the compact rows is a lexical name, a
+    /// UUID-shaped one included.
+    lexical_uuid_names: bool,
+    /// Receives each row as the derivation completes it.
+    sink: Option<&'a mut (dyn RowSink + 'a)>,
+}
+
+impl Emit<'_> {
+    fn lexical() -> Self {
+        Emit {
+            lexical_uuid_names: true,
+            sink: None,
+        }
+    }
+}
+
+/// Receives the rows of a full-form document as the derivation completes
+/// them, in array order.
+trait RowSink {
+    /// Called once, before the first row, with the number of rows.
+    fn begin(&mut self, rows: usize);
+    /// Called with each completed row. The derivation of a later row reads
+    /// only [`READ_BY_LATER_ROWS`] of it, so a sink may take everything
+    /// else out of the row once it has used it.
+    fn row(&mut self, row: &mut Map<String, Value>);
+}
+
+/// The keys of a completed row that the derivation of another row reads:
+/// its identity and metaclass, and the owned single-valued properties the
+/// array-level rules look up through the ownership indexes (a member's
+/// name, a feature's direction, a membership's member, a typing's type,
+/// a documentation's body). The derived lists are never among them: a
+/// row's lists are built from the indexes and the resolved model, not
+/// from another row's lists.
+///
+/// Every `elements[..]` read in the derivation loop whose index is not
+/// the row being completed must name a key listed here. The tests
+/// `rows_written_one_by_one_are_the_array*` hold the rows as written to
+/// the array's bytes where no resolved model answers and every such read
+/// decides a value.
+const READ_BY_LATER_ROWS: &[&str] = &[
+    "@id",
+    "@type",
+    "annotatedElement",
+    "body",
+    "chainingFeature",
+    "declaredName",
+    "declaredShortName",
+    "direction",
+    "isEnd",
+    "kind",
+    "memberElement",
+    "ownedAnnotatingElement",
+    "referencedFeature",
+    "type",
+];
+
+/// How the text of a full-form document is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextLayout {
+    /// No whitespace: the bytes of `serde_json::to_string` over the
+    /// document value.
+    #[default]
+    Compact,
+    /// Two-space indentation: the bytes of `serde_json::to_string_pretty`
+    /// over the document value.
+    Indented,
+}
+
+/// A sink writing each row to a serializer's sequence and keeping of the
+/// row only what later rows read.
+enum SequenceSink<S: serde::Serializer> {
+    Unopened(S),
+    Open(S::SerializeSeq),
+    Failed(S::Error),
+    Taken,
+}
+
+impl<S: serde::Serializer> RowSink for SequenceSink<S> {
+    fn begin(&mut self, rows: usize) {
+        if let SequenceSink::Unopened(serializer) = std::mem::replace(self, SequenceSink::Taken) {
+            *self = match serializer.serialize_seq(Some(rows)) {
+                Ok(sequence) => SequenceSink::Open(sequence),
+                Err(e) => SequenceSink::Failed(e),
+            };
+        }
+    }
+
+    fn row(&mut self, row: &mut Map<String, Value>) {
+        use serde::ser::SerializeSeq;
+        if let SequenceSink::Open(sequence) = self {
+            if let Err(e) = sequence.serialize_element(&*row) {
+                *self = SequenceSink::Failed(e);
+            }
+        }
+        row.retain(|key, _| READ_BY_LATER_ROWS.contains(&key.as_str()));
+    }
+}
+
+/// A full-form document that derives its rows while it is serialized:
+/// each row is written as soon as it is complete and then reduced to what
+/// later rows read, so the document is never held whole.
+struct RowsAsWritten<F> {
+    /// The derivation, run once with the sink the serializer backs.
+    run: std::cell::Cell<Option<F>>,
+    /// Why the derivation refused, when it did.
+    refused: std::cell::RefCell<Option<EmissionError>>,
+}
+
+impl<F> serde::Serialize for RowsAsWritten<F>
+where
+    F: FnOnce(&mut dyn RowSink) -> Result<Value, EmissionError>,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq};
+        let Some(run) = self.run.take() else {
+            return Err(S::Error::custom("the document was already written"));
+        };
+        let mut sink = SequenceSink::Unopened(serializer);
+        match (run(&mut sink), sink) {
+            (Err(e), _) => {
+                *self.refused.borrow_mut() = Some(e);
+                Err(S::Error::custom("the emission was refused"))
+            }
+            (Ok(_), SequenceSink::Open(sequence)) => sequence.end(),
+            (Ok(_), SequenceSink::Failed(e)) => Err(e),
+            // No row was announced: the input was not an element array
+            // and comes back as it was.
+            (Ok(whole), SequenceSink::Unopened(serializer)) => whole.serialize(serializer),
+            (Ok(_), SequenceSink::Taken) => Err(S::Error::custom("the rows were not written")),
+        }
+    }
+}
+
+/// Where the text is collected while the rows are written. Linear memory
+/// never shrinks and its allocator moves a block to grow it, so there a
+/// buffer that doubles leaves every size it outgrew behind as a hole no
+/// later size fits: the text is collected in pieces instead. Elsewhere
+/// the system allocator grows a large block where it is and commits only
+/// the pages written, so one buffer costs the text once and joining
+/// pieces would cost it twice.
+#[cfg(target_family = "wasm")]
+type TextBuffer = TextPieces;
+#[cfg(not(target_family = "wasm"))]
+type TextBuffer = TextWhole;
+
+/// Text collected in one growing buffer.
+#[cfg(not(target_family = "wasm"))]
+struct TextWhole(Vec<u8>);
+
+#[cfg(not(target_family = "wasm"))]
+impl TextWhole {
+    fn new() -> Self {
+        TextWhole(Vec::new())
+    }
+
+    fn into_string(self) -> String {
+        String::from_utf8(self.0).expect("serialized JSON is UTF-8")
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl std::io::Write for TextWhole {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Text collected in pieces of one size and joined once its length is
+/// known: the text once until [`Self::into_string`], which the caller
+/// reaches after releasing what it derived from, and twice while the
+/// pieces are copied into the one allocation of the exact length.
+#[cfg(any(test, target_family = "wasm"))]
+struct TextPieces {
+    full: Vec<Vec<u8>>,
+    open: Vec<u8>,
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+impl TextPieces {
+    const PIECE: usize = 1 << 20;
+
+    fn new() -> Self {
+        TextPieces {
+            full: Vec::new(),
+            open: Vec::new(),
+        }
+    }
+
+    /// The text in one allocation of its exact length, each piece
+    /// released as it is copied.
+    fn into_string(self) -> String {
+        let length = self.full.iter().map(Vec::len).sum::<usize>() + self.open.len();
+        let mut text = Vec::with_capacity(length);
+        for piece in self.full {
+            text.extend_from_slice(&piece);
+        }
+        text.extend_from_slice(&self.open);
+        String::from_utf8(text).expect("serialized JSON is UTF-8")
+    }
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+impl std::io::Write for TextPieces {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            if self.open.capacity() == 0 {
+                self.open.reserve_exact(Self::PIECE);
+            }
+            let room = self.open.capacity() - self.open.len();
+            let (now, later) = rest.split_at(room.min(rest.len()));
+            self.open.extend_from_slice(now);
+            rest = later;
+            if self.open.len() == self.open.capacity() {
+                self.full.push(std::mem::take(&mut self.open));
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The text of the full-form document `run` derives, written row by row.
+fn full_json_text(
+    layout: TextLayout,
+    run: impl FnOnce(&mut dyn RowSink) -> Result<Value, EmissionError>,
+) -> Result<TextBuffer, EmissionError> {
+    let document = RowsAsWritten {
+        run: std::cell::Cell::new(Some(run)),
+        refused: std::cell::RefCell::new(None),
+    };
+    let mut text = TextBuffer::new();
+    let written = match layout {
+        TextLayout::Compact => serde_json::to_writer(&mut text, &document),
+        TextLayout::Indented => serde_json::to_writer_pretty(&mut text, &document),
+    };
+    if let Some(refused) = document.refused.into_inner() {
+        return Err(refused);
+    }
+    written.expect("a JSON value with string keys serializes to memory");
+    Ok(text)
+}
+
+/// [`model_to_full_json_with_emission`] as text: the bytes
+/// `serde_json::to_string` (or `to_string_pretty`, by `layout`) gives for
+/// that value, written row by row as the rows are derived. The document
+/// value holds one map per reference and is several times the size of
+/// its text under the closure policies; this spelling holds the text, the
+/// compact rows and one full row at a time.
+pub fn model_to_full_json_text_with_emission(
+    model: &Model,
+    policy: EmissionPolicy,
+    layout: TextLayout,
+) -> Result<String, EmissionError> {
+    let mut resolved = crate::json::ResolvedModel::build(model);
+    let text = resolved_text_pieces(&mut resolved, model, policy, layout)?;
+    // The resolved model and what it memoized go before any joining of
+    // the text, so the two never stand together with a joined copy.
+    drop(resolved);
+    Ok(text.into_string())
+}
+
+/// [`resolved_to_full_json`] as text, written row by row
+/// ([`model_to_full_json_text_with_emission`]).
+pub fn resolved_to_full_json_text(
+    resolved: &mut crate::json::ResolvedModel,
+    model: &Model,
+    policy: EmissionPolicy,
+    layout: TextLayout,
+) -> Result<String, EmissionError> {
+    Ok(resolved_text_pieces(resolved, model, policy, layout)?.into_string())
+}
+
+fn resolved_text_pieces(
+    resolved: &mut crate::json::ResolvedModel,
+    model: &Model,
+    policy: EmissionPolicy,
+    layout: TextLayout,
+) -> Result<TextBuffer, EmissionError> {
+    let compact = model_to_compact_json(model);
+    full_json_text(layout, |sink| {
+        resolved_compact_to_full_json_impl(
+            resolved,
+            model,
+            compact,
+            policy,
+            Emit {
+                lexical_uuid_names: false,
+                sink: Some(sink),
+            },
+        )
+    })
+}
+
+/// [`resolved_compact_to_full_json`] as text, written row by row
+/// ([`model_to_full_json_text_with_emission`]). The resolved model is
+/// taken, not borrowed: it is released, with what the emission memoized
+/// in it, before the text is handed back (and, where the text was
+/// collected in pieces, before they are joined).
+pub fn resolved_compact_to_full_json_text(
+    mut resolved: crate::json::ResolvedModel,
+    model: &Model,
+    compact: Value,
+    policy: EmissionPolicy,
+    layout: TextLayout,
+) -> Result<String, EmissionError> {
+    let text = full_json_text(layout, |sink| {
+        resolved_compact_to_full_json_impl(
+            &mut resolved,
+            model,
+            compact,
+            policy,
+            Emit {
+                lexical_uuid_names: true,
+                sink: Some(sink),
+            },
+        )
+    })?;
+    drop(resolved);
+    Ok(text.into_string())
 }
 
 /// Serialize a single unit to the full form. Without a library, implied
@@ -647,7 +982,7 @@ fn full_from_compact_policy(
         projection,
         closures,
         truncated,
-        false,
+        Emit::default(),
     )
 }
 
@@ -658,39 +993,29 @@ fn full_from_compact_policy_with_reference_mode(
     projection: Option<&mut crate::json::ResolvedModel>,
     closures: ClosurePolicy,
     truncated: &mut Vec<String>,
-    lexical_uuid_names: bool,
+    emit: Emit<'_>,
 ) -> Result<Value, UnresolvedReferenceError> {
     if policy == UnresolvedReferencePolicy::Reject {
         let mut references = Vec::new();
-        unresolved_ref_spellings(&compact, &mut references, lexical_uuid_names);
+        unresolved_ref_spellings(&compact, &mut references, emit.lexical_uuid_names);
         references.sort();
         references.dedup();
         if !references.is_empty() {
             return Err(UnresolvedReferenceError { references });
         }
     }
-    if lexical_uuid_names {
-        Ok(full_from_compact_with_reference_mode(
-            compact,
-            lib_by_name,
-            policy == UnresolvedReferencePolicy::Preserve,
-            projection,
-            closures,
-            truncated,
-            true,
-        ))
-    } else {
-        Ok(full_from_compact_with(
-            compact,
-            lib_by_name,
-            policy == UnresolvedReferencePolicy::Preserve,
-            projection,
-            closures,
-            truncated,
-        ))
-    }
+    Ok(full_from_compact_with_reference_mode(
+        compact,
+        lib_by_name,
+        policy == UnresolvedReferencePolicy::Preserve,
+        projection,
+        closures,
+        truncated,
+        emit,
+    ))
 }
 
+#[cfg(test)]
 pub(crate) fn full_from_compact_with(
     compact: Value,
     lib_by_name: &HashMap<String, String>,
@@ -706,7 +1031,7 @@ pub(crate) fn full_from_compact_with(
         projection,
         closures,
         truncated,
-        false,
+        Emit::default(),
     )
 }
 
@@ -717,8 +1042,12 @@ fn full_from_compact_with_reference_mode(
     mut projection: Option<&mut crate::json::ResolvedModel>,
     closures: ClosurePolicy,
     truncated: &mut Vec<String>,
-    lexical_uuid_names: bool,
+    emit: Emit<'_>,
 ) -> Value {
+    let Emit {
+        lexical_uuid_names,
+        mut sink,
+    } = emit;
     let canonical = projection
         .as_ref()
         .is_some_and(|resolved| resolved.b.graph_format == crate::model::GraphFormat::CanonicalV3);
@@ -939,6 +1268,9 @@ fn full_from_compact_with_reference_mode(
     };
 
     // ---- derived properties ----
+    if let Some(sink) = sink.as_deref_mut() {
+        sink.begin(elements.len());
+    }
     for i in 0..elements.len() {
         let t = ty(&elements[i]).to_string();
         let this_id = eid(&elements[i]).to_string();
@@ -2304,6 +2636,11 @@ fn full_from_compact_with_reference_mode(
                 el.insert(k, v);
             }
         }
+        // The row is complete: nothing below this line of the loop, and no
+        // later iteration, writes to it again.
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.row(&mut elements[i]);
+        }
     }
 
     Value::Array(elements.into_iter().map(Value::Object).collect())
@@ -3285,6 +3622,192 @@ mod tests {
             if metaclass == "ReferenceUsage" {
                 assert_eq!(row["isVariable"], true);
                 assert_eq!(row["mayTimeVary"], true);
+            }
+        }
+    }
+
+    /// A model whose rows the array-level rules complete from other rows:
+    /// documentation and comments (prefix and `about`), directed and end
+    /// features, reference chains, state subactions, a verified
+    /// requirement, a view's rendering, an alias and an imported
+    /// membership, and references that resolve to nothing.
+    const READS_OTHER_ROWS: &str = r#"package Rules {
+    doc /* about the package */
+    comment note about Rules::Box /* a note */
+    port def Out { out attribute v : Missing::Real; inout attribute w; in attribute u; }
+    part def Box {
+        doc /* a box */
+        port i : ~Out;
+        part inner { attribute deep; }
+        attribute lead = inner.deep;
+        attribute other :> Nowhere::thing;
+    }
+    part def Big :> Box { attribute :>> lead; }
+    connection def Link { end a : Box; end b : Box; }
+    state def Machine {
+        action setup;
+        entry setup;
+        do action running;
+        exit;
+        state idle;
+    }
+    requirement def Light { doc /* stay light */ subject s : Box; }
+    requirement light : Light;
+    verification def Check {
+        subject s : Box;
+        objective { verify light; }
+    }
+    rendering asTable;
+    view def Table { render asTable; }
+    package Alias { public import Rules::Box; alias B for Box; }
+}
+"#;
+
+    /// The compact rows completed with no resolved model to project from,
+    /// so that every row is the array-level rules' and every read of
+    /// another row decides a value: as the array, and as the text written
+    /// row by row with each row reduced to what later rows read.
+    fn array_and_rows_as_written(compact: &Value, recover_refs: bool) -> (String, String) {
+        let array = full_from_compact_with(
+            compact.clone(),
+            &HashMap::new(),
+            recover_refs,
+            None,
+            ClosurePolicy::Passthrough,
+            &mut Vec::new(),
+        );
+        let rows = full_json_text(TextLayout::Compact, |sink| {
+            Ok(full_from_compact_with_reference_mode(
+                compact.clone(),
+                &HashMap::new(),
+                recover_refs,
+                None,
+                ClosurePolicy::Passthrough,
+                &mut Vec::new(),
+                Emit {
+                    lexical_uuid_names: false,
+                    sink: Some(sink),
+                },
+            ))
+        })
+        .unwrap()
+        .into_string();
+        (serde_json::to_string(&array).unwrap(), rows)
+    }
+
+    fn compact_of(name: &str, source: &str) -> Value {
+        let mut model = Model::new();
+        model.add_source(name, source);
+        model_to_compact_json(&model)
+    }
+
+    /// The same rows, last first. The emitter writes an owner before what
+    /// it owns, and most rules read downward, into rows not yet completed;
+    /// a payload may list its rows in any order, and in this one every
+    /// such read lands on a row already written and reduced.
+    fn last_first(compact: &Value) -> Value {
+        let mut rows = compact.as_array().unwrap().clone();
+        rows.reverse();
+        Value::Array(rows)
+    }
+
+    #[test]
+    fn pieces_join_to_what_was_written() {
+        use std::io::Write;
+        // Writes of every size around a piece's edge, and one spanning
+        // several pieces.
+        let piece = TextPieces::PIECE;
+        let mut pieces = TextPieces::new();
+        let mut written = Vec::new();
+        for (i, length) in [0, 1, piece - 2, 1, 1, piece, 3 * piece + 7, piece - 7, 5]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = vec![b'a' + i as u8; length];
+            pieces.write_all(&bytes).unwrap();
+            written.extend_from_slice(&bytes);
+        }
+        assert!(pieces.full.iter().all(|p| p.len() == piece));
+        assert!(pieces.into_string().as_bytes() == written.as_slice());
+        assert_eq!(TextPieces::new().into_string(), "");
+    }
+
+    #[test]
+    fn rows_written_one_by_one_are_the_array() {
+        let compact = compact_of("rules.sysml", READS_OTHER_ROWS);
+        for recover_refs in [true, false] {
+            for compact in [compact.clone(), last_first(&compact)] {
+                let (array, rows) = array_and_rows_as_written(&compact, recover_refs);
+                assert!(array == rows, "the rows as written are not the array");
+            }
+        }
+        // A payload's prefix annotation, spelled by `ownedAnnotatingElement`
+        // alone.
+        let (package, annotation, comment) = (
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000003",
+        );
+        let prefixed = json!([
+            {"@id": package, "@type": "Package", "ownedRelationship": [{"@id": annotation}]},
+            {
+                "@id": annotation,
+                "@type": "Annotation",
+                "owningRelatedElement": {"@id": package},
+                "ownedAnnotatingElement": {"@id": comment},
+            },
+            {"@id": comment, "@type": "Comment", "body": "a note"},
+        ]);
+        for compact in [last_first(&prefixed), prefixed] {
+            let (array, rows) = array_and_rows_as_written(&compact, true);
+            assert!(array.contains("\"ownedAnnotation\":[{"), "{array}");
+            assert!(array == rows, "the rows as written are not the array");
+        }
+        // Not an element array: it comes back as it was, as text too.
+        let (array, rows) = array_and_rows_as_written(&json!({"not": "rows"}), true);
+        assert_eq!(array, rows);
+        let (array, rows) = array_and_rows_as_written(&json!([]), true);
+        assert_eq!((array.as_str(), rows.as_str()), ("[]", "[]"));
+    }
+
+    #[test]
+    fn rows_written_one_by_one_are_the_array_over_the_corpus() {
+        fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path
+                    .extension()
+                    .is_some_and(|e| e == "sysml" || e == "kerml")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec-refs");
+        let mut files = Vec::new();
+        collect(&root.join("SysML-v2-Release/sysml.library"), &mut files);
+        collect(&root.join("SysML-v2-Release/sysml/src"), &mut files);
+        collect(&root.join("apollo-11-sysml-v2"), &mut files);
+        if files.is_empty() {
+            eprintln!("skipping: corpus not present");
+            return;
+        }
+        files.sort();
+        for file in &files {
+            let name = file.display().to_string();
+            let source = std::fs::read_to_string(file).unwrap();
+            let compact = compact_of(&name, &source);
+            for compact in [last_first(&compact), compact] {
+                let (array, rows) = array_and_rows_as_written(&compact, true);
+                assert!(
+                    array == rows,
+                    "{name}: the rows as written are not the array"
+                );
             }
         }
     }

@@ -785,6 +785,10 @@ pub enum ConstraintVerdict {
 /// One checked constraint.
 #[derive(Clone, Debug)]
 pub struct ConstraintCheck {
+    /// The constraint, requirement or invariant element the verdict is
+    /// about. `unit` and `span` locate the result expression's text, which
+    /// a bodiless assert takes from a definition; this stays the assert.
+    pub element: crate::json::ElementRef,
     /// Index into [`crate::model::Model::units`].
     pub unit: usize,
     /// Span of the result expression.
@@ -834,6 +838,7 @@ pub fn constraint_checks(
             _ => constraint_bindings(r, &c),
         };
         out.push(ConstraintCheck {
+            element: c.element,
             unit: c.unit,
             span: c.span,
             name: c.name,
@@ -866,6 +871,7 @@ pub fn satisfaction_checks(
                 continue;
             }
             out.push(ConstraintCheck {
+                element: c.element,
                 unit: c.unit,
                 span: c.span,
                 name: c.name.clone(),
@@ -937,6 +943,8 @@ fn indeterminate_reason(
 /// not settle it.
 #[derive(Clone, Debug)]
 pub struct SatisfactionClaim {
+    /// The `satisfy` statement's own element.
+    pub element: crate::json::ElementRef,
     /// Index into [`crate::model::Model::units`] of the `satisfy`
     /// statement.
     pub unit: usize,
@@ -946,8 +954,14 @@ pub struct SatisfactionClaim {
     /// Qualified name of the satisfied requirement, as
     /// [`ConstraintCheck::context`] carries it.
     pub requirement: Option<String>,
+    /// The satisfied requirement itself: the one the claim references, or
+    /// the claim when it declares its requirement in place, which
+    /// `requirement` then labels by the declared type.
+    pub requirement_element: crate::json::ElementRef,
     /// The satisfying feature as written after `by`.
     pub by: String,
+    /// The feature `by` resolves to, a chain's last feature.
+    pub by_element: crate::json::ElementRef,
     /// `not satisfy R by x;`: the verdict is on `x` *not* satisfying `R`.
     pub negated: bool,
     /// The claim's verdict.
@@ -999,6 +1013,7 @@ pub fn satisfaction_claims(
                 .any(|&(j, role)| j == i && role == SatisfactionRole::Assumed);
             constraints.push(ClaimConstraint {
                 check: ConstraintCheck {
+                    element: c.element,
                     unit: c.unit,
                     span: c.span,
                     name: c.name.clone(),
@@ -1013,10 +1028,13 @@ pub fn satisfaction_claims(
         }
         let (verdict, vacuous) = claim_verdict(&s.nodes, &constraints, s.negated);
         out.push(SatisfactionClaim {
+            element: s.satisfy,
             unit: s.unit,
             span: s.span,
             requirement: s.context,
+            requirement_element: s.requirement,
             by: s.by,
+            by_element: s.target,
             negated: s.negated,
             verdict,
             vacuous,

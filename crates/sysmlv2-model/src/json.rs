@@ -14035,8 +14035,14 @@ pub struct SatisfactionInfo {
     /// Source extent of the `satisfy` statement, keyword through its `;`
     /// or body.
     pub span: Span,
+    /// The satisfied requirement: the one the claim references, or the
+    /// claim itself when it declares its requirement in place
+    /// (`satisfy requirement : R by x;`).
+    pub requirement: ElementRef,
     /// The satisfying feature as written after `by`.
     pub by: String,
+    /// The feature `by` resolves to, a chain's last feature.
+    pub target: ElementRef,
     /// `not satisfy R by x;`: the claim is that `x` does not satisfy `R`.
     pub negated: bool,
     /// Qualified name of the satisfied requirement — the context label
@@ -17165,7 +17171,9 @@ impl ResolvedModel {
                 satisfy: ElementRef(sat),
                 unit: self.b.unit_of_elem(sat),
                 span: self.b.member_spans.get(&sat).copied().unwrap_or(by_span),
+                requirement: ElementRef(req),
                 by: by_spelling,
+                target: ElementRef(bound),
                 negated,
                 context,
                 constraints,

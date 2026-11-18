@@ -2830,3 +2830,90 @@ fn inherited_chain_bindings_match_through_blocks_and_named_blocks() {
         "{overrides:#?}"
     );
 }
+
+/// A check says which element it is about. An assert typed by a definition
+/// is located over the definition's expression and stays the assert; a
+/// claim carries its own element, the requirement it satisfies and the
+/// feature `by` resolves to.
+#[test]
+fn checks_and_claims_carry_their_elements() {
+    let src = "package P {
+            part def Thing { attribute m; }
+            constraint def Under { in a; in b; a <= b }
+            part box {
+                attribute m = 3;
+                assert constraint fits : Under { in a = m; in b = 5; }
+            }
+            requirement def Cap {
+                subject t : Thing;
+                require constraint { t.m <= 5 }
+            }
+            requirement cap : Cap;
+            part big : Thing { attribute :>> m = 9; }
+            part site {
+                part inner : Thing;
+                satisfy cap by big;
+                satisfy requirement : Cap by big;
+                satisfy cap by site.inner;
+            }
+        }";
+    let mut model = Model::new();
+    model.add_source("t.sysml", src);
+    assert!(!model.has_errors());
+    let mut r = sysmlv2_parser::json::ResolvedModel::build(&model);
+
+    let checks = sysmlv2_parser::check::constraint_checks(&model, &mut r);
+    let mut about: Vec<(Option<String>, &str)> = checks
+        .iter()
+        .map(|c| {
+            (
+                r.element_qualified_name(c.element),
+                &src[c.span.start as usize..c.span.end as usize],
+            )
+        })
+        .collect();
+    about.sort();
+    assert_eq!(
+        about,
+        [
+            (None, "t.m <= 5"),
+            (Some("P::Under".to_string()), "a <= b"),
+            (Some("P::box::fits".to_string()), "a <= b"),
+        ]
+    );
+
+    let claims = sysmlv2_parser::check::satisfaction_claims(&model, &mut r);
+    let named: Vec<(Option<String>, Option<String>, &str)> = claims
+        .iter()
+        .map(|c| {
+            (
+                r.element_qualified_name(c.requirement_element),
+                r.element_qualified_name(c.by_element),
+                c.by.as_str(),
+            )
+        })
+        .collect();
+    let (cap, big) = (Some("P::cap".to_string()), Some("P::big".to_string()));
+    assert_eq!(
+        named,
+        [
+            (cap.clone(), big.clone(), "big"),
+            // Declared in place: the claim is the requirement, and unnamed.
+            (None, big, "big"),
+            // A chain resolves to its last feature.
+            (cap, Some("P::site::inner".to_string()), "site.inner"),
+        ]
+    );
+    assert_ne!(claims[0].element, claims[0].requirement_element);
+    assert_eq!(claims[1].element, claims[1].requirement_element);
+    assert_ne!(claims[0].element, claims[2].element);
+    // The constraint a claim evaluates is the requirement's own.
+    let unnamed = checks
+        .iter()
+        .find(|c| c.name.is_none())
+        .expect("the requirement's unnamed constraint");
+    for claim in &claims {
+        assert_eq!(claim.constraints.len(), 1);
+        assert_eq!(claim.constraints[0].check.element, unnamed.element);
+    }
+}

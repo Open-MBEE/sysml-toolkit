@@ -4,7 +4,7 @@
 //! closure policy writes the specification's values (#55).
 
 use serde_json::Value;
-use sysmlv2_model::full::{EmissionError, EmissionPolicy, UnresolvedReferencePolicy};
+use sysmlv2_model::full::{EmissionError, EmissionPolicy, TextLayout, UnresolvedReferencePolicy};
 use sysmlv2_model::json::ClosurePolicy;
 use sysmlv2_transform::Session;
 
@@ -151,4 +151,158 @@ fn a_payload_session_takes_the_policy_too_and_a_truncated_walk_refuses() {
         deep.to_full_json_with_policy(EmissionPolicy::default())
             .is_ok()
     );
+}
+
+/// The three closure levels, unresolved references preserved.
+fn levels() -> [EmissionPolicy; 3] {
+    [EmissionPolicy::default(), closure(false), closure(true)]
+}
+
+/// The text export against the value export, serialized: the same bytes in
+/// both layouts at every level, or the same refusal.
+fn assert_text_is_the_value(session: &Session, what: &str) {
+    assert_text_is_the_value_in(session, what, &[TextLayout::Compact, TextLayout::Indented]);
+}
+
+fn assert_text_is_the_value_in(session: &Session, what: &str, layouts: &[TextLayout]) {
+    for policy in levels() {
+        let value = session.to_full_json_with_policy(policy);
+        for &layout in layouts {
+            let serialize = match layout {
+                TextLayout::Compact => {
+                    serde_json::to_string as fn(&Value) -> serde_json::Result<String>
+                }
+                TextLayout::Indented => serde_json::to_string_pretty,
+            };
+            let text = session.to_full_json_text_with_policy(policy, layout);
+            match (&value, text) {
+                (Ok(value), Ok(text)) => assert!(
+                    serialize(value).unwrap() == text,
+                    "{what}: the {layout:?} text under {:?} is not the value serialized",
+                    policy.closures
+                ),
+                (Err(refused), Err(text)) => assert_eq!(refused, &text, "{what}"),
+                (value, text) => panic!(
+                    "{what}: under {:?} the value is {} and the text {}",
+                    policy.closures,
+                    if value.is_ok() { "written" } else { "refused" },
+                    if text.is_ok() { "written" } else { "refused" },
+                ),
+            }
+        }
+    }
+}
+
+/// A session over `source` and one over its compact payload.
+fn both_sessions(name: &str, source: &str, library: Option<&sysmlv2_transform::Library>) {
+    let text = Session::from_sources_with_library(
+        vec![(name.to_string(), source.to_string())],
+        library.cloned(),
+    )
+    .unwrap();
+    assert_text_is_the_value(&text, name);
+    let payload = text.to_compact_json();
+    let loaded = Session::from_interchange_json_with(&payload, library).unwrap();
+    assert_text_is_the_value(&loaded, &format!("{name} (payload)"));
+}
+
+/// Rows the array-level rules complete, which read other rows: recovery
+/// annotations for unresolved references, documentation and comments
+/// (prefix and `about`), directed and end features, reference chains,
+/// state subactions, requirement verification, view rendering, imports
+/// of a membership.
+const ARRAY_LEVEL: &str = r#"package Rules {
+    doc /* about the package */
+    comment note about Rules::Box /* a note */
+    port def Out { out attribute v : Missing::Real; inout attribute w; in attribute u; }
+    part def Box {
+        doc /* a box */
+        port i : ~Out;
+        part inner { attribute deep; }
+        attribute lead = inner.deep;
+        attribute other :> Nowhere::thing;
+    }
+    part def Big :> Box { attribute :>> lead; }
+    connection def Link { end a : Box; end b : Box; }
+    state def Machine {
+        action setup;
+        entry setup;
+        do action running;
+        exit;
+        state idle;
+    }
+    requirement def Light { doc /* stay light */ subject s : Box; }
+    requirement light : Light;
+    verification def Check {
+        subject s : Box;
+        objective { verify light; }
+    }
+    rendering asTable;
+    view def Table { render asTable; }
+    package Alias { public import Rules::Box; alias B for Box; }
+}
+"#;
+
+#[test]
+fn the_text_is_the_value_serialized() {
+    both_sessions("export.sysml", MODEL, None);
+    both_sessions("rules.sysml", ARRAY_LEVEL, None);
+    let lib = sysmlv2_testkit::library_dir();
+    if lib.exists() {
+        let library = sysmlv2_transform::Library::dir(&lib);
+        both_sessions("export.sysml", MODEL, Some(&library));
+        both_sessions("rules.sysml", ARRAY_LEVEL, Some(&library));
+    } else {
+        eprintln!("skipping the library half: corpus not present");
+    }
+    // A refusal is the same refusal, and nothing of the text comes back.
+    let mut src = String::from("package P { package D0 { part leaf; }");
+    for i in 1..=26 {
+        src.push_str(&format!(" package D{i} {{ public import D{}::*; }}", i - 1));
+    }
+    src.push('}');
+    let deep = Session::from_sources(vec![("deep.sysml".into(), src)]).unwrap();
+    assert!(matches!(
+        deep.to_full_json_text_with_policy(closure(false), TextLayout::Compact),
+        Err(EmissionError::TruncatedClosures { ref elements }) if !elements.is_empty()
+    ));
+    assert_text_is_the_value(&deep, "deep.sysml");
+}
+
+#[test]
+fn the_text_is_the_value_serialized_over_the_corpus() {
+    let lib = sysmlv2_testkit::library_dir();
+    if !lib.exists() {
+        eprintln!("skipping: corpus not present");
+        return;
+    }
+    let mut files = sysmlv2_testkit::user_files();
+    if let Some(more) = sysmlv2_testkit::apollo_files() {
+        files.extend(more);
+    }
+    if files.is_empty() {
+        eprintln!("skipping: corpus model files not present");
+        return;
+    }
+    let library = sysmlv2_transform::Library::dir(&lib);
+    // Prepare the library once, before the files share it.
+    both_sessions("export.sysml", MODEL, Some(&library));
+    sysmlv2_testkit::par_map(&files, |path| {
+        let source = std::fs::read_to_string(path).unwrap();
+        // A file the parser reports on opens as no session.
+        let name = path.to_string_lossy().into_owned();
+        let Ok(text) =
+            Session::from_sources_with_library(vec![(name.clone(), source)], Some(library.clone()))
+        else {
+            return;
+        };
+        // The layouts differ in the writer alone, which the small models
+        // hold to both; the rows are what the corpus varies.
+        let compact = [TextLayout::Compact];
+        assert_text_is_the_value_in(&text, &name, &compact);
+        let payload = text.to_compact_json();
+        if let Ok(loaded) = Session::from_interchange_json_with(&payload, Some(&library)) {
+            assert_text_is_the_value_in(&loaded, &format!("{name} (payload)"), &compact);
+        }
+    });
 }

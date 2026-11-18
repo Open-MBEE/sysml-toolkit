@@ -42,7 +42,7 @@ use sysmlv2_model::check::{
     ConstraintVerdict, SatisfactionClaim, constraint_bindings, constraint_verdict,
     satisfaction_claims,
 };
-use sysmlv2_model::json::ResolvedModel;
+use sysmlv2_model::json::{ElementRef, ResolvedModel};
 use sysmlv2_model::model::Model;
 use sysmlv2_model::numfmt::NumberFormat;
 use term::RenderCtx;
@@ -696,6 +696,9 @@ fn propagate_core(
 /// left it open — the Z3 conclusion.
 #[derive(Clone, Debug)]
 pub struct VerifiedConstraint {
+    /// The constraint, requirement or invariant element the verdict is
+    /// about (see [`sysmlv2_model::check::ConstraintCheck::element`]).
+    pub element: ElementRef,
     /// Index into [`Model::units`].
     pub unit: usize,
     /// Span of the result expression.
@@ -799,6 +802,7 @@ fn verify_resolved(
             _ => constraint_bindings(r, c),
         };
         constraints.push(VerifiedConstraint {
+            element: c.element,
             unit: c.unit,
             span: c.span,
             name: c.name.clone(),

@@ -1003,21 +1003,23 @@ impl Session {
     /// budget.
     #[pyo3(signature = (recover_refs = true, closures = "passthrough"))]
     fn to_full_json(&self, recover_refs: bool, closures: &str) -> PyResult<String> {
-        use sysmlv2_model::full::{EmissionPolicy, UnresolvedReferencePolicy};
+        use sysmlv2_model::full::{EmissionPolicy, TextLayout, UnresolvedReferencePolicy};
         let closures = parse_closure_policy(closures)?;
         let unresolved = if recover_refs {
             UnresolvedReferencePolicy::Preserve
         } else {
             UnresolvedReferencePolicy::LegacyDanglingId
         };
-        let value = self
-            .inner
-            .to_full_json_with_policy(EmissionPolicy {
-                unresolved,
-                closures,
-            })
-            .map_err(refused)?;
-        Ok(serde_json::to_string_pretty(&value).expect("serializable"))
+        // Written row by row, never held as the document value.
+        self.inner
+            .to_full_json_text_with_policy(
+                EmissionPolicy {
+                    unresolved,
+                    closures,
+                },
+                TextLayout::Indented,
+            )
+            .map_err(refused)
     }
 
     /// Checked owned/derived property as JSON, with references encoded by ID.

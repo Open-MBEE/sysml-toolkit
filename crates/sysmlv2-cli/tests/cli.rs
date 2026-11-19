@@ -60,8 +60,20 @@ fn top_level_help_documents_conversion_matrix_and_examples() {
 #[test]
 fn every_subcommand_help_has_examples() {
     for sub in [
-        "convert", "payload", "fmt", "check", "lint", "verify", "parse", "query", "describe",
-        "members", "tree", "lsp",
+        "convert",
+        "payload",
+        "fmt",
+        "check",
+        "lint",
+        "verify",
+        "parse",
+        "query",
+        "describe",
+        "members",
+        "tree",
+        "lsp",
+        "check-project",
+        "kpar-index",
     ] {
         let out = sysmlv2(&[sub, "--help"]);
         assert!(out.status.success(), "{sub} --help failed");
@@ -4793,4 +4805,248 @@ fn tree_with_the_library_spells_library_targets_and_implied_relationships() {
         text.starts_with("ScalarValues::Real [DataType] [library]\n"),
         "{text}"
     );
+}
+
+#[test]
+fn kpar_index_includes_short_names_and_relative_paths() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-kpar-index-{}", std::process::id()));
+    let root = dir.as_path();
+    fs::create_dir_all(root.join("models")).unwrap();
+    fs::write(root.join("models/Vehicle.sysml"), "part def <v> Vehicle;\n").unwrap();
+    let out = sysmlv2(&[
+        "kpar-index",
+        "--root",
+        root.to_str().unwrap(),
+        "models/Vehicle.sysml",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let index: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        index,
+        serde_json::json!({
+            "Vehicle": "models/Vehicle.sysml",
+            "v": "models/Vehicle.sysml",
+        })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_check_reports_undeclared_direct_references() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-kpar-direct-{}", std::process::id()));
+    let root = dir.as_path();
+    fs::create_dir_all(root).unwrap();
+    let demo = root.join("Demo.sysml");
+    let vehicle = root.join("Vehicle.sysml");
+    let power = root.join("Power.sysml");
+    fs::write(
+        &demo,
+        "package Demo { private import Vehicle::Rover; part rover : Rover; }\n",
+    )
+    .unwrap();
+    fs::write(&vehicle, "package Vehicle { private import Power::Battery; part def Rover { part battery : Battery; } }\n").unwrap();
+    fs::write(&power, "package Power { part def Battery; }\n").unwrap();
+    let args = [
+        "check-project",
+        "--direct-only",
+        "--format",
+        "json",
+        "--project",
+        demo.to_str().unwrap(),
+        "--direct",
+        vehicle.to_str().unwrap(),
+        "--transitive",
+        power.to_str().unwrap(),
+    ];
+    let good = sysmlv2(&args);
+    assert!(good.status.success(), "{}", stdout(&good));
+    fs::write(
+        &demo,
+        "package Demo { private import Power::Battery; part battery : Battery; }\n",
+    )
+    .unwrap();
+    let bad = sysmlv2(&args);
+    assert!(!bad.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&bad.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(!findings.is_empty());
+    for finding in findings {
+        assert_eq!(finding["rule"], "direct-dependency");
+        // The report's stages stay the documented four.
+        assert_eq!(finding["stage"], "referential");
+        assert!(
+            finding["message"]
+                .as_str()
+                .unwrap()
+                .contains("resolves only through a transitive dependency"),
+            "{finding}"
+        );
+        assert!(
+            finding["unitName"]
+                .as_str()
+                .unwrap()
+                .ends_with("Demo.sysml")
+        );
+    }
+    let mut declared = args;
+    declared[8] = "--direct";
+    let good = sysmlv2(&declared);
+    assert!(good.status.success(), "{}", stdout(&good));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A direct-only failure must not read as a plain unresolved reference:
+/// the name does resolve in the whole model.
+#[test]
+fn project_check_text_says_why_a_direct_only_reference_fails() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-kpar-text-{}", std::process::id()));
+    let root = dir.as_path();
+    fs::create_dir_all(root).unwrap();
+    let demo = root.join("Demo.sysml");
+    let vehicle = root.join("Vehicle.sysml");
+    let power = root.join("Power.sysml");
+    fs::write(
+        &demo,
+        "package Demo { private import Power::Battery; part battery : Battery; }\n",
+    )
+    .unwrap();
+    fs::write(&vehicle, "package Vehicle { part def Rover; }\n").unwrap();
+    fs::write(&power, "package Power { part def Battery; }\n").unwrap();
+    let out = sysmlv2(&[
+        "check-project",
+        "--direct-only",
+        "--project",
+        demo.to_str().unwrap(),
+        "--direct",
+        vehicle.to_str().unwrap(),
+        "--transitive",
+        power.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let text = stderr(&out);
+    assert!(
+        text.contains(
+            "unresolved reference `Power::Battery` among the direct dependencies: it resolves \
+             only through a transitive dependency, which the project must declare directly"
+        ),
+        "{text}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Warnings fail the run only under `--strict`, and a warning the whole
+/// model already has (a standard-library name with no library loaded) is
+/// not turned into a direct-dependency error by the second pass.
+#[test]
+fn project_check_warnings_fail_only_under_strict() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-kpar-strict-{}", std::process::id()));
+    let root = dir.as_path();
+    fs::create_dir_all(root).unwrap();
+    let demo = root.join("Demo.sysml");
+    let vehicle = root.join("Vehicle.sysml");
+    let power = root.join("Power.sysml");
+    fs::write(
+        &demo,
+        "package Demo { private import ScalarValues::Real; attribute r : Real; }\n",
+    )
+    .unwrap();
+    fs::write(&vehicle, "package Vehicle { part def Rover; }\n").unwrap();
+    fs::write(&power, "package Power { part def Battery; }\n").unwrap();
+    let args = [
+        "check-project",
+        "--direct-only",
+        "--format",
+        "json",
+        "--project",
+        demo.to_str().unwrap(),
+        "--direct",
+        vehicle.to_str().unwrap(),
+        "--transitive",
+        power.to_str().unwrap(),
+    ];
+    let lenient = sysmlv2(&args);
+    assert!(lenient.status.success(), "{}", stdout(&lenient));
+    let report: serde_json::Value = serde_json::from_slice(&lenient.stdout).unwrap();
+    assert_eq!(report["summary"]["errors"], 0, "{report}");
+    assert_eq!(report["summary"]["warnings"], 2, "{report}");
+    for finding in report["findings"].as_array().unwrap() {
+        assert!(finding["rule"].is_null(), "{finding}");
+    }
+    let mut strict = args.to_vec();
+    strict.push("--strict");
+    assert!(!sysmlv2(&strict).status.success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// One rule for the index: what `kpar-index` prints is what `convert --to
+/// kpar` writes into `.meta.json`, short names and every top-level name
+/// included, and a project may hold SysML and KerML files together.
+#[test]
+fn kpar_archive_index_is_the_kpar_index() {
+    let dir = std::env::temp_dir().join(format!("sysmlv2-kpar-same-{}", std::process::id()));
+    let root = dir.as_path();
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("a.sysml"),
+        "package <a> A; part def Loose;\npart x;\n",
+    )
+    .unwrap();
+    fs::write(root.join("k.kerml"), "package K;\n").unwrap();
+    fs::write(root.join("anon.sysml"), "part y;\n").unwrap();
+    let out = sysmlv2(&[
+        "kpar-index",
+        "--root",
+        root.to_str().unwrap(),
+        "a.sysml",
+        "k.kerml",
+        "anon.sysml",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        printed,
+        serde_json::json!({
+            "A": "a.sysml", "a": "a.sysml", "Loose": "a.sysml", "x": "a.sysml",
+            "K": "k.kerml", "y": "anon.sysml",
+        })
+    );
+    let archive = root.join("p.kpar");
+    let out = sysmlv2(&[
+        "convert",
+        "--to",
+        "kpar",
+        "-o",
+        archive.to_str().unwrap(),
+        root.join("a.sysml").to_str().unwrap(),
+        root.join("k.kerml").to_str().unwrap(),
+        root.join("anon.sysml").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    match std::process::Command::new("unzip")
+        .args(["-p", archive.to_str().unwrap(), ".meta.json"])
+        .output()
+    {
+        Ok(unzip) if unzip.status.success() => {
+            let meta: serde_json::Value = serde_json::from_slice(&unzip.stdout).unwrap();
+            assert_eq!(meta["index"], printed);
+        }
+        _ => eprintln!("skipping the archive half: no unzip"),
+    }
+
+    // A name two files declare has no one path to index.
+    fs::write(root.join("dup.sysml"), "package A;\n").unwrap();
+    let out = sysmlv2(&[
+        "kpar-index",
+        "--root",
+        root.to_str().unwrap(),
+        "a.sysml",
+        "dup.sysml",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("A is declared in both a.sysml and dup.sysml"),
+        "{}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(root).unwrap();
 }

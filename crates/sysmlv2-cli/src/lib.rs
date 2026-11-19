@@ -28,6 +28,7 @@ use sysmlv2_parser::span::{LineIndex, Span};
 
 mod bundle;
 mod kpar;
+mod package_tools;
 
 /// Load a prepared standard library; the model layer also shares its immutable
 /// prefix across SDK/session rebuilds. Any legacy recording is saved after build.
@@ -938,6 +939,62 @@ enum Command {
         #[arg(long)]
         strict: bool,
         /// Report format: text on stderr, or one JSON document on stdout
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+    },
+    /// Write the project index for textual model files as JSON
+    #[command(after_help = "The index maps every top-level name and short name\n\
+                            to the path of the file that declares it, relative\n\
+                            to --root: the `index` of an archive's .meta.json,\n\
+                            and what `convert --to kpar` writes there. A name\n\
+                            two files declare is refused.\n\n\
+                            EXAMPLES:\n\
+                            \x20 sysmlv2 kpar-index --root . models/Vehicle.sysml models/Power.sysml\n\
+                            \x20 sysmlv2 kpar-index --root project/ src/*.sysml > index.json")]
+    KparIndex {
+        /// Directory relative to which the model paths are stored in the archive
+        #[arg(long)]
+        root: PathBuf,
+        /// Model files, interpreted relative to the root when not absolute
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// Validate a project with the supplied dependency sources
+    #[command(after_help = "The project's files are checked with every supplied\n\
+                            file as one model, as `check` would. Warnings are\n\
+                            reported and fail the run only under --strict.\n\
+                            --direct-only then resolves the project's files\n\
+                            again without the --transitive files: a name that\n\
+                            no longer resolves is an error whose message says\n\
+                            so, with rule `direct-dependency` in the JSON\n\
+                            report.\n\n\
+                            EXAMPLES:\n\
+                            \x20 sysmlv2 check-project --project src/Demo.sysml --direct deps/Vehicle.sysml\n\
+                            \x20 sysmlv2 check-project --direct-only --project src/Demo.sysml \\\n\
+                            \x20     --direct deps/Vehicle.sysml --transitive deps/Power.sysml\n\
+                            \x20 sysmlv2 check-project --strict --format json --lib sysml.library/ \\\n\
+                            \x20     --project src/Demo.sysml --direct deps/Vehicle.sysml")]
+    CheckProject {
+        /// One of the project's own textual model files; repeat as needed
+        #[arg(long, required = true)]
+        project: Vec<PathBuf>,
+        /// Textual files from directly declared dependencies; repeat as needed
+        #[arg(long)]
+        direct: Vec<PathBuf>,
+        /// Textual files from other dependencies in the closure; repeat as needed
+        #[arg(long)]
+        transitive: Vec<PathBuf>,
+        /// Standard-library directory or bundle
+        #[arg(long, env = "SYSMLV2_LIB_DIR")]
+        lib: Option<PathBuf>,
+        /// Also require the project's own references to resolve without transitive files
+        #[arg(long)]
+        direct_only: bool,
+        /// Treat warnings as failures, in the project's files and in the
+        /// dependencies' alike
+        #[arg(long)]
+        strict: bool,
+        /// Report format
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
         format: ReportFormat,
     },
@@ -4199,43 +4256,31 @@ fn run_convert(args: ConvertArgs, quiet: bool) -> ExitCode {
                 eprintln!("error: --to kpar needs -o <archive.kpar>");
                 return ExitCode::FAILURE;
             };
-            let mut units: Vec<(String, String, String)> = Vec::new();
+            let mut units: Vec<(String, String)> = Vec::new();
+            // The .meta.json index: every top-level name and short name,
+            // by the rule `kpar-index` prints.
+            let mut index = std::collections::BTreeMap::new();
             for (path, src) in &sources {
                 let parse = parse_file(path, src);
                 if !parse.diagnostics.is_empty() {
                     report(path, src, &parse.diagnostics);
                     return ExitCode::FAILURE;
                 }
-                // The .meta.json index maps the unit's root
-                // namespace name to its file; an anonymous root
-                // falls back to the file stem.
-                let root = parse
-                    .unit
-                    .members
-                    .iter()
-                    .find_map(|m| match &m.kind {
-                        sysmlv2_parser::ast::MemberKind::Package(pkg) => {
-                            pkg.id.name.as_ref().map(|n| n.value.clone())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| {
-                        path.file_stem().map_or_else(
-                            || "model".to_string(),
-                            |st| st.to_string_lossy().into_owned(),
-                        )
-                    });
                 let file_name = path.file_name().map_or_else(
                     || "model.sysml".to_string(),
                     |f| f.to_string_lossy().into_owned(),
                 );
-                units.push((file_name, src.clone(), root));
+                if let Err(e) = package_tools::add_to_index(&mut index, &parse.unit, &file_name) {
+                    eprintln!("error: cannot build {}: {e}", out.display());
+                    return ExitCode::FAILURE;
+                }
+                units.push((file_name, src.clone()));
             }
             let name = out.file_stem().map_or_else(
                 || "project".to_string(),
                 |st| st.to_string_lossy().into_owned(),
             );
-            let bytes = match kpar::write(&name, "1.0.0", &units) {
+            let bytes = match kpar::write(&name, "1.0.0", &units, &index) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     eprintln!("error: cannot build {}: {e}", out.display());
@@ -4883,14 +4928,27 @@ fn run_check(
         Ok(files) => files,
         Err(code) => return code,
     };
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
     // `.kpar` archives expand to their contained textual units.
     let inputs = match read_inputs(&files) {
         Ok(i) => i,
         Err(code) => return code,
     };
-    let mut sink = Sink::new(format, &inputs);
+    check_inputs(&inputs, lib, strict, format, None)
+}
+
+fn check_inputs(
+    inputs: &[(PathBuf, String)],
+    lib: Option<&Path>,
+    strict: bool,
+    format: ReportFormat,
+    direct_scope: Option<(usize, usize)>,
+) -> ExitCode {
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut sink = Sink::new(format, inputs);
+    // What the whole model already reported, so the direct-only pass
+    // adds only what the missing files cause.
+    let mut reported = package_tools::Reported::new();
     // (input index, path, source) per cleanly-parsed file, for
     // the model stage.
     let mut sources: Vec<(usize, &PathBuf, &str)> = Vec::new();
@@ -4947,6 +5005,9 @@ fn run_check(
         for (unit, d) in sysmlv2_parser::check::validate_model_with(&mut r, &model) {
             tally(&d);
             sink.diagnostic("referential", input_of(unit), &d);
+            if direct_scope.is_some() {
+                reported.insert((input_of(unit), d.span, d.message));
+            }
         }
         for (unit, d) in sysmlv2_parser::check::validate_semantics_with(&mut r, &model) {
             tally(&d);
@@ -4969,9 +5030,20 @@ fn run_check(
                 );
             }
         }
-        leave_to_exit((r, model));
+        if direct_scope.is_some() {
+            drop((r, model));
+        } else {
+            leave_to_exit((r, model));
+        }
     }
 
+    // A model with errors has no settled resolution to compare against.
+    if let Some(scope) = direct_scope.filter(|_| errors == 0) {
+        match package_tools::direct_diagnostics(inputs, lib, scope, &reported, &mut sink) {
+            Ok(count) => errors += count,
+            Err(code) => return code,
+        }
+    }
     if let Err(code) = sink.finish() {
         return code;
     }
@@ -5773,6 +5845,24 @@ fn dispatch(command: Command, quiet: bool) -> ExitCode {
             strict,
             format,
         } => run_check(files, lib.as_deref(), strict, format, quiet),
+        Command::KparIndex { root, files } => package_tools::run_index(&root, files),
+        Command::CheckProject {
+            project,
+            direct,
+            transitive,
+            lib,
+            direct_only,
+            strict,
+            format,
+        } => package_tools::run_project_check(
+            project,
+            direct,
+            transitive,
+            lib.as_deref(),
+            direct_only,
+            strict,
+            format,
+        ),
         Command::Lint {
             files,
             lib,

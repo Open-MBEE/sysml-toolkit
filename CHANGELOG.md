@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.13.0
+
+### Added
+
+- Two commands for packaging a project. `kpar-index --root <dir> <files>` prints the index an archive's `.meta.json` carries: every top-level name and short name mapped to the path, relative to the root, of the file that declares it, refusing a name two files declare. `check-project --project <file> --direct <file> --transitive <file>` checks a project together with the dependency files a package manager selected, and with `--direct-only` resolves the project's files again without the transitive ones: a reference that then no longer resolves is an error saying the dependency providing it must be declared directly, with `rule` `direct-dependency` in the `--format json` report. Warnings fail the run only under `--strict`.
+
+### Changed
+
+- `convert --to kpar` writes the archive's index by the rule `kpar-index` prints. Every top-level name and short name of each file is indexed, where only the first package's name was; a file that declares no top-level name has no entry, where its file stem stood in for one; and two files declaring the same top-level name are refused, where the later file silently took the entry.
+
 ## v0.12.2
 
 ### Performance

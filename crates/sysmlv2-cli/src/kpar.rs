@@ -186,8 +186,8 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 // ---- writing ---------------------------------------------------------------
 
-/// Build a `.kpar` archive: `.project.json`, `.meta.json` (index of the
-/// given root names, metamodel URI chosen by dialect, SHA-256 checksums,
+/// Build a `.kpar` archive: `.project.json`, `.meta.json` (the given
+/// index of top-level names to unit files, metamodel URI chosen by dialect, SHA-256 checksums,
 /// `created` = now), then the units — deflate entries with the normative
 /// zeroed date (1980-01-01), so archives are byte-deterministic apart
 /// from the creation timestamp. Fails when a name, an entry or the whole
@@ -195,11 +195,10 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 pub fn write(
     project_name: &str,
     version: &str,
-    units: &[(String, String, String)],
+    units: &[(String, String)],
+    index: &std::collections::BTreeMap<String, String>,
 ) -> Result<Vec<u8>, String> {
-    let sysml = units
-        .iter()
-        .any(|(f, _, _)| crate::has_extension(f, "sysml"));
+    let sysml = units.iter().any(|(f, _)| crate::has_extension(f, "sysml"));
     let metamodel = if sysml {
         "https://www.omg.org/spec/SysML/20250201"
     } else {
@@ -210,10 +209,8 @@ pub fn write(
         "version": version,
         "usage": [],
     });
-    let mut index = Map::new();
     let mut checksum = Map::new();
-    for (file, source, root) in units {
-        index.insert(root.clone(), json!(file));
+    for (file, source) in units {
         checksum.insert(
             file.clone(),
             json!({ "value": sha256_hex(source.as_bytes()), "algorithm": "SHA256" }),
@@ -232,7 +229,7 @@ pub fn write(
         ),
         (".meta.json".into(), serde_json::to_vec(&meta).unwrap()),
     ];
-    for (file, source, _) in units {
+    for (file, source) in units {
         entries.push((file.clone(), source.as_bytes().to_vec()));
     }
     zip_write(&entries)
@@ -438,14 +435,14 @@ mod tests {
         );
     }
 
+    fn index_of_m() -> std::collections::BTreeMap<String, String> {
+        [("M".to_string(), "M.sysml".to_string())].into()
+    }
+
     #[test]
     fn zip_round_trips() {
-        let units = vec![(
-            "M.sysml".to_string(),
-            "package M;\n".to_string(),
-            "M".to_string(),
-        )];
-        let bytes = write("Test", "1.0.0", &units).expect("writable");
+        let units = vec![("M.sysml".to_string(), "package M;\n".to_string())];
+        let bytes = write("Test", "1.0.0", &units, &index_of_m()).expect("writable");
         let kpar = read(&bytes).expect("readable");
         assert_eq!(kpar.units.len(), 1);
         assert_eq!(kpar.units[0].source, "package M;\n");
@@ -460,9 +457,8 @@ mod tests {
         let units = vec![(
             "M.sysml".to_string(),
             format!("package M {{\n{}}}\n", "    part def P;\n".repeat(200)),
-            "M".to_string(),
         )];
-        write("Test", "1.0.0", &units).expect("writable")
+        write("Test", "1.0.0", &units, &index_of_m()).expect("writable")
     }
 
     fn u16_at(bytes: &[u8], at: usize) -> usize {

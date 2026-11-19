@@ -496,7 +496,8 @@ fn member_desc(k: &MemberKind) -> String {
 }
 
 /// The identification a member contributes to its owning namespace, if any.
-fn member_identification(k: &MemberKind) -> Option<&Identification> {
+#[must_use]
+pub fn member_identification(k: &MemberKind) -> Option<&Identification> {
     match k {
         MemberKind::Package(p) => Some(&p.id),
         MemberKind::Alias(a) => Some(&a.id),
